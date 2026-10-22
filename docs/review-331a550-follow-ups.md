@@ -51,6 +51,20 @@ remaining worthwhile findings from the source review at 331a550.
   with and without a configured pin, chat spoof rejection, normal enrollment,
   injected engine failure and closed-pane listing.
 
+## Batch 4: input and reconnect correctness
+
+- L11: reconnect scrolls the primary screen into history before new session output;
+  stale graphics remain only as historical cells rather than orphaned live content.
+- L14: native modifier keys reach REPORT_ALL; Enter/Tab/Backspace releases require
+  that flag. Shifted keys carry the unshifted layout identity, and composed text
+  retains press/repeat/release identity and associated Unicode text. Mouse pixel
+  offsets are converted from DIPs using the current scale.
+- L19: a transport failure during password auth preserves the zeroizing candidate
+  for reconnection; unsolicited Success messages cannot announce connection twice.
+- Regressions cover byte-exact modifier/safety-key/shift/composition matrices and
+  reconnect isolation of primary text and graphics, in addition to existing held-key
+  bridge and SSH reconnect tests.
+
 ## Remaining batches
 
 - Automation and SFTP: L5/L6/L8/L16; negotiated read sizes; explicit overload

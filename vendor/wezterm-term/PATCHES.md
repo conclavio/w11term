@@ -26,3 +26,5 @@ The original MIT license is preserved in `LICENSE.md`.
   allocation limits. Animations have 256-frame/32 MiB limits, grow the shared table
   accounting, and direct chunk metadata is bounded. Chunked query/animation
   transmissions are explicitly rejected rather than misdecoded.
+
+- Reconnection moves the previous primary viewport into scrollback before resetting the transport modes and exposing a clean live screen.

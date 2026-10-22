@@ -512,6 +512,14 @@ impl std::io::Write for ThreadedWriter {
 impl TerminalState {
     pub(crate) fn reset_connection(&mut self) {
         let mut primary = self.screen.screen.clone();
+        let rows = primary.physical_rows;
+        primary.scroll_up(
+            &(0..rows as i64),
+            rows,
+            self.seqno + 1,
+            CellAttributes::default(),
+            self.config.bidi_mode(),
+        );
         primary.full_reset();
         primary.saved_cursor = None;
         self.increment_seqno();

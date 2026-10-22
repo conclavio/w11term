@@ -26,6 +26,7 @@ enum Seen {
 }
 struct Peer {
     seen: mpsc::UnboundedSender<Seen>,
+    drop_password: Arc<std::sync::atomic::AtomicBool>,
 }
 impl server::Handler for Peer {
     type Error = anyhow::Error;
@@ -38,6 +39,12 @@ impl server::Handler for Peer {
     }
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<server::Auth> {
         self.seen.send(Seen::Password)?;
+        if self
+            .drop_password
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected password transport failure");
+        }
         Ok(if user == "pilot+character" && password == "secret" {
             server::Auth::Accept
         } else {
@@ -178,6 +185,16 @@ async fn fixture(
     mpsc::UnboundedReceiver<Seen>,
     tokio::task::JoinHandle<()>,
 ) {
+    fixture_with_password_drop(keys, Arc::new(std::sync::atomic::AtomicBool::new(false))).await
+}
+async fn fixture_with_password_drop(
+    keys: Vec<PrivateKey>,
+    drop_password: Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    u16,
+    mpsc::UnboundedReceiver<Seen>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, seen) = mpsc::unbounded_channel();
@@ -185,7 +202,7 @@ async fn fixture(
         let mut count = 0;
         let mut peers = tokio::task::JoinSet::new();
         loop {
-            tokio::select! {stream=listener.accept()=>{let(stream,_)=stream.unwrap();let config=Arc::new(server::Config{keys:vec![keys[count.min(keys.len()-1)].clone()],auth_rejection_time:Duration::ZERO,..Default::default()});count+=1;let seen=tx.clone();peers.spawn(async move{if let Ok(running)=server::run_stream(config,stream,Peer{seen}).await{let _=running.await;}});},_=peers.join_next(),if !peers.is_empty()=>{}}
+            tokio::select! {stream=listener.accept()=>{let(stream,_)=stream.unwrap();let config=Arc::new(server::Config{keys:vec![keys[count.min(keys.len()-1)].clone()],auth_rejection_time:Duration::ZERO,..Default::default()});count+=1;let seen=tx.clone();let drop_password=drop_password.clone();peers.spawn(async move{if let Ok(running)=server::run_stream(config,stream,Peer{seen,drop_password}).await{let _=running.await;}});},_=peers.join_next(),if !peers.is_empty()=>{}}
         }
     });
     (port, seen, task)
@@ -384,5 +401,39 @@ async fn revoked_key_fails_before_prompt_or_auth_even_with_an_explicit_pin() {
     }
     assert!(seen.try_recv().is_err());
     assert_eq!(std::fs::read_to_string(path).unwrap(), record);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn password_transport_failure_reuses_the_candidate_without_a_second_prompt() {
+    let key = key();
+    let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (port, mut seen, server) = fixture_with_password_drop(
+        vec![key],
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    )
+    .await;
+    let prompts = Prompts::default();
+    let mut client = start(
+        options(port, Authentication::Password, Some(pin)),
+        prompts.clone(),
+    );
+    let question = prompt(&prompts).await;
+    prompts
+        .answer(
+            question.id,
+            Answer::Authentication(vec![zeroize::Zeroizing::new("secret".into())]),
+        )
+        .unwrap();
+    connected(&mut client, 1).await;
+    assert!(prompts.current().is_none());
+    let mut attempts = 0;
+    while let Ok(event) = seen.try_recv() {
+        if event == Seen::Password {
+            attempts += 1;
+        }
+    }
+    assert_eq!(attempts, 2);
+    client.task.abort();
     server.abort();
 }

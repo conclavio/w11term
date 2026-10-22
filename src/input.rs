@@ -26,6 +26,7 @@ struct State {
     shortcut: Box<dyn Fn(Shortcut)>,
     swallowed: HashSet<u32>,
     pressed: HashMap<u32, KeyCode>,
+    details: HashMap<u32, w11term::terminal::KeyDetails>,
     surrogate: Option<u16>,
     preferences: Interaction,
     selection: bool,
@@ -113,6 +114,7 @@ impl KeyboardBridge {
                 shortcut: Box::new(shortcut),
                 swallowed: HashSet::new(),
                 pressed: HashMap::new(),
+                details: HashMap::new(),
                 surrogate: None,
                 preferences: Interaction::default(),
                 selection: false,
@@ -196,6 +198,7 @@ impl KeyboardBridge {
         INPUT.with(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.pressed.clear();
+                s.details.clear();
                 s.surrogate = None;
             }
         });
@@ -484,20 +487,73 @@ pub fn modifiers() -> KeyModifiers {
     mods
 }
 
+fn emit_key(
+    sender: &mpsc::UnboundedSender<Command>,
+    key: KeyCode,
+    details: Option<&w11term::terminal::KeyDetails>,
+    modifiers: KeyModifiers,
+    down: bool,
+    repeat: bool,
+) {
+    let command = if let Some(details) = details {
+        Command::DetailedKey {
+            key,
+            details: details.clone(),
+            modifiers,
+            down,
+            repeat,
+        }
+    } else {
+        Command::Key {
+            key,
+            modifiers,
+            down,
+            repeat,
+        }
+    };
+    let _ = sender.send(command);
+}
+fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
+    for modifier in [VK_SHIFT, VK_LSHIFT, VK_RSHIFT] {
+        keyboard[modifier.0 as usize] = 0;
+    }
+    keyboard[VK_CAPITAL.0 as usize] = 0;
+    let mut result = [0u16; 8];
+    let count = unsafe {
+        ToUnicodeEx(
+            vk,
+            scan,
+            &keyboard,
+            &mut result,
+            4,
+            Some(GetKeyboardLayout(0)),
+        )
+    };
+    if count <= 0 {
+        return None;
+    }
+    let text = String::from_utf16_lossy(&result[..count as usize]);
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    (chars.next().is_none() && !first.is_control()).then_some(first)
+}
 impl State {
     fn release_keys(&mut self) {
         if let Some(target) = &self.target {
-            for (_, key) in self.pressed.drain() {
-                let _ = target.sender.send(Command::Key {
+            for (vk, key) in self.pressed.drain() {
+                emit_key(
+                    &target.sender,
                     key,
-                    modifiers: KeyModifiers::NONE,
-                    down: false,
-                    repeat: false,
-                });
+                    self.details.get(&vk),
+                    KeyModifiers::NONE,
+                    false,
+                    false,
+                );
             }
         } else {
             self.pressed.clear();
         }
+        self.details.clear();
         self.surrogate = None;
     }
 
@@ -706,16 +762,18 @@ impl State {
                     if let Some(key) = self.pressed.get(&vk)
                         && !self.game_mode
                     {
-                        let _ = sender.send(Command::Key {
-                            key: *key,
-                            modifiers: mods,
-                            down: true,
-                            repeat: true,
-                        });
+                        emit_key(sender, *key, self.details.get(&vk), mods, true, true);
                     }
                     return true;
                 }
-                let key = special_key(vk).or_else(|| {
+                let mut details = None;
+                let native_vk = match vk {
+                    0x10 if (message.lParam.0 >> 16) & 0xff == 0x36 => 0xa1,
+                    0x11 if message.lParam.0 & (1 << 24) != 0 => 0xa3,
+                    0x12 if message.lParam.0 & (1 << 24) != 0 => 0xa5,
+                    _ => vk,
+                };
+                let key = special_key(native_vk).or_else(|| {
                     let mut keyboard = [0u8; 256];
                     unsafe {
                         GetKeyboardState(&mut keyboard).ok()?;
@@ -736,6 +794,8 @@ impl State {
                             keyboard[index.0 as usize] = 0;
                         }
                     }
+                    let scan = ((message.lParam.0 >> 16) & 0xff) as u32;
+                    let base = (!altgr).then(|| unshifted(vk, scan, keyboard)).flatten();
                     let mut translated = [0u16; 8];
                     // This adapter consumes the keydown, so it owns dead-key translation.
                     let count = unsafe {
@@ -754,22 +814,20 @@ impl State {
                     let text = String::from_utf16_lossy(&translated[..count as usize]);
                     let mut chars = text.chars();
                     let first = chars.next()?;
-                    if chars.next().is_some() {
-                        let _ = sender.send(Command::Text(text));
-                        None
-                    } else {
-                        Some(KeyCode::Char(first))
-                    }
+                    let composed = chars.next().is_some();
+                    details = Some(w11term::terminal::KeyDetails {
+                        base,
+                        text: composed.then_some(text),
+                    });
+                    Some(KeyCode::Char(first))
                 });
                 if let Some(key) = key {
                     (self.shortcut)(Shortcut::ClearSelection);
                     self.pressed.insert(vk, key);
-                    let _ = sender.send(Command::Key {
-                        key,
-                        modifiers: mods,
-                        down: true,
-                        repeat: false,
-                    });
+                    if let Some(details) = details {
+                        self.details.insert(vk, details);
+                    }
+                    emit_key(sender, key, self.details.get(&vk), mods, true, false);
                     true
                 } else {
                     // Modifiers/dead keys must not trigger WinUI keyboard navigation.
@@ -778,12 +836,8 @@ impl State {
             }
             WM_KEYUP | WM_SYSKEYUP => {
                 if let Some(key) = self.pressed.remove(&vk) {
-                    let _ = sender.send(Command::Key {
-                        key,
-                        modifiers: mods,
-                        down: false,
-                        repeat: false,
-                    });
+                    let details = self.details.remove(&vk);
+                    emit_key(sender, key, details.as_ref(), mods, false, false);
                     return true;
                 }
                 false
@@ -848,6 +902,9 @@ impl State {
         true
     }
 }
+pub fn cell_pixel_offset(coordinate: f32, cell: f32, scale: f32) -> isize {
+    ((coordinate.max(0.0) % cell.max(1.0)) * scale).round() as isize
+}
 fn wheel_steps(remainder: &mut i32, delta: i16) -> i32 {
     *remainder += delta as i32;
     let steps = *remainder / 120;
@@ -861,6 +918,16 @@ fn special_key(vk: u32) -> Option<KeyCode> {
         0x09 => KeyCode::Char('\t'),
         0x0d => KeyCode::Char('\r'),
         0x1b => KeyCode::Char('\u{1b}'),
+        0x10 | 0xa0 => KeyCode::LeftShift,
+        0xa1 => KeyCode::RightShift,
+        0x11 | 0xa2 => KeyCode::LeftControl,
+        0xa3 => KeyCode::RightControl,
+        0x12 | 0xa4 => KeyCode::LeftAlt,
+        0xa5 => KeyCode::RightAlt,
+        0x5b => KeyCode::LeftWindows,
+        0x5c => KeyCode::RightWindows,
+        0x14 => KeyCode::CapsLock,
+        0x90 => KeyCode::NumLock,
         0x20 => KeyCode::Char(' '),
         0x21 => KeyCode::PageUp,
         0x22 => KeyCode::PageDown,
@@ -881,6 +948,13 @@ fn special_key(vk: u32) -> Option<KeyCode> {
 mod tests {
     use super::*;
     use w11term::{options::Source, session::Session};
+    #[test]
+    fn sgr_pixel_offsets_use_physical_pixels_at_non_default_dpi() {
+        assert_eq!(cell_pixel_offset(13.0, 10.0, 1.0), 3);
+        assert_eq!(cell_pixel_offset(13.0, 10.0, 1.5), 5);
+        assert_eq!(cell_pixel_offset(13.0, 10.0, 2.0), 6);
+        assert_eq!(cell_pixel_offset(-1.0, 10.0, 2.0), 0);
+    }
     #[test]
     fn win32_delete_is_a_functional_key() {
         assert_eq!(special_key(0x2e), Some(KeyCode::Delete));
@@ -918,6 +992,7 @@ mod tests {
             shortcut: Box::new(|_| {}),
             swallowed: HashSet::new(),
             pressed: HashMap::from([(0x58, KeyCode::Char('x'))]),
+            details: HashMap::new(),
             surrogate: Some(0xd800),
             preferences: Interaction::default(),
             selection: false,

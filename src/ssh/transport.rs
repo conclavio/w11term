@@ -190,14 +190,24 @@ async fn authenticate(
                     );
                     values.remove(0)
                 };
-                if session
+                match session
                     .authenticate_password(&options.user, candidate.as_str())
-                    .await?
-                    .success()
+                    .await
                 {
-                    *password = Some(candidate);
-                    accepted = true;
-                    break;
+                    Ok(result) if result.success() => {
+                        *password = Some(candidate);
+                        accepted = true;
+                        break;
+                    }
+                    Ok(_) if session.is_closed() => {
+                        *password = Some(candidate);
+                        anyhow::bail!("SSH transport closed during password authentication");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        *password = Some(candidate);
+                        return Err(error.into());
+                    }
                 }
             }
             ensure!(
@@ -439,7 +449,7 @@ async fn run_channel(
             },
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
-                Some(russh::ChannelMsg::Success)=>{pending=pending.saturating_sub(1);if pending==0{events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
+                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or shell request ({pending} outstanding)"))),
                 Some(russh::ChannelMsg::ExitStatus{exit_status})=>{output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;session.disconnect(russh::Disconnect::ByApplication,"Remote process exited","en").await?;return Ok(());},
                 Some(russh::ChannelMsg::Close)=>{session.disconnect(russh::Disconnect::ByApplication,"Remote channel closed","en").await?;return Ok(());},None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}

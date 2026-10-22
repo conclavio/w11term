@@ -31,6 +31,13 @@ pub enum Command {
         down: bool,
         repeat: bool,
     },
+    DetailedKey {
+        key: KeyCode,
+        details: terminal::KeyDetails,
+        modifiers: KeyModifiers,
+        down: bool,
+        repeat: bool,
+    },
     Paste(String),
     Text(String),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
@@ -311,7 +318,7 @@ async fn run(
                 presentation.dirty=true;
             }
             command = commands.recv() => {
-                let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::Paste(_) | Command::Text(_) | Command::ReloadDemo));
+                let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::ReloadDemo));
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
@@ -348,6 +355,11 @@ async fn run(
                         scroll_offset = 0;
                         if is_demo && down { demo_key(&mut terminal, key, modifiers); Ok(()) }
                         else { terminal::send_key_event(&mut terminal, &writer, key, modifiers, down,repeat) }
+                    }
+                    Some(Command::DetailedKey {key,details,modifiers,down,repeat}) => {
+                        scroll_offset=0;
+                        if is_demo && down { if let Some(text)=details.text { presentation.advance(&mut terminal,text,scroll_offset,&status,total_bytes); } else { demo_key(&mut terminal,key,modifiers); } Ok(()) }
+                        else { terminal::send_key_event_detailed(&mut terminal,&writer,key,modifiers,down,repeat,&details) }
                     }
                     Some(Command::Paste(text)) => {
                         scroll_offset = 0;

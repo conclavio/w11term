@@ -711,10 +711,16 @@ impl TerminalApp {
                 kind,
                 x,
                 y: y as i64,
-                x_pixel_offset: ((pointer.x as f32 - PADDING).max(0.0) % metrics.cell_width)
-                    as isize,
-                y_pixel_offset: ((pointer.y as f32 - PADDING).max(0.0) % metrics.cell_height)
-                    as isize,
+                x_pixel_offset: crate::input::cell_pixel_offset(
+                    pointer.x as f32 - PADDING,
+                    metrics.cell_width,
+                    metrics.scale,
+                ),
+                y_pixel_offset: crate::input::cell_pixel_offset(
+                    pointer.y as f32 - PADDING,
+                    metrics.cell_height,
+                    metrics.scale,
+                ),
                 button,
                 modifiers,
             }));
@@ -2634,10 +2640,13 @@ impl Component for TerminalApp {
                 if self.initial_grid.epoch() == epoch {
                     self.client_size = (width, height);
                     if first {
-                        context.spawn_background(move |_| {
-                            std::thread::sleep(Duration::from_millis(300));
-                            Message::GridFallback(epoch)
-                        });
+                        context.spawn_background_with_rejection(
+                            move |_| {
+                                std::thread::sleep(Duration::from_millis(300));
+                                Message::GridFallback(epoch)
+                            },
+                            Message::GridFallback(epoch),
+                        );
                     }
                 }
             }
