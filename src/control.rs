@@ -12,10 +12,12 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions},
+    net::windows::named_pipe::{ClientOptions, NamedPipeServer},
     sync::{mpsc, oneshot},
 };
 use wezterm_term::TerminalSize;
+mod security;
+use security::PipeSecurity;
 
 pub const VERSION: u32 = 1;
 pub const MAX_BYTES: usize = 1024 * 1024;
@@ -451,7 +453,7 @@ impl Server {
         let worker = std::thread::Builder::new().name("terminal-control".into()).spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
             runtime.block_on(async move {
-                let security = match PipeSecurity::new() { Ok(s)=>s, Err(e)=>{let _=ready_tx.send(Err(e)); return;} };
+                let security = match PipeSecurity::new() { Ok(s)=>Arc::new(s), Err(e)=>{let _=ready_tx.send(Err(e)); return;} };
                 let name = pipe_name(pid);
                 let mut listener = match security.create(&name, true) {Ok(p)=>p,Err(e)=>{let _=ready_tx.send(Err(e));return;}};
                 let _ = ready_tx.send(Ok(()));
@@ -466,8 +468,8 @@ impl Server {
                             let client = std::mem::replace(&mut listener, next);
                             if let Ok(permit) = permits.clone().try_acquire_owned() {
                                 let registry = registry.clone();
-                                let capture_png=capture_png.clone();
-                                tokio::spawn(async move { let _permit=permit; let _=serve(client, registry, capture_png).await; });
+                                let capture_png=capture_png.clone(); let security=security.clone();
+                                tokio::spawn(async move { let _permit=permit; let _=serve(client, registry, capture_png, security).await; });
                             }
                         }
                     }
@@ -503,12 +505,19 @@ impl Drop for Server {
     }
 }
 
-async fn serve(pipe: NamedPipeServer, registry: Registry, capture_png: CapturePng) -> Result<()> {
-    let (read, mut write) = tokio::io::split(pipe);
-    let mut read = BufReader::new(read).take((MAX_LINE + 1) as u64);
+async fn serve(
+    mut pipe: NamedPipeServer,
+    registry: Registry,
+    capture_png: CapturePng,
+    security: Arc<PipeSecurity>,
+) -> Result<()> {
+    let mut read = BufReader::new(&mut pipe).take((MAX_LINE + 1) as u64);
     let mut line = Vec::new();
     tokio::time::timeout(TIMEOUT, read.read_until(b'\n', &mut line)).await??;
-    let result = if line.len() > MAX_LINE {
+    drop(read);
+    let result = if let Err(error) = security.authorize(&pipe) {
+        Err(error)
+    } else if line.len() > MAX_LINE {
         Err(anyhow::anyhow!("request exceeds 2 MiB"))
     } else if !line.ends_with(b"\n") {
         Err(anyhow::anyhow!("request must end with newline"))
@@ -520,15 +529,21 @@ async fn serve(pipe: NamedPipeServer, registry: Registry, capture_png: CapturePn
     };
     let mut bytes = serde_json::to_vec(&Reply::from_result(result))?;
     bytes.push(b'\n');
-    tokio::time::timeout(TIMEOUT, write.write_all(&bytes)).await??;
+    tokio::time::timeout(TIMEOUT, pipe.write_all(&bytes)).await??;
     Ok(())
 }
 
 async fn connect(pid: u32) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
     let start = std::time::Instant::now();
     loop {
-        match ClientOptions::new().open(pipe_name(pid)) {
-            Ok(pipe) => return Ok(pipe),
+        match ClientOptions::new()
+            .security_qos_flags(windows::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION.0)
+            .open(pipe_name(pid))
+        {
+            Ok(pipe) => {
+                security::verify_server(&pipe, pid)?;
+                return Ok(pipe);
+            }
             Err(e) if e.raw_os_error() == Some(231) && start.elapsed() < Duration::from_secs(2) => {
                 tokio::time::sleep(Duration::from_millis(20)).await
             }
@@ -621,87 +636,4 @@ pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
         "unsupported control protocol version"
     );
     Ok(reply)
-}
-
-// The pipe grants access to the process user and SYSTEM, and rejects remote clients.
-// The descriptor is kept alive through each synchronous CreateNamedPipe call.
-struct PipeSecurity(windows::Win32::Security::PSECURITY_DESCRIPTOR);
-unsafe impl Send for PipeSecurity {}
-unsafe impl Sync for PipeSecurity {}
-impl PipeSecurity {
-    fn new() -> Result<Self> {
-        use windows::{
-            Win32::{
-                Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
-                Security::{
-                    Authorization::{
-                        ConvertSidToStringSidW,
-                        ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                    },
-                    GetTokenInformation, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
-                },
-                System::Threading::{GetCurrentProcess, OpenProcessToken},
-            },
-            core::{PCWSTR, PWSTR},
-        };
-        unsafe {
-            let mut token = HANDLE::default();
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
-            let mut length = 0;
-            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut length);
-            let mut buffer = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
-            let result = GetTokenInformation(
-                token,
-                TokenUser,
-                Some(buffer.as_mut_ptr().cast()),
-                length,
-                &mut length,
-            );
-            let _ = CloseHandle(token);
-            result?;
-            let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
-            let mut sid = PWSTR::null();
-            ConvertSidToStringSidW(user.User.Sid, &mut sid)?;
-            let sid_text = sid.to_string();
-            LocalFree(Some(HLOCAL(sid.0.cast())));
-            let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;{})", sid_text?)
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            let mut descriptor = PSECURITY_DESCRIPTOR::default();
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(sddl.as_ptr()),
-                1,
-                &mut descriptor,
-                None,
-            )?;
-            Ok(Self(descriptor))
-        }
-    }
-    fn create(&self, name: &str, first: bool) -> Result<NamedPipeServer> {
-        let mut attributes = windows::Win32::Security::SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: self.0.0,
-            bInheritHandle: false.into(),
-        };
-        // SAFETY: attributes/descriptor remain valid throughout the synchronous call.
-        Ok(unsafe {
-            ServerOptions::new()
-                .first_pipe_instance(first)
-                .reject_remote_clients(true)
-                .create_with_security_attributes_raw(
-                    name,
-                    (&mut attributes as *mut windows::Win32::Security::SECURITY_ATTRIBUTES).cast(),
-                )?
-        })
-    }
-}
-impl Drop for PipeSecurity {
-    fn drop(&mut self) {
-        unsafe {
-            windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
-                self.0.0,
-            )));
-        }
-    }
 }
