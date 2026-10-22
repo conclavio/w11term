@@ -1,4 +1,5 @@
 //! The terminal engine is independent of Reactor, rendering, and SSH.
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -265,11 +266,19 @@ pub struct Snapshot {
     pub search: Option<crate::search::SearchSnapshot>,
     pub prompt: Option<crate::prompts::Prompt>,
     pub connection_generation: u64,
+    pub size: TerminalSize,
+    images: HashMap<usize, FrozenImage>,
+}
+
+#[derive(Clone, Debug)]
+struct FrozenImage {
+    hash: [u8; 32],
+    data: Arc<wezterm_term::image::ImageDataType>,
 }
 
 impl Snapshot {
     pub fn capture(
-        terminal: &Terminal,
+        terminal: &wezterm_term::TerminalState,
         previous: Option<&Self>,
         generation: u64,
         scroll_offset: usize,
@@ -286,7 +295,7 @@ impl Snapshot {
         let first_stable_row = screen.phys_to_stable_row_index(start);
         let alternate = terminal.is_alt_screen_active();
         let lines = screen.lines_in_phys_range(start..start + screen.physical_rows);
-        let rows = lines
+        let rows: Vec<Arc<Line>> = lines
             .into_iter()
             .enumerate()
             .map(|(index, line)| {
@@ -306,6 +315,53 @@ impl Snapshot {
                 Arc::new(line)
             })
             .collect();
+        let mut images = HashMap::new();
+        for line in &rows {
+            for cell in line.visible_cells() {
+                for tile in cell.attrs().images().into_iter().flatten() {
+                    let source = tile.image_data();
+                    let identity = Arc::as_ptr(source) as usize;
+                    if images.contains_key(&identity) {
+                        continue;
+                    }
+                    let guard = source.data();
+                    use wezterm_term::image::ImageDataType;
+                    let hash = match &*guard {
+                        ImageDataType::Rgba8 { hash, .. } => *hash,
+                        ImageDataType::AnimRgba8 { hashes, .. } if !hashes.is_empty() => hashes[0],
+                        _ => source.hash(),
+                    };
+                    let frozen = previous
+                        .and_then(|old| old.images.get(&identity))
+                        .filter(|old| old.hash == hash)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            let data = match &*guard {
+                                ImageDataType::AnimRgba8 {
+                                    width,
+                                    height,
+                                    frames,
+                                    hashes,
+                                    ..
+                                } if !frames.is_empty() && !hashes.is_empty() => {
+                                    ImageDataType::Rgba8 {
+                                        width: *width,
+                                        height: *height,
+                                        data: frames[0].clone(),
+                                        hash: hashes[0],
+                                    }
+                                }
+                                data => data.clone(),
+                            };
+                            FrozenImage {
+                                hash,
+                                data: Arc::new(data),
+                            }
+                        });
+                    images.insert(identity, frozen);
+                }
+            }
+        }
         let cursor = terminal.cursor_pos();
         Self {
             generation,
@@ -325,7 +381,55 @@ impl Snapshot {
             search: None,
             prompt: None,
             connection_generation: 0,
+            size: terminal.get_size(),
+            images,
         }
+    }
+
+    /// Pixels referenced by a presentation never change underneath the renderer.
+    pub fn image_data(
+        &self,
+        source: &Arc<wezterm_term::image::ImageData>,
+    ) -> &wezterm_term::image::ImageDataType {
+        &self.images[&(Arc::as_ptr(source) as usize)].data
+    }
+
+    pub fn same_presentation(&self, old: &Self) -> bool {
+        self.size == old.size
+            && self.first_stable_row == old.first_stable_row
+            && self.scroll_offset == old.scroll_offset
+            && self.alternate == old.alternate
+            && self.cursor_visible == old.cursor_visible
+            && self.mouse_grabbed == old.mouse_grabbed
+            && (
+                self.cursor.x,
+                self.cursor.y,
+                self.cursor.shape,
+                self.cursor.visibility,
+            ) == (
+                old.cursor.x,
+                old.cursor.y,
+                old.cursor.shape,
+                old.cursor.visibility,
+            )
+            && self.palette == old.palette
+            && self.title == old.title
+            && self.status == old.status
+            && self.bytes_received / 1024 == old.bytes_received / 1024
+            && self.connection_generation == old.connection_generation
+            && self.prompt.as_ref().map(|p| p.id) == old.prompt.as_ref().map(|p| p.id)
+            && self.search == old.search
+            && self.rows.len() == old.rows.len()
+            && self
+                .rows
+                .iter()
+                .zip(&old.rows)
+                .all(|(a, b)| Arc::ptr_eq(a, b) || a == b)
+            && self.images.len() == old.images.len()
+            && self
+                .images
+                .iter()
+                .all(|(id, image)| old.images.get(id).is_some_and(|old| old.hash == image.hash))
     }
 }
 
@@ -394,6 +498,23 @@ pub fn colors(attrs: &CellAttributes, palette: &ColorPalette) -> (Rgba, Rgba) {
 mod tests {
     use super::*;
     use wezterm_term::{KeyCode, KeyModifiers};
+    #[test]
+    fn synchronized_output_queries_and_resets_follow_parser_state() {
+        let (mut t, mut rx) = engine();
+        for byte in b"\x1b[?2026h" {
+            t.advance_bytes([*byte]);
+        }
+        assert!(t.synchronized_output());
+        t.advance_bytes(b"\x1b[?2026$p");
+        assert_eq!(receive(&mut rx), b"\x1b[?2026;1$y");
+        t.advance_bytes(b"\x1b[?2026l\x1b[?2026$p");
+        assert_eq!(receive(&mut rx), b"\x1b[?2026;2$y");
+        t.advance_bytes(b"\x1b[?2026h\x1bc");
+        assert!(!t.synchronized_output());
+        t.advance_bytes(b"\x1b[?2026h");
+        t.reset_connection();
+        assert!(!t.synchronized_output());
+    }
     #[test]
     fn wheel_scrolls_history_reports_mouse_and_leaves_alternate_history_to_the_app() {
         let (mut terminal, mut replies) = engine();

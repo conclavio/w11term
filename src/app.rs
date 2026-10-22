@@ -148,6 +148,7 @@ pub struct TerminalApp {
     renderer: Rc<RefCell<Renderer>>,
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
+    header: RefCell<Option<View>>,
     frame_task: Option<ComponentTask>,
     watch_epoch: u64,
     default_source: Source,
@@ -1283,17 +1284,124 @@ impl TerminalApp {
         }
     }
 
+    fn header_view(&self, context: &ViewContext<Self>) -> View {
+        let tab_strip = TabView::new()
+            .height(44.0)
+            .width(
+                (self.tabs.entries().len() as f64 * 110.0 + 16.0)
+                    .min((self.width - 300.0).max(160.0)),
+            )
+            .is_add_tab_button_visible(false)
+            .can_reorder_tabs(true)
+            .selected_index(if self.selection_pending {
+                None
+            } else {
+                self.tabs.active_index()
+            })
+            .on_selection_changed({
+                let epoch = self.selection_epoch;
+                let pending = self.selection_pending;
+                context.callback(move |index| Message::Select(index, epoch, pending))
+            })
+            .on_close_requested(context.callback(Message::CloseTab))
+            .on_reordered({
+                let selected = self.tabs.active_id();
+                context.callback(move |order| Message::Reorder(order, selected))
+            })
+            .collection_slot(
+                TabViewSlot::TabItems,
+                self.tabs.entries().iter().map(|tab| {
+                    KeyedView::new(
+                        tab.id.to_string(),
+                        TabViewItem::new()
+                            .header(&tab.value.label)
+                            .tag(tab.id.to_string())
+                            .is_closable(true),
+                    )
+                }),
+            );
+        let mut menu: Vec<_> = self
+            .profiles
+            .iter()
+            .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
+            .collect();
+        if self.profile_error.is_some() {
+            menu.push(MenuItem::disabled("error", "Could not load profiles"));
+        }
+        menu.extend([
+            MenuItem::separator("profiles-end"),
+            MenuItem::item("new-profile", NEW_PROFILE),
+            MenuItem::item("lab", LAB),
+        ]);
+        let plus = Button::new()
+            .style(ButtonStyle::Subtle)
+            .width(40.0)
+            .height(36.0)
+            .automation_name("New tab")
+            .content(TextBlock::new().text("+").font_size(22.0))
+            // Reactor 0.100 cannot currently nest a Menu owner under a Tooltip wrapper.
+            .menu(Menu::new(menu, context.callback(Message::ProfileMenu)));
+        let caret = Button::new()
+            .style(ButtonStyle::Subtle)
+            .width(44.0)
+            .height(36.0)
+            .automation_name("Tab menu")
+            .content(FontIcon::new().glyph("\u{e70d}"))
+            .menu(Menu::new(
+                [
+                    MenuItem::item("paste", "Paste"),
+                    MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
+                    MenuItem::separator("paste-end"),
+                    MenuItem::item("settings", "Settings"),
+                    MenuItem::item("fullscreen", "Toggle fullscreen (F11)"),
+                    MenuItem::item("mute", "Toggle profile mute"),
+                    MenuItem::item("game-mode", "Toggle game mode (suppress key repeat)"),
+                    MenuItem::item("enroll", "Enroll this device (at game prompt)"),
+                    MenuItem::item("forget-device", "Forget this device (revoke game key)"),
+                ],
+                context.callback(|item: String| match item.as_str() {
+                    "Paste" => Message::Paste,
+                    "Paste raw (no bracketed paste)" => Message::PasteRaw,
+                    "Toggle fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
+                    "Toggle profile mute" => Message::TogglePlayer("mute".into()),
+                    "Toggle game mode (suppress key repeat)" => {
+                        Message::TogglePlayer("game_mode".into())
+                    }
+                    "Enroll this device (at game prompt)" => Message::DeviceAction(false),
+                    "Forget this device (revoke game key)" => Message::DeviceAction(true),
+                    _ => Message::SettingsMenu,
+                }),
+            ));
+        TitleBar::new()
+            .preferred_height(WindowTitleBarHeight::Tall)
+            .slot(
+                TitleBarSlot::Content,
+                Grid::new()
+                    // TitleBar centers its Content by default. Occupy its available width so
+                    // tabs start at the left rather than sitting in the middle of the caption.
+                    .width((self.width - 180.0).max(400.0))
+                    .columns([
+                        GridLength::Auto,
+                        GridLength::Auto,
+                        GridLength::Auto,
+                        GridLength::STAR,
+                    ])
+                    .children((
+                        tab_strip,
+                        Border::new().grid_column(1).content(plus),
+                        Border::new().grid_column(2).content(caret),
+                    )),
+            )
+    }
+
     fn terminal_view(&self, id: TabId, tab: &LiveTab, context: &ViewContext<Self>) -> View {
         if let Some(error) = &tab.error {
-            return StackPanel::new()
-                .spacing(12.0)
-                .children((
-                    TextBlock::new().text(format!("Unable to render terminal: {error}")),
-                    Button::new()
-                        .on_click(context.callback(move |_| Message::RetryRender(id)))
-                        .content(TextBlock::new().text("Retry rendering")),
-                ))
-                .into();
+            return StackPanel::new().spacing(12.0).children((
+                TextBlock::new().text(format!("Unable to render terminal: {error}")),
+                Button::new()
+                    .on_click(context.callback(move |_| Message::RetryRender(id)))
+                    .content(TextBlock::new().text("Retry rendering")),
+            ));
         }
         let renderer = self.renderer.clone();
         let frames = tab.session.frames.clone();
@@ -1677,6 +1785,7 @@ impl Component for TerminalApp {
             renderer: Rc::new(RefCell::new(renderer)),
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
+            header: RefCell::new(None),
             frame_task: None,
             watch_epoch: 0,
             default_source: options.source.clone(),
@@ -1721,6 +1830,9 @@ impl Component for TerminalApp {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        if !matches!(&message, Message::FrameReady(..)) {
+            self.header.borrow_mut().take();
+        }
         if matches!(&message, Message::Control(_)) {
             self.watch_control(context);
         }
@@ -2588,113 +2700,12 @@ impl Component for TerminalApp {
                 }),
         );
         context.on_window_size(context.callback(Message::WindowSize));
-        let tab_strip = TabView::new()
-            .height(44.0)
-            .width(
-                (self.tabs.entries().len() as f64 * 110.0 + 16.0)
-                    .min((self.width - 300.0).max(160.0)),
-            )
-            .is_add_tab_button_visible(false)
-            .can_reorder_tabs(true)
-            .selected_index(if self.selection_pending {
-                None
-            } else {
-                self.tabs.active_index()
-            })
-            .on_selection_changed({
-                let epoch = self.selection_epoch;
-                let pending = self.selection_pending;
-                context.callback(move |index| Message::Select(index, epoch, pending))
-            })
-            .on_close_requested(context.callback(Message::CloseTab))
-            .on_reordered({
-                let selected = self.tabs.active_id();
-                context.callback(move |order| Message::Reorder(order, selected))
-            })
-            .collection_slot(
-                TabViewSlot::TabItems,
-                self.tabs.entries().iter().map(|tab| {
-                    KeyedView::new(
-                        tab.id.to_string(),
-                        TabViewItem::new()
-                            .header(&tab.value.label)
-                            .tag(tab.id.to_string())
-                            .is_closable(true),
-                    )
-                }),
-            );
-        let mut menu: Vec<_> = self
-            .profiles
-            .iter()
-            .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
-            .collect();
-        if self.profile_error.is_some() {
-            menu.push(MenuItem::disabled("error", "Could not load profiles"));
-        }
-        menu.extend([
-            MenuItem::separator("profiles-end"),
-            MenuItem::item("new-profile", NEW_PROFILE),
-            MenuItem::item("lab", LAB),
-        ]);
-        let plus = Button::new()
-            .style(ButtonStyle::Subtle)
-            .width(40.0)
-            .height(36.0)
-            .automation_name("New tab")
-            .content(TextBlock::new().text("+").font_size(22.0))
-            // Reactor 0.100 cannot currently nest a Menu owner under a Tooltip wrapper.
-            .menu(Menu::new(menu, context.callback(Message::ProfileMenu)));
-        let caret = Button::new()
-            .style(ButtonStyle::Subtle)
-            .width(44.0)
-            .height(36.0)
-            .automation_name("Tab menu")
-            .content(FontIcon::new().glyph("\u{e70d}"))
-            .menu(Menu::new(
-                [
-                    MenuItem::item("paste", "Paste"),
-                    MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
-                    MenuItem::separator("paste-end"),
-                    MenuItem::item("settings", "Settings"),
-                    MenuItem::item("fullscreen", "Toggle fullscreen (F11)"),
-                    MenuItem::item("mute", "Toggle profile mute"),
-                    MenuItem::item("game-mode", "Toggle game mode (suppress key repeat)"),
-                    MenuItem::item("enroll", "Enroll this device (at game prompt)"),
-                    MenuItem::item("forget-device", "Forget this device (revoke game key)"),
-                ],
-                context.callback(|item: String| match item.as_str() {
-                    "Paste" => Message::Paste,
-                    "Paste raw (no bracketed paste)" => Message::PasteRaw,
-                    "Toggle fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
-                    "Toggle profile mute" => Message::TogglePlayer("mute".into()),
-                    "Toggle game mode (suppress key repeat)" => {
-                        Message::TogglePlayer("game_mode".into())
-                    }
-                    "Enroll this device (at game prompt)" => Message::DeviceAction(false),
-                    "Forget this device (revoke game key)" => Message::DeviceAction(true),
-                    _ => Message::SettingsMenu,
-                }),
-            ));
-        let header = TitleBar::new()
-            .preferred_height(WindowTitleBarHeight::Tall)
-            .slot(
-                TitleBarSlot::Content,
-                Grid::new()
-                    // TitleBar centers its Content by default. Occupy its available width so
-                    // tabs start at the left rather than sitting in the middle of the caption.
-                    .width((self.width - 180.0).max(400.0))
-                    .columns([
-                        GridLength::Auto,
-                        GridLength::Auto,
-                        GridLength::Auto,
-                        GridLength::STAR,
-                    ])
-                    .children((
-                        tab_strip,
-                        Border::new().grid_column(1).content(plus),
-                        Border::new().grid_column(2).content(caret),
-                    )),
-            );
+        let cached_header = self.header.borrow().clone();
+        let header = cached_header.unwrap_or_else(|| {
+            let header = self.header_view(context);
+            *self.header.borrow_mut() = Some(header.clone());
+            header
+        });
         let content = if let Some(id) = self.tabs.active_id() {
             match &self.tabs.get(id).unwrap().page {
                 Page::Terminal(tab) => self.terminal_view(id, tab, context),

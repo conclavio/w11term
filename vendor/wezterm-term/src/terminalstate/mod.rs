@@ -377,6 +377,8 @@ pub struct TerminalState {
     kitty_img: KittyImageState,
     seqno: SequenceNo,
 
+    synchronized_output: bool,
+
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
     unicode_version_stack: Vec<UnicodeVersionStackEntry>,
@@ -599,6 +601,7 @@ impl TerminalState {
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
+            synchronized_output: false,
             seqno,
             unicode_version,
             unicode_version_stack: vec![],
@@ -621,6 +624,15 @@ impl TerminalState {
 
     pub fn current_seqno(&self) -> SequenceNo {
         self.seqno
+    }
+
+    pub fn synchronized_output(&self) -> bool {
+        self.synchronized_output
+    }
+
+    /// Used by the embedding's watchdog; does not block parsing or input.
+    pub fn end_synchronized_output(&mut self) {
+        self.synchronized_output = false;
     }
 
     pub fn increment_seqno(&mut self) {
@@ -1709,19 +1721,17 @@ impl TerminalState {
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )) => {
-                // This is handled in wezterm's mux
+                self.synchronized_output = true;
             }
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )) => {
-                // This is handled in wezterm's mux
+                self.synchronized_output = false;
             }
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )) => {
-                // This is handled in wezterm's mux; if we get here, then it isn't enabled,
-                // so we always report false
-                self.decqrm_response(mode, true, false);
+                self.decqrm_response(mode, true, self.synchronized_output);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SmoothScroll))

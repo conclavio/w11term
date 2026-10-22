@@ -11,6 +11,8 @@ use std::{
 };
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
+mod presentation;
+use presentation::Presentation;
 
 #[derive(Debug)]
 pub enum Command {
@@ -194,6 +196,7 @@ async fn run(
         modifiers: KeyModifiers::NONE,
     };
     let mut demo_loaded = false;
+    let mut replay = None;
     let transport = match source {
         Source::Ssh(options) => {
             status = format!(
@@ -223,7 +226,7 @@ async fn run(
             match std::fs::read(&path) {
                 Ok(bytes) => {
                     total_bytes = bytes.len() as u64;
-                    terminal.advance_bytes(bytes);
+                    replay = Some(bytes);
                     status = format!("Replay · {}", path.display());
                 }
                 Err(error) => status = format!("Replay: {error}"),
@@ -241,7 +244,10 @@ async fn run(
             }))
         }
     };
-    let mut generation = 1;
+    let mut presentation = Presentation::new(frames.clone(), live_frames.clone());
+    if let Some(bytes) = replay {
+        presentation.advance(&mut terminal, bytes, 0, &status, total_bytes);
+    }
     let mut search = crate::search::Search::default();
     let mut search_dirty = false;
     let mut search_refresh = tokio::time::Instant::now();
@@ -249,30 +255,19 @@ async fn run(
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
-        generation += 1;
-        let previous = frames.load();
-        let mut frame = Snapshot::capture(
+        presentation.publish(
             &terminal,
-            Some(&previous),
-            generation,
             scroll_offset,
-            status.clone(),
-            total_bytes,
+            presentation::Metadata {
+                status: &status,
+                bytes: total_bytes,
+                search: &search,
+                prompt: prompts.current(),
+                connection: connection_generation,
+            },
         );
-        frame.search = search.snapshot(frame.first_stable_row, frame.rows.len(), frame.alternate);
-        frame.prompt = prompts.current();
-        frame.connection_generation = connection_generation;
-        if scroll_offset == 0 {
-            live_frames.publish(frame.clone());
-        } else {
-            let mut live =
-                Snapshot::capture(&terminal, None, generation, 0, status.clone(), total_bytes);
-            live.prompt = prompts.current();
-            live.connection_generation = connection_generation;
-            live_frames.publish(live);
-        }
-        frames.publish(frame);
         tokio::select! {
+            _=tokio::time::sleep_until(presentation.deadline.unwrap_or_else(||tokio::time::Instant::now()+std::time::Duration::from_secs(86400))),if presentation.deadline.is_some()=>{presentation.expire(&mut terminal);},
             _=prompts.changed()=>{},
             Some(notice)=notices.recv()=>match notice {
                 crate::sound::Notice::Play(name)=>{if sounds.try_send(name).is_err(){events.push("sound-error",serde_json::json!({"reason":"audio queue full"}));}},
@@ -290,9 +285,12 @@ async fn run(
             _ = tokio::time::sleep_until(search_refresh), if search.open && search_dirty => {
                 search.refresh(&terminal, scroll_offset);
                 search_dirty = false;
+                presentation.dirty=true;
             }
             command = commands.recv() => {
                 let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::Paste(_) | Command::Text(_) | Command::ReloadDemo));
+                let old_offset=scroll_offset;
+                presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
                     Some(Command::Shutdown) | None => break,
                     Some(Command::Observe(reply))=>{let _=reply.send(observed.subscribe());Ok(())},
@@ -320,9 +318,7 @@ async fn run(
                         Ok(())
                     }
                     Some(Command::Capture(reply)) => {
-                        let mut snapshot=Snapshot::capture(&terminal, None, generation, 0, status.clone(), total_bytes);
-                        snapshot.prompt=prompts.current();snapshot.connection_generation=connection_generation;
-                        let _ = reply.send((snapshot, size));
+                        let _ = reply.send(presentation.capture());
                         Ok(())
                     }
                     Some(Command::Key { key, modifiers, down,repeat }) => {
@@ -332,7 +328,7 @@ async fn run(
                     }
                     Some(Command::Paste(text)) => {
                         scroll_offset = 0;
-                        if is_demo { terminal.advance_bytes(text.replace('\n', "\r\n")); Ok(()) } else { terminal.send_paste(&text) }
+                        if is_demo { presentation.advance(&mut terminal,text.replace('\n', "\r\n"),scroll_offset,&status,total_bytes); Ok(()) } else { terminal.send_paste(&text) }
                     }
                     Some(Command::Text(text)) => {
                         scroll_offset = 0;
@@ -345,13 +341,14 @@ async fn run(
                     }
                     Some(Command::Resize(new_size)) => {
                         if size != new_size || (is_demo && !demo_loaded) {
+                            presentation.dirty=true;
                             size = new_size;
                             terminal.resize(size);
                             if !terminal.is_alt_screen_active() {scroll_offset=scroll_offset.min(crate::search::max_offset(&terminal));}
                             if is_demo && !demo_loaded {
                                 let bytes = demo::bytes();
                                 total_bytes += bytes.len() as u64;
-                                terminal.advance_bytes(bytes);
+                                presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes);
                                 demo_loaded = true;
                             }
                             let _ = writer.send(TransportInput::Resize(size));
@@ -377,24 +374,25 @@ async fn run(
                     }
                     Some(Command::Mouse(event)) => { last_mouse = event; terminal.mouse_event(event) },
                     Some(Command::Focus(focused)) => { terminal.focus_changed(focused); Ok(()) }
-                    Some(Command::ReloadDemo) => { if is_demo { terminal.advance_bytes(demo::bytes()); } Ok(()) }
+                    Some(Command::ReloadDemo) => { if is_demo { presentation.advance(&mut terminal,demo::bytes(),scroll_offset,&status,total_bytes); } Ok(()) }
                 };
                 if let Err(error) = result { status = format!("Input: {error:#}"); }
+                presentation.dirty|=scroll_offset!=old_offset;
                 if changes_screen && search.open && !search_dirty {search_dirty=true;search_refresh=tokio::time::Instant::now()+std::time::Duration::from_millis(150);}
             }
             Some(event) = output.recv() => {
                 let anchor = (scroll_offset>0 && !terminal.is_alt_screen_active()).then(||terminal.screen().visible_row_to_stable_row(0)-scroll_offset as isize);
                 match event {
-                    ssh::Event::Data(bytes) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; terminal.advance_bytes(bytes); }
+                    ssh::Event::Data(bytes) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes); }
                     ssh::Event::Status(message) => { log::info!("{message}"); status = message; }
-                    ssh::Event::Connected(generation)=>{if generation>1{terminal.reset_connection();scroll_offset=0;}connection_generation=generation;},
+                    ssh::Event::Connected(generation)=>{if generation>1{terminal.reset_connection();scroll_offset=0;}presentation.dirty=true;connection_generation=generation;},
                 }
                 // Coalesce a bounded amount of already-arrived output per snapshot.
                 for _ in 0..7 {
                     match output.try_recv() {
-                        Ok(ssh::Event::Data(bytes)) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; terminal.advance_bytes(bytes); }
+                        Ok(ssh::Event::Data(bytes)) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes); }
                         Ok(ssh::Event::Status(message)) => status = message,
-                        Ok(ssh::Event::Connected(generation))=>{if generation>1{terminal.reset_connection();scroll_offset=0;}connection_generation=generation;},
+                        Ok(ssh::Event::Connected(generation))=>{if generation>1{terminal.reset_connection();scroll_offset=0;}presentation.dirty=true;connection_generation=generation;},
                         Err(_) => break,
                     }
                 }

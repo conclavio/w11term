@@ -13,7 +13,7 @@ impl Match {
         self.spans[0].0
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchSnapshot {
     pub query: String,
     pub sensitive: bool,

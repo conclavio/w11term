@@ -297,8 +297,8 @@ impl Renderer {
                 if let Some(images) = cell.attrs().images() {
                     for tile in images.iter() {
                         let data = tile.image_data();
-                        let guard = data.data();
-                        live.insert(match &*guard {
+                        let guard = frame.image_data(data);
+                        live.insert(match guard {
                             ImageDataType::Rgba8 { hash, .. } => *hash,
                             ImageDataType::AnimRgba8 { hashes, .. } if !hashes.is_empty() => {
                                 hashes[0]
@@ -512,8 +512,8 @@ impl Renderer {
         tiles.sort_by_key(|(_, _, tile)| tile.z_index());
         for (row, column, tile) in tiles {
             let data = tile.image_data();
-            let guard = data.data();
-            let key = match &*guard {
+            let guard = frame.image_data(data);
+            let key = match guard {
                 ImageDataType::Rgba8 { hash, .. } => *hash,
                 ImageDataType::AnimRgba8 { hashes, .. } if !hashes.is_empty() => hashes[0],
                 _ => data.hash(),
@@ -521,8 +521,8 @@ impl Renderer {
             if !self.images.contains_key(&key) {
                 if self.rejected_images.contains(&key)
                     || self.attempted_images.contains(&key)
-                    || self.images.len() + self.rejected_images.len() + self.attempted_images.len()
-                        >= 512
+                    || self.images.len() + self.rejected_images.len() >= 512
+                    || self.attempted_images.len() >= 512
                 {
                     continue;
                 }
@@ -531,7 +531,7 @@ impl Renderer {
                 {
                     self.image_attempts += 1;
                 }
-                let Some(cached) = self.admit_image(native, &guard, key)? else {
+                let Some(cached) = self.admit_image(native, guard, key)? else {
                     continue;
                 };
                 self.tile_bytes += cached.width as usize * cached.height as usize * 4;
@@ -851,7 +851,9 @@ mod tests {
             target
                 .read_pixels()
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[0] > 100 && p[1] > 100 && p[2] > 100),
             "text still renders"
         );

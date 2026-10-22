@@ -111,6 +111,8 @@ impl server::Handler for Peer {
         self.events.send(Observed::Data(data.to_vec())).unwrap();
         if data == b"x" {
             session.data(channel, b"x".as_slice())?;
+        } else if let Some(bytes) = data.strip_prefix(b"\0sync:") {
+            session.data(channel, bytes.to_vec())?;
         }
         Ok(())
     }
@@ -324,6 +326,35 @@ async fn roundtrip(allow_none: bool) {
             drop(server);
             assert!(control::call(pid, &Request::List).await.is_err());
         }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        session.input.send(Command::Observe(tx)).unwrap();
+        let mut output = rx.await.unwrap();
+        async fn echoed(
+            session: &Session,
+            output: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
+            bytes: &[u8],
+        ) -> w11term::terminal::Snapshot {
+            let mut request = b"\0sync:".to_vec();
+            request.extend(bytes);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            session.input.send(Command::Raw(request, tx)).unwrap();
+            rx.await.unwrap().unwrap();
+            let received = tokio::time::timeout(Duration::from_secs(2), output.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, bytes);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            session.input.send(Command::Capture(tx)).unwrap();
+            rx.await.unwrap().0
+        }
+        let old = echoed(&session, &mut output, b"\x1b[2J\x1b[HOLD").await;
+        let held = echoed(&session, &mut output, b"\x1b[?2026h\rNEW").await;
+        assert_eq!(held.generation, old.generation);
+        assert!(held.rows[0].as_str().starts_with("OLD"));
+        let done = echoed(&session, &mut output, b"\x1b[?2026l").await;
+        assert_eq!(done.generation, old.generation + 1);
+        assert!(done.rows[0].as_str().starts_with("NEW"));
         drop(session);
         tokio::time::timeout(Duration::from_secs(2), server)
             .await

@@ -171,13 +171,32 @@ impl Terminal {
     /// characters; it is valid to feed in chunks of data as they arrive.
     /// The output is parsed and applied to the terminal model.
     pub fn advance_bytes<B: AsRef<[u8]>>(&mut self, bytes: B) {
+        self.advance_bytes_with_sync(bytes, |_, _| {});
+    }
+
+    /// Notify the embedding at parsed synchronized-output boundaries. Text is
+    /// flushed by Performer before a mode action, so this state is complete.
+    pub fn advance_bytes_with_sync<B: AsRef<[u8]>>(
+        &mut self,
+        bytes: B,
+        mut boundary: impl FnMut(&TerminalState, bool),
+    ) {
         self.state.increment_seqno();
         {
             let bytes = bytes.as_ref();
 
             let mut performer = Performer::new(&mut self.state);
 
-            self.parser.parse(bytes, |action| performer.perform(action));
+            self.parser.parse(bytes, |action| {
+                let before = performer.synchronized_output();
+                performer.perform(action);
+                let after = performer.synchronized_output();
+                if before != after {
+                    boundary(&performer, after);
+                    // Separate row revisions across boundaries in the same read.
+                    performer.increment_seqno();
+                }
+            });
         }
         self.trigger_unseen_output_notif();
     }

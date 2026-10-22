@@ -13,3 +13,10 @@ Regression coverage is in the parent project's `terminal.rs` unit tests and the 
 - `src/terminalstate/kitty.rs`: bound direct transmission/inflate/image-table resources, reject local file/shared-memory transports for this SSH-only embedding, and account for replacement of image id zero. See the parent project's graphics audit for the exact scope and remaining limits.
 
 The original MIT license is preserved in `LICENSE.md`.
+
+- `src/terminal.rs`, `terminalstate/mod.rs`, `terminalstate/performer.rs`: implement
+  synchronized-output mode 2026 and DECRQM state in the engine. The embedding can
+  observe parsed begin/end boundaries, including multiple transitions within one
+  read. Row sequence numbers advance across those boundaries so committed snapshots
+  cannot reuse a row from an earlier update in the same read. Reset clears the mode;
+  the embedding owns the bounded watchdog and committed presentation.

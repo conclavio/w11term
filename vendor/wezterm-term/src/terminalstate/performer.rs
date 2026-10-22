@@ -719,6 +719,7 @@ impl<'a> Performer<'a> {
                 self.unicode_version_stack.clear();
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
+                self.end_synchronized_output();
                 self.progress = Progress::default();
 
                 self.screen.full_reset();
