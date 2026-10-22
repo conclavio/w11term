@@ -41,7 +41,14 @@ pub struct Renderer {
     typography: Typography,
     ligatures: bool,
     images: HashMap<[u8; 32], CachedImage>,
+    rejected_images: HashSet<[u8; 32]>,
+    attempted_images: HashSet<[u8; 32]>,
     tile_bytes: usize,
+    image_budget: usize,
+    #[cfg(test)]
+    image_attempts: usize,
+    #[cfg(test)]
+    image_uploads: usize,
     base_cell: (f32, f32),
     pub metrics: Metrics,
 }
@@ -96,7 +103,14 @@ impl Renderer {
             typography: Typography::new(family, ligatures)?,
             ligatures,
             images: HashMap::new(),
+            rejected_images: HashSet::new(),
+            attempted_images: HashSet::new(),
             tile_bytes: 0,
+            image_budget: 32 * 1024 * 1024,
+            #[cfg(test)]
+            image_attempts: 0,
+            #[cfg(test)]
+            image_uploads: 0,
             metrics,
             base_cell: (probe.width_including_trailing_whitespace, probe.height),
         })
@@ -266,8 +280,10 @@ impl Renderer {
         if device_changed {
             self.layouts.clear();
             self.images.clear();
+            self.rejected_images.clear();
             self.tile_bytes = 0;
         }
+        self.attempted_images.clear();
         let scale = (native.dpi() / 96.0).max(0.5);
         self.measure(width, height, scale);
         // Keep GPU ownership tied to the current visible model. Replacing an id,
@@ -294,6 +310,7 @@ impl Renderer {
             }
         }
         self.images.retain(|key, _| live.contains(key));
+        self.rejected_images.retain(|key| live.contains(key));
         self.tile_bytes = self
             .images
             .values()
@@ -502,66 +519,23 @@ impl Renderer {
                 _ => data.hash(),
             };
             if !self.images.contains_key(&key) {
-                let decoded;
-                let (pixels, width, height) = match &*guard {
-                    ImageDataType::Rgba8 {
-                        data,
-                        width,
-                        height,
-                        ..
-                    } => (data.as_slice(), *width, *height),
-                    ImageDataType::AnimRgba8 {
-                        frames,
-                        width,
-                        height,
-                        ..
-                    } if !frames.is_empty() => (frames[0].as_slice(), *width, *height),
-                    ImageDataType::EncodedFile(bytes) => {
-                        let Ok(mut reader) = image::ImageReader::new(std::io::Cursor::new(bytes))
-                            .with_guessed_format()
-                        else {
-                            continue;
-                        };
-                        let mut limits = image::Limits::default();
-                        limits.max_image_width = Some(4096);
-                        limits.max_image_height = Some(4096);
-                        limits.max_alloc = Some(32 * 1024 * 1024);
-                        reader.limits(limits);
-                        let Ok(image) = reader.decode() else {
-                            continue;
-                        };
-                        decoded = image.to_rgba8();
-                        (
-                            decoded.as_raw().as_slice(),
-                            decoded.width(),
-                            decoded.height(),
-                        )
-                    }
-                    _ => continue,
-                };
-                let Some(bytes) = (width as usize)
-                    .checked_mul(height as usize)
-                    .and_then(|n| n.checked_mul(4))
-                else {
-                    continue;
-                };
-                // Bound this renderer's GPU cache. The engine owns its own image storage.
-                if bytes > 32 * 1024 * 1024 {
+                if self.rejected_images.contains(&key)
+                    || self.attempted_images.contains(&key)
+                    || self.images.len() + self.rejected_images.len() + self.attempted_images.len()
+                        >= 512
+                {
                     continue;
                 }
-                if self.tile_bytes + bytes > 32 * 1024 * 1024 || self.images.len() >= 512 {
-                    self.images.clear();
-                    self.tile_bytes = 0;
+                self.attempted_images.insert(key);
+                #[cfg(test)]
+                {
+                    self.image_attempts += 1;
                 }
-                self.images.insert(
-                    key,
-                    CachedImage {
-                        bitmap: native.image(pixels, width, height)?,
-                        width,
-                        height,
-                    },
-                );
-                self.tile_bytes += bytes;
+                let Some(cached) = self.admit_image(native, &guard, key)? else {
+                    continue;
+                };
+                self.tile_bytes += cached.width as usize * cached.height as usize * 4;
+                self.images.insert(key, cached);
             }
             let cached = &self.images[&key];
             let width = cached.width;
@@ -587,6 +561,98 @@ impl Renderer {
             native.draw_image(&cached.bitmap, Rect::new(left, top, right, bottom), dest);
         }
         Ok(())
+    }
+
+    fn admit_image(
+        &mut self,
+        native: &NativeDrawing,
+        data: &ImageDataType,
+        key: [u8; 32],
+    ) -> windows_canvas::Result<Option<CachedImage>> {
+        // Only device loss escapes to Canvas. Malformed or unsupported content is
+        // isolated to this image, including failures from the native upload API.
+        let mut deferred = false;
+        let result = (|| -> windows_canvas::Result<Option<CachedImage>> {
+            let decoded;
+            let (pixels, width, height) = match data {
+                ImageDataType::Rgba8 {
+                    data,
+                    width,
+                    height,
+                    ..
+                } => (data.as_slice(), *width, *height),
+                ImageDataType::AnimRgba8 {
+                    frames,
+                    width,
+                    height,
+                    ..
+                } if !frames.is_empty() => (frames[0].as_slice(), *width, *height),
+                ImageDataType::EncodedFile(bytes) => {
+                    let Ok(mut reader) =
+                        image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()
+                    else {
+                        return Ok(None);
+                    };
+                    let mut limits = image::Limits::default();
+                    limits.max_image_width = Some(4096);
+                    limits.max_image_height = Some(4096);
+                    limits.max_alloc = Some(32 * 1024 * 1024);
+                    reader.limits(limits);
+                    let Ok(image) = reader.decode() else {
+                        return Ok(None);
+                    };
+                    decoded = image.to_rgba8();
+                    (
+                        decoded.as_raw().as_slice(),
+                        decoded.width(),
+                        decoded.height(),
+                    )
+                }
+                _ => return Ok(None),
+            };
+            let Some(bytes) = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(4))
+            else {
+                return Ok(None);
+            };
+            // Bound this renderer's GPU cache. The engine owns its own image storage.
+            if width == 0
+                || height == 0
+                || width > native.maximum_bitmap_size()
+                || height > native.maximum_bitmap_size()
+                || bytes != pixels.len()
+                || bytes > self.image_budget
+            {
+                return Ok(None);
+            }
+            if self.tile_bytes + bytes > self.image_budget {
+                // Retry admission next frame if other images leave the view.
+                deferred = true;
+                return Ok(None);
+            }
+            #[cfg(test)]
+            {
+                self.image_uploads += 1;
+            }
+            Ok(Some(CachedImage {
+                bitmap: native.image(pixels, width, height)?,
+                width,
+                height,
+            }))
+        })();
+        match result {
+            Ok(Some(image)) => Ok(Some(image)),
+            Err(error) if windows_canvas::is_device_lost(error.code()) => Err(error),
+            other => {
+                // Budget deferrals are per-frame, all other rejections persist
+                // only while this content is visible on the same device.
+                if !deferred || other.is_err() {
+                    self.rejected_images.insert(key);
+                }
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -680,6 +746,182 @@ pub fn screenshot_with_font(
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Apartment;
+    impl Apartment {
+        fn new() -> Self {
+            unsafe {
+                windows::Win32::System::Com::CoInitializeEx(
+                    None,
+                    windows::Win32::System::Com::COINIT_MULTITHREADED,
+                )
+                .ok()
+                .unwrap();
+            }
+            Self
+        }
+    }
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_and_malformed_images_are_isolated_and_rejections_expire() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let _com = Apartment::new();
+        let mut renderer = Renderer::new().unwrap();
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(640, 360).unwrap();
+        let size = wezterm_term::TerminalSize {
+            cols: 40,
+            rows: 12,
+            pixel_width: 400,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        let mut maximum = 0;
+        target
+            .draw(|ctx| {
+                maximum = NativeDrawing::new(ctx)?.maximum_bitmap_size();
+                Ok(())
+            })
+            .unwrap();
+        // Small even on devices whose bitmap limit is larger than 20,000.
+        let width = maximum.saturating_add(1).min(20_000);
+        terminal.advance_bytes(format!(
+            "\x1b_Ga=T,i=7,p=1,f=32,s={width},v=1,c=4,r=2,q=2;{}\x1b\\\r\nhealthy",
+            STANDARD.encode([255, 0, 0, 255].repeat(width as usize))
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert!(
+            frame
+                .rows
+                .iter()
+                .any(|l| l.visible_cells().any(|c| c.attrs().images().is_some()))
+        );
+        for _ in 0..3 {
+            target
+                .draw(|ctx| {
+                    renderer.draw_surface(ctx, 640.0, 360.0, false, &frame)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            renderer.image_attempts, 1,
+            "one admission per content/device"
+        );
+        if width > maximum {
+            assert_eq!(renderer.image_uploads, 0);
+            assert_eq!(renderer.rejected_images.len(), 1);
+        }
+        target
+            .draw(|ctx| {
+                let native = NativeDrawing::new(ctx)?;
+                let malformed = ImageDataType::Rgba8 {
+                    data: vec![0; 3],
+                    width: 1,
+                    height: 1,
+                    hash: [1; 32],
+                };
+                assert!(
+                    renderer
+                        .admit_image(&native, &malformed, [1; 32])?
+                        .is_none()
+                );
+                Ok(())
+            })
+            .unwrap();
+        terminal.advance_bytes(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+        let frame = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+        target
+            .draw(|ctx| {
+                renderer.draw_surface(ctx, 640.0, 360.0, false, &frame)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(renderer.rejected_images.is_empty());
+        assert!(renderer.images.is_empty());
+        assert!(
+            target
+                .read_pixels()
+                .unwrap()
+                .chunks_exact(4)
+                .any(|p| p[0] > 100 && p[1] > 100 && p[2] > 100),
+            "text still renders"
+        );
+    }
+
+    #[test]
+    fn image_budget_defers_once_per_frame_without_evicting_visible_textures() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let _com = Apartment::new();
+        let mut renderer = Renderer::new().unwrap();
+        renderer.image_budget = 256;
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(640, 360).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(
+            wezterm_term::TerminalSize {
+                cols: 40,
+                rows: 12,
+                pixel_width: 400,
+                pixel_height: 240,
+                dpi: 96,
+            },
+            tx,
+        );
+        for (id, row, color) in [(1, 1, [255, 0, 0, 255]), (2, 4, [0, 255, 0, 255])] {
+            terminal.advance_bytes(format!(
+                "\x1b[{row};1H\x1b_Ga=T,i={id},p=1,f=32,s=8,v=8,c=4,r=2,q=2;{}\x1b\\",
+                STANDARD.encode(color.repeat(64))
+            ));
+        }
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        for n in 0..3 {
+            target
+                .draw(|ctx| {
+                    renderer.draw_surface(ctx, 640.0, 360.0, false, &frame)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(renderer.images.len(), 1);
+            assert_eq!(renderer.tile_bytes, 256);
+            assert_eq!(renderer.image_uploads, 1);
+            assert_eq!(renderer.image_attempts, 2 + n);
+            assert!(
+                renderer.rejected_images.is_empty(),
+                "budget rejection must be retryable"
+            );
+        }
+        terminal.advance_bytes(b"\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
+        let frame = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+        target
+            .draw(|ctx| {
+                renderer.draw_surface(ctx, 640.0, 360.0, false, &frame)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            renderer.image_uploads, 2,
+            "deferred image admitted after capacity frees"
+        );
+        target
+            .draw(|ctx| {
+                renderer.draw_surface(ctx, 640.0, 360.0, true, &frame)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            renderer.image_uploads, 3,
+            "device change invalidates old GPU resources"
+        );
+    }
     #[test]
     fn repeated_image_id_replacement_resize_and_deletion_release_gpu_textures() {
         use base64::{Engine, engine::general_purpose::STANDARD};

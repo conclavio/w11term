@@ -212,6 +212,7 @@ pub enum Message {
     RawPaste(Result<(), String>),
     Pointer(TabId, PointerEventInfo, MouseEventKind),
     RenderError(TabId, String),
+    RetryRender(TabId),
     Edit(TabId, Field, String),
     Auth(TabId, Option<usize>),
     SaveProfile(TabId),
@@ -1284,8 +1285,14 @@ impl TerminalApp {
 
     fn terminal_view(&self, id: TabId, tab: &LiveTab, context: &ViewContext<Self>) -> View {
         if let Some(error) = &tab.error {
-            return TextBlock::new()
-                .text(format!("Unable to render terminal: {error}"))
+            return StackPanel::new()
+                .spacing(12.0)
+                .children((
+                    TextBlock::new().text(format!("Unable to render terminal: {error}")),
+                    Button::new()
+                        .on_click(context.callback(move |_| Message::RetryRender(id)))
+                        .content(TextBlock::new().text("Retry rendering")),
+                ))
                 .into();
         }
         let renderer = self.renderer.clone();
@@ -2142,6 +2149,13 @@ impl Component for TerminalApp {
             Message::Smoke(step) => self.smoke_step(step, context),
             Message::FrameReady(id, epoch) => {
                 if self.tabs.active_id() == Some(id) && self.watch_epoch == epoch {
+                    if let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    {
+                        tab.error = None;
+                    }
                     self.connection_ui(id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
@@ -2444,6 +2458,16 @@ impl Component for TerminalApp {
                 {
                     log::error!("Renderer: {error}");
                     tab.error = Some(error);
+                }
+            }
+            Message::RetryRender(id) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.get_mut(id)
+                {
+                    tab.error = None;
+                    self.invalidator.invalidate();
                 }
             }
             Message::Edit(id, field, text) => {

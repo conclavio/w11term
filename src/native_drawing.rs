@@ -156,9 +156,19 @@ impl NativeDrawing {
         Ok(())
     }
 
+    pub fn maximum_bitmap_size(&self) -> u32 {
+        // SAFETY: the render target belongs to this drawing thread.
+        unsafe { self.context.GetMaximumBitmapSize() }
+    }
+
     pub fn image(&self, rgba: &[u8], width: u32, height: u32) -> windows_canvas::Result<GpuImage> {
         let expected = width.checked_mul(height).and_then(|n| n.checked_mul(4));
-        if width == 0 || height == 0 || expected.map(|n| n as usize) != Some(rgba.len()) {
+        if width == 0
+            || height == 0
+            || width > self.maximum_bitmap_size()
+            || height > self.maximum_bitmap_size()
+            || expected.map(|n| n as usize) != Some(rgba.len())
+        {
             return Err(windows_core_next::Error::from_hresult(
                 windows_core_next::HRESULT(0x80070057u32 as i32),
             ));
