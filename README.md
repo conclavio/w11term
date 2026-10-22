@@ -28,13 +28,41 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 The native WinUI tab strip sits in the window title bar. Click **+** to choose a saved profile and open an independent SSH session; opening a profile more than once creates separate sessions. Drag tabs to reorder them and use their close buttons to disconnect. Closing the last tab closes the window. Background sessions retain their terminal state and continue receiving output; only the active terminal is rendered.
 
-The **+ → New Profile…** form supports host, user, port, agent/key-file/none authentication, and an optional verified host fingerprint. **Save and connect** adds the profile to the selected configuration file and opens it. Existing profiles cannot be overwritten through this form. Saving preserves unrelated configuration fields and atomically replaces the file. Only the key file's path is stored; private key contents never go into the configuration.
+The **+ → New Profile…** form supports host, user, port, agent/key-file/none/password/keyboard-interactive authentication, an optional verified host fingerprint, device-key generation, and player preferences. **Save and connect** adds the profile to the selected configuration file and opens it. Existing profiles cannot be overwritten through this form. Saving preserves unrelated configuration fields and atomically replaces the file. Only the key file's path is stored; private key contents never go into the configuration.
 
 The **caret → Settings** command opens the terminal font selector and programming-ligatures toggle. The selector includes only installed Cascadia Code, Cascadia Mono, Consolas, JetBrains Mono, Monaspace-family, and Fira Code fonts. Changes apply across the window's terminal tabs and are saved automatically to `%LOCALAPPDATA%\w11term\settings.json`. `W11TERM_SETTINGS_PATH` can override that file for portable configuration or isolated tests. Settings and New Profile tabs use native controls and do not send their typing into an SSH session. The plus menu also includes the terminal lab.
 
 Ligatures default to enabled and use DirectWrite shaping for adjacent ASCII cells with matching attributes, preserving the terminal grid. Monaspace additionally enables its [documented programming-ligature feature sets](https://github.com/githubnext/monaspace#code-ligatures). Font changes recalculate cell geometry and resize existing sessions; PNG capture uses the same selected font and ligature setting.
 
-SSH uses an unencrypted private key supplied with `--identity`, the Windows OpenSSH agent (the default for an explicit `ssh user@host` command), or `--auth none` for servers that allow keyless access. It checks the user's OpenSSH `known_hosts` file. Unknown hosts fail with their fingerprint; an explicitly verified `--host-key SHA256:...` pin is an alternative. It never automatically trusts or writes a host key. Password/keyboard-interactive authentication, SSH config aliases, jump hosts, and automatic reconnection are not implemented yet.
+SSH supports OpenSSH private keys supplied with `--identity`, protected w11term device keys, the Windows OpenSSH agent (the default for `ssh user@host`), `--auth none`, `--auth password`, and `--auth keyboard-interactive`. Password and MFA challenges use native dialogs; hidden answers never enter terminal input, profiles, event logs, or recordings. A successful password remains in memory only for reconnection; one-time codes are requested again. Passphrase-protected OpenSSH keys can be used through the agent.
+
+The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`; Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog. SSH config aliases and jump hosts remain deferred.
+
+## Player profiles
+
+Dropped transports reconnect in the same tab, with 1/2/4/8/10-second backoff and a 300-second retry window. Permanent authentication/trust errors and normal remote process/channel closure stop retrying. Input while disconnected is discarded; raw control writes and SFTP operations fail explicitly instead of being replayed. The latest grid is applied to the new PTY, terminal protocol state resets, and primary scrollback remains. The client returns to the server's prompt; it never sends `BOARD` or replays game commands automatically. Every SSH shell requests `COLORTERM=truecolor`.
+
+Game mode suppresses held-key repeats while preserving the initial press and final release. Normal terminal mode sends negotiated kitty repeat event type 2 and release type 3. The caret menu toggles game mode and mute for the active saved profile. **F11** or the caret menu toggles borderless fullscreen. Normal window size and position are remembered per profile in `%LOCALAPPDATA%\w11term\windows.json`, clamped to the current monitor on restore. Explicit launch `--cols`/`--rows` takes precedence. The status bar displays columns × rows throughout resizing.
+
+The wizard generates Ed25519 device keys in process, stores them under `%LOCALAPPDATA%\w11term\keys`, encrypts private bytes with current-Windows-user DPAPI, and restricts the private file ACL to that user and SYSTEM. The machine name becomes the public comment. Only the public line can be copied by the wizard. These protected files are w11term-specific; OpenSSH cannot read them directly. For a generic host, append the copied public line to `~/.ssh/authorized_keys`.
+
+For a Rustmush profile, select the Rustmush checkbox, generate a device key, and sign in with a password. Once at the game command prompt, choose **caret → Enroll this device**. It sends `@sshkey/add`, reads a fresh `@sshkey/list`, and changes future profile authentication to the key only after verifying the exact SHA256 fingerprint. The confirmation shows that fingerprint. **Forget this device** revokes that fingerprint, verifies the server listing, and returns the profile to password authentication. The encrypted local key remains available for reenrollment. `account+character` usernames pass through unchanged. Account creation stays in the server's welcome flow. Do not concurrently drive the same pane while enrollment is running.
+
+BEL and names-only OSC 440 sounds support per-profile mute, `system`/`off`/named bells, and verified asset packs fetched over the existing SFTP connection. The complete server contract—including OSC bytes, manifest limits, and Hello fields—is in [Game client protocol v1](docs/game-client-protocol.md). Sprite/font/help assets are cached without installing or executing them. Set `W11TERM_DATA_DIR` to redirect keys, assets, and window placements for portable configuration or isolated tests; appearance settings retain their own override.
+
+Example optional profile settings (all fields may be omitted):
+
+```json
+"player": {
+  "reconnect": true,
+  "game_mode": false,
+  "rustmush": false,
+  "mute": false,
+  "bell": "system",
+  "sync_assets": true,
+  "device_key": null
+}
+```
 
 ```powershell
 cargo run -- --replay C:\path\to\capture.vt
@@ -71,6 +99,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Enter in find / F3; Shift+Enter / Shift+F3 | Next / previous find result, wrapping at either end |
 | Escape in find | Close find and restore terminal keyboard input |
 | Mouse wheel | Scrollback using Windows' wheel-line/page preference, including accumulated fractional deltas; remote wheel events when mouse reporting is enabled |
+| F11 | Toggle borderless fullscreen |
 | F5 in the local lab | Reload the protocol demo |
 | Ctrl+L in the local lab | Clear the display |
 
@@ -96,7 +125,11 @@ OSC 52 writes are plain text, work for background sessions, and are capped at 1 
 
 - `terminal.rs`: pinned WezTerm VT engine adapter, keyboard encoding, immutable screen snapshots, and protocol tests. Kitty's full input encoder comes from `wezterm-input-types`; `Terminal::key_down` alone does not implement that protocol.
 - `session.rs`: a dedicated terminal thread with its own Tokio runtime. Output has a bounded queue and bounded batches; immutable snapshots replace the previous frame rather than accumulating render work. Replies and keystrokes return to SSH.
-- `ssh.rs`: embedded `russh` transport, host verification, identity/agent/none authentication, remote PTY, shell, and resize messages.
+- `ssh/transport.rs`: embedded `russh` transport, host verification, private authentication prompts, automatic reconnection, remote PTY, shell, and resize messages.
+- `keys.rs` / `prompts.rs` / `enroll.rs`: DPAPI-protected Ed25519 device keys, private native challenges, and verified Rustmush key enrollment/revocation.
+- `assets.rs` / `sound.rs`: bounded, hashed SFTP asset synchronization and names-only sound playback outside the parser/UI threads.
+- `events.rs` / `recorder.rs`: cursor-based event journals and output-only VT captures with replay geometry.
+- `window_state.rs`: per-profile native placement/grid persistence and reversible fullscreen.
 - `sftp.rs`: reusable SFTP v3 subsystem on each pane's existing SSH connection; streaming get/put, directory and file handles, metadata, links, and advertised OpenSSH extensions through `w11term-cli sftp`. See [the control API](CONTROL.md) for commands and JSON schemas.
 - `options.rs` / `profiles.rs`: CLI, saved profiles, relative key paths, and atomic profile creation.
 - `tabs.rs`: stable tab identities, selection, closing, and reorder validation.
@@ -113,9 +146,9 @@ OSC 52 writes are plain text, work for background sessions, and are capped at 1 
 This is a runnable foundation, not complete terminal conformance or a kitty/Ghostty performance result.
 
 - ANSI/DEC behavior, primary/alternate screens, scrollback/reflow, 256/true color, wide and combining text, basic mouse reporting, bracketed paste, and negotiated kitty key encoding are connected.
-- The underlying engine has kitty/Sixel/iTerm image handling. The renderer currently draws static image content and the first frame of animated images. Animation scheduling, all z-order interactions, image protocol extensions, and resource-policy hardening need an explicit compatibility audit.
+- The engine has kitty/Sixel/iTerm image handling. The renderer draws static content and the first animation frame; animation scheduling and advanced protocol extensions remain work. The replacement/delete/resize audit is documented in [Graphics audit](docs/graphics-audit.md). It covers the cockpit's single-id replacement path and GPU eviction, with bounded direct transfers and image tables; it is not a claim of complete image-protocol conformance or a global memory bound across all retained scrollback images.
 - Text uses cached DirectWrite layouts, including color emoji and programming ligatures across matching ASCII cells. Full Unicode run shaping, full BiDi layout, italic rendering, underline variants, and exact cursor styling remain work.
-- Keyboard release events are connected, but complete repeat/physical-key/alternate-key handling and IME/TSF composition are not finished.
+- Keyboard press/repeat/release and game-mode repeat suppression are connected. Complete physical-key/alternate-key handling and IME/TSF composition remain work.
 - Terminal accessibility, split panes, tab tear-out into separate windows, profile editing/deletion, further Settings, and persistent remote sessions are deferred.
 
 ## Verify
@@ -143,6 +176,14 @@ Reactor 0.100 currently fails native startup when a menu owner is wrapped in a t
 
 Set both `W11TERM_UI_SMOKE=1` and `W11TERM_SEARCH_SMOKE=1` with an isolated `W11TERM_SETTINGS_PATH` to exercise native find-box focus, the wheel callback, history matching/highlights, next-result navigation, independent tab state, focus restoration, and closing find. Like the other UI smoke, it uses only local labs and closes its own window.
 
+Set `W11TERM_UI_SMOKE=1` and `W11TERM_PLAYER_SMOKE=1`, with isolated
+`W11TERM_SETTINGS_PATH` and `W11TERM_DATA_DIR`, to exercise the real trust and
+masked/echoing authentication dialogs, fullscreen roundtrip, normal-grid retention,
+and Rustmush wizard defaults without contacting a server or changing the clipboard.
+Loopback integration tests cover actual password/MFA/host-key handshakes,
+reconnection without offline-input replay, asset hashing/cache reuse, enrollment
+and revocation, event-driven waits, audio events under mute, and VT recording.
+
 An optional live probe opens a remote PTY through the production session and VT engine, waits for terminal output, and disconnects. It sends no shell commands and follows the same host-verification rules:
 
 ```powershell
@@ -151,7 +192,7 @@ cargo run --example ssh_probe -- --profile play-6789
 cargo run --example ssh_probe -- --profile play-6792
 ```
 
-The terminal core is vendored from commit `e2a98e1b8af156988ad0ac778658ac27b60a55fb` with a small cursor-reflow fix; see `vendor/wezterm-term/PATCHES.md`. Its shared crates remain pinned to that revision. `Cargo.lock` pins the resolved dependency graph. Treat upgrades as compatibility changes and rerun protocol and visual checks.
+The terminal core is vendored from commit `e2a98e1b8af156988ad0ac778658ac27b60a55fb` with embedding fixes and extensions; see `vendor/wezterm-term/PATCHES.md`. Its shared crates remain pinned to that revision. `Cargo.lock` pins the resolved dependency graph. Treat upgrades as compatibility changes and rerun protocol and visual checks.
 
 ## License
 

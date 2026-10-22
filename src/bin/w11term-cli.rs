@@ -3,6 +3,8 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{io::Read, path::PathBuf};
 use w11term::control::{self, Reply, Request};
+#[path = "w11term-cli/automation.rs"]
+mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
@@ -22,6 +24,13 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
                 .with_context(|| format!("{arg} requires a value"))
         };
         match arg.as_str() {
+            "wait-for-text" | "events" | "open" | "resize" | "record" if verb.is_none() => {
+                ensure!(
+                    payload.is_none() && path.is_none() && !no_paste,
+                    "invalid options before automation command"
+                );
+                return automation::parse(&arg, args, pid, pane);
+            }
             "sftp" if verb.is_none() => {
                 ensure!(
                     payload.is_none() && path.is_none() && !no_paste,
@@ -124,7 +133,7 @@ fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
 async fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
-        println!("{HELP}\n\n{}", sftp_args::HELP);
+        println!("{HELP}\n\n{}\n\n{}", sftp_args::HELP, automation::HELP);
         return;
     }
     let result = if args == ["instances"] {

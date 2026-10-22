@@ -27,6 +27,37 @@ pub type CapturePng =
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Request {
+    Record {
+        pane: u64,
+        path: Option<PathBuf>,
+    },
+    WaitForText {
+        pane: u64,
+        pattern: String,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
+    Events {
+        pane: u64,
+        #[serde(default)]
+        since: u64,
+        #[serde(default)]
+        timeout_seconds: u64,
+    },
+    Resize {
+        pane: u64,
+        cols: usize,
+        rows: usize,
+    },
+    Open {
+        profile: String,
+        cols: Option<usize>,
+        rows: Option<usize>,
+        #[serde(default)]
+        activate: bool,
+    },
     Sftp {
         pane: u64,
         #[serde(default = "sftp_default_timeout")]
@@ -47,6 +78,34 @@ pub enum Request {
         path: PathBuf,
     },
 }
+fn default_wait_timeout() -> u64 {
+    30
+}
+#[derive(Debug)]
+pub enum UiRequest {
+    Open {
+        profile: String,
+        cols: Option<usize>,
+        rows: Option<usize>,
+        activate: bool,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    Resize {
+        pane: u64,
+        cols: usize,
+        rows: usize,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+}
+impl UiRequest {
+    pub fn fail(self, message: &str) {
+        let reply = match self {
+            Self::Open { reply, .. } | Self::Resize { reply, .. } => reply,
+        };
+        let _ = reply.send(Err(message.into()));
+    }
+}
+type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
 }
@@ -87,8 +146,21 @@ pub struct Pane {
     pub input: mpsc::UnboundedSender<Command>,
 }
 #[derive(Clone, Default)]
-pub struct Registry(Arc<Mutex<BTreeMap<u64, Pane>>>);
+pub struct Registry(
+    Arc<Mutex<BTreeMap<u64, Pane>>>,
+    Arc<Mutex<Option<UiHandler>>>,
+);
 impl Registry {
+    pub fn set_ui(&self, handler: impl Fn(UiRequest) + Send + Sync + 'static) {
+        *self.1.lock().unwrap() = Some(Arc::new(handler));
+    }
+    fn ui(&self) -> Result<UiHandler> {
+        self.1
+            .lock()
+            .unwrap()
+            .clone()
+            .context("this instance has no GUI control handler")
+    }
     pub fn replace(&self, panes: impl IntoIterator<Item = Pane>) {
         *self.0.lock().unwrap() = panes.into_iter().map(|p| (p.id, p)).collect();
     }
@@ -112,6 +184,133 @@ impl Registry {
     }
     pub async fn execute(&self, request: Request, capture_png: CapturePng) -> Result<Value> {
         match request {
+            Request::Record { pane, path } => {
+                ensure!(
+                    path.as_ref().is_none_or(|p| p.is_absolute()),
+                    "recording path must be absolute"
+                );
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::Record { path, reply })
+                    .context("pane is closed")?;
+                tokio::time::timeout(TIMEOUT, response)
+                    .await??
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::Open {
+                profile,
+                cols,
+                rows,
+                activate,
+            } => {
+                validate_grid(cols.unwrap_or(120), rows.unwrap_or(32))?;
+                let (reply, response) = oneshot::channel();
+                self.ui()?(UiRequest::Open {
+                    profile,
+                    cols,
+                    rows,
+                    activate,
+                    reply,
+                });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("open timed out; tab may have been created")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::Resize { pane, cols, rows } => {
+                validate_grid(cols, rows)?;
+                self.pane(pane)?;
+                let (reply, response) = oneshot::channel();
+                self.ui()?(UiRequest::Resize {
+                    pane,
+                    cols,
+                    rows,
+                    reply,
+                });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("resize timed out; geometry may have changed")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
+            Request::Events {
+                pane,
+                since,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    timeout_seconds <= 3600,
+                    "events timeout must be 0..=3600 seconds"
+                );
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::Events(reply))
+                    .context("pane is closed")?;
+                let events = tokio::time::timeout(TIMEOUT, response).await??;
+                ensure!(
+                    since <= events.since(0).next,
+                    "event cursor is ahead of this pane; check the instance/pane identity"
+                );
+                Ok(
+                    json!({"pane":pane,"journal":events.wait(since,Duration::from_secs(timeout_seconds)).await}),
+                )
+            }
+            Request::WaitForText {
+                pane,
+                pattern,
+                regex,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "wait timeout must be 1..=3600 seconds"
+                );
+                ensure!(pattern.len() <= 4096, "pattern exceeds 4096 bytes");
+                let matcher = if regex {
+                    Some(
+                        regex::RegexBuilder::new(&pattern)
+                            .size_limit(1024 * 1024)
+                            .dfa_size_limit(8 * 1024 * 1024)
+                            .build()
+                            .context("invalid regular expression")?,
+                    )
+                } else {
+                    None
+                };
+                let target = self.pane(pane)?;
+                let (reply, response) = oneshot::channel();
+                target
+                    .input
+                    .send(Command::Frames(reply))
+                    .context("pane is closed")?;
+                let frames = tokio::time::timeout(TIMEOUT, response).await??;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
+                loop {
+                    let frame = frames.load();
+                    let generation = frame.generation;
+                    let text = frame
+                        .rows
+                        .iter()
+                        .map(|line| line.as_str().trim_end_matches(' ').to_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if matcher
+                        .as_ref()
+                        .map_or_else(|| text.contains(&pattern), |r| r.is_match(&text))
+                    {
+                        return Ok(
+                            json!({"pane":pane,"matched":true,"generation":frame.generation,"cols":frame.cols,"rows":frame.rows.len(),"text":text}),
+                        );
+                    }
+                    ensure!(
+                        frames.changed(generation, deadline).await,
+                        "wait-for-text timed out without a match"
+                    );
+                }
+            }
             Request::Sftp {
                 pane,
                 timeout_seconds,
@@ -143,7 +342,7 @@ impl Registry {
                 let mut sessions = Vec::new();
                 for pane in panes {
                     if let Ok((frame, size)) = Self::capture(&pane).await {
-                        sessions.push(json!({"id":pane.id,"label":pane.label,"active":pane.active,"title":frame.title,"status":frame.status,"cols":size.cols,"rows":size.rows}));
+                        sessions.push(json!({"id":pane.id,"label":pane.label,"active":pane.active,"title":frame.title,"status":frame.status,"cols":size.cols,"rows":size.rows,"prompt":frame.prompt,"connection_generation":frame.connection_generation}));
                     }
                 }
                 Ok(json!({"pid":std::process::id(),"sessions":sessions}))
@@ -202,6 +401,13 @@ impl Registry {
             }
         }
     }
+}
+fn validate_grid(cols: usize, rows: usize) -> Result<()> {
+    ensure!(
+        (1..=1000).contains(&cols) && (1..=500).contains(&rows),
+        "grid must be 1..=1000 columns and 1..=500 rows"
+    );
+    Ok(())
 }
 
 pub fn pipe_name(pid: u32) -> String {
@@ -396,6 +602,12 @@ pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
             Request::Sftp {
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,
+            Request::WaitForText {
+                timeout_seconds, ..
+            }
+            | Request::Events {
+                timeout_seconds, ..
+            } => (*timeout_seconds).min(3600) + 15,
             _ => 30,
         }),
         read.read_until(b'\n', &mut response),

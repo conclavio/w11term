@@ -45,6 +45,8 @@ pub enum Progress {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum Alert {
+    /// Application extension; names-only sound/asset commands are validated by the host.
+    W11termOsc440(Vec<Vec<u8>>),
     Bell,
     ToastNotification {
         /// The title text for the notification.
@@ -126,6 +128,13 @@ impl Default for TerminalSize {
 }
 
 impl Terminal {
+    /// Begin a new remote transport without interpreting an unfinished escape
+    /// sequence from the old connection. Primary scrollback is retained.
+    pub fn reset_connection(&mut self) {
+        self.parser = Parser::new();
+        self.state.reset_connection();
+    }
+
     /// Construct a new Terminal.
     /// `physical_rows` and `physical_cols` describe the dimensions
     /// of the visible portion of the terminal display in terms of

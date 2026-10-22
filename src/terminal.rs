@@ -77,6 +77,7 @@ impl TerminalConfiguration for Config {
 
 #[derive(Debug)]
 pub enum TransportInput {
+    Authenticate(crate::options::Authentication),
     Sftp(crate::sftp::Job),
     Data(Vec<u8>),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
@@ -114,6 +115,16 @@ pub fn send_key(
     key: wezterm_term::KeyCode,
     modifiers: wezterm_term::KeyModifiers,
     down: bool,
+) -> anyhow::Result<()> {
+    send_key_event(terminal, writer, key, modifiers, down, false)
+}
+pub fn send_key_event(
+    terminal: &mut Terminal,
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    key: wezterm_term::KeyCode,
+    modifiers: wezterm_term::KeyModifiers,
+    down: bool,
+    repeat: bool,
 ) -> anyhow::Result<()> {
     if let termwiz::input::KeyboardEncoding::Kitty(flags) = terminal.get_keyboard_encoding() {
         use wezterm_input_types::{KeyCode as K, KeyEvent, KeyboardLedStatus, Modifiers};
@@ -156,8 +167,16 @@ pub fn send_key(
         if modifiers.contains(wezterm_term::KeyModifiers::SUPER) {
             mods |= Modifiers::SUPER;
         }
-        let encoded = KeyEvent {
-            key: rich,
+        let report_repeat = repeat
+            && down
+            && flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
+        let encode_flags = if report_repeat {
+            flags | wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        } else {
+            flags
+        };
+        let mut encoded = KeyEvent {
+            key: rich.clone(),
             modifiers: mods,
             leds: KeyboardLedStatus::empty(),
             repeat_count: 1,
@@ -166,7 +185,57 @@ pub fn send_key(
             #[cfg(windows)]
             win32_uni_char: None,
         }
-        .encode_kitty(flags);
+        .encode_kitty(encode_flags);
+        // Upstream's legacy-character branch also bypasses REPORT_ALL_KEYS.
+        // Repair that branch before adding the repeat event type.
+        if encode_flags
+            .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+            && down
+            && !encoded.starts_with("\x1b[")
+            && let K::Char(character) = rich
+        {
+            let base = if character == '\x08' {
+                '\x7f'
+            } else {
+                character.to_ascii_lowercase()
+            };
+            let modifier = 1
+                + u8::from(mods.contains(Modifiers::SHIFT))
+                + 2 * u8::from(mods.contains(Modifiers::ALT))
+                + 4 * u8::from(mods.contains(Modifiers::CTRL))
+                + 8 * u8::from(mods.contains(Modifiers::SUPER));
+            let alternate = if encode_flags
+                .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)
+                && base != character
+            {
+                format!(":{}", character as u32)
+            } else {
+                String::new()
+            };
+            let text = if encode_flags
+                .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT)
+                && !character.is_control()
+                && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+            {
+                format!(";{}", character as u32)
+            } else {
+                String::new()
+            };
+            encoded = format!("\x1b[{}{alternate};{modifier}{text}u", base as u32);
+        }
+        // The pinned upstream encoder only distinguishes press/release. Supply
+        // the negotiated repeat event type without changing its key encoding.
+        if report_repeat
+            && encoded.starts_with("\x1b[")
+            && let Some(separator) = encoded.find(';')
+        {
+            let start = separator + 1;
+            let digits = encoded[start..]
+                .bytes()
+                .take_while(u8::is_ascii_digit)
+                .count();
+            encoded.insert_str(start + digits, ":2");
+        }
         if !encoded.is_empty() {
             writer.send(TransportInput::Data(encoded.into_bytes()))?;
         }
@@ -194,6 +263,8 @@ pub struct Snapshot {
     pub alternate: bool,
     pub mouse_grabbed: bool,
     pub search: Option<crate::search::SearchSnapshot>,
+    pub prompt: Option<crate::prompts::Prompt>,
+    pub connection_generation: u64,
 }
 
 impl Snapshot {
@@ -252,17 +323,23 @@ impl Snapshot {
             alternate,
             mouse_grabbed: terminal.is_mouse_grabbed(),
             search: None,
+            prompt: None,
+            connection_generation: 0,
         }
     }
 }
 
 /// Only an immutable frame crosses onto the UI thread. Output is never queued as frames.
-#[derive(Clone)]
-pub struct FrameStore(Arc<(Mutex<Arc<Snapshot>>, Condvar)>);
+#[derive(Clone, Debug)]
+pub struct FrameStore(Arc<(Mutex<Arc<Snapshot>>, Condvar, tokio::sync::Notify)>);
 
 impl FrameStore {
     pub fn new(frame: Snapshot) -> Self {
-        Self(Arc::new((Mutex::new(Arc::new(frame)), Condvar::new())))
+        Self(Arc::new((
+            Mutex::new(Arc::new(frame)),
+            Condvar::new(),
+            tokio::sync::Notify::new(),
+        )))
     }
     pub fn load(&self) -> Arc<Snapshot> {
         Arc::clone(&self.0.0.lock().unwrap())
@@ -270,6 +347,16 @@ impl FrameStore {
     pub fn publish(&self, frame: Snapshot) {
         *self.0.0.lock().unwrap() = Arc::new(frame);
         self.0.1.notify_all();
+        self.0.2.notify_waiters();
+    }
+    pub async fn changed(&self, generation: u64, deadline: tokio::time::Instant) -> bool {
+        let changed = self.0.2.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if self.load().generation != generation {
+            return true;
+        }
+        tokio::time::timeout_at(deadline, changed).await.is_ok()
     }
     pub fn wait_for_change(&self, generation: u64, cancelled: impl Fn() -> bool) {
         let mut frame = self.0.0.lock().unwrap();
@@ -518,6 +605,54 @@ mod tests {
     }
 
     #[test]
+    fn identifies_sixel_and_version_and_encodes_repeat_release_and_reconnect_reset() {
+        let (mut t, mut rx) = engine();
+        t.advance_bytes(b"\x1b[c");
+        assert_eq!(receive(&mut rx), b"\x1b[?65;4;6;18;22;52c");
+        t.advance_bytes(b"\x1b[>0q");
+        assert_eq!(
+            receive(&mut rx),
+            format!("\x1bP>|w11term {}\x1b\\", env!("CARGO_PKG_VERSION")).as_bytes()
+        );
+        t.advance_bytes(b"retained\x1b[?1049h\x1b[?1000h\x1b[?2004h\x1b[>11u");
+        let (writer, mut encoded) = mpsc::unbounded_channel();
+        for (down, repeat, expected) in [
+            (true, false, "\x1b[97;1u"),
+            (true, true, "\x1b[97;1:2u"),
+            (false, false, "\x1b[97;1:3u"),
+        ] {
+            send_key_event(
+                &mut t,
+                &writer,
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                down,
+                repeat,
+            )
+            .unwrap();
+            assert_eq!(receive(&mut encoded), expected.as_bytes());
+        }
+        t.advance_bytes(b"\x1b]2;unfinished");
+        t.reset_connection();
+        assert!(!t.is_alt_screen_active());
+        assert!(!t.mouse_tracking_enabled());
+        assert!(!t.bracketed_paste_enabled());
+        assert!(text(&t).starts_with("retained"));
+        t.advance_bytes(b"fresh");
+        assert!(text(&t).contains("fresh"));
+        send_key_event(
+            &mut t,
+            &writer,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(receive(&mut rx), b"a");
+    }
+
+    #[test]
     fn bracketed_paste_and_graphics_are_preserved_in_model() {
         let (mut t, mut rx) = engine();
         t.advance_bytes(b"\x1b[?2004h");
@@ -537,6 +672,37 @@ mod tests {
                 .iter()
                 .flat_map(|l| l.visible_cells())
                 .any(|c| c.attrs().images().is_some())
+        );
+    }
+
+    #[test]
+    fn deleting_a_placement_after_narrowing_removes_reflowed_image_cells() {
+        let (mut t, _) = engine();
+        t.advance_bytes(b"\x1b[2;71H\x1b_Ga=T,i=7,p=1,f=32,s=1,v=1,c=2,r=2,q=2;/wAA/w==\x1b\\");
+        let size = t.get_size();
+        t.resize(TerminalSize {
+            cols: 40,
+            pixel_width: 400,
+            ..size
+        });
+        let before = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+        assert!(
+            before
+                .rows
+                .iter()
+                .flat_map(|l| l.visible_cells())
+                .any(|c| c.attrs().images().is_some()),
+            "placement disappeared during reflow"
+        );
+        t.advance_bytes(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+        let snapshot = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+        assert!(
+            !snapshot
+                .rows
+                .iter()
+                .flat_map(|l| l.visible_cells())
+                .any(|c| c.attrs().images().is_some()),
+            "stale image cells survived deletion after reflow"
         );
     }
 }

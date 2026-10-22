@@ -508,6 +508,22 @@ impl std::io::Write for ThreadedWriter {
 }
 
 impl TerminalState {
+    pub(crate) fn reset_connection(&mut self) {
+        let mut primary = self.screen.screen.clone();
+        primary.full_reset();
+        primary.saved_cursor = None;
+        self.increment_seqno();
+        {
+            let mut performer = performer::Performer::new(self);
+            performer.perform(wezterm_escape_parser::Action::Esc(
+                wezterm_escape_parser::Esc::Code(wezterm_escape_parser::EscCode::FullReset),
+            ));
+        }
+        self.kitty_img = Default::default();
+        self.screen.screen = primary;
+        self.screen.activate_primary_screen(self.seqno);
+    }
+
     /// Constructs the terminal state.
     /// You generally want the `Terminal` struct rather than this one;
     /// Terminal contains and dereferences to `TerminalState`.

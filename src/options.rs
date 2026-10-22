@@ -11,6 +11,33 @@ pub enum Authentication {
     Agent,
     None,
     Identity { identity: PathBuf },
+    Password,
+    KeyboardInteractive,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlayerOptions {
+    pub reconnect: bool,
+    pub game_mode: bool,
+    pub rustmush: bool,
+    pub mute: bool,
+    pub bell: String,
+    pub sync_assets: bool,
+    pub device_key: Option<PathBuf>,
+}
+impl Default for PlayerOptions {
+    fn default() -> Self {
+        Self {
+            reconnect: true,
+            game_mode: false,
+            rustmush: false,
+            mute: false,
+            bell: "system".into(),
+            sync_assets: true,
+            device_key: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -22,6 +49,8 @@ pub struct SshOptions {
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
+    #[serde(default)]
+    pub player: PlayerOptions,
 }
 
 fn default_port() -> u16 {
@@ -57,6 +86,15 @@ pub(crate) fn load_profiles(path: &Path) -> Result<Profiles> {
     let mut profiles: Profiles =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     for (name, ssh) in &mut profiles.profiles {
+        ensure!(
+            crate::assets::name(&ssh.player.bell),
+            "profile {name}: bell must be a sound name, system, or off"
+        );
+        if let Some(device_key) = &mut ssh.player.device_key
+            && device_key.is_relative()
+        {
+            *device_key = path.parent().unwrap_or(Path::new(".")).join(&*device_key);
+        }
         ensure!(
             !ssh.host.is_empty() && !ssh.user.is_empty() && ssh.port != 0,
             "profile {name}: host, user, and port must be nonempty"
@@ -116,7 +154,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent]\n      [--host-key SHA256:...]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -153,6 +191,7 @@ impl Options {
                         port: 22,
                         authentication: Authentication::Agent,
                         host_key: None,
+                        player: Default::default(),
                     });
                 }
                 "--port" => port = Some(value(&mut args, &arg)?.parse::<u16>()?),
@@ -173,8 +212,10 @@ impl Options {
                     authentication = Some(match value(&mut args, &arg)?.as_str() {
                         "none" => Authentication::None,
                         "agent" => Authentication::Agent,
+                        "password" => Authentication::Password,
+                        "keyboard-interactive" => Authentication::KeyboardInteractive,
                         other => bail!(
-                            "unknown authentication method {other}; use none, agent, or --identity KEY"
+                            "unknown authentication method {other}; use none, agent, password, keyboard-interactive, or --identity KEY"
                         ),
                     });
                 }
@@ -193,6 +234,8 @@ impl Options {
                         Authentication::None => "none",
                         Authentication::Agent => "agent",
                         Authentication::Identity { .. } => "identity",
+                        Authentication::Password => "password",
+                        Authentication::KeyboardInteractive => "keyboard-interactive",
                     }
                 );
             }
@@ -234,6 +277,32 @@ impl Options {
                 port.is_none() && authentication.is_none() && host_key.is_none(),
                 "SSH options require ssh user@host or --profile NAME"
             );
+        }
+        if let Source::Replay(path) = &source {
+            let metadata = path.with_extension("vt.json");
+            if metadata.is_file() {
+                let metadata: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&metadata)?)
+                        .context("reading VT recording geometry")?;
+                ensure!(
+                    metadata["version"] == 1,
+                    "unsupported recording metadata version"
+                );
+                if cols.is_none() {
+                    cols = Some(usize::try_from(
+                        metadata["cols"]
+                            .as_u64()
+                            .context("invalid recording columns")?,
+                    )?);
+                }
+                if rows.is_none() {
+                    rows = Some(usize::try_from(
+                        metadata["rows"]
+                            .as_u64()
+                            .context("invalid recording rows")?,
+                    )?);
+                }
+            }
         }
         ensure!(
             cols.is_none_or(|n| (1..=1000).contains(&n)),

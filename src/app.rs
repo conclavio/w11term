@@ -2,6 +2,7 @@ use crate::{
     input::{KeyboardBridge, Shortcut},
     renderer::{Metrics, PADDING, Renderer, STATUS_HEIGHT},
 };
+use anyhow::Context as _;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -28,6 +29,8 @@ const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
 struct LiveTab {
+    device_busy: bool,
+    device_message: Option<String>,
     session: Session,
     last_size: Rc<Cell<Option<TerminalSize>>>,
     error: Option<String>,
@@ -40,6 +43,9 @@ struct LiveTab {
     scroll_tick: bool,
     gesture: u64,
     find: Find,
+    prompt_id: Option<u64>,
+    answers: Vec<zeroize::Zeroizing<String>>,
+    connection_generation: u64,
 }
 struct Find {
     open: bool,
@@ -95,6 +101,9 @@ struct ProfileDraft {
     fingerprint: String,
     authentication: usize,
     error: Option<String>,
+    player: w11term::options::PlayerOptions,
+    device: Option<w11term::keys::DeviceKey>,
+    generating: bool,
 }
 
 impl Default for ProfileDraft {
@@ -108,6 +117,9 @@ impl Default for ProfileDraft {
             fingerprint: String::new(),
             authentication: 0,
             error: None,
+            player: Default::default(),
+            device: None,
+            generating: false,
         }
     }
 }
@@ -123,10 +135,15 @@ pub enum Field {
 }
 
 pub struct TerminalApp {
+    windows: Rc<RefCell<crate::window_state::Windows>>,
+    window_profile: Option<String>,
+    window_restored: bool,
     // Unhook before dropping tabs and shutting down their independent sessions.
     keyboard: KeyboardBridge,
     _control: Server,
     registry: Registry,
+    control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<w11term::control::UiRequest>>>,
+    control_task: Option<ComponentTask>,
     tabs: Tabs<AppTab>,
     renderer: Rc<RefCell<Renderer>>,
     metrics: Rc<Cell<Metrics>>,
@@ -153,6 +170,25 @@ pub struct TerminalApp {
 }
 
 pub enum Message {
+    DeviceAction(bool),
+    DeviceDone(TabId, bool, Result<String, String>),
+    DraftBell(TabId, String),
+    RestoreWindow,
+    TogglePlayer(String),
+    ControlIdle,
+    Control(w11term::control::UiRequest),
+    ControlResizeDone {
+        pane: u64,
+        cols: usize,
+        rows: usize,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    PromptEdit(TabId, u64, usize, String),
+    PromptReply(TabId, u64, ContentDialogResult),
+    GenerateKey(TabId),
+    KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
+    CopyPublicKey(TabId),
+    DraftPlayer(TabId, String, bool),
     FrameReady(TabId, u64),
     CloseWindow,
     Select(Option<usize>, u64, bool),
@@ -197,6 +233,8 @@ fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            device_busy: false,
+            device_message: None,
             session: Session::start_configured(source, size, osc52),
             last_size: Rc::new(Cell::new(None)),
             error: None,
@@ -209,6 +247,9 @@ fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool
             scroll_tick: false,
             gesture: 0,
             find: Find::default(),
+            prompt_id: None,
+            answers: Vec::new(),
+            connection_generation: 0,
         }),
     }
 }
@@ -226,6 +267,113 @@ fn profile_label(name: &str, ssh: &SshOptions) -> String {
 }
 
 impl TerminalApp {
+    fn watch_control(&mut self, context: &ComponentContext<Self>) {
+        let receiver = self.control_rx.clone();
+        self.control_task = Some(context.spawn_background(move |cancel| {
+            loop {
+                if cancel.is_cancelled() {
+                    return Message::ControlIdle;
+                }
+                match receiver
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(200))
+                {
+                    Ok(request) => return Message::Control(request),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(_) => return Message::ControlIdle,
+                }
+            }
+        }));
+    }
+    fn connection_ui(&mut self, id: TabId) {
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.get_mut(id)
+        else {
+            return;
+        };
+        let frame = tab.session.frames.load();
+        let prompt_id = frame.prompt.as_ref().map(|p| p.id);
+        let changed = prompt_id != tab.prompt_id;
+        self.keyboard
+            .set_game_mode(tab.session.player.read().unwrap().game_mode);
+        if changed {
+            tab.answers = match frame.prompt.as_ref().map(|p| &p.question) {
+                Some(w11term::prompts::Question::Authentication { challenges, .. }) => (0
+                    ..challenges.len())
+                    .map(|_| zeroize::Zeroizing::new(String::new()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            tab.prompt_id = prompt_id;
+        }
+        if tab.connection_generation != frame.connection_generation {
+            tab.connection_generation = frame.connection_generation;
+            self.keyboard.reset_keys();
+        }
+        self.keyboard.set_modal(prompt_id.is_some());
+        if changed {
+            self.keyboard
+                .set_target(if prompt_id.is_none() && !tab.device_busy {
+                    Some((tab.session.input.clone(), tab.session.frames.clone()))
+                } else {
+                    None
+                });
+            self.keyboard
+                .set_search(prompt_id.is_none() && tab.find.open);
+        } else if prompt_id.is_some() || tab.device_busy {
+            self.keyboard.set_target(None);
+        }
+    }
+    fn prompt_view(
+        &self,
+        id: TabId,
+        tab: &LiveTab,
+        prompt: &w11term::prompts::Prompt,
+        context: &ViewContext<Self>,
+    ) -> View {
+        use w11term::prompts::Question;
+        let prompt_id = prompt.id;
+        let (title,primary,children):(String,&str,Vec<View>)=match &prompt.question {
+            Question::HostKey{host,port,algorithm,fingerprint}=>("Trust this SSH host?".into(),"Accept and save",vec![
+                TextBlock::new().text(format!("First connection to {host}:{port}")).text_wrapping(TextWrapping::Wrap).into(),
+                TextBlock::new().text(format!("{algorithm}\n{fingerprint}")).text_wrapping(TextWrapping::Wrap).into(),
+                TextBlock::new().text("Verify this fingerprint with the server owner. Accepting saves it in your OpenSSH known_hosts file.").text_wrapping(TextWrapping::Wrap).into(),
+            ]),
+            Question::Authentication{name,instructions,challenges}=> {
+                let mut children:Vec<View>=vec![TextBlock::new().text(instructions).text_wrapping(TextWrapping::Wrap).into()];
+                for (index,challenge) in challenges.iter().enumerate(){
+                    children.push(TextBlock::new().text(&challenge.label).text_wrapping(TextWrapping::Wrap).into());
+                    let value=tab.answers.get(index).map_or("",|v|v.as_str());
+                    children.push(if challenge.echo {
+                        TextBox::new().text(value).automation_name(&challenge.label).on_text_changed(context.callback(move |value|Message::PromptEdit(id,prompt_id,index,value))).into()
+                    }else{
+                        PasswordBox::new().password(value).automation_name(&challenge.label).password_reveal_mode(PasswordRevealMode::Hidden).on_password_changed(context.callback(move |value|Message::PromptEdit(id,prompt_id,index,value))).into()
+                    });
+                }
+                (if name.is_empty(){"SSH authentication".into()}else{name.clone()},"Sign in",children)
+            }
+        };
+        ContentDialog::new()
+            .is_open(true)
+            .title(title)
+            .primary_button_text(primary)
+            .close_button_text("Cancel")
+            .on_closed(context.callback(move |result| Message::PromptReply(id, prompt_id, result)))
+            .content(
+                StackPanel::new()
+                    .max_width(500.0)
+                    .spacing(12.0)
+                    .keyed_children(
+                        children
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, v)| KeyedView::new(i.to_string(), v)),
+                    ),
+            )
+    }
     fn find(&mut self, close: bool, direction: Option<isize>, context: &ComponentContext<Self>) {
         let Some(id) = self.tabs.active_id() else {
             return;
@@ -910,6 +1058,25 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        let profile = self
+            .tabs
+            .active()
+            .filter(|t| self.profiles.contains_key(&t.label))
+            .map(|t| t.label.clone());
+        if profile != self.window_profile {
+            if let Some(previous) = self.window_profile.take() {
+                let _ = self.windows.borrow_mut().remember(&previous);
+            }
+            self.window_profile = profile;
+            self.restore_window();
+        }
+        let windows = self.windows.clone();
+        let profile = self.window_profile.clone();
+        self.keyboard.on_close(move || {
+            if let Some(name) = &profile {
+                let _ = windows.borrow_mut().remember(name);
+            }
+        });
         if let Some(id) = self.tabs.active_id() {
             self.mru.retain(|i| *i != id);
             self.mru.insert(0, id);
@@ -926,8 +1093,11 @@ impl TerminalApp {
             _ => None,
         };
         self.keyboard.set_target(target);
+        if let Some(id) = self.tabs.active_id() {
+            self.connection_ui(id);
+        }
         self.keyboard.set_search(
-            matches!(self.tabs.active(),Some(AppTab{page:Page::Terminal(tab),..}) if tab.find.open),
+            matches!(self.tabs.active(),Some(AppTab{page:Page::Terminal(tab),..}) if tab.find.open && tab.prompt_id.is_none()),
         );
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {
@@ -949,6 +1119,26 @@ impl TerminalApp {
         self.invalidator.invalidate();
         self.watch_frames(context);
         self.publish_panes();
+    }
+
+    fn restore_window(&self) {
+        if self.initial_grid.get().is_some() {
+            return;
+        }
+        if let Some(name) = &self.window_profile {
+            let windows = self.windows.borrow();
+            if windows.fullscreen() {
+                return;
+            }
+            if windows.restore(name).is_ok()
+                && let Some(placement) = windows.profiles.get(name)
+                && let Some((cols, rows)) = placement.cols.zip(placement.rows)
+                && (1..=1000).contains(&cols)
+                && (1..=500).contains(&rows)
+            {
+                self.initial_grid.set(Some((cols, rows)));
+            }
+        }
     }
 
     fn close_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
@@ -1047,6 +1237,8 @@ impl TerminalApp {
                     }
                 }
                 2 => Authentication::None,
+                3 => Authentication::Password,
+                4 => Authentication::KeyboardInteractive,
                 _ => Authentication::Agent,
             };
             let options = SshOptions {
@@ -1060,6 +1252,7 @@ impl TerminalApp {
                 authentication,
                 host_key: (!draft.fingerprint.trim().is_empty())
                     .then(|| draft.fingerprint.trim().into()),
+                player: draft.player.clone(),
             };
             self.store.add(name, &options)?;
             self.profiles = self.store.load()?;
@@ -1103,6 +1296,7 @@ impl TerminalApp {
         let error_sender = context.sender();
         let geometry_sender = context.sender();
         let initial_grid = self.initial_grid.clone();
+        let window_state = self.windows.clone();
         let window_size = (self.width, self.window_height);
         let terminal_area = self.terminal_area.clone();
         let selection = tab.selection.clone();
@@ -1117,6 +1311,12 @@ impl TerminalApp {
                 hover.borrow().as_ref(),
             )?;
             metrics.set(measured);
+            if initial_grid
+                .get()
+                .is_none_or(|grid| grid == (measured.cols, measured.rows))
+            {
+                window_state.borrow_mut().grid = Some((measured.cols, measured.rows));
+            }
             let scale = measured.scale;
             terminal_area.set(Some((ctx.width, ctx.height, scale)));
             crate::input::set_grid(
@@ -1202,6 +1402,8 @@ impl TerminalApp {
                         "Windows SSH agent",
                         "Private key file",
                         "None (keyless server)",
+                        "Password",
+                        "Keyboard-interactive (password / MFA)",
                     ])
                     .selected_index(draft.authentication)
                     .horizontal_alignment(HorizontalAlignment::Stretch)
@@ -1243,6 +1445,73 @@ impl TerminalApp {
                     .into(),
             );
         }
+        fields.push(
+            Button::new()
+                .is_enabled(!draft.generating)
+                .on_click(context.callback(move |_| Message::GenerateKey(id)))
+                .content(if draft.generating {
+                    "Generating device key…"
+                } else {
+                    "Generate device key (Ed25519)"
+                }),
+        );
+        if let Some(device) = &draft.device {
+            fields.push(
+                TextBlock::new()
+                    .text(format!(
+                        "{} · {}\n{}",
+                        device.device,
+                        device.fingerprint,
+                        device.path.display()
+                    ))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            );
+            fields.push(
+                Button::new()
+                    .on_click(context.callback(move |_| Message::CopyPublicKey(id)))
+                    .content("Copy public key"),
+            );
+            fields.push(TextBlock::new().text("Private key: Windows-user DPAPI encryption and a restricted ACL. For another host, append the copied public line to ~/.ssh/authorized_keys. OpenSSH cannot read the DPAPI file directly.").text_wrapping(TextWrapping::Wrap).into());
+        }
+        for (name, label, value) in [
+            (
+                "rustmush",
+                "Rustmush server (device-key enrollment)",
+                draft.player.rustmush,
+            ),
+            (
+                "game_mode",
+                "Game mode (suppress held-key repeats)",
+                draft.player.game_mode,
+            ),
+            (
+                "reconnect",
+                "Reconnect after a network interruption",
+                draft.player.reconnect,
+            ),
+            ("mute", "Mute this profile", draft.player.mute),
+        ] {
+            fields.push(
+                CheckBox::new()
+                    .is_checked(value)
+                    .on_is_checked_changed(
+                        context.callback(move |value| Message::DraftPlayer(id, name.into(), value)),
+                    )
+                    .content(label),
+            );
+        }
+        fields.push(
+            TextBlock::new()
+                .text("Bell sound name (system, off, or a named WAV)")
+                .into(),
+        );
+        fields.push(
+            TextBox::new()
+                .text(&draft.player.bell)
+                .on_text_changed(context.callback(move |v| Message::DraftBell(id, v)))
+                .into(),
+        );
         fields.push(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
@@ -1371,6 +1640,17 @@ impl Component for TerminalApp {
             }
         }
         let registry = Registry::default();
+        let (control_sender, control_rx) =
+            std::sync::mpsc::sync_channel::<w11term::control::UiRequest>(8);
+        registry.set_ui(move |request| {
+            if let Err(
+                std::sync::mpsc::TrySendError::Full(request)
+                | std::sync::mpsc::TrySendError::Disconnected(request),
+            ) = control_sender.try_send(request)
+            {
+                request.fail("GUI control queue is unavailable or full");
+            }
+        });
         let capture_appearance = appearance.clone();
         let control = Server::start(registry.clone(), move |frame, size, path| {
             let appearance = capture_appearance.read().unwrap().clone();
@@ -1378,9 +1658,14 @@ impl Component for TerminalApp {
         })
         .expect("starting local control pipe");
         let mut app = Self {
+            windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
+            window_profile: None,
+            window_restored: options.cols.is_some() || options.rows.is_some(),
             keyboard,
             _control: control,
             registry,
+            control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
+            control_task: None,
             tabs,
             renderer: Rc::new(RefCell::new(renderer)),
             metrics: Rc::new(Cell::new(Metrics::default())),
@@ -1406,6 +1691,7 @@ impl Component for TerminalApp {
             selection_epoch: 0,
         };
         app.activate(context);
+        app.watch_control(context);
         app.sync_selection(context);
         #[cfg(feature = "ui-smoke")]
         if std::env::var_os("W11TERM_UI_SMOKE").is_some() {
@@ -1428,11 +1714,435 @@ impl Component for TerminalApp {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        if matches!(&message, Message::Control(_)) {
+            self.watch_control(context);
+        }
         match message {
+            Message::DraftBell(id, value) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && value.len() <= 128
+                {
+                    draft.player.bell = value;
+                }
+            }
+            Message::DeviceAction(remove) => {
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(AppTab {
+                        label,
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    && !tab.device_busy
+                {
+                    let result = (|| -> anyhow::Result<_> {
+                        let profile = self
+                            .profiles
+                            .get(label)
+                            .context("Use a saved Rustmush profile")?;
+                        anyhow::ensure!(
+                            profile.player.rustmush,
+                            "Enable Rustmush in this profile first"
+                        );
+                        let path = profile
+                            .player
+                            .device_key
+                            .clone()
+                            .context("Generate a device key in the connect wizard first")?;
+                        anyhow::ensure!(
+                            tab.session.frames.load().connection_generation > 0
+                                && tab.session.prompts.current().is_none(),
+                            "Sign in and reach the game prompt first"
+                        );
+                        Ok((path, profile.user.clone()))
+                    })();
+                    match result {
+                        Ok((path, user)) => {
+                            tab.device_busy = true;
+                            tab.device_message = Some(
+                                if remove {
+                                    "Revoking this device and verifying the server listing…"
+                                } else {
+                                    "Enrolling this device and verifying its fingerprint…"
+                                }
+                                .into(),
+                            );
+                            let input = tab.session.input.clone();
+                            self.keyboard.set_target(None);
+                            context.spawn_background(move |_| {
+                                let result = (|| -> anyhow::Result<String> {
+                                    let key = w11term::keys::describe(&path)?;
+                                    let fingerprint = key.fingerprint.clone();
+                                    tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()?
+                                        .block_on(w11term::enroll::run(input, key, user, remove))?;
+                                    Ok(fingerprint)
+                                })();
+                                Message::DeviceDone(
+                                    id,
+                                    remove,
+                                    result.map_err(|e| format!("{e:#}")),
+                                )
+                            });
+                        }
+                        Err(error) => tab.device_message = Some(format!("{error:#}")),
+                    }
+                }
+            }
+            Message::DeviceDone(id, remove, result) => {
+                let active = self.tabs.active_id() == Some(id);
+                let mut auth_update = None;
+                if let Some(AppTab {
+                    label,
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.get_mut(id)
+                {
+                    tab.device_busy = false;
+                    tab.device_message = Some(match result {
+                        Ok(fingerprint) => {
+                            let result = (|| -> anyhow::Result<()> {
+                                let mut profile = self
+                                    .profiles
+                                    .get(label)
+                                    .context("profile was removed")?
+                                    .clone();
+                                let auth = if remove {
+                                    Authentication::Password
+                                } else {
+                                    Authentication::Identity {
+                                        identity: profile
+                                            .player
+                                            .device_key
+                                            .clone()
+                                            .context("device key path missing")?,
+                                    }
+                                };
+                                profile.authentication = auth.clone();
+                                self.store.update(label, &profile)?;
+                                self.profiles.insert(label.clone(), profile);
+                                auth_update = Some((label.clone(), auth));
+                                Ok(())
+                            })();
+                            match result {
+                                Ok(()) => format!(
+                                    "{} · verified {fingerprint}",
+                                    if remove {
+                                        "Device revoked; future connections use a password"
+                                    } else {
+                                        "Device enrolled; future connections use its key"
+                                    }
+                                ),
+                                Err(error) => format!(
+                                    "Server operation succeeded ({fingerprint}), but saving the profile failed: {error:#}"
+                                ),
+                            }
+                        }
+                        Err(error) => error,
+                    });
+                    if active {
+                        self.keyboard.set_target(Some((
+                            tab.session.input.clone(),
+                            tab.session.frames.clone(),
+                        )));
+                    }
+                }
+                if let Some((label, auth)) = auth_update {
+                    for entry in self.tabs.entries() {
+                        if entry.value.label == label
+                            && let Page::Terminal(tab) = &entry.value.page
+                        {
+                            let _ = tab.session.input.send(Command::Authenticate(auth.clone()));
+                        }
+                    }
+                }
+            }
+            Message::RestoreWindow => {
+                self.restore_window();
+            }
+            Message::TogglePlayer(field) => {
+                if let Some(AppTab {
+                    label,
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active()
+                {
+                    let mut player = tab.session.player.write().unwrap();
+                    match field.as_str() {
+                        "mute" => player.mute = !player.mute,
+                        "game_mode" => player.game_mode = !player.game_mode,
+                        _ => {}
+                    }
+                    if let Some(profile) = self.profiles.get_mut(label) {
+                        profile.player = player.clone();
+                        if let Err(error) = self.store.update(label, profile) {
+                            log::warn!("Saving player preferences: {error:#}");
+                        }
+                    }
+                    let preferences = player.clone();
+                    drop(player);
+                    for entry in self.tabs.entries() {
+                        if entry.value.label == *label
+                            && let Page::Terminal(other) = &entry.value.page
+                        {
+                            *other.session.player.write().unwrap() = preferences.clone();
+                        }
+                    }
+                }
+                if let Some(id) = self.tabs.active_id() {
+                    self.connection_ui(id);
+                }
+            }
+            Message::ControlIdle => {}
+            Message::Control(w11term::control::UiRequest::Open {
+                profile,
+                cols,
+                rows,
+                activate,
+                reply,
+            }) => {
+                let result = (|| -> anyhow::Result<serde_json::Value> {
+                    let ssh = self
+                        .profiles
+                        .get(&profile)
+                        .with_context(|| format!("unknown profile {profile}"))?
+                        .clone();
+                    let metrics = self.metrics.get();
+                    let explicit_grid = cols.is_some() || rows.is_some();
+                    anyhow::ensure!(
+                        !activate || !explicit_grid || !self.windows.borrow().fullscreen(),
+                        "Exit fullscreen before opening an active tab with a different grid; background open is available"
+                    );
+                    let cols = cols.unwrap_or(metrics.cols.max(1));
+                    let rows = rows.unwrap_or(metrics.rows.max(1));
+                    let size = TerminalSize {
+                        cols,
+                        rows,
+                        pixel_width: (cols as f32 * metrics.cell_width * metrics.scale).round()
+                            as usize,
+                        pixel_height: (rows as f32 * metrics.cell_height * metrics.scale).round()
+                            as usize,
+                        dpi: (96.0 * metrics.scale).round() as u32,
+                    };
+                    let previous = self.tabs.active_id();
+                    let id = self.tabs.insert(live_tab_sized(
+                        profile,
+                        Source::Ssh(ssh),
+                        size,
+                        self.appearance.read().unwrap().interaction.osc52,
+                    ));
+                    if !activate && let Some(previous) = previous {
+                        self.tabs.select(previous);
+                    }
+                    self.sync_selection(context);
+                    if activate || previous.is_none() {
+                        if explicit_grid {
+                            self.initial_grid.set(Some((cols, rows)));
+                            self.windows.borrow_mut().grid = Some((cols, rows));
+                        }
+                        self.activate(context);
+                    } else {
+                        self.publish_panes();
+                    }
+                    Ok(
+                        serde_json::json!({"pane":id,"cols":cols,"rows":rows,"active":activate||previous.is_none()}),
+                    )
+                })();
+                let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+            }
+            Message::Control(w11term::control::UiRequest::Resize {
+                pane,
+                cols,
+                rows,
+                reply,
+            }) => {
+                if self.tabs.active_id() == Some(pane) && self.windows.borrow().fullscreen() {
+                    let _ = reply.send(Err(
+                        "Exit fullscreen before resizing the active window grid".into(),
+                    ));
+                    return;
+                }
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.get(pane)
+                {
+                    let metrics = self.metrics.get();
+                    let size = TerminalSize {
+                        cols,
+                        rows,
+                        pixel_width: (cols as f32 * metrics.cell_width * metrics.scale).round()
+                            as usize,
+                        pixel_height: (rows as f32 * metrics.cell_height * metrics.scale).round()
+                            as usize,
+                        dpi: (96.0 * metrics.scale).round() as u32,
+                    };
+                    let _ = tab.session.input.send(Command::Resize(size));
+                    if self.tabs.active_id() == Some(pane) {
+                        self.initial_grid.set(Some((cols, rows)));
+                        self.windows.borrow_mut().grid = Some((cols, rows));
+                        self.client_size.0 +=
+                            (cols as f64 - metrics.cols as f64) * metrics.cell_width as f64;
+                        self.client_size.1 +=
+                            (rows as f64 - metrics.rows as f64) * metrics.cell_height as f64;
+                        self.invalidator.invalidate();
+                    }
+                    context.spawn_background(move |_| {
+                        std::thread::sleep(Duration::from_millis(300));
+                        Message::ControlResizeDone {
+                            pane,
+                            cols,
+                            rows,
+                            reply,
+                        }
+                    });
+                } else {
+                    let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
+                }
+            }
+            Message::ControlResizeDone {
+                pane,
+                cols,
+                rows,
+                reply,
+            } => {
+                let result = if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.get(pane)
+                {
+                    let frame = tab.session.frames.load();
+                    if frame.cols == cols && frame.rows.len() == rows {
+                        Ok(serde_json::json!({"pane":pane,"cols":cols,"rows":rows}))
+                    } else {
+                        self.initial_grid.set(None);
+                        Err(format!(
+                            "requested grid does not fit the current window/display; actual {}x{}",
+                            frame.cols,
+                            frame.rows.len()
+                        ))
+                    }
+                } else {
+                    Err("pane was closed".into())
+                };
+                let _ = reply.send(result);
+            }
+            Message::PromptEdit(id, prompt, index, value) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && tab.prompt_id == Some(prompt)
+                    && value.len() <= 4096
+                    && let Some(answer) = tab.answers.get_mut(index)
+                {
+                    *answer = zeroize::Zeroizing::new(value);
+                }
+            }
+            Message::PromptReply(id, prompt, result) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && tab.prompt_id == Some(prompt)
+                {
+                    let question = tab.session.prompts.current();
+                    let answer = if result == ContentDialogResult::Primary {
+                        match question.map(|p| p.question) {
+                            Some(w11term::prompts::Question::HostKey { .. }) => {
+                                w11term::prompts::Answer::Trust(true)
+                            }
+                            _ => w11term::prompts::Answer::Authentication(std::mem::take(
+                                &mut tab.answers,
+                            )),
+                        }
+                    } else {
+                        w11term::prompts::Answer::Cancel
+                    };
+                    let _ = tab.session.prompts.answer(prompt, answer);
+                    tab.answers.clear();
+                }
+            }
+            Message::GenerateKey(id) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && !draft.generating
+                {
+                    draft.generating = true;
+                    draft.error = None;
+                    let name = draft.name.clone();
+                    context.spawn_background(move |_| {
+                        Message::KeyGenerated(
+                            id,
+                            w11term::keys::generate(&name).map_err(|e| format!("{e:#}")),
+                        )
+                    });
+                }
+            }
+            Message::KeyGenerated(id, result) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                {
+                    draft.generating = false;
+                    match result {
+                        Ok(key) => {
+                            draft.identity = key.path.to_string_lossy().into_owned();
+                            draft.player.device_key = Some(key.path.clone());
+                            draft.authentication = if draft.player.rustmush { 3 } else { 1 };
+                            if let Err(e) = w11term::clipboard::write(&key.public_line) {
+                                draft.error =
+                                    Some(format!("Public key generated; clipboard: {e:#}"));
+                            }
+                            draft.device = Some(key);
+                        }
+                        Err(e) => draft.error = Some(e),
+                    }
+                }
+            }
+            Message::CopyPublicKey(id) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get(id)
+                    && let Some(key) = &draft.device
+                    && let Err(e) = w11term::clipboard::write(&key.public_line)
+                {
+                    log::warn!("Copying public key: {e:#}");
+                }
+            }
+            Message::DraftPlayer(id, field, value) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                {
+                    match field.as_str() {
+                        "rustmush" => {
+                            draft.player.rustmush = value;
+                            if value {
+                                draft.player.game_mode = true;
+                                draft.authentication = 3;
+                            }
+                        }
+                        "game_mode" => draft.player.game_mode = value,
+                        "reconnect" => draft.player.reconnect = value,
+                        "mute" => draft.player.mute = value,
+                        _ => {}
+                    }
+                }
+            }
             #[cfg(feature = "ui-smoke")]
             Message::Smoke(step) => self.smoke_step(step, context),
             Message::FrameReady(id, epoch) => {
                 if self.tabs.active_id() == Some(id) && self.watch_epoch == epoch {
+                    self.connection_ui(id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -1471,6 +2181,9 @@ impl Component for TerminalApp {
                 }
             }
             Message::CloseWindow => {
+                if let Some(name) = &self.window_profile {
+                    let _ = self.windows.borrow_mut().remember(name);
+                }
                 let _ = context.window().request_close();
             }
             Message::SyncSelection(epoch) => {
@@ -1513,6 +2226,17 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::Fullscreen => {
+                    if let Err(error) = self.windows.borrow_mut().toggle() {
+                        log::warn!("Fullscreen: {error:#}");
+                    }
+                    self.invalidator.invalidate();
+                }
+                Shortcut::RememberWindow => {
+                    if let Some(name) = &self.window_profile {
+                        let _ = self.windows.borrow_mut().remember(name);
+                    }
+                }
                 Shortcut::Find => self.find(false, None, context),
                 Shortcut::FindNext => self.find(false, Some(1), context),
                 Shortcut::FindPrevious => self.find(false, Some(-1), context),
@@ -1701,6 +2425,13 @@ impl Component for TerminalApp {
             Message::WindowSize(size) => {
                 self.width = size.width;
                 self.window_height = size.height;
+                if !self.window_restored {
+                    self.window_restored = true;
+                    context.spawn_background(|_| {
+                        std::thread::sleep(Duration::from_millis(200));
+                        Message::RestoreWindow
+                    });
+                }
             }
             Message::Geometry(width, height) => {
                 self.client_size = (width, height);
@@ -1901,10 +2632,22 @@ impl Component for TerminalApp {
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
+                    MenuItem::item("fullscreen", "Toggle fullscreen (F11)"),
+                    MenuItem::item("mute", "Toggle profile mute"),
+                    MenuItem::item("game-mode", "Toggle game mode (suppress key repeat)"),
+                    MenuItem::item("enroll", "Enroll this device (at game prompt)"),
+                    MenuItem::item("forget-device", "Forget this device (revoke game key)"),
                 ],
                 context.callback(|item: String| match item.as_str() {
                     "Paste" => Message::Paste,
                     "Paste raw (no bracketed paste)" => Message::PasteRaw,
+                    "Toggle fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
+                    "Toggle profile mute" => Message::TogglePlayer("mute".into()),
+                    "Toggle game mode (suppress key repeat)" => {
+                        Message::TogglePlayer("game_mode".into())
+                    }
+                    "Enroll this device (at game prompt)" => Message::DeviceAction(false),
+                    "Forget this device (revoke game key)" => Message::DeviceAction(true),
                     _ => Message::SettingsMenu,
                 }),
             ));
@@ -1998,6 +2741,38 @@ impl Component for TerminalApp {
                     ),
             ));
         }
+        if let Some(id) = self.tabs.active_id()
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get(id)
+            && let Some(prompt) = &tab.session.frames.load().prompt
+        {
+            views.push(KeyedView::new(
+                format!("prompt-{}", prompt.id),
+                self.prompt_view(id, tab, prompt, context),
+            ));
+        }
+        if let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.active()
+            && let Some(message) = &tab.device_message
+        {
+            views.push(KeyedView::new(
+                "device-message",
+                Border::new()
+                    .grid_row(1)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .background(Color::rgb(40, 42, 48))
+                    .padding(10.0)
+                    .content(
+                        TextBlock::new()
+                            .text(message)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ),
+            ));
+        }
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .background(Color::rgb(14, 16, 20))
@@ -2008,6 +2783,10 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_PLAYER_SMOKE").is_some() {
+            self.player_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_SEARCH_SMOKE").is_some() {
             self.search_smoke_step(step, context);
             return;
@@ -2196,6 +2975,96 @@ impl TerminalApp {
             std::thread::sleep(std::time::Duration::from_millis(500));
             Message::Smoke(step + 1)
         });
+    }
+    fn player_smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        use w11term::prompts::{Answer, Challenge, Question};
+        eprintln!("Player UI smoke step {step}");
+        match step {
+            0 | 2 => {
+                let Page::Terminal(tab) = &self.tabs.get(1).unwrap().page else {
+                    panic!()
+                };
+                let prompts = tab.session.prompts.clone();
+                context.spawn_background(move |_|{let question=if step==0{Question::HostKey{host:"loopback.test".into(),port:22,algorithm:"ssh-ed25519".into(),fingerprint:"SHA256:test-fingerprint".into()}}else{Question::Authentication{name:"MFA test".into(),instructions:"Isolated native prompt test".into(),challenges:vec![Challenge{label:"Account".into(),echo:true},Challenge{label:"Password".into(),echo:false}]}};
+                    let answer=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(prompts.ask(question)).unwrap();
+                    if step==0{assert!(matches!(answer,Answer::Trust(true)));}else{assert!(matches!(answer,Answer::Authentication(ref v)if v.len()==2&&v[0].as_str()=="pilot"&&v[1].as_str()=="secret"));}Message::Smoke(step+2)
+                });
+                context.spawn_background(move |_| {
+                    std::thread::sleep(Duration::from_millis(500));
+                    Message::Smoke(step + 1)
+                });
+            }
+            1 | 3 => {
+                let Page::Terminal(tab) = &self.tabs.get(1).unwrap().page else {
+                    panic!()
+                };
+                let prompt = tab.session.prompts.current().unwrap();
+                assert_eq!(tab.prompt_id, Some(prompt.id));
+                assert!(!self.keyboard.has_target());
+                if step == 3 {
+                    self.update(
+                        Message::PromptEdit(1, prompt.id, 0, "pilot".into()),
+                        context,
+                    );
+                    self.update(
+                        Message::PromptEdit(1, prompt.id, 1, "secret".into()),
+                        context,
+                    );
+                }
+                self.update(
+                    Message::PromptReply(1, prompt.id, ContentDialogResult::Primary),
+                    context,
+                );
+            }
+            4 => {
+                self.windows.borrow_mut().remember("ui-smoke").unwrap();
+                self.update(Message::Shortcut(Shortcut::Fullscreen), context);
+                assert!(self.windows.borrow().fullscreen());
+                context.spawn_background(|_| {
+                    std::thread::sleep(Duration::from_millis(250));
+                    Message::Smoke(5)
+                });
+            }
+            5 => {
+                let expected = {
+                    let windows = self.windows.borrow();
+                    let placement = &windows.profiles["ui-smoke"];
+                    (placement.cols, placement.rows)
+                };
+                self.windows.borrow_mut().remember("ui-smoke").unwrap();
+                {
+                    let windows = self.windows.borrow();
+                    let placement = &windows.profiles["ui-smoke"];
+                    assert_eq!(
+                        (placement.cols, placement.rows),
+                        expected,
+                        "fullscreen replaced the saved normal grid"
+                    );
+                }
+                self.update(Message::Shortcut(Shortcut::Fullscreen), context);
+                assert!(!self.windows.borrow().fullscreen());
+                self.utility(false, context);
+                context.spawn_background(|_| {
+                    std::thread::sleep(Duration::from_millis(250));
+                    Message::Smoke(6)
+                });
+            }
+            6 => {
+                assert!(!self.keyboard.has_target());
+                let id = self.tabs.active_id().unwrap();
+                self.update(Message::DraftPlayer(id, "rustmush".into(), true), context);
+                let Page::NewProfile(draft) = &self.tabs.get(id).unwrap().page else {
+                    panic!()
+                };
+                assert_eq!(draft.authentication, 3);
+                assert!(draft.player.game_mode);
+                eprintln!(
+                    "Player UI smoke passed: trust and private/native prompts, fullscreen roundtrip, expanded wizard."
+                );
+                let _ = context.window().request_close();
+            }
+            _ => {}
+        }
     }
     fn search_smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
         eprintln!("Search UI smoke step {step}");

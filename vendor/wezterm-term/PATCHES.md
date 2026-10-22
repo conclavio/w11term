@@ -8,4 +8,8 @@ Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27
 
 Regression coverage is in the parent project's `terminal.rs` unit tests and the loopback SSH session test. Keep this change isolated when updating upstream.
 
+- `src/terminal.rs` / `terminalstate/performer.rs`: forward only private OSC 440 through an application alert. The host validates the version, verb, names, and queue policy. No general unknown-OSC execution hook is added.
+- `src/terminal.rs` / `terminalstate/mod.rs`: reset parser and negotiated modes on a new SSH transport while retaining the primary screen/scrollback and discarding old kitty transmission state.
+- `src/terminalstate/kitty.rs`: bound direct transmission/inflate/image-table resources, reject local file/shared-memory transports for this SSH-only embedding, and account for replacement of image id zero. See the parent project's graphics audit for the exact scope and remaining limits.
+
 The original MIT license is preserved in `LICENSE.md`.

@@ -16,6 +16,8 @@ $port = $probe.LocalEndpoint.Port
 $probe.Stop()
 $peer = $null
 $terminal = $null
+$oldDataDir = $env:W11TERM_DATA_DIR
+$env:W11TERM_DATA_DIR = Join-Path $state 'data'
 function Invoke-Control([string[]]$Arguments) {
     $raw = & $ctl --pid $terminal.Id @Arguments
     $result = $raw | ConvertFrom-Json
@@ -66,15 +68,53 @@ try {
     if ([Convert]::ToHexString($png[0..7]) -ne '89504E470D0A1A0A' -or $image.width -le 0 -or $image.height -le 0) { throw 'Invalid PNG capture' }
     $listing = Invoke-Control @('list')
     if ($listing.sessions[0].active -or -not $listing.sessions[1].active) { throw 'Control changed tab selection' }
+    $waited = Invoke-Control @('wait-for-text', '--pane', '1', '--regex', '--timeout', '5', 'BOARD')
+    if (-not $waited.matched) { throw 'wait-for-text failed' }
+    $null = Invoke-Control @('resize', '--pane', '1', '--cols', '160', '--rows', '40')
+    $resized = Invoke-Control @('get-text', '--pane', '1')
+    if ($resized.cols -ne 160 -or $resized.rows -ne 40) { throw 'Background resize failed' }
+    $opened = Invoke-Control @('open', '--profile', 'first', '--cols', '130', '--rows', '35')
+    if ($opened.active) { throw 'open selected a background tab' }
+    $null = Invoke-Control @('wait-for-text', '--pane', [string]$opened.pane, '--timeout', '5', 'Loopback SSH echo')
+    $listing = Invoke-Control @('list')
+    if ($listing.sessions.Count -ne 3 -or -not $listing.sessions[1].active) { throw 'open changed active tab' }
+    $null = Invoke-Control @('resize', '--pane', '2', '--cols', '150', '--rows', '42')
+    $capture = Join-Path $state 'recording.vt'
+    $null = Invoke-Control @('record', '--pane', '1', $capture)
+    $null = Invoke-Control @('send-text', '--pane', '1', '--no-paste', "TAPE`r")
+    $null = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '5', 'TAPE')
+    $recorded = Invoke-Control @('record', '--pane', '1', '--stop')
+    if ($recorded.bytes -le 0 -or -not (Test-Path -LiteralPath $capture) -or -not (Test-Path -LiteralPath (Join-Path $state 'recording.vt.json'))) { throw 'VT recording failed' }
+    $events = Invoke-Control @('events', '--pane', '1', '--since', '0')
+    if ($events.journal.events.kind -notcontains 'recording-stopped') { throw 'Recording event missing' }
+    $errorReply = & $ctl --pid $terminal.Id wait-for-text --pane 1 --timeout 1 'NO SUCH TEXT EXISTS' | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $errorReply.ok -or $errorReply.error -notmatch 'timed out') { throw 'wait timeout must fail with JSON' }
     $errorReply = & $ctl --pid $terminal.Id get-text --pane 999 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 1 -or $errorReply.ok -or $errorReply.error -notmatch 'unknown pane') { throw 'Missing pane should fail with JSON' }
     $errorReply = & $ctl --pid 4294967295 list | ConvertFrom-Json
     if ($LASTEXITCODE -ne 1 -or $errorReply.ok -or $errorReply.error -notmatch 'nothing was started') { throw 'Missing instance should fail without starting anything' }
-    Write-Output "Control smoke passed: two SSH panes at 170x48, raw input and PNG capture on an inactive pane, selection preserved, JSON failures. Artifacts: $state"
+    $null = $terminal.CloseMainWindow()
+    if (-not $terminal.WaitForExit(5000)) { throw 'GUI failed to close' }
+    $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'second') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'restored.log') -RedirectStandardError (Join-Path $state 'restored.err')
+    $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($terminal.Id).json"
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not (Test-Path -LiteralPath $manifest)) {
+        if ($terminal.HasExited -or [DateTime]::UtcNow -gt $deadline) { throw 'Restored GUI did not start' }
+        Start-Sleep -Milliseconds 50
+    }
+    do {
+        $listing = Invoke-Control @('list')
+        if ($listing.sessions[0].cols -eq 150 -and $listing.sessions[0].rows -eq 42) { break }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if ($listing.sessions[0].cols -ne 150 -or $listing.sessions[0].rows -ne 42) { throw "Saved profile window was not restored: $($listing | ConvertTo-Json -Compress)" }
+    Write-Output "Control smoke passed: SSH launch geometry, inactive raw input/PNG, event-driven waits, background open, active/background resize, recording/events, saved window restore, selection preserved, JSON failures. Artifacts: $state"
 } finally {
     if ($terminal -and -not $terminal.HasExited) {
         $null = $terminal.CloseMainWindow()
         if (-not $terminal.WaitForExit(5000)) { Stop-Process -Id $terminal.Id }
     }
     if ($peer -and -not $peer.HasExited) { Stop-Process -Id $peer.Id }
+    $env:W11TERM_DATA_DIR = $oldDataDir
 }
+if (-not (Test-Path -LiteralPath (Join-Path $state 'data/windows.json'))) { throw 'Window placement was not saved on native close' }

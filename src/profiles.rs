@@ -22,6 +22,16 @@ impl ProfileStore {
     }
 
     pub fn add(&self, name: &str, options: &SshOptions) -> Result<()> {
+        self.write(name, options, false)
+    }
+    pub fn update(&self, name: &str, options: &SshOptions) -> Result<()> {
+        self.write(name, options, true)
+    }
+    fn write(&self, name: &str, options: &SshOptions, replace: bool) -> Result<()> {
+        ensure!(
+            crate::assets::name(&options.player.bell),
+            "Bell must be system, off, or a sound name (letters, digits, _ and -)"
+        );
         ensure!(!name.trim().is_empty(), "Enter a profile name");
         ensure!(
             name == name.trim(),
@@ -46,10 +56,16 @@ impl ProfileStore {
             .and_then(|v| v.as_object_mut())
             .context("Configuration must contain a profiles object")?;
         ensure!(
-            !profiles.contains_key(name),
-            "A profile named {name} already exists"
+            profiles.contains_key(name) == replace,
+            "Profile {name} was removed or already exists"
         );
-        profiles.insert(name.into(), serde_json::to_value(options)?);
+        let mut value = profiles.get(name).cloned().unwrap_or(serde_json::json!({}));
+        let object = value.as_object_mut().context("profile must be an object")?;
+        object.remove("identity");
+        for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
+            object.insert(key.clone(), value.clone());
+        }
+        profiles.insert(name.into(), value);
         // Validate the serialized profile, including its selected authentication mode.
         let _ = serde_json::from_value::<crate::options::Profiles>(document.clone())?;
         let parent = self
@@ -94,6 +110,7 @@ mod tests {
                 identity: "local-key".into(),
             },
             host_key: None,
+            player: Default::default(),
         };
         store.add("new", &options).unwrap();
         let saved = std::fs::read(&path).unwrap();

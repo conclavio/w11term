@@ -3466,10 +3466,12 @@ dependencies = [
  "image",
  "log",
  "rand 0.10.3",
+ "regex",
  "russh",
  "russh-sftp",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "termwiz",
  "tokio",
@@ -3481,6 +3483,7 @@ dependencies = [
  "windows-numerics 0.3.1",
  "windows-reactor",
  "windows-reactor-setup",
+ "zeroize",
 ]
 
 [[package]]

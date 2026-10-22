@@ -35,6 +35,9 @@ struct State {
     search: bool,
     wheel_remainder: i32,
     zoom_remainder: i32,
+    modal: bool,
+    game_mode: bool,
+    close_handler: Option<Box<dyn Fn()>>,
 }
 
 struct Target {
@@ -44,6 +47,8 @@ struct Target {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Shortcut {
+    Fullscreen,
+    RememberWindow,
     NextTab,
     PreviousTab,
     NewTab,
@@ -67,6 +72,10 @@ pub struct KeyboardBridge {
     messages: HHOOK,
     focus: HHOOK,
     mouse: HHOOK,
+}
+
+pub fn window() -> Option<HWND> {
+    INPUT.with(|s| s.borrow().as_ref().and_then(|s| s.window))
 }
 
 impl KeyboardBridge {
@@ -112,6 +121,9 @@ impl KeyboardBridge {
                 search: false,
                 wheel_remainder: 0,
                 zoom_remainder: 0,
+                modal: false,
+                game_mode: false,
+                close_handler: None,
             })
         });
         Ok(Self {
@@ -159,6 +171,38 @@ impl KeyboardBridge {
                 if let Some(target) = &s.target {
                     let _ = target.sender.send(Command::Focus(!visible));
                 }
+            }
+        });
+    }
+    pub fn set_modal(&self, visible: bool) {
+        INPUT.with(|i| {
+            if let Some(s) = i.borrow_mut().as_mut() {
+                if visible {
+                    s.release_keys();
+                }
+                s.modal = visible;
+            }
+        });
+    }
+    pub fn on_close(&self, handler: impl Fn() + 'static) {
+        INPUT.with(|state| {
+            if let Some(state) = state.borrow_mut().as_mut() {
+                state.close_handler = Some(Box::new(handler));
+            }
+        });
+    }
+    pub fn reset_keys(&self) {
+        INPUT.with(|i| {
+            if let Some(s) = i.borrow_mut().as_mut() {
+                s.pressed.clear();
+                s.surrogate = None;
+            }
+        });
+    }
+    pub fn set_game_mode(&self, game: bool) {
+        INPUT.with(|i| {
+            if let Some(s) = i.borrow_mut().as_mut() {
+                s.game_mode = game;
             }
         });
     }
@@ -337,7 +381,28 @@ unsafe extern "system" fn window_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    // Persist before native destruction; a queued component message can be
+    // retired with the window before it gets a chance to inspect its HWND.
+    if message == WM_CLOSE {
+        INPUT.with(|state| {
+            if let Ok(state) = state.try_borrow()
+                && let Some(state) = state.as_ref()
+                && let Some(handler) = &state.close_handler
+            {
+                handler();
+            }
+        });
+    }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    if matches!(message, WM_EXITSIZEMOVE | WM_CLOSE) {
+        INPUT.with(|s| {
+            if let Ok(s) = s.try_borrow()
+                && let Some(s) = s.as_ref()
+            {
+                (s.shortcut)(Shortcut::RememberWindow);
+            }
+        });
+    }
     if message == WM_SIZING && lparam.0 != 0 {
         INPUT.with(|i| {
             if let Ok(state) = i.try_borrow()
@@ -417,6 +482,7 @@ impl State {
                     key,
                     modifiers: KeyModifiers::NONE,
                     down: false,
+                    repeat: false,
                 });
             }
         } else {
@@ -446,6 +512,16 @@ impl State {
             }
         }
         let vk = message.wParam.0 as u32;
+        if self.modal {
+            return false;
+        }
+        if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_F11.0 as u32 {
+            if message.lParam.0 & (1 << 30) == 0 {
+                (self.shortcut)(Shortcut::Fullscreen);
+            }
+            self.swallowed.insert(vk);
+            return true;
+        }
         let mut mods = modifiers();
         if self.switcher {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP)
@@ -615,6 +691,20 @@ impl State {
                     let _ = sender.send(Command::ReloadDemo);
                     return true;
                 }
+                let repeat = self.pressed.contains_key(&vk) || message.lParam.0 & (1 << 30) != 0;
+                if repeat {
+                    if let Some(key) = self.pressed.get(&vk)
+                        && !self.game_mode
+                    {
+                        let _ = sender.send(Command::Key {
+                            key: *key,
+                            modifiers: mods,
+                            down: true,
+                            repeat: true,
+                        });
+                    }
+                    return true;
+                }
                 let key = special_key(vk).or_else(|| {
                     let mut keyboard = [0u8; 256];
                     unsafe {
@@ -668,6 +758,7 @@ impl State {
                         key,
                         modifiers: mods,
                         down: true,
+                        repeat: false,
                     });
                     true
                 } else {
@@ -681,6 +772,7 @@ impl State {
                         key,
                         modifiers: mods,
                         down: false,
+                        repeat: false,
                     });
                     return true;
                 }
@@ -820,6 +912,9 @@ mod tests {
             search: false,
             wheel_remainder: 0,
             zoom_remainder: 0,
+            modal: false,
+            game_mode: false,
+            close_handler: None,
         };
         state.retarget(Some(Target {
             sender: new,
@@ -830,6 +925,7 @@ mod tests {
             Command::Key {
                 key: KeyCode::Char('x'),
                 down: false,
+                repeat: false,
                 ..
             }
         ));
@@ -859,6 +955,66 @@ mod tests {
             "find text must stay in the native textbox"
         );
         state.search = false;
+        state.game_mode = true;
+        let key_message = |message, repeat| MSG {
+            message,
+            wParam: WPARAM(0x27),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        assert!(state.handle(&key_message(WM_KEYDOWN, false)));
+        for _ in 0..5 {
+            assert!(state.handle(&key_message(WM_KEYDOWN, true)));
+        }
+        assert!(state.handle(&key_message(WM_KEYUP, false)));
+        assert!(matches!(
+            new_input.try_recv().unwrap(),
+            Command::Key {
+                down: true,
+                repeat: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            new_input.try_recv().unwrap(),
+            Command::Key {
+                down: false,
+                repeat: false,
+                ..
+            }
+        ));
+        assert!(
+            new_input.try_recv().is_err(),
+            "game-mode repeats leaked to SSH"
+        );
+        state.game_mode = false;
+        state.handle(&key_message(WM_KEYDOWN, false));
+        state.handle(&key_message(WM_KEYDOWN, true));
+        state.handle(&key_message(WM_KEYUP, false));
+        assert!(matches!(
+            new_input.try_recv().unwrap(),
+            Command::Key {
+                down: true,
+                repeat: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            new_input.try_recv().unwrap(),
+            Command::Key {
+                down: true,
+                repeat: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            new_input.try_recv().unwrap(),
+            Command::Key {
+                down: false,
+                repeat: false,
+                ..
+            }
+        ));
         state.retarget(None);
         assert!(matches!(
             new_input.try_recv().unwrap(),

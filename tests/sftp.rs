@@ -330,7 +330,15 @@ async fn fixture(
         port,
         authentication: Authentication::None,
         host_key: Some(pin),
+        player: Default::default(),
     }));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while session.frames.load().connection_generation == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("SSH fixture did not connect");
     (session, root, opens, server)
 }
 async fn request(op: Value) -> control::Reply {
@@ -355,6 +363,184 @@ fn registry(session: &Session) -> Registry {
         input: session.input.clone(),
     }]);
     r
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_failure() {
+    use sha2::{Digest, Sha256};
+    let (session, root, opens, server) = fixture(false).await;
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("assets/sounds")).unwrap();
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&836u32.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&8000u32.to_le_bytes());
+    wav.extend_from_slice(&8000u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&8u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&800u32.to_le_bytes());
+    wav.extend_from_slice(&[128; 800]);
+    let hash: String = Sha256::digest(&wav)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    fs::write(root.path().join("assets/sounds/shot.wav"), &wav).unwrap();
+    let manifest = |version: &str, hash: &str| json!({"version":1,"pack_version":version,"files":[{"name":"shot","path":"sounds/shot.wav","kind":"sound","sha256":hash,"size":wav.len()}]});
+    fs::write(
+        root.path().join("assets/manifest.json"),
+        serde_json::to_vec(&manifest("pack1", &hash)).unwrap(),
+    )
+    .unwrap();
+    let (input, mut jobs) = tokio::sync::mpsc::unbounded_channel();
+    let commands = session.input.clone();
+    let bridge = tokio::spawn(async move {
+        while let Some(w11term::terminal::TransportInput::Sftp(job)) = jobs.recv().await {
+            commands.send(Command::Sftp(job)).unwrap();
+        }
+    });
+    let store = w11term::assets::Store::default();
+    let sync = |version: &str| {
+        w11term::assets::sync_into(
+            input.clone(),
+            "test@loopback:22".into(),
+            version.into(),
+            store.clone(),
+            cache.path().into(),
+        )
+    };
+    assert_eq!(sync("pack1").await.unwrap(), 1);
+    let path = store.sound("shot").unwrap();
+    assert_eq!(fs::read(&path).unwrap(), wav);
+    fs::remove_file(root.path().join("assets/sounds/shot.wav")).unwrap();
+    assert_eq!(
+        sync("pack1").await.unwrap(),
+        0,
+        "unchanged content must not be fetched again"
+    );
+    fs::write(root.path().join("assets/sounds/shot.wav"), &wav).unwrap();
+    fs::write(
+        root.path().join("assets/manifest.json"),
+        serde_json::to_vec(&manifest("pack2", &"0".repeat(64))).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        sync("pack2")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("mismatch")
+    );
+    assert_eq!(store.version(), "pack1");
+    assert_eq!(store.sound("shot"), Some(path));
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "asset traffic must reuse the established SSH and SFTP channels"
+    );
+    bridge.abort();
+    drop(session);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
+    let (session, _root, _opens, server) = fixture(false).await;
+    session.player.write().unwrap().mute = true;
+    let registry = registry(&session);
+    let capture: w11term::control::CapturePng = Arc::new(|_, _, _| anyhow::bail!("unused"));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bug.vt");
+    registry
+        .execute(
+            Request::Record {
+                pane: 1,
+                path: Some(path.clone()),
+            },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    let bytes=b"recorded fps=144\x07\x1b]0;Event title\x1b\\\x1b]9;Test notification\x1b\\\x1b]440;1;play;shot\x1b\\";
+    let (reply, response) = tokio::sync::oneshot::channel();
+    session
+        .input
+        .send(Command::Raw(bytes.to_vec(), reply))
+        .unwrap();
+    response.await.unwrap().unwrap();
+    registry
+        .execute(
+            Request::WaitForText {
+                pane: 1,
+                pattern: "fps=144".into(),
+                regex: false,
+                timeout_seconds: 3,
+            },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut cursor = 0;
+    let mut events = Vec::new();
+    loop {
+        let batch = session.events.wait(cursor, Duration::from_secs(1)).await;
+        cursor = batch.next;
+        events.extend(batch.events);
+        if events.iter().any(|e| e.kind == "sound") {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+    }
+    assert!(events.iter().any(|e| e.kind == "bell"));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "title" && e.data["title"] == "Event title")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "notification" && e.data["body"] == "Test notification")
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.kind == "sound")
+            .all(|e| e.data["outcome"] == "muted")
+    );
+    let result = registry
+        .execute(
+            Request::Record {
+                pane: 1,
+                path: None,
+            },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["bytes"], bytes.len());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(path.with_extension("vt.json").is_file());
+    assert!(
+        registry
+            .execute(
+                Request::Record {
+                    pane: 1,
+                    path: Some(path)
+                },
+                capture
+            )
+            .await
+            .is_err(),
+        "recordings must not overwrite an existing bug capture"
+    );
+    drop(session);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

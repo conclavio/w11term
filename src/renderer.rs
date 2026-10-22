@@ -1,5 +1,5 @@
 use crate::native_drawing::{GpuImage, NativeDrawing, Typography};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use w11term::terminal::{Snapshot, colors, rgba};
 use wezterm_term::{Intensity, Underline, image::ImageDataType};
 use windows_canvas::{
@@ -270,6 +270,35 @@ impl Renderer {
         }
         let scale = (native.dpi() / 96.0).max(0.5);
         self.measure(width, height, scale);
+        // Keep GPU ownership tied to the current visible model. Replacing an id,
+        // deleting a placement, changing tabs, or scrolling releases obsolete textures.
+        let mut live = HashSet::new();
+        for line in frame.rows.iter().take(self.metrics.rows) {
+            for cell in line
+                .visible_cells()
+                .take_while(|c| c.cell_index() < self.metrics.cols)
+            {
+                if let Some(images) = cell.attrs().images() {
+                    for tile in images.iter() {
+                        let data = tile.image_data();
+                        let guard = data.data();
+                        live.insert(match &*guard {
+                            ImageDataType::Rgba8 { hash, .. } => *hash,
+                            ImageDataType::AnimRgba8 { hashes, .. } if !hashes.is_empty() => {
+                                hashes[0]
+                            }
+                            _ => data.hash(),
+                        });
+                    }
+                }
+            }
+        }
+        self.images.retain(|key, _| live.contains(key));
+        self.tile_bytes = self
+            .images
+            .values()
+            .map(|i| i.width as usize * i.height as usize * 4)
+            .sum();
         let cw = self.metrics.cell_width;
         let ch = self.metrics.cell_height;
         let background = rgba(frame.palette.background);
@@ -444,6 +473,7 @@ impl Renderer {
         frame: &Snapshot,
         below_text: bool,
     ) -> windows_canvas::Result<()> {
+        let mut tiles = Vec::new();
         for (row, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             for cell in line
                 .visible_cells()
@@ -456,89 +486,105 @@ impl Renderer {
                     .iter()
                     .filter(|tile| (tile.z_index() < 0) == below_text)
                 {
-                    let data = tile.image_data();
-                    let guard = data.data();
-                    let key = match &*guard {
-                        ImageDataType::Rgba8 { hash, .. } => *hash,
-                        ImageDataType::AnimRgba8 { hashes, .. } if !hashes.is_empty() => hashes[0],
-                        _ => data.hash(),
-                    };
-                    if !self.images.contains_key(&key) {
-                        let decoded;
-                        let (pixels, width, height) = match &*guard {
-                            ImageDataType::Rgba8 {
-                                data,
-                                width,
-                                height,
-                                ..
-                            } => (data.as_slice(), *width, *height),
-                            ImageDataType::AnimRgba8 {
-                                frames,
-                                width,
-                                height,
-                                ..
-                            } if !frames.is_empty() => (frames[0].as_slice(), *width, *height),
-                            ImageDataType::EncodedFile(bytes) => {
-                                let Ok(image) = image::load_from_memory(bytes) else {
-                                    continue;
-                                };
-                                decoded = image.to_rgba8();
-                                (
-                                    decoded.as_raw().as_slice(),
-                                    decoded.width(),
-                                    decoded.height(),
-                                )
-                            }
-                            _ => continue,
-                        };
-                        let Some(bytes) = (width as usize)
-                            .checked_mul(height as usize)
-                            .and_then(|n| n.checked_mul(4))
+                    tiles.push((row, cell.cell_index(), tile.clone()));
+                }
+            }
+        }
+        // Sort all placements in each layer, including overlapping placements
+        // anchored in different cells. Stable ties preserve model order.
+        tiles.sort_by_key(|(_, _, tile)| tile.z_index());
+        for (row, column, tile) in tiles {
+            let data = tile.image_data();
+            let guard = data.data();
+            let key = match &*guard {
+                ImageDataType::Rgba8 { hash, .. } => *hash,
+                ImageDataType::AnimRgba8 { hashes, .. } if !hashes.is_empty() => hashes[0],
+                _ => data.hash(),
+            };
+            if !self.images.contains_key(&key) {
+                let decoded;
+                let (pixels, width, height) = match &*guard {
+                    ImageDataType::Rgba8 {
+                        data,
+                        width,
+                        height,
+                        ..
+                    } => (data.as_slice(), *width, *height),
+                    ImageDataType::AnimRgba8 {
+                        frames,
+                        width,
+                        height,
+                        ..
+                    } if !frames.is_empty() => (frames[0].as_slice(), *width, *height),
+                    ImageDataType::EncodedFile(bytes) => {
+                        let Ok(mut reader) = image::ImageReader::new(std::io::Cursor::new(bytes))
+                            .with_guessed_format()
                         else {
                             continue;
                         };
-                        // Bound this renderer's GPU cache. The engine owns its own image storage.
-                        if bytes > 32 * 1024 * 1024 {
+                        let mut limits = image::Limits::default();
+                        limits.max_image_width = Some(4096);
+                        limits.max_image_height = Some(4096);
+                        limits.max_alloc = Some(32 * 1024 * 1024);
+                        reader.limits(limits);
+                        let Ok(image) = reader.decode() else {
                             continue;
-                        }
-                        if self.tile_bytes + bytes > 32 * 1024 * 1024 || self.images.len() >= 512 {
-                            self.images.clear();
-                            self.tile_bytes = 0;
-                        }
-                        self.images.insert(
-                            key,
-                            CachedImage {
-                                bitmap: native.image(pixels, width, height)?,
-                                width,
-                                height,
-                            },
-                        );
-                        self.tile_bytes += bytes;
+                        };
+                        decoded = image.to_rgba8();
+                        (
+                            decoded.as_raw().as_slice(),
+                            decoded.width(),
+                            decoded.height(),
+                        )
                     }
-                    let cached = &self.images[&key];
-                    let width = cached.width;
-                    let height = cached.height;
-                    let tl = tile.top_left();
-                    let br = tile.bottom_right();
-                    let left = (tl.x.into_inner() * width as f32).clamp(0.0, width as f32);
-                    let top = (tl.y.into_inner() * height as f32).clamp(0.0, height as f32);
-                    let right = (br.x.into_inner() * width as f32).clamp(left, width as f32);
-                    let bottom = (br.y.into_inner() * height as f32).clamp(top, height as f32);
-                    if right == left || bottom == top {
-                        continue;
-                    }
-                    let (pl, pt, pr, pb) = tile.padding();
-                    let cw = self.metrics.cell_width;
-                    let ch = self.metrics.cell_height;
-                    let dest = Rect::from_xywh(
-                        PADDING + cell.cell_index() as f32 * cw + pl as f32 / self.metrics.scale,
-                        PADDING + row as f32 * ch + pt as f32 / self.metrics.scale,
-                        (cw - (pl as f32 + pr as f32) / self.metrics.scale).max(0.0),
-                        (ch - (pt as f32 + pb as f32) / self.metrics.scale).max(0.0),
-                    );
-                    native.draw_image(&cached.bitmap, Rect::new(left, top, right, bottom), dest);
+                    _ => continue,
+                };
+                let Some(bytes) = (width as usize)
+                    .checked_mul(height as usize)
+                    .and_then(|n| n.checked_mul(4))
+                else {
+                    continue;
+                };
+                // Bound this renderer's GPU cache. The engine owns its own image storage.
+                if bytes > 32 * 1024 * 1024 {
+                    continue;
                 }
+                if self.tile_bytes + bytes > 32 * 1024 * 1024 || self.images.len() >= 512 {
+                    self.images.clear();
+                    self.tile_bytes = 0;
+                }
+                self.images.insert(
+                    key,
+                    CachedImage {
+                        bitmap: native.image(pixels, width, height)?,
+                        width,
+                        height,
+                    },
+                );
+                self.tile_bytes += bytes;
             }
+            let cached = &self.images[&key];
+            let width = cached.width;
+            let height = cached.height;
+            let tl = tile.top_left();
+            let br = tile.bottom_right();
+            let left = (tl.x.into_inner() * width as f32).clamp(0.0, width as f32);
+            let top = (tl.y.into_inner() * height as f32).clamp(0.0, height as f32);
+            let right = (br.x.into_inner() * width as f32).clamp(left, width as f32);
+            let bottom = (br.y.into_inner() * height as f32).clamp(top, height as f32);
+            if right == left || bottom == top {
+                continue;
+            }
+            let (pl, pt, pr, pb) = tile.padding();
+            let cw = self.metrics.cell_width;
+            let ch = self.metrics.cell_height;
+            let dest = Rect::from_xywh(
+                PADDING + column as f32 * cw + pl as f32 / self.metrics.scale,
+                PADDING + row as f32 * ch + pt as f32 / self.metrics.scale,
+                (cw - (pl as f32 + pr as f32) / self.metrics.scale).max(0.0),
+                (ch - (pt as f32 + pb as f32) / self.metrics.scale).max(0.0),
+            );
+            native.draw_image(&cached.bitmap, Rect::new(left, top, right, bottom), dest);
         }
         Ok(())
     }
@@ -634,6 +680,80 @@ pub fn screenshot_with_font(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_image_id_replacement_resize_and_deletion_release_gpu_textures() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok().unwrap();
+        }
+        struct Com;
+        impl Drop for Com {
+            fn drop(&mut self) {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+        let _com = Com;
+        let mut renderer = Renderer::new().unwrap();
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(640, 360).unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut size = wezterm_term::TerminalSize {
+            cols: 40,
+            rows: 12,
+            pixel_width: 400,
+            pixel_height: 240,
+            dpi: 96,
+        };
+        let mut terminal = w11term::terminal::create(size, tx);
+        for frame in 0..100 {
+            let pixels = [frame as u8, 255 - frame as u8, 42, 255].repeat(8 * 8);
+            terminal.advance_bytes(format!(
+                "\x1b[1;1H\x1b_Ga=T,i=7,p=1,f=32,s=8,v=8,c=2,r=2,q=2;{}\x1b\\",
+                STANDARD.encode(pixels)
+            ));
+            if frame == 50 {
+                size.cols = 60;
+                size.pixel_width = 600;
+                terminal.resize(size);
+            }
+            let snapshot = Snapshot::capture(&terminal, None, frame + 1, 0, String::new(), 0);
+            target
+                .draw(|ctx| {
+                    renderer.draw_surface(ctx, 640.0, 360.0, frame == 0, &snapshot)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                renderer.images.len(),
+                1,
+                "old GPU image survived replacement {frame}"
+            );
+            assert_eq!(renderer.tile_bytes, 8 * 8 * 4);
+            assert!(
+                snapshot.rows[0]
+                    .visible_cells()
+                    .next()
+                    .unwrap()
+                    .attrs()
+                    .images()
+                    .is_some(),
+                "placement lost on resize"
+            );
+        }
+        terminal.advance_bytes(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+        let snapshot = Snapshot::capture(&terminal, None, 101, 0, String::new(), 0);
+        target
+            .draw(|ctx| {
+                renderer.draw_surface(ctx, 640.0, 360.0, false, &snapshot)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(renderer.images.is_empty());
+        assert_eq!(renderer.tile_bytes, 0);
+    }
     #[test]
     fn offscreen_png_contains_terminal_text_kitty_and_sixel_pixels() {
         use base64::Engine;

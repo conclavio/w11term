@@ -183,6 +183,7 @@ async fn roundtrip(allow_none: bool) {
                     }
                 },
                 host_key: Some(pin),
+                player: Default::default(),
             }),
             initial_size,
         );
@@ -218,6 +219,7 @@ async fn roundtrip(allow_none: bool) {
                 key: KeyCode::Char('x'),
                 modifiers: KeyModifiers::NONE,
                 down: true,
+                repeat: false,
             })
             .unwrap();
         assert_eq!(

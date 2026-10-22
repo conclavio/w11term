@@ -774,7 +774,11 @@ impl<'a> Performer<'a> {
                 self.set_hyperlink(link);
             }
             OperatingSystemCommand::Unspecified(unspec) => {
-                if self.config.log_unknown_escape_sequences() {
+                if unspec.first().is_some_and(|part| part == b"440") {
+                    if let Some(handler) = self.alert_handler.as_mut() {
+                        handler.alert(Alert::W11termOsc440(unspec));
+                    }
+                } else if self.config.log_unknown_escape_sequences() {
                     let mut output = String::new();
                     write!(&mut output, "Unhandled OSC ").ok();
 

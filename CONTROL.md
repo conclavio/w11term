@@ -40,7 +40,7 @@ if ($screen.result.text -notmatch 'fps=') { throw 'HUD missing' }
 & $ctl --pid 12345 screenshot --pane $pane .\frame.png
 ```
 
-`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8; the limit is 1 MiB per command. A successful reply acknowledges the SSH channel write, **not remote application processing**. Poll `get-text` until the expected output arrives. A write timeout means delivery is unknown; retrying could duplicate input. Demo/replay panes reject raw input.
+`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8; the limit is 1 MiB per command. A successful reply acknowledges the SSH channel write, **not remote application processing**. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown; retrying could duplicate input. Demo/replay panes reject raw input. Reconnecting panes reject raw writes and SFTP work rather than queuing them for a later connection.
 
 `get-text` returns the current live screen, including alternate-screen TUI content. It excludes scrollback, trims trailing ASCII spaces on each row, and preserves the row count as `lines`. `text` joins those lines with LF. Graphics are not OCRed. Both text and screenshots include a snapshot generation to help correlate results. Reading does not change the user's scrollback position.
 
@@ -72,7 +72,86 @@ Direct protocol screenshot paths must be absolute. The CLI resolves relative pat
 {"version":1,"ok":false,"error":"unknown pane 99"}
 ```
 
-`list.result` contains `pid` and `sessions`; each session has `id`, `label`, `active`, `title`, `status`, `cols`, and `rows`. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels. Commands operate on the addressed pane independently of native keyboard focus.
+`list.result` contains `pid` and `sessions`; each session has `id`, `label`, `active`, `title`, `status`, `cols`, `rows`, `connection_generation`, and `prompt`. A prompt contains public challenge metadata only; passwords and challenge answers never appear. The connection generation increases after each new SSH login. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels. Commands operate on the addressed pane independently of native keyboard focus.
+
+## Waiting, geometry, tabs, and events
+
+```powershell
+& $ctl --pid 12345 wait-for-text --pane $pane --regex --timeout 15 'fps=\d+'
+& $ctl --pid 12345 resize --pane $pane --cols 170 --rows 48
+$opened = & $ctl --pid 12345 open --profile play-6792 --cols 170 --rows 48 | ConvertFrom-Json
+& $ctl --pid 12345 events --pane $pane --since 0
+& $ctl --pid 12345 events --pane $pane --since 42 --timeout 30
+```
+
+`wait-for-text` waits on published live-screen changes; it does not poll or move
+the user's scrollback. Patterns are literal UTF-8 unless `--regex` is supplied.
+Regex uses Rust's regex syntax, is capped at 4096 pattern bytes and bounded compiled
+size, and can match across LF-separated rows. It does not search scrollback or OCR
+images. Timeout defaults to 30 seconds, range 1–3600; no match is a JSON error.
+Success returns `pane`, `matched`, `generation`, `cols`, `rows`, and matching screen
+`text`. It observes screen state, not every transient byte that may have appeared
+between snapshots.
+
+`resize` accepts the launch grid ranges. It resizes an active pane's window or a
+background pane's PTY without selecting the pane or activating the window. Changes
+to the active grid require leaving fullscreen first. A grid that cannot fit the
+current display/window constraints fails clearly; geometry may
+already have changed. The next user tab activation uses the shared window's grid.
+Success acknowledges the client model/resize request, not a remote TUI redraw.
+
+`open` creates an independent tab in the existing process from a saved profile.
+Without `--activate`, the current tab stays selected. `--activate` selects the new
+tab inside the app; it does not request OS keyboard focus. Omitted dimensions use
+the current window grid. Replies return `pane`, `cols`, `rows`, and `active`. New
+tabs may still be connecting or awaiting a native trust/authentication prompt;
+scripts can inspect `list`. No command starts a new GUI process.
+
+`events` returns `{"pane":1,"journal":{"events":[...],"next":42,"oldest":1,"lost":false}}`.
+Each event has `sequence`, Unix `timestamp_ms`, `kind`, and JSON `data`. Use the
+returned `next` for the next request. `--timeout` long-polls until an event arrives
+(default 0, range 0–3600). Cursors are per pane and process; a future cursor fails.
+The journal retains 4096 entries and truncates data larger than 4096 serialized
+bytes. `lost=true` reports eviction. Events include `bell`, `title`, `notification`,
+`sound`, connection/reconnection, assets, and recording. A bell event does not imply
+audible playback; inspect the `sound` outcome. See [the game protocol](docs/game-client-protocol.md).
+The CLI allows the requested wait timeout plus 15 seconds for these replies.
+
+```json
+{"verb":"wait-for-text","pane":1,"pattern":"fps=\\d+","regex":true,"timeout_seconds":15}
+{"verb":"resize","pane":1,"cols":170,"rows":48}
+{"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
+{"verb":"events","pane":1,"since":42,"timeout_seconds":30}
+```
+
+## VT recording
+
+```powershell
+& $ctl --pid 12345 record --pane $pane .\bug.vt
+# Reproduce the problem, or request a repaint from the remote application.
+& $ctl --pid 12345 record --pane $pane --stop
+.\target\release\w11term.exe --replay .\bug.vt
+```
+
+Recordings contain exact incoming terminal-output bytes, including graphics and
+escape sequences, from the moment recording begins. Input and SSH authentication
+answers are excluded, but a server may echo typed text or display sensitive output;
+review captures before sharing. Starting mid-session does not capture previous
+terminal state or an escape sequence's already-received prefix. Trigger a remote
+full repaint when capturing a TUI bug. Timing, reconnection resets, and out-of-band
+SSH resize events are not stored; this is an output stream, not a timed video.
+
+Start creates a new file and a `<stem>.vt.json` sidecar with initial columns/rows;
+existing files are never overwritten. Replay reads that geometry unless explicit
+`--cols`/`--rows` override it. The parent must exist. Stop flushes and syncs the file,
+and returns its path and byte count. Closing the pane flushes it too. A disk error
+or 256 MiB limit stops recording and emits `recording-error`. Abrupt process death
+can lose buffered tail bytes. Keep the sidecar with the `.vt` file.
+
+```json
+{"verb":"record","pane":1,"path":"C:\\tests\\bug.vt"}
+{"verb":"record","pane":1,"path":null}
+```
 
 ## SFTP
 
@@ -146,4 +225,4 @@ SFTP replies use the same `ok` / `error` envelope and exit status as other comma
 
 The opt-in `tests\sftp-live-smoke.ps1 [-Configuration debug] [-Profile root]` checks a real OpenSSH server through a GUI instance it launches, including SHA-256 transfer equality, symlink/hardlink behavior, metadata, and advertised extensions. It creates one uniquely named `/tmp/w11term-sftp-...` directory, cleans up its known files, and closes only its own GUI. Artifacts remain under `.local\sftp-smoke`.
 
-With the release GUI, CLI, and `echo_server` example built, run `tests\control-smoke.ps1` in PowerShell 7. It launches its own loopback-only SSH peer and two temporary GUI panes at 170×48, sends input to the inactive pane, asserts screen text, captures a PNG, checks selection stays unchanged, and verifies JSON failures. It closes only the processes it started. Artifacts remain under `.local\control-smoke`.
+With the release GUI, CLI, and `echo_server` example built, run `tests\control-smoke.ps1` in PowerShell 7 (`-Configuration debug` for debug builds). It launches its own loopback SSH peer and GUI, checks launch geometry, inactive raw input/PNG capture, regex waits, background tab creation, active/background resizing, recording/events, JSON failures, and exact saved-grid restoration after reopening a profile. Window settings are isolated. It closes only the processes it started. Artifacts remain under `.local\control-smoke`.

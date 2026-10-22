@@ -25,6 +25,7 @@ pub struct KittyImageState {
     id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
     used_memory: usize,
+    accumulated_bytes: usize,
 }
 
 impl KittyImageState {
@@ -34,17 +35,19 @@ impl KittyImageState {
         }
     }
 
-    fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) {
-        if image_id != 0 {
-            self.remove_data_for_id(image_id);
-        }
+    fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) -> anyhow::Result<()> {
         self.prune_unreferenced();
+        let old = self.id_to_data.get(&image_id).map_or(0, |data| data.len());
+        anyhow::ensure!(self.used_memory.saturating_sub(old).saturating_add(data.len()) <= 64 * 1024 * 1024, "kitty image table exceeds 64 MiB");
+        anyhow::ensure!(self.id_to_data.contains_key(&image_id) || self.id_to_data.len() < 512, "kitty image table exceeds 512 ids");
+        self.remove_data_for_id(image_id);
         self.used_memory += data.len();
         self.id_to_data.insert(image_id, data);
+        Ok(())
     }
 
     fn prune_unreferenced(&mut self) {
-        let budget = 320 * 1024 * 1024; // FIXME: make this configurable
+        let budget = 32 * 1024 * 1024;
         if self.used_memory > budget {
             let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
             let target = self.used_memory - budget;
@@ -177,6 +180,23 @@ impl TerminalState {
             return Ok(());
         }
         let verbosity = img.verbosity();
+        if let KittyImage::TransmitData { transmit, .. }
+            | KittyImage::TransmitDataAndDisplay { transmit, .. }
+            | KittyImage::TransmitFrame { transmit, .. }
+            | KittyImage::Query { transmit } = &img {
+            let bytes = match &transmit.data {
+                KittyImageData::Direct(data) => data.len(),
+                KittyImageData::DirectBin(data) => data.len(),
+                _ => { self.kitty_img.accumulator.clear(); self.kitty_img.accumulated_bytes = 0; anyhow::bail!("SSH kitty images require direct transport"); }
+            };
+            if self.kitty_img.accumulated_bytes.saturating_add(bytes) > 48 * 1024 * 1024 {
+                self.kitty_img.accumulator.clear(); self.kitty_img.accumulated_bytes = 0;
+                anyhow::bail!("kitty image transmission exceeds 48 MiB");
+            }
+            if transmit.more_data_follows {
+                self.kitty_img.accumulated_bytes += bytes;
+            }
+        }
         match img {
             KittyImage::Query { transmit } => match transmit.data.load_data() {
                 Ok(_) => {
@@ -770,7 +790,7 @@ impl TerminalState {
         let data = match transmit.compression {
             KittyImageCompression::None => data,
             KittyImageCompression::Deflate => {
-                miniz_oxide::inflate::decompress_to_vec_zlib(&data)
+                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, 32 * 1024 * 1024)
                     .map_err(|e| anyhow::anyhow!("decompressing data: {:?}", e))?
             }
         };
@@ -785,6 +805,7 @@ impl TerminalState {
                 };
 
                 check_image_dimensions(width, height)?;
+                anyhow::ensure!(width as u64 * height as u64 * 4 <= 32 * 1024 * 1024, "kitty image exceeds 32 MiB");
 
                 let data = match transmit.format {
                     Some(KittyImageFormat::Rgb) => {
@@ -812,6 +833,7 @@ impl TerminalState {
             Some(KittyImageFormat::Png) => {
                 let info = dimensions(&data)?;
                 check_image_dimensions(info.width, info.height)?;
+                anyhow::ensure!(info.width as u64 * info.height as u64 * 4 <= 32 * 1024 * 1024, "kitty image exceeds 32 MiB");
                 let decoded = image::load_from_memory(&data).context("decode png")?;
                 let (width, height) = decoded.dimensions();
                 let data = decoded.into_rgba8().into_vec();
@@ -833,7 +855,7 @@ impl TerminalState {
         let img = self
             .raw_image_to_image_data(img)
             .context("storing image data")?;
-        self.kitty_img.record_id_to_data(image_id, img);
+        self.kitty_img.record_id_to_data(image_id, img)?;
 
         if image_number.is_some() {
             self.kitty_send_response(
@@ -849,6 +871,7 @@ impl TerminalState {
     }
 
     fn coalesce_kitty_accumulation(&mut self, img: KittyImage) -> anyhow::Result<KittyImage> {
+        self.kitty_img.accumulated_bytes = 0;
         if self.kitty_img.accumulator.is_empty() {
             Ok(img)
         } else {
