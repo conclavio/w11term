@@ -1,0 +1,23 @@
+{
+  "profiles": {
+    "root": {
+      "host": "conclav.io",
+      "user": "root",
+      "port": 22,
+      "auth": "identity",
+      "identity": "hostinger"
+    },
+    "play-6789": {
+      "host": "conclav.io",
+      "user": "play",
+      "port": 6789,
+      "auth": "none"
+    },
+    "play-6792": {
+      "host": "conclav.io",
+      "user": "play",
+      "port": 6792,
+      "auth": "none"
+    }
+  }
+}

@@ -1,0 +1,5 @@
+/target/
+/.local/
+*.log
+/hostinger
+/hostinger.pub

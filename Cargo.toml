@@ -1,0 +1,43 @@
+[package]
+name = "w11term"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A Windows-native SSH terminal built with Rust and Windows Reactor"
+license = "Apache-2.0"
+repository = "https://github.com/conclavio/w11term"
+default-run = "w11term"
+
+[features]
+ui-smoke = []
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+wezterm-term = { path = "vendor/wezterm-term" }
+termwiz = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb" }
+wezterm-input-types = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb" }
+russh = { version = "0.63.1", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "fs"] }
+windows-reactor = "=0.100.0"
+windows-canvas = { version = "=0.100.0", default-features = false, features = ["reactor"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_System_Threading", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Com", "Win32_Security", "Win32_Security_Authorization", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-core-next = { package = "windows-core", version = "=0.100.0" }
+windows-numerics = "0.3"
+russh-sftp = "3"
+
+[build-dependencies]
+windows-reactor-setup = "=0.100.0"
+
+[dev-dependencies]
+rand = "0.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

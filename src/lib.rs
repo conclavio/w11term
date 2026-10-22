@@ -1,0 +1,13 @@
+pub mod appearance;
+pub mod clipboard;
+pub mod control;
+pub mod demo;
+pub mod interaction;
+pub mod options;
+pub mod profiles;
+pub mod search;
+pub mod session;
+pub mod sftp;
+pub mod ssh;
+pub mod tabs;
+pub mod terminal;

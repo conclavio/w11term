@@ -1,0 +1,14 @@
+w11term
+Copyright 2026 w11term contributors
+
+w11term's original project code is licensed under the Apache License, Version 2.0.
+
+This project includes wezterm-term, the terminal emulator core from WezTerm,
+by Wez Furlong and contributors.
+
+Upstream: https://github.com/wezterm/wezterm
+Revision: e2a98e1b8af156988ad0ac778658ac27b60a55fb
+Copyright (c) 2018-Present Wez Furlong
+License: MIT; the complete upstream notice is preserved in
+vendor/wezterm-term/LICENSE.md.
+Local modifications are documented in vendor/wezterm-term/PATCHES.md.
