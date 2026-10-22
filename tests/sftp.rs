@@ -403,6 +403,21 @@ async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_
             commands.send(Command::Sftp(job)).unwrap();
         }
     });
+    let help = b"pilot help";
+    let help_hash: String = Sha256::digest(help)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    fs::write(root.path().join("assets/help.txt"), help).unwrap();
+    let mut initial = manifest("pack1", &hash);
+    initial["files"].as_array_mut().unwrap().push(json!({"name":"help","path":"docs/help.txt","kind":"help","sha256":help_hash,"size":help.len()}));
+    fs::create_dir_all(root.path().join("assets/docs")).unwrap();
+    fs::write(root.path().join("assets/docs/help.txt"), help).unwrap();
+    fs::write(
+        root.path().join("assets/manifest.json"),
+        serde_json::to_vec(&initial).unwrap(),
+    )
+    .unwrap();
     let store = w11term::assets::Store::default();
     let sync = |version: &str| {
         w11term::assets::sync_into(
@@ -413,7 +428,7 @@ async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_
             cache.path().into(),
         )
     };
-    assert_eq!(sync("pack1").await.unwrap(), 1);
+    assert_eq!(sync("pack1").await.unwrap(), 2);
     let path = store.sound("shot").unwrap();
     assert_eq!(fs::read(&path).unwrap(), wav);
     fs::remove_file(root.path().join("assets/sounds/shot.wav")).unwrap();
@@ -434,6 +449,31 @@ async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_
             .unwrap_err()
             .to_string()
             .contains("mismatch")
+    );
+    let help_path = path.parent().unwrap().join(&help_hash);
+    assert_eq!(
+        fs::read(&help_path).unwrap(),
+        help,
+        "failed replacement must retain non-sound files"
+    );
+    fs::write(
+        root.path().join("assets/manifest.json"),
+        serde_json::to_vec(&manifest("pack3", &hash)).unwrap(),
+    )
+    .unwrap();
+    let other = w11term::assets::Store::default();
+    w11term::assets::sync_into(
+        input.clone(),
+        "test@loopback:22".into(),
+        "pack3".into(),
+        other,
+        cache.path().into(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        help_path.exists(),
+        "a second pane must not prune the first pane's generation"
     );
     assert_eq!(store.version(), "pack1");
     assert_eq!(store.sound("shot"), Some(path));

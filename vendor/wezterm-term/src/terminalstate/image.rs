@@ -293,7 +293,21 @@ impl TerminalState {
         } else {
             let data = data.swap_out()?;
             let image_data = Arc::new(ImageData::with_data(data));
-            self.image_cache.put(key, Arc::clone(&image_data));
+            // Do not retain large decoded images after their last placement dies.
+            const CACHE_BYTES: usize = 4 * 1024 * 1024;
+            if image_data.len() <= CACHE_BYTES {
+                while self
+                    .image_cache
+                    .iter()
+                    .map(|(_, image)| image.len())
+                    .sum::<usize>()
+                    + image_data.len()
+                    > CACHE_BYTES
+                {
+                    self.image_cache.pop_lru();
+                }
+                self.image_cache.put(key, Arc::clone(&image_data));
+            }
             Ok(image_data)
         }
     }

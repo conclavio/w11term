@@ -42,3 +42,6 @@ windows-reactor-setup = "=0.100.0"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[patch."https://github.com/wezterm/wezterm"]
+vtparse = { path = "vendor/vtparse" }

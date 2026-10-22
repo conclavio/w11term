@@ -113,13 +113,65 @@ impl Manifest {
     }
 }
 #[derive(Clone, Default)]
-pub struct Store(Arc<RwLock<(String, BTreeMap<String, PathBuf>)>>);
+pub struct Store(Arc<RwLock<Published>>);
+#[derive(Default)]
+struct Published {
+    version: String,
+    sounds: BTreeMap<String, PathBuf>,
+    // A shared OS lock advertises this generation to other panes/processes.
+    // The lease disappears only after its last Store owner releases it.
+    _lease: Option<tempfile::NamedTempFile>,
+}
+async fn disk<T: Send + 'static>(
+    lock: Arc<std::fs::File>,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(move || {
+        let _lock = lock;
+        work()
+    })
+    .await?
+}
+fn prune(dir: &std::path::Path, wanted: &BTreeSet<String>) -> Result<()> {
+    let mut keep = wanted.clone();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("lease-") {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())?;
+            match file.try_lock() {
+                Ok(()) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    keep.extend(serde_json::from_reader::<_, BTreeSet<String>>(file)?);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.len() == 64
+            && name.bytes().all(|c| c.is_ascii_hexdigit())
+            && !keep.contains(&name)
+            && entry.file_type()?.is_file()
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
 impl Store {
     pub fn sound(&self, name: &str) -> Option<PathBuf> {
-        self.0.read().unwrap().1.get(name).cloned()
+        self.0.read().unwrap().sounds.get(name).cloned()
     }
     pub fn version(&self) -> String {
-        self.0.read().unwrap().0.clone()
+        self.0.read().unwrap().version.clone()
     }
 }
 async fn request(
@@ -213,67 +265,89 @@ pub async fn sync_into(
     cache: PathBuf,
 ) -> Result<usize> {
     ensure!(name(&version), "invalid asset pack announcement");
+    let dir = cache.join(digest(endpoint.as_bytes()));
+    let lock_dir = dir.clone();
+    let lock = Arc::new(
+        tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+            std::fs::create_dir_all(&lock_dir)?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_dir.join("sync.lock"))?;
+            file.lock()?;
+            Ok(file)
+        })
+        .await??,
+    );
     let bytes = read(&input, "/assets/manifest.json".into(), 256 * 1024).await?;
     let manifest: Manifest = serde_json::from_slice(&bytes).context("invalid asset manifest")?;
     manifest.validate(&version)?;
-    let dir = cache.join(digest(endpoint.as_bytes()));
-    std::fs::create_dir_all(&dir)?;
-    let old: BTreeSet<_> = store.0.read().unwrap().1.values().cloned().collect();
-    let wanted: BTreeSet<_> = manifest.files.iter().map(|f| f.sha256.as_str()).collect();
-    // Prune abandoned staged packs too, so repeatedly failing syncs cannot fill disk.
-    for entry in std::fs::read_dir(&dir)?.flatten() {
-        let filename = entry.file_name();
-        let filename = filename.to_string_lossy();
-        if filename.len() == 64
-            && filename.bytes().all(|c| c.is_ascii_hexdigit())
-            && !wanted.contains(filename.as_ref())
-            && !old.contains(&entry.path())
-            && entry.file_type()?.is_file()
-        {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
+    let wanted: BTreeSet<String> = manifest.files.iter().map(|f| f.sha256.clone()).collect();
+    let cleanup_dir = dir.clone();
+    let wanted_before = wanted.clone();
+    disk(lock.clone(), move || prune(&cleanup_dir, &wanted_before)).await?;
     let mut sounds = BTreeMap::new();
     let mut fetched = 0;
     for file in &manifest.files {
         let path = dir.join(&file.sha256);
-        let valid = std::fs::metadata(&path).is_ok_and(|m| m.len() == file.size)
-            && std::fs::read(&path).is_ok_and(|b| digest(&b) == file.sha256);
+        let check_path = path.clone();
+        let check = file.clone();
+        let valid = disk(lock.clone(), move || {
+            let valid = std::fs::metadata(&check_path).is_ok_and(|m| m.len() == check.size)
+                && std::fs::read(&check_path).is_ok_and(|b| {
+                    digest(&b) == check.sha256
+                        && (check.kind != "sound" || validate_wav(&b).is_ok())
+                });
+            Ok(valid)
+        })
+        .await?;
         if !valid {
             let bytes = read(&input, format!("/assets/{}", file.path), file.size as usize).await?;
-            ensure!(
-                bytes.len() as u64 == file.size && digest(&bytes) == file.sha256,
-                "asset size/hash mismatch for {}",
-                file.name
-            );
-            if file.kind == "sound" {
-                validate_wav(&bytes)?;
-            }
-            let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
-            temporary.write_all(&bytes)?;
-            temporary.as_file().sync_all()?;
-            temporary.persist(&path)?;
+            let check = file.clone();
+            let target = path.clone();
+            let parent = dir.clone();
+            disk(lock.clone(), move || {
+                ensure!(
+                    bytes.len() as u64 == check.size && digest(&bytes) == check.sha256,
+                    "asset size/hash mismatch for {}",
+                    check.name
+                );
+                if check.kind == "sound" {
+                    validate_wav(&bytes)?;
+                }
+                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+                temporary.write_all(&bytes)?;
+                temporary.as_file().sync_all()?;
+                temporary.persist(target)?;
+                Ok(())
+            })
+            .await?;
             fetched += 1;
         }
         if file.kind == "sound" {
-            validate_wav(&std::fs::read(&path)?)?;
             sounds.insert(file.name.clone(), path);
         }
     }
-    // Publish only a complete, verified generation. A failed download keeps the old pack usable.
-    *store.0.write().unwrap() = (version, sounds);
-    let keep: BTreeSet<_> = manifest.files.iter().map(|f| f.sha256.as_str()).collect();
-    for entry in std::fs::read_dir(&dir)?.flatten() {
-        let filename = entry.file_name();
-        let filename = filename.to_string_lossy();
-        if filename.len() == 64
-            && filename.bytes().all(|c| c.is_ascii_hexdigit())
-            && !keep.contains(filename.as_ref())
-            && entry.file_type()?.is_file()
-        {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    let publish_dir = dir.clone();
+    let lease = disk(lock.clone(), move || {
+        let mut lease = tempfile::Builder::new()
+            .prefix("lease-")
+            .tempfile_in(&publish_dir)?;
+        serde_json::to_writer(&mut lease, &wanted)?;
+        lease.flush()?;
+        lease.as_file().lock_shared()?;
+        Ok(lease)
+    })
+    .await?;
+    // Every asset kind remains leased until a complete replacement is published.
+    *store.0.write().unwrap() = Published {
+        version,
+        sounds,
+        _lease: Some(lease),
+    };
+    disk(lock, move || prune(&dir, &BTreeSet::new())).await?;
     Ok(fetched)
 }
 pub fn validate_wav(bytes: &[u8]) -> Result<()> {

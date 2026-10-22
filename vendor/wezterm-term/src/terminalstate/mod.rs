@@ -522,8 +522,14 @@ impl TerminalState {
             ));
         }
         self.kitty_img = Default::default();
+        self.image_cache.clear();
         self.screen.screen = primary;
         self.screen.activate_primary_screen(self.seqno);
+    }
+
+    /// Retained CPU image cache bytes (live screen/scrollback references are separate).
+    pub fn image_cache_bytes(&self) -> usize {
+        self.image_cache.iter().map(|(_, image)| image.len()).sum()
     }
 
     /// Constructs the terminal state.

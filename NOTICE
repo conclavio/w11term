@@ -12,3 +12,5 @@ Copyright (c) 2018-Present Wez Furlong
 License: MIT; the complete upstream notice is preserved in
 vendor/wezterm-term/LICENSE.md.
 Local modifications are documented in vendor/wezterm-term/PATCHES.md.
+
+The vendored vtparse parser is from the same WezTerm revision and retains its MIT license in vendor/vtparse/LICENSE.md.

@@ -49,6 +49,7 @@ struct Target {
 pub enum Shortcut {
     Fullscreen,
     RememberWindow,
+    BeginResize,
     NextTab,
     PreviousTab,
     NewTab,
@@ -390,6 +391,15 @@ unsafe extern "system" fn window_proc(
                 && let Some(handler) = &state.close_handler
             {
                 handler();
+            }
+        });
+    }
+    if message == WM_ENTERSIZEMOVE {
+        INPUT.with(|s| {
+            if let Ok(s) = s.try_borrow()
+                && let Some(s) = s.as_ref()
+            {
+                (s.shortcut)(Shortcut::BeginResize);
             }
         });
     }

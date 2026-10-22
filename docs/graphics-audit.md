@@ -45,7 +45,7 @@ transmissions to 48 MiB encoded / 32 MiB inflated, limits decoded kitty frames t
 are pruned when the table exceeds 32 MiB. Remote SSH peers cannot request local
 file, temporary-file, or shared-memory kitty transports. These limits cover direct
 replacement; they do not establish a global RAM limit for sixel, iTerm images,
-animated-frame mutations, parser buffers, or images retained in primary scrollback.
+images retained in primary scrollback or other image protocols. APC buffers are capped at 48 MiB; oversized strings are discarded through their terminator. Kitty animations are capped at 256 frames / 32 MiB and accounted in the 64 MiB table. The separate CPU dedup cache retains at most 4 MiB, and clears on deletion, reset and animation edits. Chunked query/animation transmissions are explicitly unsupported.
 Large graphics or unused table entries may be rejected/evicted. The renderer still
 shows the first frame of animated images.
 

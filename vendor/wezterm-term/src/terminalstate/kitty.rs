@@ -188,6 +188,13 @@ impl TerminalState {
         if !self.config.enable_kitty_graphics() {
             return Ok(());
         }
+        if matches!(&img, KittyImage::Query { transmit } | KittyImage::TransmitFrame { transmit, .. }
+            if transmit.more_data_follows)
+        {
+            self.kitty_img.accumulated_bytes = 0;
+            self.kitty_img.accumulator.clear();
+            anyhow::bail!("chunked kitty query/animation is unsupported");
+        }
         let verbosity = img.verbosity();
         if let KittyImage::TransmitData { transmit, .. }
         | KittyImage::TransmitDataAndDisplay { transmit, .. }
@@ -210,6 +217,11 @@ impl TerminalState {
             }
             if transmit.more_data_follows {
                 self.kitty_img.accumulated_bytes += bytes;
+            } else if !matches!(
+                img,
+                KittyImage::TransmitData { .. } | KittyImage::TransmitDataAndDisplay { .. }
+            ) {
+                self.kitty_img.accumulated_bytes = 0;
             }
         }
         match img {
@@ -243,6 +255,11 @@ impl TerminalState {
                     verbosity,
                 };
                 if more_data_follows {
+                    if self.kitty_img.accumulator.len() >= 16384 {
+                        self.kitty_img.accumulator.clear();
+                        self.kitty_img.accumulated_bytes = 0;
+                        anyhow::bail!("too many kitty image chunks");
+                    }
                     self.kitty_img.accumulator.push(img);
                 } else {
                     self.kitty_img_inner(img)?;
@@ -260,6 +277,11 @@ impl TerminalState {
                     verbosity,
                 };
                 if more_data_follows {
+                    if self.kitty_img.accumulator.len() >= 16384 {
+                        self.kitty_img.accumulator.clear();
+                        self.kitty_img.accumulated_bytes = 0;
+                        anyhow::bail!("too many kitty image chunks");
+                    }
                     self.kitty_img.accumulator.push(img);
                 } else {
                     self.kitty_img_inner(img)?;
@@ -294,6 +316,7 @@ impl TerminalState {
 
                 if delete {
                     self.kitty_img.remove_data_for_id(image_id);
+                    self.image_cache.clear();
                 }
             }
             KittyImage::Delete {
@@ -378,6 +401,7 @@ impl TerminalState {
         }
         if delete {
             self.kitty_img.id_to_data.clear();
+            self.image_cache.clear();
             self.kitty_img.used_memory = 0;
             self.kitty_img.number_to_id.clear();
         }
@@ -427,6 +451,7 @@ impl TerminalState {
         frame: KittyImageFrameCompose,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
+        self.image_cache.clear();
         let image_id = match frame.image_number {
             Some(no) => match self.kitty_img.number_to_id.get(&no) {
                 Some(id) => *id,
@@ -628,7 +653,37 @@ impl TerminalState {
             }
         };
 
+        self.image_cache.clear();
+        let old_len = anim.len();
         let mut anim = anim.data();
+        let (width, height) = anim.dimensions()?;
+        let (frame_count, append) = match &*anim {
+            ImageDataType::Rgba8 { .. } => (1usize, frame.frame_number != Some(1)),
+            ImageDataType::AnimRgba8 { frames, .. } => (
+                frames.len(),
+                frame
+                    .frame_number
+                    .is_none_or(|n| n as usize == frames.len() + 1),
+            ),
+            _ => (0, false),
+        };
+        let growth = if append {
+            width as usize * height as usize * 4
+        } else {
+            0
+        };
+        anyhow::ensure!(
+            !append || frame_count < 256,
+            "kitty animation exceeds 256 frames"
+        );
+        anyhow::ensure!(
+            old_len.saturating_add(growth) <= 32 * 1024 * 1024,
+            "kitty animation exceeds 32 MiB"
+        );
+        anyhow::ensure!(
+            self.kitty_img.used_memory.saturating_add(growth) <= 64 * 1024 * 1024,
+            "kitty image table exceeds 64 MiB"
+        );
         let x = frame.x.unwrap_or(0);
         let y = frame.y.unwrap_or(0);
         let frame_gap = Duration::from_millis(match frame.duration_ms {
@@ -772,6 +827,8 @@ impl TerminalState {
             }
         }
 
+        drop(anim);
+        self.kitty_img.used_memory += growth;
         Ok(())
     }
 
@@ -855,7 +912,16 @@ impl TerminalState {
                     info.width as u64 * info.height as u64 * 4 <= 32 * 1024 * 1024,
                     "kitty image exceeds 32 MiB"
                 );
-                let decoded = image::load_from_memory(&data).context("decode png")?;
+                let mut reader = image::ImageReader::with_format(
+                    std::io::Cursor::new(&data),
+                    image::ImageFormat::Png,
+                );
+                let mut limits = image::Limits::default();
+                limits.max_image_width = Some(info.width);
+                limits.max_image_height = Some(info.height);
+                limits.max_alloc = Some(32 * 1024 * 1024);
+                reader.limits(limits);
+                let decoded = reader.decode().context("decode png")?;
                 let (width, height) = decoded.dimensions();
                 let data = decoded.into_rgba8().into_vec();
                 ImageDataType::new_single_frame(width, height, data)

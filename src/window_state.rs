@@ -3,6 +3,49 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Write};
 use windows::Win32::{Foundation::*, Graphics::Gdi::*, UI::WindowsAndMessaging::*};
+/// A requested cell box is best-effort: displays can clamp native geometry.
+#[derive(Default)]
+pub struct RequestedGrid {
+    target: std::cell::Cell<Option<(usize, usize)>>,
+    attempts: std::cell::Cell<u8>,
+    epoch: std::cell::Cell<u64>,
+}
+impl RequestedGrid {
+    pub fn new(target: Option<(usize, usize)>) -> Self {
+        let value = Self::default();
+        value.set(target);
+        value
+    }
+    pub fn get(&self) -> Option<(usize, usize)> {
+        self.target.get()
+    }
+    pub fn set(&self, target: Option<(usize, usize)>) {
+        self.target.set(target);
+        self.attempts.set(0);
+        self.epoch.set(self.epoch.get().wrapping_add(1));
+    }
+    pub fn epoch(&self) -> u64 {
+        self.epoch.get()
+    }
+    pub fn correction(&self, measured: (usize, usize)) -> Option<((usize, usize), bool)> {
+        let target = self.get()?;
+        if target == measured || self.attempts.get() >= 2 {
+            self.set(None);
+            return None;
+        }
+        let first = self.attempts.get() == 0;
+        self.attempts.set(self.attempts.get() + 1);
+        Some((target, first))
+    }
+}
+fn fit_axis(position: i32, size: i32, start: i32, end: i32, minimum: i32) -> (i32, i32) {
+    let available = end.saturating_sub(start).max(1);
+    let size = size.clamp(minimum.min(available), available);
+    (
+        position.clamp(start, end.saturating_sub(size).max(start)),
+        size,
+    )
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Placement {
     pub x: i32,
@@ -102,10 +145,8 @@ impl Windows {
             };
             GetMonitorInfoW(monitor, &mut info).ok()?;
             let work = info.rcWork;
-            let width = p.width.clamp(320, (work.right - work.left).max(320));
-            let height = p.height.clamp(240, (work.bottom - work.top).max(240));
-            let x = p.x.clamp(work.left, work.right - width);
-            let y = p.y.clamp(work.top, work.bottom - height);
+            let (x, width) = fit_axis(p.x, p.width, work.left, work.right, 320);
+            let (y, height) = fit_axis(p.y, p.height, work.top, work.bottom, 240);
             let placement = WINDOWPLACEMENT {
                 length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
                 showCmd: SW_SHOWNOACTIVATE.0 as u32,
@@ -175,5 +216,31 @@ impl Windows {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn geometry_converges_or_falls_back_and_new_requests_reset_budget() {
+        let request = RequestedGrid::new(Some((170, 48)));
+        assert_eq!(request.correction((80, 24)), Some(((170, 48), true)));
+        assert_eq!(request.correction((100, 30)), Some(((170, 48), false)));
+        assert_eq!(request.correction((100, 30)), None);
+        assert_eq!(request.get(), None);
+        request.set(Some((80, 24)));
+        assert_eq!(request.correction((80, 24)), None);
+        assert_eq!(request.get(), None);
+        request.set(Some((170, 48)));
+        assert_eq!(request.correction((80, 24)), Some(((170, 48), true)));
+        request.set(None); // user resizing cancels the pending request
+        assert_eq!(request.correction((90, 25)), None);
+    }
+    #[test]
+    fn placement_fits_tiny_negative_and_normal_work_areas() {
+        assert_eq!(fit_axis(999, 640, 0, 200, 320), (0, 200));
+        assert_eq!(fit_axis(-9999, 400, -1920, -640, 320), (-1920, 400));
+        assert_eq!(fit_axis(800, 400, 0, 1000, 320), (600, 400));
     }
 }

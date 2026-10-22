@@ -161,7 +161,7 @@ pub struct TerminalApp {
     selection_epoch: u64,
     client_size: (f64, f64),
     window_height: f64,
-    initial_grid: Rc<Cell<Option<(usize, usize)>>>,
+    initial_grid: Rc<crate::window_state::RequestedGrid>,
     appearance: Arc<RwLock<Appearance>>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
@@ -218,7 +218,8 @@ pub enum Message {
     Auth(TabId, Option<usize>),
     SaveProfile(TabId),
     WindowSize(WindowSize),
-    Geometry(f64, f64),
+    Geometry(f64, f64, u64, bool),
+    GridFallback(u64),
     FindEdit(TabId, String),
     FindCase(TabId, bool),
     FindApply(TabId, u64),
@@ -1445,19 +1446,19 @@ impl TerminalApp {
                 ctx.height,
                 scale,
             );
-            if let Some((cols, rows)) = initial_grid.get() {
-                if measured.cols != cols || measured.rows != rows {
-                    geometry_sender.send(Message::Geometry(
-                        window_size.0
-                            + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width)
-                                as f64,
-                        window_size.1
-                            + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
-                                - ctx.height) as f64,
-                    ));
-                    return Ok(());
-                }
-                initial_grid.set(None);
+            if let Some(((cols, rows), first)) =
+                initial_grid.correction((measured.cols, measured.rows))
+            {
+                geometry_sender.send(Message::Geometry(
+                    window_size.0
+                        + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width) as f64,
+                    window_size.1
+                        + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
+                            - ctx.height) as f64,
+                    initial_grid.epoch(),
+                    first,
+                ));
+                return Ok(());
             }
             let size = TerminalSize {
                 rows: measured.rows,
@@ -1805,7 +1806,7 @@ impl Component for TerminalApp {
             width: client_size.0,
             window_height: client_size.1,
             client_size,
-            initial_grid: Rc::new(Cell::new(grid)),
+            initial_grid: Rc::new(crate::window_state::RequestedGrid::new(grid)),
             appearance,
             fonts,
             appearance_error,
@@ -2377,6 +2378,9 @@ impl Component for TerminalApp {
                     }
                     self.invalidator.invalidate();
                 }
+                Shortcut::BeginResize => {
+                    self.initial_grid.set(None);
+                }
                 Shortcut::RememberWindow => {
                     if let Some(name) = &self.window_profile {
                         let _ = self.windows.borrow_mut().remember(name);
@@ -2578,8 +2582,22 @@ impl Component for TerminalApp {
                     });
                 }
             }
-            Message::Geometry(width, height) => {
-                self.client_size = (width, height);
+            Message::Geometry(width, height, epoch, first) => {
+                if self.initial_grid.epoch() == epoch {
+                    self.client_size = (width, height);
+                    if first {
+                        context.spawn_background(move |_| {
+                            std::thread::sleep(Duration::from_millis(300));
+                            Message::GridFallback(epoch)
+                        });
+                    }
+                }
+            }
+            Message::GridFallback(epoch) => {
+                if self.initial_grid.epoch() == epoch && self.initial_grid.get().is_some() {
+                    self.initial_grid.set(None);
+                    self.invalidator.invalidate();
+                }
             }
             Message::RenderError(id, error) => {
                 if let Some(AppTab {

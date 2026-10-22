@@ -20,3 +20,9 @@ The original MIT license is preserved in `LICENSE.md`.
   read. Row sequence numbers advance across those boundaries so committed snapshots
   cannot reuse a row from an earlier update in the same read. Reset clears the mode;
   the embedding owns the bounded watchdog and committed presentation.
+
+- CPU dedup cache has a 4 MiB byte budget and is cleared on image deletion,
+  connection reset and animation mutation. PNG decoding is explicitly PNG with
+  allocation limits. Animations have 256-frame/32 MiB limits, grow the shared table
+  accounting, and direct chunk metadata is bounded. Chunked query/animation
+  transmissions are explicitly rejected rather than misdecoded.
