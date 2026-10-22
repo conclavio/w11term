@@ -37,32 +37,37 @@ pub(crate) struct Handler {
 }
 impl Handler {
     fn known(&self, key: &russh::keys::PublicKey) -> Result<bool> {
-        use russh::keys::known_hosts;
-        let known = if let Some(path) = self.prompts.as_ref().and_then(Prompts::known_hosts) {
-            known_hosts::check_known_hosts_path(&self.options.host, self.options.port, key, path)
-        } else {
-            known_hosts::check_known_hosts(&self.options.host, self.options.port, key)
-        }?;
-        if !known {
-            let recorded = if let Some(path) = self.prompts.as_ref().and_then(Prompts::known_hosts)
-            {
-                known_hosts::known_host_keys_path(&self.options.host, self.options.port, path)
-            } else {
-                known_hosts::known_host_keys(&self.options.host, self.options.port)
-            }?;
-            ensure!(
-                recorded.is_empty(),
-                "server presented a new key algorithm for a known host; verify the change outside this connection"
-            );
-        }
-        Ok(known)
+        let path = self
+            .prompts
+            .as_ref()
+            .and_then(Prompts::known_hosts)
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
+            .context("cannot locate known_hosts")?;
+        super::known_hosts::verify(
+            &path,
+            &self.options.host,
+            self.options.port,
+            key,
+            self.options.host_key.as_deref(),
+        )
     }
+
     fn learn(&self, key: &russh::keys::PublicKey) -> Result<()> {
         use russh::keys::known_hosts;
         if let Some(path) = self.prompts.as_ref().and_then(Prompts::known_hosts) {
-            known_hosts::learn_known_hosts_path(&self.options.host, self.options.port, key, path)?;
+            known_hosts::learn_known_hosts_path(
+                &self.options.host.to_ascii_lowercase(),
+                self.options.port,
+                key,
+                path,
+            )?;
         } else {
-            known_hosts::learn_known_hosts(&self.options.host, self.options.port, key)?;
+            known_hosts::learn_known_hosts(
+                &self.options.host.to_ascii_lowercase(),
+                self.options.port,
+                key,
+            )?;
         }
         Ok(())
     }
@@ -72,14 +77,6 @@ impl client::Handler for Handler {
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
         let key = key.public_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
-        if let Some(expected) = &self.options.host_key {
-            if expected != &fingerprint {
-                return Err(stop(format!(
-                    "host key mismatch: expected {expected}, received {fingerprint}"
-                )));
-            }
-            return Ok(true);
-        }
         match self.known(&key) {
             Ok(true) => return Ok(true),
             Ok(false) => {}

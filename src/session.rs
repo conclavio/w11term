@@ -52,6 +52,25 @@ pub enum Command {
     Shutdown,
 }
 
+fn contain_worker_failure(
+    frames: &FrameStore,
+    events: &crate::events::Events,
+    work: impl FnOnce(),
+) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+        // Never resume a possibly inconsistent terminal engine after unwinding.
+        let mut frame = (*frames.load()).clone();
+        frame.generation += 1;
+        frame.status = "Terminal engine failed; close and reopen this tab to reconnect".into();
+        frame.prompt = None;
+        frames.publish(frame);
+        events.push(
+            "session-error",
+            serde_json::json!({"reason":"terminal worker panicked","recoverable_by_reopen":true}),
+        );
+    }
+}
+
 pub struct Session {
     pub prompts: crate::prompts::Prompts,
     pub events: crate::events::Events,
@@ -118,21 +137,25 @@ impl Session {
                     .enable_all()
                     .build()
                     .expect("creating terminal runtime");
-                runtime.block_on(run(
-                    source,
-                    terminal,
-                    input,
-                    writer,
-                    transport_input,
-                    worker_frames,
-                    Services {
-                        prompts: worker_prompts,
-                        events: worker_events,
-                        player: worker_player,
-                        notices: notice_rx,
-                        live_frames,
-                    },
-                ));
+                let failure_frames = worker_frames.clone();
+                let failure_events = worker_events.clone();
+                contain_worker_failure(&failure_frames, &failure_events, || {
+                    runtime.block_on(run(
+                        source,
+                        terminal,
+                        input,
+                        writer,
+                        transport_input,
+                        worker_frames,
+                        Services {
+                            prompts: worker_prompts,
+                            events: worker_events,
+                            player: worker_player,
+                            notices: notice_rx,
+                            live_frames,
+                        },
+                    ))
+                });
             })
             .expect("starting terminal worker");
         Self {
@@ -469,4 +492,23 @@ pub fn benchmark() {
         elapsed.as_secs_f64(),
         bytes as f64 / 1048576.0 / elapsed.as_secs_f64()
     );
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    #[test]
+    fn panic_publishes_a_visible_failure_and_preserves_last_committed_pixels() {
+        let (writer, _) = mpsc::unbounded_channel();
+        let terminal = terminal::create(Default::default(), writer);
+        let frames = FrameStore::new(Snapshot::capture(&terminal, None, 1, 0, "ready".into(), 0));
+        let events = crate::events::Events::default();
+        let before = frames.load();
+        contain_worker_failure(&frames, &events, || panic!("injected engine failure"));
+        let after = frames.load();
+        assert_eq!(events.since(0).events[0].kind, "session-error");
+        assert!(after.status.contains("Terminal engine failed"));
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.rows, before.rows);
+    }
 }

@@ -33,6 +33,8 @@ windows-numerics = "0.3"
 russh-sftp = "3"
 regex = "1.13.1"
 sha2 = "0.11.1"
+sha1 = "0.11"
+hmac = "0.13"
 zeroize = "1.9.1"
 rand = "0.10"
 

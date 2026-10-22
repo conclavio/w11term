@@ -135,3 +135,28 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
         );
     }
 }
+
+#[tokio::test]
+async fn list_keeps_closed_sessions_with_an_explicit_error() {
+    let (input, receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop(receiver);
+    let registry = Registry::default();
+    registry.replace([Pane {
+        id: 17,
+        label: "failed".into(),
+        active: false,
+        input,
+    }]);
+    let result = registry
+        .execute(Request::List, Arc::new(|_, _, _| anyhow::bail!("unused")))
+        .await
+        .unwrap();
+    assert_eq!(result["sessions"][0]["id"], 17);
+    assert_eq!(result["sessions"][0]["status"], "unavailable");
+    assert!(
+        result["sessions"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("closed")
+    );
+}

@@ -52,18 +52,30 @@ async fn read_until<T>(
     )?
 }
 fn listing(text: &str, account: &str) -> Option<Result<BTreeSet<String>>> {
-    let header =
-        regex::RegexBuilder::new(&format!("SSH keys on account {}:", regex::escape(account)))
-            .case_insensitive(true)
-            .build()
-            .ok()?;
+    let header = regex::RegexBuilder::new(&format!(
+        r"(?m)^SSH keys on account {}:$",
+        regex::escape(account)
+    ))
+    .case_insensitive(true)
+    .build()
+    .ok()?;
     let empty = "@sshkey: you have no registered SSH keys.";
     // Request twice: the second response header bounds the complete first list,
     // even when SSH splits a listing across packets. Echoed command text is not proof.
     let markers: Vec<_> = header
         .find_iter(text)
         .map(|found| found.start())
-        .chain(text.match_indices(empty).map(|(i, _)| i))
+        .chain(
+            text.match_indices(empty)
+                .filter(|(i, _)| {
+                    (*i == 0 || text.as_bytes()[i - 1] == b'\n')
+                        && text
+                            .as_bytes()
+                            .get(i + empty.len())
+                            .is_none_or(|c| *c == b'\n')
+                })
+                .map(|(i, _)| i),
+        )
         .collect();
     if markers.len() < 2 {
         return None;
@@ -108,15 +120,18 @@ pub async fn run(
     };
     send(&input, command).await?;
     read_until(&mut output, |text| {
-        let confirmed = if remove {
-            text.contains(&format!("@sshkey: removed key {}.", device.fingerprint))
-        } else {
-            text.contains(&format!("@sshkey: key {} added.", device.fingerprint))
-                || text.contains(&format!(
-                    "@sshkey: that key is already registered ({}).",
-                    device.fingerprint
-                ))
-        };
+        let confirmed = text.lines().any(|line| {
+            if remove {
+                line == format!("@sshkey: removed key {}.", device.fingerprint)
+            } else {
+                line.starts_with(&format!("@sshkey: key {} added.", device.fingerprint))
+                    || line
+                        == format!(
+                            "@sshkey: that key is already registered ({}).",
+                            device.fingerprint
+                        )
+            }
+        });
         confirmed.then_some(())
     })
     .await?;
@@ -131,6 +146,12 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chat_substrings_cannot_supply_listing_boundaries() {
+        let chat = "Someone says, SSH keys on account pilot:\n  1) SHA256:abc desktop (added now)\nSomeone says, SSH keys on account pilot:\n";
+        assert!(listing(chat, "pilot").is_none());
+        assert!(listing("Someone says, @sshkey: you have no registered SSH keys.\nSomeone says, @sshkey: you have no registered SSH keys.\n","pilot").is_none());
+    }
     #[test]
     fn requires_fresh_complete_listing_and_exact_fingerprint() {
         let text =

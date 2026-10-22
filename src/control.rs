@@ -343,8 +343,9 @@ impl Registry {
                 let panes: Vec<_> = self.0.lock().unwrap().values().cloned().collect();
                 let mut sessions = Vec::new();
                 for pane in panes {
-                    if let Ok((frame, size)) = Self::capture(&pane).await {
-                        sessions.push(json!({"id":pane.id,"label":pane.label,"active":pane.active,"title":frame.title,"status":frame.status,"cols":size.cols,"rows":size.rows,"prompt":frame.prompt,"connection_generation":frame.connection_generation}));
+                    match Self::capture(&pane).await {
+                        Ok((frame, size)) => sessions.push(json!({"id":pane.id,"label":pane.label,"active":pane.active,"title":frame.title,"status":frame.status,"cols":size.cols,"rows":size.rows,"prompt":frame.prompt,"connection_generation":frame.connection_generation})),
+                        Err(error) => sessions.push(json!({"id":pane.id,"label":pane.label,"active":pane.active,"status":"unavailable","error":format!("{error:#}")})),
                     }
                 }
                 Ok(json!({"pid":std::process::id(),"sessions":sessions}))

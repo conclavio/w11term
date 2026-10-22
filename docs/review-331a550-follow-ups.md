@@ -35,6 +35,22 @@ remaining worthwhile findings from the source review at 331a550.
   commands, timer execution/cancellation, asset guard cleanup, oversized wire
   replies, failed download publication and a cancelled read preserving handles.
 
+## Batch 3: trust confirmation and failure reporting
+
+- L1: host verification handles case-folded names, comma lists, wildcard/negated
+  patterns and OpenSSH hashed names. Revoked keys fail before prompts or auth,
+  including explicit pins. Matching certificate-authority entries fail explicitly
+  until host-certificate verification is implemented; they never trigger TOFU.
+- L9: enrollment confirmations and listing boundaries start at line boundaries;
+  chat substrings cannot confirm enrollment. The fresh double-list check remains.
+- L13: a worker panic publishes a visible failure and session-error event while
+  retaining the last committed screen; the engine is discarded, never resumed.
+  Reopening the tab is the recovery action.
+- list now returns failed/closed panes with an explicit error instead of omitting them.
+- Regressions cover pattern/hash/negation behavior, revocation on real handshakes
+  with and without a configured pin, chat spoof rejection, normal enrollment,
+  injected engine failure and closed-pane listing.
+
 ## Remaining batches
 
 - Automation and SFTP: L5/L6/L8/L16; negotiated read sizes; explicit overload

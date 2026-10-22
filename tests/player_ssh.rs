@@ -352,3 +352,37 @@ async fn first_trust_is_saved_known_host_skips_prompt_and_changed_key_fails() {
     assert_eq!(std::fs::read(path).unwrap(), saved);
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoked_key_fails_before_prompt_or_auth_even_with_an_explicit_pin() {
+    let server_key = key();
+    let pin = server_key
+        .public_key()
+        .fingerprint(HashAlg::Sha256)
+        .to_string();
+    let (port, mut seen, server) = fixture(vec![server_key.clone()]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("known_hosts");
+    let record = format!(
+        "@revoked [127.0.0.1]:{port} {}\n",
+        server_key.public_key().to_openssh().unwrap()
+    );
+    std::fs::write(&path, &record).unwrap();
+    for pin in [None, Some(pin)] {
+        let prompts = Prompts::with_known_hosts(path.clone());
+        let client = start(
+            options(port, Authentication::Password, pin),
+            prompts.clone(),
+        );
+        let error = tokio::time::timeout(Duration::from_secs(3), client.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("revoked"));
+        assert!(prompts.current().is_none());
+    }
+    assert!(seen.try_recv().is_err());
+    assert_eq!(std::fs::read_to_string(path).unwrap(), record);
+    server.abort();
+}
