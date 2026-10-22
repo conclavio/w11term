@@ -123,13 +123,11 @@ pub fn worker(
                                         .ok()?;
                                     Some(bytes)
                                 })
-                                .filter(|b| {
-                                    b.len() <= assets::MAX_FILE && assets::validate_wav(b).is_ok()
-                                });
-                            if let Some(bytes) = bytes {
+                                .and_then(|b| crate::wav::ValidatedSound::parse(&b).ok());
+                            if let Some(sound) = bytes {
                                 if unsafe {
                                     PlaySoundW(
-                                        windows::core::PCWSTR(bytes.as_ptr().cast()),
+                                        windows::core::PCWSTR(sound.as_bytes().as_ptr().cast()),
                                         None,
                                         SND_MEMORY | SND_NODEFAULT | SND_SYNC,
                                     )

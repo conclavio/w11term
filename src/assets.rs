@@ -277,45 +277,7 @@ pub async fn sync_into(
     Ok(fetched)
 }
 pub fn validate_wav(bytes: &[u8]) -> Result<()> {
-    ensure!(
-        bytes.len() >= 44 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
-        "sound is not a RIFF/WAVE file"
-    );
-    let mut offset = 12;
-    let mut format = false;
-    let mut data = false;
-    let mut byte_rate = 0;
-    let mut audio_bytes = 0;
-    while offset + 8 <= bytes.len() {
-        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        let start = offset + 8;
-        ensure!(size <= bytes.len() - start, "invalid WAV chunk size");
-        if &bytes[offset..offset + 4] == b"fmt " {
-            ensure!(size >= 16, "invalid WAV format");
-            let value = |i| u16::from_le_bytes([bytes[start + i], bytes[start + i + 1]]);
-            let rate = u32::from_le_bytes(bytes[start + 4..start + 8].try_into().unwrap());
-            ensure!(
-                value(0) == 1
-                    && (1..=2).contains(&value(2))
-                    && (8000..=96000).contains(&rate)
-                    && matches!(value(14), 8 | 16),
-                "only mono/stereo PCM WAV, 8/16 bit, 8–96 kHz is supported"
-            );
-            format = true;
-            byte_rate = rate as usize * value(2) as usize * value(14) as usize / 8;
-        }
-        if &bytes[offset..offset + 4] == b"data" {
-            data = size > 0;
-            audio_bytes += size;
-        }
-        offset = start + size + (size & 1);
-    }
-    ensure!(format && data, "WAV is missing format or audio data");
-    ensure!(
-        audio_bytes <= byte_rate * 5,
-        "sound exceeds five-second duration limit"
-    );
-    Ok(())
+    crate::wav::validate(bytes)
 }
 #[cfg(test)]
 mod tests {
