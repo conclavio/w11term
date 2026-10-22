@@ -457,7 +457,9 @@ impl Server {
                 let name = pipe_name(pid);
                 let mut listener = match security.create(&name, true) {Ok(p)=>p,Err(e)=>{let _=ready_tx.send(Err(e));return;}};
                 let _ = ready_tx.send(Ok(()));
-                let permits = Arc::new(tokio::sync::Semaphore::new(8));
+                let ingress = Arc::new(tokio::sync::Semaphore::new(32));
+                let commands = Arc::new(tokio::sync::Semaphore::new(8));
+                let waits = Arc::new(tokio::sync::Semaphore::new(16));
                 tokio::pin!(stop_rx);
                 loop {
                     tokio::select! {
@@ -466,10 +468,16 @@ impl Server {
                             if let Err(e) = connected { log::error!("control pipe: {e}"); break; }
                             let next = match security.create(&name, false) {Ok(p)=>p,Err(e)=>{log::error!("control pipe: {e:#}");break;}};
                             let client = std::mem::replace(&mut listener, next);
-                            if let Ok(permit) = permits.clone().try_acquire_owned() {
+                            if let Ok(permit) = ingress.clone().try_acquire_owned() {
                                 let registry = registry.clone();
                                 let capture_png=capture_png.clone(); let security=security.clone();
-                                tokio::spawn(async move { let _permit=permit; let _=serve(client, registry, capture_png, security).await; });
+                                let commands=commands.clone(); let waits=waits.clone();
+                                tokio::spawn(async move { let _permit=permit; if let Err(error)=serve(client, registry, capture_png, security, commands, waits).await { log::warn!("control request failed: {error:#}"); } });
+                            } else {
+                                // Bound overload handling too: never spawn an unbounded rejection task.
+                                let mut client=client;
+                                let _=tokio::time::timeout(Duration::from_millis(250), write_reply(&mut client,
+                                    Err(anyhow::anyhow!("busy: control connection limit reached")))).await;
                             }
                         }
                     }
@@ -510,6 +518,8 @@ async fn serve(
     registry: Registry,
     capture_png: CapturePng,
     security: Arc<PipeSecurity>,
+    commands: Arc<tokio::sync::Semaphore>,
+    waits: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     let mut read = BufReader::new(&mut pipe).take((MAX_LINE + 1) as u64);
     let mut line = Vec::new();
@@ -523,10 +533,32 @@ async fn serve(
         Err(anyhow::anyhow!("request must end with newline"))
     } else {
         match serde_json::from_slice::<Request>(&line) {
-            Ok(r) => registry.execute(r, capture_png).await,
+            Ok(r) => {
+                let pool = if matches!(
+                    r,
+                    Request::WaitForText { .. }
+                        | Request::Events {
+                            timeout_seconds: 1..,
+                            ..
+                        }
+                ) {
+                    waits
+                } else {
+                    commands
+                };
+                match pool.try_acquire_owned() {
+                    Ok(_permit) => registry.execute(r, capture_png).await,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "busy: control request capacity reached; request was not executed"
+                    )),
+                }
+            }
             Err(e) => Err(e.into()),
         }
     };
+    write_reply(&mut pipe, result).await
+}
+async fn write_reply(pipe: &mut NamedPipeServer, result: Result<Value>) -> Result<()> {
     let mut bytes = serde_json::to_vec(&Reply::from_result(result))?;
     bytes.push(b'\n');
     tokio::time::timeout(TIMEOUT, pipe.write_all(&bytes)).await??;

@@ -150,6 +150,7 @@ pub struct TerminalApp {
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
     frame_task: Option<ComponentTask>,
+    watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
     default_source: Source,
     default_label: String,
@@ -177,6 +178,8 @@ pub enum Message {
     RestoreWindow,
     TogglePlayer(String),
     ControlIdle,
+    WatchRejected,
+    RetryWatchers,
     Control(w11term::control::UiRequest),
     ControlResizeDone {
         pane: u64,
@@ -272,22 +275,25 @@ fn profile_label(name: &str, ssh: &SshOptions) -> String {
 impl TerminalApp {
     fn watch_control(&mut self, context: &ComponentContext<Self>) {
         let receiver = self.control_rx.clone();
-        self.control_task = Some(context.spawn_background(move |cancel| {
-            loop {
-                if cancel.is_cancelled() {
-                    return Message::ControlIdle;
+        self.control_task = Some(context.spawn_background_with_rejection(
+            move |cancel| {
+                loop {
+                    if cancel.is_cancelled() {
+                        return Message::ControlIdle;
+                    }
+                    match receiver
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_millis(200))
+                    {
+                        Ok(request) => return Message::Control(request),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(_) => return Message::ControlIdle,
+                    }
                 }
-                match receiver
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_millis(200))
-                {
-                    Ok(request) => return Message::Control(request),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(_) => return Message::ControlIdle,
-                }
-            }
-        }));
+            },
+            Message::WatchRejected,
+        ));
     }
     fn connection_ui(&mut self, id: TabId) {
         let Some(AppTab {
@@ -1054,10 +1060,13 @@ impl TerminalApp {
         let frames = tab.session.frames.clone();
         let generation = frames.load().generation;
         let epoch = self.watch_epoch;
-        self.frame_task = Some(context.spawn_background(move |cancel| {
-            frames.wait_for_change(generation, || cancel.is_cancelled());
-            Message::FrameReady(id, epoch)
-        }));
+        self.frame_task = Some(context.spawn_background_with_rejection(
+            move |cancel| {
+                frames.wait_for_change(generation, || cancel.is_cancelled());
+                Message::FrameReady(id, epoch)
+            },
+            Message::WatchRejected,
+        ));
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
@@ -1797,6 +1806,7 @@ impl Component for TerminalApp {
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
             frame_task: None,
+            watcher_retry: None,
             watch_epoch: 0,
             default_source: options.source.clone(),
             default_label: label,
@@ -2029,6 +2039,44 @@ impl Component for TerminalApp {
                 }
             }
             Message::ControlIdle => {}
+            Message::WatchRejected => {
+                if self.watcher_retry.is_none() {
+                    let sender = context.sender();
+                    match crate::ui_timer::RetryTimer::new(move || {
+                        sender.send(Message::RetryWatchers);
+                    }) {
+                        Ok(timer) => self.watcher_retry = Some(timer),
+                        Err(error) => log::error!("Cannot schedule watcher recovery: {error}"),
+                    }
+                }
+            }
+            Message::RetryWatchers => {
+                if self
+                    .control_task
+                    .as_ref()
+                    .is_none_or(|task| task.status() == ComponentTaskStatus::Rejected)
+                {
+                    self.watch_control(context);
+                }
+                if self
+                    .frame_task
+                    .as_ref()
+                    .is_none_or(|task| task.status() == ComponentTaskStatus::Rejected)
+                {
+                    self.watch_frames(context);
+                }
+                if self
+                    .control_task
+                    .as_ref()
+                    .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
+                    && self
+                        .frame_task
+                        .as_ref()
+                        .is_none_or(|task| task.status() != ComponentTaskStatus::Rejected)
+                {
+                    self.watcher_retry = None;
+                }
+            }
             Message::Control(w11term::control::UiRequest::Open {
                 profile,
                 cols,

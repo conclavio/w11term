@@ -220,3 +220,8 @@ The terminal core is vendored from commit `e2a98e1b8af156988ad0ac778658ac27b60a5
 ## License
 
 w11term's original project code is licensed under [Apache-2.0](LICENSE). Vendored `wezterm-term` remains MIT-licensed, with its upstream copyright and license notices preserved. Other dependencies retain their respective licenses. See [NOTICE](NOTICE) for attribution.
+
+Control requests have separate ordinary-command and long-poll capacity. Overload
+returns a JSON `busy` error; that request was not executed. `sftp get` accepts
+`--max-bytes N` to cap a scripted download. Cancelling an SFTP caller does not
+invalidate unrelated handles; transport errors and actual operation timeouts do.

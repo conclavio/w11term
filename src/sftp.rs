@@ -35,6 +35,8 @@ pub enum Operation {
         remote: String,
         local: PathBuf,
         #[serde(default)]
+        max_bytes: Option<u64>,
+        #[serde(default)]
         overwrite: bool,
     },
     Put {
@@ -203,43 +205,84 @@ pub struct Job {
 pub(crate) async fn run(
     session: Arc<russh::client::Handle<crate::ssh::Handler>>,
     mut jobs: mpsc::Receiver<Job>,
+    mut cleanup: mpsc::UnboundedReceiver<Job>,
 ) {
     let mut engine: Option<Engine> = None;
     loop {
         let job = tokio::select! {
+            biased;
+            Some(job) = cleanup.recv() => job,
             job = jobs.recv() => match job {Some(job)=>job,None=>break},
             _ = tokio::time::sleep(Duration::from_secs(300)) => { engine = None; continue; }
         };
         let Job {
             operation,
             deadline,
-            mut reply,
+            reply,
         } = job;
-        if reply.is_closed() {
+        if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
             continue;
         }
+        let detached_close = reply.is_closed() && matches!(operation, Operation::Close { .. });
+        let deadline = if detached_close {
+            Instant::now() + Duration::from_secs(15)
+        } else {
+            deadline
+        };
         if deadline <= Instant::now() {
             let _ = reply.send(Err(
                 "SFTP request expired in the queue; operation was not started".into(),
             ));
             continue;
         }
-        let result = tokio::select! {
-            result = tokio::time::timeout_at(deadline, async {
-                if engine.is_none() { engine = Some(Engine::connect(&session).await?); }
-                engine.as_mut().unwrap().execute(operation).await
-            }) => match result {
-                Ok(result) => {
-                    if result.as_ref().err().and_then(|e|e.downcast_ref::<Error>()).is_some_and(transport_error) {
-                        engine = None;
-                        result.context("SFTP channel failed; outcome may be unknown; handles invalidated, do not blindly retry")
-                    } else { result }
-                },
-                Err(_) => { engine = None; Err(anyhow::anyhow!("SFTP timed out; partial uploads may remain and the operation may have completed; handles invalidated, do not blindly retry")) }
-            },
-            _ = reply.closed() => { engine = None; continue; }
+        let creates_handle = matches!(
+            operation,
+            Operation::Open { .. } | Operation::Opendir { .. }
+        );
+        // Finish an admitted request even if its caller disappears. Cancelling a
+        // read must not reset the shared SFTP channel and invalidate CLI handles.
+        let result = match tokio::time::timeout_at(deadline, async {
+            if engine.is_none() {
+                engine = Some(Engine::connect(&session).await?);
+            }
+            engine.as_mut().unwrap().execute(operation).await
+        })
+        .await
+        {
+            Ok(result) => {
+                if result
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<Error>())
+                    .is_some_and(transport_error)
+                {
+                    engine = None;
+                    result.context("SFTP channel failed; outcome may be unknown; handles invalidated, do not blindly retry")
+                } else {
+                    result
+                }
+            }
+            Err(_) => {
+                engine = None;
+                Err(anyhow::anyhow!(
+                    "SFTP timed out; partial uploads may remain and the operation may have completed; handles invalidated, do not blindly retry"
+                ))
+            }
         };
-        let _ = reply.send(result.map_err(|e| format!("SFTP: {e:#}")));
+        if let Err(Ok(value)) = reply.send(result.map_err(|e| format!("SFTP: {e:#}")))
+            && creates_handle
+            && let Some(handle) = value["handle"].as_u64()
+            && let Some(active) = engine.as_mut()
+        {
+            let closed = tokio::time::timeout(
+                Duration::from_secs(5),
+                active.execute(Operation::Close { handle }),
+            )
+            .await;
+            if !matches!(closed, Ok(Ok(_))) {
+                engine = None;
+            }
+        }
     }
 }
 
@@ -360,7 +403,8 @@ impl Engine {
                 remote,
                 local,
                 overwrite,
-            } => self.get(remote, local, overwrite).await?,
+                max_bytes,
+            } => self.get(remote, local, overwrite, max_bytes).await?,
             Put {
                 local,
                 remote,
@@ -432,6 +476,10 @@ impl Engine {
                     .await
                 {
                     Ok(data) => {
+                        ensure!(
+                            data.data.len() <= len as usize,
+                            "server returned more SFTP data than requested"
+                        );
                         json!({"data_base64":STANDARD.encode(&data.data),"bytes_read":data.data.len(),"eof":false})
                     }
                     Err(e) if eof(&e) => json!({"data_base64":"","bytes_read":0,"eof":true}),
@@ -533,7 +581,13 @@ impl Engine {
             }
         })
     }
-    async fn get(&self, remote: String, local: PathBuf, overwrite: bool) -> Result<Value> {
+    async fn get(
+        &self,
+        remote: String,
+        local: PathBuf,
+        overwrite: bool,
+        max_bytes: Option<u64>,
+    ) -> Result<Value> {
         ensure!(local.is_absolute(), "local path must be absolute");
         if !overwrite {
             ensure!(
@@ -559,8 +613,19 @@ impl Engine {
                 match self.raw.read(&h, offset, self.read_size as u32).await {
                     Ok(data) => {
                         ensure!(
+                            data.data.len() <= self.read_size,
+                            "server returned more SFTP data than requested"
+                        );
+                        ensure!(
                             !data.data.is_empty(),
                             "server returned empty data without EOF"
+                        );
+                        let next = offset
+                            .checked_add(data.data.len() as u64)
+                            .context("file size overflow")?;
+                        ensure!(
+                            max_bytes.is_none_or(|limit| next <= limit),
+                            "download exceeds --max-bytes limit"
                         );
                         file.write_all(&data.data).await?;
                         offset = offset

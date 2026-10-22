@@ -19,6 +19,22 @@ remaining worthwhile findings from the source review at 331a550.
   frame cap, real SSH/SFTP pack rollback including help and two live stores,
   grid convergence/cancellation, tiny and negative-coordinate work areas.
 
+## Batch 2: automation and SFTP availability
+
+- L6: bounded ingress, eight ordinary requests and sixteen long-polls in separate
+  pools; saturation returns an explicit JSON busy error without executing work.
+- L16: frame/control watcher rejection is handled with a native UI retry timer
+  independent of background task slots.
+- L5: oversized SFTP data replies fail before disk writes; get supports optional
+  --max-bytes without imposing a small universal file limit.
+- L8 / drift 3: asset reads use negotiated limits and cancellation enqueues Close
+  through an independent cleanup queue. Abandoned requests finish within their
+  deadlines, abandoned opens close their handles, and cancellation does not reset
+  unrelated handles. Actual transport failure/timeouts still invalidate handles.
+- Regressions cover native 17-client long-poll saturation with responsive ordinary
+  commands, timer execution/cancellation, asset guard cleanup, oversized wire
+  replies, failed download publication and a cancelled read preserving handles.
+
 ## Remaining batches
 
 - Automation and SFTP: L5/L6/L8/L16; negotiated read sizes; explicit overload

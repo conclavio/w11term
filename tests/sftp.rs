@@ -168,14 +168,16 @@ impl russh_sftp::server::Handler for Files {
         offset: u64,
         len: u32,
     ) -> Result<Data, StatusCode> {
+        fs::write(self.root.join("read-entered"), []).map_err(io)?;
         // Keep the SFTP channel busy long enough to verify independent terminal input.
         tokio::time::sleep(Duration::from_millis(20)).await;
         if self.root.join("pause-reads").exists() {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
+        let oversized = self.root.join("oversized-reads").exists();
         let file = self.file(&h)?;
         file.seek(SeekFrom::Start(offset)).map_err(io)?;
-        let mut data = vec![0; len as usize];
+        let mut data = vec![0; len as usize + usize::from(oversized)];
         let n = file.read(&mut data).map_err(io)?;
         if n == 0 {
             return Err(StatusCode::Eof);
@@ -602,6 +604,13 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         tokio::time::timeout(Duration::from_millis(100),rx).await.expect("SFTP blocked terminal input").unwrap().unwrap();
         assert!(!download.is_finished(),"test transfer finished before input assertion");download.await.unwrap();assert_eq!(fs::read(&dest).unwrap(),bytes);
         assert!(session.frames.load().rows.iter().any(|l|l.as_str().contains("interactive")),"shell echo was not processed during SFTP");
+        let limited=local.path().join("limited.bin");
+        let reply=request(json!({"op":"get","remote":"/folder/日本 file.bin","local":limited,"max_bytes":100})).await;
+        assert!(!reply.ok && reply.error.unwrap().contains("max-bytes")); assert!(!limited.exists());
+        fs::write(root.path().join("oversized-reads"),[]).unwrap();
+        let reply=request(json!({"op":"get","remote":"/folder/日本 file.bin","local":limited})).await;
+        assert!(!reply.ok && reply.error.unwrap().contains("more SFTP data")); assert!(!limited.exists());
+        fs::remove_file(root.path().join("oversized-reads")).unwrap();
         fs::write(&dest,b"preserved").unwrap();assert!(!request(json!({"op":"get","remote":"/folder/日本 file.bin","local":dest})).await.ok);assert_eq!(fs::read(&dest).unwrap(),b"preserved");
         ok(json!({"op":"get","remote":"/folder/日本 file.bin","local":dest,"overwrite":true})).await;assert_eq!(fs::read(&dest).unwrap(),bytes);
         let h=ok(json!({"op":"opendir","path":"/folder"})).await["handle"].as_u64().unwrap();
@@ -609,6 +618,20 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         assert_eq!(ok(json!({"op":"readdir","handle":h})).await["eof"],true);ok(json!({"op":"close","handle":h})).await;
         assert!(!request(json!({"op":"readdir","handle":h})).await.ok);
         let h=ok(json!({"op":"open","path":"/folder/日本 file.bin","flags":["read","write"]})).await["handle"].as_u64().unwrap();
+        fs::write(root.path().join("oversized-reads"),[]).unwrap();
+        assert!(!request(json!({"op":"read","handle":h,"offset":0,"len":3})).await.ok);
+        fs::remove_file(root.path().join("oversized-reads")).unwrap();
+        // Abandon an admitted read without resetting the shared channel or its handles.
+        let _=fs::remove_file(root.path().join("read-entered"));
+        fs::write(root.path().join("pause-reads"),[]).unwrap();
+        let (reply,response)=tokio::sync::oneshot::channel();
+        session.input.send(Command::Sftp(w11term::sftp::Job{operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply})).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !root.path().join("read-entered").exists() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        drop(response);
+        assert_eq!(ok(json!({"op":"info"})).await["open_handles"],1);
+        fs::remove_file(root.path().join("pause-reads")).unwrap();
         ok(json!({"op":"write","handle":h,"offset":1,"data_base64":"AAf/"})).await;
         assert_eq!(ok(json!({"op":"read","handle":h,"offset":1,"len":3})).await["data_base64"],"AAf/");
         ok(json!({"op":"fsetstat","handle":h,"attrs":{"size":4}})).await;
@@ -624,6 +647,7 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         let output=tokio::task::spawn_blocking(move||std::process::Command::new(env!("CARGO_BIN_EXE_w11term-cli")).args(["--pid",&pid,"sftp","--pane","1","info"]).output().unwrap()).await.unwrap();
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));
         assert_eq!(opens.load(Ordering::Relaxed),2,"SFTP must reuse one sibling channel on the existing SSH connection");
+        fs::remove_file(root.path().join("read-entered")).unwrap();
         assert_eq!(fs::read_dir(root.path()).unwrap().count(),0);
         fs::write(root.path().join("slow"),b"slow").unwrap();
         let handle=ok(json!({"op":"open","path":"/slow","flags":["read"]})).await["handle"].as_u64().unwrap();

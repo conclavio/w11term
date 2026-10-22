@@ -192,11 +192,33 @@ async fn request(
         .context("asset SFTP timed out")??
         .map_err(anyhow::Error::msg)
 }
+struct RemoteFile {
+    input: mpsc::UnboundedSender<TransportInput>,
+    handle: Option<u64>,
+}
+impl Drop for RemoteFile {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let (reply, _) = oneshot::channel();
+            let _ = self.input.send(TransportInput::Sftp(Job {
+                operation: Operation::Close { handle },
+                deadline: tokio::time::Instant::now() + Duration::from_secs(15),
+                reply,
+            }));
+        }
+    }
+}
 async fn read(
     input: &mpsc::UnboundedSender<TransportInput>,
     path: String,
     limit: usize,
 ) -> Result<Vec<u8>> {
+    let info = request(input, Operation::Info).await?;
+    let chunk_size = info["read_chunk"]
+        .as_u64()
+        .context("missing negotiated read size")?
+        .min(16 * 1024) as usize;
+    ensure!(chunk_size > 0, "unusable negotiated read size");
     let opened = request(
         input,
         Operation::Open {
@@ -207,10 +229,14 @@ async fn read(
     )
     .await?;
     let handle = opened["handle"].as_u64().context("missing SFTP handle")?;
+    let mut guard = RemoteFile {
+        input: input.clone(),
+        handle: Some(handle),
+    };
     let result = async {
         let mut bytes = Vec::new();
         loop {
-            let len = (limit + 1 - bytes.len()).min(16 * 1024) as u32;
+            let len = (limit + 1 - bytes.len()).min(chunk_size) as u32;
             let value = request(
                 input,
                 Operation::Read {
@@ -238,6 +264,7 @@ async fn read(
     }
     .await;
     let closed = request(input, Operation::Close { handle }).await;
+    guard.handle = None;
     let bytes = result?;
     closed?;
     Ok(bytes)
@@ -356,6 +383,39 @@ pub fn validate_wav(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancelling_an_asset_read_enqueues_close() {
+        let (input, mut jobs) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move { read(&input, "/assets/test".into(), 100).await });
+        let Some(TransportInput::Sftp(job)) = jobs.recv().await else {
+            panic!()
+        };
+        assert!(matches!(job.operation, Operation::Info));
+        job.reply
+            .send(Ok(serde_json::json!({"read_chunk":512})))
+            .unwrap();
+        let Some(TransportInput::Sftp(job)) = jobs.recv().await else {
+            panic!()
+        };
+        job.reply.send(Ok(serde_json::json!({"handle":7}))).unwrap();
+        let Some(TransportInput::Sftp(job)) = jobs.recv().await else {
+            panic!()
+        };
+        assert!(matches!(
+            job.operation,
+            Operation::Read {
+                handle: 7,
+                len: 101,
+                ..
+            }
+        ));
+        task.abort();
+        let _ = task.await;
+        let Some(TransportInput::Sftp(close)) = jobs.recv().await else {
+            panic!()
+        };
+        assert!(matches!(close.operation, Operation::Close { handle: 7 }));
+    }
     #[test]
     fn rejects_paths_versions_hashes_and_duplicate_names() {
         let file = File {

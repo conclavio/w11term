@@ -8,7 +8,7 @@ use w11term::{
 
 pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
-  get REMOTE LOCAL [--overwrite] | put LOCAL REMOTE [--overwrite]\n\
+  get REMOTE LOCAL [--overwrite] [--max-bytes N] | put LOCAL REMOTE [--overwrite]\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -93,6 +93,11 @@ pub fn parse(
             fields.insert("local".into(), json!(std::path::absolute(local)?));
             fields.insert("overwrite".into(), json!(overwrite));
             overwrite = false;
+            if command == "get"
+                && let Some(limit) = opts.remove("--max-bytes")
+            {
+                fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
+            }
         }
         "rename" | "hardlink" => {
             fields.insert("from".into(), json!(path()?));

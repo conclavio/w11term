@@ -415,8 +415,9 @@ async fn run_channel(
 ) -> Result<()> {
     let mut channel = session.channel_open_session().await?;
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
+    let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let mut children = tokio::task::JoinSet::new();
-    children.spawn(crate::sftp::run(session.clone(), sftp_rx));
+    children.spawn(crate::sftp::run(session.clone(), sftp_rx, cleanup_rx));
     channel
         .request_pty(
             true,
@@ -435,7 +436,7 @@ async fn run_channel(
         tokio::select! {
             message=input.recv()=>match message {
                 Some(TransportInput::Authenticate(auth))=>options.authentication=auth,
-                Some(TransportInput::Sftp(job))=>if let Err(error)=sftp_tx.try_send(job){let message=if matches!(&error,mpsc::error::TrySendError::Full(_)){"SFTP queue is full"}else{"SFTP worker is closed"};let _=error.into_inner().reply.send(Err(message.into()));},
+                Some(TransportInput::Sftp(job))=>if job.reply.is_closed() && matches!(job.operation,crate::sftp::Operation::Close{..}) { let _=cleanup_tx.send(job); } else if let Err(error)=sftp_tx.try_send(job){let message=if matches!(&error,mpsc::error::TrySendError::Full(_)){"SFTP queue is full"}else{"SFTP worker is closed"};let _=error.into_inner().reply.send(Err(message.into()));},
                 Some(TransportInput::Data(bytes))=>channel.data(bytes.as_slice()).await?,Some(TransportInput::Raw(bytes,reply))=>{let result=channel.data(bytes.as_slice()).await;let _=reply.send(result.as_ref().map(|_|()).map_err(|e|e.to_string()));result?;},
                 Some(TransportInput::Resize(new))=>{*size=new;channel.window_change(size.cols as u32,size.rows as u32,size.pixel_width as u32,size.pixel_height as u32).await?;},None=>{session.disconnect(russh::Disconnect::ByApplication,"Tab closed","en").await?;return Ok(());}
             },

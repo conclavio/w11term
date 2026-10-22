@@ -59,3 +59,79 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
             .contains("invalid regular expression")
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
+    let _ = env_logger::try_init();
+    let session = Session::start(Source::Demo);
+    let registry = Registry::default();
+    registry.replace([Pane {
+        id: 1,
+        label: "lab".into(),
+        active: false,
+        input: session.input.clone(),
+    }]);
+    let _server =
+        w11term::control::Server::start(registry, |_, _, _| anyhow::bail!("unused")).unwrap();
+    let pid = Some(std::process::id());
+    let (replies, mut results) = tokio::sync::mpsc::unbounded_channel();
+    for _ in 0..17 {
+        let replies = replies.clone();
+        tokio::spawn(async move {
+            let result = w11term::control::call(
+                pid,
+                &Request::WaitForText {
+                    pane: 1,
+                    pattern: "capacity-marker".into(),
+                    regex: false,
+                    timeout_seconds: 10,
+                },
+            )
+            .await
+            .unwrap();
+            replies.send(result).unwrap();
+        });
+    }
+    let busy = tokio::time::timeout(std::time::Duration::from_secs(3), results.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!busy.ok && busy.error.unwrap().starts_with("busy:"));
+    assert!(
+        w11term::control::call(pid, &Request::List)
+            .await
+            .unwrap()
+            .ok
+    );
+    assert!(
+        w11term::control::call(pid, &Request::GetText { pane: 1 })
+            .await
+            .unwrap()
+            .ok
+    );
+    use base64::Engine;
+    let input_reply = w11term::control::call(
+        pid,
+        &Request::SendText {
+            pane: 1,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(b"capacity-marker"),
+            no_paste: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!input_reply.ok && !input_reply.error.unwrap().starts_with("busy:")); // Demo has no SSH channel.
+    session
+        .input
+        .send(Command::Text("capacity-marker".into()))
+        .unwrap();
+    for _ in 0..16 {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), results.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .ok
+        );
+    }
+}
