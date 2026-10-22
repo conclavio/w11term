@@ -44,6 +44,14 @@ Dropped transports reconnect in the same tab, with 1/2/4/8/10-second backoff and
 
 Game mode suppresses held-key repeats while preserving the initial press and final release. Normal terminal mode sends negotiated kitty repeat event type 2 and release type 3. The caret menu toggles game mode and mute for the active saved profile. **F11** or the caret menu toggles borderless fullscreen. Normal window size and position are remembered per profile in `%LOCALAPPDATA%\w11term\windows.json`, clamped to the current monitor on restore. Explicit launch `--cols`/`--rows` takes precedence. The status bar displays columns × rows throughout resizing.
 
+Alternate-screen wheel-to-arrow compatibility is disabled by default in game mode.
+`player.alternate_scroll` defaults to `null` (follow game mode); set it to `true` or
+`false` to override that policy. The connect form and caret menu expose this setting.
+Application-requested wheel reports still pass through, Shift keeps the local
+override, and alternate-screen history remains the remote application's job.
+The bundled `play-6789` and `play-6792` profiles explicitly disable wheel-generated
+arrow keys.
+
 The wizard generates Ed25519 device keys in process, stores them under `%LOCALAPPDATA%\w11term\keys`, encrypts private bytes with current-Windows-user DPAPI, and restricts the private file ACL to that user and SYSTEM. The machine name becomes the public comment. Only the public line can be copied by the wizard. These protected files are w11term-specific; OpenSSH cannot read them directly. For a generic host, append the copied public line to `~/.ssh/authorized_keys`.
 
 For a Rustmush profile, select the Rustmush checkbox, generate a device key, and sign in with a password. Once at the game command prompt, choose **caret → Enroll this device**. It sends `@sshkey/add`, reads a fresh `@sshkey/list`, and changes future profile authentication to the key only after verifying the exact SHA256 fingerprint. The confirmation shows that fingerprint. **Forget this device** revokes that fingerprint, verifies the server listing, and returns the profile to password authentication. The encrypted local key remains available for reenrollment. `account+character` usernames pass through unchanged. Account creation stays in the server's welcome flow. Do not concurrently drive the same pane while enrollment is running.
@@ -56,6 +64,7 @@ Example optional profile settings (all fields may be omitted):
 "player": {
   "reconnect": true,
   "game_mode": false,
+  "alternate_scroll": null,
   "rustmush": false,
   "mute": false,
   "bell": "system",
@@ -142,6 +151,20 @@ OSC 52 writes are plain text, work for background sessions, and are capped at 1 
 - `input.rs`: a UI-thread-local input bridge because Reactor 0.100 does not expose the necessary raw keyboard events. It routes terminal input to the active session, releases held keys on the old session before switching, and removes its terminal target for native form/Settings pages. Native popup windows are excluded from interception.
 
 ## Current boundaries
+
+Synchronized output (`CSI ? 2026 h` / `CSI ? 2026 l`) commits text and image pixels
+together. Parsing, replies and input continue during a hold; a missing end marker
+expires after 150 ms. `get-text`, screenshots and `wait-for-text` observe committed
+frames. Capture queries and no-op input do not publish another frame. Oversized or
+invalid image resources are skipped without disabling a tab, and visible textures
+are retained when the GPU budget is full.
+
+The local control pipe uses a protected user/SYSTEM DACL and an explicit mandatory
+integrity label matching its process. Lower-integrity clients are rejected; the CLI
+also verifies the connected server's PID and user. Run the CLI at the same integrity
+level as the GUI. The opt-in elevated regression is
+`cargo test --lib native_high_server_refuses_medium_integrity_client -- --ignored`
+from an administrator terminal; ordinary tests exercise medium/low isolation.
 
 This is a runnable foundation, not complete terminal conformance or a kitty/Ghostty performance result.
 

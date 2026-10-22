@@ -80,7 +80,24 @@ async fn fragmented_update_and_control_capture_share_the_committed_frame() {
         )
         .await
         .unwrap();
+    let waiting = registry.execute(
+        Request::WaitForText {
+            pane: 1,
+            pattern: "new picture".into(),
+            regex: false,
+            timeout_seconds: 1,
+        },
+        Arc::new(|_, _, _| anyhow::bail!("unused")),
+    );
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), waiting.as_mut())
+            .await
+            .is_err(),
+        "wait-for-text observed uncommitted output"
+    );
     let done = feed(&session, "\x1b[?2026l").await;
+    waiting.await.unwrap();
     assert!(text(&done).contains("new HUD\nnew picture"));
     assert_eq!(done.generation, old.generation + 1);
 }

@@ -1356,6 +1356,7 @@ impl TerminalApp {
                     MenuItem::item("fullscreen", "Toggle fullscreen (F11)"),
                     MenuItem::item("mute", "Toggle profile mute"),
                     MenuItem::item("game-mode", "Toggle game mode (suppress key repeat)"),
+                    MenuItem::item("alternate-scroll", "Toggle alternate-screen wheel keys"),
                     MenuItem::item("enroll", "Enroll this device (at game prompt)"),
                     MenuItem::item("forget-device", "Forget this device (revoke game key)"),
                 ],
@@ -1366,6 +1367,9 @@ impl TerminalApp {
                     "Toggle profile mute" => Message::TogglePlayer("mute".into()),
                     "Toggle game mode (suppress key repeat)" => {
                         Message::TogglePlayer("game_mode".into())
+                    }
+                    "Toggle alternate-screen wheel keys" => {
+                        Message::TogglePlayer("alternate_scroll".into())
                     }
                     "Enroll this device (at game prompt)" => Message::DeviceAction(false),
                     "Forget this device (revoke game key)" => Message::DeviceAction(true),
@@ -1606,6 +1610,11 @@ impl TerminalApp {
                 draft.player.reconnect,
             ),
             ("mute", "Mute this profile", draft.player.mute),
+            (
+                "alternate_scroll",
+                "Send wheel as arrow keys on the alternate screen",
+                draft.player.alternate_scroll_enabled(),
+            ),
         ] {
             fields.push(
                 CheckBox::new()
@@ -1993,6 +2002,9 @@ impl Component for TerminalApp {
                     match field.as_str() {
                         "mute" => player.mute = !player.mute,
                         "game_mode" => player.game_mode = !player.game_mode,
+                        "alternate_scroll" => {
+                            player.alternate_scroll = Some(!player.alternate_scroll_enabled())
+                        }
                         _ => {}
                     }
                     if let Some(profile) = self.profiles.get_mut(label) {
@@ -2251,6 +2263,13 @@ impl Component for TerminalApp {
                             }
                         }
                         "game_mode" => draft.player.game_mode = value,
+                        "alternate_scroll" => {
+                            // Native property reconciliation can emit the same
+                            // value; that must not turn automatic policy into an override.
+                            if draft.player.alternate_scroll_enabled() != value {
+                                draft.player.alternate_scroll = Some(value);
+                            }
+                        }
                         "reconnect" => draft.player.reconnect = value,
                         "mute" => draft.player.mute = value,
                         _ => {}
@@ -3093,8 +3112,28 @@ impl TerminalApp {
                 };
                 assert_eq!(draft.authentication, 3);
                 assert!(draft.player.game_mode);
+                assert!(!draft.player.alternate_scroll_enabled());
+                self.update(
+                    Message::DraftPlayer(id, "alternate_scroll".into(), false),
+                    context,
+                );
+                let Page::NewProfile(draft) = &self.tabs.get(id).unwrap().page else {
+                    panic!()
+                };
+                assert!(
+                    draft.player.alternate_scroll.is_none(),
+                    "native reconciliation overwrote automatic policy"
+                );
+                self.update(
+                    Message::DraftPlayer(id, "alternate_scroll".into(), true),
+                    context,
+                );
+                let Page::NewProfile(draft) = &self.tabs.get(id).unwrap().page else {
+                    panic!()
+                };
+                assert_eq!(draft.player.alternate_scroll, Some(true));
                 eprintln!(
-                    "Player UI smoke passed: trust and private/native prompts, fullscreen roundtrip, expanded wizard."
+                    "Player UI smoke passed: trust and private/native prompts, fullscreen roundtrip, wizard wheel policy."
                 );
                 let _ = context.window().request_close();
             }

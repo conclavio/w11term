@@ -49,6 +49,22 @@ the current sound. The gateway should send short game effects rather than music.
 Files must be RIFF/WAVE, PCM format 1, mono or stereo, 8/16-bit, 8–96 kHz,
 and at most five seconds long.
 
+The RIFF length must exactly match the file. Supply one PCM `fmt ` chunk before
+one nonempty `data` chunk, with valid padding, byte rate, block alignment and whole
+sample frames. PCM format chunks may be 16 bytes, or 18 bytes with a zero extension
+size. Duplicate format/data chunks and trailing partial chunks are rejected.
+Bounded ancillary chunks are accepted but discarded before native playback; w11term
+constructs a canonical WAV from the validated format and samples.
+
+## Cockpit frame presentation
+
+Wrap each logical HUD and image update in `CSI ? 2026 h` (begin synchronized
+output) and `CSI ? 2026 l` (end). `CSI ? 2026 $ p` queries support/state; w11term
+answers state 1 while held and 2 otherwise. Parsing, SSH replies, and player input
+continue during the hold. An incomplete update is released after a 150 ms watchdog;
+repeated begin markers do not extend it. Send the end marker promptly for every
+frame. This batches presentation; it does not schedule or guarantee a frame rate.
+
 ## Asset manifest and SFTP
 
 The subsystem is `sftp` on a sibling channel of the existing authenticated SSH

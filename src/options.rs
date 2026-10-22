@@ -20,6 +20,8 @@ pub enum Authentication {
 pub struct PlayerOptions {
     pub reconnect: bool,
     pub game_mode: bool,
+    /// None follows game mode: compatible cursor-key scrolling outside games.
+    pub alternate_scroll: Option<bool>,
     pub rustmush: bool,
     pub mute: bool,
     pub bell: String,
@@ -31,12 +33,19 @@ impl Default for PlayerOptions {
         Self {
             reconnect: true,
             game_mode: false,
+            alternate_scroll: None,
             rustmush: false,
             mute: false,
             bell: "system".into(),
             sync_assets: true,
             device_key: None,
         }
+    }
+}
+
+impl PlayerOptions {
+    pub fn alternate_scroll_enabled(&self) -> bool {
+        self.alternate_scroll.unwrap_or(!self.game_mode)
     }
 }
 
@@ -350,6 +359,10 @@ mod tests {
             assert_eq!(profiles[name].authentication, Authentication::None);
             assert_eq!(profiles[name].port, port);
             assert_eq!(profiles[name].user, "play");
+            assert!(
+                !profiles[name].player.alternate_scroll_enabled(),
+                "bundled game profiles must not turn the camera with wheel-generated arrows"
+            );
         }
     }
 
@@ -378,5 +391,22 @@ mod tests {
         assert_eq!((options.cols, options.rows), (Some(170), Some(48)));
         assert!(parse(&["--cols", "0"]).is_err());
         assert!(parse(&["--rows", "501"]).is_err());
+    }
+    #[test]
+    fn alternate_scroll_defaults_follow_game_mode_and_explicit_profile_policy_wins() {
+        let normal: PlayerOptions = serde_json::from_str("{}").unwrap();
+        assert!(normal.alternate_scroll_enabled());
+        let game: PlayerOptions = serde_json::from_str(r#"{"game_mode":true}"#).unwrap();
+        assert!(!game.alternate_scroll_enabled());
+        for (game, setting) in [(true, true), (true, false), (false, true), (false, false)] {
+            let options: PlayerOptions = serde_json::from_value(
+                serde_json::json!({"game_mode":game,"alternate_scroll":setting}),
+            )
+            .unwrap();
+            assert_eq!(options.alternate_scroll_enabled(), setting);
+            let restored: PlayerOptions =
+                serde_json::from_value(serde_json::to_value(&options).unwrap()).unwrap();
+            assert_eq!(restored, options);
+        }
     }
 }

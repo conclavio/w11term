@@ -19,9 +19,10 @@ pub fn scroll_wheel(
     last: wezterm_term::MouseEvent,
     lines: isize,
     modifiers: wezterm_term::KeyModifiers,
+    alternate_scroll: bool,
 ) -> anyhow::Result<()> {
     use wezterm_term::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    if (terminal.is_mouse_grabbed() || terminal.is_alt_screen_active())
+    if (terminal.is_mouse_grabbed() || (terminal.is_alt_screen_active() && alternate_scroll))
         && !modifiers.contains(KeyModifiers::SHIFT)
     {
         let button = if lines > 0 {
@@ -167,6 +168,34 @@ pub fn send_key_event(
         }
         if modifiers.contains(wezterm_term::KeyModifiers::SUPER) {
             mods |= Modifiers::SUPER;
+        }
+        // The pinned encoder treats an unmodified DEL character as Backspace
+        // before reaching its functional-key branch. Preserve physical Delete
+        // for every negotiated flag set and every event type.
+        if matches!(key, L::Delete | L::Char('\x7f')) {
+            let reports =
+                flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
+            if !down && !reports {
+                return Ok(());
+            }
+            let modifier = 1
+                + u8::from(mods.contains(Modifiers::SHIFT))
+                + 2 * u8::from(mods.contains(Modifiers::ALT))
+                + 4 * u8::from(mods.contains(Modifiers::CTRL))
+                + 8 * u8::from(mods.contains(Modifiers::SUPER));
+            let event = if !reports {
+                ""
+            } else if !down {
+                ":3"
+            } else if repeat {
+                ":2"
+            } else {
+                ""
+            };
+            writer.send(TransportInput::Data(
+                format!("\x1b[3;{modifier}{event}~").into_bytes(),
+            ))?;
+            return Ok(());
         }
         let report_repeat = repeat
             && down
@@ -516,6 +545,143 @@ mod tests {
         assert!(!t.synchronized_output());
     }
     #[test]
+    fn delete_and_backspace_stay_distinct_for_every_kitty_event_and_modifier() {
+        for flags in [1, 3, 8, 11] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut t = create(TerminalSize::default(), tx.clone());
+            t.advance_bytes(format!("\x1b[>{flags}u"));
+            for (modifiers, code) in [
+                (KeyModifiers::NONE, 1),
+                (KeyModifiers::SHIFT, 2),
+                (KeyModifiers::CTRL, 5),
+                (KeyModifiers::ALT, 3),
+                (KeyModifiers::SUPER, 9),
+                (
+                    KeyModifiers::SHIFT
+                        | KeyModifiers::CTRL
+                        | KeyModifiers::ALT
+                        | KeyModifiers::SUPER,
+                    16,
+                ),
+            ] {
+                for key in [KeyCode::Delete, KeyCode::Char('\x7f'), KeyCode::Backspace] {
+                    for (down, repeat) in [(true, false), (true, true), (false, false)] {
+                        send_key_event(&mut t, &tx, key, modifiers, down, repeat).unwrap();
+                        let report = flags & 2 != 0;
+                        if !down && !report {
+                            assert!(rx.try_recv().is_err());
+                            continue;
+                        }
+                        let event = if !report {
+                            ""
+                        } else if !down {
+                            ":3"
+                        } else if repeat {
+                            ":2"
+                        } else {
+                            ""
+                        };
+                        let expected = if key == KeyCode::Backspace {
+                            if modifiers == KeyModifiers::NONE
+                                && flags & 8 == 0
+                                && down
+                                && !(repeat && report)
+                            {
+                                "\x7f".to_owned()
+                            } else {
+                                format!("\x1b[127;{code}{event}u")
+                            }
+                        } else {
+                            format!("\x1b[3;{code}{event}~")
+                        };
+                        assert_eq!(
+                            receive(&mut rx),
+                            expected.as_bytes(),
+                            "flags={flags}, {key:?}, {modifiers:?}, down={down}, repeat={repeat}"
+                        );
+                    }
+                }
+            }
+            t.reset_connection();
+            send_key_event(
+                &mut t,
+                &tx,
+                KeyCode::Delete,
+                KeyModifiers::NONE,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(receive(&mut rx), b"\x1b[3~");
+            send_key_event(
+                &mut t,
+                &tx,
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(receive(&mut rx), b"\x7f");
+        }
+    }
+    #[test]
+    fn wheel_policy_preserves_mouse_reporting_and_never_synthesizes_game_keys() {
+        use wezterm_term::{MouseButton, MouseEvent, MouseEventKind};
+        let last = MouseEvent {
+            kind: MouseEventKind::Move,
+            button: MouseButton::None,
+            modifiers: KeyModifiers::NONE,
+            x: 0,
+            y: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        };
+        for flags in [0, 3, 11] {
+            for alternate in [false, true] {
+                for tracking in [false, true] {
+                    for shift in [false, true] {
+                        for policy in [false, true] {
+                            let (mut t, mut rx) = engine();
+                            for _ in 0..30 {
+                                t.advance_bytes(b"line\r\n");
+                            }
+                            if alternate {
+                                t.advance_bytes(b"\x1b[?1049h");
+                            }
+                            if tracking {
+                                t.advance_bytes(b"\x1b[?1000h\x1b[?1006h");
+                            }
+                            if flags != 0 {
+                                t.advance_bytes(format!("\x1b[>{flags}u"));
+                            }
+                            let modifiers = if shift {
+                                KeyModifiers::SHIFT
+                            } else {
+                                KeyModifiers::NONE
+                            };
+                            let mut offset = 0;
+                            scroll_wheel(&mut t, &mut offset, last, 1, modifiers, policy).unwrap();
+                            if !shift && tracking {
+                                assert_eq!(receive(&mut rx), b"\x1b[<64;1;1M");
+                            } else if !shift && alternate && policy {
+                                assert_eq!(receive(&mut rx), b"\x1b[A");
+                            } else {
+                                assert!(rx.try_recv().is_err());
+                                assert_eq!(offset, usize::from(!alternate));
+                            }
+                            // Drain an ordered engine reply as a barrier: the
+                            // engine writes on another thread, so try_recv alone
+                            // cannot prove that no cursor key was queued.
+                            t.advance_bytes(b"\x1b[?2026$p");
+                            assert_eq!(receive(&mut rx), b"\x1b[?2026;2$y");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn wheel_scrolls_history_reports_mouse_and_leaves_alternate_history_to_the_app() {
         let (mut terminal, mut replies) = engine();
         terminal.resize(TerminalSize {
@@ -536,7 +702,15 @@ mod tests {
             y_pixel_offset: 0,
         };
         let mut offset = 0;
-        scroll_wheel(&mut terminal, &mut offset, last, 3, KeyModifiers::NONE).unwrap();
+        scroll_wheel(
+            &mut terminal,
+            &mut offset,
+            last,
+            3,
+            KeyModifiers::NONE,
+            true,
+        )
+        .unwrap();
         assert_eq!(offset, 3);
         assert!(replies.try_recv().is_err());
         scroll_wheel(
@@ -545,6 +719,7 @@ mod tests {
             last,
             isize::MAX,
             KeyModifiers::NONE,
+            true,
         )
         .unwrap();
         assert_eq!(offset, terminal.screen().phys_row(0));
@@ -554,14 +729,38 @@ mod tests {
             terminal.screen().phys_to_stable_row_index(0)
         );
         terminal.advance_bytes(b"\x1b[?1000h\x1b[?1006h");
-        scroll_wheel(&mut terminal, &mut offset, last, 2, KeyModifiers::NONE).unwrap();
+        scroll_wheel(
+            &mut terminal,
+            &mut offset,
+            last,
+            2,
+            KeyModifiers::NONE,
+            true,
+        )
+        .unwrap();
         assert_eq!(receive(&mut replies), b"\x1b[<64;1;1M");
         assert_eq!(receive(&mut replies), b"\x1b[<64;1;1M");
-        scroll_wheel(&mut terminal, &mut offset, last, -2, KeyModifiers::SHIFT).unwrap();
+        scroll_wheel(
+            &mut terminal,
+            &mut offset,
+            last,
+            -2,
+            KeyModifiers::SHIFT,
+            true,
+        )
+        .unwrap();
         assert!(replies.try_recv().is_err());
         let primary = offset;
         terminal.advance_bytes(b"\x1b[?1000l\x1b[?1049h");
-        scroll_wheel(&mut terminal, &mut offset, last, 2, KeyModifiers::NONE).unwrap();
+        scroll_wheel(
+            &mut terminal,
+            &mut offset,
+            last,
+            2,
+            KeyModifiers::NONE,
+            true,
+        )
+        .unwrap();
         assert_eq!(receive(&mut replies), b"\x1b[A");
         assert_eq!(receive(&mut replies), b"\x1b[A");
         assert_eq!(offset, primary);
@@ -574,6 +773,51 @@ mod tests {
             Snapshot::capture(&terminal, None, 3, offset, String::new(), 0).scroll_offset,
             primary
         );
+    }
+    #[test]
+    fn game_wheel_policy_and_explicit_override_survive_reconnect() {
+        let (mut t, mut rx) = engine();
+        let mut profile = crate::options::PlayerOptions {
+            game_mode: true,
+            ..Default::default()
+        };
+        let last = wezterm_term::MouseEvent {
+            kind: wezterm_term::MouseEventKind::Move,
+            button: wezterm_term::MouseButton::None,
+            modifiers: KeyModifiers::NONE,
+            x: 0,
+            y: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+        };
+        let mut offset = 0;
+        for _ in 0..2 {
+            t.reset_connection();
+            t.advance_bytes(b"\x1b[?1049h\x1b[>3u");
+            profile.alternate_scroll = None;
+            scroll_wheel(
+                &mut t,
+                &mut offset,
+                last,
+                1,
+                KeyModifiers::NONE,
+                profile.alternate_scroll_enabled(),
+            )
+            .unwrap();
+            t.advance_bytes(b"\x1b[?2026$p");
+            assert_eq!(receive(&mut rx), b"\x1b[?2026;2$y");
+            profile.alternate_scroll = Some(true);
+            scroll_wheel(
+                &mut t,
+                &mut offset,
+                last,
+                1,
+                KeyModifiers::NONE,
+                profile.alternate_scroll_enabled(),
+            )
+            .unwrap();
+            assert_eq!(receive(&mut rx), b"\x1b[A");
+        }
     }
 
     #[test]

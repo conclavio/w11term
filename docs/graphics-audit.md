@@ -20,6 +20,18 @@ renderer has a 32 MiB / 512-texture cache and rejects larger individual textures
 Encoded image decoding uses dimension and allocation limits before conversion.
 GPU release occurs at the next paint, not synchronously when the parser sees delete.
 
+The renderer also checks the actual Direct2D maximum bitmap dimension. Invalid or
+unsupported images are isolated and remembered while visible on that device.
+Admission is attempted once per distinct image per paint; over-budget images are
+deferred instead of clearing textures already needed by the frame. Rejection state
+and cached textures are discarded when no longer visible or when the device changes.
+Regressions cover a 20,000×1 image, malformed pixels, budget deferral, and recovery.
+
+Published snapshots freeze the displayed image data, including in-place kitty frame
+edits. Synchronized-output holds use those committed pixels for both Canvas and
+screenshots while the parser updates its separate working state. Unchanged frozen
+images are shared across snapshots rather than copied again for every cell or paint.
+
 The renderer sorts all visible tiles by z-index inside the below-text and above-text
 layers, including placements anchored in different cells. Stable ties preserve model
 order. This fixes traversal order overriding explicit z-indices. Cell backgrounds

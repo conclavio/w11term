@@ -861,7 +861,7 @@ fn special_key(vk: u32) -> Option<KeyCode> {
         0x27 => KeyCode::RightArrow,
         0x28 => KeyCode::DownArrow,
         0x2d => KeyCode::Insert,
-        0x2e => KeyCode::Char('\u{7f}'),
+        0x2e => KeyCode::Delete,
         0x70..=0x87 => KeyCode::Function((vk - 0x6f) as u8),
         _ => return None,
     })
@@ -871,6 +871,11 @@ fn special_key(vk: u32) -> Option<KeyCode> {
 mod tests {
     use super::*;
     use w11term::{options::Source, session::Session};
+    #[test]
+    fn win32_delete_is_a_functional_key() {
+        assert_eq!(special_key(0x2e), Some(KeyCode::Delete));
+        assert_eq!(special_key(0x08), Some(KeyCode::Char('\x08')));
+    }
     #[test]
     fn fractional_wheel_deltas_accumulate_in_both_directions() {
         let mut remainder = 0;
@@ -958,7 +963,7 @@ mod tests {
         state.game_mode = true;
         let key_message = |message, repeat| MSG {
             message,
-            wParam: WPARAM(0x27),
+            wParam: WPARAM(0x2e),
             lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
             ..Default::default()
         };
@@ -970,6 +975,7 @@ mod tests {
         assert!(matches!(
             new_input.try_recv().unwrap(),
             Command::Key {
+                key: KeyCode::Delete,
                 down: true,
                 repeat: false,
                 ..
@@ -978,6 +984,7 @@ mod tests {
         assert!(matches!(
             new_input.try_recv().unwrap(),
             Command::Key {
+                key: KeyCode::Delete,
                 down: false,
                 repeat: false,
                 ..

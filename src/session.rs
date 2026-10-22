@@ -370,7 +370,7 @@ async fn run(
                     }
                     Some(Command::SearchClose) => {search.open=false;Ok(())}
                     Some(Command::Wheel(lines, modifiers)) => {
-                        terminal::scroll_wheel(&mut terminal,&mut scroll_offset,last_mouse,lines,modifiers)
+                        terminal::scroll_wheel(&mut terminal,&mut scroll_offset,last_mouse,lines,modifiers,player.read().unwrap().alternate_scroll_enabled())
                     }
                     Some(Command::Mouse(event)) => { last_mouse = event; terminal.mouse_event(event) },
                     Some(Command::Focus(focused)) => { terminal.focus_changed(focused); Ok(()) }

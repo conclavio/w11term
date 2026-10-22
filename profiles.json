@@ -11,13 +11,15 @@
       "host": "conclav.io",
       "user": "play",
       "port": 6789,
-      "auth": "none"
+      "auth": "none",
+      "player": { "alternate_scroll": false }
     },
     "play-6792": {
       "host": "conclav.io",
       "user": "play",
       "port": 6792,
-      "auth": "none"
+      "auth": "none",
+      "player": { "alternate_scroll": false }
     }
   }
 }

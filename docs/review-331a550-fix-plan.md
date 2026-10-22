@@ -2,14 +2,16 @@
 
 Verified against `331a5504c59a9c9d4c96bcd0a986ee9f104cf6ab` on Windows,
 2026-10-22. Scope: the five priorities in `w11term-review-331a550.md`.
-This is a plan; application fixes have not been implemented.
+All five fixes are implemented in the order below, with regression coverage.
+The verification table records the original behavior at the reviewed commit.
 
 ## Evidence
 
 The isolated harness is `.local/review-probe`, with output in
 `.local/review-probe/results.txt`. It imports the existing library and renderer,
 uses offscreen Direct2D, and never connects to a remote host or plays audio.
-These files are ignored by Git. Reproduce with:
+These files are ignored by Git. The original verification command at that baseline
+(before the implementation API changes) was:
 
 ```powershell
 cargo run --offline --manifest-path .local/review-probe/Cargo.toml --target-dir target --quiet
@@ -41,7 +43,7 @@ Keep five separate commits so failures and protocol changes remain easy to revie
 Start with the small failures reachable from remote content, then complete frame
 publication and input behavior before another feature batch.
 
-### 1. Contain image failures
+### 1. Contain image failures — implemented
 
 - Query the render target's maximum bitmap dimension before CPU conversion or
   upload. Retain checked dimensions, buffer-length checks, and byte budgets.
@@ -62,7 +64,7 @@ publication and input behavior before another feature batch.
   uploads within one frame. Preserve device-loss recovery and the existing
   replacement/deletion regression.
 
-### 2. Give playback a single, bounded PCM interpretation
+### 2. Give playback a single, bounded PCM interpretation — implemented
 
 - Parse the complete RIFF container with checked sizes, exact bounds and padding.
   Require one supported format before one nonempty data chunk; reject duplicate
@@ -79,7 +81,7 @@ publication and input behavior before another feature batch.
   five seconds fail without invoking playback. Valid mono/stereo 8/16-bit PCM at
   supported rates still works. Test the canonical output's sizes independently.
 
-### 3. Enforce the control process's integrity boundary
+### 3. Enforce the control process's integrity boundary — implemented
 
 - Add an explicit mandatory label derived from the server token, with no-write-up
   and no-read-up policy. Preserve the protected user/SYSTEM DACL, local-only pipe,
@@ -95,7 +97,7 @@ publication and input behavior before another feature batch.
   in normal tests and an opt-in native high-server/medium-client test using a
   harmless command. The latter is still required to validate the elevated case.
 
-### 4. Implement synchronized presentation and selective publication
+### 4. Implement synchronized presentation and selective publication — implemented
 
 - Track mode 2026 through the engine parser, including correct DECRQM replies,
   reset/reconnect behavior, fragmented escapes, and transitions within one read.
@@ -123,7 +125,7 @@ publication and input behavior before another feature batch.
   idle/no-op commands, a missing terminator, repeated begins, resize and reconnect.
   Test publication counts directly; no Typometer work is needed.
 
-### 5. Correct Delete and make alternate scrolling a profile policy
+### 5. Correct Delete and make alternate scrolling a profile policy — implemented
 
 - Keep physical Delete distinct from Backspace through the input path. Since the
   pinned upstream encoder has a Delete fast-path defect, merely replacing the
@@ -152,6 +154,15 @@ The high/medium-integrity integration check must be reported separately if its
 required Windows token configuration is unavailable.
 
 ## Primary references
+
+Implementation validation: 73 tests passed across all targets/features; strict
+Clippy passed. The native medium-server/low-client test passed. The high-server/
+medium-client variant is present but requires an elevated test process and was
+not run. The clipboard-writing test remains intentionally opt-in.
+Release GUI/CLI builds and native tab/font/interaction, player-dialog/wheel-policy,
+search, and loopback control smoke checks passed. The control smoke covers raw
+inactive-pane input, PNG capture, event-driven waits, tab open, resize, recording,
+JSON failures, and saved-window restoration.
 
 - [Synchronized output semantics and unspecified timeout](https://github.com/contour-terminal/vt-extensions/blob/master/synchronized-output.md)
 - [Direct2D bitmap dimension capability](https://learn.microsoft.com/en-us/windows/win32/api/d2d1/nf-d2d1-id2d1rendertarget-getmaximumbitmapsize)
