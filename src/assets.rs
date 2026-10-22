@@ -16,6 +16,19 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Default)]
+pub struct PendingPack(Option<String>);
+impl PendingPack {
+    pub fn announce(&mut self, version: String) {
+        self.0 = Some(version);
+    }
+    pub fn next(&mut self, busy: bool, enabled: bool, loaded: &str) -> Option<String> {
+        if busy {
+            return None;
+        }
+        self.0.take().filter(|version| enabled && version != loaded)
+    }
+}
 pub const MAX_FILE: usize = 8 * 1024 * 1024;
 pub const MAX_PACK: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -303,14 +316,45 @@ pub async fn sync_into(
                 .read(true)
                 .write(true)
                 .open(lock_dir.join("sync.lock"))?;
-            file.lock()?;
             Ok(file)
         })
         .await??,
     );
+    loop {
+        let attempt = lock.clone();
+        let acquired = disk(lock.clone(), move || match attempt.try_lock() {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(error) => Err(error.into()),
+        })
+        .await?;
+        if acquired {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let bytes = read(&input, "/assets/manifest.json".into(), 256 * 1024).await?;
     let manifest: Manifest = serde_json::from_slice(&bytes).context("invalid asset manifest")?;
     manifest.validate(&version)?;
+    let budget = sync_budget(manifest.files.iter().map(|file| file.size).sum());
+    tokio::time::timeout(
+        budget,
+        publish_pack(input, version, store, manifest, dir, lock),
+    )
+    .await
+    .context("asset pack synchronization exceeded its size-based deadline")?
+}
+fn sync_budget(bytes: u64) -> Duration {
+    Duration::from_secs(180 + bytes.min(MAX_PACK).div_ceil(64 * 1024))
+}
+async fn publish_pack(
+    input: mpsc::UnboundedSender<TransportInput>,
+    version: String,
+    store: Store,
+    manifest: Manifest,
+    dir: PathBuf,
+    lock: Arc<std::fs::File>,
+) -> Result<usize> {
     let wanted: BTreeSet<String> = manifest.files.iter().map(|f| f.sha256.clone()).collect();
     let cleanup_dir = dir.clone();
     let wanted_before = wanted.clone();
@@ -374,7 +418,9 @@ pub async fn sync_into(
         sounds,
         _lease: Some(lease),
     };
-    disk(lock, move || prune(&dir, &BTreeSet::new())).await?;
+    if let Err(error) = disk(lock, move || prune(&dir, &BTreeSet::new())).await {
+        log::warn!("Asset pack published; old cache cleanup failed: {error:#}");
+    }
     Ok(fetched)
 }
 pub fn validate_wav(bytes: &[u8]) -> Result<()> {
@@ -383,6 +429,23 @@ pub fn validate_wav(bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pack_announcements_keep_latest_pending_version_and_budget_scales_with_size() {
+        let mut packs = PendingPack::default();
+        packs.announce("one".into());
+        assert_eq!(packs.next(false, true, ""), Some("one".into()));
+        packs.announce("two".into());
+        assert_eq!(packs.next(true, true, ""), None);
+        packs.announce("three".into());
+        assert_eq!(packs.next(false, true, "one"), Some("three".into()));
+        packs.announce("three".into());
+        assert_eq!(packs.next(false, true, "three"), None);
+        packs.announce("four".into());
+        assert_eq!(packs.next(false, false, "three"), None);
+        assert_eq!(sync_budget(0), Duration::from_secs(180));
+        assert_eq!(sync_budget(MAX_PACK), Duration::from_secs(1204));
+        assert_eq!(sync_budget(u64::MAX), sync_budget(MAX_PACK));
+    }
     #[tokio::test]
     async fn cancelling_an_asset_read_enqueues_close() {
         let (input, mut jobs) = mpsc::unbounded_channel();

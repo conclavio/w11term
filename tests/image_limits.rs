@@ -90,3 +90,61 @@ fn oversized_unterminated_apc_is_discarded_and_parser_recovers() {
             .any(|r| r.as_str().contains("recovered"))
     );
 }
+
+#[test]
+fn exhausted_automatic_image_ids_reject_without_panicking_or_breaking_text() {
+    let (writer, _) = tokio::sync::mpsc::unbounded_channel();
+    let mut terminal = terminal::create(Default::default(), writer);
+    send(
+        &mut terminal,
+        "a=t,f=32,s=1,v=1,i=4294967295,q=2",
+        &[1, 2, 3, 255],
+    );
+    send(&mut terminal, "a=t,f=32,s=1,v=1,I=1,q=2", &[1, 2, 3, 255]);
+    terminal.advance_bytes(b"still usable");
+    let snapshot = terminal::Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+    assert!(
+        snapshot
+            .rows
+            .iter()
+            .any(|line| line.as_str().contains("still usable"))
+    );
+}
+
+#[test]
+fn shared_image_mutations_remain_inside_the_table_budget() {
+    let (writer, _) = tokio::sync::mpsc::unbounded_channel();
+    let mut terminal = terminal::create(
+        wezterm_term::TerminalSize {
+            pixel_width: 800,
+            pixel_height: 480,
+            ..Default::default()
+        },
+        writer,
+    );
+    let pixels = vec![128; 512 * 1024 * 4];
+    send(
+        &mut terminal,
+        "a=T,f=32,s=512,v=1024,i=1,c=1,r=1,C=1,q=2",
+        &pixels,
+    );
+    for id in 2..=16 {
+        send(
+            &mut terminal,
+            &format!("a=t,f=32,s=512,v=1024,i={id},q=2"),
+            &pixels,
+        );
+    }
+    // One full-canvas append consumes the rest of the conservatively counted table budget.
+    for _ in 0..3 {
+        send(&mut terminal, "a=f,f=32,s=1,v=1,i=1,q=2", &[1, 2, 3, 255]);
+    }
+    let snapshot = terminal::Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+    let images = snapshot
+        .rows
+        .iter()
+        .flat_map(|r| r.visible_cells())
+        .find_map(|c| c.attrs().images())
+        .unwrap();
+    assert_eq!(images[0].image_data().len(), 4 * 1024 * 1024);
+}

@@ -213,6 +213,7 @@ async fn run(
     let assets = crate::assets::Store::default();
     let sounds = crate::sound::worker(player.clone(), assets.clone(), events.clone());
     let mut asset_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending_pack = crate::assets::PendingPack::default();
     let mut status;
     let mut total_bytes = 0u64;
     let mut scroll_offset = 0usize;
@@ -285,6 +286,37 @@ async fn run(
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
+        if let Some(version) = pending_pack.next(
+            asset_task.is_some(),
+            is_ssh && player.read().unwrap().sync_assets_enabled(),
+            &assets.version(),
+        ) {
+            let input = writer.clone();
+            let endpoint = endpoint.clone();
+            let assets = assets.clone();
+            let events = events.clone();
+            asset_task = Some(tokio::spawn(async move {
+                events.push(
+                    "assets-syncing",
+                    serde_json::json!({"pack_version":version}),
+                );
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1800),
+                    crate::assets::sync(input, endpoint, version.clone(), assets),
+                )
+                .await;
+                match result {
+                    Ok(Ok(fetched)) => events.push(
+                        "assets-ready",
+                        serde_json::json!({"pack_version":version,"downloaded":fetched}),
+                    ),
+                    other => events.push(
+                        "assets-error",
+                        serde_json::json!({"pack_version":version,"error":format!("{other:?}")}),
+                    ),
+                }
+            }));
+        }
         presentation.publish(
             &terminal,
             scroll_offset,
@@ -301,17 +333,9 @@ async fn run(
             _=prompts.changed()=>{},
             Some(notice)=notices.recv()=>match notice {
                 crate::sound::Notice::Play(name)=>{if sounds.try_send(name).is_err(){events.push("sound-error",serde_json::json!({"reason":"audio queue full"}));}},
-                crate::sound::Notice::Pack(version)=>{
-                    if is_ssh&&player.read().unwrap().sync_assets&&assets.version()!=version&&asset_task.as_ref().is_none_or(|t|t.is_finished()) {
-                        let input=writer.clone();let endpoint=endpoint.clone();let assets=assets.clone();let events=events.clone();
-                        asset_task=Some(tokio::spawn(async move{
-                            events.push("assets-syncing",serde_json::json!({"pack_version":version}));
-                            let result=tokio::time::timeout(std::time::Duration::from_secs(180),crate::assets::sync(input,endpoint,version.clone(),assets)).await;
-                            match result {Ok(Ok(fetched))=>events.push("assets-ready",serde_json::json!({"pack_version":version,"downloaded":fetched})),other=>events.push("assets-error",serde_json::json!({"pack_version":version,"error":format!("{other:?}")}))}
-                        }));
-                    }
-                }
+                crate::sound::Notice::Pack(version)=> { pending_pack.announce(version); }
             },
+            _ = async { if let Some(task)=asset_task.as_mut() { let _=task.await; } }, if asset_task.is_some() => { asset_task=None; },
             _ = tokio::time::sleep_until(search_refresh), if search.open && search_dirty => {
                 search.refresh(&terminal, scroll_offset);
                 search_dirty = false;

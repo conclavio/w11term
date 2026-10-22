@@ -268,9 +268,12 @@ async fn roundtrip(allow_none: bool) {
                 active: false,
                 input: session.input.clone(),
             }]);
-            let server = control::Server::start(registry.clone(), |_, _, _| {
-                anyhow::bail!("capture unavailable in transport test")
-            })
+            let discovery = tempfile::tempdir().unwrap();
+            let server = control::Server::start_in_directory(
+                registry.clone(),
+                |_, _, _| anyhow::bail!("capture unavailable in transport test"),
+                discovery.path().into(),
+            )
             .unwrap();
             let pid = Some(std::process::id());
             let reply = control::call(pid, &Request::List).await.unwrap();

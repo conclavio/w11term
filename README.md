@@ -68,7 +68,8 @@ Example optional profile settings (all fields may be omitted):
   "rustmush": false,
   "mute": false,
   "bell": "system",
-  "sync_assets": true,
+  "sync_assets": null,
+  "remote_sounds": null,
   "device_key": null
 }
 ```
@@ -128,7 +129,7 @@ Remote programs can set the local Windows clipboard with **OSC 52**, without a f
 printf '\033]52;c;%s\a' "$(printf '%s' 'Copied from the remote host 🌍' | base64 | tr -d '\n')"
 ```
 
-OSC 52 writes are plain text, work for background sessions, and are capped at 1 MiB. Clipboard-read queries receive no response. Remote clipboard writes can be disabled in Settings. Normal UI paste remains distinct from the control CLI's `send-text --no-paste`, which always sends raw bytes. For bytes that cannot be represented as Windows clipboard text, use `--file`, `--stdin`, or `--base64` through the CLI.
+OSC 52 writes are plain text, work for background sessions, and are capped at 1 MiB and four remote writes per second across the process. Clipboard-read queries receive no response. Remote clipboard writes can be disabled in Settings. Normal UI paste remains distinct from the control CLI's `send-text --no-paste`, which always sends raw bytes. For bytes that cannot be represented as Windows clipboard text, use `--file`, `--stdin`, or `--base64` through the CLI.
 
 ## Architecture
 
@@ -225,3 +226,8 @@ Control requests have separate ordinary-command and long-poll capacity. Overload
 returns a JSON `busy` error; that request was not executed. `sftp get` accepts
 `--max-bytes N` to cap a scripted download. Cancelling an SFTP caller does not
 invalidate unrelated handles; transport errors and actual operation timeouts do.
+
+Remote named sounds and automatic asset fetching follow the profile's game/rustmush
+mode unless `player.remote_sounds` / `player.sync_assets` explicitly override it.
+The connect wizard and tab menu expose both controls. Ordinary SSH profiles default
+them off; the bundled play profiles explicitly enable them. BEL remains independent.

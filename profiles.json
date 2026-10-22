@@ -12,14 +12,14 @@
       "user": "play",
       "port": 6789,
       "auth": "none",
-      "player": { "alternate_scroll": false }
+      "player": { "alternate_scroll": false, "sync_assets": true, "remote_sounds": true }
     },
     "play-6792": {
       "host": "conclav.io",
       "user": "play",
       "port": 6792,
       "auth": "none",
-      "player": { "alternate_scroll": false }
+      "player": { "alternate_scroll": false, "sync_assets": true, "remote_sounds": true }
     }
   }
 }

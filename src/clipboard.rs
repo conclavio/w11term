@@ -106,6 +106,20 @@ pub fn write(text: &str) -> Result<()> {
         .context("Clipboard write timed out")?
 }
 
+#[derive(Default)]
+struct RemoteRateLimit(Option<std::time::Instant>);
+impl RemoteRateLimit {
+    fn admit(&mut self, now: std::time::Instant) -> Result<()> {
+        ensure!(
+            self.0.is_none_or(
+                |last| now.saturating_duration_since(last) >= Duration::from_millis(250)
+            ),
+            "OSC 52 rate limited (four writes per second)"
+        );
+        self.0 = Some(now);
+        Ok(())
+    }
+}
 pub struct RemoteClipboard(pub Arc<AtomicBool>);
 impl wezterm_term::Clipboard for RemoteClipboard {
     fn set_contents(
@@ -121,6 +135,9 @@ impl wezterm_term::Clipboard for RemoteClipboard {
             text.len() <= MAX_TEXT,
             "OSC 52 clipboard text exceeds 1 MiB"
         );
+        static LIMIT: std::sync::Mutex<RemoteRateLimit> =
+            std::sync::Mutex::new(RemoteRateLimit(None));
+        LIMIT.lock().unwrap().admit(std::time::Instant::now())?;
         service()?
             .try_send(Request::Write(text, None))
             .context("Clipboard service is busy")?;
@@ -198,6 +215,14 @@ fn write_native(hwnd: HWND, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_writes_are_rate_limited_without_touching_the_system_clipboard() {
+        let now = std::time::Instant::now();
+        let mut limit = RemoteRateLimit::default();
+        assert!(limit.admit(now).is_ok());
+        assert!(limit.admit(now + Duration::from_millis(249)).is_err());
+        assert!(limit.admit(now + Duration::from_millis(250)).is_ok());
+    }
     #[test]
     #[ignore = "Writes the system clipboard; run explicitly during native verification"]
     fn native_osc52_roundtrip_preserving_existing_plain_text() {

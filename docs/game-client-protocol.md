@@ -32,10 +32,15 @@ Windows DOS device names (`CON`, `NUL`, `COM1`, etc., case insensitive) are reje
 No filenames, paths, URLs, shell commands, base64 audio, volume, or executable content
 are accepted. Unknown versions/verbs and malformed commands are ignored and
 reported as `sound-error` events. An overflowing command queue drops commands.
+`player.remote_sounds` and `player.sync_assets` are optional per-profile booleans;
+when absent/null they follow `game_mode || rustmush`. Ordinary SSH profiles default
+both off. Explicit true/false overrides this policy; the bundled play profiles opt in.
+BEL is independent of OSC 440 permission and retains its configurable bell behavior.
 Do not repeatedly send pack announcements with every rendered frame.
 
 `play` resolves a name from the fully verified pack for this connection first,
-then `%LOCALAPPDATA%\w11term\sounds\<name>.wav`. `system` and `off` are reserved
+then `%LOCALAPPDATA%\w11term\sounds\<name>.wav` (or the data directory selected
+by `W11TERM_DATA_DIR`). Local fallback requires exact filename case even on NTFS. `system` and `off` are reserved
 for the Windows default bell and silence. The per-profile `player.mute` applies
 to all sounds, including BEL. The profile's `player.bell` defaults to `system`;
 it can be `off` or another valid sound name. BEL always produces a `bell` event,
@@ -90,7 +95,9 @@ The manifest is always `/assets/manifest.json`:
 
 The example hash/size are placeholders. `version` is the manifest schema version;
 `pack_version` is an opaque pack identifier and must exactly match the announcement.
-Names must be unique across the pack. Kinds are `sound`, `sprite`, `font`, and
+`pack_version` and every file `name` use the same 1–64 character grammar and DOS
+name exclusions as OSC 440 arguments. Names must be unique across the pack;
+`system` and `off` are reserved for sound names. Kinds are `sound`, `sprite`, `font`, and
 `help`. Non-sound files are cached only: no automatic font installation, document
 opening, code execution, or sprite protocol is implied.
 
@@ -99,13 +106,22 @@ segments, and cannot contain `.`/`..` segments, backslashes, drive letters, or U
 Segments contain only ASCII letters, digits, `_`, `-`, spaces, and `.`. Paths are
 unique and at most 200 bytes. Sound paths end in `.wav`. Hashes are exactly 64
 lowercase hex digits and cover the complete file bytes. Sizes are exact byte
-counts, not hints. Unknown manifest fields are rejected in version 1.
+counts, not hints, and must be nonzero. Unknown manifest fields are rejected in version 1.
 
 Client limits: 256 KiB manifest, 256 files, 8 MiB per file, 64 MiB declared pack,
-15 seconds per SFTP request, 180 seconds per synchronization. Reads are sequential
-16 KiB chunks with 16 ms spacing (at most roughly 1 MiB/s). The server should also
+15 seconds per SFTP request. After manifest validation, the transfer budget is
+180 seconds plus one second per declared 64 KiB (up to 1,204 seconds for 64 MiB).
+An outer 1,800-second limit includes connection and cache-lock waiting. This is a
+bounded time budget, not a throughput guarantee. Reads are sequential chunks of
+at most 16 KiB with 16 ms spacing (at most roughly 1 MiB/s). SFTP v3 is required;
+when `limits@openssh.com` is advertised, reads also respect its negotiated size. The server should also
 cap bytes per connection so asset traffic cannot starve interactive rendering.
 The client opens files read-only and uses open/read/close for synchronization.
+While a sync runs, announcements retain the latest pending pack version; completion
+wakes the session to process it. Failed replacements preserve the previous published
+pack. Files are leased across live panes/processes so pruning cannot remove their
+current generations. Cancelled reads enqueue Close without resetting unrelated
+SFTP handles. A transport failure or actual request timeout still invalidates handles.
 
 The gateway exposes only a curated, read-only virtual `/assets` tree. It should
 implement open/read/close, opendir/readdir, stat/lstat/fstat, and realpath. Reject
@@ -157,3 +173,10 @@ Sequence cursors are local to one pane in one process. Retain the returned `next
 truncates oversized data; it is an observation channel, not a durable audit log.
 No event changes window focus. Tests should assert `sound` outcomes rather than
 relying on the machine's speakers.
+
+## Clipboard policy
+
+OSC 52 writes remain enabled by default as requested, can be disabled in Settings,
+and are capped at 1 MiB and four remote writes per second across the process.
+Clipboard-read queries are never answered. Local copy operations use their own
+explicit UI path and are not subject to the remote rate limit.

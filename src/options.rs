@@ -25,7 +25,8 @@ pub struct PlayerOptions {
     pub rustmush: bool,
     pub mute: bool,
     pub bell: String,
-    pub sync_assets: bool,
+    pub sync_assets: Option<bool>,
+    pub remote_sounds: Option<bool>,
     pub device_key: Option<PathBuf>,
 }
 impl Default for PlayerOptions {
@@ -37,13 +38,21 @@ impl Default for PlayerOptions {
             rustmush: false,
             mute: false,
             bell: "system".into(),
-            sync_assets: true,
+            sync_assets: None,
+            remote_sounds: None,
             device_key: None,
         }
     }
 }
 
 impl PlayerOptions {
+    pub fn sync_assets_enabled(&self) -> bool {
+        self.sync_assets.unwrap_or(self.game_mode || self.rustmush)
+    }
+    pub fn remote_sounds_enabled(&self) -> bool {
+        self.remote_sounds
+            .unwrap_or(self.game_mode || self.rustmush)
+    }
     pub fn alternate_scroll_enabled(&self) -> bool {
         self.alternate_scroll.unwrap_or(!self.game_mode)
     }
@@ -343,6 +352,20 @@ fn value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_extensions_follow_game_profiles_with_explicit_overrides() {
+        let mut options = PlayerOptions::default();
+        assert!(!options.sync_assets_enabled() && !options.remote_sounds_enabled());
+        options.game_mode = true;
+        assert!(options.sync_assets_enabled() && options.remote_sounds_enabled());
+        options.sync_assets = Some(false);
+        options.remote_sounds = Some(false);
+        assert!(!options.sync_assets_enabled() && !options.remote_sounds_enabled());
+        options.game_mode = false;
+        options.sync_assets = Some(true);
+        options.remote_sounds = Some(true);
+        assert!(options.sync_assets_enabled() && options.remote_sounds_enabled());
+    }
     #[test]
     fn profile_paths_are_relative_to_config_and_games_never_offer_keys() {
         let directory = tempfile::tempdir().unwrap();

@@ -65,18 +65,45 @@ remaining worthwhile findings from the source review at 331a550.
   reconnect isolation of primary text and graphics, in addition to existing held-key
   bridge and SSH reconnect tests.
 
-## Remaining batches
+## Batch 5: explicit policy and contract completion
 
-- Automation and SFTP: L5/L6/L8/L16; negotiated read sizes; explicit overload
-  responses, independent wait capacity, reliable watchers, cancellation cleanup.
-- Trust and failure reporting: L1/L9/L13; revoked/patterned known-host handling,
-  anchored enrollment confirmations, session failure containment.
-- Compatibility and small correctness items: L11/L14/L19; reconnect screen
-  separation, kitty event/modifier/DPI behavior and authentication cleanup.
-- Contract clarity: document manifest grammar/nonzero sizes/SFTP v3 and timing;
-  explicit profile policy for OSC 440/assets, bounded OSC 52 writes while
-  retaining the requested clipboard feature.
+- L3/L4: optional profile controls for OSC 440 playback and asset sync follow game
+  profiles by default, with wizard/menu overrides. Bundled play profiles opt in.
+  OSC 52 retains the requested default and has a process-wide four-writes/second
+  remote limit; local copy is independent. BEL queue overflow emits sound-error.
+- Drift 2/3: document exact name/version grammar, reserved names, nonzero sizes,
+  unknown-field rejection, SFTP v3, negotiated read sizes and timing.
+- L7: transfer deadline scales with declared pack size rather than rejecting large
+  otherwise valid packs at a fixed 180 seconds. This is not a latency guarantee.
+- Latest pack announcement is retained while a sync runs; completion wakes the
+  session to process it. Local sound fallback matches case exactly.
+- Test discovery records use isolated directories; control listener termination
+  removes its discovery record. Endpoint lock acquisition is cancellation-safe.
+- Regressions cover explicit/automatic profile policies, queue overflow, clipboard
+  rate limiting without writing the clipboard, exact-case sounds, pending pack
+  versions, size-based budgets and a real server advertising 512-byte SFTP reads.
 
-L2 server authentication, M4 GPU cache thrashing and L15 alternate scroll policy
-are already resolved. L17/L20 speculative performance changes remain deferred
-pending profiling; no performance claim depends on implementing them.
+## Deliberate remaining limits
+
+L17/L20 performance changes remain deferred pending profiling. The memory bounds
+are not a universal cap on all terminal/scrollback image allocations. Full kitty
+animation rendering and host-certificate authority verification remain unsupported.
+The latter fails explicitly rather than offering TOFU.
+
+The application retains challenge answers in zeroizing strings, but russh's public
+keyboard-interactive API takes owned Vec<String> and does not guarantee zeroizing
+those internal copies. Fixing that part of L19 requires an upstream API change or
+vendoring the SSH library; it is recorded here rather than claiming full erasure.
+The elevated high-server/medium-client test and clipboard-writing smoke remain
+opt-in; the normal native low/medium integrity and renderer tests run routinely.
+
+## Final validation
+
+98 tests passed across all targets/features; two opt-in tests were skipped as
+identified above. Formatting and strict Clippy passed. Release GUI/CLI builds,
+native tab/font/interaction/player/search smokes, and the loopback control smoke
+passed. The latter also passed against the final normal build without ui-smoke.
+
+The user's existing release executable was running and was not interrupted.
+The fresh normal GUI is target/release/w11term-review.exe; the temporary alternate
+Cargo target used to build it is not part of the committed project configuration.

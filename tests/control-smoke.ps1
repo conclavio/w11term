@@ -1,8 +1,8 @@
 [CmdletBinding()]
-param([string]$Configuration = 'release')
+param([string]$Configuration = 'release', [string]$GuiPath)
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
-$gui = Join-Path $project "target\$Configuration\w11term.exe"
+$gui = if ($GuiPath) { [System.IO.Path]::GetFullPath($GuiPath) } else { Join-Path $project "target\$Configuration\w11term.exe" }
 $ctl = Join-Path $project "target\$Configuration\w11term-cli.exe"
 $echo = Join-Path $project "target\$Configuration\examples\echo_server.exe"
 foreach ($exe in @($gui, $ctl, $echo)) {

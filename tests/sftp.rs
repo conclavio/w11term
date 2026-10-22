@@ -142,6 +142,30 @@ impl Files {
 }
 impl russh_sftp::server::Handler for Files {
     type Error = StatusCode;
+    async fn init(&mut self, _: u32, _: HashMap<String, String>) -> Result<Version, StatusCode> {
+        let mut version = Version::new();
+        if self.root.join("small-reads").exists() {
+            version
+                .extensions
+                .insert("limits@openssh.com".into(), "1".into());
+        }
+        Ok(version)
+    }
+    async fn extended(
+        &mut self,
+        id: u32,
+        request: String,
+        _: Vec<u8>,
+    ) -> Result<Packet, StatusCode> {
+        if request != "limits@openssh.com" || !self.root.join("small-reads").exists() {
+            return Err(StatusCode::OpUnsupported);
+        }
+        let data = [65536u64, 512, 32768, 128]
+            .into_iter()
+            .flat_map(u64::to_be_bytes)
+            .collect();
+        Ok(Packet::ExtendedReply(ExtendedReply { id, data }))
+    }
     fn unimplemented(&self) -> StatusCode {
         StatusCode::OpUnsupported
     }
@@ -168,6 +192,9 @@ impl russh_sftp::server::Handler for Files {
         offset: u64,
         len: u32,
     ) -> Result<Data, StatusCode> {
+        if self.root.join("small-reads").exists() && len > 512 {
+            return Err(StatusCode::Failure);
+        }
         fs::write(self.root.join("read-entered"), []).map_err(io)?;
         // Keep the SFTP channel busy long enough to verify independent terminal input.
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -372,6 +399,7 @@ async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_
     use sha2::{Digest, Sha256};
     let (session, root, opens, server) = fixture(false).await;
     let cache = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("small-reads"), []).unwrap();
     fs::create_dir_all(root.path().join("assets/sounds")).unwrap();
     let mut wav = Vec::new();
     wav.extend_from_slice(b"RIFF");
@@ -493,6 +521,7 @@ async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_
 async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
     let (session, _root, _opens, server) = fixture(false).await;
     session.player.write().unwrap().mute = true;
+    session.player.write().unwrap().remote_sounds = Some(true);
     let registry = registry(&session);
     let capture: w11term::control::CapturePng = Arc::new(|_, _, _| anyhow::bail!("unused"));
     let dir = tempfile::tempdir().unwrap();
@@ -590,7 +619,8 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
     tokio::time::timeout(Duration::from_secs(30),async {
         let (session,root,opens,server)=fixture(false).await;
         let panes=registry(&session);
-        let control=control::Server::start(panes,|_,_,_|anyhow::bail!("unused")).unwrap();
+        let discovery=tempfile::tempdir().unwrap();
+        let control=control::Server::start_in_directory(panes,|_,_,_|anyhow::bail!("unused"),discovery.path().into()).unwrap();
         let local=tempfile::tempdir().unwrap();let source=local.path().join("binary source.bin");let dest=local.path().join("download.bin");
         let bytes:Vec<u8>=(0..200_003).map(|i|(i%256) as u8).collect();fs::write(&source,&bytes).unwrap();
         assert_eq!(ok(json!({"op":"info"})).await["version"],3);
@@ -662,7 +692,7 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         assert_eq!(opens.load(Ordering::Relaxed),3,"recovery opens only a new SFTP channel, not a new SSH transport");
         drop(control);drop(session);server.await.unwrap();
         let (session,_root,_opens,server)=fixture(true).await;
-        let control=control::Server::start(registry(&session),|_,_,_|anyhow::bail!("unused")).unwrap();
+        let control=control::Server::start_in_directory(registry(&session),|_,_,_|anyhow::bail!("unused"),discovery.path().into()).unwrap();
         let r=request(json!({"op":"info"})).await;assert!(!r.ok);assert!(r.error.unwrap().contains("rejected"));
         let (tx,rx)=tokio::sync::oneshot::channel();session.input.send(Command::Raw(b"still here".to_vec(),tx)).unwrap();rx.await.unwrap().unwrap();
         drop(control);drop(session);server.await.unwrap();

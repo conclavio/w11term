@@ -23,7 +23,12 @@ impl wezterm_term::AlertHandler for Alerts {
             Alert::Bell => {
                 self.events.push("bell", serde_json::json!({}));
                 let name = self.player.read().unwrap().bell.clone();
-                let _ = self.notices.try_send(Notice::Play(name));
+                if self.notices.try_send(Notice::Play(name)).is_err() {
+                    self.events.push(
+                        "sound-error",
+                        serde_json::json!({"reason":"command queue full"}),
+                    );
+                }
             }
             Alert::WindowTitleChanged(title) => self
                 .events
@@ -35,6 +40,20 @@ impl wezterm_term::AlertHandler for Alerts {
             Alert::W11termOsc440(parts) => {
                 let parsed = parse(&parts);
                 if let Some(notice) = parsed {
+                    let allowed = {
+                        let player = self.player.read().unwrap();
+                        match &notice {
+                            Notice::Play(_) => player.remote_sounds_enabled(),
+                            Notice::Pack(_) => player.sync_assets_enabled(),
+                        }
+                    };
+                    if !allowed {
+                        self.events.push(
+                            "remote-extension-blocked",
+                            serde_json::json!({"reason":"profile policy"}),
+                        );
+                        return;
+                    }
                     if self.notices.try_send(notice).is_err() {
                         self.events.push(
                             "sound-error",
@@ -65,6 +84,17 @@ pub fn parse(parts: &[Vec<u8>]) -> Option<Notice> {
         b"pack" => Some(Notice::Pack(value.into())),
         _ => None,
     }
+}
+fn exact_local_sound(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let wanted = format!("{name}.wav");
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_name().to_str() == Some(wanted.as_str())
+                && entry.file_type().is_ok_and(|t| t.is_file())
+        })
+        .map(|entry| entry.path())
 }
 pub fn worker(
     player: Arc<RwLock<PlayerOptions>>,
@@ -107,8 +137,7 @@ pub fn worker(
                         let path = store.sound(&name).or_else(|| {
                             crate::keys::data_dir()
                                 .ok()
-                                .map(|dir| dir.join("sounds").join(format!("{name}.wav")))
-                                .filter(|p| p.is_file())
+                                .and_then(|dir| exact_local_sound(&dir.join("sounds"), &name))
                         });
                         if let Some(path) = path {
                             use windows::Win32::Media::Audio::{
@@ -155,6 +184,47 @@ pub fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn osc440_requires_profile_policy_and_bell_overflow_is_reported() {
+        use wezterm_term::{Alert, AlertHandler};
+        let events = Events::default();
+        let player = Arc::new(RwLock::new(PlayerOptions::default()));
+        let (notices, mut receiver) = mpsc::channel(1);
+        let mut alerts = Alerts {
+            events: events.clone(),
+            notices,
+            player: player.clone(),
+        };
+        let command = || {
+            Alert::W11termOsc440(vec![
+                b"440".to_vec(),
+                b"1".to_vec(),
+                b"play".to_vec(),
+                b"shot".to_vec(),
+            ])
+        };
+        alerts.alert(command());
+        assert!(receiver.try_recv().is_err());
+        player.write().unwrap().remote_sounds = Some(true);
+        alerts.alert(command());
+        assert!(matches!(receiver.try_recv(),Ok(Notice::Play(name)) if name=="shot"));
+        alerts.alert(Alert::Bell);
+        alerts.alert(Alert::Bell);
+        assert!(
+            events
+                .since(0)
+                .events
+                .iter()
+                .any(|event| event.kind == "sound-error")
+        );
+    }
+    #[test]
+    fn local_sound_names_are_case_sensitive_on_windows_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Shot.wav"), []).unwrap();
+        assert!(exact_local_sound(dir.path(), "Shot").is_some());
+        assert!(exact_local_sound(dir.path(), "shot").is_none());
+    }
     #[test]
     fn osc_contract_is_strict() {
         let parse_text = |s: &str| {

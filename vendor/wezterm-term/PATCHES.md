@@ -28,3 +28,7 @@ The original MIT license is preserved in `LICENSE.md`.
   transmissions are explicitly rejected rather than misdecoded.
 
 - Reconnection moves the previous primary viewport into scrollback before resetting the transport modes and exposing a clean live screen.
+
+- Automatic image-id exhaustion rejects without overflow; number aliases are only
+  published after successful storage and are retired with deleted/pruned images.
+  Animation table accounting includes shared image aliases.

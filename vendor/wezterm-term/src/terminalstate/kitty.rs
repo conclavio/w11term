@@ -36,6 +36,8 @@ impl KittyImageState {
     }
 
     fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) -> anyhow::Result<()> {
+        // Deduplicated images can be mutated through another image id.
+        self.used_memory = self.id_to_data.values().map(|data| data.len()).sum();
         self.prune_unreferenced();
         let old = self.id_to_data.get(&image_id).map_or(0, |data| data.len());
         anyhow::ensure!(
@@ -76,6 +78,8 @@ impl KittyImageState {
                 freed
             );
             self.used_memory = self.used_memory.saturating_sub(freed);
+            let table = &self.id_to_data;
+            self.number_to_id.retain(|_, id| table.contains_key(id));
         }
     }
 }
@@ -316,6 +320,7 @@ impl TerminalState {
 
                 if delete {
                     self.kitty_img.remove_data_for_id(image_id);
+                    self.kitty_img.number_to_id.retain(|_, id| *id != image_id);
                     self.image_cache.clear();
                 }
             }
@@ -635,6 +640,12 @@ impl TerminalState {
             (background_pixel & 0xff) as u8,
         ]);
 
+        self.kitty_img.used_memory = self
+            .kitty_img
+            .id_to_data
+            .values()
+            .map(|data| data.len())
+            .sum();
         let anim = match self.kitty_img.id_to_data.get(&image_id) {
             Some(anim) => anim,
             None => {
@@ -655,6 +666,12 @@ impl TerminalState {
 
         self.image_cache.clear();
         let old_len = anim.len();
+        let aliases = self
+            .kitty_img
+            .id_to_data
+            .values()
+            .filter(|data| Arc::ptr_eq(data, anim))
+            .count();
         let mut anim = anim.data();
         let (width, height) = anim.dimensions()?;
         let (frame_count, append) = match &*anim {
@@ -681,7 +698,10 @@ impl TerminalState {
             "kitty animation exceeds 32 MiB"
         );
         anyhow::ensure!(
-            self.kitty_img.used_memory.saturating_add(growth) <= 64 * 1024 * 1024,
+            self.kitty_img
+                .used_memory
+                .saturating_add(growth.saturating_mul(aliases))
+                <= 64 * 1024 * 1024,
             "kitty image table exceeds 64 MiB"
         );
         let x = frame.x.unwrap_or(0);
@@ -828,7 +848,7 @@ impl TerminalState {
         }
 
         drop(anim);
-        self.kitty_img.used_memory += growth;
+        self.kitty_img.used_memory += growth * aliases;
         Ok(())
     }
 
@@ -848,8 +868,11 @@ impl TerminalState {
             }
             (Some(id), None) => (id, None),
             (None, Some(no)) => {
-                let id = self.kitty_img.max_image_id + 1;
-                self.kitty_img.number_to_id.insert(no, id);
+                let id = self
+                    .kitty_img
+                    .max_image_id
+                    .checked_add(1)
+                    .context("kitty image id space exhausted")?;
                 (id, Some(no))
             }
         };
@@ -943,6 +966,9 @@ impl TerminalState {
             .raw_image_to_image_data(img)
             .context("storing image data")?;
         self.kitty_img.record_id_to_data(image_id, img)?;
+        if let Some(number) = image_number {
+            self.kitty_img.number_to_id.insert(number, image_id);
+        }
 
         if image_number.is_some() {
             self.kitty_send_response(

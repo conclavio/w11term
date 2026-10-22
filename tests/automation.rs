@@ -71,8 +71,13 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
         active: false,
         input: session.input.clone(),
     }]);
-    let _server =
-        w11term::control::Server::start(registry, |_, _, _| anyhow::bail!("unused")).unwrap();
+    let discovery = tempfile::tempdir().unwrap();
+    let _server = w11term::control::Server::start_in_directory(
+        registry,
+        |_, _, _| anyhow::bail!("unused"),
+        discovery.path().into(),
+    )
+    .unwrap();
     let pid = Some(std::process::id());
     let (replies, mut results) = tokio::sync::mpsc::unbounded_channel();
     for _ in 0..17 {

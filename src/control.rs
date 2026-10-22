@@ -444,11 +444,22 @@ impl Server {
         + Sync
         + 'static,
     ) -> Result<Self> {
+        Self::start_in_directory(registry, capture_png, discovery_dir()?)
+    }
+    /// Embedders/tests can isolate discovery records without changing process environment.
+    pub fn start_in_directory(
+        registry: Registry,
+        capture_png: impl Fn(&Snapshot, TerminalSize, &Path) -> Result<(u32, u32)>
+        + Send
+        + Sync
+        + 'static,
+        directory: PathBuf,
+    ) -> Result<Self> {
         let capture_png: CapturePng = Arc::new(capture_png);
-        let directory = discovery_dir()?;
         std::fs::create_dir_all(&directory)?;
         let pid = std::process::id();
         let manifest = directory.join(format!("{pid}.json"));
+        let worker_manifest = manifest.clone();
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new().name("terminal-control".into()).spawn(move || {
@@ -484,6 +495,7 @@ impl Server {
                     }
                 }
             });
+            let _=std::fs::remove_file(worker_manifest);
         })?;
         ready_rx.recv().context("control server startup failed")??;
         let server = Self {

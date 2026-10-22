@@ -577,7 +577,15 @@ impl State {
                 self.window = Some(root);
             }
         }
-        let vk = message.wParam.0 as u32;
+        let raw_vk = message.wParam.0 as u32;
+        let vk = if matches!(
+            message.message,
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+        ) {
+            key_identity(raw_vk, message.lParam.0)
+        } else {
+            raw_vk
+        };
         if self.modal {
             return false;
         }
@@ -767,13 +775,7 @@ impl State {
                     return true;
                 }
                 let mut details = None;
-                let native_vk = match vk {
-                    0x10 if (message.lParam.0 >> 16) & 0xff == 0x36 => 0xa1,
-                    0x11 if message.lParam.0 & (1 << 24) != 0 => 0xa3,
-                    0x12 if message.lParam.0 & (1 << 24) != 0 => 0xa5,
-                    _ => vk,
-                };
-                let key = special_key(native_vk).or_else(|| {
+                let key = special_key(vk).or_else(|| {
                     let mut keyboard = [0u8; 256];
                     unsafe {
                         GetKeyboardState(&mut keyboard).ok()?;
@@ -912,6 +914,32 @@ fn wheel_steps(remainder: &mut i32, delta: i16) -> i32 {
     steps
 }
 
+fn key_identity(vk: u32, data: isize) -> u32 {
+    match vk {
+        0x10 => {
+            if (data >> 16) & 0xff == 0x36 {
+                0xa1
+            } else {
+                0xa0
+            }
+        }
+        0x11 => {
+            if data & (1 << 24) != 0 {
+                0xa3
+            } else {
+                0xa2
+            }
+        }
+        0x12 => {
+            if data & (1 << 24) != 0 {
+                0xa5
+            } else {
+                0xa4
+            }
+        }
+        _ => vk,
+    }
+}
 fn special_key(vk: u32) -> Option<KeyCode> {
     Some(match vk {
         0x08 => KeyCode::Char('\u{8}'),
@@ -948,6 +976,19 @@ fn special_key(vk: u32) -> Option<KeyCode> {
 mod tests {
     use super::*;
     use w11term::{options::Source, session::Session};
+    #[test]
+    fn simultaneous_left_and_right_modifiers_have_distinct_press_identities() {
+        assert_ne!(
+            key_identity(0x10, 0x2a << 16),
+            key_identity(0x10, 0x36 << 16)
+        );
+        assert_ne!(key_identity(0x11, 0), key_identity(0x11, 1 << 24));
+        assert_ne!(key_identity(0x12, 0), key_identity(0x12, 1 << 24));
+        assert_eq!(
+            special_key(key_identity(0x10, 0x36 << 16)),
+            Some(KeyCode::RightShift)
+        );
+    }
     #[test]
     fn sgr_pixel_offsets_use_physical_pixels_at_non_default_dpi() {
         assert_eq!(cell_pixel_offset(13.0, 10.0, 1.0), 3);

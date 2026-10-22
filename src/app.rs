@@ -1373,6 +1373,8 @@ impl TerminalApp {
                     MenuItem::item("mute", "Toggle profile mute"),
                     MenuItem::item("game-mode", "Toggle game mode (suppress key repeat)"),
                     MenuItem::item("alternate-scroll", "Toggle alternate-screen wheel keys"),
+                    MenuItem::item("remote-sounds", "Toggle remote named sounds"),
+                    MenuItem::item("sync-assets", "Toggle remote asset synchronization"),
                     MenuItem::item("enroll", "Enroll this device (at game prompt)"),
                     MenuItem::item("forget-device", "Forget this device (revoke game key)"),
                 ],
@@ -1386,6 +1388,10 @@ impl TerminalApp {
                     }
                     "Toggle alternate-screen wheel keys" => {
                         Message::TogglePlayer("alternate_scroll".into())
+                    }
+                    "Toggle remote named sounds" => Message::TogglePlayer("remote_sounds".into()),
+                    "Toggle remote asset synchronization" => {
+                        Message::TogglePlayer("sync_assets".into())
                     }
                     "Enroll this device (at game prompt)" => Message::DeviceAction(false),
                     "Forget this device (revoke game key)" => Message::DeviceAction(true),
@@ -1626,6 +1632,16 @@ impl TerminalApp {
                 draft.player.reconnect,
             ),
             ("mute", "Mute this profile", draft.player.mute),
+            (
+                "remote_sounds",
+                "Allow remote named sounds (OSC 440)",
+                draft.player.remote_sounds_enabled(),
+            ),
+            (
+                "sync_assets",
+                "Allow remote asset synchronization over SFTP",
+                draft.player.sync_assets_enabled(),
+            ),
             (
                 "alternate_scroll",
                 "Send wheel as arrow keys on the alternate screen",
@@ -2019,6 +2035,10 @@ impl Component for TerminalApp {
                     match field.as_str() {
                         "mute" => player.mute = !player.mute,
                         "game_mode" => player.game_mode = !player.game_mode,
+                        "remote_sounds" => {
+                            player.remote_sounds = Some(!player.remote_sounds_enabled())
+                        }
+                        "sync_assets" => player.sync_assets = Some(!player.sync_assets_enabled()),
                         "alternate_scroll" => {
                             player.alternate_scroll = Some(!player.alternate_scroll_enabled())
                         }
@@ -2323,6 +2343,16 @@ impl Component for TerminalApp {
                             // value; that must not turn automatic policy into an override.
                             if draft.player.alternate_scroll_enabled() != value {
                                 draft.player.alternate_scroll = Some(value);
+                            }
+                        }
+                        "remote_sounds" => {
+                            if draft.player.remote_sounds_enabled() != value {
+                                draft.player.remote_sounds = Some(value);
+                            }
+                        }
+                        "sync_assets" => {
+                            if draft.player.sync_assets_enabled() != value {
+                                draft.player.sync_assets = Some(value);
                             }
                         }
                         "reconnect" => draft.player.reconnect = value,
