@@ -241,8 +241,12 @@ impl TerminalState {
                     }
                 };
 
-                self.screen_mut()
-                    .set_cell(cursor_x + x, cursor_y, &cell, seqno);
+                self.screen_mut().set_cell_clearing_image_placements(
+                    cursor_x + x,
+                    cursor_y,
+                    &cell,
+                    seqno,
+                );
                 xpos += x_delta;
             }
             ypos += y_delta;
