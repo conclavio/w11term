@@ -101,8 +101,12 @@ pub(crate) struct Profiles {
 
 pub(crate) fn load_profiles(path: &Path) -> Result<Profiles> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    parse_profiles(&bytes, path)
+}
+
+pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
     let mut profiles: Profiles =
-        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+        serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
     for (name, ssh) in &mut profiles.profiles {
         ensure!(
             crate::assets::name(&ssh.player.bell),

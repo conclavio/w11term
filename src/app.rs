@@ -93,6 +93,8 @@ struct AppTab {
 
 #[derive(Clone)]
 struct ProfileDraft {
+    original: Option<(String, SshOptions)>,
+    saved: bool,
     name: String,
     host: String,
     user: String,
@@ -109,6 +111,8 @@ struct ProfileDraft {
 impl Default for ProfileDraft {
     fn default() -> Self {
         Self {
+            original: None,
+            saved: false,
             name: String::new(),
             host: String::new(),
             user: String::new(),
@@ -121,6 +125,56 @@ impl Default for ProfileDraft {
             device: None,
             generating: false,
         }
+    }
+}
+
+impl ProfileDraft {
+    fn existing(name: String, options: SshOptions) -> Self {
+        let (authentication, identity) = match &options.authentication {
+            Authentication::Agent => (0, String::new()),
+            Authentication::Identity { identity } => (1, identity.to_string_lossy().into_owned()),
+            Authentication::None => (2, String::new()),
+            Authentication::Password => (3, String::new()),
+            Authentication::KeyboardInteractive => (4, String::new()),
+        };
+        Self {
+            name: name.clone(),
+            host: options.host.clone(),
+            user: options.user.clone(),
+            port: options.port.to_string(),
+            identity,
+            fingerprint: options.host_key.clone().unwrap_or_default(),
+            authentication,
+            player: options.player.clone(),
+            original: Some((name, options)),
+            ..Default::default()
+        }
+    }
+}
+fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
+    match state {
+        Some(state) => MenuItem::item(
+            key,
+            format!("{label}: {}", if state { "On" } else { "Off" }),
+        ),
+        None => MenuItem::disabled(key, format!("{label} (select a terminal tab)")),
+    }
+}
+fn tab_menu_message(label: String) -> Message {
+    match label.split(": ").next().unwrap_or(&label) {
+        "Paste" => Message::Paste,
+        "Paste raw (no bracketed paste)" => Message::PasteRaw,
+        "Fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
+        "Mute" => Message::TogglePlayer("mute".into()),
+        "Game mode (suppress key repeat)" => Message::TogglePlayer("game_mode".into()),
+        "Alternate-screen wheel keys" => Message::TogglePlayer("alternate_scroll".into()),
+        "Remote named sounds" => Message::TogglePlayer("remote_sounds".into()),
+        "Remote asset synchronization" => Message::TogglePlayer("sync_assets".into()),
+        "Edit current profile…" => Message::EditActiveProfile,
+        "Enroll this device (at game prompt)" => Message::DeviceAction(false),
+        "Forget this device (revoke game key)" => Message::DeviceAction(true),
+        "Settings" => Message::SettingsMenu,
+        _ => Message::ControlIdle,
     }
 }
 
@@ -220,6 +274,9 @@ pub enum Message {
     Edit(TabId, Field, String),
     Auth(TabId, Option<usize>),
     SaveProfile(TabId),
+    SaveProfileOnly(TabId),
+    EditProfile(String),
+    EditActiveProfile,
     WindowSize(WindowSize),
     Geometry(f64, f64, u64, bool),
     GridFallback(u64),
@@ -932,6 +989,44 @@ impl TerminalApp {
             TextBlock::new().text("Used by fonts with ligature support, such as Cascadia Code, JetBrains Mono and Fira Code.").text_wrapping(TextWrapping::Wrap).into(),
             TextBlock::new().text("Applies to all tabs. Changes are saved automatically.").into(),
         ];
+        let mut profiles: Vec<View> =
+            vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
+        for (name, ssh) in &self.profiles {
+            let display = profile_label(name, ssh);
+            let name = name.clone();
+            profiles.push(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(12.0)
+                    .children((
+                        Button::new()
+                            .automation_name(format!("Edit profile {name}"))
+                            .on_click(context.callback(move |_| Message::EditProfile(name.clone())))
+                            .content("Edit…"),
+                        TextBlock::new()
+                            .text(display)
+                            .vertical_alignment(VerticalAlignment::Center),
+                    )),
+            );
+        }
+        if self.profiles.is_empty() {
+            profiles.push(TextBlock::new().text("No saved profiles yet.").into());
+        }
+        if let Some(error) = &self.profile_error {
+            profiles.push(
+                TextBlock::new()
+                    .text(error)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .foreground(Color::rgb(255, 150, 130))
+                    .into(),
+            );
+        }
+        profiles.push(
+            Button::new()
+                .on_click(context.callback(|_| Message::ProfileMenu(NEW_PROFILE.into())))
+                .content("New Profile…"),
+        );
+        children.splice(1..1, profiles);
         children.push(
             TextBlock::new()
                 .text(format!(
@@ -1198,7 +1293,7 @@ impl TerminalApp {
                 if settings {
                     matches!(t.value.page, Page::Settings)
                 } else {
-                    matches!(t.value.page, Page::NewProfile(_))
+                    matches!(&t.value.page, Page::NewProfile(draft) if draft.original.is_none())
                 }
             })
             .map(|t| t.id);
@@ -1222,7 +1317,39 @@ impl TerminalApp {
         self.activate(context);
     }
 
+    fn edit_profile(&mut self, name: String, context: &ComponentContext<Self>) {
+        if let Some(id)=self.tabs.entries().iter().find(|tab|matches!(&tab.value.page,
+            Page::NewProfile(draft) if draft.original.as_ref().is_some_and(|(original,_)| original==&name))).map(|tab|tab.id) {
+            self.tabs.select(id);self.activate(context);return;
+        }
+        let result = self.store.load().and_then(|profiles| {
+            let options = profiles
+                .get(&name)
+                .with_context(|| format!("Profile {name} was removed"))?
+                .clone();
+            Ok((profiles, options))
+        });
+        match result {
+            Ok((profiles, options)) => {
+                self.profiles = profiles;
+                self.profile_error = None;
+                self.tabs.insert(AppTab {
+                    label: format!("Edit {name}"),
+                    page: Page::NewProfile(ProfileDraft::existing(name, options)),
+                });
+                self.sync_selection(context);
+                self.activate(context);
+            }
+            Err(error) => {
+                self.profile_error = Some(format!("{error:#}"));
+                self.utility(true, context);
+            }
+        }
+    }
     fn save_profile(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        self.save_profile_action(id, true, context);
+    }
+    fn save_profile_action(&mut self, id: TabId, connect: bool, context: &ComponentContext<Self>) {
         let Some(AppTab {
             page: Page::NewProfile(draft),
             ..
@@ -1272,20 +1399,63 @@ impl TerminalApp {
                     .then(|| draft.fingerprint.trim().into()),
                 player: draft.player.clone(),
             };
-            self.store.add(name, &options)?;
+            if let Some((original, expected)) = &draft.original {
+                self.store.edit(original, name, &options, expected)?;
+            } else {
+                self.store.add(name, &options)?;
+            }
             self.profiles = self.store.load()?;
             self.profile_error = None;
             Ok(self.profiles[name].clone())
         })();
         match result {
             Ok(options) => {
-                if let Some(tab) = self.tabs.get_mut(id) {
-                    *tab = live_tab(
-                        draft.name.trim().into(),
-                        Source::Ssh(options),
-                        self.appearance.read().unwrap().interaction.osc52,
-                    );
+                let name = draft.name.trim().to_owned();
+                if let Some((original, _)) = &draft.original {
+                    if self.default_label == *original
+                        && matches!(self.default_source, Source::Ssh(_))
+                    {
+                        self.default_label = name.clone();
+                        self.default_source = Source::Ssh(options.clone());
+                    }
+                    let ids: Vec<_> = self
+                        .tabs
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.value.label == *original)
+                        .map(|entry| entry.id)
+                        .collect();
+                    for id in ids {
+                        if let Some(tab) = self.tabs.get_mut(id) {
+                            tab.label = name.clone();
+                            if let Page::Terminal(live) = &tab.page {
+                                *live.session.player.write().unwrap() = options.player.clone();
+                            }
+                        }
+                    }
+                    if original != &name {
+                        let mut windows = self.windows.borrow_mut();
+                        if let Some(placement) = windows.profiles.remove(original) {
+                            windows.profiles.entry(name.clone()).or_insert(placement);
+                        }
+                    }
                 }
+                if let Some(tab) = self.tabs.get_mut(id) {
+                    if connect {
+                        *tab = live_tab(
+                            name,
+                            Source::Ssh(options),
+                            self.appearance.read().unwrap().interaction.osc52,
+                        );
+                    } else if let Page::NewProfile(editor) = &mut tab.page {
+                        editor.original = Some((name.clone(), options));
+                        editor.name = name.clone();
+                        editor.error = None;
+                        editor.saved = true;
+                        tab.label = format!("Edit {name}");
+                    }
+                }
+                self.sync_selection(context);
                 self.activate(context);
             }
             Err(error) => {
@@ -1357,6 +1527,13 @@ impl TerminalApp {
             .content(TextBlock::new().text("+").font_size(22.0))
             // Reactor 0.100 cannot currently nest a Menu owner under a Tooltip wrapper.
             .menu(Menu::new(menu, context.callback(Message::ProfileMenu)));
+        let player = self.tabs.active().and_then(|tab| match &tab.page {
+            Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
+            _ => None,
+        });
+        let can_edit = self.tabs.active().is_some_and(|tab| {
+            matches!(tab.page, Page::Terminal(_)) && self.profiles.contains_key(&tab.label)
+        });
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -1369,34 +1546,42 @@ impl TerminalApp {
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
-                    MenuItem::item("fullscreen", "Toggle fullscreen (F11)"),
-                    MenuItem::item("mute", "Toggle profile mute"),
-                    MenuItem::item("game-mode", "Toggle game mode (suppress key repeat)"),
-                    MenuItem::item("alternate-scroll", "Toggle alternate-screen wheel keys"),
-                    MenuItem::item("remote-sounds", "Toggle remote named sounds"),
-                    MenuItem::item("sync-assets", "Toggle remote asset synchronization"),
+                    state_menu_item(
+                        "fullscreen",
+                        "Fullscreen (F11)",
+                        Some(self.windows.borrow().fullscreen()),
+                    ),
+                    state_menu_item("mute", "Mute", player.as_ref().map(|p| p.mute)),
+                    state_menu_item(
+                        "game-mode",
+                        "Game mode (suppress key repeat)",
+                        player.as_ref().map(|p| p.game_mode),
+                    ),
+                    state_menu_item(
+                        "alternate-scroll",
+                        "Alternate-screen wheel keys",
+                        player.as_ref().map(|p| p.alternate_scroll_enabled()),
+                    ),
+                    state_menu_item(
+                        "remote-sounds",
+                        "Remote named sounds",
+                        player.as_ref().map(|p| p.remote_sounds_enabled()),
+                    ),
+                    state_menu_item(
+                        "sync-assets",
+                        "Remote asset synchronization",
+                        player.as_ref().map(|p| p.sync_assets_enabled()),
+                    ),
+                    MenuItem::separator("profile-actions"),
+                    if can_edit {
+                        MenuItem::item("edit-profile", "Edit current profile…")
+                    } else {
+                        MenuItem::disabled("edit-profile", "Edit current profile…")
+                    },
                     MenuItem::item("enroll", "Enroll this device (at game prompt)"),
                     MenuItem::item("forget-device", "Forget this device (revoke game key)"),
                 ],
-                context.callback(|item: String| match item.as_str() {
-                    "Paste" => Message::Paste,
-                    "Paste raw (no bracketed paste)" => Message::PasteRaw,
-                    "Toggle fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
-                    "Toggle profile mute" => Message::TogglePlayer("mute".into()),
-                    "Toggle game mode (suppress key repeat)" => {
-                        Message::TogglePlayer("game_mode".into())
-                    }
-                    "Toggle alternate-screen wheel keys" => {
-                        Message::TogglePlayer("alternate_scroll".into())
-                    }
-                    "Toggle remote named sounds" => Message::TogglePlayer("remote_sounds".into()),
-                    "Toggle remote asset synchronization" => {
-                        Message::TogglePlayer("sync_assets".into())
-                    }
-                    "Enroll this device (at game prompt)" => Message::DeviceAction(false),
-                    "Forget this device (revoke game key)" => Message::DeviceAction(true),
-                    _ => Message::SettingsMenu,
-                }),
+                context.callback(tab_menu_message),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -1516,8 +1701,35 @@ impl TerminalApp {
     }
 
     fn profile_form(&self, id: TabId, draft: &ProfileDraft, context: &ViewContext<Self>) -> View {
-        let mut fields: Vec<View> =
-            vec![TextBlock::new().text("New Profile").font_size(26.0).into()];
+        let mut fields: Vec<View> = vec![
+            TextBlock::new()
+                .text(if draft.original.is_some() {
+                    "Edit Profile"
+                } else {
+                    "New Profile"
+                })
+                .font_size(26.0)
+                .into(),
+        ];
+        if draft.original.is_some() {
+            fields.push(TextBlock::new().text("Connection changes apply to new sessions. Sound and game options update open tabs.").text_wrapping(TextWrapping::Wrap).into());
+        }
+        // Keep the feedback slot mounted so save/error messages do not remount inputs.
+        fields.push(
+            TextBlock::new()
+                .text(draft.error.as_deref().unwrap_or(if draft.saved {
+                    "Changes saved."
+                } else {
+                    ""
+                }))
+                .text_wrapping(TextWrapping::Wrap)
+                .foreground(if draft.error.is_some() {
+                    Color::rgb(255, 160, 150)
+                } else {
+                    Color::rgb(130, 220, 160)
+                })
+                .into(),
+        );
         for (field, label, text, placeholder) in [
             (Field::Name, "Profile name", &draft.name, "My server"),
             (Field::Host, "Host", &draft.host, "example.com"),
@@ -1577,15 +1789,6 @@ impl TerminalApp {
                     ),
             )),
         );
-        if let Some(error) = &draft.error {
-            fields.push(
-                TextBlock::new()
-                    .text(error)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .foreground(Color::rgb(255, 160, 150))
-                    .into(),
-            );
-        }
         fields.push(
             Button::new()
                 .is_enabled(!draft.generating)
@@ -1668,18 +1871,29 @@ impl TerminalApp {
                 .on_text_changed(context.callback(move |v| Message::DraftBell(id, v)))
                 .into(),
         );
+        if draft.original.is_some() {
+            fields.push(
+                Button::new()
+                    .style(ButtonStyle::Accent)
+                    .automation_name("Save profile changes")
+                    .is_enabled(!draft.generating)
+                    .on_click(context.callback(move |_| Message::SaveProfileOnly(id)))
+                    .content("Save changes"),
+            );
+        }
         fields.push(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(10.0)
                 .children((
                     Button::new()
-                        .style(ButtonStyle::Accent)
+                        .style(draft.original.is_none().then_some(ButtonStyle::Accent))
+                        .is_enabled(!draft.generating)
                         .on_click(context.callback(move |_| Message::SaveProfile(id)))
                         .content("Save and connect"),
                     Button::new()
                         .on_click(context.callback(move |_| Message::CloseTab(id.to_string())))
-                        .content("Cancel"),
+                        .content(if draft.saved { "Close" } else { "Cancel" }),
                 )),
         );
         ScrollViewer::new().content(
@@ -1857,6 +2071,17 @@ impl Component for TerminalApp {
                 matches!(options.source, Source::Demo) && options.extra_profiles.is_empty(),
                 "UI smoke uses only the local lab"
             );
+            if std::env::var_os("W11TERM_PROFILE_SMOKE").is_some() {
+                let fixture = std::path::PathBuf::from(
+                    std::env::var_os("W11TERM_PROFILE_SMOKE_CONFIG")
+                        .expect("profile smoke requires an isolated config"),
+                );
+                assert_eq!(
+                    options.profiles_path.canonicalize().unwrap(),
+                    fixture.canonicalize().unwrap(),
+                    "profile smoke must not edit user profiles"
+                );
+            }
             context.spawn_background(|_| {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 Message::Smoke(0)
@@ -1886,6 +2111,9 @@ impl Component for TerminalApp {
                 }) = self.tabs.get_mut(id)
                     && value.len() <= 128
                 {
+                    if draft.player.bell != value {
+                        draft.saved = false;
+                    }
                     draft.player.bell = value;
                 }
             }
@@ -2301,6 +2529,7 @@ impl Component for TerminalApp {
                         Ok(key) => {
                             draft.identity = key.path.to_string_lossy().into_owned();
                             draft.player.device_key = Some(key.path.clone());
+                            draft.saved = false;
                             draft.authentication = if draft.player.rustmush { 3 } else { 1 };
                             if let Err(e) = w11term::clipboard::write(&key.public_line) {
                                 draft.error =
@@ -2329,10 +2558,12 @@ impl Component for TerminalApp {
                     ..
                 }) = self.tabs.get_mut(id)
                 {
+                    let before = draft.player.clone();
                     match field.as_str() {
                         "rustmush" => {
+                            let changed = draft.player.rustmush != value;
                             draft.player.rustmush = value;
-                            if value {
+                            if value && changed {
                                 draft.player.game_mode = true;
                                 draft.authentication = 3;
                             }
@@ -2358,6 +2589,9 @@ impl Component for TerminalApp {
                         "reconnect" => draft.player.reconnect = value,
                         "mute" => draft.player.mute = value,
                         _ => {}
+                    }
+                    if draft.player != before {
+                        draft.saved = false;
                     }
                 }
             }
@@ -2502,7 +2736,10 @@ impl Component for TerminalApp {
                 Shortcut::CancelTab => self.finish_switcher(false, context),
                 Shortcut::NewTab => self.open(
                     self.default_label.clone(),
-                    self.default_source.clone(),
+                    self.profiles
+                        .get(&self.default_label)
+                        .map(|options| Source::Ssh(options.clone()))
+                        .unwrap_or_else(|| self.default_source.clone()),
                     context,
                 ),
                 Shortcut::CloseTab => {
@@ -2529,6 +2766,17 @@ impl Component for TerminalApp {
                     .map(|(n, p)| (n.clone(), p.clone()))
                 {
                     self.open(name, Source::Ssh(profile), context);
+                }
+            }
+            Message::EditProfile(name) => self.edit_profile(name, context),
+            Message::EditActiveProfile => {
+                if let Some(name) = self
+                    .tabs
+                    .active()
+                    .filter(|tab| self.profiles.contains_key(&tab.label))
+                    .map(|tab| tab.label.clone())
+                {
+                    self.edit_profile(name, context);
                 }
             }
             Message::SettingsMenu => self.utility(true, context),
@@ -2712,15 +2960,20 @@ impl Component for TerminalApp {
                     ..
                 }) = self.tabs.get_mut(id)
                 {
-                    *match field {
+                    let target = match field {
                         Field::Name => &mut draft.name,
                         Field::Host => &mut draft.host,
                         Field::User => &mut draft.user,
                         Field::Port => &mut draft.port,
                         Field::Identity => &mut draft.identity,
                         Field::Fingerprint => &mut draft.fingerprint,
-                    } = text;
-                    draft.error = None;
+                    };
+                    let changed = *target != text;
+                    *target = text;
+                    if changed {
+                        draft.saved = false;
+                        draft.error = None;
+                    }
                 }
             }
             Message::Auth(id, Some(index)) => {
@@ -2729,11 +2982,15 @@ impl Component for TerminalApp {
                     ..
                 }) = self.tabs.get_mut(id)
                 {
+                    if draft.authentication != index {
+                        draft.saved = false;
+                    }
                     draft.authentication = index;
                 }
             }
             Message::Auth(_, None) => {}
             Message::SaveProfile(id) => self.save_profile(id, context),
+            Message::SaveProfileOnly(id) => self.save_profile_action(id, false, context),
             Message::Pointer(id, pointer, kind) => self.pointer(id, pointer, kind, context),
             Message::FindEdit(id, mut text) => {
                 if let Some(AppTab {
@@ -2942,6 +3199,10 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_PROFILE_SMOKE").is_some() {
+            self.profile_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_PLAYER_SMOKE").is_some() {
             self.player_smoke_step(step, context);
             return;
@@ -3132,6 +3393,110 @@ impl TerminalApp {
         }
         context.spawn_background(move |_| {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            Message::Smoke(step + 1)
+        });
+    }
+    fn profile_smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        eprintln!("Profile UI smoke step {step}");
+        match step {
+            0 => {
+                assert!(std::env::var_os("W11TERM_DATA_DIR").is_some());
+                self.update(tab_menu_message("Mute: Off".into()), context);
+                let Page::Terminal(tab) = &self.tabs.get(1).unwrap().page else {
+                    panic!()
+                };
+                assert!(tab.session.player.read().unwrap().mute);
+                self.utility(true, context);
+                self.edit_profile("typo".into(), context);
+            }
+            1 => {
+                let id = self.tabs.active_id().unwrap();
+                let Page::NewProfile(draft) = &self.tabs.get(id).unwrap().page else {
+                    panic!()
+                };
+                assert_eq!(draft.name, "typo");
+                assert_eq!(draft.host, "127.0.0.1");
+                assert_eq!(
+                    draft.authentication, 1,
+                    "native mounting changed the saved auth choice"
+                );
+                self.update(Message::Edit(id, Field::Name, "other".into()), context);
+                self.save_profile_action(id, false, context);
+                let Page::NewProfile(draft) = &self.tabs.get(id).unwrap().page else {
+                    panic!()
+                };
+                assert!(draft.error.as_ref().unwrap().contains("already exists"));
+                self.update(Message::Edit(id, Field::Name, "corrected".into()), context);
+                self.update(Message::Auth(id, Some(2)), context);
+                self.update(
+                    Message::Edit(
+                        id,
+                        Field::Port,
+                        std::env::var("W11TERM_PROFILE_SMOKE_PORT").unwrap(),
+                    ),
+                    context,
+                );
+                self.save_profile_action(id, false, context);
+                let Page::NewProfile(draft) = &self.tabs.get(id).unwrap().page else {
+                    panic!()
+                };
+                assert!(draft.saved, "{:?}", draft.error);
+                assert!(self.profiles.contains_key("corrected"));
+                assert!(!self.profiles.contains_key("typo"));
+                let count = self.tabs.entries().len();
+                self.edit_profile("corrected".into(), context);
+                assert_eq!(self.tabs.entries().len(), count);
+                self.utility(false, context);
+                let blank = self.tabs.active_id().unwrap();
+                assert_ne!(blank, id);
+                self.close_tab(blank, context);
+                self.tabs.select(id);
+                self.activate(context);
+            }
+            2 => {
+                let id = self.tabs.active_id().unwrap();
+                let Page::NewProfile(draft) = &self.tabs.get(id).unwrap().page else {
+                    panic!()
+                };
+                assert_eq!(draft.authentication, 2);
+                assert!(draft.error.is_none());
+                assert!(draft.saved, "native reconciliation cleared saved state");
+                let document: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(std::env::var_os("W11TERM_PROFILE_SMOKE_CONFIG").unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(document["custom"], 42);
+                assert_eq!(document["profiles"]["other"]["custom"], 99);
+                assert_eq!(self.tabs.entries().len(), 3);
+                self.save_profile(id, context);
+            }
+            _ => {
+                let id = self.tabs.active_id().unwrap();
+                let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
+                    panic!("Save and connect did not open a terminal")
+                };
+                if tab.session.frames.load().connection_generation == 0 {
+                    assert!(step < 24, "loopback connection did not become ready");
+                } else {
+                    assert_eq!(self.tabs.get(id).unwrap().label, "corrected");
+                    self.update(tab_menu_message("Remote named sounds: Off".into()), context);
+                    assert!(
+                        self.store.load().unwrap()["corrected"]
+                            .player
+                            .remote_sounds_enabled()
+                    );
+                    assert!(matches!(self.tabs.get(1).unwrap().page, Page::Terminal(_)));
+                    eprintln!(
+                        "Profile UI smoke passed: stateful menu, prefill, rename, collision protection, save-only, independent new form, save and connect"
+                    );
+                    self.update(Message::CloseWindow, context);
+                    return;
+                }
+            }
+        }
+        context.spawn_background(move |_| {
+            std::thread::sleep(Duration::from_millis(500));
             Message::Smoke(step + 1)
         });
     }
@@ -3352,5 +3717,63 @@ impl TerminalApp {
             std::thread::sleep(Duration::from_millis(400));
             Message::Smoke(step + 1)
         });
+    }
+}
+
+#[cfg(test)]
+mod profile_ui_tests {
+    use super::*;
+    #[test]
+    fn state_labels_dispatch_the_same_action_before_and_after_toggling() {
+        for (state, expected) in [(true, "Mute: On"), (false, "Mute: Off")] {
+            let MenuItem::Item { label, enabled, .. } =
+                state_menu_item("mute", "Mute", Some(state))
+            else {
+                panic!()
+            };
+            assert_eq!(label, expected);
+            assert!(enabled);
+            assert!(
+                matches!(tab_menu_message(label),Message::TogglePlayer(field) if field=="mute")
+            );
+        }
+        assert!(matches!(
+            state_menu_item("mute", "Mute", None),
+            MenuItem::Item { enabled: false, .. }
+        ));
+    }
+    #[test]
+    fn existing_profiles_prefill_all_authentication_modes_and_preferences() {
+        for (expected, authentication) in [
+            (0, Authentication::Agent),
+            (
+                1,
+                Authentication::Identity {
+                    identity: "key".into(),
+                },
+            ),
+            (2, Authentication::None),
+            (3, Authentication::Password),
+            (4, Authentication::KeyboardInteractive),
+        ] {
+            let options = SshOptions {
+                host: "test.invalid".into(),
+                user: "pilot+character".into(),
+                port: 6792,
+                authentication,
+                host_key: Some("SHA256:test".into()),
+                player: w11term::options::PlayerOptions {
+                    mute: true,
+                    game_mode: true,
+                    ..Default::default()
+                },
+            };
+            let draft = ProfileDraft::existing("existing".into(), options.clone());
+            assert_eq!(draft.authentication, expected);
+            assert_eq!(draft.port, "6792");
+            assert_eq!(draft.fingerprint, "SHA256:test");
+            assert!(draft.player.mute && draft.player.game_mode);
+            assert_eq!(draft.original, Some(("existing".into(), options)));
+        }
     }
 }

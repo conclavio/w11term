@@ -39,9 +39,11 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 The native WinUI tab strip sits in the window title bar. Click **+** to choose a saved profile and open an independent SSH session; opening a profile more than once creates separate sessions. Drag tabs to reorder them and use their close buttons to disconnect. Closing the last tab closes the window. Background sessions retain their terminal state and continue receiving output; only the active terminal is rendered.
 
-The **+ → New Profile…** form supports host, user, port, agent/key-file/none/password/keyboard-interactive authentication, an optional verified host fingerprint, device-key generation, and player preferences. **Save and connect** adds the profile to the selected configuration file and opens it. Existing profiles cannot be overwritten through this form. Saving preserves unrelated configuration fields and atomically replaces the file. Only the key file's path is stored; private key contents never go into the configuration.
+The **+ → New Profile…** form supports host, user, port, agent/key-file/none/password/keyboard-interactive authentication, an optional verified host fingerprint, device-key generation, and player preferences. **Save and connect** adds the profile to the selected configuration file and opens it. New Profile refuses duplicate names. **Settings → Profiles → Edit…** or **caret → Edit current profile…** opens an existing profile with its saved values. The editor supports renaming and all connection/player fields. **Save changes** updates it without opening or disconnecting a session; **Save and connect** opens the updated connection. Connection changes apply to new sessions; sound and game options update open tabs. Edits preserve unrelated fields and unchanged relative key paths, refuse name collisions, and report a conflict if the profile changed on disk while the editor was open. Saving preserves unrelated configuration fields and atomically replaces the file. Only the key file's path is stored; private key contents never go into the configuration.
 
-The **caret → Settings** command opens the terminal font selector and programming-ligatures toggle. The selector includes only installed Cascadia Code, Cascadia Mono, Consolas, JetBrains Mono, Monaspace-family, and Fira Code fonts. Changes apply across the window's terminal tabs and are saved automatically to `%LOCALAPPDATA%\w11term\settings.json`. `W11TERM_SETTINGS_PATH` can override that file for portable configuration or isolated tests. Settings and New Profile tabs use native controls and do not send their typing into an SSH session. The plus menu also includes the terminal lab.
+The caret menu displays **On**/**Off** for fullscreen, mute, game mode, alternate-screen wheel keys, remote named sounds, and asset synchronization, using the active terminal’s effective settings. Terminal-only actions are disabled when a settings/form tab is selected.
+
+The **caret → Settings** command opens profile management, the terminal font selector and programming-ligatures toggle. The selector includes only installed Cascadia Code, Cascadia Mono, Consolas, JetBrains Mono, Monaspace-family, and Fira Code fonts. Changes apply across the window's terminal tabs and are saved automatically to `%LOCALAPPDATA%\w11term\settings.json`. `W11TERM_SETTINGS_PATH` can override that file for portable configuration or isolated tests. Settings and New Profile tabs use native controls and do not send their typing into an SSH session. The plus menu also includes the terminal lab.
 
 Ligatures default to enabled and use DirectWrite shaping for adjacent ASCII cells with matching attributes, preserving the terminal grid. Monaspace additionally enables its [documented programming-ligature feature sets](https://github.com/githubnext/monaspace#code-ligatures). Font changes recalculate cell geometry and resize existing sessions; PNG capture uses the same selected font and ligature setting.
 
@@ -242,3 +244,10 @@ Remote named sounds and automatic asset fetching follow the profile's game/rustm
 mode unless `player.remote_sounds` / `player.sync_assets` explicitly override it.
 The connect wizard and tab menu expose both controls. Ordinary SSH profiles default
 them off; the bundled play profiles explicitly enable them. BEL remains independent.
+
+Native profile-editor regression (isolated configuration and loopback SSH only):
+
+```powershell
+cargo build --features ui-smoke --bin w11term --example echo_server
+.\tests\profile-ui-smoke.ps1
+```
