@@ -8,6 +8,17 @@ Terminal emulation is provided by **[wezterm-term](https://github.com/wezterm/we
 
 Requires Windows and the Rust MSVC toolchain with Visual Studio C++ Build Tools. The build stages the WinUI runtime beside the executable; there is no separate runtime installation step. The first build downloads Rust dependencies, a pinned WezTerm source revision, and Microsoft's runtime packages.
 
+Launch the build with `cargo run --release`, `.\target\release\w11term.exe`, or
+`.\launch.ps1` from the project root. Copying only `w11term.exe` into another folder
+does not produce a standalone installation: keep the runtime DLLs, PRI resource
+files, and runtime subfolders beside it. Move the complete staged runtime folder
+when deploying elsewhere.
+
+Startup failures write `%LOCALAPPDATA%\w11term\startup.log` (or the directory in
+`W11TERM_DATA_DIR`) and report the error to stderr. An Explorer launch without a
+console shows a native error dialog. A missing Windows App Runtime is a packaging
+error; renaming `profiles.json` does not repair it.
+
 ```powershell
 cargo run
 cargo run -- --profile root
