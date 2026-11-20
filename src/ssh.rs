@@ -1,5 +1,6 @@
 //! Embedded SSH transport, interactive authentication, and reconnect lifecycle.
 mod durability;
+mod game_resume;
 mod known_hosts;
 mod sharing;
 mod transport;
