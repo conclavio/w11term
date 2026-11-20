@@ -32,6 +32,8 @@ const LAB: &str = "Terminal lab";
 mod config_import;
 mod file_drawer;
 use file_drawer::{FileAction, FileDrawer};
+#[cfg(feature = "ui-smoke")]
+mod accessibility_smoke;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
@@ -278,6 +280,7 @@ pub enum Field {
 }
 
 pub struct TerminalApp {
+    accessible: crate::accessibility::Bridge,
     active_group: Option<TabId>,
     windows: Rc<RefCell<crate::window_state::Windows>>,
     window_profile: Option<String>,
@@ -318,6 +321,7 @@ pub struct TerminalApp {
 
 pub enum Message {
     Files(FileAction),
+    AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
     PaneNeighbor(Direction),
     ZoomPane,
@@ -2514,6 +2518,7 @@ impl Component for TerminalApp {
         })
         .expect("starting local control pipe");
         let mut app = Self {
+            accessible: Default::default(),
             active_group: None,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
@@ -2617,6 +2622,31 @@ impl Component for TerminalApp {
         }
         match message {
             Message::Files(action) => self.file_action(action, context),
+            Message::AccessibleSelection(request) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active_id().and_then(|id| self.tabs.get_mut(id))
+                    && tab.session.pane_id == request.pane
+                    && tab.prompt_id.is_none()
+                    && !tab.find.open
+                    && self.switcher.is_none()
+                {
+                    let frame = tab.session.frames.load();
+                    if frame.generation == request.generation {
+                        *tab.selection.borrow_mut() = request.span.map(|(anchor, end)| {
+                            let mut selection = Selection::new(anchor, false, frame.alternate);
+                            selection.update(end);
+                            selection.active = true;
+                            selection.dragging = false;
+                            selection.observe(&frame);
+                            selection
+                        });
+                        self.keyboard.set_selection(request.span.is_some());
+                        tab.surface.invalidator.invalidate();
+                    }
+                }
+            }
             Message::DraftBell(id, value) => {
                 if let Some(AppTab {
                     page: Page::NewProfile(draft),
@@ -3697,6 +3727,38 @@ impl Component for TerminalApp {
     }
 
     fn view(&self, _options: &Options, context: &mut ViewContext<Self>) -> View {
+        if let Some(AppTab {
+            label,
+            page: Page::Terminal(tab),
+        }) = self.tabs.active()
+            && tab.prompt_id.is_none()
+            && !tab.find.open
+            && self.switcher.is_none()
+            && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
+        {
+            let metrics = tab.surface.metrics.get();
+            let sender = context.sender();
+            self.accessible.update(
+                parent,
+                crate::accessibility::Pane {
+                    id: tab.session.pane_id,
+                    label,
+                    frames: &tab.session.frames,
+                    geometry: crate::accessibility::Geometry {
+                        bounds,
+                        cell_width: f64::from(metrics.cell_width * metrics.scale),
+                        cell_height: f64::from(metrics.cell_height * metrics.scale),
+                        padding: f64::from(PADDING * metrics.scale),
+                    },
+                    selection: tab.selection.borrow().as_ref(),
+                },
+                move |request| {
+                    sender.send(Message::AccessibleSelection(request));
+                },
+            );
+        } else {
+            self.accessible.clear();
+        }
         let title = self
             .tabs
             .active()
@@ -3850,6 +3912,10 @@ impl TerminalApp {
         }
         if std::env::var_os("W11TERM_IMPORT_SMOKE").is_some() {
             self.import_smoke_step(step, context);
+            return;
+        }
+        if let Some(path) = std::env::var_os("W11TERM_UIA_SMOKE") {
+            self.accessibility_smoke(step, std::path::Path::new(&path), context);
             return;
         }
         if std::env::var_os("W11TERM_IME_SMOKE").is_some() {

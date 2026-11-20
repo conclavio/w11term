@@ -3482,6 +3482,7 @@ dependencies = [
  "windows",
  "windows-canvas",
  "windows-core 0.100.0",
+ "windows-core 0.62.2",
  "windows-numerics 0.3.1",
  "windows-reactor",
  "windows-reactor-setup",
