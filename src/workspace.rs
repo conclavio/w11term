@@ -41,7 +41,10 @@ impl SavedSource {
             (Source::Ssh(_), Some(name)) => Self::SavedProfile(name.into()),
             (Source::Ssh(options), None) => {
                 let mut options = options.clone();
-                if let Authentication::Identity { identity } = &mut options.authentication {
+                for auth in options.authentications_mut() {
+                    let Authentication::Identity { identity } = auth else {
+                        continue;
+                    };
                     ensure!(!identity.as_os_str().is_empty(), "Empty identity path");
                     *identity = std::path::absolute(&*identity)?;
                 }
@@ -62,6 +65,7 @@ impl SavedSource {
             Self::Demo => {}
             Self::Replay(path) => ensure!(path.is_absolute(), "Expected an absolute replay path"),
             Self::Ssh(options) => {
+                options.validate_route()?;
                 ensure!(
                     !options.host.trim().is_empty()
                         && !options.user.trim().is_empty()
@@ -72,7 +76,12 @@ impl SavedSource {
                     crate::assets::name(&options.player.bell),
                     "Invalid bell name"
                 );
-                if let Authentication::Identity { identity } = &options.authentication {
+                for auth in std::iter::once(&options.authentication)
+                    .chain(options.proxy_jump.iter().map(|hop| &hop.authentication))
+                {
+                    let Authentication::Identity { identity } = auth else {
+                        continue;
+                    };
                     ensure!(identity.is_absolute(), "Expected an absolute identity path");
                 }
                 if let Some(path) = &options.player.device_key {
@@ -409,6 +418,7 @@ mod tests {
             port: 22,
             authentication: Authentication::Agent,
             host_key: None,
+            proxy_jump: Vec::new(),
             player: Default::default(),
         }
     }

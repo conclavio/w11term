@@ -52,6 +52,10 @@ Use **caret → Workspaces…** to name and save your current terminal tabs. A w
 
 Each restored pane starts a fresh session and receives a new process-local control ID. Named profile references use the current profile settings. Ad-hoc SSH panes retain their connection options and key paths. Replay panes reference their original capture files. Workspaces are stored in `%LOCALAPPDATA%\w11term\workspaces.json`, or in `W11TERM_DATA_DIR` when set.
 
+**Settings → Import OpenSSH config** previews aliases from your Windows SSH config or another selected file. Pick an alias to see its destination, identity, jump hosts and any unsupported directives. Saving creates an editable w11term profile. Import reads the selected file and leaves it intact. Routes or trust settings that cannot be represented are flagged before saving.
+
+Imported `ProxyJump` routes use SSH `direct-tcpip` channels. Each jump host and the final destination have their own authentication and host-key checks. The resulting SSH shell and its SFTP drawer use the destination connection. For a manually configured profile, `proxy_jump` is an ordered array of objects with `host`, `user`, optional `port`, `auth` and optional `host_key`. Each hop supports the same authentication choices as the destination.
+
 | Pane action | Shortcut |
 | --- | --- |
 | Split right or below | Ctrl+Alt+Shift+Right or Down |

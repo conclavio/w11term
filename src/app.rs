@@ -29,6 +29,7 @@ use windows_reactor::*;
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
+mod config_import;
 mod file_drawer;
 use file_drawer::{FileAction, FileDrawer};
 mod pane_view;
@@ -96,6 +97,7 @@ pub enum InteractionField {
 }
 enum Page {
     Terminal(LiveTab),
+    ImportConfig(config_import::ImportPage),
     Workspaces(workspace_view::WorkspacePage),
     Settings,
     NewProfile(ProfileDraft),
@@ -148,6 +150,7 @@ impl DraftOrigin {
 struct ProfileDraft {
     origin: DraftOrigin,
     confirm_delete: bool,
+    proxy_jump: Vec<w11term::options::JumpHost>,
     saved: bool,
     name: String,
     host: String,
@@ -167,6 +170,7 @@ impl Default for ProfileDraft {
         Self {
             origin: DraftOrigin::New,
             confirm_delete: false,
+            proxy_jump: Vec::new(),
             saved: false,
             name: String::new(),
             host: String::new(),
@@ -193,6 +197,7 @@ impl ProfileDraft {
             Authentication::KeyboardInteractive => (4, String::new()),
         };
         Self {
+            proxy_jump: options.proxy_jump.clone(),
             name,
             host: options.host.clone(),
             user: options.user.clone(),
@@ -342,6 +347,7 @@ pub enum Message {
     ProfileMenu(String),
     SettingsMenu,
     Workspace(workspace_view::WorkspaceAction),
+    ImportConfig(config_import::Action),
     Font(Option<usize>),
     Ligatures(bool),
     Interaction(InteractionField, bool),
@@ -1123,6 +1129,11 @@ impl TerminalApp {
                 .on_click(context.callback(|_| Message::ProfileMenu(NEW_PROFILE.into())))
                 .content("New Profile…"),
         );
+        profiles.push(
+            Button::new()
+                .on_click(context.callback(|_| Message::ImportConfig(config_import::Action::Show)))
+                .content("Import OpenSSH config…"),
+        );
         children.splice(1..1, profiles);
         children.push(
             TextBlock::new()
@@ -1777,6 +1788,7 @@ impl TerminalApp {
                 host_key: (!draft.fingerprint.trim().is_empty())
                     .then(|| draft.fingerprint.trim().into()),
                 player: draft.player.clone(),
+                proxy_jump: draft.proxy_jump.clone(),
             };
             match &draft.origin {
                 DraftOrigin::New => self.store.add(name, &options)?,
@@ -2063,6 +2075,14 @@ impl TerminalApp {
             fields.push(TextBlock::new().text("Connection changes apply to new sessions. Sound and game options update open tabs.").text_wrapping(TextWrapping::Wrap).into());
         }
         // Keep the feedback slot mounted so save/error messages do not remount inputs.
+        if !draft.proxy_jump.is_empty() {
+            fields.push(
+                TextBlock::new()
+                    .text(config_import::jump_summary(&draft.proxy_jump))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            );
+        }
         fields.push(
             TextBlock::new()
                 .text(draft.error.as_deref().unwrap_or(if draft.saved {
@@ -2484,6 +2504,14 @@ impl Component for TerminalApp {
         app.sync_selection(context);
         #[cfg(feature = "ui-smoke")]
         if std::env::var_os("W11TERM_UI_SMOKE").is_some() {
+            if let Some(fixture) = std::env::var_os("W11TERM_IMPORT_SMOKE") {
+                let expected = std::path::PathBuf::from(fixture).with_file_name("profiles.json");
+                assert_eq!(
+                    options.profiles_path.canonicalize().unwrap(),
+                    expected.canonicalize().unwrap(),
+                    "import smoke requires isolated profiles beside the fixture"
+                );
+            }
             let loopback = (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
                 || std::env::var_os("W11TERM_FILE_SMOKE").is_some())
                 && matches!(&options.source, Source::Ssh(ssh) if ssh.host == "127.0.0.1" && ssh.user == "test" && ssh.host_key.is_some());
@@ -3311,6 +3339,7 @@ impl Component for TerminalApp {
             }
             Message::SettingsMenu => self.utility(true, context),
             Message::Workspace(action) => self.workspace_action(action, context),
+            Message::ImportConfig(action) => self.import_action(action, context),
             Message::Paste => self.paste(false, context),
             Message::PasteRaw => self.paste(true, context),
             Message::RawPaste(result) => {
@@ -3640,6 +3669,7 @@ impl Component for TerminalApp {
                 },
                 Page::Settings => self.settings_view(context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
+                Page::ImportConfig(page) => self.import_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
             }
         } else {
@@ -3751,6 +3781,10 @@ impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
         if std::env::var_os("W11TERM_FILE_SMOKE").is_some() {
             self.file_smoke_step(step, context);
+            return;
+        }
+        if std::env::var_os("W11TERM_IMPORT_SMOKE").is_some() {
+            self.import_smoke_step(step, context);
             return;
         }
         if std::env::var_os("W11TERM_WORKSPACE_SMOKE").is_some() {
@@ -4406,6 +4440,7 @@ mod profile_ui_tests {
                 port: 6792,
                 authentication,
                 host_key: Some("SHA256:test".into()),
+                proxy_jump: Vec::new(),
                 player: w11term::options::PlayerOptions {
                     mute: true,
                     game_mode: true,

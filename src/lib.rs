@@ -17,6 +17,7 @@ pub mod session;
 pub mod sftp;
 pub mod sound;
 pub mod ssh;
+pub mod ssh_config;
 pub mod tabs;
 pub mod terminal;
 pub mod wav;

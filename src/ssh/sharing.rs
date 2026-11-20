@@ -21,6 +21,8 @@ pub(crate) static NETWORK: LazyLock<runtime::Runtime> = LazyLock::new(|| {
 
 struct Link {
     handle: Arc<client::Handle<Handler>>,
+    // A forwarded connection owns its authenticated upstream transport.
+    _upstream: Option<ConnectionShare>,
     options: SshOptions,
     known_hosts: Option<PathBuf>,
     runtime: runtime::Handle,
@@ -45,9 +47,11 @@ impl ConnectionShare {
         handle: client::Handle<Handler>,
         options: SshOptions,
         prompts: Option<&Prompts>,
+        upstream: Option<ConnectionShare>,
     ) -> Self {
         Self(Arc::new(Link {
             handle: Arc::new(handle),
+            _upstream: upstream,
             options,
             known_hosts: prompts.and_then(Prompts::known_hosts).map(PathBuf::from),
             runtime: runtime::Handle::current(),
@@ -61,6 +65,7 @@ impl ConnectionShare {
             && connected.user == options.user
             && connected.authentication == options.authentication
             && connected.host_key == options.host_key
+            && connected.proxy_jump == options.proxy_jump
             && self.0.known_hosts.as_deref() == prompts.and_then(Prompts::known_hosts)
     }
     pub(super) fn handle(&self) -> Arc<client::Handle<Handler>> {

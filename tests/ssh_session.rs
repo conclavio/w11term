@@ -185,6 +185,7 @@ async fn roundtrip(allow_none: bool) {
                     }
                 },
                 host_key: Some(pin),
+                proxy_jump: Vec::new(),
                 player: Default::default(),
             }),
             initial_size,
