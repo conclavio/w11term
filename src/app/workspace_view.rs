@@ -138,7 +138,11 @@ impl TerminalApp {
             let Page::Terminal(live) = &tab.page else {
                 anyhow::bail!("Expected a terminal pane")
             };
-            SavedSource::capture(&live.source, live.profile_name.as_deref())
+            SavedSource::capture(&live.source, live.profile_name.as_deref())?.with_session(
+                live.session
+                    .durable_state()
+                    .and_then(|state| state.reference),
+            )
         })
     }
 
@@ -240,14 +244,19 @@ pub(super) fn append_resolved_workspace(
 ) {
     restore_tabs(tabs, workspace, |slot, saved| {
         let source = sources.remove(&slot).expect("validated workspace slot");
-        let profile_name = match saved {
-            SavedSource::SavedProfile(name) => Some(name.clone()),
-            _ => None,
-        };
+        let profile_name = saved.profile_name().map(str::to_owned);
         let label = profile_name
             .clone()
             .unwrap_or_else(|| source_label(&source));
-        live_tab(label, source, osc52).with_profile(profile_name)
+        live_tab_sized(
+            label,
+            source,
+            TerminalSize::default(),
+            osc52,
+            None,
+            saved.session().cloned(),
+        )
+        .with_profile(profile_name)
     });
 }
 

@@ -70,6 +70,8 @@ pub struct SshOptions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_jump: Vec<JumpHost>,
     #[serde(default)]
+    pub durable: bool,
+    #[serde(default)]
     pub player: PlayerOptions,
 }
 
@@ -95,6 +97,7 @@ impl From<JumpHost> for SshOptions {
             authentication: hop.authentication,
             host_key: hop.host_key,
             proxy_jump: Vec::new(),
+            durable: false,
             player: PlayerOptions::default(),
         }
     }
@@ -283,6 +286,7 @@ impl Options {
                         authentication: Authentication::Agent,
                         host_key: None,
                         proxy_jump: Vec::new(),
+                        durable: false,
                         player: Default::default(),
                     });
                 }

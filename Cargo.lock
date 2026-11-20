@@ -3469,6 +3469,7 @@ dependencies = [
  "regex",
  "russh",
  "russh-sftp",
+ "semver",
  "serde",
  "serde_json",
  "sha1",

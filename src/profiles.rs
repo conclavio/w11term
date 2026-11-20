@@ -253,6 +253,7 @@ mod tests {
             },
             host_key: None,
             proxy_jump: Vec::new(),
+            durable: false,
             player: Default::default(),
         };
         store.add("new", &options).unwrap();

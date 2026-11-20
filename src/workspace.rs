@@ -1,5 +1,6 @@
 //! Named workspace recipes. Slot IDs are scoped to a single saved layout.
 
+use crate::durable::DurableReference;
 use crate::options::{Authentication, Source, SshOptions};
 use crate::pane_layout::{Axis, Layout};
 use anyhow::{Context, Result, ensure};
@@ -27,9 +28,39 @@ pub enum SavedSource {
     /// Connection options contain authentication methods and key paths; live
     /// passwords, private key material and authentication answers live elsewhere.
     Ssh(SshOptions),
+    Durable {
+        connection: Box<SavedSource>,
+        session: DurableReference,
+    },
 }
 
 impl SavedSource {
+    pub fn with_session(self, reference: Option<DurableReference>) -> Result<Self> {
+        let Some(session) = reference else {
+            return Ok(self);
+        };
+        let saved = Self::Durable {
+            connection: Box::new(self),
+            session,
+        };
+        saved.validate()?;
+        Ok(saved)
+    }
+
+    pub fn session(&self) -> Option<&DurableReference> {
+        match self {
+            Self::Durable { session, .. } => Some(session),
+            _ => None,
+        }
+    }
+
+    pub fn profile_name(&self) -> Option<&str> {
+        match self {
+            Self::SavedProfile(name) => Some(name),
+            Self::Durable { connection, .. } => connection.profile_name(),
+            _ => None,
+        }
+    }
     /// Supply a profile name only when the pane was opened from that profile.
     pub fn capture(source: &Source, profile: Option<&str>) -> Result<Self> {
         let saved = match (source, profile) {
@@ -61,6 +92,17 @@ impl SavedSource {
 
     fn validate(&self) -> Result<()> {
         match self {
+            Self::Durable {
+                connection,
+                session,
+            } => {
+                ensure!(
+                    matches!(connection.as_ref(), Self::Ssh(_) | Self::SavedProfile(_)),
+                    "A durable reference requires an SSH connection"
+                );
+                connection.validate()?;
+                session.validate()?;
+            }
             Self::SavedProfile(name) => ensure!(!name.trim().is_empty(), "Missing profile name"),
             Self::Demo => {}
             Self::Replay(path) => ensure!(path.is_absolute(), "Expected an absolute replay path"),
@@ -95,6 +137,17 @@ impl SavedSource {
     pub fn resolve(&self, profiles: &BTreeMap<String, SshOptions>) -> Result<Source> {
         self.validate()?;
         Ok(match self {
+            Self::Durable {
+                connection,
+                session,
+            } => {
+                let source = connection.resolve(profiles)?;
+                ensure!(
+                    matches!(&source, Source::Ssh(options) if options.durable && session.matches_endpoint(options)),
+                    "The saved durable session belongs to a different host, account, host key, or a profile with durability disabled"
+                );
+                source
+            }
             Self::SavedProfile(name) => Source::Ssh(
                 profiles
                     .get(name)
@@ -228,7 +281,7 @@ impl WorkspaceLaunch {
         let mut needs_profiles = false;
         for tab in &layout.tabs {
             tab.layout.visit(0, &mut |_, source| {
-                needs_profiles |= matches!(source, SavedSource::SavedProfile(_));
+                needs_profiles |= source.profile_name().is_some();
                 Ok(())
             })?;
         }
@@ -419,6 +472,7 @@ mod tests {
             authentication: Authentication::Agent,
             host_key: None,
             proxy_jump: Vec::new(),
+            durable: false,
             player: Default::default(),
         }
     }
@@ -451,6 +505,60 @@ mod tests {
         let sources = captured.resolve_sources(&profiles).unwrap();
         assert_eq!(sources[&2], Source::Ssh(ssh("new-host.example")));
         assert_eq!(sources[&3], Source::Replay(replay));
+    }
+
+    #[test]
+    fn durable_workspace_checks_the_current_profile_before_reattaching() {
+        let mut options = ssh("dev.example");
+        options.durable = true;
+        let pin = format!("SHA256:{}", "A".repeat(43));
+        let reference = DurableReference::new(&options, &pin);
+        let profile = SavedSource::SavedProfile("dev".into());
+        let saved = profile
+            .clone()
+            .with_session(Some(reference.clone()))
+            .unwrap();
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let restored: SavedSource = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.session(), Some(&reference));
+        assert_eq!(restored.profile_name(), Some("dev"));
+        let resolve = |opts| restored.resolve(&BTreeMap::from([("dev".into(), opts)]));
+        assert_eq!(
+            resolve(options.clone()).unwrap(),
+            Source::Ssh(options.clone())
+        );
+        for changed in [
+            SshOptions {
+                host: "other.example".into(),
+                ..options.clone()
+            },
+            SshOptions {
+                port: 2222,
+                ..options.clone()
+            },
+            SshOptions {
+                user: "someone-else".into(),
+                ..options.clone()
+            },
+            SshOptions {
+                host_key: Some(format!("SHA256:{}", "B".repeat(43))),
+                ..options.clone()
+            },
+            SshOptions {
+                durable: false,
+                ..options
+            },
+        ] {
+            assert!(resolve(changed).is_err());
+        }
+        assert!(
+            SavedSource::Demo
+                .with_session(Some(reference.clone()))
+                .is_err()
+        );
+        let mut invalid = reference;
+        invalid.generation.clear();
+        assert!(profile.with_session(Some(invalid)).is_err());
     }
 
     #[test]
