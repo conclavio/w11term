@@ -3,6 +3,7 @@ pub mod assets;
 pub mod clipboard;
 pub mod control;
 pub mod demo;
+pub mod durable;
 pub mod enroll;
 pub mod events;
 pub mod interaction;

@@ -32,6 +32,7 @@ const LAB: &str = "Terminal lab";
 mod config_import;
 mod file_drawer;
 use file_drawer::{FileAction, FileDrawer};
+mod durable_view;
 mod pane_view;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
@@ -40,6 +41,8 @@ use pane_view::PaneSurface;
 
 struct LiveTab {
     files: Box<FileDrawer>,
+    confirm_end: bool,
+    durable_phase: Option<w11term::ssh::DurablePhase>,
     source: Source,
     profile_name: Option<String>,
     surface: PaneSurface,
@@ -151,6 +154,7 @@ struct ProfileDraft {
     origin: DraftOrigin,
     confirm_delete: bool,
     proxy_jump: Vec<w11term::options::JumpHost>,
+    durable: bool,
     saved: bool,
     name: String,
     host: String,
@@ -171,6 +175,7 @@ impl Default for ProfileDraft {
             origin: DraftOrigin::New,
             confirm_delete: false,
             proxy_jump: Vec::new(),
+            durable: false,
             saved: false,
             name: String::new(),
             host: String::new(),
@@ -199,6 +204,7 @@ impl ProfileDraft {
         Self {
             proxy_jump: options.proxy_jump.clone(),
             name,
+            durable: options.durable,
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
@@ -220,6 +226,9 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(action) = durable_view::menu_action(&label) {
+        return Message::Durability(action);
+    }
     for (prefix, axis) in [
         ("Split right with ", Axis::Columns),
         ("Split below with ", Axis::Rows),
@@ -337,6 +346,7 @@ pub enum Message {
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
     DraftPlayer(TabId, String, bool),
+    Durability(durable_view::Action),
     FrameReady(TabId, u64),
     CloseWindow,
     Select(Option<usize>, u64, bool),
@@ -385,7 +395,7 @@ pub enum Message {
 }
 
 fn live_tab(label: String, source: Source, osc52: bool) -> AppTab {
-    live_tab_sized(label, source, TerminalSize::default(), osc52, None)
+    live_tab_sized(label, source, TerminalSize::default(), osc52, None, None)
 }
 fn live_tab_sized(
     label: String,
@@ -393,17 +403,25 @@ fn live_tab_sized(
     size: TerminalSize,
     osc52: bool,
     connection: Option<w11term::ssh::ConnectionShare>,
+    saved: Option<w11term::durable::DurableReference>,
 ) -> AppTab {
+    let session = if matches!(&source, Source::Ssh(ssh) if ssh.durable) {
+        Session::start_durable(source.clone(), size, osc52, connection, saved)
+    } else {
+        Session::start_configured_with_connection(source.clone(), size, osc52, connection)
+    };
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
             files: Box::default(),
-            source: source.clone(),
+            source,
+            confirm_end: false,
+            durable_phase: None,
             profile_name: None,
             surface: PaneSurface::default(),
             device_busy: false,
             device_message: None,
-            session: Session::start_configured_with_connection(source, size, osc52, connection),
+            session,
             last_size: Rc::new(Cell::new(None)),
             error: None,
             selection: Rc::new(RefCell::new(None)),
@@ -1506,6 +1524,7 @@ impl TerminalApp {
             TerminalSize::default(),
             self.appearance.read().unwrap().interaction.osc52,
             connection,
+            None,
         )
         .with_profile(profile_name);
         if self.tabs.split(id, leaf, axis).is_some() {
@@ -1789,6 +1808,7 @@ impl TerminalApp {
                     .then(|| draft.fingerprint.trim().into()),
                 player: draft.player.clone(),
                 proxy_jump: draft.proxy_jump.clone(),
+                durable: draft.durable,
             };
             match &draft.origin {
                 DraftOrigin::New => self.store.add(name, &options)?,
@@ -2018,6 +2038,14 @@ impl TerminalApp {
         {
             items.push(MenuItem::item("files", "SFTP files"));
         }
+        if let Some(AppTab {
+            page: Page::Terminal(live),
+            ..
+        }) = self.tabs.active()
+            && let Some(menu) = durable_view::pane_menu(live)
+        {
+            items.push(menu);
+        }
         if !self.profiles.is_empty() {
             for (key, label) in [
                 ("right-profile", "Split right with"),
@@ -2186,6 +2214,16 @@ impl TerminalApp {
             );
             fields.push(TextBlock::new().text("Private key: Windows-user DPAPI encryption and a restricted ACL. For another host, append the copied public line to ~/.ssh/authorized_keys. OpenSSH cannot read the DPAPI file directly.").text_wrapping(TextWrapping::Wrap).into());
         }
+        fields.push(
+            CheckBox::new()
+                .is_checked(draft.durable)
+                .on_is_checked_changed(
+                    context.callback(move |v| {
+                        Message::Durability(durable_view::Action::Profile(id, v))
+                    }),
+                )
+                .content("Keep the remote shell running with zmx (Linux)"),
+        );
         for (name, label, value) in [
             (
                 "rustmush",
@@ -2419,8 +2457,15 @@ impl Component for TerminalApp {
             );
         } else {
             tabs.insert(
-                live_tab_sized(label.clone(), options.source.clone(), size, osc52, None)
-                    .with_profile(options.initial_profile.clone()),
+                live_tab_sized(
+                    label.clone(),
+                    options.source.clone(),
+                    size,
+                    osc52,
+                    None,
+                    None,
+                )
+                .with_profile(options.initial_profile.clone()),
             );
             for name in &options.extra_profiles {
                 if let Some(profile) = profiles.get(name) {
@@ -2430,6 +2475,7 @@ impl Component for TerminalApp {
                             Source::Ssh(profile.clone()),
                             size,
                             osc52,
+                            None,
                             None,
                         )
                         .with_profile(Some(name.clone())),
@@ -2512,9 +2558,11 @@ impl Component for TerminalApp {
                     "import smoke requires isolated profiles beside the fixture"
                 );
             }
-            let loopback = (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
-                || std::env::var_os("W11TERM_FILE_SMOKE").is_some())
-                && matches!(&options.source, Source::Ssh(ssh) if ssh.host == "127.0.0.1" && ssh.user == "test" && ssh.host_key.is_some());
+            let loopback = matches!(&options.source, Source::Ssh(ssh)
+                if ssh.host == "127.0.0.1" && ssh.host_key.is_some() &&
+                    ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_FILE_SMOKE").is_some()))
+                     || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())));
             assert!(
                 (matches!(options.source, Source::Demo) || loopback)
                     && options.extra_profiles.is_empty(),
@@ -2831,6 +2879,7 @@ impl Component for TerminalApp {
                         size,
                         self.appearance.read().unwrap().interaction.osc52,
                         None,
+                        None,
                     )
                     .with_profile(Some(profile));
                     let pane = tab.pane_id().expect("new terminal has a pane ID");
@@ -3085,6 +3134,7 @@ impl Component for TerminalApp {
                     }
                 }
             }
+            Message::Durability(action) => self.durability_action(action),
             #[cfg(feature = "ui-smoke")]
             Message::Smoke(step) => self.smoke_step(step, context),
             Message::FrameReady(id, epoch) => {
@@ -3098,6 +3148,12 @@ impl Component for TerminalApp {
                         tab.error = None;
                         tab.files
                             .observe_connection(tab.session.frames.load().connection_generation);
+                        let phase = tab.session.durable_state().map(|s| s.phase);
+                        if tab.durable_phase != phase {
+                            tab.durable_phase = phase;
+                            tab.confirm_end = false;
+                            self.header.borrow_mut().take();
+                        }
                     }
                     if self.tabs.active_id() == Some(id) {
                         self.connection_ui(id);
@@ -3779,6 +3835,10 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_DURABLE_SMOKE").is_some() {
+            self.durable_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_FILE_SMOKE").is_some() {
             self.file_smoke_step(step, context);
             return;
@@ -4441,6 +4501,7 @@ mod profile_ui_tests {
                 authentication,
                 host_key: Some("SHA256:test".into()),
                 proxy_jump: Vec::new(),
+                durable: false,
                 player: w11term::options::PlayerOptions {
                     mute: true,
                     game_mode: true,

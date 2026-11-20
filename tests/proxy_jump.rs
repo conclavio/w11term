@@ -264,7 +264,7 @@ async fn two_jumps_authenticate_independently_and_close_with_the_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bad_pin_at_any_endpoint_stops_before_its_authentication() {
-    for rejected in 0..HOSTS.len() {
+    for (rejected, host) in HOSTS.iter().enumerate() {
         let mut fixture = Fixture::start().await.unwrap();
         let wrong = fixture.options.proxy_jump[(rejected + 1) % 2]
             .host_key
@@ -282,7 +282,7 @@ async fn a_bad_pin_at_any_endpoint_stops_before_its_authentication() {
             .unwrap();
         let diagnostic = format!("{:#}", result.unwrap_err());
         assert!(
-            diagnostic.contains("host key mismatch") && diagnostic.contains(HOSTS[rejected]),
+            diagnostic.contains("host key mismatch") && diagnostic.contains(*host),
             "{diagnostic}"
         );
         let allowed: Vec<_> = (0..rejected)

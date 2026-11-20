@@ -20,9 +20,10 @@ pub(crate) static NETWORK: LazyLock<runtime::Runtime> = LazyLock::new(|| {
 });
 
 struct Link {
-    handle: Arc<client::Handle<Handler>>,
     // A forwarded connection owns its authenticated upstream transport.
     _upstream: Option<ConnectionShare>,
+    handle: Arc<client::Handle<Handler>>,
+    fingerprint: String,
     options: SshOptions,
     known_hosts: Option<PathBuf>,
     runtime: runtime::Handle,
@@ -47,10 +48,12 @@ impl ConnectionShare {
         handle: client::Handle<Handler>,
         options: SshOptions,
         prompts: Option<&Prompts>,
+        fingerprint: String,
         upstream: Option<ConnectionShare>,
     ) -> Self {
         Self(Arc::new(Link {
             handle: Arc::new(handle),
+            fingerprint,
             _upstream: upstream,
             options,
             known_hosts: prompts.and_then(Prompts::known_hosts).map(PathBuf::from),
@@ -70,6 +73,9 @@ impl ConnectionShare {
     }
     pub(super) fn handle(&self) -> Arc<client::Handle<Handler>> {
         self.0.handle.clone()
+    }
+    pub(super) fn fingerprint(&self) -> &str {
+        &self.0.fingerprint
     }
     pub(super) async fn open_shell(&self) -> Result<ShellChannel> {
         // russh doesn't close a bare Channel on drop. An opener cancelled
@@ -128,4 +134,5 @@ impl ShareSlot {
 pub(crate) struct Sharing {
     pub published: ShareSlot,
     pub offered: Option<ConnectionShare>,
+    pub durable: Option<super::durability::Worker>,
 }

@@ -88,6 +88,7 @@ pub struct Session {
     pub frames: FrameStore,
     pub clipboard_enabled: Arc<AtomicBool>,
     ssh_connection: ssh::ShareSlot,
+    durable: Option<ssh::DurableControl>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -124,6 +125,37 @@ impl Session {
         allow_clipboard: bool,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
+        Self::start_worker(source, size, allow_clipboard, connection, None)
+    }
+
+    pub fn start_durable(
+        source: Source,
+        size: TerminalSize,
+        allow_clipboard: bool,
+        connection: Option<ssh::ConnectionShare>,
+        saved: Option<crate::durable::DurableReference>,
+    ) -> Self {
+        Self::start_worker(source, size, allow_clipboard, connection, Some(saved))
+    }
+
+    pub fn durable_state(&self) -> Option<ssh::DurableState> {
+        self.durable.as_ref().map(|control| control.state())
+    }
+
+    pub fn durable_action(&self, action: ssh::DurableAction) -> anyhow::Result<()> {
+        self.durable
+            .as_ref()
+            .context("This pane does not manage a durable SSH shell")?
+            .action(action)
+    }
+
+    fn start_worker(
+        source: Source,
+        size: TerminalSize,
+        allow_clipboard: bool,
+        connection: Option<ssh::ConnectionShare>,
+        saved: Option<Option<crate::durable::DurableReference>>,
+    ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
         let prompts = crate::prompts::Prompts::default();
@@ -158,9 +190,14 @@ impl Session {
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
         let ssh_connection = ssh::ShareSlot::default();
+        let (durable, lifecycle) = saved
+            .filter(|_| matches!(source, Source::Ssh(_)))
+            .map(ssh::DurableControl::new)
+            .unzip();
         let sharing = ssh::Sharing {
             published: ssh_connection.clone(),
             offered: connection.filter(|_| matches!(source, Source::Ssh(_))),
+            durable: lifecycle,
         };
         let worker = thread::Builder::new()
             .name("terminal-session".into())
@@ -200,6 +237,7 @@ impl Session {
             frames,
             clipboard_enabled,
             ssh_connection,
+            durable,
             worker: Some(worker),
         }
     }
