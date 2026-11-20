@@ -10,8 +10,10 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
     let registry = Registry::default();
     registry.replace([Pane {
         id: 1,
+        tab_id: 10,
         label: "lab".into(),
         active: false,
+        visible: false,
         input: session.input.clone(),
     }]);
     let capture: w11term::control::CapturePng = Arc::new(|_, _, _| anyhow::bail!("unused"));
@@ -67,8 +69,10 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
     let registry = Registry::default();
     registry.replace([Pane {
         id: 1,
+        tab_id: 10,
         label: "lab".into(),
         active: false,
+        visible: false,
         input: session.input.clone(),
     }]);
     let discovery = tempfile::tempdir().unwrap();
@@ -148,8 +152,10 @@ async fn list_keeps_closed_sessions_with_an_explicit_error() {
     let registry = Registry::default();
     registry.replace([Pane {
         id: 17,
+        tab_id: 3,
         label: "failed".into(),
         active: false,
+        visible: true,
         input,
     }]);
     let result = registry
@@ -157,6 +163,9 @@ async fn list_keeps_closed_sessions_with_an_explicit_error() {
         .await
         .unwrap();
     assert_eq!(result["sessions"][0]["id"], 17);
+    assert_eq!(result["sessions"][0]["tab_id"], 3);
+    assert_eq!(result["sessions"][0]["active"], false);
+    assert_eq!(result["sessions"][0]["visible"], true);
     assert_eq!(result["sessions"][0]["status"], "unavailable");
     assert!(
         result["sessions"][0]["error"]

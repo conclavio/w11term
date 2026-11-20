@@ -91,6 +91,15 @@ struct AppTab {
     page: Page,
 }
 
+impl AppTab {
+    fn pane_id(&self) -> Option<u64> {
+        match &self.page {
+            Page::Terminal(tab) => Some(tab.session.pane_id),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ProfileDraft {
     original: Option<(String, SshOptions)>,
@@ -1129,12 +1138,21 @@ impl TerminalApp {
                     return None;
                 };
                 Some(Pane {
-                    id: entry.id,
+                    id: tab.session.pane_id,
+                    tab_id: entry.id,
+                    visible: self.tabs.active_id() == Some(entry.id),
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
                 })
             }));
+    }
+    fn tab_for_pane(&self, pane: u64) -> Option<TabId> {
+        self.tabs
+            .entries()
+            .iter()
+            .find(|tab| tab.value.pane_id() == Some(pane))
+            .map(|tab| tab.id)
     }
     fn sync_selection(&mut self, context: &ComponentContext<Self>) {
         // Native collection resets select the first item after Reactor's property pass.
@@ -2362,12 +2380,14 @@ impl Component for TerminalApp {
                         dpi: (96.0 * metrics.scale).round() as u32,
                     };
                     let previous = self.tabs.active_id();
-                    let id = self.tabs.insert(live_tab_sized(
+                    let tab = live_tab_sized(
                         profile,
                         Source::Ssh(ssh),
                         size,
                         self.appearance.read().unwrap().interaction.osc52,
-                    ));
+                    );
+                    let pane = tab.pane_id().expect("new terminal has a pane ID");
+                    self.tabs.insert(tab);
                     if !activate && let Some(previous) = previous {
                         self.tabs.select(previous);
                     }
@@ -2382,7 +2402,7 @@ impl Component for TerminalApp {
                         self.publish_panes();
                     }
                     Ok(
-                        serde_json::json!({"pane":id,"cols":cols,"rows":rows,"active":activate||previous.is_none()}),
+                        serde_json::json!({"pane":pane,"cols":cols,"rows":rows,"active":activate||previous.is_none()}),
                     )
                 })();
                 let _ = reply.send(result.map_err(|e| format!("{e:#}")));
@@ -2393,7 +2413,11 @@ impl Component for TerminalApp {
                 rows,
                 reply,
             }) => {
-                if self.tabs.active_id() == Some(pane) && self.windows.borrow().fullscreen() {
+                let Some(tab_id) = self.tab_for_pane(pane) else {
+                    let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
+                    return;
+                };
+                if self.tabs.active_id() == Some(tab_id) && self.windows.borrow().fullscreen() {
                     let _ = reply.send(Err(
                         "Exit fullscreen before resizing the active window grid".into(),
                     ));
@@ -2402,7 +2426,7 @@ impl Component for TerminalApp {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
-                }) = self.tabs.get(pane)
+                }) = self.tabs.get(tab_id)
                 {
                     let metrics = self.metrics.get();
                     let size = TerminalSize {
@@ -2415,7 +2439,7 @@ impl Component for TerminalApp {
                         dpi: (96.0 * metrics.scale).round() as u32,
                     };
                     let _ = tab.session.input.send(Command::Resize(size));
-                    if self.tabs.active_id() == Some(pane) {
+                    if self.tabs.active_id() == Some(tab_id) {
                         self.initial_grid.set(Some((cols, rows)));
                         self.windows.borrow_mut().grid = Some((cols, rows));
                         self.client_size.0 +=
@@ -2446,7 +2470,7 @@ impl Component for TerminalApp {
                 let result = if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
-                }) = self.tabs.get(pane)
+                }) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id))
                 {
                     let frame = tab.session.frames.load();
                     if frame.cols == cols && frame.rows.len() == rows {
@@ -3476,6 +3500,9 @@ impl TerminalApp {
                 let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
                     panic!("Save and connect did not open a terminal")
                 };
+                let pane_id = tab.session.pane_id;
+                assert_ne!(pane_id, id, "utility tabs should not allocate pane IDs");
+                assert_eq!(self.tab_for_pane(pane_id), Some(id));
                 if tab.session.frames.load().connection_generation == 0 {
                     assert!(step < 24, "loopback connection did not become ready");
                 } else {

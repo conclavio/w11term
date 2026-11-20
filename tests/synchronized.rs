@@ -32,8 +32,10 @@ fn registry(session: &Session) -> Registry {
     let registry = Registry::default();
     registry.replace([Pane {
         id: 1,
+        tab_id: 5,
         label: "test".into(),
         active: true,
+        visible: true,
         input: session.input.clone(),
     }]);
     registry
