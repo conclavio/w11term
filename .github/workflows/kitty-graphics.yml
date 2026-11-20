@@ -1,12 +1,6 @@
 name: Kitty graphics reference
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/kitty-graphics.yml'
-      - 'tests/kitty-reference.py'
-      - 'tests/fixtures/kitty/**'
-      - 'vendor/wezterm-term/src/terminalstate/kitty*'
-      - 'vendor/wezterm-term/src/terminalstate/kitty/**'
+  workflow_call:
   workflow_dispatch:
 permissions:
   contents: read

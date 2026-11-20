@@ -1,0 +1,175 @@
+name: Windows CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUSTUP_TOOLCHAIN: 1.98.0
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  test:
+    name: Windows unit and loopback tests
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - &checkout
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Install Rust, rustfmt, Clippy and coverage tools
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt,clippy,llvm-tools-preview
+      - &cargo-cache
+        name: Cache Cargo downloads
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          key: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check all targets with Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Install the coverage reporter
+        run: cargo install cargo-llvm-cov --version 0.9.2 --locked
+      - name: Run unit and integration tests with line coverage
+        run: cargo llvm-cov --locked --all-targets --all-features --lcov --output-path "$env:RUNNER_TEMP/coverage.lcov"
+      - name: Summarize Rust suite coverage
+        run: |
+          cargo llvm-cov report --json --summary-only --output-path "$env:RUNNER_TEMP/coverage.json"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $report = Get-Content -Raw "$env:RUNNER_TEMP/coverage.json" | ConvertFrom-Json
+          $src = (Resolve-Path src).Path + [IO.Path]::DirectorySeparatorChar
+          $files = @($report.data[0].files | Where-Object { [IO.Path]::GetFullPath($_.filename).StartsWith($src, [StringComparison]::OrdinalIgnoreCase) })
+          $total = ($files | ForEach-Object { $_.summary.lines.count } | Measure-Object -Sum).Sum
+          $covered = ($files | ForEach-Object { $_.summary.lines.covered } | Measure-Object -Sum).Sum
+          if (!$total) { throw 'No w11term source files were present in the coverage report.' }
+          "Rust unit and integration tests covered **$covered / $total** instrumented lines in w11term src (**$([math]::Round(100 * $covered / $total, 1))%**)." >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-rust-coverage
+          path: |
+            ${{ runner.temp }}/coverage.lcov
+            ${{ runner.temp }}/coverage.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+  native-e2e:
+    name: Windows native end-to-end tests
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - *checkout
+      - name: Install Rust
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      - *cargo-cache
+      - name: Build the GUI, CLI and loopback SSH peer
+        run: cargo build --locked --features ui-smoke --bins --example echo_server
+      - name: Set the desktop size for native resize and accessibility assertions
+        run: Set-DisplayResolution -Width 1920 -Height 1080 -Force
+      - name: Verify SSH splits, file transfers, ConPTY, durable panes and accessibility
+        run: cargo test --locked --features ui-smoke --test accessibility --test durable_ssh --test sftp -- --ignored --test-threads=1
+      - name: Copy Unicode text through the real OSC 52 clipboard path
+        run: |
+          Set-Clipboard -Value 'w11term clipboard fixture'
+          cargo test --locked --features ui-smoke --lib clipboard::tests::native_osc52_roundtrip_preserving_existing_plain_text -- --ignored --exact
+      - name: Verify the elevated control pipe rejects a medium-integrity client
+        run: cargo test --locked --features ui-smoke --lib control::security::tests::native_high_server_refuses_medium_integrity_client -- --ignored --exact
+      - name: Drive the GUI over its control pipe
+        run: ./tests/control-smoke.ps1 -Configuration debug
+      - name: Exercise tabs, font settings, search and authentication prompts
+        run: ./tests/lab-ui-smoke.ps1
+      - name: Split native panes
+        run: ./tests/split-ui-smoke.ps1
+      - name: Save and reopen native workspaces
+        run: ./tests/workspace-ui-smoke.ps1
+      - name: Edit profiles and connect to the loopback peer
+        run: ./tests/profile-ui-smoke.ps1
+      - name: Import OpenSSH profiles through the GUI
+        run: ./tests/openssh-import-ui-smoke.ps1
+      - name: Compose and commit text through the native IME interface
+        run: ./tests/ime-ui-smoke.ps1
+      - name: Save failing GUI logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-gui-logs
+          path: |
+            .local/*smoke*/**/*.log
+            .local/*smoke*/**/*.err
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  durable-linux:
+    uses: ./.github/workflows/durable-pty.yml
+
+  kitty-reference:
+    uses: ./.github/workflows/kitty-graphics.yml
+
+  package:
+    uses: ./.github/workflows/windows-package.yml
+
+  publish:
+    name: Publish the verified merge build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, native-e2e, durable-linux, kitty-reference, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: read
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Identify the merged pull request for this main commit
+        id: merge
+        run: |
+          prs=$(gh api --paginate --slurp "repos/$GH_REPO/commits/$GITHUB_SHA/pulls")
+          number=$(jq -r --arg sha "$GITHUB_SHA" \
+            '[.[][] | select(.merged_at and .base.ref == "main" and .merge_commit_sha == $sha)][0].number // empty' <<< "$prs")
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+      - name: Download the archive from this run
+        if: steps.merge.outputs.number != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: w11term-windows-x64
+          path: release
+      - name: Publish ZIP and SHA-256
+        if: steps.merge.outputs.number != ''
+        working-directory: release
+        env:
+          PR_NUMBER: ${{ steps.merge.outputs.number }}
+        run: |
+          set -euo pipefail
+          archive=w11term-windows-x64.zip
+          sha256sum --check "$archive.sha256"
+          tag="build-${GITHUB_SHA:0:12}"
+          if details=$(gh release view "$tag" --json isDraft,assets); then
+            if [[ $(jq -r '.isDraft' <<< "$details") == false ]]; then
+              jq -e --arg zip "$archive" \
+                '[.assets[] | select(.size > 0) | .name] | contains([$zip, ($zip + ".sha256")])' <<< "$details"
+              exit 0
+            fi
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --draft \
+              --title "w11term for Windows x64 · ${GITHUB_SHA:0:12}" \
+              --notes "Built from $GITHUB_SHA after merging #$PR_NUMBER. Extract the complete ZIP and launch w11term.exe."
+          fi
+          gh release upload "$tag" "$archive" "$archive.sha256" --clobber
+          gh release edit "$tag" --draft=false

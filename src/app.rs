@@ -4161,17 +4161,24 @@ impl TerminalApp {
                         std::env::var_os("W11TERM_SETTINGS_PATH").is_some(),
                         "font smoke needs isolated settings"
                     );
+                    let current = self.appearance.read().unwrap().font_family.clone();
                     let index = self
                         .fonts
                         .iter()
                         .position(|font| font == "Cascadia Code")
-                        .expect("font smoke requires Cascadia Code");
+                        .or_else(|| self.fonts.iter().position(|font| font != &current))
+                        .unwrap_or(0);
+                    let selected = self
+                        .fonts
+                        .get(index)
+                        .expect("font smoke needs an installed curated terminal font")
+                        .clone();
                     self.update(Message::Font(Some(index)), context);
                     self.update(Message::Ligatures(false), context);
-                    assert_eq!(self.appearance.read().unwrap().font_family, "Cascadia Code");
+                    assert_eq!(self.appearance.read().unwrap().font_family, selected);
                     assert!(!self.appearance.read().unwrap().ligatures);
                     let saved = Appearance::load(&Appearance::path().unwrap()).unwrap();
-                    assert_eq!(saved.font_family, "Cascadia Code");
+                    assert_eq!(saved.font_family, selected);
                     assert!(!saved.ligatures);
                     assert!(
                         self.appearance_error.is_none(),

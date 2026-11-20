@@ -1,12 +1,7 @@
 name: Durable Linux PTY
 on:
-  pull_request:
-    paths:
-      - 'tests/durable/**'
-      - '.github/workflows/durable-pty.yml'
-  push:
-    branches: [codex/durable-linux-trial]
-    paths: ['tests/durable/**', '.github/workflows/durable-pty.yml']
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
