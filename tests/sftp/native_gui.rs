@@ -51,3 +51,37 @@ async fn native_file_drawer() {
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens an isolated mixed SSH and PowerShell window"]
+async fn native_mixed_ssh_and_powershell() {
+    let (source, _remote, opens, server) = fixture_connections(false, 2).await;
+    let state = tempfile::tempdir().unwrap();
+    run_gui(
+        &source,
+        state.path(),
+        &[("W11TERM_LOCAL_SMOKE", state.path().to_str().unwrap())],
+        "Mixed SSH and local shell smoke passed",
+    )
+    .await;
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one SSH shell before and one after restoring the workspace"
+    );
+    let baseline = image::open(state.path().join("direct.png"))
+        .unwrap()
+        .to_rgba8();
+    let mixed = image::open(state.path().join("mixed.png"))
+        .unwrap()
+        .to_rgba8();
+    let crop = |img: &image::RgbaImage| image::imageops::crop_imm(img, 0, 0, 130, 70).to_image();
+    assert_eq!(crop(&baseline), crop(&mixed));
+    assert!(
+        crop(&baseline)
+            .pixels()
+            .any(|p| p[0] > 220 && p[1] < 45 && p[2] < 45),
+        "expected the red kitty fixture"
+    );
+    server.abort();
+}

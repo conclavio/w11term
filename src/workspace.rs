@@ -23,6 +23,10 @@ const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 )]
 pub enum SavedSource {
     SavedProfile(String),
+    Local {
+        name: Option<String>,
+        shell: crate::options::LocalOptions,
+    },
     Demo,
     Replay(PathBuf),
     /// Connection options contain authentication methods and key paths; live
@@ -57,6 +61,7 @@ impl SavedSource {
     pub fn profile_name(&self) -> Option<&str> {
         match self {
             Self::SavedProfile(name) => Some(name),
+            Self::Local { name, .. } => name.as_deref(),
             Self::Durable { connection, .. } => connection.profile_name(),
             _ => None,
         }
@@ -64,6 +69,19 @@ impl SavedSource {
     /// Supply a profile name only when the pane was opened from that profile.
     pub fn capture(source: &Source, profile: Option<&str>) -> Result<Self> {
         let saved = match (source, profile) {
+            (Source::Local(shell), name) => {
+                let mut shell = shell.clone();
+                if let Some(cwd) = &mut shell.cwd {
+                    *cwd = std::path::absolute(&*cwd)?;
+                }
+                if shell.executable.is_relative() && !shell.is_command_name() {
+                    shell.executable = std::path::absolute(&shell.executable)?;
+                }
+                Self::Local {
+                    name: name.map(str::to_owned),
+                    shell,
+                }
+            }
             (Source::Demo, _) => Self::Demo,
             (Source::Replay(path), _) => {
                 ensure!(!path.as_os_str().is_empty(), "Empty replay path");
@@ -105,6 +123,14 @@ impl SavedSource {
             }
             Self::SavedProfile(name) => ensure!(!name.trim().is_empty(), "Missing profile name"),
             Self::Demo => {}
+            Self::Local { name, shell } => {
+                ensure!(
+                    name.as_ref().is_none_or(|name| !name.trim().is_empty()),
+                    "Missing local profile name"
+                );
+                shell.validate()?;
+                shell.validate_resolved_paths()?;
+            }
             Self::Replay(path) => ensure!(path.is_absolute(), "Expected an absolute replay path"),
             Self::Ssh(options) => {
                 options.validate_route()?;
@@ -155,6 +181,27 @@ impl SavedSource {
                     .clone(),
             ),
             Self::Demo => Source::Demo,
+            Self::Local { shell, .. } => {
+                if let Some(cwd) = &shell.cwd {
+                    ensure!(
+                        cwd.is_dir(),
+                        "Workspace local working directory is unavailable: {}",
+                        cwd.display()
+                    );
+                }
+                if shell.executable.is_absolute() {
+                    let executable = &shell.executable;
+                    // CreateProcess also tries .exe on an extensionless program.
+                    ensure!(
+                        executable.is_file()
+                            || (executable.extension().is_none()
+                                && executable.with_extension("exe").is_file()),
+                        "Workspace local executable is unavailable: {}",
+                        executable.display()
+                    );
+                }
+                Source::Local(shell.clone())
+            }
             Self::Replay(path) => {
                 ensure!(
                     path.is_file(),
@@ -281,7 +328,8 @@ impl WorkspaceLaunch {
         let mut needs_profiles = false;
         for tab in &layout.tabs {
             tab.layout.visit(0, &mut |_, source| {
-                needs_profiles |= source.profile_name().is_some();
+                needs_profiles |=
+                    !matches!(source, SavedSource::Local { .. }) && source.profile_name().is_some();
                 Ok(())
             })?;
         }
@@ -559,6 +607,69 @@ mod tests {
         let mut invalid = reference;
         invalid.generation.clear();
         assert!(profile.with_session(Some(invalid)).is_err());
+    }
+
+    #[test]
+    fn local_workspace_preserves_executable_arguments_and_directory_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = crate::options::LocalOptions {
+            executable: "powershell.exe".into(),
+            args: vec!["-NoProfile".into()],
+            cwd: Some(dir.path().to_owned()),
+        };
+        let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
+        let mut layout = Layout::Leaf(41);
+        layout.split(41, 42, Axis::Columns);
+        let workspace = Workspace::capture([(&layout, 42)], 0, |id| {
+            if id == 42 {
+                SavedSource::capture(&Source::Local(shell.clone()), Some("Studio"))
+            } else {
+                Ok(SavedSource::SavedProfile("ssh".into()))
+            }
+        })
+        .unwrap();
+        store.save("mixed", &workspace).unwrap();
+        let restored = store.load().unwrap().remove("mixed").unwrap();
+        assert_eq!(workspace, restored);
+        let profiles = BTreeMap::from([("ssh".into(), ssh("remote"))]);
+        let sources = restored.resolve_sources(&profiles).unwrap();
+        assert!(matches!(&sources[&1], Source::Ssh(_)));
+        assert_eq!(sources[&2], Source::Local(shell));
+    }
+
+    #[test]
+    fn restored_local_paths_do_not_depend_on_the_launching_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let recipe = |exe: &Path, cwd: &Path| SavedSource::Local {
+            name: None,
+            shell: crate::options::LocalOptions {
+                executable: exe.into(),
+                cwd: Some(cwd.into()),
+                args: Vec::new(),
+            },
+        };
+        let profiles = BTreeMap::new();
+        for (exe, cwd) in [
+            (Path::new("bin/tool.exe"), dir.path()),
+            (Path::new("tool.exe"), Path::new("local-cwd")),
+        ] {
+            assert!(recipe(exe, cwd).resolve(&profiles).is_err());
+        }
+        assert!(
+            recipe(&dir.path().join("missing.exe"), dir.path())
+                .resolve(&profiles)
+                .is_err()
+        );
+        assert!(
+            recipe(Path::new("tool.exe"), &dir.path().join("missing"))
+                .resolve(&profiles)
+                .is_err()
+        );
+        assert!(
+            recipe(Path::new("tool.exe"), dir.path())
+                .resolve(&profiles)
+                .is_ok()
+        );
     }
 
     #[test]

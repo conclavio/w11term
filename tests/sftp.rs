@@ -344,14 +344,16 @@ impl russh_sftp::server::Handler for Files {
     }
 }
 
-async fn fixture_server(
-    reject: bool,
-) -> (
+type FixtureServer = (
     Source,
     tempfile::TempDir,
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
-) {
+);
+async fn fixture_server(reject: bool) -> FixtureServer {
+    fixture_connections(reject, 1).await
+}
+async fn fixture_connections(reject: bool, connections: usize) -> FixtureServer {
     use russh::keys::{Algorithm, HashAlg, PrivateKey};
     let root = tempfile::tempdir().unwrap();
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -366,18 +368,29 @@ async fn fixture_server(
         .unwrap();
     let port = listener.local_addr().unwrap().port();
     let opens = Arc::new(AtomicUsize::new(0));
-    let peer = Peer {
-        channels: HashMap::new(),
-        root: root.path().into(),
-        opens: opens.clone(),
-        reject,
-    };
+    let root_path = root.path().to_owned();
+    let opens_for_server = opens.clone();
     let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let _ = server::run_stream(config, stream, peer)
-            .await
-            .unwrap()
-            .await;
+        let mut peers = tokio::task::JoinSet::new();
+        for _ in 0..connections {
+            let (stream, _) = listener.accept().await.unwrap();
+            let peer = Peer {
+                channels: HashMap::new(),
+                root: root_path.clone(),
+                opens: opens_for_server.clone(),
+                reject,
+            };
+            let config = config.clone();
+            peers.spawn(async move {
+                let _ = server::run_stream(config, stream, peer)
+                    .await
+                    .unwrap()
+                    .await;
+            });
+        }
+        while let Some(done) = peers.join_next().await {
+            done.unwrap();
+        }
     });
     let source = Source::Ssh(SshOptions {
         host: "127.0.0.1".into(),

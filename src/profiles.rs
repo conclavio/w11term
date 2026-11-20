@@ -14,6 +14,13 @@ pub struct ProfileStore {
     path: PathBuf,
 }
 
+#[derive(Clone)]
+pub struct LocalProfileSnapshot {
+    pub name: String,
+    pub options: crate::options::LocalOptions,
+    raw: Option<serde_json::Value>,
+}
+
 impl ProfileStore {
     pub fn new(path: PathBuf) -> Result<Self> {
         let path = if path.is_absolute() {
@@ -28,11 +35,94 @@ impl ProfileStore {
         Ok(load_profiles(&self.path)?.profiles)
     }
 
+    pub fn catalog(&self) -> Result<crate::options::Profiles> {
+        load_profiles(&self.path)
+    }
+
+    pub fn inspect_local(&self, name: &str) -> Result<LocalProfileSnapshot> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => br#"{"profiles":{}}"#.to_vec(),
+            Err(e) => return Err(e.into()),
+        };
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let options = crate::options::parse_profiles(&bytes, &self.path)?
+            .local
+            .remove(name)
+            .context("Local profile was removed or its backend changed")?;
+        Ok(LocalProfileSnapshot {
+            name: name.into(),
+            options,
+            raw: raw["profiles"].get(name).cloned(),
+        })
+    }
+
+    pub fn save_local(
+        &self,
+        original: Option<&LocalProfileSnapshot>,
+        name: &str,
+        shell: &crate::options::LocalOptions,
+    ) -> Result<()> {
+        ensure!(
+            !name.is_empty() && name == name.trim() && !name.chars().any(char::is_control),
+            "Enter a local profile name"
+        );
+        shell.validate()?;
+        self.modify(|profiles, _| {
+            if let Some(base) = original {
+                ensure!(
+                    profiles.get(&base.name) == base.raw.as_ref(),
+                    "Local profile changed on disk; reopen the editor before saving"
+                );
+            }
+            ensure!(
+                original.is_some_and(|base| base.name == name)
+                    || (!profiles.contains_key(name)
+                        && !crate::options::LocalOptions::installed().contains_key(name)),
+                "Profile {name} already exists"
+            );
+            let mut entry = original
+                .and_then(|base| base.raw.clone())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let fields = entry
+                .as_object_mut()
+                .context("Local profile must be an object")?;
+            fields.insert("backend".into(), "local".into());
+            let stored = original.filter(|base| base.raw.is_some());
+            if stored.is_none_or(|base| base.options.executable != shell.executable) {
+                fields.insert(
+                    "executable".into(),
+                    serde_json::to_value(&shell.executable)?,
+                );
+            }
+            fields.insert("args".into(), serde_json::to_value(&shell.args)?);
+            if stored.is_none_or(|base| base.options.cwd != shell.cwd) {
+                fields.insert("cwd".into(), serde_json::to_value(&shell.cwd)?);
+            }
+            if let Some(base) = original
+                && base.name != name
+            {
+                profiles.remove(&base.name);
+            }
+            profiles.insert(name.into(), entry);
+            Ok(())
+        })
+    }
+
     /// Both the editor and the conflict check use the same read of profiles.json.
     pub fn inspect(&self, name: &str) -> Result<(BTreeMap<String, SshOptions>, ProfileSnapshot)> {
+        let (catalog, snapshot) = self.inspect_catalog(name)?;
+        Ok((catalog.profiles, snapshot))
+    }
+
+    pub fn inspect_catalog(
+        &self,
+        name: &str,
+    ) -> Result<(crate::options::Profiles, ProfileSnapshot)> {
         let bytes = std::fs::read(&self.path)?;
-        let profiles = crate::options::parse_profiles(&bytes, &self.path)?.profiles;
-        let options = profiles
+        let catalog = crate::options::parse_profiles(&bytes, &self.path)?;
+        let options = catalog
+            .profiles
             .get(name)
             .with_context(|| format!("Profile {name} was removed"))?
             .clone();
@@ -42,7 +132,7 @@ impl ProfileStore {
             options,
             raw: raw["profiles"][name].clone(),
         };
-        Ok((profiles, snapshot))
+        Ok((catalog, snapshot))
     }
 
     pub fn add(&self, name: &str, options: &SshOptions) -> Result<()> {
@@ -121,13 +211,18 @@ impl ProfileStore {
                 );
             }
             if let Some(original) = original {
+                let current = profiles
+                    .get(original)
+                    .with_context(|| format!("Profile {original} was removed"))?;
                 ensure!(
-                    profiles.contains_key(original),
-                    "Profile {original} was removed"
+                    current.get("backend").and_then(|v| v.as_str()) != Some("local"),
+                    "Profile {original} is now a local shell; reopen the profile"
                 );
             }
             ensure!(
-                original == Some(name) || !profiles.contains_key(name),
+                original == Some(name)
+                    || (!profiles.contains_key(name)
+                        && !crate::options::LocalOptions::installed().contains_key(name)),
                 "Profile {name} already exists"
             );
             let mut value = original

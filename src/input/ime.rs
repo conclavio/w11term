@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn updates_stay_local_until_a_utf16_result_and_cancel_cannot_retarget() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let hwnd = HWND(1usize as *mut _);
+        let hwnd = HWND(std::ptr::dangling_mut());
         let mut ime = Composition {
             owner: Some(hwnd),
             surface: Some(Surface::new(tx, Default::default(), || None)),

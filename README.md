@@ -1,6 +1,6 @@
 # w11term
 
-A Windows-native SSH terminal prototype in Rust. Windows Reactor supplies the window and hosts a GPU terminal surface. The shell runs on the SSH server; there is no ConPTY, local PowerShell, or cmd dependency.
+A Windows-native terminal in Rust. Windows Reactor hosts the window and GPU terminal surface. SSH panes connect directly through russh. Local shell profiles run Windows console programs through ConPTY.
 
 Terminal emulation is provided by **[wezterm-term](https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term)**, the terminal core from [WezTerm](https://wezterm.org/), by Wez Furlong and contributors. Its VT parser, screen model, scrollback/reflow, graphics protocols, and semantic prompt support are the foundation of w11term's terminal. The vendored crate retains its [original MIT license](vendor/wezterm-term/LICENSE.md); our local changes are documented in [PATCHES.md](vendor/wezterm-term/PATCHES.md).
 
@@ -26,6 +26,7 @@ cargo run -- --profile play-6789
 cargo run -- --profile play-6792
 cargo run -- --profile root --tab play-6789 --tab play-6792
 cargo run -- --workspace "Admin console"
+cargo run -- --profile "Windows PowerShell"
 cargo run -- --list-profiles
 cargo run -- ssh user@example.com --identity C:\path\to\id_ed25519
 cargo run -- ssh user@example.com --port 2222 --host-key SHA256:verified-fingerprint
@@ -38,11 +39,15 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 ## Tabs and profiles
 
-The native WinUI tab strip sits in the title bar. Click **+** to open a saved profile as an independent SSH session. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
+The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
 
 Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
+
+Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
+
+Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.
 
 On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** or drop local files onto the drawer to upload into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
 
