@@ -10,6 +10,7 @@ use w11term::{
     terminal::FrameStore,
 };
 use wezterm_term::{KeyCode, KeyModifiers};
+pub(crate) mod ime;
 use windows::Win32::{
     Foundation::*,
     System::Threading::GetCurrentThreadId,
@@ -187,6 +188,7 @@ impl KeyboardBridge {
                 state.retarget(target.map(|(sender, frames)| Target { sender, frames }));
             }
         });
+        ime::sync_context();
     }
     pub fn set_wheel_panes(
         &self,
@@ -235,15 +237,18 @@ impl KeyboardBridge {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.switcher = visible;
                 if visible {
+                    ime::cancel();
                     s.wheel_panes.hovered = None;
                 }
             }
         });
+        ime::sync_context();
     }
     pub fn set_search(&self, visible: bool) {
         INPUT.with(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 if visible {
+                    ime::cancel();
                     s.release_keys();
                     s.wheel_panes.hovered = None;
                 }
@@ -253,17 +258,27 @@ impl KeyboardBridge {
                 }
             }
         });
+        ime::sync_context();
     }
     pub fn set_modal(&self, visible: bool) {
-        INPUT.with(|i| {
+        let changed = INPUT.with(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
+                if s.modal == visible {
+                    return false;
+                }
                 if visible {
+                    ime::cancel();
                     s.release_keys();
                     s.wheel_panes.hovered = None;
                 }
                 s.modal = visible;
+                return true;
             }
+            false
         });
+        if changed {
+            ime::sync_context();
+        }
     }
     pub fn on_close(&self, handler: impl Fn() + 'static) {
         INPUT.with(|state| {
@@ -322,6 +337,7 @@ impl KeyboardBridge {
 
 impl Drop for KeyboardBridge {
     fn drop(&mut self) {
+        ime::uninstall();
         // SAFETY: this object owns the hook, and is destroyed on its installing thread.
         unsafe {
             let _ = UnhookWindowsHookEx(self.messages);
@@ -370,6 +386,7 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code >= 0 {
         // SAFETY: WH_CALLWNDPROC supplies a CWPSTRUCT valid for this callback.
         let message = unsafe { &*(lparam.0 as *const CWPSTRUCT) };
+        ime::observe(message.hwnd, message.message);
         if message.message == WM_ACTIVATEAPP && is_terminal(message.hwnd) {
             INPUT.with(|input| {
                 if let Ok(mut input) = input.try_borrow_mut()
@@ -377,6 +394,7 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 {
                     let focused = message.wParam.0 != 0;
                     if !focused {
+                        ime::cancel();
                         state.release_keys();
                         if state.switcher {
                             state.switcher = false;
@@ -645,6 +663,14 @@ impl State {
     }
 
     fn retarget(&mut self, target: Option<Target>) {
+        if !self
+            .target
+            .as_ref()
+            .zip(target.as_ref())
+            .is_some_and(|(a, b)| a.sender.same_channel(&b.sender))
+        {
+            ime::cancel();
+        }
         self.release_keys();
         if let Some(old) = self.target.take() {
             let _ = old.sender.send(Command::Focus(false));
@@ -675,6 +701,13 @@ impl State {
         };
         if self.modal {
             return false;
+        }
+        if ime::active() {
+            match message.message {
+                WM_CHAR | WM_SYSCHAR => return true,
+                WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => return false,
+                _ => {}
+            }
         }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_F11.0 as u32 {
             if message.lParam.0 & (1 << 30) == 0 {
