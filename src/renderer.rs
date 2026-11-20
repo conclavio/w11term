@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use w11term::terminal::{Snapshot, colors, rgba};
 use wezterm_term::{Intensity, Underline, image::ImageDataType};
 use windows_canvas::{
-    ColorF, DrawContext, DrawingSession, Rect, TextFormat, TextLayout, WordWrapping,
+    Brush, ColorF, DrawContext, DrawingSession, Rect, TextFormat, TextLayout, Vector2, WordWrapping,
 };
 
 pub const PADDING: f32 = 12.0;
@@ -37,7 +37,7 @@ pub struct Renderer {
     normal: TextFormat,
     bold: TextFormat,
     small: TextFormat,
-    layouts: HashMap<(String, bool), CachedLayout>,
+    layouts: HashMap<(String, TextStyle), CachedLayout>,
     typography: Typography,
     ligatures: bool,
     images: HashMap<[u8; 32], CachedImage>,
@@ -62,14 +62,147 @@ struct CachedLayout {
     layout: TextLayout,
     natural_width: f32,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TextStyle {
+    bold: bool,
+    italic: bool,
+    rtl: bool,
+}
 struct TextRun<'a> {
     text: &'a str,
-    bold: bool,
+    style: TextStyle,
     x: f32,
     y: f32,
     cols: usize,
     fg: [f32; 4],
     shape: bool,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum RunKind {
+    Ascii,
+    Script,
+}
+
+fn run_kind(cell: &wezterm_term::CellRef<'_>, ligatures: bool, rtl: bool) -> Option<RunKind> {
+    let text = cell.str();
+    if text.is_ascii() {
+        return (ligatures && cell.width() == 1 && text.len() == 1).then_some(RunKind::Ascii);
+    }
+    // Frame and block glyphs need an exact cell advance. Connected scripts
+    // need their neighbors even when programming ligatures are disabled.
+    let first = text.chars().next()?;
+    if cell.width() != 1
+        && (!first.is_alphabetic()
+            || wezterm_term::grapheme_column_width(&text[..first.len_utf8()], None) > 1)
+    {
+        // Keep intrinsically wide characters and emoji anchored individually.
+        // Indic conjuncts can occupy two cells even though the first base is narrow.
+        return None;
+    }
+    if matches!(first, '\u{2500}'..='\u{259f}' | '\u{10eeee}') {
+        return None;
+    }
+    if !rtl
+        && matches!(
+            wezterm_bidi::bidi_class_for_char(first),
+            wezterm_bidi::BidiClass::RightToLeft | wezterm_bidi::BidiClass::ArabicLetter
+        )
+    {
+        // Explicit visual-order mode: preserve the application's cell positions.
+        return None;
+    }
+    Some(RunKind::Script)
+}
+
+fn run_extent(
+    cells: &[wezterm_term::CellRef<'_>],
+    map: &w11term::text_layout::CellMap,
+    ligatures: bool,
+) -> (usize, Option<RunKind>) {
+    let first = &cells[0];
+    let rtl = map.rtl(first.cell_index());
+    let Some(kind) = run_kind(first, ligatures, rtl) else {
+        return (1, None);
+    };
+    let mut count = 1;
+    for pair in cells.windows(2) {
+        let (prev, next) = (&pair[0], &pair[1]);
+        let col = next.cell_index();
+        let prev_visual = map.visual(prev.cell_index());
+        let next_visual = map.visual(col);
+        let adjacent = if rtl {
+            next_visual + next.width() == prev_visual
+        } else {
+            prev_visual + prev.width() == next_visual
+        };
+        if !adjacent
+            || col != prev.cell_index() + prev.width()
+            || next.attrs() != first.attrs()
+            || map.rtl(col) != rtl
+            || run_kind(next, ligatures, rtl) != Some(kind)
+        {
+            break;
+        }
+        count += 1;
+    }
+    (count, Some(kind))
+}
+
+fn draw_underline(
+    ctx: &DrawingSession<'_>,
+    brush: &Brush,
+    style: Underline,
+    cell: Rect,
+    scale: f32,
+) {
+    let height = cell.bottom - cell.top;
+    let stroke = (height / 19.0 * scale).round().max(1.0) / scale;
+    let baseline = cell.bottom - 3.0 * stroke;
+    let stripe =
+        |left, top, width| ctx.fill_rect(&Rect::from_xywh(left, top, width, stroke), brush);
+    match style {
+        Underline::None => {}
+        Underline::Single | Underline::Double => {
+            stripe(cell.left, baseline, cell.right - cell.left);
+            if style == Underline::Double {
+                stripe(cell.left, baseline - 2.0 * stroke, cell.right - cell.left);
+            }
+        }
+        Underline::Dotted | Underline::Dashed => {
+            let ink = if style == Underline::Dotted {
+                stroke
+            } else {
+                4.0 * stroke
+            };
+            let period = ink + 2.0 * stroke;
+            // Phase is shared by the entire row, including fractional-DPI cells.
+            let mut x = cell.left - (cell.left - PADDING).rem_euclid(period);
+            while x < cell.right {
+                let left = x.max(cell.left);
+                let right = (x + ink).min(cell.right);
+                if right > left {
+                    stripe(left, baseline, right - left);
+                }
+                x += period;
+            }
+        }
+        Underline::Curly => {
+            let step = 2.0 * stroke;
+            let wave = |x: f32| {
+                let phase = ((x - PADDING) / step).rem_euclid(2.0);
+                Vector2::new(x, baseline + (1.0 - (phase - 1.0).abs()) * 2.0 * stroke)
+            };
+            let mut x = cell.left;
+            let mut boundary = x - (x - PADDING).rem_euclid(step) + step;
+            while x < cell.right {
+                let next = boundary.min(cell.right);
+                ctx.draw_line(wave(x), wave(next), brush, stroke);
+                x = next;
+                boundary += step;
+            }
+        }
+    }
 }
 
 impl Renderer {
@@ -119,7 +252,7 @@ impl Renderer {
     fn text(&mut self, native: &NativeDrawing, run: TextRun<'_>) -> windows_canvas::Result<()> {
         let TextRun {
             text,
-            bold,
+            style,
             x,
             y,
             cols,
@@ -129,18 +262,18 @@ impl Renderer {
         if text.trim_end_matches(' ').is_empty() {
             return Ok(());
         }
-        let key = (text.to_owned(), bold);
+        let key = (text.to_owned(), style);
         if !self.layouts.contains_key(&key) {
             if self.layouts.len() >= 2048 {
                 self.layouts.clear();
             }
             let layout = TextLayout::new(
                 text,
-                if bold { &self.bold } else { &self.normal },
+                if style.bold { &self.bold } else { &self.normal },
                 self.metrics.cell_width * cols as f32 + 4.0,
                 self.metrics.cell_height,
             )?;
-            self.typography.apply(&layout)?;
+            self.typography.apply(&layout, style.italic, style.rtl)?;
             let natural_width = layout.metrics().width_including_trailing_whitespace;
             self.layouts.insert(
                 key.clone(),
@@ -151,8 +284,8 @@ impl Renderer {
             );
         }
         let cached = &self.layouts[&key];
-        // Monospaced ASCII shaping keeps its total advance equal to the occupied cells.
-        // Scale the run once so pixel-snapped cells cannot accumulate fractional drift.
+        // Anchor each shaped run to its occupied grid columns even when DirectWrite
+        // chose a proportional fallback font or the grid was snapped to physical pixels.
         let scale = if shape && cached.natural_width > 0.0 {
             cols as f32 * self.metrics.cell_width / cached.natural_width
         } else {
@@ -181,7 +314,11 @@ impl Renderer {
         if text.is_empty() || frame.cursor.y < 0 || frame.cursor.y as usize >= self.metrics.rows {
             return Ok(0.0);
         }
-        let x = PADDING + frame.cursor.x.min(self.metrics.cols.saturating_sub(1)) as f32 * cw;
+        let x = PADDING
+            + frame
+                .visual_cursor_column()
+                .min(self.metrics.cols.saturating_sub(1)) as f32
+                * cw;
         let y = PADDING + frame.cursor.y as f32 * ch;
         let layout = TextLayout::new(text, &self.normal, 1000000.0, ch)?;
         let width = layout
@@ -212,6 +349,24 @@ impl Renderer {
         let cw = self.metrics.cell_width;
         let ch = self.metrics.cell_height;
         let brush = ctx.create_solid_brush(ColorF::new(0.25, 0.53, 0.90, 0.4))?;
+        let highlight = |row: usize, span, top: f32, height: f32| {
+            if let Some(map) = frame.cell_map(row) {
+                for visual in map.visual_ranges(span) {
+                    let end = visual.end.min(self.metrics.cols);
+                    if visual.start < end {
+                        ctx.fill_rect(
+                            &Rect::from_xywh(
+                                PADDING + visual.start as f32 * cw,
+                                PADDING + row as f32 * ch + top,
+                                (end - visual.start) as f32 * cw,
+                                height,
+                            ),
+                            &brush,
+                        );
+                    }
+                }
+            }
+        };
         if let Some(search) = &frame.search {
             for (selected, matched) in &search.visible {
                 brush.set_color(if *selected {
@@ -222,15 +377,7 @@ impl Renderer {
                 for (point, end) in &matched.spans {
                     let y = point.row - frame.first_stable_row;
                     if y >= 0 && y < self.metrics.rows as isize {
-                        ctx.fill_rect(
-                            &Rect::from_xywh(
-                                PADDING + point.col as f32 * cw,
-                                PADDING + y as f32 * ch,
-                                end.saturating_sub(point.col) as f32 * cw,
-                                ch,
-                            ),
-                            &brush,
-                        );
+                        highlight(y as usize, point.col..*end, 0.0, ch);
                     }
                 }
             }
@@ -255,15 +402,7 @@ impl Renderer {
                             span.end = cell.cell_index() + cell.width();
                         }
                     }
-                    ctx.fill_rect(
-                        &Rect::from_xywh(
-                            PADDING + span.start as f32 * cw,
-                            PADDING + y as f32 * ch,
-                            span.len() as f32 * cw,
-                            ch,
-                        ),
-                        &brush,
-                    );
+                    highlight(y, span, 0.0, ch);
                 }
             }
         }
@@ -272,15 +411,7 @@ impl Renderer {
             for (row, span) in &link.spans {
                 let y = *row - frame.first_stable_row;
                 if y >= 0 && y < self.metrics.rows as isize {
-                    ctx.fill_rect(
-                        &Rect::from_xywh(
-                            PADDING + span.start as f32 * cw,
-                            PADDING + (y + 1) as f32 * ch - 2.0,
-                            span.len() as f32 * cw,
-                            1.0,
-                        ),
-                        &brush,
-                    );
+                    highlight(y as usize, span.clone(), ch - 2.0, 1.0);
                 }
             }
         }
@@ -357,16 +488,18 @@ impl Renderer {
 
         // Cell backgrounds, then image/text layers in protocol z order.
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
+            let map = frame.cell_map(y).expect("row belongs to the snapshot");
             for cell in line
                 .visible_cells()
-                .take_while(|cell| cell.cell_index() < self.metrics.cols)
+                .take_while(|cell| cell.cell_index() < frame.cols)
+                .filter(|cell| map.visual(cell.cell_index()) < self.metrics.cols)
             {
                 let (_, bg) = colors(cell.attrs(), &frame.palette);
                 if bg != background {
                     brush.set_color(color(bg));
                     ctx.fill_rect(
                         &Rect::from_xywh(
-                            PADDING + cell.cell_index() as f32 * cw,
+                            PADDING + map.visual(cell.cell_index()) as f32 * cw,
                             PADDING + y as f32 * ch,
                             cw * cell.width() as f32,
                             ch,
@@ -378,64 +511,64 @@ impl Renderer {
         }
         self.draw_images(&native, frame, true)?;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
+            let map = frame.cell_map(y).expect("row belongs to the snapshot");
             let cells: Vec<_> = line
                 .visible_cells()
-                .take_while(|cell| cell.cell_index() < self.metrics.cols)
+                .take_while(|c| c.cell_index() < frame.cols)
+                .filter(|c| map.visual(c.cell_index()) < self.metrics.cols)
                 .collect();
-            let mut shaped_until = 0;
+            let y = PADDING + y as f32 * ch;
+            let mut next_run = 0;
             for (index, cell) in cells.iter().enumerate() {
+                let col = cell.cell_index();
                 let attrs = cell.attrs();
-                let text = cell.str();
-                let x = PADDING + cell.cell_index() as f32 * cw;
-                let y = PADDING + y as f32 * ch;
+                if attrs.invisible() {
+                    continue;
+                }
+                let visual = map.visual(col);
+                let x = PADDING + visual as f32 * cw;
                 let (fg, _) = colors(attrs, &frame.palette);
-                brush.set_color(color(fg));
-                if cell.cell_index() >= shaped_until && !text.is_empty() && !attrs.invisible() {
-                    if self.ligatures
-                        && cell.width() == 1
-                        && text.len() == 1
-                        && matches!(text.as_bytes()[0], b' '..=b'~')
-                    {
-                        let mut run = String::new();
-                        for next in &cells[index..] {
-                            if next.cell_index() != cell.cell_index() + run.len()
-                                || next.width() != 1
-                                || next.attrs() != attrs
-                                || next.str().len() != 1
-                                || !matches!(next.str().as_bytes()[0], b' '..=b'~')
-                            {
-                                break;
-                            }
-                            run.push_str(next.str());
-                        }
-                        shaped_until = cell.cell_index() + run.len();
-                        let run = run.trim_end_matches(' ');
-                        self.text(
-                            &native,
-                            TextRun {
-                                text: run,
-                                bold: attrs.intensity() == Intensity::Bold,
-                                x,
-                                y,
-                                cols: run.len(),
-                                fg,
-                                shape: true,
-                            },
-                        )?;
+                // Kitty marks the image's placement in the text grid with U+10EEEE.
+                if index >= next_run && !cell.str().starts_with('\u{10eeee}') {
+                    let rtl = map.rtl(col);
+                    let (count, kind) = run_extent(&cells[index..], map, self.ligatures);
+                    next_run = index + count;
+                    let run_cells = &cells[index..next_run];
+                    let mut joined = String::new();
+                    let text = if run_cells.len() == 1 {
+                        cell.str()
                     } else {
-                        self.text(
-                            &native,
-                            TextRun {
-                                text,
+                        for member in run_cells {
+                            joined.push_str(member.str());
+                        }
+                        &joined
+                    };
+                    let last = run_cells.last().unwrap();
+                    let mut cols = last.cell_index() + last.width() - col;
+                    let left = visual.min(map.visual(last.cell_index()));
+                    let text = if kind == Some(RunKind::Ascii) && !rtl {
+                        let trimmed = text.trim_end_matches(' ');
+                        cols -= text.len() - trimmed.len();
+                        trimmed
+                    } else {
+                        text
+                    };
+                    self.text(
+                        &native,
+                        TextRun {
+                            text,
+                            style: TextStyle {
                                 bold: attrs.intensity() == Intensity::Bold,
-                                x,
-                                y,
-                                cols: cell.width().max(1),
-                                fg,
-                                shape: false,
+                                italic: attrs.italic(),
+                                rtl,
                             },
-                        )?;
-                    }
+                            x: PADDING + left as f32 * cw,
+                            y,
+                            cols,
+                            fg,
+                            shape: kind.is_some(),
+                        },
+                    )?;
                 }
                 if attrs.underline() != Underline::None {
                     let underline = if attrs.underline_color()
@@ -446,32 +579,38 @@ impl Renderer {
                         rgba(frame.palette.resolve_fg(attrs.underline_color()))
                     };
                     brush.set_color(color(underline));
-                    ctx.fill_rect(
-                        &Rect::from_xywh(x, y + ch - 3.0, cw * cell.width() as f32, 1.0),
+                    draw_underline(
+                        ctx,
                         &brush,
+                        attrs.underline(),
+                        Rect::from_xywh(x, y, cell.width() as f32 * cw, ch),
+                        self.metrics.scale,
                     );
-                    if attrs.underline() == Underline::Double {
-                        ctx.fill_rect(
-                            &Rect::from_xywh(x, y + ch - 5.0, cw * cell.width() as f32, 1.0),
-                            &brush,
-                        );
-                    }
                 }
                 if attrs.strikethrough() {
+                    brush.set_color(color(fg));
+                    let scale = self.metrics.scale;
+                    let top = ((y + ch * 0.5) * scale).round() / scale;
                     ctx.fill_rect(
-                        &Rect::from_xywh(x, y + ch * 0.5, cw * cell.width() as f32, 1.0),
+                        &Rect::from_xywh(
+                            x,
+                            top,
+                            cw * cell.width() as f32,
+                            scale.round().max(1.0) / scale,
+                        ),
                         &brush,
                     );
                 }
             }
         }
         self.draw_images(&native, frame, false)?;
+        let col = frame.visual_cursor_column();
         if frame.cursor_visible
-            && frame.cursor.x < self.metrics.cols
-            && frame.cursor.y >= 0
-            && (frame.cursor.y as usize) < self.metrics.rows
+            && let Ok(row) = usize::try_from(frame.cursor.y)
+            && row < self.metrics.rows
+            && col < self.metrics.cols
         {
-            let x = PADDING + frame.cursor.x as f32 * cw;
+            let x = PADDING + col as f32 * cw;
             let y = PADDING + frame.cursor.y as f32 * ch;
             brush.set_color(color(rgba(frame.palette.cursor_bg)));
             use termwiz::surface::CursorShape;
@@ -799,6 +938,115 @@ mod tests {
                 windows::Win32::System::Com::CoUninitialize();
             }
         }
+    }
+
+    #[test]
+    fn complex_text_fixture_matches_native_word_shaping_and_decoration_masks() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::with_font("Cascadia Mono", false).unwrap();
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let width = 480;
+        let height = 410;
+        let target = device.create_render_target(width, height).unwrap();
+        let reference = device.create_render_target(width, height).unwrap();
+        let size = wezterm_term::TerminalSize {
+            cols: 32,
+            rows: 12,
+            dpi: 96,
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = w11term::terminal::create(size, tx);
+        term.advance_bytes(include_bytes!("../tests/fixtures/complex-text.vt"));
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        target
+            .draw(|ctx| {
+                NativeDrawing::new(ctx)?.set_dpi(96.0);
+                renderer.draw_surface(ctx, width as f32, height as f32, false, &frame)?;
+                Ok(())
+            })
+            .unwrap();
+        let pixels = target.read_pixels().unwrap();
+        let cw = renderer.metrics.cell_width as usize;
+        let ch = renderer.metrics.cell_height as usize;
+        let row_pixels = |buffer: &[u8], row: usize, cols: usize| -> Vec<[u8; 4]> {
+            let mut out = Vec::new();
+            for y in 0..ch {
+                let start = (PADDING as usize + row * ch + y) * width as usize + PADDING as usize;
+                out.extend_from_slice(
+                    buffer[start * 4..(start + cw * cols) * 4]
+                        .as_chunks::<4>()
+                        .0,
+                );
+            }
+            out
+        };
+        // The logical red Alef is the rightmost Hebrew letter in this mixed line.
+        let top = row_pixels(&pixels, 0, 8);
+        assert_eq!(top[5 * cw], [0, 0, 255, 255]);
+        assert_ne!(top[cw], [0, 0, 255, 255]);
+
+        // Build an independent native DirectWrite reference from whole logical words.
+        // This tests the terminal's run assembly, contextual forms and placement
+        // without baking machine-specific fallback fonts into a golden bitmap.
+        reference
+            .draw(|ctx| {
+                let native = NativeDrawing::new(ctx)?;
+                native.set_dpi(96.0);
+                ctx.clear(color(rgba(frame.palette.background)));
+                for (row, text, rtl) in [(1, "سلام", true), (2, "नमस्ते", false)] {
+                    let grid = (wezterm_term::unicode_column_width(text, None) * cw) as f32;
+                    let layout = TextLayout::new(text, &renderer.normal, grid + 4.0, ch as f32)?;
+                    renderer.typography.apply(&layout, false, rtl)?;
+                    let natural = layout.metrics().width_including_trailing_whitespace;
+                    native.text(
+                        &layout,
+                        PADDING,
+                        PADDING + (row * ch) as f32,
+                        rgba(frame.palette.foreground),
+                        grid / natural,
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let expected = reference.read_pixels().unwrap();
+        for row in 1..=2 {
+            let actual = row_pixels(&pixels, row, 8);
+            assert!(actual.iter().any(|p| p[1] > 100), "empty word on row {row}");
+            assert!(
+                actual == row_pixels(&expected, row, 8),
+                "word on row {row} differs from DirectWrite reference: {:?}",
+                frame.rows[row]
+                    .visible_cells()
+                    .map(|c| (c.str().to_owned(), c.width()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            row_pixels(&pixels, 3, 7) != row_pixels(&pixels, 4, 7),
+            "italic matched upright"
+        );
+
+        let mut masks = HashSet::new();
+        for row in 5..10 {
+            let samples = row_pixels(&pixels, row, 8);
+            let mask: Vec<_> = samples.iter().map(|p| p[2] > 100 && p[1] < 64).collect();
+            assert!(
+                mask.iter().any(|bit| *bit),
+                "missing underline on row {row}"
+            );
+            assert!(masks.insert(mask), "duplicate underline shape on row {row}");
+        }
+        let strike = row_pixels(&pixels, 10, 8);
+        assert!(
+            strike.iter().any(|p| p[1] > 160 && p[2] < 64),
+            "strike lost its foreground color"
+        );
+        assert!(
+            strike.iter().any(|p| p[2] > 160 && p[1] < 64),
+            "underline lost its explicit color"
+        );
     }
 
     #[test]

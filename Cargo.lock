@@ -3477,6 +3477,7 @@ dependencies = [
  "tempfile",
  "termwiz",
  "tokio",
+ "wezterm-bidi",
  "wezterm-input-types",
  "wezterm-term",
  "windows",

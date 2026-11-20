@@ -51,6 +51,13 @@ pub fn scroll_wheel(
 struct Config;
 
 impl TerminalConfiguration for Config {
+    fn bidi_mode(&self) -> wezterm_term::config::BidiMode {
+        wezterm_term::config::BidiMode {
+            enabled: true,
+            hint: wezterm_bidi::ParagraphDirectionHint::LeftToRight,
+        }
+    }
+
     fn color_palette(&self) -> ColorPalette {
         ColorPalette {
             foreground: SrgbaTuple(0.86, 0.88, 0.91, 1.0),
@@ -411,6 +418,7 @@ pub struct Snapshot {
     pub connection_generation: u64,
     pub size: TerminalSize,
     images: HashMap<usize, FrozenImage>,
+    cell_maps: std::sync::OnceLock<Arc<[crate::text_layout::CellMap]>>,
 }
 
 #[derive(Clone, Debug)]
@@ -526,7 +534,29 @@ impl Snapshot {
             connection_generation: 0,
             size: terminal.get_size(),
             images,
+            cell_maps: Default::default(),
         }
+    }
+
+    /// Shared by drawing, local pointer input, and assistive clients.
+    pub fn cell_map(&self, row: usize) -> Option<&crate::text_layout::CellMap> {
+        self.cell_maps().get(row)
+    }
+
+    pub fn visual_cursor_column(&self) -> usize {
+        usize::try_from(self.cursor.y)
+            .ok()
+            .and_then(|row| self.cell_map(row))
+            .map_or(self.cursor.x, |map| map.visual(self.cursor.x))
+    }
+
+    pub fn cell_maps(&self) -> &Arc<[crate::text_layout::CellMap]> {
+        self.cell_maps.get_or_init(|| {
+            self.rows
+                .iter()
+                .map(|line| crate::text_layout::CellMap::new(line, self.cols))
+                .collect()
+        })
     }
 
     /// Pixels referenced by a presentation never change underneath the renderer.

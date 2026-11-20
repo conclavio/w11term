@@ -12,8 +12,9 @@ use windows::Win32::Graphics::{
         DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG,
         DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_ALTERNATES,
         DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_LIGATURES, DWRITE_FONT_FEATURE_TAG_STANDARD_LIGATURES,
-        DWRITE_TEXT_RANGE, DWriteCreateFactory, IDWriteFactory, IDWriteTextLayout,
-        IDWriteTypography,
+        DWRITE_FONT_STYLE_ITALIC, DWRITE_READING_DIRECTION_RIGHT_TO_LEFT,
+        DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_RANGE, DWriteCreateFactory, IDWriteFactory,
+        IDWriteTextLayout, IDWriteTypography,
     },
     Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
 };
@@ -63,20 +64,35 @@ impl Typography {
             Ok(Self(typography))
         }
     }
-    pub fn apply(&self, layout: &TextLayout) -> windows_canvas::Result<()> {
+    pub fn apply(
+        &self,
+        layout: &TextLayout,
+        italic: bool,
+        rtl: bool,
+    ) -> windows_canvas::Result<()> {
         let raw = layout.raw().as_raw();
         // SAFETY: both bindings project the same COM interface; layout outlives this call.
         let layout = unsafe { IDWriteTextLayout::from_raw_borrowed(&raw).unwrap() };
         unsafe {
-            layout
-                .SetTypography(
-                    &self.0,
-                    DWRITE_TEXT_RANGE {
-                        startPosition: 0,
-                        length: u32::MAX,
-                    },
-                )
-                .map_err(error)
+            let all = DWRITE_TEXT_RANGE {
+                startPosition: 0,
+                length: u32::MAX,
+            };
+            if italic {
+                layout
+                    .SetFontStyle(DWRITE_FONT_STYLE_ITALIC, all)
+                    .map_err(error)?;
+            }
+            if rtl {
+                layout
+                    .SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)
+                    .map_err(error)?;
+                // Terminal runs supply an absolute left edge even for RTL glyphs.
+                layout
+                    .SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)
+                    .map_err(error)?;
+            }
+            layout.SetTypography(&self.0, all).map_err(error)
         }
     }
 }
@@ -266,7 +282,7 @@ mod tests {
                 let layout = TextLayout::new(text, &format, 1000.0, 100.0).unwrap();
                 Typography::new(font, enabled)
                     .unwrap()
-                    .apply(&layout)
+                    .apply(&layout, false, false)
                     .unwrap();
                 target
                     .draw(|ctx| {

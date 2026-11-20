@@ -867,7 +867,7 @@ impl TerminalApp {
             .min(metrics.rows.saturating_sub(1));
         let point = Point {
             row: frame.first_stable_row + y as isize,
-            col: x,
+            col: frame.cell_map(y).map_or(x, |map| map.logical(x)),
         };
         let link = link_at(&frame, point, preferences.detect_urls);
         if *tab.hover.borrow() != link {
