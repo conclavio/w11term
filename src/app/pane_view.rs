@@ -21,6 +21,14 @@ impl DividerDrag {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+enum WindowGrid {
+    #[default]
+    Off,
+    Terminal,
+    WithDrawer,
+}
+
 #[derive(Default)]
 pub(super) struct PaneSurface {
     #[cfg(feature = "ui-smoke")]
@@ -28,14 +36,14 @@ pub(super) struct PaneSurface {
     pub(super) metrics: Rc<Cell<Metrics>>,
     pub(super) invalidator: Invalidator,
     pub(super) area: Rc<Cell<Option<(f32, f32, f32)>>>,
-    window_grid: Rc<Cell<bool>>,
+    window_grid: Rc<Cell<WindowGrid>>,
     window_size: Rc<Cell<(f64, f64)>>,
     canvas: RefCell<Option<View>>,
 }
 
 impl PaneSurface {
     pub(super) fn window_hidden(&self) {
-        self.window_grid.set(false);
+        self.window_grid.set(WindowGrid::Off);
         self.release();
     }
 
@@ -109,7 +117,8 @@ impl TerminalApp {
             )?;
             metrics.set(measured);
             area.set(Some((ctx.width, ctx.height, measured.scale)));
-            if window_grid.get() {
+            let window_mode = window_grid.get();
+            if matches!(window_mode, WindowGrid::Terminal) {
                 if initial_grid
                     .get()
                     .is_none_or(|grid| grid == (measured.cols, measured.rows))
@@ -123,22 +132,21 @@ impl TerminalApp {
                     ctx.height,
                     measured.scale,
                 );
-                if let Some(((cols, rows), first)) =
+            }
+            if !matches!(window_mode, WindowGrid::Off)
+                && let Some(((cols, rows), first)) =
                     initial_grid.correction((measured.cols, measured.rows))
-                {
-                    let (width, height) = window_size.get();
-                    geometry_sender.send(Message::Geometry(
-                        width
-                            + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width)
-                                as f64,
-                        height
-                            + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
-                                - ctx.height) as f64,
-                        initial_grid.epoch(),
-                        first,
-                    ));
-                    return Ok(());
-                }
+            {
+                let (width, height) = window_size.get();
+                geometry_sender.send(Message::Geometry(
+                    width + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width) as f64,
+                    height
+                        + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
+                            - ctx.height) as f64,
+                    initial_grid.epoch(),
+                    first,
+                ));
+                return Ok(());
             }
             let size = terminal_size(measured);
             if last_size.replace(Some(size)) != Some(size) {
@@ -163,7 +171,11 @@ impl TerminalApp {
     ) -> View {
         tab.surface
             .window_grid
-            .set(matches!(self.tabs.active_layout(), Some(Layout::Leaf(_))));
+            .set(match self.tabs.active_layout() {
+                Some(Layout::Leaf(_)) if tab.files.open => WindowGrid::WithDrawer,
+                Some(Layout::Leaf(_)) => WindowGrid::Terminal,
+                _ => WindowGrid::Off,
+            });
         tab.surface
             .window_size
             .set((self.width, self.window_height));

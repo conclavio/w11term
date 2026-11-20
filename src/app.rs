@@ -29,6 +29,8 @@ use windows_reactor::*;
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
+mod file_drawer;
+use file_drawer::{FileAction, FileDrawer};
 mod pane_view;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
@@ -36,6 +38,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    files: Box<FileDrawer>,
     source: Source,
     profile_name: Option<String>,
     surface: PaneSurface,
@@ -204,6 +207,7 @@ fn tab_menu_message(label: String) -> Message {
         }
     }
     match label.split(": ").next().unwrap_or(&label) {
+        "SFTP files" => Message::Files(FileAction::Toggle),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
@@ -279,6 +283,7 @@ pub struct TerminalApp {
 }
 
 pub enum Message {
+    Files(FileAction),
     SplitPane(Axis, Option<String>),
     PaneNeighbor(Direction),
     ZoomPane,
@@ -366,6 +371,7 @@ fn live_tab_sized(
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            files: Box::default(),
             source: source.clone(),
             profile_name: None,
             surface: PaneSurface::default(),
@@ -1882,6 +1888,10 @@ impl TerminalApp {
             MenuItem::item("split-right", "Split right"),
             MenuItem::item("split-below", "Split below"),
         ];
+        if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
+        {
+            items.push(MenuItem::item("files", "SFTP files"));
+        }
         if !self.profiles.is_empty() {
             for (key, label) in [
                 ("right-profile", "Split right with"),
@@ -2312,7 +2322,8 @@ impl Component for TerminalApp {
         app.sync_selection(context);
         #[cfg(feature = "ui-smoke")]
         if std::env::var_os("W11TERM_UI_SMOKE").is_some() {
-            let loopback = std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
+            let loopback = (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
+                || std::env::var_os("W11TERM_FILE_SMOKE").is_some())
                 && matches!(&options.source, Source::Ssh(ssh) if ssh.host == "127.0.0.1" && ssh.user == "test" && ssh.host_key.is_some());
             assert!(
                 (matches!(options.source, Source::Demo) || loopback)
@@ -2348,6 +2359,7 @@ impl Component for TerminalApp {
         if !matches!(
             &message,
             Message::FrameReady(..)
+                | Message::Files(..)
                 | Message::PaneRatio(..)
                 | Message::DividerPress(..)
                 | Message::DividerEnd(..)
@@ -2361,6 +2373,7 @@ impl Component for TerminalApp {
             self.watch_control(context);
         }
         match message {
+            Message::Files(action) => self.file_action(action, context),
             Message::DraftBell(id, value) => {
                 if let Some(AppTab {
                     page: Page::NewProfile(draft),
@@ -2893,6 +2906,8 @@ impl Component for TerminalApp {
                     }) = self.tabs.get_mut(id)
                     {
                         tab.error = None;
+                        tab.files
+                            .observe_connection(tab.session.frames.load().connection_generation);
                     }
                     if self.tabs.active_id() == Some(id) {
                         self.connection_ui(id);
@@ -3454,6 +3469,7 @@ impl Component for TerminalApp {
         } else {
             Border::new().into()
         };
+        let content = self.with_file_drawer(content, context);
         let mut views = vec![
             KeyedView::new(
                 "header",
@@ -3557,6 +3573,10 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_FILE_SMOKE").is_some() {
+            self.file_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_WORKSPACE_SMOKE").is_some() {
             self.workspace_smoke_step(step, context);
             return;

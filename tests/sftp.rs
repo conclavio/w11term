@@ -89,6 +89,7 @@ impl server::Handler for Peer {
         let channel = self.channels.remove(&c).unwrap();
         let peer = Files {
             root: self.root.clone(),
+            ssh: s.handle(),
             handles: HashMap::new(),
             next: 0,
         };
@@ -104,6 +105,7 @@ enum Opened {
 }
 struct Files {
     root: PathBuf,
+    ssh: server::Handle,
     handles: HashMap<String, Opened>,
     next: u64,
 }
@@ -196,6 +198,9 @@ impl russh_sftp::server::Handler for Files {
             return Err(StatusCode::Failure);
         }
         fs::write(self.root.join("read-entered"), []).map_err(io)?;
+        while offset > 0 && self.root.join("hold-next-chunk").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Keep the SFTP channel busy long enough to verify independent terminal input.
         tokio::time::sleep(Duration::from_millis(20)).await;
         if self.root.join("pause-reads").exists() {
@@ -219,6 +224,20 @@ impl russh_sftp::server::Handler for Files {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, StatusCode> {
+        if offset > 0 && self.root.join("disconnect-next-write").exists() {
+            let _ = self
+                .ssh
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "test connection loss".into(),
+                    "en".into(),
+                )
+                .await;
+            return Err(StatusCode::ConnectionLost);
+        }
+        if offset > 0 && self.root.join("fail-next-write").exists() {
+            return Err(StatusCode::Failure);
+        }
         let f = self.file(&h)?;
         f.seek(SeekFrom::Start(offset)).map_err(io)?;
         f.write_all(&data).map_err(io)?;
@@ -234,6 +253,9 @@ impl russh_sftp::server::Handler for Files {
         self.stat(id, path).await
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
+        if self.root.join("no-fstat").exists() {
+            return Err(StatusCode::OpUnsupported);
+        }
         Ok(Attrs {
             id,
             attrs: (&self.file(&h)?.metadata().map_err(io)?).into(),
@@ -313,7 +335,11 @@ impl russh_sftp::server::Handler for Files {
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
         Ok(Name {
             id,
-            files: vec![russh_sftp::protocol::File::dummy(path)],
+            files: vec![russh_sftp::protocol::File::dummy(if path == "." {
+                "/".into()
+            } else {
+                path
+            })],
         })
     }
 }
@@ -426,6 +452,7 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
                 operation,
                 deadline,
                 reply,
+                progress: None,
             }))
             .unwrap();
         tokio::time::timeout_at(deadline, response)
@@ -475,6 +502,156 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
     assert_eq!(result["entries"][0]["filename"], "from-second-pane");
     request(&child, Operation::Close { handle }).await.unwrap();
     drop(child);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
+    use tokio::sync::{oneshot, watch};
+    use w11term::sftp::{CHUNK, Job, Operation, TransferProgress};
+
+    fn start(
+        session: &Session,
+        operation: Operation,
+    ) -> (
+        watch::Receiver<TransferProgress>,
+        oneshot::Receiver<Result<Value, String>>,
+    ) {
+        let (sender, progress) = watch::channel(TransferProgress::default());
+        let (reply, response) = oneshot::channel();
+        session
+            .input
+            .send(Command::Sftp(Job {
+                operation,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                reply,
+                progress: Some(sender),
+            }))
+            .unwrap();
+        (progress, response)
+    }
+
+    let (session, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let size = CHUNK * 2 + 123;
+    let bytes: Vec<_> = (0..size).map(|i| i as u8).collect();
+    fs::write(remote.path().join("source"), &bytes).unwrap();
+    let destination = local.path().join("download");
+    let download = || Operation::Get {
+        remote: "/source".into(),
+        local: destination.clone(),
+        overwrite: true,
+        max_bytes: None,
+    };
+    let hold = remote.path().join("hold-next-chunk");
+    fs::write(&hold, []).unwrap();
+    fs::write(&destination, b"previous copy").unwrap();
+    let (mut progress, response) = start(&session, download());
+    let expected_total = Some(size as u64);
+    let partial = tokio::time::timeout(Duration::from_secs(5), progress.wait_for(|p| p.bytes > 0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        *partial,
+        TransferProgress {
+            bytes: CHUNK as u64,
+            total: expected_total
+        }
+    );
+    drop(partial);
+    assert_eq!(fs::read(&destination).unwrap(), b"previous copy");
+    fs::remove_file(hold).unwrap();
+    assert_eq!(response.await.unwrap().unwrap()["bytes_transferred"], size);
+    assert_eq!(
+        *progress.borrow(),
+        TransferProgress {
+            bytes: size as u64,
+            total: expected_total
+        }
+    );
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+
+    fs::write(remote.path().join("no-fstat"), []).unwrap();
+    let (progress, response) = start(&session, download());
+    assert_eq!(response.await.unwrap().unwrap()["bytes_transferred"], size);
+    assert_eq!(
+        *progress.borrow(),
+        TransferProgress {
+            bytes: size as u64,
+            total: None
+        }
+    );
+
+    let upload = || Operation::Put {
+        local: destination.clone(),
+        remote: "/upload".into(),
+        overwrite: false,
+    };
+    let fail = remote.path().join("fail-next-write");
+    fs::write(&fail, []).unwrap();
+    let (progress, response) = start(&session, upload());
+    assert!(
+        response
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("partial file")
+    );
+    assert_eq!(
+        *progress.borrow(),
+        TransferProgress {
+            bytes: CHUNK as u64,
+            total: expected_total
+        }
+    );
+    let uploaded = remote.path().join("upload");
+    assert_eq!(fs::read(&uploaded).unwrap(), &bytes[..CHUNK]);
+    fs::remove_file(fail).unwrap();
+    // A retry preserves a partial remote destination until overwrite is requested.
+    let (_, response) = start(&session, upload());
+    assert!(response.await.unwrap().is_err());
+    assert_eq!(fs::read(&uploaded).unwrap(), &bytes[..CHUNK]);
+    let (progress, response) = start(
+        &session,
+        Operation::Put {
+            local: destination.clone(),
+            remote: "/upload".into(),
+            overwrite: true,
+        },
+    );
+    assert_eq!(response.await.unwrap().unwrap()["bytes_transferred"], size);
+    assert_eq!(
+        *progress.borrow(),
+        TransferProgress {
+            bytes: size as u64,
+            total: expected_total
+        }
+    );
+    assert_eq!(fs::read(uploaded).unwrap(), bytes);
+    fs::write(remote.path().join("disconnect-next-write"), []).unwrap();
+    let (progress, response) = start(
+        &session,
+        Operation::Put {
+            local: destination,
+            remote: "/dropped".into(),
+            overwrite: false,
+        },
+    );
+    let error = response
+        .await
+        .expect("admitted upload lost its reply")
+        .unwrap_err();
+    assert!(error.contains("partial"), "{error}");
+    assert_eq!(progress.borrow().bytes, CHUNK as u64);
+    assert_eq!(
+        fs::read(remote.path().join("dropped")).unwrap(),
+        &bytes[..CHUNK]
+    );
+    drop(session);
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .unwrap()
@@ -742,7 +919,7 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         let _=fs::remove_file(root.path().join("read-entered"));
         fs::write(root.path().join("pause-reads"),[]).unwrap();
         let (reply,response)=tokio::sync::oneshot::channel();
-        session.input.send(Command::Sftp(w11term::sftp::Job{operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply})).unwrap();
+        session.input.send(Command::Sftp(w11term::sftp::Job{operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply,progress:None})).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !root.path().join("read-entered").exists() { tokio::task::yield_now().await; }
         }).await.unwrap();
