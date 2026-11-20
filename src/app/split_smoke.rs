@@ -8,8 +8,8 @@ thread_local! {
 impl TerminalApp {
     fn split_lab(&self, entry: TabId) -> &LiveTab {
         match &self.tabs.get(entry).expect("smoke pane").page {
-            Page::Terminal(tab) if matches!(tab.source, Source::Demo) => tab,
-            _ => panic!("split smoke requires local labs"),
+            Page::Terminal(tab) => tab,
+            _ => panic!("split smoke requires a terminal"),
         }
     }
 
@@ -32,6 +32,14 @@ impl TerminalApp {
             0 => {
                 assert_eq!(self.tabs.entries().len(), 1);
                 let left = self.split_lab(1);
+                if matches!(left.source, Source::Ssh(_)) && left.session.ssh_connection().is_none()
+                {
+                    context.spawn_background(|_| {
+                        std::thread::sleep(Duration::from_millis(50));
+                        Message::Smoke(0)
+                    });
+                    return;
+                }
                 left.session
                     .input
                     .send(Command::Text(format!("left-{}\r", left.session.pane_id)))
@@ -191,6 +199,25 @@ async fn check_split_control(
     anyhow::ensure!(left_entry["tab_id"] == right_entry["tab_id"]);
     anyhow::ensure!(left_entry["visible"] == true && right_entry["visible"] == true);
     anyhow::ensure!(left_entry["active"] == false && right_entry["active"] == true);
+
+    if std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        for (pane, marker) in [(left, "raw-left"), (right, "raw-right")] {
+            split_control(Request::SendText {
+                pane,
+                data_base64: STANDARD.encode(format!("\r\n{marker}\r\n")),
+                no_paste: true,
+            })
+            .await?;
+            split_control(Request::WaitForText {
+                pane,
+                pattern: marker.into(),
+                regex: false,
+                timeout_seconds: 5,
+            })
+            .await?;
+        }
+    }
 
     split_control(Request::Resize {
         pane: left,

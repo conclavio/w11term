@@ -87,6 +87,7 @@ pub struct Session {
     pub input: mpsc::UnboundedSender<Command>,
     pub frames: FrameStore,
     pub clipboard_enabled: Arc<AtomicBool>,
+    ssh_connection: ssh::ShareSlot,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -96,6 +97,7 @@ struct Services {
     player: Arc<std::sync::RwLock<crate::options::PlayerOptions>>,
     notices: mpsc::Receiver<crate::sound::Notice>,
     live_frames: FrameStore,
+    sharing: ssh::Sharing,
 }
 
 impl Session {
@@ -107,6 +109,21 @@ impl Session {
         Self::start_configured(source, size, true)
     }
     pub fn start_configured(source: Source, size: TerminalSize, allow_clipboard: bool) -> Self {
+        Self::start_configured_with_connection(source, size, allow_clipboard, None)
+    }
+
+    /// Snapshot the authenticated connection of a ready SSH pane, for an
+    /// explicit split of that pane. Ordinary profile opens are independent.
+    pub fn ssh_connection(&self) -> Option<ssh::ConnectionShare> {
+        self.ssh_connection.current()
+    }
+
+    pub fn start_configured_with_connection(
+        source: Source,
+        size: TerminalSize,
+        allow_clipboard: bool,
+        connection: Option<ssh::ConnectionShare>,
+    ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
         let prompts = crate::prompts::Prompts::default();
@@ -140,6 +157,11 @@ impl Session {
         let live_frames = FrameStore::new((*frames.load()).clone());
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
+        let ssh_connection = ssh::ShareSlot::default();
+        let sharing = ssh::Sharing {
+            published: ssh_connection.clone(),
+            offered: connection.filter(|_| matches!(source, Source::Ssh(_))),
+        };
         let worker = thread::Builder::new()
             .name("terminal-session".into())
             .spawn(move || {
@@ -163,6 +185,7 @@ impl Session {
                             player: worker_player,
                             notices: notice_rx,
                             live_frames,
+                            sharing,
                         },
                     ))
                 });
@@ -176,6 +199,7 @@ impl Session {
             input: commands,
             frames,
             clipboard_enabled,
+            ssh_connection,
             worker: Some(worker),
         }
     }
@@ -205,6 +229,7 @@ async fn run(
         player,
         mut notices,
         live_frames,
+        sharing,
     } = services;
     let mut size = terminal.get_size();
     let (output_tx, mut output) = mpsc::channel(32);
@@ -232,7 +257,8 @@ async fn run(
     };
     let mut demo_loaded = false;
     let mut replay = None;
-    let transport = match source {
+    let mut transports = tokio::task::JoinSet::new();
+    match source {
         Source::Ssh(options) => {
             status = format!(
                 "Connecting to {}@{}:{}…",
@@ -240,22 +266,26 @@ async fn run(
             );
             let prompts = prompts.clone();
             let events = events.clone();
-            Some(tokio::spawn(async move {
-                let result = ssh::run_configured(
-                    options,
-                    size,
-                    transport_input,
-                    output_tx.clone(),
-                    Some(prompts),
-                    events,
-                )
-                .await;
-                let message = match result {
-                    Ok(()) => "Disconnected".into(),
-                    Err(error) => format!("SSH: {error:#}"),
-                };
-                let _ = output_tx.send(ssh::Event::Status(message)).await;
-            }))
+            transports.spawn_on(
+                async move {
+                    let result = ssh::run_with_sharing(
+                        options,
+                        size,
+                        transport_input,
+                        output_tx.clone(),
+                        Some(prompts),
+                        events,
+                        sharing,
+                    )
+                    .await;
+                    let message = match result {
+                        Ok(()) => "Disconnected".into(),
+                        Err(error) => format!("SSH: {error:#}"),
+                    };
+                    let _ = output_tx.send(ssh::Event::Status(message)).await;
+                },
+                ssh::NETWORK.handle(),
+            );
         }
         Source::Replay(path) => {
             match std::fs::read(&path) {
@@ -267,16 +297,12 @@ async fn run(
                 Err(error) => status = format!("Replay: {error}"),
             }
             // Keep consuming engine replies; replay has no peer to answer them.
-            Some(tokio::spawn(async move {
-                while transport_input.recv().await.is_some() {}
-            }))
+            transports.spawn(async move { while transport_input.recv().await.is_some() {} });
         }
         Source::Demo => {
             status = "Terminal lab · F5 reload · Shift+PageUp/PageDown scroll · Ctrl+Shift+V paste"
                 .into();
-            Some(tokio::spawn(async move {
-                while transport_input.recv().await.is_some() {}
-            }))
+            transports.spawn(async move { while transport_input.recv().await.is_some() {} });
         }
     };
     let mut presentation = Presentation::new(frames.clone(), live_frames.clone());
@@ -464,9 +490,7 @@ async fn run(
             }
         }
     }
-    if let Some(task) = transport {
-        task.abort();
-    }
+    transports.shutdown().await;
     if let Some(task) = asset_task {
         task.abort();
     }

@@ -40,7 +40,9 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 The native WinUI tab strip sits in the title bar. Click **+** to open a saved profile as an independent SSH session. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
-Use **caret → Panes** to split right or below with the current connection settings or another saved profile. The new pane starts an independent session. Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
+Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
+
+Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
 
 Use **caret → Workspaces…** to name and save your current terminal tabs. A workspace remembers tab order, split directions and proportions, the focused pane in each tab and which tab you were using. Opening a workspace from this page adds its terminals to the current window. Launching with `--workspace "Admin console"` opens the saved layout in a new window.
 
