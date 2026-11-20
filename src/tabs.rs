@@ -68,6 +68,10 @@ impl<T> Tabs<T> {
     pub fn active_layout(&self) -> Option<&Layout> {
         Some(&self.groups.get(self.active_index()?)?.layout)
     }
+    pub fn layout_for(&self, entry: TabId) -> Option<&Layout> {
+        let id = self.group_id(entry)?;
+        self.groups.iter().find(|g| g.id == id).map(|g| &g.layout)
+    }
     pub fn zoomed(&self) -> bool {
         self.active_index()
             .is_some_and(|index| self.groups[index].zoomed)

@@ -25,6 +25,7 @@ cargo run -- --profile root
 cargo run -- --profile play-6789
 cargo run -- --profile play-6792
 cargo run -- --profile root --tab play-6789 --tab play-6792
+cargo run -- --workspace "Admin console"
 cargo run -- --list-profiles
 cargo run -- ssh user@example.com --identity C:\path\to\id_ed25519
 cargo run -- ssh user@example.com --port 2222 --host-key SHA256:verified-fingerprint
@@ -40,6 +41,10 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 The native WinUI tab strip sits in the title bar. Click **+** to open a saved profile as an independent SSH session. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Use **caret → Panes** to split right or below with the current connection settings or another saved profile. The new pane starts an independent session. Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
+
+Use **caret → Workspaces…** to name and save your current terminal tabs. A workspace remembers tab order, split directions and proportions, the focused pane in each tab and which tab you were using. Opening a workspace from this page adds its terminals to the current window. Launching with `--workspace "Admin console"` opens the saved layout in a new window.
+
+Each restored pane starts a fresh session and receives a new process-local control ID. Named profile references use the current profile settings. Ad-hoc SSH panes retain their connection options and key paths. Replay panes reference their original capture files. Workspaces are stored in `%LOCALAPPDATA%\w11term\workspaces.json`, or in `W11TERM_DATA_DIR` when set.
 
 | Pane action | Shortcut |
 | --- | --- |
