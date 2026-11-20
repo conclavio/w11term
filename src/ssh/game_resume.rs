@@ -1,5 +1,5 @@
 //! Private, opt-in RustMUSH control channel. No sideband bytes enter the VT stream.
-use super::sharing::ConnectionShare;
+use super::sharing::{ConnectionShare, ShellChannel};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -55,15 +55,22 @@ impl Pane {
     }
     pub fn finish(&mut self, peer: &str, outcome: Outcome) -> &'static str {
         let status = outcome.status();
-        self.lease = match outcome {
-            Outcome::Issued(ticket, grace) | Outcome::Redeemed(ticket, grace) => Some(Lease {
-                ticket,
-                grace,
-                peer: peer.to_owned(),
-                lost: None,
-            }),
-            _ => None,
-        };
+        match outcome {
+            Outcome::Issued(ticket, grace) | Outcome::Redeemed(ticket, grace) => {
+                self.lease = Some(Lease {
+                    ticket,
+                    grace,
+                    peer: peer.to_owned(),
+                    lost: None,
+                });
+            }
+            // Neither result tells us whether the server accepted the ticket.
+            // Preserve the first drop deadline even if several replies are lost.
+            Outcome::Interrupted | Outcome::Unsupported => {}
+            Outcome::Expired | Outcome::Denied | Outcome::Busy | Outcome::Unavailable => {
+                self.lease = None;
+            }
+        }
         status
     }
 }
@@ -83,13 +90,28 @@ impl Probe {
     pub fn marker(&self) -> String {
         format!("{}:{}", self.operation(), self.pane)
     }
-    pub async fn exchange(&self, link: &ConnectionShare, auth: oneshot::Sender<()>) -> Outcome {
+    pub async fn exchange(
+        &self,
+        link: &ConnectionShare,
+        auth: oneshot::Sender<()>,
+        previous: Option<ShellChannel>,
+    ) -> (Outcome, Option<ShellChannel>) {
         let open = async {
-            let mut side = link.open_shell().await.ok()?;
+            // The doorway allows just the shell and one auxiliary channel. Put
+            // CLOSE on the SSH send queue before asking for the replacement.
+            if let Some(previous) = previous {
+                previous.close().await;
+            }
+            let mut side = link.open_shell().await.map_err(|_| Outcome::Interrupted)?;
             let channel = side.channel();
-            channel.request_subsystem(true, SUBSYSTEM).await.ok()?;
-            if !matches!(channel.wait().await, Some(russh::ChannelMsg::Success)) {
-                return None;
+            channel
+                .request_subsystem(true, SUBSYSTEM)
+                .await
+                .map_err(|_| Outcome::Interrupted)?;
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Success) => {}
+                Some(russh::ChannelMsg::Failure) => return Err(Outcome::Unsupported),
+                _ => return Err(Outcome::Interrupted),
             }
             let request = Request {
                 v: 1,
@@ -97,18 +119,24 @@ impl Probe {
                 pane: &self.pane,
                 ticket: self.ticket.as_ref().map(|t| t.as_str()),
             };
-            let payload = Zeroizing::new(serde_json::to_vec(&request).ok()?);
+            let payload =
+                Zeroizing::new(serde_json::to_vec(&request).map_err(|_| Outcome::Interrupted)?);
             channel
                 .data(&(payload.len() as u32).to_be_bytes()[..])
                 .await
-                .ok()?;
-            channel.data(payload.as_slice()).await.ok()?;
-            Some(side)
+                .map_err(|_| Outcome::Interrupted)?;
+            channel
+                .data(payload.as_slice())
+                .await
+                .map_err(|_| Outcome::Interrupted)?;
+            Ok(side)
         };
         let final_deadline = self.deadline.unwrap_or_else(|| Instant::now() + MAX_GRACE);
         let first_deadline = (Instant::now() + PROBE_TIMEOUT).min(final_deadline);
-        let Ok(Some(mut side)) = timeout_at(first_deadline, open).await else {
-            return Outcome::Unsupported;
+        let mut side = match timeout_at(first_deadline, open).await {
+            Ok(Ok(side)) => side,
+            Ok(Err(outcome)) => return (outcome, None),
+            Err(_) => return (Outcome::Interrupted, None),
         };
         let mut reader = side.channel().make_reader();
         let first = if self.redeeming() {
@@ -117,18 +145,19 @@ impl Probe {
             final_deadline
         };
         let Ok(Some(mut response)) = timeout_at(first, read_response(&mut reader)).await else {
-            return Outcome::Unavailable;
+            return (Outcome::Interrupted, None);
         };
         if matches!(response, Response::AuthRequired) {
             let _ = auth.send(());
             let Ok(Some(final_response)) =
                 timeout_at(final_deadline, read_response(&mut reader)).await
             else {
-                return Outcome::Unavailable;
+                return (Outcome::Interrupted, None);
             };
             response = final_response;
         }
-        match response {
+        drop(reader);
+        let outcome = match response {
             Response::Issued {
                 ticket,
                 grace_seconds,
@@ -140,8 +169,11 @@ impl Probe {
             Response::Expired => Outcome::Expired,
             Response::Denied => Outcome::Denied,
             Response::Busy => Outcome::Busy,
-            _ => Outcome::Unavailable,
-        }
+            Response::Unavailable => Outcome::Unavailable,
+            _ => Outcome::Interrupted,
+        };
+        let follow_up = self.redeeming() && outcome.refused();
+        (outcome, follow_up.then_some(side))
     }
 }
 #[derive(Serialize)]
@@ -186,7 +218,7 @@ fn accepted(ticket: String, grace: u16, redeemed: bool) -> Outcome {
         ticket.len() == 43 && URL_SAFE_NO_PAD.decode_slice(ticket.as_bytes(), &mut raw) == Ok(32);
     raw.zeroize();
     if !canonical || !(1..=300).contains(&grace) {
-        return Outcome::Unavailable;
+        return Outcome::Interrupted;
     }
     let grace = Duration::from_secs(grace.into());
     if redeemed {
@@ -200,12 +232,19 @@ pub(super) enum Outcome {
     Issued(Zeroizing<String>, Duration),
     Redeemed(Zeroizing<String>, Duration),
     Unsupported,
+    Interrupted,
     Expired,
     Denied,
     Busy,
     Unavailable,
 }
 impl Outcome {
+    pub fn refused(&self) -> bool {
+        matches!(
+            self,
+            Self::Expired | Self::Denied | Self::Busy | Self::Unavailable
+        )
+    }
     fn status(&self) -> &'static str {
         match self {
             Self::Issued(..) => "issued",
@@ -214,7 +253,7 @@ impl Outcome {
             Self::Expired => "expired",
             Self::Denied => "denied",
             Self::Busy => "busy",
-            Self::Unavailable => "unavailable",
+            Self::Interrupted | Self::Unavailable => "unavailable",
         }
     }
 }
@@ -231,12 +270,32 @@ mod tests {
         game.finish("first", issued());
         game.disconnected();
         let first = game.probe("first").deadline.unwrap();
-        game.disconnected();
-        assert_eq!(game.probe("first").deadline, Some(first));
+        for outcome in [Outcome::Interrupted, Outcome::Unsupported] {
+            assert!(!outcome.refused());
+            game.finish("first", outcome);
+            game.disconnected();
+            assert_eq!(game.probe("first").deadline, Some(first));
+        }
         assert!(!game.probe("different-key").redeeming());
         game.finish("first", issued());
         game.lease.as_mut().unwrap().lost = Some(Instant::now() - Duration::from_secs(21));
         assert!(!game.probe("first").redeeming());
+    }
+    #[test]
+    fn every_explicit_refusal_retires_the_old_ticket() {
+        for refusal in [
+            Outcome::Busy,
+            Outcome::Denied,
+            Outcome::Expired,
+            Outcome::Unavailable,
+        ] {
+            let mut game = Pane::new();
+            game.finish("first", issued());
+            game.disconnected();
+            assert!(refusal.refused());
+            game.finish("first", refusal);
+            assert!(!game.probe("first").redeeming());
+        }
     }
     #[tokio::test]
     async fn capped_frames_and_canonical_tickets() {
@@ -254,7 +313,7 @@ mod tests {
             (good + "=", 10),
             ("!".repeat(43), 10),
         ] {
-            assert!(matches!(accepted(value, grace, true), Outcome::Unavailable));
+            assert!(matches!(accepted(value, grace, true), Outcome::Interrupted));
         }
         let body = br#"{"v":2,"status":"expired"}"#;
         let frame = [(body.len() as u32).to_be_bytes().as_slice(), body].concat();

@@ -733,12 +733,13 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     let (auth, mut auth_rx) = tokio::sync::oneshot::channel();
     let mut probing = probe.is_some();
     let mut auth_pending = probing;
-    let sideband = async {
-        probe
-            .expect("enabled game sideband")
-            .exchange(&shell.link, auth)
-            .await
+    let link = &shell.link;
+    let exchange = |probe: Option<game_resume::Probe>, auth, previous| async move {
+        let probe = probe.expect("enabled game sideband");
+        let (outcome, follow_up) = probe.exchange(link, auth, previous).await;
+        (probe.redeeming(), outcome, follow_up)
     };
+    let sideband = exchange(probe, auth, None);
     tokio::pin!(sideband);
     if managed {
         shell.published.publish(&shell.link);
@@ -757,32 +758,43 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     }
     loop {
         tokio::select! {
-            outcome = &mut sideband, if probing => {
-                probing = false;
-                auth_pending = false;
+            (redeeming, outcome, follow_up) = &mut sideband, if probing => {
                 if waiting_for_resume {
                     queued_before_unlock = input.len();
                     waiting_for_resume = false;
                 }
-                let status = game.as_mut().expect("enabled game sideband")
-                    .finish(shell.link.fingerprint(), outcome);
+                // A final refusal allows one new issue on this primary channel.
+                // A missing reply leaves the previous proof for the next reconnect.
+                let pane = game.as_mut().expect("enabled game sideband");
+                let status = pane.finish(link.fingerprint(), outcome);
                 events.push("game-resume", serde_json::json!({"status": status}));
-                if restoring {
+                if redeeming {
                     let message = if status == "redeemed" {
                         "RustMUSH session restored".into()
                     } else {
                         format!("RustMUSH resume {status} · using the current login")
                     };
                     output.send(Event::Status(message)).await?;
+                } else if restoring && status == "issued" {
+                    output.send(Event::Status("RustMUSH reconnect ticket renewed".into())).await?;
+                }
+                probing = follow_up.is_some();
+                auth_pending = probing;
+                if let Some(previous) = follow_up {
+                    let (auth, receiver) = tokio::sync::oneshot::channel();
+                    auth_rx = receiver;
+                    sideband.set(exchange(Some(pane.probe(link.fingerprint())), auth, Some(previous)));
                 }
             }
             result = &mut auth_rx, if auth_pending => {
                 auth_pending = false;
-                if result.is_ok() && waiting_for_resume {
-                    queued_before_unlock = input.len();
-                    waiting_for_resume = false;
+                if result.is_ok() {
+                    if waiting_for_resume {
+                        queued_before_unlock = input.len();
+                        waiting_for_resume = false;
+                        output.send(Event::Status("RustMUSH resume requires game account login".into())).await?;
+                    }
                     events.push("game-resume", serde_json::json!({"status": "auth_required"}));
-                    output.send(Event::Status("RustMUSH resume requires game account login".into())).await?;
                 }
             }
             message = input.recv() => {
