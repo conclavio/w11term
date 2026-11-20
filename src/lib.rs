@@ -20,3 +20,4 @@ pub mod ssh;
 pub mod tabs;
 pub mod terminal;
 pub mod wav;
+pub mod workspace;

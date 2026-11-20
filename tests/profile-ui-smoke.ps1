@@ -1,9 +1,10 @@
 [CmdletBinding()]
-param([string]$Configuration = 'debug')
+param([string]$Configuration = 'debug', [string]$TargetDir)
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
-$gui = Join-Path $project "target\$Configuration\w11term.exe"
-$echo = Join-Path $project "target\$Configuration\examples\echo_server.exe"
+if (-not $TargetDir) { $TargetDir = Join-Path $project 'target' }
+$gui = Join-Path $TargetDir "$Configuration\w11term.exe"
+$echo = Join-Path $TargetDir "$Configuration\examples\echo_server.exe"
 $state = Join-Path $project ('.local\profile-ui-smoke\' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $state -Force | Out-Null
 $variables = @('W11TERM_UI_SMOKE','W11TERM_PROFILE_SMOKE','W11TERM_PROFILE_SMOKE_PORT','W11TERM_PROFILE_SMOKE_CONFIG','W11TERM_DATA_DIR','W11TERM_SETTINGS_PATH')

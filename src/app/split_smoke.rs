@@ -102,7 +102,7 @@ impl TerminalApp {
                 assert!(left.1 < right.1 && below.1 < right.1);
                 self.update(Message::Shortcut(Shortcut::ClosePane), context);
                 assert!(self.tabs.get(3).is_none());
-                self.open("Background lab".into(), Source::Demo, context);
+                self.open("Background lab".into(), Source::Demo, None, context);
             }
             6 => {
                 assert_eq!(self.tabs.active_id(), Some(4));

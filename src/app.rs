@@ -32,10 +32,12 @@ const LAB: &str = "Terminal lab";
 mod pane_view;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
+mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
     source: Source,
+    profile_name: Option<String>,
     surface: PaneSurface,
     device_busy: bool,
     device_message: Option<String>,
@@ -91,6 +93,7 @@ pub enum InteractionField {
 }
 enum Page {
     Terminal(LiveTab),
+    Workspaces(workspace_view::WorkspacePage),
     Settings,
     NewProfile(ProfileDraft),
 }
@@ -100,6 +103,20 @@ struct AppTab {
 }
 
 impl AppTab {
+    fn profile_name(&self) -> Option<&str> {
+        match &self.page {
+            Page::Terminal(live) => live.profile_name.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn with_profile(mut self, name: Option<String>) -> Self {
+        if let Page::Terminal(live) = &mut self.page {
+            live.profile_name = name;
+        }
+        self
+    }
+
     fn pane_id(&self) -> Option<u64> {
         match &self.page {
             Page::Terminal(tab) => Some(tab.session.pane_id),
@@ -208,6 +225,7 @@ fn tab_menu_message(label: String) -> Message {
         "Enroll this device (at game prompt)" => Message::DeviceAction(false),
         "Forget this device (revoke game key)" => Message::DeviceAction(true),
         "Settings" => Message::SettingsMenu,
+        "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         _ => Message::ControlIdle,
     }
 }
@@ -242,6 +260,7 @@ pub struct TerminalApp {
     watch_epoch: u64,
     default_source: Source,
     default_label: String,
+    default_profile: Option<String>,
     profiles: BTreeMap<String, SshOptions>,
     store: ProfileStore,
     profile_error: Option<String>,
@@ -300,6 +319,7 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     SettingsMenu,
+    Workspace(workspace_view::WorkspaceAction),
     Font(Option<usize>),
     Ligatures(bool),
     Interaction(InteractionField, bool),
@@ -341,6 +361,7 @@ fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool
         label,
         page: Page::Terminal(LiveTab {
             source: source.clone(),
+            profile_name: None,
             surface: PaneSurface::default(),
             device_busy: false,
             device_message: None,
@@ -1240,12 +1261,9 @@ impl TerminalApp {
         let profile = self
             .tabs
             .active()
-            .filter(|t| {
-                single
-                    && matches!(t.page, Page::Terminal(_))
-                    && self.profiles.contains_key(&t.label)
-            })
-            .map(|t| t.label.clone());
+            .and_then(AppTab::profile_name)
+            .filter(|name| single && self.profiles.contains_key(*name))
+            .map(str::to_owned);
         let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
         let group_changed = self.active_group != group;
         self.active_group = group;
@@ -1383,12 +1401,21 @@ impl TerminalApp {
         }
     }
 
-    fn open(&mut self, label: String, source: Source, context: &ComponentContext<Self>) {
-        self.tabs.insert(live_tab(
-            label,
-            source,
-            self.appearance.read().unwrap().interaction.osc52,
-        ));
+    fn open(
+        &mut self,
+        label: String,
+        source: Source,
+        profile: Option<String>,
+        context: &ComponentContext<Self>,
+    ) {
+        self.tabs.insert(
+            live_tab(
+                label,
+                source,
+                self.appearance.read().unwrap().interaction.osc52,
+            )
+            .with_profile(profile),
+        );
         self.sync_selection(context);
         self.activate(context);
     }
@@ -1415,12 +1442,13 @@ impl TerminalApp {
         else {
             return;
         };
-        let (label, source) = match profile {
+        let profile_name = profile.or_else(|| tab.profile_name.clone());
+        let (label, source) = match &profile_name {
             Some(name) => {
-                let Some(options) = self.profiles.get(&name) else {
+                let Some(options) = self.profiles.get(name) else {
                     return;
                 };
-                (name, Source::Ssh(options.clone()))
+                (name.clone(), Source::Ssh(options.clone()))
             }
             None => (label.clone(), tab.source.clone()),
         };
@@ -1428,7 +1456,8 @@ impl TerminalApp {
             label,
             source,
             self.appearance.read().unwrap().interaction.osc52,
-        );
+        )
+        .with_profile(profile_name);
         if self.tabs.split(id, leaf, axis).is_some() {
             self.initial_grid.set(None);
             self.sync_selection(context);
@@ -1635,23 +1664,23 @@ impl TerminalApp {
             Ok(options) => {
                 let name = draft.name.trim().to_owned();
                 if let Some((original, _)) = &draft.original {
-                    if self.default_label == *original
-                        && matches!(self.default_source, Source::Ssh(_))
-                    {
+                    if self.default_profile.as_ref() == Some(original) {
                         self.default_label = name.clone();
+                        self.default_profile = Some(name.clone());
                         self.default_source = Source::Ssh(options.clone());
                     }
                     let ids: Vec<_> = self
                         .tabs
                         .entries()
                         .iter()
-                        .filter(|entry| entry.value.label == *original)
+                        .filter(|entry| entry.value.profile_name() == Some(original.as_str()))
                         .map(|entry| entry.id)
                         .collect();
                     for id in ids {
                         if let Some(tab) = self.tabs.get_mut(id) {
                             tab.label = name.clone();
-                            if let Page::Terminal(live) = &tab.page {
+                            if let Page::Terminal(live) = &mut tab.page {
+                                live.profile_name = Some(name.clone());
                                 *live.session.player.write().unwrap() = options.player.clone();
                             }
                         }
@@ -1666,10 +1695,11 @@ impl TerminalApp {
                 if let Some(tab) = self.tabs.get_mut(id) {
                     if connect {
                         *tab = live_tab(
-                            name,
+                            name.clone(),
                             Source::Ssh(options),
                             self.appearance.read().unwrap().interaction.osc52,
-                        );
+                        )
+                        .with_profile(Some(name));
                     } else if let Page::NewProfile(editor) = &mut tab.page {
                         editor.original = Some((name.clone(), options));
                         editor.name = name.clone();
@@ -1755,7 +1785,8 @@ impl TerminalApp {
             _ => None,
         });
         let can_edit = self.tabs.active().is_some_and(|tab| {
-            matches!(tab.page, Page::Terminal(_)) && self.profiles.contains_key(&tab.label)
+            tab.profile_name()
+                .is_some_and(|name| self.profiles.contains_key(name))
         });
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
@@ -1770,6 +1801,7 @@ impl TerminalApp {
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
+                    MenuItem::item("workspaces", "Workspaces…"),
                     state_menu_item(
                         "fullscreen",
                         "Fullscreen (F11)",
@@ -2172,22 +2204,36 @@ impl Component for TerminalApp {
                 )
             })
             .unwrap_or((1120.0, 760.0));
-        tabs.insert(live_tab_sized(
-            label.clone(),
-            options.source.clone(),
-            size,
-            appearance.read().unwrap().interaction.osc52,
-        ));
-        for name in &options.extra_profiles {
-            if let Some(profile) = profiles.get(name) {
-                tabs.insert(live_tab_sized(
-                    name.clone(),
-                    Source::Ssh(profile.clone()),
-                    size,
-                    appearance.read().unwrap().interaction.osc52,
-                ));
+        let osc52 = appearance.read().unwrap().interaction.osc52;
+        if let Some(workspace) = &options.workspace {
+            workspace_view::append_resolved_workspace(
+                &mut tabs,
+                &workspace.layout,
+                workspace.sources.clone(),
+                osc52,
+            );
+        } else {
+            tabs.insert(
+                live_tab_sized(label.clone(), options.source.clone(), size, osc52)
+                    .with_profile(options.initial_profile.clone()),
+            );
+            for name in &options.extra_profiles {
+                if let Some(profile) = profiles.get(name) {
+                    tabs.insert(
+                        live_tab_sized(name.clone(), Source::Ssh(profile.clone()), size, osc52)
+                            .with_profile(Some(name.clone())),
+                    );
+                }
             }
         }
+        // The initial cell target sizes the whole window. A split layout derives
+        // its individual PTY grids from the measured rectangle of each canvas.
+        let grid = grid.filter(|_| {
+            matches!(
+                tabs.active_layout(),
+                Some(w11term::pane_layout::Layout::Leaf(_))
+            )
+        });
         let registry = Registry::default();
         let (control_sender, control_rx) =
             std::sync::mpsc::sync_channel::<w11term::control::UiRequest>(8);
@@ -2225,6 +2271,7 @@ impl Component for TerminalApp {
             watch_epoch: 0,
             default_source: options.source.clone(),
             default_label: label,
+            default_profile: options.initial_profile.clone(),
             profiles,
             store,
             profile_error,
@@ -2308,16 +2355,16 @@ impl Component for TerminalApp {
             Message::DeviceAction(remove) => {
                 if let Some(id) = self.tabs.active_id()
                     && let Some(AppTab {
-                        label,
                         page: Page::Terminal(tab),
                         ..
                     }) = self.tabs.get_mut(id)
                     && !tab.device_busy
                 {
                     let result = (|| -> anyhow::Result<_> {
-                        let profile = self
-                            .profiles
-                            .get(label)
+                        let profile = tab
+                            .profile_name
+                            .as_ref()
+                            .and_then(|name| self.profiles.get(name))
                             .context("Use a saved Rustmush profile")?;
                         anyhow::ensure!(
                             profile.player.rustmush,
@@ -2373,7 +2420,6 @@ impl Component for TerminalApp {
                 let active = self.tabs.active_id() == Some(id);
                 let mut auth_update = None;
                 if let Some(AppTab {
-                    label,
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get_mut(id)
@@ -2382,6 +2428,8 @@ impl Component for TerminalApp {
                     tab.device_message = Some(match result {
                         Ok(fingerprint) => {
                             let result = (|| -> anyhow::Result<()> {
+                                let label =
+                                    tab.profile_name.as_ref().context("profile was removed")?;
                                 let mut profile = self
                                     .profiles
                                     .get(label)
@@ -2429,7 +2477,7 @@ impl Component for TerminalApp {
                 }
                 if let Some((label, auth)) = auth_update {
                     for entry in self.tabs.entries() {
-                        if entry.value.label == label
+                        if entry.value.profile_name() == Some(label.as_str())
                             && let Page::Terminal(tab) = &entry.value.page
                         {
                             let _ = tab.session.input.send(Command::Authenticate(auth.clone()));
@@ -2441,11 +2489,11 @@ impl Component for TerminalApp {
                 self.restore_window();
             }
             Message::TogglePlayer(field) => {
-                if let Some(AppTab {
-                    label,
-                    page: Page::Terminal(tab),
-                    ..
-                }) = self.tabs.active()
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.get_mut(id)
                 {
                     let mut player = tab.session.player.write().unwrap();
                     match field.as_str() {
@@ -2460,19 +2508,25 @@ impl Component for TerminalApp {
                         }
                         _ => {}
                     }
-                    if let Some(profile) = self.profiles.get_mut(label) {
-                        profile.player = player.clone();
-                        if let Err(error) = self.store.update(label, profile) {
-                            log::warn!("Saving player preferences: {error:#}");
-                        }
-                    }
                     let preferences = player.clone();
                     drop(player);
-                    for entry in self.tabs.entries() {
-                        if entry.value.label == *label
-                            && let Page::Terminal(other) = &entry.value.page
-                        {
-                            *other.session.player.write().unwrap() = preferences.clone();
+                    if let Source::Ssh(options) = &mut tab.source {
+                        options.player = preferences.clone();
+                    }
+                    if let Some(name) = tab.profile_name.clone() {
+                        if let Some(profile) = self.profiles.get_mut(&name) {
+                            profile.player = preferences.clone();
+                            if let Err(error) = self.store.update(&name, profile) {
+                                log::warn!("Saving player preferences: {error:#}");
+                            }
+                        }
+                        for entry in self.tabs.entries() {
+                            if entry.id != id
+                                && entry.value.profile_name() == Some(name.as_str())
+                                && let Page::Terminal(other) = &entry.value.page
+                            {
+                                *other.session.player.write().unwrap() = preferences.clone();
+                            }
                         }
                     }
                 }
@@ -2547,11 +2601,12 @@ impl Component for TerminalApp {
                     };
                     let previous = self.tabs.active_id();
                     let tab = live_tab_sized(
-                        profile,
+                        profile.clone(),
                         Source::Ssh(ssh),
                         size,
                         self.appearance.read().unwrap().interaction.osc52,
-                    );
+                    )
+                    .with_profile(Some(profile));
                     let pane = tab.pane_id().expect("new terminal has a pane ID");
                     self.tabs.insert(tab);
                     if !activate && let Some(previous) = previous {
@@ -2994,10 +3049,12 @@ impl Component for TerminalApp {
                 Shortcut::CancelTab => self.finish_switcher(false, context),
                 Shortcut::NewTab => self.open(
                     self.default_label.clone(),
-                    self.profiles
-                        .get(&self.default_label)
+                    self.default_profile
+                        .as_ref()
+                        .and_then(|name| self.profiles.get(name))
                         .map(|options| Source::Ssh(options.clone()))
                         .unwrap_or_else(|| self.default_source.clone()),
+                    self.default_profile.clone(),
                     context,
                 ),
                 Shortcut::CloseTab => {
@@ -3016,14 +3073,14 @@ impl Component for TerminalApp {
                 if label == NEW_PROFILE {
                     self.utility(false, context);
                 } else if label == LAB {
-                    self.open(LAB.into(), Source::Demo, context);
+                    self.open(LAB.into(), Source::Demo, None, context);
                 } else if let Some((name, profile)) = self
                     .profiles
                     .iter()
                     .find(|(name, ssh)| profile_label(name, ssh) == label)
                     .map(|(n, p)| (n.clone(), p.clone()))
                 {
-                    self.open(name, Source::Ssh(profile), context);
+                    self.open(name.clone(), Source::Ssh(profile), Some(name), context);
                 }
             }
             Message::EditProfile(name) => self.edit_profile(name, context),
@@ -3031,13 +3088,15 @@ impl Component for TerminalApp {
                 if let Some(name) = self
                     .tabs
                     .active()
-                    .filter(|tab| self.profiles.contains_key(&tab.label))
-                    .map(|tab| tab.label.clone())
+                    .and_then(AppTab::profile_name)
+                    .filter(|name| self.profiles.contains_key(*name))
+                    .map(str::to_owned)
                 {
                     self.edit_profile(name, context);
                 }
             }
             Message::SettingsMenu => self.utility(true, context),
+            Message::Workspace(action) => self.workspace_action(action, context),
             Message::Paste => self.paste(false, context),
             Message::PasteRaw => self.paste(true, context),
             Message::RawPaste(result) => {
@@ -3366,6 +3425,7 @@ impl Component for TerminalApp {
                     _ => self.pane_view(id, tab, false, context),
                 },
                 Page::Settings => self.settings_view(context),
+                Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
             }
         } else {
@@ -3474,6 +3534,10 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_WORKSPACE_SMOKE").is_some() {
+            self.workspace_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_SPLIT_SMOKE").is_some() {
             self.split_smoke_step(step, context);
             return;
@@ -3521,7 +3585,7 @@ impl TerminalApp {
                         .unwrap();
                 }
             }
-            1 => self.open("Second lab".into(), Source::Demo, context),
+            1 => self.open("Second lab".into(), Source::Demo, None, context),
             2 => {
                 if let Page::Terminal(tab) = &self.tabs.get(2).unwrap().page {
                     tab.session
@@ -3680,11 +3744,30 @@ impl TerminalApp {
         match step {
             0 => {
                 assert!(std::env::var_os("W11TERM_DATA_DIR").is_some());
+                // Represent the saved fixture with a lab until the editor connects to the echo peer.
+                let first = self.tabs.get_mut(1).unwrap();
+                first.label = "typo".into();
+                let Page::Terminal(live) = &mut first.page else {
+                    panic!("expected local lab")
+                };
+                live.profile_name = Some("typo".into());
+                *live.session.player.write().unwrap() = self.profiles["typo"].player.clone();
                 self.update(tab_menu_message("Mute: Off".into()), context);
                 let Page::Terminal(tab) = &self.tabs.get(1).unwrap().page else {
                     panic!()
                 };
                 assert!(tab.session.player.read().unwrap().mute);
+                // Another connection may display the same label without belonging to that profile.
+                self.open("typo".into(), Source::Demo, None, context);
+                let ad_hoc = self.tabs.active_id().unwrap();
+                self.update(tab_menu_message("Mute: Off".into()), context);
+                self.update(tab_menu_message("Mute: On".into()), context);
+                assert!(self.store.load().unwrap()["typo"].player.mute);
+                let Page::Terminal(named) = &self.tabs.get(1).unwrap().page else {
+                    panic!()
+                };
+                assert!(named.session.player.read().unwrap().mute);
+                self.close_tab(ad_hoc, context);
                 self.utility(true, context);
                 self.edit_profile("typo".into(), context);
             }
@@ -3722,6 +3805,8 @@ impl TerminalApp {
                 assert!(draft.saved, "{:?}", draft.error);
                 assert!(self.profiles.contains_key("corrected"));
                 assert!(!self.profiles.contains_key("typo"));
+                assert_eq!(self.tabs.get(1).unwrap().profile_name(), Some("corrected"));
+                assert_eq!(self.tabs.get(1).unwrap().label, "corrected");
                 let count = self.tabs.entries().len();
                 self.edit_profile("corrected".into(), context);
                 assert_eq!(self.tabs.entries().len(), count);
@@ -3762,6 +3847,7 @@ impl TerminalApp {
                     assert!(step < 24, "loopback connection did not become ready");
                 } else {
                     assert_eq!(self.tabs.get(id).unwrap().label, "corrected");
+                    assert_eq!(tab.profile_name.as_deref(), Some("corrected"));
                     self.update(tab_menu_message("Remote named sounds: Off".into()), context);
                     assert!(
                         self.store.load().unwrap()["corrected"]
@@ -3963,7 +4049,7 @@ impl TerminalApp {
                     tab.session.frames.load().search.as_ref().unwrap().selected,
                     Some(1)
                 );
-                self.open("Second search lab".into(), Source::Demo, context);
+                self.open("Second search lab".into(), Source::Demo, None, context);
             }
             7 => {
                 let Page::Terminal(tab) = &self.tabs.get(2).unwrap().page else {
