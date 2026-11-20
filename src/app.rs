@@ -18,7 +18,7 @@ use w11term::{
     },
     options::{Authentication, Options, Source, SshOptions},
     pane_layout::{Axis, Direction},
-    profiles::ProfileStore,
+    profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
     tabs::{TabId, Tabs},
 };
@@ -128,9 +128,26 @@ impl AppTab {
     }
 }
 
+#[derive(Clone, Default)]
+enum DraftOrigin {
+    #[default]
+    New,
+    Edit(ProfileSnapshot),
+    Copy(ProfileSnapshot),
+}
+impl DraftOrigin {
+    fn editing(&self) -> Option<&ProfileSnapshot> {
+        match self {
+            Self::Edit(base) => Some(base),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ProfileDraft {
-    original: Option<(String, SshOptions)>,
+    origin: DraftOrigin,
+    confirm_delete: bool,
     saved: bool,
     name: String,
     host: String,
@@ -148,7 +165,8 @@ struct ProfileDraft {
 impl Default for ProfileDraft {
     fn default() -> Self {
         Self {
-            original: None,
+            origin: DraftOrigin::New,
+            confirm_delete: false,
             saved: false,
             name: String::new(),
             host: String::new(),
@@ -166,7 +184,7 @@ impl Default for ProfileDraft {
 }
 
 impl ProfileDraft {
-    fn existing(name: String, options: SshOptions) -> Self {
+    fn from_options(name: String, options: &SshOptions) -> Self {
         let (authentication, identity) = match &options.authentication {
             Authentication::Agent => (0, String::new()),
             Authentication::Identity { identity } => (1, identity.to_string_lossy().into_owned()),
@@ -175,7 +193,7 @@ impl ProfileDraft {
             Authentication::KeyboardInteractive => (4, String::new()),
         };
         Self {
-            name: name.clone(),
+            name,
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
@@ -183,7 +201,6 @@ impl ProfileDraft {
             fingerprint: options.host_key.clone().unwrap_or_default(),
             authentication,
             player: options.player.clone(),
-            original: Some((name, options)),
             ..Default::default()
         }
     }
@@ -346,6 +363,9 @@ pub enum Message {
     SaveProfileOnly(TabId),
     EditProfile(String),
     EditActiveProfile,
+    DuplicateProfile(TabId),
+    DeleteProfile(TabId),
+    ConfirmDeleteProfile(TabId, bool),
     WindowSize(WindowSize),
     Geometry(f64, f64, u64, bool),
     GridFallback(u64),
@@ -1564,7 +1584,7 @@ impl TerminalApp {
                 if settings {
                     matches!(t.value.page, Page::Settings)
                 } else {
-                    matches!(&t.value.page, Page::NewProfile(draft) if draft.original.is_none())
+                    matches!(&t.value.page, Page::NewProfile(draft) if matches!(draft.origin, DraftOrigin::New))
                 }
             })
             .map(|t| t.id);
@@ -1589,24 +1609,30 @@ impl TerminalApp {
     }
 
     fn edit_profile(&mut self, name: String, context: &ComponentContext<Self>) {
-        if let Some(id)=self.tabs.entries().iter().find(|tab|matches!(&tab.value.page,
-            Page::NewProfile(draft) if draft.original.as_ref().is_some_and(|(original,_)| original==&name))).map(|tab|tab.id) {
-            self.tabs.select(id);self.activate(context);return;
+        if let Some(id) = self
+            .tabs
+            .entries()
+            .iter()
+            .find(|tab| {
+                matches!(&tab.value.page,
+            Page::NewProfile(draft) if draft.origin.editing().is_some_and(|base| base.name==name))
+            })
+            .map(|tab| tab.id)
+        {
+            self.tabs.select(id);
+            self.activate(context);
+            return;
         }
-        let result = self.store.load().and_then(|profiles| {
-            let options = profiles
-                .get(&name)
-                .with_context(|| format!("Profile {name} was removed"))?
-                .clone();
-            Ok((profiles, options))
-        });
-        match result {
-            Ok((profiles, options)) => {
+        match self.store.inspect(&name) {
+            Ok((profiles, base)) => {
                 self.profiles = profiles;
                 self.profile_error = None;
                 self.tabs.insert(AppTab {
                     label: format!("Edit {name}"),
-                    page: Page::NewProfile(ProfileDraft::existing(name, options)),
+                    page: Page::NewProfile(ProfileDraft {
+                        origin: DraftOrigin::Edit(base.clone()),
+                        ..ProfileDraft::from_options(name, &base.options)
+                    }),
                 });
                 self.sync_selection(context);
                 self.activate(context);
@@ -1617,6 +1643,88 @@ impl TerminalApp {
             }
         }
     }
+    fn duplicate_profile(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        let Some(AppTab {
+            page: Page::NewProfile(draft),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let Some(base) = draft.origin.editing() else {
+            return;
+        };
+        let mut name = format!("{} copy", base.name);
+        let mut index = 2;
+        while self.profiles.contains_key(&name) {
+            name = format!("{} copy {index}", base.name);
+            index += 1;
+        }
+        let copy = ProfileDraft {
+            origin: DraftOrigin::Copy(base.clone()),
+            ..ProfileDraft::from_options(name, &base.options)
+        };
+        self.tabs.insert(AppTab {
+            label: format!("Duplicate {}", base.name),
+            page: Page::NewProfile(copy),
+        });
+        self.sync_selection(context);
+        self.activate(context);
+    }
+
+    fn confirm_delete_profile(
+        &mut self,
+        id: TabId,
+        accept: bool,
+        context: &ComponentContext<Self>,
+    ) {
+        let Some(AppTab {
+            page: Page::NewProfile(draft),
+            ..
+        }) = self.tabs.get_mut(id)
+        else {
+            return;
+        };
+        if !std::mem::take(&mut draft.confirm_delete) || !accept {
+            return;
+        }
+        let Some(base) = draft.origin.editing() else {
+            return;
+        };
+        if let Err(error) = self.store.delete(base) {
+            draft.error = Some(format!("{error:#}"));
+            return;
+        }
+        let name = base.name.clone();
+        self.profiles.remove(&name);
+        let linked: Vec<_> = self
+            .tabs
+            .entries()
+            .iter()
+            .filter(|tab| tab.value.profile_name() == Some(&name))
+            .map(|tab| tab.id)
+            .collect();
+        for linked_id in linked {
+            if let Some(AppTab {
+                page: Page::Terminal(live),
+                ..
+            }) = self.tabs.get_mut(linked_id)
+            {
+                live.profile_name = None;
+                if let Source::Ssh(options) = &mut live.source {
+                    options.player = live.session.player.read().unwrap().clone();
+                }
+            }
+        }
+        if self.default_profile.as_ref() == Some(&name) {
+            self.default_profile = None;
+            self.default_source = Source::Demo;
+            self.default_label = LAB.into();
+        }
+        self.utility(true, context);
+        self.close_tab(id, context);
+    }
+
     fn save_profile(&mut self, id: TabId, context: &ComponentContext<Self>) {
         self.save_profile_action(id, true, context);
     }
@@ -1629,7 +1737,7 @@ impl TerminalApp {
             return;
         };
         let draft = draft.clone();
-        let result = (|| -> anyhow::Result<SshOptions> {
+        let result = (|| -> anyhow::Result<ProfileSnapshot> {
             let name = draft.name.trim();
             anyhow::ensure!(!name.is_empty(), "Enter a profile name");
             let host = draft.host.trim().trim_matches(['[', ']']);
@@ -1670,19 +1778,24 @@ impl TerminalApp {
                     .then(|| draft.fingerprint.trim().into()),
                 player: draft.player.clone(),
             };
-            if let Some((original, expected)) = &draft.original {
-                self.store.edit(original, name, &options, expected)?;
-            } else {
-                self.store.add(name, &options)?;
+            match &draft.origin {
+                DraftOrigin::New => self.store.add(name, &options)?,
+                DraftOrigin::Edit(base) => {
+                    self.store.edit(&base.name, name, &options, &base.options)?
+                }
+                DraftOrigin::Copy(base) => self.store.duplicate(base, name, &options)?,
             }
-            self.profiles = self.store.load()?;
+            let (profiles, saved) = self.store.inspect(name)?;
+            self.profiles = profiles;
             self.profile_error = None;
-            Ok(self.profiles[name].clone())
+            Ok(saved)
         })();
         match result {
-            Ok(options) => {
+            Ok(saved) => {
+                let options = &saved.options;
                 let name = draft.name.trim().to_owned();
-                if let Some((original, _)) = &draft.original {
+                if let Some(base) = draft.origin.editing() {
+                    let original = &base.name;
                     if self.default_profile.as_ref() == Some(original) {
                         self.default_label = name.clone();
                         self.default_profile = Some(name.clone());
@@ -1715,12 +1828,13 @@ impl TerminalApp {
                     if connect {
                         *tab = live_tab(
                             name.clone(),
-                            Source::Ssh(options),
+                            Source::Ssh(options.clone()),
                             self.appearance.read().unwrap().interaction.osc52,
                         )
                         .with_profile(Some(name));
                     } else if let Page::NewProfile(editor) = &mut tab.page {
-                        editor.original = Some((name.clone(), options));
+                        editor.origin = DraftOrigin::Edit(saved);
+                        editor.confirm_delete = false;
                         editor.name = name.clone();
                         editor.error = None;
                         editor.saved = true;
@@ -1937,15 +2051,15 @@ impl TerminalApp {
     fn profile_form(&self, id: TabId, draft: &ProfileDraft, context: &ViewContext<Self>) -> View {
         let mut fields: Vec<View> = vec![
             TextBlock::new()
-                .text(if draft.original.is_some() {
-                    "Edit Profile"
-                } else {
-                    "New Profile"
+                .text(match draft.origin {
+                    DraftOrigin::Edit(_) => "Edit Profile",
+                    DraftOrigin::Copy(_) => "Duplicate Profile",
+                    DraftOrigin::New => "New Profile",
                 })
                 .font_size(26.0)
                 .into(),
         ];
-        if draft.original.is_some() {
+        if draft.origin.editing().is_some() {
             fields.push(TextBlock::new().text("Connection changes apply to new sessions. Sound and game options update open tabs.").text_wrapping(TextWrapping::Wrap).into());
         }
         // Keep the feedback slot mounted so save/error messages do not remount inputs.
@@ -2105,14 +2219,18 @@ impl TerminalApp {
                 .on_text_changed(context.callback(move |v| Message::DraftBell(id, v)))
                 .into(),
         );
-        if draft.original.is_some() {
+        if !matches!(draft.origin, DraftOrigin::New) {
             fields.push(
                 Button::new()
                     .style(ButtonStyle::Accent)
                     .automation_name("Save profile changes")
                     .is_enabled(!draft.generating)
                     .on_click(context.callback(move |_| Message::SaveProfileOnly(id)))
-                    .content("Save changes"),
+                    .content(if matches!(draft.origin, DraftOrigin::Copy(_)) {
+                        "Save copy"
+                    } else {
+                        "Save changes"
+                    }),
             );
         }
         fields.push(
@@ -2121,7 +2239,9 @@ impl TerminalApp {
                 .spacing(10.0)
                 .children((
                     Button::new()
-                        .style(draft.original.is_none().then_some(ButtonStyle::Accent))
+                        .style(
+                            matches!(draft.origin, DraftOrigin::New).then_some(ButtonStyle::Accent),
+                        )
                         .is_enabled(!draft.generating)
                         .on_click(context.callback(move |_| Message::SaveProfile(id)))
                         .content("Save and connect"),
@@ -2130,6 +2250,48 @@ impl TerminalApp {
                         .content(if draft.saved { "Close" } else { "Cancel" }),
                 )),
         );
+        if let Some(base) = draft.origin.editing() {
+            if draft.confirm_delete {
+                fields.push(TextBlock::new().text(format!("Delete saved profile “{}”? Open sessions stay connected and key files stay on disk.", base.name)).text_wrapping(TextWrapping::Wrap).into());
+                fields.push(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(10.0)
+                        .children((
+                            Button::new()
+                                .on_click(
+                                    context.callback(move |_| {
+                                        Message::ConfirmDeleteProfile(id, false)
+                                    }),
+                                )
+                                .content("Keep profile"),
+                            Button::new()
+                                .automation_name(format!("Confirm delete {}", base.name))
+                                .on_click(
+                                    context
+                                        .callback(move |_| Message::ConfirmDeleteProfile(id, true)),
+                                )
+                                .content("Delete saved profile"),
+                        )),
+                );
+            } else {
+                fields.push(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(10.0)
+                        .children((
+                            Button::new()
+                                .is_enabled(!draft.generating)
+                                .on_click(context.callback(move |_| Message::DuplicateProfile(id)))
+                                .content("Duplicate saved profile…"),
+                            Button::new()
+                                .is_enabled(!draft.generating)
+                                .on_click(context.callback(move |_| Message::DeleteProfile(id)))
+                                .content("Delete profile…"),
+                        )),
+                );
+            }
+        }
         ScrollViewer::new().content(
             StackPanel::new()
                 .spacing(14.0)
@@ -3122,6 +3284,20 @@ impl Component for TerminalApp {
                 }
             }
             Message::EditProfile(name) => self.edit_profile(name, context),
+            Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
+            Message::DeleteProfile(id) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && draft.origin.editing().is_some()
+                {
+                    draft.confirm_delete = true;
+                }
+            }
+            Message::ConfirmDeleteProfile(id, accept) => {
+                self.confirm_delete_profile(id, accept, context)
+            }
             Message::EditActiveProfile => {
                 if let Some(name) = self
                     .tabs
@@ -3878,6 +4054,58 @@ impl TerminalApp {
                 assert_eq!(self.tabs.entries().len(), 3);
                 self.save_profile(id, context);
             }
+            30 => {
+                let copy = self.tabs.active_id().unwrap();
+                let Page::NewProfile(draft) = &self.tabs.get(copy).unwrap().page else {
+                    panic!("expected copy form")
+                };
+                assert!(matches!(draft.origin, DraftOrigin::Copy(_)));
+                assert_eq!(draft.name, "corrected copy");
+                assert_eq!(draft.authentication, 2);
+                self.update(Message::Edit(copy, Field::Name, "second".into()), context);
+                self.update(Message::SaveProfileOnly(copy), context);
+                assert!(
+                    self.profiles.contains_key("corrected") && self.profiles.contains_key("second")
+                );
+                self.update(Message::DeleteProfile(copy), context);
+            }
+            31 => {
+                let copy = self.tabs.active_id().unwrap();
+                self.update(Message::ConfirmDeleteProfile(copy, false), context);
+                assert!(self.store.load().unwrap().contains_key("second"));
+                self.update(Message::DeleteProfile(copy), context);
+                self.update(Message::ConfirmDeleteProfile(copy, true), context);
+                assert!(!self.store.load().unwrap().contains_key("second"));
+                self.edit_profile("corrected".into(), context);
+                self.update(
+                    Message::DeleteProfile(self.tabs.active_id().unwrap()),
+                    context,
+                );
+            }
+            32 => {
+                let editor = self.tabs.active_id().unwrap();
+                let existing = self.tabs.entries().iter().find(|entry| {
+                    matches!(&entry.value.page, Page::Terminal(live) if matches!(live.source, Source::Ssh(_)))
+                }).unwrap();
+                let pane = existing.value.pane_id().unwrap();
+                let entry = existing.id;
+                let options = self.profiles["corrected"].clone();
+                self.update(Message::ConfirmDeleteProfile(editor, true), context);
+                assert!(!self.profiles.contains_key("corrected"));
+                self.store.add("corrected", &options).unwrap();
+                self.profiles = self.store.load().unwrap();
+                let Page::Terminal(live) = &self.tabs.get(entry).unwrap().page else {
+                    panic!("connection was closed")
+                };
+                assert_eq!(live.profile_name, None);
+                assert_eq!(live.session.pane_id, pane);
+                assert!(live.session.frames.load().connection_generation > 0);
+                eprintln!(
+                    "Profile UI smoke passed: rename, duplicate, cancel and confirm deletion, live pane identity and save-and-connect"
+                );
+                self.update(Message::CloseWindow, context);
+                return;
+            }
             _ => {
                 let id = self.tabs.active_id().unwrap();
                 let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
@@ -3898,10 +4126,15 @@ impl TerminalApp {
                             .remote_sounds_enabled()
                     );
                     assert!(matches!(self.tabs.get(1).unwrap().page, Page::Terminal(_)));
-                    eprintln!(
-                        "Profile UI smoke passed: stateful menu, prefill, rename, collision protection, save-only, independent new form, save and connect"
+                    self.edit_profile("corrected".into(), context);
+                    self.update(
+                        Message::DuplicateProfile(self.tabs.active_id().unwrap()),
+                        context,
                     );
-                    self.update(Message::CloseWindow, context);
+                    context.spawn_background(move |_| {
+                        std::thread::sleep(Duration::from_millis(500));
+                        Message::Smoke(30)
+                    });
                     return;
                 }
             }
@@ -4179,12 +4412,12 @@ mod profile_ui_tests {
                     ..Default::default()
                 },
             };
-            let draft = ProfileDraft::existing("existing".into(), options.clone());
+            let draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
             assert_eq!(draft.fingerprint, "SHA256:test");
             assert!(draft.player.mute && draft.player.game_mode);
-            assert_eq!(draft.original, Some(("existing".into(), options)));
+            assert_eq!(draft.name, "existing");
         }
     }
 }
