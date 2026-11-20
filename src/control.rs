@@ -332,6 +332,7 @@ impl Registry {
                         operation,
                         deadline,
                         reply,
+                        progress: None,
                     }))
                     .context("pane is closed")?;
                 let result = tokio::time::timeout_at(deadline + Duration::from_secs(1), response)

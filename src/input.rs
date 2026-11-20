@@ -5,10 +5,12 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use w11term::{
     interaction::{Interaction, TabSwitcherMode},
+    pane_layout::Direction,
     session::Command,
     terminal::FrameStore,
 };
 use wezterm_term::{KeyCode, KeyModifiers};
+pub(crate) mod ime;
 use windows::Win32::{
     Foundation::*,
     System::Threading::GetCurrentThreadId,
@@ -34,6 +36,7 @@ struct State {
     grid: Option<Grid>,
     window: Option<HWND>,
     search: bool,
+    wheel_panes: WheelPanes,
     wheel_remainder: i32,
     zoom_remainder: i32,
     modal: bool,
@@ -46,7 +49,44 @@ struct Target {
     frames: FrameStore,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Default)]
+struct WheelPanes {
+    visible: HashMap<u64, (Target, i32)>,
+    hovered: Option<u64>,
+}
+
+impl WheelPanes {
+    fn replace(
+        &mut self,
+        panes: impl IntoIterator<Item = (u64, mpsc::UnboundedSender<Command>, FrameStore)>,
+    ) {
+        self.visible = panes
+            .into_iter()
+            .map(|(id, sender, frames)| {
+                let remainder = self
+                    .visible
+                    .get(&id)
+                    .filter(|(target, _)| target.sender.same_channel(&sender))
+                    .map_or(0, |(_, remainder)| *remainder);
+                (id, (Target { sender, frames }, remainder))
+            })
+            .collect();
+        self.hovered = self.hovered.filter(|id| self.visible.contains_key(id));
+    }
+
+    fn target(&mut self) -> Option<(&Target, &mut i32)> {
+        // The single canvas has historically accepted wheel input anywhere
+        // in the terminal window. Multiple canvases require a pointer hit.
+        let (target, remainder) = if self.visible.len() == 1 {
+            self.visible.values_mut().next()?
+        } else {
+            self.visible.get_mut(&self.hovered?)?
+        };
+        Some((target, remainder))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shortcut {
     Fullscreen,
     RememberWindow,
@@ -55,6 +95,11 @@ pub enum Shortcut {
     PreviousTab,
     NewTab,
     CloseTab,
+    SplitRight,
+    SplitBelow,
+    FocusPane(Direction),
+    ZoomPane,
+    ClosePane,
     Select(usize),
     Copy,
     Paste,
@@ -122,6 +167,7 @@ impl KeyboardBridge {
                 grid: None,
                 window: None,
                 search: false,
+                wheel_panes: WheelPanes::default(),
                 wheel_remainder: 0,
                 zoom_remainder: 0,
                 modal: false,
@@ -140,6 +186,35 @@ impl KeyboardBridge {
         INPUT.with(|input| {
             if let Some(state) = input.borrow_mut().as_mut() {
                 state.retarget(target.map(|(sender, frames)| Target { sender, frames }));
+            }
+        });
+        ime::sync_context();
+    }
+    pub fn set_wheel_panes(
+        &self,
+        panes: impl IntoIterator<Item = (u64, mpsc::UnboundedSender<Command>, FrameStore)>,
+    ) {
+        INPUT.with(|input| {
+            if let Some(state) = input.borrow_mut().as_mut() {
+                state.wheel_panes.replace(panes);
+            }
+        });
+    }
+    pub fn hover_pane(&self, id: u64) {
+        INPUT.with(|input| {
+            if let Some(state) = input.borrow_mut().as_mut()
+                && state.wheel_panes.visible.contains_key(&id)
+            {
+                state.wheel_panes.hovered = Some(id);
+            }
+        });
+    }
+    pub fn leave_pane(&self, id: u64) {
+        INPUT.with(|input| {
+            if let Some(state) = input.borrow_mut().as_mut()
+                && state.wheel_panes.hovered == Some(id)
+            {
+                state.wheel_panes.hovered = None;
             }
         });
     }
@@ -161,14 +236,21 @@ impl KeyboardBridge {
         INPUT.with(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.switcher = visible;
+                if visible {
+                    ime::cancel();
+                    s.wheel_panes.hovered = None;
+                }
             }
         });
+        ime::sync_context();
     }
     pub fn set_search(&self, visible: bool) {
         INPUT.with(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 if visible {
+                    ime::cancel();
                     s.release_keys();
+                    s.wheel_panes.hovered = None;
                 }
                 s.search = visible;
                 if let Some(target) = &s.target {
@@ -176,16 +258,27 @@ impl KeyboardBridge {
                 }
             }
         });
+        ime::sync_context();
     }
     pub fn set_modal(&self, visible: bool) {
-        INPUT.with(|i| {
+        let changed = INPUT.with(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
+                if s.modal == visible {
+                    return false;
+                }
                 if visible {
+                    ime::cancel();
                     s.release_keys();
+                    s.wheel_panes.hovered = None;
                 }
                 s.modal = visible;
+                return true;
             }
+            false
         });
+        if changed {
+            ime::sync_context();
+        }
     }
     pub fn on_close(&self, handler: impl Fn() + 'static) {
         INPUT.with(|state| {
@@ -244,6 +337,7 @@ impl KeyboardBridge {
 
 impl Drop for KeyboardBridge {
     fn drop(&mut self) {
+        ime::uninstall();
         // SAFETY: this object owns the hook, and is destroyed on its installing thread.
         unsafe {
             let _ = UnhookWindowsHookEx(self.messages);
@@ -292,6 +386,7 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code >= 0 {
         // SAFETY: WH_CALLWNDPROC supplies a CWPSTRUCT valid for this callback.
         let message = unsafe { &*(lparam.0 as *const CWPSTRUCT) };
+        ime::observe(message.hwnd, message.message);
         if message.message == WM_ACTIVATEAPP && is_terminal(message.hwnd) {
             INPUT.with(|input| {
                 if let Ok(mut input) = input.try_borrow_mut()
@@ -299,6 +394,7 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 {
                     let focused = message.wParam.0 != 0;
                     if !focused {
+                        ime::cancel();
                         state.release_keys();
                         if state.switcher {
                             state.switcher = false;
@@ -354,6 +450,15 @@ struct Grid {
     width: f32,
     height: f32,
     scale: f32,
+}
+pub fn clear_grid() {
+    INPUT.with(|i| {
+        if let Ok(mut state) = i.try_borrow_mut()
+            && let Some(state) = state.as_mut()
+        {
+            state.grid = None;
+        }
+    });
 }
 pub fn set_grid(cw: f32, ch: f32, width: f32, height: f32, scale: f32) {
     INPUT.with(|i| {
@@ -558,6 +663,14 @@ impl State {
     }
 
     fn retarget(&mut self, target: Option<Target>) {
+        if !self
+            .target
+            .as_ref()
+            .zip(target.as_ref())
+            .is_some_and(|(a, b)| a.sender.same_channel(&b.sender))
+        {
+            ime::cancel();
+        }
         self.release_keys();
         if let Some(old) = self.target.take() {
             let _ = old.sender.send(Command::Focus(false));
@@ -588,6 +701,13 @@ impl State {
         };
         if self.modal {
             return false;
+        }
+        if ime::active() {
+            match message.message {
+                WM_CHAR | WM_SYSCHAR => return true,
+                WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => return false,
+                _ => {}
+            }
         }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) && vk == VK_F11.0 as u32 {
             if message.lParam.0 & (1 << 30) == 0 {
@@ -656,7 +776,12 @@ impl State {
                     return true;
                 }
             }
-            let shortcut = if mods.contains(KeyModifiers::CTRL) && vk == VK_TAB.0 as u32 {
+            let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
+            let pane_action =
+                pane_shortcut(vk, mods, self.target.is_some() && !self.search, right_alt);
+            let shortcut = if pane_action.is_some() {
+                pane_action
+            } else if mods.contains(KeyModifiers::CTRL) && vk == VK_TAB.0 as u32 {
                 Some(if mods.contains(KeyModifiers::SHIFT) {
                     Shortcut::PreviousTab
                 } else {
@@ -664,12 +789,12 @@ impl State {
                 })
             } else if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x54 {
                 Some(Shortcut::NewTab)
-            } else if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x57 {
+            } else if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x57 {
                 Some(Shortcut::CloseTab)
             } else if mods.contains(KeyModifiers::CTRL | KeyModifiers::ALT)
                 && (0x31..=0x39).contains(&vk)
                 // AltGr is also represented as Ctrl+Alt; it must remain text input.
-                && unsafe { GetKeyState(VK_RMENU.0 as i32) >= 0 }
+                && !right_alt
             {
                 Some(Shortcut::Select((vk - 0x31) as usize))
             } else {
@@ -868,6 +993,9 @@ impl State {
         }
     }
     fn wheel(&mut self, delta: i16, mods: KeyModifiers) -> bool {
+        if self.modal || self.switcher {
+            return false;
+        }
         let Some(target) = &self.target else {
             return false;
         };
@@ -877,7 +1005,14 @@ impl State {
                 (self.shortcut)(Shortcut::Zoom(steps));
             }
         } else {
-            let steps = wheel_steps(&mut self.wheel_remainder, delta);
+            let (target, remainder) = if self.wheel_panes.visible.is_empty() {
+                (target, &mut self.wheel_remainder)
+            } else if let Some(hit) = self.wheel_panes.target() {
+                hit
+            } else {
+                return false;
+            };
+            let steps = wheel_steps(remainder, delta);
             if steps != 0 {
                 let mut lines = 3u32;
                 // Respect Windows' configured lines-per-notch, including page scrolling.
@@ -902,6 +1037,36 @@ impl State {
             }
         }
         true
+    }
+}
+fn pane_shortcut(
+    vk: u32,
+    mods: KeyModifiers,
+    terminal_focused: bool,
+    right_alt: bool,
+) -> Option<Shortcut> {
+    if !terminal_focused || right_alt {
+        return None;
+    }
+    let pane_mods = KeyModifiers::CTRL | KeyModifiers::ALT;
+    if mods == pane_mods {
+        Some(Shortcut::FocusPane(match vk {
+            0x25 => Direction::Left,
+            0x26 => Direction::Up,
+            0x27 => Direction::Right,
+            0x28 => Direction::Down,
+            _ => return None,
+        }))
+    } else if mods == (pane_mods | KeyModifiers::SHIFT) {
+        match vk {
+            0x27 => Some(Shortcut::SplitRight),
+            0x28 => Some(Shortcut::SplitBelow),
+            0x5a => Some(Shortcut::ZoomPane),
+            0x57 => Some(Shortcut::ClosePane),
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 pub fn cell_pixel_offset(coordinate: f32, cell: f32, scale: f32) -> isize {
@@ -976,6 +1141,33 @@ fn special_key(vk: u32) -> Option<KeyCode> {
 mod tests {
     use super::*;
     use w11term::{options::Source, session::Session};
+
+    #[test]
+    fn pane_shortcuts_require_terminal_focus_and_leave_altgr_and_tab_digits_available() {
+        let navigate = KeyModifiers::CTRL | KeyModifiers::ALT;
+        let action = navigate | KeyModifiers::SHIFT;
+        for (vk, mods, expected) in [
+            (0x25, navigate, Shortcut::FocusPane(Direction::Left)),
+            (0x26, navigate, Shortcut::FocusPane(Direction::Up)),
+            (0x27, navigate, Shortcut::FocusPane(Direction::Right)),
+            (0x28, navigate, Shortcut::FocusPane(Direction::Down)),
+            (0x27, action, Shortcut::SplitRight),
+            (0x28, action, Shortcut::SplitBelow),
+            (0x5a, action, Shortcut::ZoomPane),
+            (0x57, action, Shortcut::ClosePane),
+        ] {
+            assert_eq!(pane_shortcut(vk, mods, true, false), Some(expected));
+            assert_eq!(pane_shortcut(vk, mods, false, false), None);
+            assert_eq!(pane_shortcut(vk, mods, true, true), None);
+            assert_eq!(
+                pane_shortcut(vk, mods | KeyModifiers::SUPER, true, false),
+                None
+            );
+        }
+        for vk in 0x31..=0x39 {
+            assert_eq!(pane_shortcut(vk, navigate, true, false), None);
+        }
+    }
     #[test]
     fn simultaneous_left_and_right_modifiers_have_distinct_press_identities() {
         assert_ne!(
@@ -1013,6 +1205,40 @@ mod tests {
         assert_eq!(wheel_steps(&mut remainder, -80), -1);
         assert_eq!(wheel_steps(&mut remainder, 360), 3);
     }
+
+    #[test]
+    fn split_wheel_tracks_fractional_scroll_independently_for_each_visible_pane() {
+        let lab = Session::start(Source::Demo);
+        let (left, _left_input) = mpsc::unbounded_channel();
+        let (right, _right_input) = mpsc::unbounded_channel();
+        let layout = || {
+            [
+                (5, left.clone(), lab.frames.clone()),
+                (6, right.clone(), lab.frames.clone()),
+            ]
+        };
+        let mut panes = WheelPanes::default();
+        panes.replace(layout());
+        assert!(panes.target().is_none());
+        panes.hovered = Some(6);
+        let (target, remainder) = panes.target().unwrap();
+        assert!(target.sender.same_channel(&right));
+        assert_eq!(wheel_steps(remainder, 60), 0);
+        panes.hovered = Some(5);
+        let (target, remainder) = panes.target().unwrap();
+        assert!(target.sender.same_channel(&left));
+        assert_eq!(wheel_steps(remainder, 60), 0);
+        panes.replace(layout());
+        assert_eq!(wheel_steps(panes.target().unwrap().1, 60), 1);
+        panes.hovered = Some(6);
+        assert_eq!(wheel_steps(panes.target().unwrap().1, 60), 1);
+
+        panes.replace([(5, left.clone(), lab.frames.clone())]);
+        assert_eq!(panes.hovered, None);
+        assert!(panes.target().unwrap().0.sender.same_channel(&left));
+        panes.replace([]);
+        assert!(panes.target().is_none());
+    }
     #[test]
     fn grid_snap_rounds_to_cells_with_fixed_window_chrome() {
         assert_eq!(snap_extent(1238, 24, 10), 1234);
@@ -1041,6 +1267,7 @@ mod tests {
             grid: None,
             window: None,
             search: false,
+            wheel_panes: WheelPanes::default(),
             wheel_remainder: 0,
             zoom_remainder: 0,
             modal: false,

@@ -16,8 +16,9 @@ use w11term::{
     interaction::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
-    options::{Authentication, Options, Source, SshOptions},
-    profiles::ProfileStore,
+    options::{Authentication, LocalOptions, Options, Source, SshOptions, profile_source},
+    pane_layout::{Axis, Direction},
+    profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
     tabs::{TabId, Tabs},
 };
@@ -28,7 +29,30 @@ use windows_reactor::*;
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
+mod config_import;
+mod file_drawer;
+mod local_profile;
+use file_drawer::{FileAction, FileDrawer};
+#[cfg(feature = "ui-smoke")]
+mod accessibility_smoke;
+mod durable_view;
+#[cfg(feature = "ui-smoke")]
+mod ime_smoke;
+#[cfg(feature = "ui-smoke")]
+mod local_smoke;
+mod pane_view;
+#[cfg(feature = "ui-smoke")]
+mod split_smoke;
+mod workspace_view;
+use pane_view::PaneSurface;
+
 struct LiveTab {
+    files: Box<FileDrawer>,
+    confirm_end: bool,
+    durable_phase: Option<w11term::ssh::DurablePhase>,
+    source: Source,
+    profile_name: Option<String>,
+    surface: PaneSurface,
     device_busy: bool,
     device_message: Option<String>,
     session: Session,
@@ -83,6 +107,9 @@ pub enum InteractionField {
 }
 enum Page {
     Terminal(LiveTab),
+    LocalProfile(local_profile::Draft),
+    ImportConfig(config_import::ImportPage),
+    Workspaces(workspace_view::WorkspacePage),
     Settings,
     NewProfile(ProfileDraft),
 }
@@ -92,6 +119,29 @@ struct AppTab {
 }
 
 impl AppTab {
+    fn profile_name(&self) -> Option<&str> {
+        match &self.page {
+            Page::Terminal(live) => live.profile_name.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn with_profile(mut self, name: Option<String>) -> Self {
+        if let Page::Terminal(live) = &mut self.page {
+            live.profile_name = name;
+        }
+        self
+    }
+
+    fn ssh_profile_name(&self) -> Option<&str> {
+        match &self.page {
+            Page::Terminal(live) if matches!(live.source, Source::Ssh(_)) => {
+                live.profile_name.as_deref()
+            }
+            _ => None,
+        }
+    }
+
     fn pane_id(&self) -> Option<u64> {
         match &self.page {
             Page::Terminal(tab) => Some(tab.session.pane_id),
@@ -100,9 +150,28 @@ impl AppTab {
     }
 }
 
+#[derive(Clone, Default)]
+enum DraftOrigin {
+    #[default]
+    New,
+    Edit(ProfileSnapshot),
+    Copy(ProfileSnapshot),
+}
+impl DraftOrigin {
+    fn editing(&self) -> Option<&ProfileSnapshot> {
+        match self {
+            Self::Edit(base) => Some(base),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ProfileDraft {
-    original: Option<(String, SshOptions)>,
+    origin: DraftOrigin,
+    confirm_delete: bool,
+    proxy_jump: Vec<w11term::options::JumpHost>,
+    durable: bool,
     saved: bool,
     name: String,
     host: String,
@@ -120,7 +189,10 @@ struct ProfileDraft {
 impl Default for ProfileDraft {
     fn default() -> Self {
         Self {
-            original: None,
+            origin: DraftOrigin::New,
+            confirm_delete: false,
+            proxy_jump: Vec::new(),
+            durable: false,
             saved: false,
             name: String::new(),
             host: String::new(),
@@ -138,7 +210,7 @@ impl Default for ProfileDraft {
 }
 
 impl ProfileDraft {
-    fn existing(name: String, options: SshOptions) -> Self {
+    fn from_options(name: String, options: &SshOptions) -> Self {
         let (authentication, identity) = match &options.authentication {
             Authentication::Agent => (0, String::new()),
             Authentication::Identity { identity } => (1, identity.to_string_lossy().into_owned()),
@@ -147,7 +219,9 @@ impl ProfileDraft {
             Authentication::KeyboardInteractive => (4, String::new()),
         };
         Self {
-            name: name.clone(),
+            proxy_jump: options.proxy_jump.clone(),
+            name,
+            durable: options.durable,
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
@@ -155,7 +229,6 @@ impl ProfileDraft {
             fingerprint: options.host_key.clone().unwrap_or_default(),
             authentication,
             player: options.player.clone(),
-            original: Some((name, options)),
             ..Default::default()
         }
     }
@@ -170,7 +243,28 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(action) = durable_view::menu_action(&label) {
+        return Message::Durability(action);
+    }
+    for (prefix, axis) in [
+        ("Split right with ", Axis::Columns),
+        ("Split below with ", Axis::Rows),
+    ] {
+        if let Some(name) = label.strip_prefix(prefix) {
+            return Message::SplitPane(axis, Some(name.to_owned()));
+        }
+    }
     match label.split(": ").next().unwrap_or(&label) {
+        "SFTP files" => Message::Files(FileAction::Toggle),
+        "Split right" => Message::SplitPane(Axis::Columns, None),
+        "Split below" => Message::SplitPane(Axis::Rows, None),
+        "Focus left" => Message::PaneNeighbor(Direction::Left),
+        "Focus right" => Message::PaneNeighbor(Direction::Right),
+        "Focus above" => Message::PaneNeighbor(Direction::Up),
+        "Focus below" => Message::PaneNeighbor(Direction::Down),
+        "Zoom pane" | "Restore panes" => Message::ZoomPane,
+        "Close pane" => Message::ClosePane,
+        "Move pane to new tab" => Message::MovePaneToTab,
         "Paste" => Message::Paste,
         "Paste raw (no bracketed paste)" => Message::PasteRaw,
         "Fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
@@ -183,6 +277,7 @@ fn tab_menu_message(label: String) -> Message {
         "Enroll this device (at game prompt)" => Message::DeviceAction(false),
         "Forget this device (revoke game key)" => Message::DeviceAction(true),
         "Settings" => Message::SettingsMenu,
+        "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         _ => Message::ControlIdle,
     }
 }
@@ -198,6 +293,8 @@ pub enum Field {
 }
 
 pub struct TerminalApp {
+    accessible: crate::accessibility::Bridge,
+    active_group: Option<TabId>,
     windows: Rc<RefCell<crate::window_state::Windows>>,
     window_profile: Option<String>,
     window_restored: bool,
@@ -208,16 +305,17 @@ pub struct TerminalApp {
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<w11term::control::UiRequest>>>,
     control_task: Option<ComponentTask>,
     tabs: Tabs<AppTab>,
-    renderer: Rc<RefCell<Renderer>>,
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
-    frame_task: Option<ComponentTask>,
+    frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
     default_source: Source,
     default_label: String,
+    default_profile: Option<String>,
     profiles: BTreeMap<String, SshOptions>,
+    local_profiles: BTreeMap<String, LocalOptions>,
     store: ProfileStore,
     profile_error: Option<String>,
     width: f64,
@@ -229,12 +327,26 @@ pub struct TerminalApp {
     appearance: Arc<RwLock<Appearance>>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
-    terminal_area: Rc<Cell<Option<(f32, f32, f32)>>>,
+    divider_drag: Rc<RefCell<Option<pane_view::DividerDrag>>>,
+    measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     mru: Vec<TabId>,
     switcher: Option<TabSwitcher>,
 }
 
 pub enum Message {
+    LocalProfile(local_profile::Action),
+    Files(FileAction),
+    AccessibleSelection(crate::accessibility::SelectionRequest),
+    SplitPane(Axis, Option<String>),
+    PaneNeighbor(Direction),
+    ZoomPane,
+    ClosePane,
+    MovePaneToTab,
+    PaneFocus(TabId),
+    PaneRatio(u64, Vec<bool>, f64),
+    HoverPane(TabId),
+    DividerPress(u64, Vec<bool>, f64),
+    DividerEnd(u64, Vec<bool>),
     DeviceAction(bool),
     DeviceDone(TabId, bool, Result<String, String>),
     DraftBell(TabId, String),
@@ -256,6 +368,7 @@ pub enum Message {
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
     DraftPlayer(TabId, String, bool),
+    Durability(durable_view::Action),
     FrameReady(TabId, u64),
     CloseWindow,
     Select(Option<usize>, u64, bool),
@@ -265,6 +378,8 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     SettingsMenu,
+    Workspace(workspace_view::WorkspaceAction),
+    ImportConfig(config_import::Action),
     Font(Option<usize>),
     Ligatures(bool),
     Interaction(InteractionField, bool),
@@ -286,6 +401,9 @@ pub enum Message {
     SaveProfileOnly(TabId),
     EditProfile(String),
     EditActiveProfile,
+    DuplicateProfile(TabId),
+    DeleteProfile(TabId),
+    ConfirmDeleteProfile(TabId, bool),
     WindowSize(WindowSize),
     Geometry(f64, f64, u64, bool),
     GridFallback(u64),
@@ -299,15 +417,33 @@ pub enum Message {
 }
 
 fn live_tab(label: String, source: Source, osc52: bool) -> AppTab {
-    live_tab_sized(label, source, TerminalSize::default(), osc52)
+    live_tab_sized(label, source, TerminalSize::default(), osc52, None, None)
 }
-fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool) -> AppTab {
+fn live_tab_sized(
+    label: String,
+    source: Source,
+    size: TerminalSize,
+    osc52: bool,
+    connection: Option<w11term::ssh::ConnectionShare>,
+    saved: Option<w11term::durable::DurableReference>,
+) -> AppTab {
+    let session = if matches!(&source, Source::Ssh(ssh) if ssh.durable) {
+        Session::start_durable(source.clone(), size, osc52, connection, saved)
+    } else {
+        Session::start_configured_with_connection(source.clone(), size, osc52, connection)
+    };
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            files: Box::default(),
+            source,
+            confirm_end: false,
+            durable_phase: None,
+            profile_name: None,
+            surface: PaneSurface::default(),
             device_busy: false,
             device_message: None,
-            session: Session::start_configured(source, size, osc52),
+            session,
             last_size: Rc::new(Cell::new(None)),
             error: None,
             selection: Rc::new(RefCell::new(None)),
@@ -328,6 +464,12 @@ fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool
 
 fn source_label(source: &Source) -> String {
     match source {
+        Source::Local(shell) => shell
+            .executable
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
         Source::Demo => LAB.into(),
         Source::Replay(path) => format!("Replay · {}", path.display()),
         Source::Ssh(ssh) => format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
@@ -685,10 +827,10 @@ impl TerminalApp {
                 self.mru
                     .iter()
                     .copied()
-                    .filter(|id| self.tabs.get(*id).is_some())
+                    .filter(|id| self.tabs.headers().iter().any(|header| header.id == *id))
                     .collect()
             } else {
-                self.tabs.entries().iter().map(|tab| tab.id).collect()
+                self.tabs.headers().iter().map(|tab| tab.id).collect()
             };
             let ids: Vec<TabId> = ids;
             let index = ids
@@ -722,11 +864,14 @@ impl TerminalApp {
         kind: MouseEventKind,
         context: &ComponentContext<Self>,
     ) {
-        if self.tabs.active_id() != Some(id) {
+        if !self.tabs.visible(id) {
             return;
         }
+        if kind == MouseEventKind::Press && self.tabs.active_id() != Some(id) {
+            self.focus_pane(id, context);
+        }
+        self.keyboard.hover_pane(id);
         let preferences = self.appearance.read().unwrap().interaction.clone();
-        let metrics = self.metrics.get();
         let modifiers = crate::input::modifiers();
         let Some(AppTab {
             page: Page::Terminal(tab),
@@ -735,6 +880,7 @@ impl TerminalApp {
         else {
             return;
         };
+        let metrics = tab.surface.metrics.get();
         let frame = tab.session.frames.load();
         let x = (((pointer.x as f32 - PADDING).max(0.0) / metrics.cell_width).floor() as usize)
             .min(metrics.cols.saturating_sub(1));
@@ -742,12 +888,12 @@ impl TerminalApp {
             .min(metrics.rows.saturating_sub(1));
         let point = Point {
             row: frame.first_stable_row + y as isize,
-            col: x,
+            col: frame.cell_map(y).map_or(x, |map| map.logical(x)),
         };
         let link = link_at(&frame, point, preferences.detect_urls);
         if *tab.hover.borrow() != link {
             *tab.hover.borrow_mut() = link.clone();
-            self.invalidator.invalidate();
+            tab.surface.invalidator.invalidate();
         }
         let button = if pointer.is_left_button_pressed {
             MouseButton::Left
@@ -850,7 +996,7 @@ impl TerminalApp {
                     }
                     selection.observe(&frame);
                     *tab.selection.borrow_mut() = Some(selection);
-                    self.invalidator.invalidate();
+                    tab.surface.invalidator.invalidate();
                 }
             }
             MouseEventKind::Move if pointer.is_left_button_pressed => {
@@ -873,7 +1019,7 @@ impl TerminalApp {
                         Message::DragScroll(id)
                     });
                 }
-                self.invalidator.invalidate();
+                tab.surface.invalidator.invalidate();
             }
             MouseEventKind::Release => {
                 tab.scroll_direction = 0;
@@ -888,12 +1034,14 @@ impl TerminalApp {
                     selection.observe(&frame);
                     should_copy = preferences.copy_on_select && selection.active;
                 }
-                self.invalidator.invalidate();
+                tab.surface.invalidator.invalidate();
             }
             _ => {}
         }
         let selected = tab.selection.borrow().as_ref().is_some_and(|s| s.active);
-        self.keyboard.set_selection(selected);
+        if self.tabs.active_id() == Some(id) {
+            self.keyboard.set_selection(selected);
+        }
         if should_copy {
             self.copy();
             if kind == MouseEventKind::Press
@@ -958,26 +1106,18 @@ impl TerminalApp {
                 return;
             }
         };
-        if let Some((width, height, scale)) = self.terminal_area.get() {
-            let metrics = renderer.measure(width, height, scale);
-            self.metrics.set(metrics);
-            let size = TerminalSize {
-                cols: metrics.cols,
-                rows: metrics.rows,
-                pixel_width: (metrics.cols as f32 * metrics.cell_width * scale).round() as usize,
-                pixel_height: (metrics.rows as f32 * metrics.cell_height * scale).round() as usize,
-                dpi: (96.0 * scale).round() as u32,
-            };
-            for entry in self.tabs.entries() {
-                if let Page::Terminal(tab) = &entry.value.page {
-                    tab.selection.borrow_mut().take();
-                    tab.hover.borrow_mut().take();
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(tab) = &entry.value.page {
+                tab.selection.borrow_mut().take();
+                tab.hover.borrow_mut().take();
+                if let Some(size) = tab.surface.remeasure(&mut renderer) {
                     tab.last_size.set(Some(size));
                     let _ = tab.session.input.send(Command::Resize(size));
                 }
+                tab.surface.release();
+                tab.surface.invalidator.invalidate();
             }
         }
-        *self.renderer.borrow_mut() = renderer;
         self.keyboard.set_selection(false);
         self.save_preferences(appearance);
         self.invalidator.invalidate();
@@ -1021,6 +1161,27 @@ impl TerminalApp {
         if self.profiles.is_empty() {
             profiles.push(TextBlock::new().text("No saved profiles yet.").into());
         }
+        for name in self.local_profiles.keys() {
+            let name = name.clone();
+            profiles.push(
+                Button::new()
+                    .automation_name(format!("Edit local profile {name}"))
+                    .on_click(context.callback({
+                        let name = name.clone();
+                        move |_| {
+                            Message::LocalProfile(local_profile::Action::Open(Some(name.clone())))
+                        }
+                    }))
+                    .content(format!("Edit {name} · Local…")),
+            );
+        }
+        profiles.push(
+            Button::new()
+                .on_click(
+                    context.callback(|_| Message::LocalProfile(local_profile::Action::Open(None))),
+                )
+                .content("New local shell profile…"),
+        );
         if let Some(error) = &self.profile_error {
             profiles.push(
                 TextBlock::new()
@@ -1034,6 +1195,11 @@ impl TerminalApp {
             Button::new()
                 .on_click(context.callback(|_| Message::ProfileMenu(NEW_PROFILE.into())))
                 .content("New Profile…"),
+        );
+        profiles.push(
+            Button::new()
+                .on_click(context.callback(|_| Message::ImportConfig(config_import::Action::Show)))
+                .content("Import OpenSSH config…"),
         );
         children.splice(1..1, profiles);
         children.push(
@@ -1139,8 +1305,8 @@ impl TerminalApp {
                 };
                 Some(Pane {
                     id: tab.session.pane_id,
-                    tab_id: entry.id,
-                    visible: self.tabs.active_id() == Some(entry.id),
+                    tab_id: self.tabs.group_id(entry.id)?,
+                    visible: self.tabs.visible(entry.id),
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
@@ -1165,41 +1331,64 @@ impl TerminalApp {
             Message::SyncSelection(epoch)
         });
     }
+    fn cancel_frame_tasks(&mut self) {
+        self.watch_epoch += 1;
+        for (_, task) in std::mem::take(&mut self.frame_tasks) {
+            task.cancel();
+        }
+    }
+
     fn watch_frames(&mut self, context: &ComponentContext<Self>) {
-        let Some(id) = self.tabs.active_id() else {
-            return;
-        };
-        let Some(AppTab {
-            page: Page::Terminal(tab),
-            ..
-        }) = self.tabs.get(id)
-        else {
-            return;
-        };
-        let frames = tab.session.frames.clone();
-        let generation = frames.load().generation;
-        let epoch = self.watch_epoch;
-        self.frame_task = Some(context.spawn_background_with_rejection(
-            move |cancel| {
-                frames.wait_for_change(generation, || cancel.is_cancelled());
-                Message::FrameReady(id, epoch)
-            },
-            Message::WatchRejected,
-        ));
+        for entry in self.tabs.entries() {
+            let id = entry.id;
+            if !self.tabs.visible(id) || self.frame_tasks.contains_key(&id) {
+                continue;
+            }
+            let Page::Terminal(tab) = &entry.value.page else {
+                continue;
+            };
+            let frames = tab.session.frames.clone();
+            let generation = frames.load().generation;
+            let epoch = self.watch_epoch;
+            self.frame_tasks.insert(
+                id,
+                context.spawn_background_with_rejection(
+                    move |cancel| {
+                        frames.wait_for_change(generation, || cancel.is_cancelled());
+                        Message::FrameReady(id, epoch)
+                    },
+                    Message::WatchRejected,
+                ),
+            );
+        }
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        let single = matches!(
+            self.tabs.active_layout(),
+            Some(w11term::pane_layout::Layout::Leaf(_))
+        );
         let profile = self
             .tabs
             .active()
-            .filter(|t| self.profiles.contains_key(&t.label))
-            .map(|t| t.label.clone());
+            .and_then(AppTab::profile_name)
+            .filter(|name| {
+                single
+                    && (self.profiles.contains_key(*name)
+                        || self.local_profiles.contains_key(*name))
+            })
+            .map(str::to_owned);
+        let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
+        let group_changed = self.active_group != group;
+        self.active_group = group;
         if profile != self.window_profile {
             if let Some(previous) = self.window_profile.take() {
                 let _ = self.windows.borrow_mut().remember(&previous);
             }
             self.window_profile = profile;
-            self.restore_window();
+            if group_changed {
+                self.restore_window();
+            }
         }
         let windows = self.windows.clone();
         let profile = self.window_profile.clone();
@@ -1212,9 +1401,32 @@ impl TerminalApp {
             self.mru.retain(|i| *i != id);
             self.mru.insert(0, id);
         }
-        self.watch_epoch += 1;
-        if let Some(task) = self.frame_task.take() {
-            task.cancel();
+        self.cancel_frame_tasks();
+        self.divider_drag.borrow_mut().take();
+        if !single
+            || !matches!(
+                self.tabs.active(),
+                Some(AppTab {
+                    page: Page::Terminal(_),
+                    ..
+                })
+            )
+        {
+            crate::input::clear_grid();
+            self.initial_grid.set(None);
+        }
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(tab) = &entry.value.page {
+                if self.tabs.active_id() == Some(entry.id) {
+                    self.metrics = tab.surface.metrics.clone();
+                    self.invalidator = tab.surface.invalidator.clone();
+                }
+                if self.tabs.visible(entry.id) {
+                    tab.surface.invalidator.invalidate();
+                } else {
+                    tab.surface.window_hidden();
+                }
+            }
         }
         let target = match self.tabs.active() {
             Some(AppTab {
@@ -1224,6 +1436,20 @@ impl TerminalApp {
             _ => None,
         };
         self.keyboard.set_target(target);
+        self.sync_ime_surface();
+        self.keyboard
+            .set_wheel_panes(self.tabs.entries().iter().filter_map(|entry| {
+                let Page::Terminal(tab) = &entry.value.page else {
+                    return None;
+                };
+                self.tabs.visible(entry.id).then(|| {
+                    (
+                        entry.id,
+                        tab.session.input.clone(),
+                        tab.session.frames.clone(),
+                    )
+                })
+            }));
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
         }
@@ -1273,14 +1499,12 @@ impl TerminalApp {
     }
 
     fn close_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
-        let active = self.tabs.active_id() == Some(id);
+        let active = self.active_group == self.tabs.group_id(id);
         if active {
             self.keyboard.set_target(None);
-            if let Some(task) = self.frame_task.take() {
-                task.cancel();
-            }
+            self.cancel_frame_tasks();
         }
-        self.tabs.remove(id);
+        self.tabs.remove_group(id);
         self.publish_panes();
         if self.tabs.entries().is_empty() {
             let _ = context.window().request_close();
@@ -1292,14 +1516,150 @@ impl TerminalApp {
         }
     }
 
-    fn open(&mut self, label: String, source: Source, context: &ComponentContext<Self>) {
-        self.tabs.insert(live_tab(
-            label,
-            source,
-            self.appearance.read().unwrap().interaction.osc52,
-        ));
+    fn open(
+        &mut self,
+        label: String,
+        source: Source,
+        profile: Option<String>,
+        context: &ComponentContext<Self>,
+    ) {
+        self.tabs.insert(
+            live_tab(
+                label,
+                source,
+                self.appearance.read().unwrap().interaction.osc52,
+            )
+            .with_profile(profile),
+        );
         self.sync_selection(context);
         self.activate(context);
+    }
+
+    fn focus_pane(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        if self.tabs.visible(id) && self.tabs.active_id() != Some(id) && self.tabs.select(id) {
+            self.activate(context);
+        }
+    }
+
+    fn split_pane(
+        &mut self,
+        axis: Axis,
+        profile: Option<String>,
+        context: &ComponentContext<Self>,
+    ) {
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let Some(AppTab {
+            label,
+            page: Page::Terminal(tab),
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let connection = if profile.is_none() {
+            tab.session.ssh_connection()
+        } else {
+            None
+        };
+        let explicit_profile = profile.is_some();
+        let profile_name = profile.or_else(|| tab.profile_name.clone());
+        let (label, source) = match &profile_name {
+            Some(name) => {
+                let source = match profile_source(&self.profiles, &self.local_profiles, name) {
+                    Some(source) => source,
+                    None if !explicit_profile => tab.source.clone(),
+                    None => return,
+                };
+                (name.clone(), source)
+            }
+            None => (label.clone(), tab.source.clone()),
+        };
+        let leaf = live_tab_sized(
+            label,
+            source,
+            TerminalSize::default(),
+            self.appearance.read().unwrap().interaction.osc52,
+            connection,
+            None,
+        )
+        .with_profile(profile_name);
+        if self.tabs.split(id, leaf, axis).is_some() {
+            self.initial_grid.set(None);
+            self.sync_selection(context);
+            self.activate(context);
+        }
+    }
+
+    fn resize_split(&mut self, id: TabId, cols: usize, rows: usize) -> anyhow::Result<()> {
+        use w11term::pane_layout::Layout;
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            anyhow::bail!("pane is closed");
+        };
+        let layout = self.tabs.active_layout().context("no visible layout")?;
+        let (width, height, _) = tab
+            .surface
+            .area
+            .get()
+            .context("pane has not been drawn yet")?;
+        let metrics = tab.surface.metrics.get();
+        let mut edits = Vec::new();
+        for (axis, current, requested, extent, cell, padding) in [
+            (
+                Axis::Columns,
+                metrics.cols,
+                cols,
+                width,
+                metrics.cell_width,
+                2.0 * PADDING,
+            ),
+            (
+                Axis::Rows,
+                metrics.rows,
+                rows,
+                height,
+                metrics.cell_height,
+                2.0 * PADDING + STATUS_HEIGHT,
+            ),
+        ] {
+            if current == requested {
+                continue;
+            }
+            let (path, node, second_side) = layout.divider_for(id, axis).context(
+                "requested grid cannot fit on this axis within the visible split layout",
+            )?;
+            let Layout::Split { first, second, .. } = node else {
+                unreachable!()
+            };
+            let first_size = self
+                .layout_size(first)
+                .context("split is still being measured")?;
+            let second_size = self
+                .layout_size(second)
+                .context("split is still being measured")?;
+            let (a, b) = match axis {
+                Axis::Columns => (first_size.0, second_size.0),
+                Axis::Rows => (first_size.1, second_size.1),
+            };
+            // Aim inside the requested cell to absorb WinUI's physical-pixel rounding.
+            let delta = f64::from(padding + (requested as f32 + 0.25) * cell - extent);
+            let first_extent = if second_side { a - delta } else { a + delta };
+            let available = a + b;
+            anyhow::ensure!(
+                first_extent >= f64::from(padding + cell)
+                    && available - first_extent >= f64::from(padding + cell),
+                "requested grid does not fit while keeping both panes visible"
+            );
+            edits.push((path, first_extent / available));
+        }
+        for (path, ratio) in edits {
+            self.tabs.set_ratio(&path, ratio);
+        }
+        Ok(())
     }
 
     fn utility(&mut self, settings: bool, context: &ComponentContext<Self>) {
@@ -1311,7 +1671,7 @@ impl TerminalApp {
                 if settings {
                     matches!(t.value.page, Page::Settings)
                 } else {
-                    matches!(&t.value.page, Page::NewProfile(draft) if draft.original.is_none())
+                    matches!(&t.value.page, Page::NewProfile(draft) if matches!(draft.origin, DraftOrigin::New))
                 }
             })
             .map(|t| t.id);
@@ -1336,24 +1696,31 @@ impl TerminalApp {
     }
 
     fn edit_profile(&mut self, name: String, context: &ComponentContext<Self>) {
-        if let Some(id)=self.tabs.entries().iter().find(|tab|matches!(&tab.value.page,
-            Page::NewProfile(draft) if draft.original.as_ref().is_some_and(|(original,_)| original==&name))).map(|tab|tab.id) {
-            self.tabs.select(id);self.activate(context);return;
+        if let Some(id) = self
+            .tabs
+            .entries()
+            .iter()
+            .find(|tab| {
+                matches!(&tab.value.page,
+            Page::NewProfile(draft) if draft.origin.editing().is_some_and(|base| base.name==name))
+            })
+            .map(|tab| tab.id)
+        {
+            self.tabs.select(id);
+            self.activate(context);
+            return;
         }
-        let result = self.store.load().and_then(|profiles| {
-            let options = profiles
-                .get(&name)
-                .with_context(|| format!("Profile {name} was removed"))?
-                .clone();
-            Ok((profiles, options))
-        });
-        match result {
-            Ok((profiles, options)) => {
-                self.profiles = profiles;
+        match self.store.inspect_catalog(&name) {
+            Ok((catalog, base)) => {
+                self.profiles = catalog.profiles;
+                self.local_profiles = catalog.local;
                 self.profile_error = None;
                 self.tabs.insert(AppTab {
                     label: format!("Edit {name}"),
-                    page: Page::NewProfile(ProfileDraft::existing(name, options)),
+                    page: Page::NewProfile(ProfileDraft {
+                        origin: DraftOrigin::Edit(base.clone()),
+                        ..ProfileDraft::from_options(name, &base.options)
+                    }),
                 });
                 self.sync_selection(context);
                 self.activate(context);
@@ -1364,6 +1731,94 @@ impl TerminalApp {
             }
         }
     }
+    fn duplicate_profile(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        let Some(AppTab {
+            page: Page::NewProfile(draft),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let Some(base) = draft.origin.editing() else {
+            return;
+        };
+        let mut name = format!("{} copy", base.name);
+        let mut index = 2;
+        while self.profiles.contains_key(&name) || self.local_profiles.contains_key(&name) {
+            name = format!("{} copy {index}", base.name);
+            index += 1;
+        }
+        let copy = ProfileDraft {
+            origin: DraftOrigin::Copy(base.clone()),
+            ..ProfileDraft::from_options(name, &base.options)
+        };
+        self.tabs.insert(AppTab {
+            label: format!("Duplicate {}", base.name),
+            page: Page::NewProfile(copy),
+        });
+        self.sync_selection(context);
+        self.activate(context);
+    }
+
+    fn confirm_delete_profile(
+        &mut self,
+        id: TabId,
+        accept: bool,
+        context: &ComponentContext<Self>,
+    ) {
+        let Some(AppTab {
+            page: Page::NewProfile(draft),
+            ..
+        }) = self.tabs.get_mut(id)
+        else {
+            return;
+        };
+        if !std::mem::take(&mut draft.confirm_delete) || !accept {
+            return;
+        }
+        let Some(base) = draft.origin.editing() else {
+            return;
+        };
+        let catalog = match self.store.delete(base).and_then(|_| self.store.catalog()) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                draft.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let name = base.name.clone();
+        self.profiles = catalog.profiles;
+        self.local_profiles = catalog.local;
+        let linked: Vec<_> = self
+            .tabs
+            .entries()
+            .iter()
+            .filter(|tab| tab.value.ssh_profile_name() == Some(&name))
+            .map(|tab| tab.id)
+            .collect();
+        for linked_id in linked {
+            if let Some(AppTab {
+                page: Page::Terminal(live),
+                ..
+            }) = self.tabs.get_mut(linked_id)
+            {
+                live.profile_name = None;
+                if let Source::Ssh(options) = &mut live.source {
+                    options.player = live.session.player.read().unwrap().clone();
+                }
+            }
+        }
+        if self.default_profile.as_ref() == Some(&name)
+            && matches!(self.default_source, Source::Ssh(_))
+        {
+            self.default_profile = None;
+            self.default_source = Source::Demo;
+            self.default_label = LAB.into();
+        }
+        self.utility(true, context);
+        self.close_tab(id, context);
+    }
+
     fn save_profile(&mut self, id: TabId, context: &ComponentContext<Self>) {
         self.save_profile_action(id, true, context);
     }
@@ -1376,7 +1831,7 @@ impl TerminalApp {
             return;
         };
         let draft = draft.clone();
-        let result = (|| -> anyhow::Result<SshOptions> {
+        let result = (|| -> anyhow::Result<ProfileSnapshot> {
             let name = draft.name.trim();
             anyhow::ensure!(!name.is_empty(), "Enter a profile name");
             let host = draft.host.trim().trim_matches(['[', ']']);
@@ -1416,37 +1871,47 @@ impl TerminalApp {
                 host_key: (!draft.fingerprint.trim().is_empty())
                     .then(|| draft.fingerprint.trim().into()),
                 player: draft.player.clone(),
+                proxy_jump: draft.proxy_jump.clone(),
+                durable: draft.durable,
             };
-            if let Some((original, expected)) = &draft.original {
-                self.store.edit(original, name, &options, expected)?;
-            } else {
-                self.store.add(name, &options)?;
+            match &draft.origin {
+                DraftOrigin::New => self.store.add(name, &options)?,
+                DraftOrigin::Edit(base) => {
+                    self.store.edit(&base.name, name, &options, &base.options)?
+                }
+                DraftOrigin::Copy(base) => self.store.duplicate(base, name, &options)?,
             }
-            self.profiles = self.store.load()?;
+            let (catalog, saved) = self.store.inspect_catalog(name)?;
+            self.profiles = catalog.profiles;
+            self.local_profiles = catalog.local;
             self.profile_error = None;
-            Ok(self.profiles[name].clone())
+            Ok(saved)
         })();
         match result {
-            Ok(options) => {
+            Ok(saved) => {
+                let options = &saved.options;
                 let name = draft.name.trim().to_owned();
-                if let Some((original, _)) = &draft.original {
-                    if self.default_label == *original
+                if let Some(base) = draft.origin.editing() {
+                    let original = &base.name;
+                    if self.default_profile.as_ref() == Some(original)
                         && matches!(self.default_source, Source::Ssh(_))
                     {
                         self.default_label = name.clone();
+                        self.default_profile = Some(name.clone());
                         self.default_source = Source::Ssh(options.clone());
                     }
                     let ids: Vec<_> = self
                         .tabs
                         .entries()
                         .iter()
-                        .filter(|entry| entry.value.label == *original)
+                        .filter(|entry| entry.value.ssh_profile_name() == Some(original.as_str()))
                         .map(|entry| entry.id)
                         .collect();
                     for id in ids {
                         if let Some(tab) = self.tabs.get_mut(id) {
                             tab.label = name.clone();
-                            if let Page::Terminal(live) = &tab.page {
+                            if let Page::Terminal(live) = &mut tab.page {
+                                live.profile_name = Some(name.clone());
                                 *live.session.player.write().unwrap() = options.player.clone();
                             }
                         }
@@ -1461,12 +1926,14 @@ impl TerminalApp {
                 if let Some(tab) = self.tabs.get_mut(id) {
                     if connect {
                         *tab = live_tab(
-                            name,
-                            Source::Ssh(options),
+                            name.clone(),
+                            Source::Ssh(options.clone()),
                             self.appearance.read().unwrap().interaction.osc52,
-                        );
+                        )
+                        .with_profile(Some(name));
                     } else if let Page::NewProfile(editor) = &mut tab.page {
-                        editor.original = Some((name.clone(), options));
+                        editor.origin = DraftOrigin::Edit(saved);
+                        editor.confirm_delete = false;
                         editor.name = name.clone();
                         editor.error = None;
                         editor.saved = true;
@@ -1492,7 +1959,7 @@ impl TerminalApp {
         let tab_strip = TabView::new()
             .height(44.0)
             .width(
-                (self.tabs.entries().len() as f64 * 110.0 + 16.0)
+                (self.tabs.headers().len() as f64 * 110.0 + 16.0)
                     .min((self.width - 300.0).max(160.0)),
             )
             .is_add_tab_button_visible(false)
@@ -1514,9 +1981,9 @@ impl TerminalApp {
             })
             .collection_slot(
                 TabViewSlot::TabItems,
-                self.tabs.entries().iter().map(|tab| {
+                self.tabs.headers().into_iter().map(|tab| {
                     KeyedView::new(
-                        tab.id.to_string(),
+                        self.tabs.group_id(tab.id).unwrap().to_string(),
                         TabViewItem::new()
                             .header(&tab.value.label)
                             .tag(tab.id.to_string())
@@ -1529,6 +1996,11 @@ impl TerminalApp {
             .iter()
             .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
             .collect();
+        menu.extend(
+            self.local_profiles
+                .keys()
+                .map(|name| MenuItem::item(format!("local:{name}"), format!("{name} · Local"))),
+        );
         if self.profile_error.is_some() {
             menu.push(MenuItem::disabled("error", "Could not load profiles"));
         }
@@ -1550,7 +2022,9 @@ impl TerminalApp {
             _ => None,
         });
         let can_edit = self.tabs.active().is_some_and(|tab| {
-            matches!(tab.page, Page::Terminal(_)) && self.profiles.contains_key(&tab.label)
+            tab.profile_name().is_some_and(|name| {
+                self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
+            })
         });
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
@@ -1560,10 +2034,12 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
                 [
+                    self.pane_menu(),
                     MenuItem::item("paste", "Paste"),
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
+                    MenuItem::item("workspaces", "Workspaces…"),
                     state_menu_item(
                         "fullscreen",
                         "Fullscreen (F11)",
@@ -1623,116 +2099,92 @@ impl TerminalApp {
             )
     }
 
-    fn terminal_view(&self, id: TabId, tab: &LiveTab, context: &ViewContext<Self>) -> View {
-        if let Some(error) = &tab.error {
-            return StackPanel::new().spacing(12.0).children((
-                TextBlock::new().text(format!("Unable to render terminal: {error}")),
-                Button::new()
-                    .on_click(context.callback(move |_| Message::RetryRender(id)))
-                    .content(TextBlock::new().text("Retry rendering")),
-            ));
+    fn pane_menu(&self) -> MenuItem {
+        if self.tabs.active().and_then(AppTab::pane_id).is_none() {
+            return MenuItem::disabled("panes", "Panes");
         }
-        let renderer = self.renderer.clone();
-        let frames = tab.session.frames.clone();
-        let metrics = self.metrics.clone();
-        let sender = tab.session.input.clone();
-        let last_size = tab.last_size.clone();
-        let error_sender = context.sender();
-        let geometry_sender = context.sender();
-        let initial_grid = self.initial_grid.clone();
-        let window_state = self.windows.clone();
-        let window_size = (self.width, self.window_height);
-        let terminal_area = self.terminal_area.clone();
-        let selection = tab.selection.clone();
-        let hover = tab.hover.clone();
-        let canvas: View = Canvas::invalidated(&self.invalidator, move |ctx| {
-            let frame = frames.load();
-            let measured = renderer.borrow_mut().draw(ctx, &frame)?;
-            renderer.borrow().draw_interaction(
-                ctx,
-                &frame,
-                selection.borrow().as_ref(),
-                hover.borrow().as_ref(),
-            )?;
-            metrics.set(measured);
-            if initial_grid
-                .get()
-                .is_none_or(|grid| grid == (measured.cols, measured.rows))
-            {
-                window_state.borrow_mut().grid = Some((measured.cols, measured.rows));
-            }
-            let scale = measured.scale;
-            terminal_area.set(Some((ctx.width, ctx.height, scale)));
-            crate::input::set_grid(
-                measured.cell_width,
-                measured.cell_height,
-                ctx.width,
-                ctx.height,
-                scale,
-            );
-            if let Some(((cols, rows), first)) =
-                initial_grid.correction((measured.cols, measured.rows))
-            {
-                geometry_sender.send(Message::Geometry(
-                    window_size.0
-                        + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width) as f64,
-                    window_size.1
-                        + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
-                            - ctx.height) as f64,
-                    initial_grid.epoch(),
-                    first,
+        let mut items = vec![
+            MenuItem::item("split-right", "Split right"),
+            MenuItem::item("split-below", "Split below"),
+        ];
+        if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
+        {
+            items.push(MenuItem::item("files", "SFTP files"));
+        }
+        if let Some(AppTab {
+            page: Page::Terminal(live),
+            ..
+        }) = self.tabs.active()
+            && let Some(menu) = durable_view::pane_menu(live)
+        {
+            items.push(menu);
+        }
+        if !self.profiles.is_empty() || !self.local_profiles.is_empty() {
+            for (key, label) in [
+                ("right-profile", "Split right with"),
+                ("below-profile", "Split below with"),
+            ] {
+                items.push(MenuItem::submenu(
+                    key,
+                    format!("{label} profile"),
+                    self.profiles
+                        .keys()
+                        .chain(self.local_profiles.keys())
+                        .map(|name| MenuItem::item(name.clone(), format!("{label} {name}"))),
                 ));
-                return Ok(());
             }
-            let size = TerminalSize {
-                rows: measured.rows,
-                cols: measured.cols,
-                pixel_width: (measured.cols as f32 * measured.cell_width * scale).round() as usize,
-                pixel_height: (measured.rows as f32 * measured.cell_height * scale).round()
-                    as usize,
-                dpi: (96.0 * scale).round() as u32,
-            };
-            if last_size.replace(Some(size)) != Some(size) {
-                let _ = sender.send(Command::Resize(size));
+        }
+        if self
+            .tabs
+            .active_layout()
+            .is_some_and(|layout| matches!(layout, w11term::pane_layout::Layout::Split { .. }))
+        {
+            items.push(MenuItem::separator("pane-actions"));
+            for (key, label) in [
+                ("left", "Focus left"),
+                ("right", "Focus right"),
+                ("up", "Focus above"),
+                ("down", "Focus below"),
+            ] {
+                items.push(MenuItem::item(key, label));
             }
-            Ok(())
-        })
-        .on_error(move |error| {
-            error_sender.send(Message::RenderError(id, format!("{error:?}")));
-        })
-        .into();
-        Border::new()
-            .background(Color::rgb(14, 16, 20))
-            .capture_pointer_on_press(true)
-            .on_pointer_capture_lost(context.callback(move |_| Message::CaptureLost(id)))
-            .on_pointer_exited(context.callback(move |_| Message::PointerExit(id)))
-            .on_pointer_pressed(
-                context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Press)),
-            )
-            .on_pointer_released(
-                context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Release)),
-            )
-            .on_pointer_moved(
-                context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Move)),
-            )
-            .content(canvas)
+            items.push(MenuItem::item(
+                "zoom-pane",
+                if self.tabs.zoomed() {
+                    "Restore panes"
+                } else {
+                    "Zoom pane"
+                },
+            ));
+            items.push(MenuItem::item("close-pane", "Close pane"));
+            items.push(MenuItem::item("move-pane", "Move pane to new tab"));
+        }
+        MenuItem::submenu("panes", "Panes", items)
     }
 
     fn profile_form(&self, id: TabId, draft: &ProfileDraft, context: &ViewContext<Self>) -> View {
         let mut fields: Vec<View> = vec![
             TextBlock::new()
-                .text(if draft.original.is_some() {
-                    "Edit Profile"
-                } else {
-                    "New Profile"
+                .text(match draft.origin {
+                    DraftOrigin::Edit(_) => "Edit Profile",
+                    DraftOrigin::Copy(_) => "Duplicate Profile",
+                    DraftOrigin::New => "New Profile",
                 })
                 .font_size(26.0)
                 .into(),
         ];
-        if draft.original.is_some() {
+        if draft.origin.editing().is_some() {
             fields.push(TextBlock::new().text("Connection changes apply to new sessions. Sound and game options update open tabs.").text_wrapping(TextWrapping::Wrap).into());
         }
         // Keep the feedback slot mounted so save/error messages do not remount inputs.
+        if !draft.proxy_jump.is_empty() {
+            fields.push(
+                TextBlock::new()
+                    .text(config_import::jump_summary(&draft.proxy_jump))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+            );
+        }
         fields.push(
             TextBlock::new()
                 .text(draft.error.as_deref().unwrap_or(if draft.saved {
@@ -1836,10 +2288,20 @@ impl TerminalApp {
             );
             fields.push(TextBlock::new().text("Private key: Windows-user DPAPI encryption and a restricted ACL. For another host, append the copied public line to ~/.ssh/authorized_keys. OpenSSH cannot read the DPAPI file directly.").text_wrapping(TextWrapping::Wrap).into());
         }
+        fields.push(
+            CheckBox::new()
+                .is_checked(draft.durable)
+                .on_is_checked_changed(
+                    context.callback(move |v| {
+                        Message::Durability(durable_view::Action::Profile(id, v))
+                    }),
+                )
+                .content("Keep the remote shell running with zmx (Linux)"),
+        );
         for (name, label, value) in [
             (
                 "rustmush",
-                "Rustmush server (device-key enrollment)",
+                "RustMUSH server (device keys and session resume)",
                 draft.player.rustmush,
             ),
             (
@@ -1889,14 +2351,18 @@ impl TerminalApp {
                 .on_text_changed(context.callback(move |v| Message::DraftBell(id, v)))
                 .into(),
         );
-        if draft.original.is_some() {
+        if !matches!(draft.origin, DraftOrigin::New) {
             fields.push(
                 Button::new()
                     .style(ButtonStyle::Accent)
                     .automation_name("Save profile changes")
                     .is_enabled(!draft.generating)
                     .on_click(context.callback(move |_| Message::SaveProfileOnly(id)))
-                    .content("Save changes"),
+                    .content(if matches!(draft.origin, DraftOrigin::Copy(_)) {
+                        "Save copy"
+                    } else {
+                        "Save changes"
+                    }),
             );
         }
         fields.push(
@@ -1905,7 +2371,9 @@ impl TerminalApp {
                 .spacing(10.0)
                 .children((
                     Button::new()
-                        .style(draft.original.is_none().then_some(ButtonStyle::Accent))
+                        .style(
+                            matches!(draft.origin, DraftOrigin::New).then_some(ButtonStyle::Accent),
+                        )
                         .is_enabled(!draft.generating)
                         .on_click(context.callback(move |_| Message::SaveProfile(id)))
                         .content("Save and connect"),
@@ -1914,6 +2382,48 @@ impl TerminalApp {
                         .content(if draft.saved { "Close" } else { "Cancel" }),
                 )),
         );
+        if let Some(base) = draft.origin.editing() {
+            if draft.confirm_delete {
+                fields.push(TextBlock::new().text(format!("Delete saved profile “{}”? Open sessions stay connected and key files stay on disk.", base.name)).text_wrapping(TextWrapping::Wrap).into());
+                fields.push(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(10.0)
+                        .children((
+                            Button::new()
+                                .on_click(
+                                    context.callback(move |_| {
+                                        Message::ConfirmDeleteProfile(id, false)
+                                    }),
+                                )
+                                .content("Keep profile"),
+                            Button::new()
+                                .automation_name(format!("Confirm delete {}", base.name))
+                                .on_click(
+                                    context
+                                        .callback(move |_| Message::ConfirmDeleteProfile(id, true)),
+                                )
+                                .content("Delete saved profile"),
+                        )),
+                );
+            } else {
+                fields.push(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(10.0)
+                        .children((
+                            Button::new()
+                                .is_enabled(!draft.generating)
+                                .on_click(context.callback(move |_| Message::DuplicateProfile(id)))
+                                .content("Duplicate saved profile…"),
+                            Button::new()
+                                .is_enabled(!draft.generating)
+                                .on_click(context.callback(move |_| Message::DeleteProfile(id)))
+                                .content("Delete profile…"),
+                        )),
+                );
+            }
+        }
         ScrollViewer::new().content(
             StackPanel::new()
                 .spacing(14.0)
@@ -1942,9 +2452,13 @@ impl Component for TerminalApp {
         .expect("installing terminal input adapter");
         let store = ProfileStore::new(options.profiles_path.clone())
             .expect("resolving profile configuration path");
-        let (profiles, profile_error) = match store.load() {
-            Ok(p) => (p, None),
-            Err(e) => (BTreeMap::new(), Some(format!("{e:#}"))),
+        let (profiles, local_profiles, profile_error) = match store.catalog() {
+            Ok(p) => (p.profiles, p.local, None),
+            Err(e) => (
+                BTreeMap::new(),
+                LocalOptions::installed(),
+                Some(format!("{e:#}")),
+            ),
         };
         let label = options
             .initial_profile
@@ -2011,22 +2525,43 @@ impl Component for TerminalApp {
                 )
             })
             .unwrap_or((1120.0, 760.0));
-        tabs.insert(live_tab_sized(
-            label.clone(),
-            options.source.clone(),
-            size,
-            appearance.read().unwrap().interaction.osc52,
-        ));
-        for name in &options.extra_profiles {
-            if let Some(profile) = profiles.get(name) {
-                tabs.insert(live_tab_sized(
-                    name.clone(),
-                    Source::Ssh(profile.clone()),
+        let osc52 = appearance.read().unwrap().interaction.osc52;
+        if let Some(workspace) = &options.workspace {
+            workspace_view::append_resolved_workspace(
+                &mut tabs,
+                &workspace.layout,
+                workspace.sources.clone(),
+                osc52,
+            );
+        } else {
+            tabs.insert(
+                live_tab_sized(
+                    label.clone(),
+                    options.source.clone(),
                     size,
-                    appearance.read().unwrap().interaction.osc52,
-                ));
+                    osc52,
+                    None,
+                    None,
+                )
+                .with_profile(options.initial_profile.clone()),
+            );
+            for name in &options.extra_profiles {
+                if let Some(source) = profile_source(&profiles, &local_profiles, name) {
+                    tabs.insert(
+                        live_tab_sized(name.clone(), source, size, osc52, None, None)
+                            .with_profile(Some(name.clone())),
+                    );
+                }
             }
         }
+        // The initial cell target sizes the whole window. A split layout derives
+        // its individual PTY grids from the measured rectangle of each canvas.
+        let grid = grid.filter(|_| {
+            matches!(
+                tabs.active_layout(),
+                Some(w11term::pane_layout::Layout::Leaf(_))
+            )
+        });
         let registry = Registry::default();
         let (control_sender, control_rx) =
             std::sync::mpsc::sync_channel::<w11term::control::UiRequest>(8);
@@ -2046,6 +2581,8 @@ impl Component for TerminalApp {
         })
         .expect("starting local control pipe");
         let mut app = Self {
+            accessible: Default::default(),
+            active_group: None,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
             window_restored: options.cols.is_some() || options.rows.is_some(),
@@ -2055,16 +2592,17 @@ impl Component for TerminalApp {
             control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
             control_task: None,
             tabs,
-            renderer: Rc::new(RefCell::new(renderer)),
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
-            frame_task: None,
+            frame_tasks: BTreeMap::new(),
             watcher_retry: None,
             watch_epoch: 0,
             default_source: options.source.clone(),
             default_label: label,
+            default_profile: options.initial_profile.clone(),
             profiles,
+            local_profiles,
             store,
             profile_error,
             width: client_size.0,
@@ -2074,7 +2612,8 @@ impl Component for TerminalApp {
             appearance,
             fonts,
             appearance_error,
-            terminal_area: Rc::new(Cell::new(None)),
+            divider_drag: Rc::new(RefCell::new(None)),
+            measured_layout: None,
             mru: Vec::new(),
             switcher: None,
             selection_pending: true,
@@ -2085,9 +2624,25 @@ impl Component for TerminalApp {
         app.sync_selection(context);
         #[cfg(feature = "ui-smoke")]
         if std::env::var_os("W11TERM_UI_SMOKE").is_some() {
+            if let Some(fixture) = std::env::var_os("W11TERM_IMPORT_SMOKE") {
+                let expected = std::path::PathBuf::from(fixture).with_file_name("profiles.json");
+                assert_eq!(
+                    options.profiles_path.canonicalize().unwrap(),
+                    expected.canonicalize().unwrap(),
+                    "import smoke requires isolated profiles beside the fixture"
+                );
+            }
+            let loopback = matches!(&options.source, Source::Ssh(ssh)
+                if ssh.host == "127.0.0.1" && ssh.host_key.is_some() &&
+                    ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_FILE_SMOKE").is_some()))
+                     || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())
+                     || (ssh.user == "bench" && std::env::var_os("W11TERM_PROFILE_SMOKE").is_some())));
             assert!(
-                matches!(options.source, Source::Demo) && options.extra_profiles.is_empty(),
-                "UI smoke uses only the local lab"
+                (matches!(options.source, Source::Demo) || loopback)
+                    && options.extra_profiles.is_empty(),
+                "UI smoke requires a local lab or an explicit loopback fixture"
             );
             if std::env::var_os("W11TERM_PROFILE_SMOKE").is_some() {
                 let fixture = std::path::PathBuf::from(
@@ -2115,13 +2670,49 @@ impl Component for TerminalApp {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
-        if !matches!(&message, Message::FrameReady(..)) {
+        if !matches!(
+            &message,
+            Message::FrameReady(..)
+                | Message::Files(..)
+                | Message::PaneRatio(..)
+                | Message::DividerPress(..)
+                | Message::DividerEnd(..)
+                | Message::HoverPane(..)
+                | Message::PointerExit(..)
+                | Message::Pointer(_, _, MouseEventKind::Move)
+        ) {
             self.header.borrow_mut().take();
         }
         if matches!(&message, Message::Control(_)) {
             self.watch_control(context);
         }
         match message {
+            Message::Files(action) => self.file_action(action, context),
+            Message::AccessibleSelection(request) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active_id().and_then(|id| self.tabs.get_mut(id))
+                    && tab.session.pane_id == request.pane
+                    && tab.prompt_id.is_none()
+                    && !tab.find.open
+                    && self.switcher.is_none()
+                {
+                    let frame = tab.session.frames.load();
+                    if frame.generation == request.generation {
+                        *tab.selection.borrow_mut() = request.span.map(|(anchor, end)| {
+                            let mut selection = Selection::new(anchor, false, frame.alternate);
+                            selection.update(end);
+                            selection.active = true;
+                            selection.dragging = false;
+                            selection.observe(&frame);
+                            selection
+                        });
+                        self.keyboard.set_selection(request.span.is_some());
+                        tab.surface.invalidator.invalidate();
+                    }
+                }
+            }
             Message::DraftBell(id, value) => {
                 if let Some(AppTab {
                     page: Page::NewProfile(draft),
@@ -2138,16 +2729,16 @@ impl Component for TerminalApp {
             Message::DeviceAction(remove) => {
                 if let Some(id) = self.tabs.active_id()
                     && let Some(AppTab {
-                        label,
                         page: Page::Terminal(tab),
                         ..
                     }) = self.tabs.get_mut(id)
                     && !tab.device_busy
                 {
                     let result = (|| -> anyhow::Result<_> {
-                        let profile = self
-                            .profiles
-                            .get(label)
+                        let profile = tab
+                            .profile_name
+                            .as_ref()
+                            .and_then(|name| self.profiles.get(name))
                             .context("Use a saved Rustmush profile")?;
                         anyhow::ensure!(
                             profile.player.rustmush,
@@ -2203,7 +2794,6 @@ impl Component for TerminalApp {
                 let active = self.tabs.active_id() == Some(id);
                 let mut auth_update = None;
                 if let Some(AppTab {
-                    label,
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get_mut(id)
@@ -2212,6 +2802,8 @@ impl Component for TerminalApp {
                     tab.device_message = Some(match result {
                         Ok(fingerprint) => {
                             let result = (|| -> anyhow::Result<()> {
+                                let label =
+                                    tab.profile_name.as_ref().context("profile was removed")?;
                                 let mut profile = self
                                     .profiles
                                     .get(label)
@@ -2259,7 +2851,7 @@ impl Component for TerminalApp {
                 }
                 if let Some((label, auth)) = auth_update {
                     for entry in self.tabs.entries() {
-                        if entry.value.label == label
+                        if entry.value.ssh_profile_name() == Some(label.as_str())
                             && let Page::Terminal(tab) = &entry.value.page
                         {
                             let _ = tab.session.input.send(Command::Authenticate(auth.clone()));
@@ -2271,11 +2863,11 @@ impl Component for TerminalApp {
                 self.restore_window();
             }
             Message::TogglePlayer(field) => {
-                if let Some(AppTab {
-                    label,
-                    page: Page::Terminal(tab),
-                    ..
-                }) = self.tabs.active()
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.get_mut(id)
                 {
                     let mut player = tab.session.player.write().unwrap();
                     match field.as_str() {
@@ -2290,19 +2882,29 @@ impl Component for TerminalApp {
                         }
                         _ => {}
                     }
-                    if let Some(profile) = self.profiles.get_mut(label) {
-                        profile.player = player.clone();
-                        if let Err(error) = self.store.update(label, profile) {
-                            log::warn!("Saving player preferences: {error:#}");
-                        }
-                    }
                     let preferences = player.clone();
                     drop(player);
-                    for entry in self.tabs.entries() {
-                        if entry.value.label == *label
-                            && let Page::Terminal(other) = &entry.value.page
-                        {
-                            *other.session.player.write().unwrap() = preferences.clone();
+                    if let Source::Ssh(options) = &mut tab.source {
+                        options.player = preferences.clone();
+                    }
+                    if let Some(name) = tab
+                        .profile_name
+                        .clone()
+                        .filter(|_| matches!(tab.source, Source::Ssh(_)))
+                    {
+                        if let Some(profile) = self.profiles.get_mut(&name) {
+                            profile.player = preferences.clone();
+                            if let Err(error) = self.store.update(&name, profile) {
+                                log::warn!("Saving player preferences: {error:#}");
+                            }
+                        }
+                        for entry in self.tabs.entries() {
+                            if entry.id != id
+                                && entry.value.ssh_profile_name() == Some(name.as_str())
+                                && let Page::Terminal(other) = &entry.value.page
+                            {
+                                *other.session.player.write().unwrap() = preferences.clone();
+                            }
                         }
                     }
                 }
@@ -2330,21 +2932,17 @@ impl Component for TerminalApp {
                 {
                     self.watch_control(context);
                 }
-                if self
-                    .frame_task
-                    .as_ref()
-                    .is_none_or(|task| task.status() == ComponentTaskStatus::Rejected)
-                {
-                    self.watch_frames(context);
-                }
+                self.frame_tasks
+                    .retain(|_, task| task.status() != ComponentTaskStatus::Rejected);
+                self.watch_frames(context);
                 if self
                     .control_task
                     .as_ref()
                     .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
                     && self
-                        .frame_task
-                        .as_ref()
-                        .is_none_or(|task| task.status() != ComponentTaskStatus::Rejected)
+                        .frame_tasks
+                        .values()
+                        .all(|task| task.status() != ComponentTaskStatus::Rejected)
                 {
                     self.watcher_retry = None;
                 }
@@ -2357,11 +2955,8 @@ impl Component for TerminalApp {
                 reply,
             }) => {
                 let result = (|| -> anyhow::Result<serde_json::Value> {
-                    let ssh = self
-                        .profiles
-                        .get(&profile)
-                        .with_context(|| format!("unknown profile {profile}"))?
-                        .clone();
+                    let source = profile_source(&self.profiles, &self.local_profiles, &profile)
+                        .with_context(|| format!("unknown profile {profile}"))?;
                     let metrics = self.metrics.get();
                     let explicit_grid = cols.is_some() || rows.is_some();
                     anyhow::ensure!(
@@ -2381,11 +2976,14 @@ impl Component for TerminalApp {
                     };
                     let previous = self.tabs.active_id();
                     let tab = live_tab_sized(
-                        profile,
-                        Source::Ssh(ssh),
+                        profile.clone(),
+                        source,
                         size,
                         self.appearance.read().unwrap().interaction.osc52,
-                    );
+                        None,
+                        None,
+                    )
+                    .with_profile(Some(profile));
                     let pane = tab.pane_id().expect("new terminal has a pane ID");
                     self.tabs.insert(tab);
                     if !activate && let Some(previous) = previous {
@@ -2417,13 +3015,31 @@ impl Component for TerminalApp {
                     let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
                     return;
                 };
-                if self.tabs.active_id() == Some(tab_id) && self.windows.borrow().fullscreen() {
+                let split = self.tabs.visible(tab_id)
+                    && matches!(
+                        self.tabs.active_layout(),
+                        Some(w11term::pane_layout::Layout::Split { .. })
+                    );
+                if split && self.tabs.zoomed() {
+                    let _ =
+                        reply.send(Err("Unzoom the pane before resizing its split grid".into()));
+                    return;
+                }
+                if !split
+                    && self.tabs.active_id() == Some(tab_id)
+                    && self.windows.borrow().fullscreen()
+                {
                     let _ = reply.send(Err(
                         "Exit fullscreen before resizing the active window grid".into(),
                     ));
                     return;
                 }
-                if let Some(AppTab {
+                if split {
+                    if let Err(error) = self.resize_split(tab_id, cols, rows) {
+                        let _ = reply.send(Err(error.to_string()));
+                        return;
+                    }
+                } else if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get(tab_id)
@@ -2448,18 +3064,19 @@ impl Component for TerminalApp {
                             (rows as f64 - metrics.rows as f64) * metrics.cell_height as f64;
                         self.invalidator.invalidate();
                     }
-                    context.spawn_background(move |_| {
-                        std::thread::sleep(Duration::from_millis(300));
-                        Message::ControlResizeDone {
-                            pane,
-                            cols,
-                            rows,
-                            reply,
-                        }
-                    });
                 } else {
                     let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
+                    return;
                 }
+                context.spawn_background(move |_| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    Message::ControlResizeDone {
+                        pane,
+                        cols,
+                        rows,
+                        reply,
+                    }
+                });
             }
             Message::ControlResizeDone {
                 pane,
@@ -2619,18 +3236,30 @@ impl Component for TerminalApp {
                     }
                 }
             }
+            Message::Durability(action) => self.durability_action(action),
             #[cfg(feature = "ui-smoke")]
             Message::Smoke(step) => self.smoke_step(step, context),
             Message::FrameReady(id, epoch) => {
-                if self.tabs.active_id() == Some(id) && self.watch_epoch == epoch {
+                if self.tabs.visible(id) && self.watch_epoch == epoch {
+                    self.frame_tasks.remove(&id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
                     }) = self.tabs.get_mut(id)
                     {
                         tab.error = None;
+                        tab.files
+                            .observe_connection(tab.session.frames.load().connection_generation);
+                        let phase = tab.session.durable_state().map(|s| s.phase);
+                        if tab.durable_phase != phase {
+                            tab.durable_phase = phase;
+                            tab.confirm_end = false;
+                            self.header.borrow_mut().take();
+                        }
                     }
-                    self.connection_ui(id);
+                    if self.tabs.active_id() == Some(id) {
+                        self.connection_ui(id);
+                    }
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -2644,7 +3273,9 @@ impl Component for TerminalApp {
                             .is_some_and(|s| s.alternate != frame.alternate || s.cols != frame.cols)
                         {
                             tab.selection.borrow_mut().take();
-                            self.keyboard.set_selection(false);
+                            if self.tabs.active_id() == Some(id) {
+                                self.keyboard.set_selection(false);
+                            }
                         }
                         if let Some(selection) =
                             tab.selection.borrow_mut().as_mut().filter(|s| s.dragging)
@@ -2663,8 +3294,8 @@ impl Component for TerminalApp {
                                 });
                             }
                         }
+                        tab.surface.invalidator.invalidate();
                     }
-                    self.invalidator.invalidate();
                     self.watch_frames(context);
                 }
             }
@@ -2674,6 +3305,43 @@ impl Component for TerminalApp {
                 }
                 let _ = context.window().request_close();
             }
+            Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::PaneRatio(epoch, path, ratio) => {
+                if epoch == self.watch_epoch && self.dragging_divider(epoch, &path) {
+                    self.tabs.set_ratio(&path, ratio);
+                }
+            }
+            Message::PaneNeighbor(direction) => {
+                if self.tabs.focus_neighbor(direction) {
+                    self.activate(context);
+                }
+            }
+            Message::ZoomPane => {
+                if self.tabs.toggle_zoom() {
+                    self.activate(context);
+                }
+            }
+            Message::MovePaneToTab => {
+                if self.tabs.move_active_to_new_tab() {
+                    self.sync_selection(context);
+                    self.activate(context);
+                }
+            }
+            Message::ClosePane => {
+                if let Some(id) = self.tabs.active_id() {
+                    if self.tabs.active_layout().is_some_and(|layout| {
+                        matches!(layout, w11term::pane_layout::Layout::Split { .. })
+                    }) {
+                        self.keyboard.set_target(None);
+                        self.tabs.remove(id);
+                        self.sync_selection(context);
+                        self.activate(context);
+                    } else {
+                        self.close_tab(id, context);
+                    }
+                }
+            }
+            Message::SplitPane(axis, profile) => self.split_pane(axis, profile, context),
             Message::SyncSelection(epoch) => {
                 if self.selection_epoch == epoch {
                     self.selection_pending = false;
@@ -2683,7 +3351,7 @@ impl Component for TerminalApp {
                 if pending || self.selection_pending || epoch != self.selection_epoch {
                     return;
                 }
-                if let Some(id) = self.tabs.entries().get(index).map(|t| t.id)
+                if let Some(id) = self.tabs.headers().get(index).map(|t| t.id)
                     && self.tabs.active_id() != Some(id)
                 {
                     self.tabs.select(id);
@@ -2714,6 +3382,13 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
+                Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
+                Shortcut::FocusPane(direction) => {
+                    self.update(Message::PaneNeighbor(direction), context)
+                }
+                Shortcut::ZoomPane => self.update(Message::ZoomPane, context),
+                Shortcut::ClosePane => self.update(Message::ClosePane, context),
                 Shortcut::Fullscreen => {
                     if let Err(error) = self.windows.borrow_mut().toggle() {
                         log::warn!("Fullscreen: {error:#}");
@@ -2760,10 +3435,11 @@ impl Component for TerminalApp {
                 Shortcut::CancelTab => self.finish_switcher(false, context),
                 Shortcut::NewTab => self.open(
                     self.default_label.clone(),
-                    self.profiles
-                        .get(&self.default_label)
-                        .map(|options| Source::Ssh(options.clone()))
+                    self.default_profile
+                        .as_ref()
+                        .and_then(|name| profile_source(&self.profiles, &self.local_profiles, name))
                         .unwrap_or_else(|| self.default_source.clone()),
+                    self.default_profile.clone(),
                     context,
                 ),
                 Shortcut::CloseTab => {
@@ -2772,7 +3448,7 @@ impl Component for TerminalApp {
                     }
                 }
                 Shortcut::Select(index) => {
-                    if let Some(id) = self.tabs.entries().get(index).map(|t| t.id) {
+                    if let Some(id) = self.tabs.headers().get(index).map(|t| t.id) {
                         self.tabs.select(id);
                         self.activate(context);
                     }
@@ -2782,28 +3458,58 @@ impl Component for TerminalApp {
                 if label == NEW_PROFILE {
                     self.utility(false, context);
                 } else if label == LAB {
-                    self.open(LAB.into(), Source::Demo, context);
+                    self.open(LAB.into(), Source::Demo, None, context);
                 } else if let Some((name, profile)) = self
                     .profiles
                     .iter()
                     .find(|(name, ssh)| profile_label(name, ssh) == label)
                     .map(|(n, p)| (n.clone(), p.clone()))
                 {
-                    self.open(name, Source::Ssh(profile), context);
+                    self.open(name.clone(), Source::Ssh(profile), Some(name), context);
+                } else if let Some(name) = label.strip_suffix(" · Local")
+                    && let Some(shell) = self.local_profiles.get(name)
+                {
+                    self.open(
+                        name.into(),
+                        Source::Local(shell.clone()),
+                        Some(name.into()),
+                        context,
+                    );
                 }
             }
             Message::EditProfile(name) => self.edit_profile(name, context),
+            Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
+            Message::DeleteProfile(id) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && draft.origin.editing().is_some()
+                {
+                    draft.confirm_delete = true;
+                }
+            }
+            Message::ConfirmDeleteProfile(id, accept) => {
+                self.confirm_delete_profile(id, accept, context)
+            }
             Message::EditActiveProfile => {
                 if let Some(name) = self
                     .tabs
                     .active()
-                    .filter(|tab| self.profiles.contains_key(&tab.label))
-                    .map(|tab| tab.label.clone())
+                    .and_then(AppTab::profile_name)
+                    .map(str::to_owned)
                 {
-                    self.edit_profile(name, context);
+                    if self.profiles.contains_key(&name) {
+                        self.edit_profile(name, context);
+                    } else if self.local_profiles.contains_key(&name) {
+                        self.local_profile_action(local_profile::Action::Open(Some(name)), context);
+                    }
                 }
             }
             Message::SettingsMenu => self.utility(true, context),
+            Message::LocalProfile(action) => self.local_profile_action(action, context),
+            Message::Workspace(action) => self.workspace_action(action, context),
+            Message::ImportConfig(action) => self.import_action(action, context),
             Message::Paste => self.paste(false, context),
             Message::PasteRaw => self.paste(true, context),
             Message::RawPaste(result) => {
@@ -2876,14 +3582,26 @@ impl Component for TerminalApp {
                     tab.clicked_link = None;
                 }
             }
+            Message::DividerPress(epoch, path, coordinate) => {
+                if epoch == self.watch_epoch {
+                    self.begin_divider(&path, coordinate);
+                }
+            }
+            Message::DividerEnd(epoch, path) => {
+                if self.dragging_divider(epoch, &path) {
+                    self.divider_drag.borrow_mut().take();
+                }
+            }
+            Message::HoverPane(id) => self.keyboard.hover_pane(id),
             Message::PointerExit(id) => {
+                self.keyboard.leave_pane(id);
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get(id)
                 {
                     tab.hover.borrow_mut().take();
-                    self.invalidator.invalidate();
+                    tab.surface.invalidator.invalidate();
                 }
             }
             Message::DragScroll(id) => {
@@ -3088,6 +3806,38 @@ impl Component for TerminalApp {
     }
 
     fn view(&self, _options: &Options, context: &mut ViewContext<Self>) -> View {
+        if let Some(AppTab {
+            label,
+            page: Page::Terminal(tab),
+        }) = self.tabs.active()
+            && tab.prompt_id.is_none()
+            && !tab.find.open
+            && self.switcher.is_none()
+            && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
+        {
+            let metrics = tab.surface.metrics.get();
+            let sender = context.sender();
+            self.accessible.update(
+                parent,
+                crate::accessibility::Pane {
+                    id: tab.session.pane_id,
+                    label,
+                    frames: &tab.session.frames,
+                    geometry: crate::accessibility::Geometry {
+                        bounds,
+                        cell_width: f64::from(metrics.cell_width * metrics.scale),
+                        cell_height: f64::from(metrics.cell_height * metrics.scale),
+                        padding: f64::from(PADDING * metrics.scale),
+                    },
+                    selection: tab.selection.borrow().as_ref(),
+                },
+                move |request| {
+                    sender.send(Message::AccessibleSelection(request));
+                },
+            );
+        } else {
+            self.accessible.clear();
+        }
         let title = self
             .tabs
             .active()
@@ -3113,13 +3863,22 @@ impl Component for TerminalApp {
         });
         let content = if let Some(id) = self.tabs.active_id() {
             match &self.tabs.get(id).unwrap().page {
-                Page::Terminal(tab) => self.terminal_view(id, tab, context),
+                Page::Terminal(tab) => match self.tabs.active_layout() {
+                    Some(layout) if !self.tabs.zoomed() => {
+                        self.layout_view(layout, &mut Vec::new(), context)
+                    }
+                    _ => self.pane_view(id, tab, false, context),
+                },
                 Page::Settings => self.settings_view(context),
+                Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
+                Page::Workspaces(page) => self.workspace_view(id, page, context),
+                Page::ImportConfig(page) => self.import_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
             }
         } else {
             Border::new().into()
         };
+        let content = self.with_file_drawer(content, context);
         let mut views = vec![
             KeyedView::new(
                 "header",
@@ -3223,6 +3982,38 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_DURABLE_SMOKE").is_some() {
+            self.durable_smoke_step(step, context);
+            return;
+        }
+        if let Some(dir) = std::env::var_os("W11TERM_LOCAL_SMOKE") {
+            self.local_smoke_step(step, std::path::Path::new(&dir), context);
+            return;
+        }
+        if std::env::var_os("W11TERM_FILE_SMOKE").is_some() {
+            self.file_smoke_step(step, context);
+            return;
+        }
+        if std::env::var_os("W11TERM_IMPORT_SMOKE").is_some() {
+            self.import_smoke_step(step, context);
+            return;
+        }
+        if let Some(path) = std::env::var_os("W11TERM_UIA_SMOKE") {
+            self.accessibility_smoke(step, std::path::Path::new(&path), context);
+            return;
+        }
+        if std::env::var_os("W11TERM_IME_SMOKE").is_some() {
+            self.ime_smoke_step(step, context);
+            return;
+        }
+        if std::env::var_os("W11TERM_WORKSPACE_SMOKE").is_some() {
+            self.workspace_smoke_step(step, context);
+            return;
+        }
+        if std::env::var_os("W11TERM_SPLIT_SMOKE").is_some() {
+            self.split_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_PROFILE_SMOKE").is_some() {
             self.profile_smoke_step(step, context);
             return;
@@ -3266,7 +4057,7 @@ impl TerminalApp {
                         .unwrap();
                 }
             }
-            1 => self.open("Second lab".into(), Source::Demo, context),
+            1 => self.open("Second lab".into(), Source::Demo, None, context),
             2 => {
                 if let Page::Terminal(tab) = &self.tabs.get(2).unwrap().page {
                     tab.session
@@ -3371,17 +4162,24 @@ impl TerminalApp {
                         std::env::var_os("W11TERM_SETTINGS_PATH").is_some(),
                         "font smoke needs isolated settings"
                     );
+                    let current = self.appearance.read().unwrap().font_family.clone();
                     let index = self
                         .fonts
                         .iter()
                         .position(|font| font == "Cascadia Code")
-                        .expect("font smoke requires Cascadia Code");
+                        .or_else(|| self.fonts.iter().position(|font| font != &current))
+                        .unwrap_or(0);
+                    let selected = self
+                        .fonts
+                        .get(index)
+                        .expect("font smoke needs an installed curated terminal font")
+                        .clone();
                     self.update(Message::Font(Some(index)), context);
                     self.update(Message::Ligatures(false), context);
-                    assert_eq!(self.appearance.read().unwrap().font_family, "Cascadia Code");
+                    assert_eq!(self.appearance.read().unwrap().font_family, selected);
                     assert!(!self.appearance.read().unwrap().ligatures);
                     let saved = Appearance::load(&Appearance::path().unwrap()).unwrap();
-                    assert_eq!(saved.font_family, "Cascadia Code");
+                    assert_eq!(saved.font_family, selected);
                     assert!(!saved.ligatures);
                     assert!(
                         self.appearance_error.is_none(),
@@ -3425,11 +4223,23 @@ impl TerminalApp {
         match step {
             0 => {
                 assert!(std::env::var_os("W11TERM_DATA_DIR").is_some());
+                assert_eq!(self.tabs.get(1).unwrap().ssh_profile_name(), Some("typo"));
                 self.update(tab_menu_message("Mute: Off".into()), context);
                 let Page::Terminal(tab) = &self.tabs.get(1).unwrap().page else {
                     panic!()
                 };
                 assert!(tab.session.player.read().unwrap().mute);
+                // Another connection may display the same label without belonging to that profile.
+                self.open("typo".into(), Source::Demo, None, context);
+                let ad_hoc = self.tabs.active_id().unwrap();
+                self.update(tab_menu_message("Mute: Off".into()), context);
+                self.update(tab_menu_message("Mute: On".into()), context);
+                assert!(self.store.load().unwrap()["typo"].player.mute);
+                let Page::Terminal(named) = &self.tabs.get(1).unwrap().page else {
+                    panic!()
+                };
+                assert!(named.session.player.read().unwrap().mute);
+                self.close_tab(ad_hoc, context);
                 self.utility(true, context);
                 self.edit_profile("typo".into(), context);
             }
@@ -3467,6 +4277,8 @@ impl TerminalApp {
                 assert!(draft.saved, "{:?}", draft.error);
                 assert!(self.profiles.contains_key("corrected"));
                 assert!(!self.profiles.contains_key("typo"));
+                assert_eq!(self.tabs.get(1).unwrap().profile_name(), Some("corrected"));
+                assert_eq!(self.tabs.get(1).unwrap().label, "corrected");
                 let count = self.tabs.entries().len();
                 self.edit_profile("corrected".into(), context);
                 assert_eq!(self.tabs.entries().len(), count);
@@ -3495,6 +4307,59 @@ impl TerminalApp {
                 assert_eq!(self.tabs.entries().len(), 3);
                 self.save_profile(id, context);
             }
+            30 => {
+                let copy = self.tabs.active_id().unwrap();
+                let Page::NewProfile(draft) = &self.tabs.get(copy).unwrap().page else {
+                    panic!("expected copy form")
+                };
+                assert!(matches!(draft.origin, DraftOrigin::Copy(_)));
+                assert_eq!(draft.name, "corrected copy");
+                assert_eq!(draft.authentication, 2);
+                self.update(Message::Edit(copy, Field::Name, "second".into()), context);
+                self.update(Message::SaveProfileOnly(copy), context);
+                assert!(
+                    self.profiles.contains_key("corrected") && self.profiles.contains_key("second")
+                );
+                self.update(Message::DeleteProfile(copy), context);
+            }
+            31 => {
+                let copy = self.tabs.active_id().unwrap();
+                self.update(Message::ConfirmDeleteProfile(copy, false), context);
+                assert!(self.store.load().unwrap().contains_key("second"));
+                self.update(Message::DeleteProfile(copy), context);
+                self.update(Message::ConfirmDeleteProfile(copy, true), context);
+                assert!(!self.store.load().unwrap().contains_key("second"));
+                self.edit_profile("corrected".into(), context);
+                self.update(
+                    Message::DeleteProfile(self.tabs.active_id().unwrap()),
+                    context,
+                );
+            }
+            32 => {
+                let editor = self.tabs.active_id().unwrap();
+                let existing = self.tabs.entries().iter().find(|entry| {
+                    entry.value.ssh_profile_name() == Some("corrected")
+                        && matches!(&entry.value.page, Page::Terminal(live) if live.session.frames.load().connection_generation > 0)
+                }).expect("save-and-connect pane is connected to the loopback peer");
+                let pane = existing.value.pane_id().unwrap();
+                let entry = existing.id;
+                let options = self.profiles["corrected"].clone();
+                self.update(Message::ConfirmDeleteProfile(editor, true), context);
+                assert!(!self.profiles.contains_key("corrected"));
+                self.store.add("corrected", &options).unwrap();
+                self.profiles = self.store.load().unwrap();
+                let Page::Terminal(live) = &self.tabs.get(entry).unwrap().page else {
+                    panic!("connection was closed")
+                };
+                assert_eq!(live.profile_name, None);
+                assert_eq!(live.session.pane_id, pane);
+                assert!(live.session.frames.load().connection_generation > 0);
+                eprintln!(
+                    "Profile UI smoke passed: rename, duplicate, cancel and confirm deletion, live pane identity and save-and-connect"
+                );
+                self.update(Message::CloseWindow, context);
+                return;
+            }
             _ => {
                 let id = self.tabs.active_id().unwrap();
                 let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
@@ -3507,6 +4372,7 @@ impl TerminalApp {
                     assert!(step < 24, "loopback connection did not become ready");
                 } else {
                     assert_eq!(self.tabs.get(id).unwrap().label, "corrected");
+                    assert_eq!(tab.profile_name.as_deref(), Some("corrected"));
                     self.update(tab_menu_message("Remote named sounds: Off".into()), context);
                     assert!(
                         self.store.load().unwrap()["corrected"]
@@ -3514,10 +4380,15 @@ impl TerminalApp {
                             .remote_sounds_enabled()
                     );
                     assert!(matches!(self.tabs.get(1).unwrap().page, Page::Terminal(_)));
-                    eprintln!(
-                        "Profile UI smoke passed: stateful menu, prefill, rename, collision protection, save-only, independent new form, save and connect"
+                    self.edit_profile("corrected".into(), context);
+                    self.update(
+                        Message::DuplicateProfile(self.tabs.active_id().unwrap()),
+                        context,
                     );
-                    self.update(Message::CloseWindow, context);
+                    context.spawn_background(move |_| {
+                        std::thread::sleep(Duration::from_millis(500));
+                        Message::Smoke(30)
+                    });
                     return;
                 }
             }
@@ -3708,7 +4579,7 @@ impl TerminalApp {
                     tab.session.frames.load().search.as_ref().unwrap().selected,
                     Some(1)
                 );
-                self.open("Second search lab".into(), Source::Demo, context);
+                self.open("Second search lab".into(), Source::Demo, None, context);
             }
             7 => {
                 let Page::Terminal(tab) = &self.tabs.get(2).unwrap().page else {
@@ -3789,18 +4660,20 @@ mod profile_ui_tests {
                 port: 6792,
                 authentication,
                 host_key: Some("SHA256:test".into()),
+                proxy_jump: Vec::new(),
+                durable: false,
                 player: w11term::options::PlayerOptions {
                     mute: true,
                     game_mode: true,
                     ..Default::default()
                 },
             };
-            let draft = ProfileDraft::existing("existing".into(), options.clone());
+            let draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
             assert_eq!(draft.fingerprint, "SHA256:test");
             assert!(draft.player.mute && draft.player.game_mode);
-            assert_eq!(draft.original, Some(("existing".into(), options)));
+            assert_eq!(draft.name, "existing");
         }
     }
 }

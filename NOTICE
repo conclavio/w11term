@@ -14,3 +14,7 @@ vendor/wezterm-term/LICENSE.md.
 Local modifications are documented in vendor/wezterm-term/PATCHES.md.
 
 The vendored vtparse parser is from the same WezTerm revision and retains its MIT license in vendor/vtparse/LICENSE.md.
+
+The vendored wezterm-escape-parser is from the same WezTerm revision under
+the MIT license. See vendor/wezterm-escape-parser/LICENSE.md. The kitty
+placeholder diacritic indices are protocol data derived from Unicode 6.0.

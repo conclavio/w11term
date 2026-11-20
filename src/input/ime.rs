@@ -1,0 +1,555 @@
+//! Inline IMM32 composition for terminal canvases. The input window stays with
+//! WinUI, including its native candidate lists and input-method switching.
+use super::*;
+use windows::Win32::{
+    Graphics::Gdi::{ClientToScreen, MapWindowPoints},
+    UI::Input::Ime::*,
+};
+
+#[derive(Clone, Default)]
+pub(crate) struct Preedit {
+    pub text: String,
+    /// UTF-16 index supplied by the IME, also used by DirectWrite.
+    pub cursor: u32,
+}
+pub(crate) struct Surface {
+    sender: mpsc::UnboundedSender<Command>,
+    invalidator: windows_canvas::Invalidator,
+    caret: Box<dyn Fn() -> Option<RECT>>,
+}
+impl Surface {
+    pub(crate) fn new(
+        sender: mpsc::UnboundedSender<Command>,
+        invalidator: windows_canvas::Invalidator,
+        caret: impl Fn() -> Option<RECT> + 'static,
+    ) -> Self {
+        Self {
+            sender,
+            invalidator,
+            caret: Box::new(caret),
+        }
+    }
+}
+#[derive(Default)]
+struct Composition {
+    surface: Option<Surface>,
+    owner: Option<HWND>,
+    discarded: Option<HWND>,
+    preedit: Preedit,
+    offset: i32,
+    candidate_mask: u32,
+    positioned: Option<RECT>,
+}
+thread_local! {
+    static IME: RefCell<Composition> = RefCell::new(Composition::default());
+    static WINDOWS: RefCell<Vec<HWND>> = const {RefCell::new(Vec::new())};
+    static ASSOCIATION: std::cell::Cell<Option<(HWND,HIMC)>> = const {std::cell::Cell::new(None)};
+}
+impl Composition {
+    fn clear(&mut self) {
+        self.owner = None;
+        self.preedit = Preedit::default();
+        self.offset = 0;
+        self.positioned = None;
+        self.candidate_mask = 1;
+        if let Some(surface) = &self.surface {
+            surface.invalidator.invalidate();
+        }
+    }
+    fn update(
+        &mut self,
+        hwnd: HWND,
+        result: Option<String>,
+        preedit: Option<String>,
+        cursor: Option<u32>,
+    ) {
+        if self.owner != Some(hwnd) {
+            return;
+        }
+        let Some(surface) = &self.surface else { return };
+        if let Some(text) = result {
+            if !text.is_empty() {
+                let _ = surface.sender.send(Command::Composed(text));
+            }
+            self.preedit = Preedit::default();
+            self.offset = 0;
+        }
+        if let Some(text) = preedit {
+            self.preedit.text = text;
+        }
+        if let Some(cursor) = cursor {
+            self.preedit.cursor = cursor.min(self.preedit.text.encode_utf16().count() as u32);
+        }
+        surface.invalidator.invalidate();
+    }
+}
+
+pub(crate) fn set_surface(surface: Option<Surface>) {
+    IME.with_borrow_mut(|ime| ime.surface = surface);
+}
+pub(crate) fn preedit(sender: &mpsc::UnboundedSender<Command>) -> Option<Preedit> {
+    IME.with_borrow(|ime| {
+        (ime.owner.is_some() && ime.surface.as_ref()?.sender.same_channel(sender))
+            .then(|| ime.preedit.clone())
+    })
+}
+pub(crate) fn active() -> bool {
+    IME.with_borrow(|ime| ime.owner.is_some())
+}
+pub(crate) fn client_height() -> Option<i32> {
+    let hwnd = window()?;
+    let mut rect = RECT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect).ok()?;
+    }
+    Some(rect.bottom)
+}
+pub(crate) fn caret_box(
+    (pane_x, pane_y, w, h): (i32, i32, i32, i32),
+    metrics: crate::renderer::Metrics,
+    col: usize,
+    row: i64,
+) -> Option<RECT> {
+    if w <= 0 || h <= 0 || row < 0 || row as usize >= metrics.rows {
+        return None;
+    }
+    let px = |v: f32| (v * metrics.scale).round() as i32;
+    let left = pane_x
+        + px(crate::renderer::PADDING
+            + col.min(metrics.cols.saturating_sub(1)) as f32 * metrics.cell_width);
+    let top = pane_y + px(crate::renderer::PADDING + row as f32 * metrics.cell_height);
+    Some(RECT {
+        left,
+        top,
+        right: (left + px(metrics.cell_width)).min(pane_x + w),
+        bottom: (top + px(metrics.cell_height)).min(pane_y + h),
+    })
+}
+
+/// Each context obtained from the IMM belongs to the HWND it was acquired with.
+struct Context(HWND, HIMC);
+impl Context {
+    fn get(hwnd: HWND) -> Option<Self> {
+        let himc = unsafe { ImmGetContext(hwnd) };
+        (!himc.is_invalid()).then_some(Self(hwnd, himc))
+    }
+    fn string(&self, kind: IME_COMPOSITION_STRING) -> Option<String> {
+        let count = unsafe { ImmGetCompositionStringW(self.1, kind, None, 0) };
+        if count < 0 || count % 2 != 0 || count > 65536 {
+            return None;
+        }
+        let mut text = vec![0u16; count as usize / 2];
+        let actual = unsafe {
+            ImmGetCompositionStringW(self.1, kind, Some(text.as_mut_ptr().cast()), count as u32)
+        };
+        if actual < 0 || actual > count || actual % 2 != 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&text[..actual as usize / 2]))
+    }
+}
+impl Drop for Context {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ImmReleaseContext(self.0, self.1);
+        }
+    }
+}
+
+pub(super) fn cancel() {
+    let owner = IME.with_borrow_mut(|ime| {
+        let owner = ime.owner?;
+        ime.discarded = Some(owner);
+        ime.clear();
+        Some(owner)
+    });
+    if let Some(context) = owner.and_then(Context::get) {
+        // ImmNotifyIME can synchronously deliver END/COMPOSITION. Drop all RefCell
+        // borrows and forget the old destination before calling into the IME.
+        unsafe {
+            let _ = ImmNotifyIME(context.1, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+        }
+    }
+}
+
+fn eligible() -> bool {
+    INPUT.with(|state| {
+        state.try_borrow().ok().is_some_and(|state| {
+            state
+                .as_ref()
+                .is_some_and(|s| s.target.is_some() && !s.search && !s.modal && !s.switcher)
+        })
+    })
+}
+
+// Some non-editing island windows have no input context. Temporarily attach
+// the UI thread's default HIMC there; never replace a native editor's HIMC.
+pub(super) fn sync_context() {
+    let hwnd = unsafe { GetFocus() };
+    let wanted = (!hwnd.is_invalid() && eligible() && is_terminal(hwnd)).then_some(hwnd);
+    let current = ASSOCIATION.get();
+    if current.is_some_and(|(old, _)| Some(old) == wanted) {
+        return;
+    }
+    restore_context();
+    if let Some(hwnd) = wanted
+        && Context::get(hwnd).is_none()
+        && unsafe { ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT) }.as_bool()
+        && let Some(context) = Context::get(hwnd)
+    {
+        ASSOCIATION.set(Some((hwnd, context.1)));
+    }
+}
+
+fn restore_context() {
+    if let Some((hwnd, bound)) = ASSOCIATION.take()
+        && Context::get(hwnd).is_some_and(|context| context.1 == bound)
+    {
+        unsafe {
+            ImmAssociateContext(hwnd, HIMC::default());
+        }
+    }
+}
+pub(crate) fn position_after_draw(offset: f32, scale: f32) {
+    IME.with_borrow_mut(|ime| ime.offset = (offset * scale).round() as i32);
+    position(false);
+}
+fn position(force: bool) {
+    let update = IME.with_borrow_mut(|ime| {
+        let hwnd = ime.owner?;
+        let mut rect = (ime.surface.as_ref()?.caret)()?;
+        rect.left += ime.offset;
+        rect.right = rect.left + 1;
+        if !force && ime.positioned == Some(rect) {
+            return None;
+        }
+        ime.positioned = Some(rect);
+        Some((hwnd, rect, ime.candidate_mask))
+    });
+    let Some((hwnd, rect, mask)) = update else {
+        return;
+    };
+    let Some(context) = Context::get(hwnd) else {
+        return;
+    };
+    let Some(root) = window() else { return };
+    let mut points = [
+        POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+        POINT {
+            x: rect.right,
+            y: rect.bottom,
+        },
+    ];
+    unsafe {
+        MapWindowPoints(Some(root), Some(hwnd), &mut points);
+    }
+    let area = RECT {
+        left: points[0].x,
+        top: points[0].y,
+        right: points[1].x,
+        bottom: points[1].y,
+    };
+    for i in 0..4 {
+        if mask & (1 << i) != 0 {
+            let form = CANDIDATEFORM {
+                dwIndex: i,
+                dwStyle: CFS_EXCLUDE,
+                ptCurrentPos: points[0],
+                rcArea: area,
+            };
+            unsafe {
+                let _ = ImmSetCandidateWindow(context.1, &form);
+            }
+        }
+    }
+}
+
+pub(super) fn observe(hwnd: HWND, msg: u32) {
+    if !matches!(
+        msg,
+        WM_SETFOCUS | WM_IME_STARTCOMPOSITION | WM_IME_SETCONTEXT | WM_IME_COMPOSITION
+    ) || !is_terminal(hwnd)
+    {
+        return;
+    }
+    WINDOWS.with_borrow_mut(|hooks| {
+        if !hooks.contains(&hwnd) && unsafe { SetWindowSubclass(hwnd, Some(proc), 2, 0) }.as_bool()
+        {
+            hooks.push(hwnd);
+        }
+    });
+}
+pub(super) fn uninstall() {
+    cancel();
+    restore_context();
+    WINDOWS.with_borrow_mut(|hooks| {
+        for hwnd in hooks.drain(..) {
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(proc), 2);
+            }
+        }
+    });
+    IME.with_borrow_mut(|ime| *ime = Composition::default());
+}
+unsafe extern "system" fn proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _: usize,
+    _: usize,
+) -> LRESULT {
+    let handled =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(hwnd, msg, w, l)))
+            .ok()
+            .flatten();
+    handled.unwrap_or_else(|| unsafe { DefSubclassProc(hwnd, msg, w, l) })
+}
+fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+    let zero = Some(LRESULT(0));
+    if msg == WM_SETFOCUS {
+        sync_context();
+    }
+    if matches!(msg, WM_KILLFOCUS | WM_INPUTLANGCHANGE | WM_NCDESTROY)
+        && IME.with_borrow(|i| i.owner == Some(hwnd))
+    {
+        cancel();
+    }
+    if matches!(msg, WM_KILLFOCUS | WM_NCDESTROY)
+        && ASSOCIATION.get().is_some_and(|(owner, _)| owner == hwnd)
+    {
+        restore_context();
+    }
+    if msg == WM_NCDESTROY {
+        WINDOWS.with_borrow_mut(|hooks| hooks.retain(|h| *h != hwnd));
+        unsafe {
+            let _ = RemoveWindowSubclass(hwnd, Some(proc), 2);
+        }
+        return None;
+    }
+    if !matches!(
+        msg,
+        WM_IME_STARTCOMPOSITION
+            | WM_IME_COMPOSITION
+            | WM_IME_ENDCOMPOSITION
+            | WM_IME_SETCONTEXT
+            | WM_IME_REQUEST
+            | WM_IME_NOTIFY
+    ) {
+        return None;
+    }
+    if msg == WM_IME_STARTCOMPOSITION {
+        IME.with_borrow_mut(|i| i.discarded = None);
+        if !eligible() {
+            return None;
+        }
+        IME.with_borrow_mut(|i| {
+            i.clear();
+            i.owner = Some(hwnd);
+        });
+        INPUT.with(|state| {
+            if let Ok(state) = state.try_borrow()
+                && let Some(target) = state.as_ref().and_then(|s| s.target.as_ref())
+                && target.frames.load().scroll_offset > 0
+            {
+                let _ = target.sender.send(Command::ScrollEdge(false));
+            }
+        });
+        position(true);
+        return zero;
+    }
+    if msg == WM_IME_COMPOSITION && IME.with_borrow(|i| i.discarded == Some(hwnd)) {
+        return zero;
+    }
+    if msg == WM_IME_SETCONTEXT && w.0 != 0 && eligible() {
+        return Some(unsafe {
+            DefSubclassProc(
+                hwnd,
+                msg,
+                w,
+                LPARAM(l.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize)),
+            )
+        });
+    }
+    if !IME.with_borrow(|i| i.owner == Some(hwnd)) {
+        return None;
+    }
+    match msg {
+        WM_IME_COMPOSITION => {
+            let flags = l.0 as u32;
+            #[cfg(feature = "ui-smoke")]
+            if let Some((result, text, cursor)) = smoke::READ.with_borrow_mut(Option::take) {
+                IME.with_borrow_mut(|i| i.update(hwnd, result, text, cursor));
+                return zero;
+            }
+            let context = Context::get(hwnd)?;
+            let has = |kind: IME_COMPOSITION_STRING| flags & kind.0 != 0;
+            let result = has(GCS_RESULTSTR)
+                .then(|| context.string(GCS_RESULTSTR))
+                .flatten();
+            let text = if flags == 0 {
+                Some(String::new())
+            } else {
+                has(GCS_COMPSTR)
+                    .then(|| context.string(GCS_COMPSTR))
+                    .flatten()
+            };
+            let cursor = has(GCS_CURSORPOS).then(|| {
+                unsafe { ImmGetCompositionStringW(context.1, GCS_CURSORPOS, None, 0) }.max(0) as u32
+            });
+            IME.with_borrow_mut(|i| i.update(hwnd, result, text, cursor));
+            // Owning the result prevents the default procedure from generating
+            // a second WM_IME_CHAR / WM_CHAR for these same UTF-16 units.
+            zero
+        }
+        WM_IME_ENDCOMPOSITION => {
+            IME.with_borrow_mut(|i| i.clear());
+            zero
+        }
+        WM_IME_NOTIFY if matches!(w.0 as u32, IMN_OPENCANDIDATE | IMN_CHANGECANDIDATE) => {
+            IME.with_borrow_mut(|i| i.candidate_mask = (l.0 as u32 & 15).max(1));
+            position(true);
+            None
+        }
+        WM_IME_REQUEST if w.0 as u32 == IMR_QUERYCHARPOSITION && l.0 != 0 => {
+            // The operating system supplies this writable record for the call.
+            let query = unsafe { &mut *(l.0 as *mut IMECHARPOSITION) };
+            if query.dwSize < (std::mem::size_of::<IMECHARPOSITION>() as u32) {
+                return None;
+            }
+            let (rect, offset, cursor) = IME.with_borrow(|i| {
+                Some(((i.surface.as_ref()?.caret)()?, i.offset, i.preedit.cursor))
+            })?;
+            if query.dwCharPos != 0 && query.dwCharPos != cursor {
+                return None;
+            }
+            let mut point = POINT {
+                x: rect.left + if query.dwCharPos == 0 { 0 } else { offset },
+                y: rect.top,
+            };
+            let root = window()?;
+            unsafe {
+                ClientToScreen(root, &mut point).ok().ok()?;
+            }
+            query.pt = point;
+            query.cLineHeight = (rect.bottom - rect.top).max(1) as u32;
+            unsafe {
+                GetWindowRect(root, &mut query.rcDocument).ok()?;
+            }
+            Some(LRESULT(1))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "ui-smoke")]
+pub(crate) mod smoke {
+    use super::*;
+    // These fixtures stand in only for the data a language IME puts into HIMC.
+    // START, COMPOSITION, END and query requests still pass through User32.
+    type Strings = (Option<String>, Option<String>, Option<u32>);
+    thread_local! {pub(super) static READ: RefCell<Option<Strings>> = const{RefCell::new(None)};}
+    pub fn start() {
+        let hwnd = window().expect("terminal HWND");
+        unsafe {
+            SendMessageW(hwnd, WM_IME_STARTCOMPOSITION, None, None);
+        }
+    }
+    pub fn update(result: Option<&str>, text: Option<&str>, cursor: u32) {
+        READ.with_borrow_mut(|v| {
+            *v = Some((
+                result.map(str::to_owned),
+                text.map(str::to_owned),
+                Some(cursor),
+            ))
+        });
+        let flags = GCS_CURSORPOS.0
+            | if result.is_some() { GCS_RESULTSTR.0 } else { 0 }
+            | if text.is_some() { GCS_COMPSTR.0 } else { 0 };
+        unsafe {
+            SendMessageW(
+                window().unwrap(),
+                WM_IME_COMPOSITION,
+                None,
+                Some(LPARAM(flags as isize)),
+            );
+        }
+        READ.with_borrow_mut(Option::take);
+    }
+    pub fn query(cursor: u32) -> POINT {
+        let mut query = IMECHARPOSITION {
+            dwSize: std::mem::size_of::<IMECHARPOSITION>() as u32,
+            dwCharPos: cursor,
+            ..Default::default()
+        };
+        let hwnd = window().unwrap();
+        let handled = unsafe {
+            SendMessageW(
+                hwnd,
+                WM_IME_REQUEST,
+                Some(WPARAM(IMR_QUERYCHARPOSITION as usize)),
+                Some(LPARAM((&mut query as *mut IMECHARPOSITION) as isize)),
+            )
+        };
+        assert_eq!(handled, LRESULT(1));
+        unsafe {
+            windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut query.pt)
+                .ok()
+                .unwrap();
+        }
+        query.pt
+    }
+    pub fn end() {
+        unsafe {
+            SendMessageW(window().unwrap(), WM_IME_ENDCOMPOSITION, None, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn updates_stay_local_until_a_utf16_result_and_cancel_cannot_retarget() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let hwnd = HWND(std::ptr::dangling_mut());
+        let mut ime = Composition {
+            owner: Some(hwnd),
+            surface: Some(Surface::new(tx, Default::default(), || None)),
+            ..Default::default()
+        };
+        ime.update(hwnd, None, Some("かな".into()), Some(2));
+        assert_eq!(ime.preedit.text, "かな");
+        assert!(rx.try_recv().is_err());
+        ime.update(hwnd, Some("仮名🦀".into()), Some("次".into()), Some(1));
+        assert!(matches!(rx.try_recv(),Ok(Command::Composed(text)) if text=="仮名🦀"));
+        assert_eq!(ime.preedit.text, "次");
+        ime.clear();
+        ime.update(hwnd, Some("late".into()), None, None);
+        assert!(rx.try_recv().is_err());
+        assert!(ime.preedit.text.is_empty());
+    }
+    #[test]
+    fn caret_uses_canvas_offsets_and_fractional_dpi() {
+        let m = crate::renderer::Metrics {
+            cell_width: 8.0,
+            cell_height: 16.0,
+            cols: 80,
+            rows: 24,
+            scale: 1.5,
+        };
+        assert_eq!(
+            caret_box((300, 160, 500, 480), m, 2, 3),
+            Some(RECT {
+                left: 342,
+                top: 250,
+                right: 354,
+                bottom: 274
+            })
+        );
+        assert!(caret_box((0, 0, 500, 480), m, 1, -1).is_none());
+    }
+}

@@ -40,7 +40,7 @@ if ($screen.result.text -notmatch 'fps=') { throw 'HUD missing' }
 & $ctl --pid 12345 screenshot --pane $pane .\frame.png
 ```
 
-`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8; the limit is 1 MiB per command. A successful reply acknowledges the SSH channel write, **not remote application processing**. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown; retrying could duplicate input. Demo/replay panes reject raw input. Reconnecting panes reject raw writes and SFTP work rather than queuing them for a later connection.
+`send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8; the limit is 1 MiB per command. A successful reply acknowledges the write to the SSH channel or local ConPTY input pipe. The receiving program may still be processing it. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown; retrying could duplicate input. Demo/replay panes reject raw input. Reconnecting panes reject raw writes and SFTP work rather than queuing them for a later connection.
 
 `get-text` returns the current live screen, including alternate-screen TUI content. It excludes scrollback, trims trailing ASCII spaces on each row, and preserves the row count as `lines`. `text` joins those lines with LF. Graphics are not OCRed. Both text and screenshots include a snapshot generation to help correlate results. Reading does not change the user's scrollback position.
 
@@ -54,7 +54,7 @@ Each GUI owns `\\.\pipe\w11term-<pid>` and publishes `%LOCALAPPDATA%\w11term\ins
 {"version":1,"pid":12345,"pipe":"\\\\.\\pipe\\w11term-12345"}
 ```
 
-The pipe accepts only the process's Windows user and SYSTEM, and rejects remote clients. Treat access as permission to type into that user's SSH sessions and save screenshots with that user's filesystem permissions. Discovery records are removed on normal exit; stale records from a crash are ignored when the pipe cannot be opened.
+The pipe accepts only the process's Windows user and SYSTEM, and rejects remote clients. Treat access as permission to type into that user's SSH and local sessions and save screenshots with that user's filesystem permissions. Discovery records are removed on normal exit; stale records from a crash are ignored when the pipe cannot be opened.
 
 Open a new pipe connection for each command. Write one UTF-8 JSON object followed by LF; read one JSON reply followed by LF. Maximum request size is 2 MiB; at most eight requests run concurrently. The initial read and reply write time out after ten seconds. Input/snapshot requests have a ten-second execution timeout; the CLI allows thirty seconds for a reply to accommodate rendering.
 
@@ -95,7 +95,9 @@ Success returns `pane`, `matched`, `generation`, `cols`, `rows`, and matching sc
 `text`. It observes screen state, not every transient byte that may have appeared
 between snapshots.
 
-`resize` accepts the launch grid ranges. It resizes an active pane's window or a
+`resize` accepts the launch grid ranges. In a visible split it adjusts available dividers to reach the requested cell grid. Unzoom the focused pane before resizing it. A dimension fixed by the tab bounds, or a grid that leaves too little space for a sibling, produces a geometry error. The command keeps keyboard focus on its current pane.
+
+For a single pane it resizes an active pane's window or a
 background pane's PTY without selecting the pane or activating the window. Changes
 to the active grid require leaving fullscreen first. A grid that cannot fit the
 current display/window constraints fails clearly; geometry may

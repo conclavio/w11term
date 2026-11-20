@@ -1,0 +1,26 @@
+name: Kitty graphics reference
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install kitty 0.32.2 and the X11 capture environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends 'kitty=0.32.2-*' xvfb xauth xdotool imagemagick python3-pil libgl1-mesa-dri
+      - name: Capture the reference and compare cell colors
+        run: |
+          mkdir -p artifacts
+          dpkg-query -W kitty xvfb libgl1-mesa-dri > artifacts/versions.txt
+          xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: kitty-reference
+          path: artifacts

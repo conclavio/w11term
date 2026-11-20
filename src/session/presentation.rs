@@ -132,6 +132,15 @@ impl Presentation {
         }
         self.dirty = false;
     }
+    pub fn animation_deadline(&self, terminal: &Terminal) -> Option<Instant> {
+        if terminal.synchronized_output() || terminal.kitty_animation_deadline().is_none() {
+            return None;
+        }
+        self.frames
+            .load()
+            .animation_deadline(terminal)
+            .map(Instant::from_std)
+    }
     pub fn capture(&self) -> (Snapshot, wezterm_term::TerminalSize) {
         let frame = (*self.live.load()).clone();
         let size = frame.size;

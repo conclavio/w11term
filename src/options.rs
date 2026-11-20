@@ -4,6 +4,8 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+mod local;
+pub use local::LocalOptions;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "auth", rename_all = "kebab-case")]
@@ -67,8 +69,64 @@ pub struct SshOptions {
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_jump: Vec<JumpHost>,
+    #[serde(default)]
+    pub durable: bool,
     #[serde(default)]
     pub player: PlayerOptions,
+}
+
+pub const MAX_JUMPS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct JumpHost {
+    pub host: String,
+    pub user: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(flatten)]
+    pub authentication: Authentication,
+    pub host_key: Option<String>,
+}
+
+impl From<JumpHost> for SshOptions {
+    fn from(hop: JumpHost) -> Self {
+        Self {
+            host: hop.host,
+            user: hop.user,
+            port: hop.port,
+            authentication: hop.authentication,
+            host_key: hop.host_key,
+            proxy_jump: Vec::new(),
+            durable: false,
+            player: PlayerOptions::default(),
+        }
+    }
+}
+
+impl SshOptions {
+    pub(crate) fn validate_route(&self) -> Result<()> {
+        ensure!(
+            self.proxy_jump.len() <= MAX_JUMPS,
+            "at most {MAX_JUMPS} SSH jump hosts are supported"
+        );
+        for hop in &self.proxy_jump {
+            ensure!(
+                !hop.host.trim().is_empty() && !hop.user.trim().is_empty() && hop.port != 0,
+                "an SSH jump host requires a host, user and port"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authentications_mut(&mut self) -> impl Iterator<Item = &mut Authentication> {
+        std::iter::once(&mut self.authentication).chain(
+            self.proxy_jump
+                .iter_mut()
+                .map(|hop| &mut hop.authentication),
+        )
+    }
 }
 
 fn default_port() -> u16 {
@@ -94,19 +152,65 @@ fn default_profiles_path() -> PathBuf {
     local
 }
 
-#[derive(Deserialize)]
-pub(crate) struct Profiles {
-    pub(crate) profiles: BTreeMap<String, SshOptions>,
+pub struct Profiles {
+    pub profiles: BTreeMap<String, SshOptions>,
+    pub local: BTreeMap<String, LocalOptions>,
+}
+
+impl Profiles {
+    pub fn source(&self, name: &str) -> Option<Source> {
+        profile_source(&self.profiles, &self.local, name)
+    }
+}
+
+pub fn profile_source(
+    ssh: &BTreeMap<String, SshOptions>,
+    local: &BTreeMap<String, LocalOptions>,
+    name: &str,
+) -> Option<Source> {
+    ssh.get(name)
+        .cloned()
+        .map(Source::Ssh)
+        .or_else(|| local.get(name).cloned().map(Source::Local))
 }
 
 pub(crate) fn load_profiles(path: &Path) -> Result<Profiles> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Profiles {
+                profiles: BTreeMap::new(),
+                local: LocalOptions::installed(),
+            });
+        }
+        result => result.with_context(|| format!("reading {}", path.display()))?,
+    };
     parse_profiles(&bytes, path)
 }
 
 pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
-    let mut profiles: Profiles =
+    #[derive(Deserialize)]
+    struct Document {
+        profiles: BTreeMap<String, serde_json::Value>,
+    }
+    let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let mut profiles = Profiles {
+        profiles: BTreeMap::new(),
+        local: LocalOptions::installed(),
+    };
+    for (name, value) in document.profiles {
+        if value.get("backend").and_then(|v| v.as_str()) == Some("local") {
+            let mut local: LocalOptions =
+                serde_json::from_value(value).with_context(|| format!("local profile {name}"))?;
+            local.resolve_paths(path)?;
+            profiles.local.insert(name, local);
+        } else {
+            let ssh =
+                serde_json::from_value(value).with_context(|| format!("SSH profile {name}"))?;
+            profiles.local.remove(&name);
+            profiles.profiles.insert(name, ssh);
+        }
+    }
     for (name, ssh) in &mut profiles.profiles {
         ensure!(
             crate::assets::name(&ssh.player.bell),
@@ -121,7 +225,12 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
             !ssh.host.is_empty() && !ssh.user.is_empty() && ssh.port != 0,
             "profile {name}: host, user, and port must be nonempty"
         );
-        if let Authentication::Identity { identity } = &mut ssh.authentication {
+        ssh.validate_route()
+            .with_context(|| format!("profile {name}"))?;
+        for auth in ssh.authentications_mut() {
+            let Authentication::Identity { identity } = auth else {
+                continue;
+            };
             ensure!(
                 !identity.as_os_str().is_empty(),
                 "profile {name}: identity path is empty"
@@ -138,12 +247,14 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
 pub enum Source {
     Demo,
     Replay(PathBuf),
+    Local(LocalOptions),
     Ssh(SshOptions),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub source: Source,
+    pub workspace: Option<crate::workspace::WorkspaceLaunch>,
     pub benchmark: bool,
     pub smoke_seconds: Option<u64>,
     pub profiles_path: PathBuf,
@@ -162,6 +273,8 @@ impl Options {
         let mut args = args.into_iter();
         let mut source = Source::Demo;
         let mut profile = None;
+        let mut workspace_name = None;
+        let mut explicit_source = false;
         let mut profiles_path = default_profiles_path();
         let mut list_profiles = false;
         let mut port = None;
@@ -173,10 +286,14 @@ impl Options {
         let mut cols = None;
         let mut rows = None;
         while let Some(arg) = args.next() {
+            explicit_source |= matches!(
+                arg.as_str(),
+                "--demo" | "--replay" | "--profile" | "ssh" | "--tab"
+            );
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -189,6 +306,10 @@ impl Options {
                     profile = None;
                 }
                 "--profile" => profile = Some(value(&mut args, &arg)?),
+                "--workspace" => {
+                    ensure!(workspace_name.is_none(), "Choose one workspace");
+                    workspace_name = Some(value(&mut args, &arg)?);
+                }
                 "--tab" => extra_profiles.push(value(&mut args, &arg)?),
                 "--cols" => cols = Some(value(&mut args, &arg)?.parse::<usize>()?),
                 "--rows" => rows = Some(value(&mut args, &arg)?.parse::<usize>()?),
@@ -213,6 +334,8 @@ impl Options {
                         port: 22,
                         authentication: Authentication::Agent,
                         host_key: None,
+                        proxy_jump: Vec::new(),
+                        durable: false,
                         player: Default::default(),
                     });
                 }
@@ -245,8 +368,16 @@ impl Options {
                 _ => bail!("unknown argument: {arg}; use --help"),
             }
         }
+        ensure!(
+            workspace_name.is_none() || !(explicit_source || list_profiles || benchmark),
+            "--workspace cannot be combined with a terminal source, --tab, --list-profiles or --benchmark"
+        );
         if list_profiles {
-            for (name, ssh) in load_profiles(&profiles_path)?.profiles {
+            let catalog = load_profiles(&profiles_path)?;
+            for (name, shell) in &catalog.local {
+                println!("{name:16} {} (local)", shell.executable.display());
+            }
+            for (name, ssh) in catalog.profiles {
                 println!(
                     "{name:16} {}@{}:{} ({})",
                     ssh.user,
@@ -263,25 +394,19 @@ impl Options {
             }
             return Ok(None);
         }
-        let initial_profile = profile.clone();
+        let initial_profile = profile
+            .clone()
+            .filter(|_| port.is_none() && authentication.is_none() && host_key.is_none());
         if !extra_profiles.is_empty() {
             let profiles = load_profiles(&profiles_path)?;
             for name in &extra_profiles {
-                ensure!(
-                    profiles.profiles.contains_key(name),
-                    "unknown profile {name}"
-                );
+                ensure!(profiles.source(name).is_some(), "unknown profile {name}");
             }
         }
         if let Some(name) = profile {
-            source = Source::Ssh(
-                load_profiles(&profiles_path)?
-                    .profiles
-                    .remove(&name)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unknown profile {name}; use --list-profiles")
-                    })?,
-            );
+            source = load_profiles(&profiles_path)?
+                .source(&name)
+                .with_context(|| format!("unknown profile {name}; use --list-profiles"))?;
         }
         if let Source::Ssh(ssh) = &mut source {
             if let Some(port) = port {
@@ -334,8 +459,19 @@ impl Options {
             rows.is_none_or(|n| (1..=500).contains(&n)),
             "--rows must be 1..500"
         );
+        let workspace = workspace_name
+            .as_deref()
+            .map(|name| {
+                crate::workspace::WorkspaceLaunch::load(
+                    &crate::workspace::WorkspaceStore::open()?,
+                    name,
+                    &profiles_path,
+                )
+            })
+            .transpose()?;
         Ok(Some(Self {
             source,
+            workspace,
             benchmark,
             smoke_seconds,
             profiles_path,
@@ -355,6 +491,38 @@ fn value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workspace_is_the_only_launch_source_and_overridden_profiles_are_ad_hoc() {
+        let parse = |args: &[&str]| Options::parse_from(args.iter().map(|s| s.to_string()));
+        for source in [
+            vec!["--demo"],
+            vec!["--profile", "root"],
+            vec!["--tab", "root"],
+            vec!["ssh", "alice@localhost"],
+        ] {
+            let mut args = vec!["--workspace", "desk"];
+            args.extend(source);
+            assert!(
+                parse(&args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--workspace cannot")
+            );
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(&path, include_str!("../profiles.json")).unwrap();
+        let mut args = vec!["--profiles", path.to_str().unwrap(), "--profile", "root"];
+        assert_eq!(
+            parse(&args).unwrap().unwrap().initial_profile.as_deref(),
+            Some("root")
+        );
+        args.extend(["--port", "2222"]);
+        let launch = parse(&args).unwrap().unwrap();
+        assert!(launch.initial_profile.is_none());
+        assert!(matches!(launch.source, Source::Ssh(ssh) if ssh.port == 2222));
+    }
 
     #[test]
     fn remote_extensions_follow_game_profiles_with_explicit_overrides() {

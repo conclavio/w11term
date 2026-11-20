@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::Instant,
 };
 
@@ -195,11 +195,57 @@ pub fn open_flags(flags: &[String]) -> Result<OpenFlags> {
     Ok(result)
 }
 
+/// Bytes written to the local file or acknowledged by the remote server.
+/// The total is a metadata estimate. Completion is reported by the job reply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransferProgress {
+    pub bytes: u64,
+    pub total: Option<u64>,
+}
+
+fn report(progress: Option<&watch::Sender<TransferProgress>>, bytes: u64, total: Option<u64>) {
+    if let Some(progress) = progress {
+        progress.send_replace(TransferProgress {
+            bytes,
+            total: total.filter(|size| *size >= bytes),
+        });
+    }
+}
+
+type JobResult = Result<Value, String>;
+
 #[derive(Debug)]
 pub struct Job {
     pub operation: Operation,
     pub deadline: Instant,
-    pub reply: oneshot::Sender<Result<Value, String>>,
+    pub reply: oneshot::Sender<JobResult>,
+    pub progress: Option<watch::Sender<TransferProgress>>,
+}
+
+// The SSH transport aborts its SFTP worker when the connection goes away.
+// Preserve the uncertain outcome of an admitted request across that teardown.
+struct PendingReply {
+    sender: Option<oneshot::Sender<JobResult>>,
+    uploading: bool,
+}
+
+impl PendingReply {
+    fn finish(mut self, result: JobResult) -> Result<(), JobResult> {
+        self.sender.take().unwrap().send(result)
+    }
+}
+
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let message = if self.uploading {
+                "SFTP upload interrupted; remote destination may contain a partial file"
+            } else {
+                "SFTP operation interrupted; outcome may be unknown"
+            };
+            let _ = sender.send(Err(message.into()));
+        }
+    }
 }
 
 pub(crate) async fn run(
@@ -219,6 +265,7 @@ pub(crate) async fn run(
             operation,
             deadline,
             reply,
+            progress,
         } = job;
         if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
             continue;
@@ -239,13 +286,21 @@ pub(crate) async fn run(
             operation,
             Operation::Open { .. } | Operation::Opendir { .. }
         );
+        let reply = PendingReply {
+            sender: Some(reply),
+            uploading: matches!(operation, Operation::Put { .. }),
+        };
         // Finish an admitted request even if its caller disappears. Cancelling a
         // read must not reset the shared SFTP channel and invalidate CLI handles.
         let result = match tokio::time::timeout_at(deadline, async {
             if engine.is_none() {
                 engine = Some(Engine::connect(&session).await?);
             }
-            engine.as_mut().unwrap().execute(operation).await
+            engine
+                .as_mut()
+                .unwrap()
+                .execute(operation, progress.as_ref())
+                .await
         })
         .await
         {
@@ -269,14 +324,14 @@ pub(crate) async fn run(
                 ))
             }
         };
-        if let Err(Ok(value)) = reply.send(result.map_err(|e| format!("SFTP: {e:#}")))
+        if let Err(Ok(value)) = reply.finish(result.map_err(|e| format!("SFTP: {e:#}")))
             && creates_handle
             && let Some(handle) = value["handle"].as_u64()
             && let Some(active) = engine.as_mut()
         {
             let closed = tokio::time::timeout(
                 Duration::from_secs(5),
-                active.execute(Operation::Close { handle }),
+                active.execute(Operation::Close { handle }, None),
             )
             .await;
             if !matches!(closed, Ok(Ok(_))) {
@@ -392,7 +447,11 @@ impl Engine {
         self.handles.insert(id, Handle { remote, directory });
         Ok(json!({"handle":id,"directory":directory}))
     }
-    async fn execute(&mut self, op: Operation) -> Result<Value> {
+    async fn execute(
+        &mut self,
+        op: Operation,
+        progress: Option<&watch::Sender<TransferProgress>>,
+    ) -> Result<Value> {
         use Operation::*;
         let ok = json!({});
         Ok(match op {
@@ -404,12 +463,15 @@ impl Engine {
                 local,
                 overwrite,
                 max_bytes,
-            } => self.get(remote, local, overwrite, max_bytes).await?,
+            } => {
+                self.get(remote, local, overwrite, max_bytes, progress)
+                    .await?
+            }
             Put {
                 local,
                 remote,
                 overwrite,
-            } => self.put(local, remote, overwrite).await?,
+            } => self.put(local, remote, overwrite, progress).await?,
             Opendir { path } => {
                 let h = self.raw.opendir(path).await?.handle;
                 self.remember(h, true).await?
@@ -587,6 +649,7 @@ impl Engine {
         local: PathBuf,
         overwrite: bool,
         max_bytes: Option<u64>,
+        progress: Option<&watch::Sender<TransferProgress>>,
     ) -> Result<Value> {
         ensure!(local.is_absolute(), "local path must be absolute");
         if !overwrite {
@@ -608,6 +671,17 @@ impl Engine {
             .await?
             .handle;
         let copied = async {
+            // Some servers omit size or disallow FSTAT on readable files.
+            let total = if progress.is_some() {
+                match self.raw.fstat(&h).await {
+                    Ok(reply) => reply.attrs.size,
+                    Err(error) if transport_error(&error) => return Err(error.into()),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            report(progress, 0, total);
             let mut offset = 0u64;
             loop {
                 match self.raw.read(&h, offset, self.read_size as u32).await {
@@ -628,9 +702,8 @@ impl Engine {
                             "download exceeds --max-bytes limit"
                         );
                         file.write_all(&data.data).await?;
-                        offset = offset
-                            .checked_add(data.data.len() as u64)
-                            .context("file size overflow")?;
+                        offset = next;
+                        report(progress, offset, total);
                     }
                     Err(e) if eof(&e) => break,
                     Err(e) => return Err(e.into()),
@@ -655,15 +728,21 @@ impl Engine {
         .await??;
         Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
     }
-    async fn put(&self, local: PathBuf, remote: String, overwrite: bool) -> Result<Value> {
+    async fn put(
+        &self,
+        local: PathBuf,
+        remote: String,
+        overwrite: bool,
+        progress: Option<&watch::Sender<TransferProgress>>,
+    ) -> Result<Value> {
         ensure!(local.is_absolute(), "local path must be absolute");
         let mut file = tokio::fs::File::open(&local)
             .await
             .context("opening local source")?;
-        ensure!(
-            file.metadata().await?.is_file(),
-            "local source must be a regular file"
-        );
+        let metadata = file.metadata().await?;
+        ensure!(metadata.is_file(), "local source must be a regular file");
+        let total = Some(metadata.len());
+        report(progress, 0, total);
         let flags = OpenFlags::WRITE
             | OpenFlags::CREATE
             | if overwrite {
@@ -688,6 +767,7 @@ impl Engine {
                 offset = offset
                     .checked_add(len as u64)
                     .context("file size overflow")?;
+                report(progress, offset, total);
             }
             Ok::<u64, anyhow::Error>(offset)
         }

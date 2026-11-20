@@ -3469,6 +3469,7 @@ dependencies = [
  "regex",
  "russh",
  "russh-sftp",
+ "semver",
  "serde",
  "serde_json",
  "sha1",
@@ -3476,11 +3477,13 @@ dependencies = [
  "tempfile",
  "termwiz",
  "tokio",
+ "wezterm-bidi",
  "wezterm-input-types",
  "wezterm-term",
  "windows",
  "windows-canvas",
  "windows-core 0.100.0",
+ "windows-core 0.62.2",
  "windows-numerics 0.3.1",
  "windows-reactor",
  "windows-reactor-setup",
@@ -3650,7 +3653,6 @@ dependencies = [
 [[package]]
 name = "wezterm-escape-parser"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=e2a98e1b8af156988ad0ac778658ac27b60a55fb#e2a98e1b8af156988ad0ac778658ac27b60a55fb"
 dependencies = [
  "base64",
  "bitflags 2.13.2",

@@ -8,7 +8,11 @@ use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+mod placement;
+mod playback;
+use placement::ProjectedPlacement;
+use playback::Playback;
 use wezterm_cell::image::ImageDataType;
 use wezterm_escape_parser::apc::{
     KittyFrameCompositionMode, KittyImage, KittyImageCompression, KittyImageData, KittyImageDelete,
@@ -24,19 +28,22 @@ pub struct KittyImageState {
     number_to_id: HashMap<u32, u32>,
     id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
+    playback: HashMap<u32, Playback>,
+    projected: HashMap<(u32, Option<u32>), ProjectedPlacement>,
+    history_anchors: std::sync::Mutex<placement::HistoryAnchors>,
     used_memory: usize,
     accumulated_bytes: usize,
 }
 
 impl KittyImageState {
     fn remove_data_for_id(&mut self, image_id: u32) {
+        self.playback.remove(&image_id);
         if let Some(data) = self.id_to_data.remove(&image_id) {
             self.used_memory = self.used_memory.saturating_sub(data.len());
         }
     }
 
     fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) -> anyhow::Result<()> {
-        // Deduplicated images can be mutated through another image id.
         self.used_memory = self.id_to_data.values().map(|data| data.len()).sum();
         self.prune_unreferenced();
         let old = self.id_to_data.get(&image_id).map_or(0, |data| data.len());
@@ -60,7 +67,12 @@ impl KittyImageState {
     fn prune_unreferenced(&mut self) {
         let budget = 32 * 1024 * 1024;
         if self.used_memory > budget {
-            let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
+            let referenced: HashSet<u32> = self
+                .placements
+                .keys()
+                .chain(self.projected.keys())
+                .map(|(k, _)| *k)
+                .collect();
             let target = self.used_memory - budget;
             let mut freed = 0;
             self.id_to_data.retain(|id, data| {
@@ -80,6 +92,7 @@ impl KittyImageState {
             self.used_memory = self.used_memory.saturating_sub(freed);
             let table = &self.id_to_data;
             self.number_to_id.retain(|_, id| table.contains_key(id));
+            self.playback.retain(|id, _| table.contains_key(id));
         }
     }
 }
@@ -116,9 +129,6 @@ impl TerminalState {
             placement,
             verbosity
         );
-        if image_id != 0 {
-            self.kitty_remove_placement(image_id, placement.placement_id);
-        }
         let img = Arc::clone(self.kitty_img.id_to_data.get(&image_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "no matching image id {} in id_to_data for image_number {:?}",
@@ -126,6 +136,45 @@ impl TerminalState {
                 image_number
             )
         })?);
+
+        let key = (image_id, placement.placement_id);
+        let parent = match self.validate_kitty_parent(key, &placement) {
+            Ok(parent) => parent,
+            Err(reason) => {
+                self.kitty_send_response(
+                    verbosity,
+                    false,
+                    Some(image_id),
+                    image_number,
+                    reason.into(),
+                );
+                return Ok(());
+            }
+        };
+        if !self.kitty_img.placements.contains_key(&key)
+            && !self.kitty_img.projected.contains_key(&key)
+            && self.kitty_img.placements.len() + self.kitty_img.projected.len() >= 1024
+        {
+            self.kitty_send_response(
+                verbosity,
+                false,
+                Some(image_id),
+                image_number,
+                "ENOSPC".into(),
+            );
+            return Ok(());
+        }
+        // Repositioning an existing parent preserves its dependent placements.
+        if let Some(info) = self.kitty_img.placements.remove(&key) {
+            self.kitty_remove_placement_from_model(image_id, placement.placement_id, info);
+        }
+        self.kitty_img.projected.remove(&key);
+        if placement.virtual_placement || parent.is_some() {
+            self.kitty_img
+                .projected
+                .insert(key, ProjectedPlacement { placement, parent });
+            return Ok(());
+        }
 
         let (image_width, image_height) = img.data().dimensions()?;
 
@@ -183,21 +232,19 @@ impl TerminalState {
                 let image_id = self.kitty_img_transmit(transmit, verbosity)?;
                 self.kitty_img_place(Some(image_id), image_number, placement, verbosity)
             }
+            KittyImage::TransmitFrame {
+                transmit,
+                frame,
+                verbosity,
+            } => self.kitty_frame_transmit(transmit, frame, verbosity),
             _ => anyhow::bail!("impossible KittImage variant"),
         }
     }
 
-    pub(crate) fn kitty_img(&mut self, img: KittyImage) -> anyhow::Result<()> {
+    pub(crate) fn kitty_img(&mut self, mut img: KittyImage) -> anyhow::Result<()> {
         log::trace!("{:?}", img);
         if !self.config.enable_kitty_graphics() {
             return Ok(());
-        }
-        if matches!(&img, KittyImage::Query { transmit } | KittyImage::TransmitFrame { transmit, .. }
-            if transmit.more_data_follows)
-        {
-            self.kitty_img.accumulated_bytes = 0;
-            self.kitty_img.accumulator.clear();
-            anyhow::bail!("chunked kitty query/animation is unsupported");
         }
         let verbosity = img.verbosity();
         if let KittyImage::TransmitData { transmit, .. }
@@ -220,12 +267,19 @@ impl TerminalState {
                 anyhow::bail!("kitty image transmission exceeds 48 MiB");
             }
             if transmit.more_data_follows {
+                if matches!(&img, KittyImage::Query { .. })
+                    || self.kitty_img.accumulator.len() >= 16384
+                {
+                    self.kitty_img.accumulated_bytes = 0;
+                    self.kitty_img.accumulator.clear();
+                    anyhow::bail!("unsupported kitty query continuation or too many chunks");
+                }
                 self.kitty_img.accumulated_bytes += bytes;
-            } else if !matches!(
-                img,
-                KittyImage::TransmitData { .. } | KittyImage::TransmitDataAndDisplay { .. }
-            ) {
-                self.kitty_img.accumulated_bytes = 0;
+                self.kitty_img.accumulator.push(img);
+                return Ok(());
+            }
+            if transmission(&mut img).is_some() {
+                return self.kitty_img_inner(img);
             }
         }
         match img {
@@ -249,48 +303,6 @@ impl TerminalState {
                     );
                 }
             },
-            KittyImage::TransmitData {
-                transmit,
-                verbosity,
-            } => {
-                let more_data_follows = transmit.more_data_follows;
-                let img = KittyImage::TransmitData {
-                    transmit,
-                    verbosity,
-                };
-                if more_data_follows {
-                    if self.kitty_img.accumulator.len() >= 16384 {
-                        self.kitty_img.accumulator.clear();
-                        self.kitty_img.accumulated_bytes = 0;
-                        anyhow::bail!("too many kitty image chunks");
-                    }
-                    self.kitty_img.accumulator.push(img);
-                } else {
-                    self.kitty_img_inner(img)?;
-                }
-            }
-            KittyImage::TransmitDataAndDisplay {
-                transmit,
-                placement,
-                verbosity,
-            } => {
-                let more_data_follows = transmit.more_data_follows;
-                let img = KittyImage::TransmitDataAndDisplay {
-                    transmit,
-                    placement,
-                    verbosity,
-                };
-                if more_data_follows {
-                    if self.kitty_img.accumulator.len() >= 16384 {
-                        self.kitty_img.accumulator.clear();
-                        self.kitty_img.accumulated_bytes = 0;
-                        anyhow::bail!("too many kitty image chunks");
-                    }
-                    self.kitty_img.accumulator.push(img);
-                } else {
-                    self.kitty_img_inner(img)?;
-                }
-            }
             KittyImage::Display {
                 image_id,
                 image_number,
@@ -318,7 +330,14 @@ impl TerminalState {
 
                 self.kitty_remove_placement(image_id, placement_id);
 
-                if delete {
+                if delete
+                    && !self
+                        .kitty_img
+                        .placements
+                        .keys()
+                        .chain(self.kitty_img.projected.keys())
+                        .any(|key| key.0 == image_id)
+                {
                     self.kitty_img.remove_data_for_id(image_id);
                     self.kitty_img.number_to_id.retain(|_, id| *id != image_id);
                     self.image_cache.clear();
@@ -333,14 +352,50 @@ impl TerminalState {
             KittyImage::Delete { what, verbosity } => {
                 log::warn!("unhandled KittyImage::Delete {:?} {:?}", what, verbosity);
             }
-            KittyImage::TransmitFrame {
-                transmit,
-                frame,
+            KittyImage::TransmitData { .. }
+            | KittyImage::TransmitDataAndDisplay { .. }
+            | KittyImage::TransmitFrame { .. } => unreachable!("handled before dispatch"),
+            KittyImage::Animation {
+                image_id,
+                image_number,
+                state,
+                edit_frame,
+                gap,
+                current,
+                loops,
                 verbosity,
             } => {
-                if let Err(err) = self.kitty_frame_transmit(transmit, frame, verbosity) {
-                    log::error!("Error {:#} while handling KittyImage::TransmitFrame", err,);
-                }
+                let id =
+                    image_id.or_else(|| self.kitty_img.number_to_id.get(&image_number?).copied());
+                let control = playback::Control {
+                    state,
+                    edit_frame,
+                    gap,
+                    current,
+                    loops,
+                };
+                let result = id
+                    .and_then(|id| {
+                        self.kitty_img
+                            .id_to_data
+                            .get(&id)
+                            .map(|img| (id, Arc::clone(img)))
+                    })
+                    .ok_or("ENOENT")
+                    .and_then(|(id, img)| {
+                        self.kitty_img.playback.entry(id).or_default().control(
+                            &mut img.data(),
+                            control,
+                            Instant::now(),
+                        )
+                    });
+                self.kitty_send_response(
+                    verbosity,
+                    result.is_ok(),
+                    id,
+                    image_number,
+                    result.err().unwrap_or("OK").into(),
+                );
             }
             KittyImage::ComposeFrame { frame, verbosity } => {
                 if let Err(err) = self.kitty_frame_compose(frame, verbosity) {
@@ -373,6 +428,7 @@ impl TerminalState {
     }
 
     fn kitty_remove_placement(&mut self, image_id: u32, placement_id: Option<u32>) {
+        self.remove_kitty_dependents(image_id, placement_id);
         if placement_id.is_some() {
             if let Some(info) = self.kitty_img.placements.remove(&(image_id, placement_id)) {
                 log::trace!("removed placement {} {:?}", image_id, placement_id);
@@ -404,11 +460,40 @@ impl TerminalState {
         for ((image_id, p), info) in std::mem::take(&mut self.kitty_img.placements).into_iter() {
             self.kitty_remove_placement_from_model(image_id, p, info);
         }
+        // A virtual prototype has no physical position. Global deletion drops
+        // its visible relative placements, but leaves the prototype available.
+        // Children of a deleted ordinary parent also lose orphaned image data.
+        let orphaned: HashSet<_> = self
+            .kitty_img
+            .projected
+            .iter()
+            .filter_map(|(&key, node)| {
+                (node.parent.is_some() && !self.has_virtual_ancestor(key)).then_some(key.0)
+            })
+            .collect();
+        self.kitty_img
+            .projected
+            .retain(|_, node| node.placement.virtual_placement);
+        for id in orphaned {
+            if !self.kitty_img.projected.keys().any(|k| k.0 == id) {
+                self.kitty_img.remove_data_for_id(id);
+                self.kitty_img.number_to_id.retain(|_, other| *other != id);
+            }
+        }
         if delete {
-            self.kitty_img.id_to_data.clear();
+            let keep: HashSet<_> = self.kitty_img.projected.keys().map(|k| k.0).collect();
+            self.kitty_img.id_to_data.retain(|id, _| keep.contains(id));
+            self.kitty_img.playback.retain(|id, _| keep.contains(id));
             self.image_cache.clear();
-            self.kitty_img.used_memory = 0;
-            self.kitty_img.number_to_id.clear();
+            self.kitty_img.used_memory = self
+                .kitty_img
+                .id_to_data
+                .values()
+                .map(|img| img.len())
+                .sum();
+            self.kitty_img
+                .number_to_id
+                .retain(|_, id| keep.contains(id));
         }
     }
 
@@ -666,12 +751,6 @@ impl TerminalState {
 
         self.image_cache.clear();
         let old_len = anim.len();
-        let aliases = self
-            .kitty_img
-            .id_to_data
-            .values()
-            .filter(|data| Arc::ptr_eq(data, anim))
-            .count();
         let mut anim = anim.data();
         let (width, height) = anim.dimensions()?;
         let (frame_count, append) = match &*anim {
@@ -698,17 +777,14 @@ impl TerminalState {
             "kitty animation exceeds 32 MiB"
         );
         anyhow::ensure!(
-            self.kitty_img
-                .used_memory
-                .saturating_add(growth.saturating_mul(aliases))
-                <= 64 * 1024 * 1024,
+            self.kitty_img.used_memory.saturating_add(growth) <= 64 * 1024 * 1024,
             "kitty image table exceeds 64 MiB"
         );
         let x = frame.x.unwrap_or(0);
         let y = frame.y.unwrap_or(0);
         let frame_gap = Duration::from_millis(match frame.duration_ms {
             None | Some(0) => 40,
-            Some(n) => n.into(),
+            Some(n) => n.max(0) as u64,
         });
 
         match &mut *anim {
@@ -766,7 +842,13 @@ impl TerminalState {
                         let new_frame_hash = ImageDataType::hash_bytes(&new_frame_data);
 
                         let frames = vec![std::mem::take(data), new_frame_data];
-                        let durations = vec![Duration::from_millis(0), frame_gap];
+                        let durations = vec![
+                            self.kitty_img
+                                .playback
+                                .get(&image_id)
+                                .map_or(Duration::ZERO, |p| p.root_gap),
+                            frame_gap,
+                        ];
                         let hashes = vec![*hash, new_frame_hash];
 
                         *anim = ImageDataType::AnimRgba8 {
@@ -843,12 +925,25 @@ impl TerminalState {
 
                     drop(anim_img);
                     hashes[frame_no - 1] = ImageDataType::hash_bytes(&frames[frame_no - 1]);
+                    if frame.duration_ms.is_some() {
+                        durations[frame_no - 1] = frame_gap;
+                    }
                 }
             }
         }
 
+        if frame.frame_number == Some(1) && frame.duration_ms.is_some() {
+            self.kitty_img
+                .playback
+                .entry(image_id)
+                .or_default()
+                .root_gap = frame_gap;
+        }
+        if let Some(playback) = self.kitty_img.playback.get_mut(&image_id) {
+            playback.frames_changed(&anim, Instant::now());
+        }
         drop(anim);
-        self.kitty_img.used_memory += growth * aliases;
+        self.kitty_img.used_memory += growth;
         Ok(())
     }
 
@@ -962,9 +1057,9 @@ impl TerminalState {
         let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
         self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
 
-        let img = self
-            .raw_image_to_image_data(img)
-            .context("storing image data")?;
+        // An image id owns its mutable animation frames. Equal initial pixels under
+        // two ids may subsequently receive different frames and playback commands.
+        let img = Arc::new(ImageData::with_data(img));
         self.kitty_img.record_id_to_data(image_id, img)?;
         if let Some(number) = image_number {
             self.kitty_img.number_to_id.insert(number, image_id);
@@ -986,77 +1081,40 @@ impl TerminalState {
     fn coalesce_kitty_accumulation(&mut self, img: KittyImage) -> anyhow::Result<KittyImage> {
         self.kitty_img.accumulated_bytes = 0;
         if self.kitty_img.accumulator.is_empty() {
-            Ok(img)
-        } else {
-            let mut data = vec![];
-            let mut trans;
-            let place;
-            let final_verbosity = img.verbosity();
-
-            self.kitty_img.accumulator.push(img);
-
-            let mut empty_data = KittyImageData::Direct(String::new());
-            match self.kitty_img.accumulator.remove(0) {
-                KittyImage::TransmitData { transmit, .. } => {
-                    trans = transmit;
-                    place = None;
-                    std::mem::swap(&mut empty_data, &mut trans.data);
-                }
-                KittyImage::TransmitDataAndDisplay {
-                    transmit,
-                    placement,
-                    ..
-                } => {
-                    place = Some(placement);
-                    trans = transmit;
-                    std::mem::swap(&mut empty_data, &mut trans.data);
-                }
-                _ => unreachable!(),
-            }
-            data.push(empty_data);
-
-            for item in self.kitty_img.accumulator.drain(..) {
-                match item {
-                    KittyImage::TransmitData { transmit, .. }
-                    | KittyImage::TransmitDataAndDisplay { transmit, .. } => {
-                        data.push(transmit.data);
-                    }
-                    _ => unreachable!(),
-                }
-            }
-
-            let mut b64_decoded = vec![];
-            for mut data in data.into_iter() {
-                match &mut data {
-                    KittyImageData::DirectBin(b) => {
-                        b64_decoded.append(b);
-                    }
-                    KittyImageData::Direct(b) => {
-                        if !b.is_empty() {
-                            b64_decoded.append(&mut data.load_data()?);
-                        }
-                    }
-                    data => {
-                        anyhow::bail!("expected data chunks to be Direct data, found {:#?}", data)
-                    }
-                }
-            }
-
-            trans.data = KittyImageData::DirectBin(b64_decoded);
-
-            if let Some(placement) = place {
-                Ok(KittyImage::TransmitDataAndDisplay {
-                    transmit: trans,
-                    placement,
-                    verbosity: final_verbosity,
-                })
-            } else {
-                Ok(KittyImage::TransmitData {
-                    transmit: trans,
-                    verbosity: final_verbosity,
-                })
-            }
+            return Ok(img);
         }
+        let final_verbosity = img.verbosity();
+        let chunks = std::mem::take(&mut self.kitty_img.accumulator);
+        let mut chunks = chunks.into_iter().chain(std::iter::once(img));
+        let mut first = chunks.next().unwrap();
+        let head = transmission(&mut first).unwrap();
+        let load = |part: &mut KittyImageTransmit| {
+            std::mem::replace(&mut part.data, KittyImageData::DirectBin(Vec::new())).load_data()
+        };
+        let mut bytes = load(head)?;
+        for mut chunk in chunks {
+            let part =
+                transmission(&mut chunk).context("expected kitty transmission continuation")?;
+            bytes.append(&mut load(part)?);
+        }
+        head.data = KittyImageData::DirectBin(bytes);
+        head.more_data_follows = false;
+        match &mut first {
+            KittyImage::TransmitData { verbosity, .. }
+            | KittyImage::TransmitDataAndDisplay { verbosity, .. }
+            | KittyImage::TransmitFrame { verbosity, .. } => *verbosity = final_verbosity,
+            _ => unreachable!(),
+        }
+        Ok(first)
+    }
+}
+
+fn transmission(img: &mut KittyImage) -> Option<&mut KittyImageTransmit> {
+    match img {
+        KittyImage::TransmitData { transmit, .. }
+        | KittyImage::TransmitDataAndDisplay { transmit, .. }
+        | KittyImage::TransmitFrame { transmit, .. } => Some(transmit),
+        _ => None,
     }
 }
 

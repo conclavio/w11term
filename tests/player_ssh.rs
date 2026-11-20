@@ -12,8 +12,9 @@ use tokio::{
 };
 use w11term::{
     events::Events,
-    options::{Authentication, SshOptions},
+    options::{Authentication, Source, SshOptions},
     prompts::{Answer, Prompts, Question},
+    session::{Command, Session},
     ssh::{self, Event},
     terminal::TransportInput,
 };
@@ -27,6 +28,7 @@ enum Seen {
 struct Peer {
     seen: mpsc::UnboundedSender<Seen>,
     drop_password: Arc<std::sync::atomic::AtomicBool>,
+    allowed_opens: usize,
 }
 impl server::Handler for Peer {
     type Error = anyhow::Error;
@@ -81,7 +83,14 @@ impl server::Handler for Peer {
         reply: server::ChannelOpenHandle,
         _: &mut server::Session,
     ) -> Result<()> {
-        reply.accept().await;
+        if self.allowed_opens == 0 {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+        } else {
+            self.allowed_opens -= 1;
+            reply.accept().await;
+        }
         Ok(())
     }
     async fn pty_request(
@@ -195,6 +204,17 @@ async fn fixture_with_password_drop(
     mpsc::UnboundedReceiver<Seen>,
     tokio::task::JoinHandle<()>,
 ) {
+    fixture_with_channel_limit(keys, drop_password, usize::MAX).await
+}
+async fn fixture_with_channel_limit(
+    keys: Vec<PrivateKey>,
+    drop_password: Arc<std::sync::atomic::AtomicBool>,
+    allowed_opens: usize,
+) -> (
+    u16,
+    mpsc::UnboundedReceiver<Seen>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, seen) = mpsc::unbounded_channel();
@@ -202,7 +222,28 @@ async fn fixture_with_password_drop(
         let mut count = 0;
         let mut peers = tokio::task::JoinSet::new();
         loop {
-            tokio::select! {stream=listener.accept()=>{let(stream,_)=stream.unwrap();let config=Arc::new(server::Config{keys:vec![keys[count.min(keys.len()-1)].clone()],auth_rejection_time:Duration::ZERO,..Default::default()});count+=1;let seen=tx.clone();let drop_password=drop_password.clone();peers.spawn(async move{if let Ok(running)=server::run_stream(config,stream,Peer{seen,drop_password}).await{let _=running.await;}});},_=peers.join_next(),if !peers.is_empty()=>{}}
+            tokio::select! {
+                stream = listener.accept() => {
+                    let (stream, _) = stream.unwrap();
+                    let config = Arc::new(server::Config {
+                        keys: vec![keys[count.min(keys.len()-1)].clone()],
+                        auth_rejection_time: Duration::ZERO,
+                        ..Default::default()
+                    });
+                    count += 1;
+                    let peer = Peer {
+                        seen: tx.clone(),
+                        drop_password: drop_password.clone(),
+                        allowed_opens,
+                    };
+                    peers.spawn(async move {
+                        if let Ok(running) = server::run_stream(config, stream, peer).await {
+                            let _ = running.await;
+                        }
+                    });
+                }
+                _ = peers.join_next(), if !peers.is_empty() => {}
+            }
         }
     });
     (port, seen, task)
@@ -219,12 +260,211 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
         port,
         authentication,
         host_key: pin,
+        proxy_jump: Vec::new(),
+        durable: false,
         player: Default::default(),
     }
 }
 fn key() -> PrivateKey {
     PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap()
 }
+
+async fn enter_password(session: &Session) {
+    let question = prompt(&session.prompts).await;
+    assert!(matches!(question.question, Question::Authentication { .. }));
+    session
+        .prompts
+        .answer(
+            question.id,
+            Answer::Authentication(vec![zeroize::Zeroizing::new("secret".into())]),
+        )
+        .unwrap();
+}
+
+async fn connection(session: &Session) -> ssh::ConnectionShare {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(connection) = session.ssh_connection() {
+                return connection;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("SSH pane did not establish a shell")
+}
+
+async fn send(session: &Session, text: &str) {
+    let (reply, response) = oneshot::channel();
+    session
+        .input
+        .send(Command::Raw(text.as_bytes().to_vec(), reply))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+async fn expect_echo(session: &Session, text: &str) {
+    send(session, text).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !session
+            .frames
+            .load()
+            .rows
+            .iter()
+            .any(|row| row.as_str().contains(text))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("expected echo on this pane");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_channels_outlive_original_pane_and_sibling_shell_exit() {
+    let key = key();
+    let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (port, mut seen, server) = fixture(vec![key]).await;
+    let source = Source::Ssh(options(port, Authentication::Password, Some(pin)));
+    let original = Session::start(source.clone());
+    enter_password(&original).await;
+    let child = Session::start_configured_with_connection(
+        source.clone(),
+        Default::default(),
+        false,
+        Some(connection(&original).await),
+    );
+    let sibling = Session::start_configured_with_connection(
+        source.clone(),
+        Default::default(),
+        false,
+        Some(connection(&child).await),
+    );
+    drop(connection(&sibling).await);
+    drop(original);
+    expect_echo(&child, "after-owner-closed").await;
+    send(&sibling, "quit").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while sibling.ssh_connection().is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("exited shell still offering its connection");
+    expect_echo(&child, "after-peer-exited").await;
+    assert_eq!(
+        std::iter::from_fn(|| seen.try_recv().ok())
+            .filter(|e| *e == Seen::Password)
+            .count(),
+        1
+    );
+    // An ordinary open of this exact profile still gets a separate login.
+    let independent = Session::start(source);
+    enter_password(&independent).await;
+    drop(connection(&independent).await);
+    drop((child, sibling, independent));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_split_channel_authenticates_independently_without_closing_original() {
+    let key = key();
+    let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (port, mut seen, server) =
+        fixture_with_channel_limit(vec![key], Default::default(), 1).await;
+    let source = Source::Ssh(options(port, Authentication::Password, Some(pin)));
+    let original = Session::start(source.clone());
+    enter_password(&original).await;
+    let child = Session::start_configured_with_connection(
+        source,
+        Default::default(),
+        false,
+        Some(connection(&original).await),
+    );
+    enter_password(&child).await;
+    drop(connection(&child).await);
+    expect_echo(&original, "still-first-login").await;
+    expect_echo(&child, "second-login").await;
+    assert_eq!(
+        std::iter::from_fn(|| seen.try_recv().ok())
+            .filter(|e| *e == Seen::Password)
+            .count(),
+        2
+    );
+    drop((original, child));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_with_different_host_pin_requires_fresh_verification() {
+    let actual = key();
+    let pin = actual.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let other = key().public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (port, _seen, server) = fixture(vec![actual]).await;
+    let original = Session::start(Source::Ssh(options(port, Authentication::None, Some(pin))));
+    let child = Session::start_configured_with_connection(
+        Source::Ssh(options(port, Authentication::None, Some(other))),
+        Default::default(),
+        false,
+        Some(connection(&original).await),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = child.frames.load();
+            assert_eq!(
+                frame.connection_generation, 0,
+                "the mismatched pin was ignored"
+            );
+            if frame.status.contains("host verification failed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("mismatched split pin should fail host verification");
+    expect_echo(&original, "still-trusted").await;
+    drop((child, original));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_reconnects_using_its_own_authentication_after_link_loss() {
+    let key = key();
+    let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (port, _seen, server) = fixture(vec![key]).await;
+    let source = Source::Ssh(options(port, Authentication::Password, Some(pin)));
+    let original = Session::start(source.clone());
+    enter_password(&original).await;
+    let child = Session::start_configured_with_connection(
+        source,
+        Default::default(),
+        false,
+        Some(connection(&original).await),
+    );
+    drop(connection(&child).await);
+    send(&child, "drop").await;
+    enter_password(&child).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while [&original, &child]
+            .iter()
+            .any(|pane| pane.frames.load().connection_generation < 2)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both panes should independently reconnect");
+    assert!(original.prompts.current().is_none());
+    expect_echo(&child, "ready-again").await;
+    drop((child, original));
+    server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays_offline_input() {
     let key = key();

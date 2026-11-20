@@ -1,3 +1,6 @@
+use super::durability::{LifecycleError, Program};
+use super::game_resume;
+use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use crate::{
     events::Events,
     options::{Authentication, SshOptions},
@@ -34,6 +37,8 @@ fn stop(message: impl Into<String>) -> anyhow::Error {
 pub(crate) struct Handler {
     options: SshOptions,
     prompts: Option<Prompts>,
+    fingerprint: Arc<std::sync::OnceLock<String>>,
+    durable_peer: Option<String>,
 }
 impl Handler {
     fn known(&self, key: &russh::keys::PublicKey) -> Result<bool> {
@@ -77,6 +82,17 @@ impl client::Handler for Handler {
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
         let key = key.public_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+        if self
+            .durable_peer
+            .as_ref()
+            .is_some_and(|saved| saved != &fingerprint)
+        {
+            return Err(stop("SSH host key differs from the saved durable session"));
+        }
+        ensure!(
+            self.fingerprint.get_or_init(|| fingerprint.clone()) == &fingerprint,
+            Permanent("SSH peer changed its host key during this connection".into())
+        );
         match self.known(&key) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
@@ -180,7 +196,7 @@ async fn authenticate(
                 let candidate = if let Some(value) = password.take() {
                     value
                 } else {
-                    let answer=prompts.ask(Question::Authentication{name:format!("Sign in as {}",options.user),instructions:if attempt==0{"Password is kept in memory for reconnection, never saved to the profile."}else{"Password rejected. Try again."}.into(),challenges:vec![Challenge{label:"Password".into(),echo:false}]}).await.map_err(|e|stop(e.to_string()))?;
+                    let answer=prompts.ask(Question::Authentication{name:format!("Sign in as {}@{}:{}",options.user,options.host,options.port),instructions:if attempt==0{"Password is kept in memory for reconnection, never saved to the profile."}else{"Password rejected. Try again."}.into(),challenges:vec![Challenge{label:"Password".into(),echo:false}]}).await.map_err(|e|stop(e.to_string()))?;
                     let Answer::Authentication(mut values) = answer else {
                         return Err(stop("authentication cancelled"));
                     };
@@ -245,7 +261,10 @@ async fn authenticate(
                         } else {
                             prompts
                                 .ask(Question::Authentication {
-                                    name,
+                                    name: format!(
+                                        "{}@{}:{} · {name}",
+                                        options.user, options.host, options.port
+                                    ),
                                     instructions,
                                     challenges: questions
                                         .into_iter()
@@ -278,23 +297,93 @@ async fn authenticate(
     Ok(())
 }
 async fn connect(
-    options: SshOptions,
-    prompts: Option<Prompts>,
+    options: &SshOptions,
+    prompts: Option<&Prompts>,
+    passwords: &mut [Option<Zeroizing<String>>],
+    durable_peer: Option<&str>,
+) -> Result<ConnectionShare> {
+    let route = options
+        .proxy_jump
+        .iter()
+        .cloned()
+        .map(SshOptions::from)
+        .chain(std::iter::once(options.clone()));
+    let mut upstream: Option<ConnectionShare> = None;
+    for (index, (endpoint, password)) in route.zip(passwords).enumerate() {
+        let expected_peer = if index == options.proxy_jump.len() {
+            durable_peer
+        } else {
+            None
+        };
+        let address = format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port);
+        let (handle, fingerprint) = if let Some(hop) = &upstream {
+            let handle = hop.handle();
+            let channel = tokio::time::timeout(
+                Duration::from_secs(15),
+                handle.channel_open_direct_tcpip(
+                    &endpoint.host,
+                    u32::from(endpoint.port),
+                    "127.0.0.1",
+                    0,
+                ),
+            )
+            .await
+            .with_context(|| format!("forward to {address} timed out"))?
+            .map_err(|error| {
+                let message = format!("jump host refused forward to {address}: {error}");
+                match error {
+                    russh::Error::ChannelOpenFailure(
+                        russh::ChannelOpenFailure::AdministrativelyProhibited
+                        | russh::ChannelOpenFailure::UnknownChannelType,
+                    ) => stop(message),
+                    _ => anyhow::Error::from(error).context(message),
+                }
+            })?;
+            handshake(
+                &endpoint,
+                prompts,
+                password,
+                expected_peer,
+                channel.into_stream(),
+            )
+            .await
+        } else {
+            let stream = tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
+            )
+            .await
+            .with_context(|| format!("SSH TCP connection to {address} timed out"))?
+            .with_context(|| format!("connecting to {address}"))?;
+            stream.set_nodelay(true)?;
+            handshake(&endpoint, prompts, password, expected_peer, stream).await
+        }
+        .with_context(|| format!("SSH handshake or authentication for {address}"))?;
+        upstream = Some(ConnectionShare::new(
+            handle,
+            endpoint,
+            prompts,
+            fingerprint,
+            upstream,
+        ));
+    }
+    upstream.context("missing SSH destination")
+}
+
+async fn handshake(
+    options: &SshOptions,
+    prompts: Option<&Prompts>,
     password: &mut Option<Zeroizing<String>>,
-) -> Result<client::Handle<Handler>> {
+    durable_peer: Option<&str>,
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+) -> Result<(client::Handle<Handler>, String)> {
     let config = Arc::new(client::Config {
         nodelay: true,
         keepalive_interval: Some(Duration::from_secs(5)),
         keepalive_max: 2,
         ..Default::default()
     });
-    let stream = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio::net::TcpStream::connect((options.host.as_str(), options.port)),
-    )
-    .await
-    .context("SSH TCP connection timed out")??;
-    stream.set_nodelay(true)?;
+    let fingerprint = Arc::new(std::sync::OnceLock::new());
     let mut session = tokio::time::timeout(
         Duration::from_secs(300),
         client::connect_stream(
@@ -302,14 +391,22 @@ async fn connect(
             stream,
             Handler {
                 options: options.clone(),
-                prompts: prompts.clone(),
+                prompts: prompts.cloned(),
+                fingerprint: fingerprint.clone(),
+                durable_peer: durable_peer.map(str::to_owned),
             },
         ),
     )
     .await
     .context("SSH handshake timed out")??;
-    authenticate(&mut session, &options, prompts.as_ref(), password).await?;
-    Ok(session)
+    authenticate(&mut session, options, prompts, password).await?;
+    Ok((
+        session,
+        fingerprint
+            .get()
+            .context("SSH peer did not supply an authenticated host key")?
+            .clone(),
+    ))
 }
 fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOptions) {
     match input {
@@ -338,121 +435,399 @@ pub async fn run(
     run_configured(options, size, input, output, None, Events::default()).await
 }
 pub async fn run_configured(
-    mut options: SshOptions,
-    mut size: TerminalSize,
-    mut input: mpsc::UnboundedReceiver<TransportInput>,
+    options: SshOptions,
+    size: TerminalSize,
+    input: mpsc::UnboundedReceiver<TransportInput>,
     output: mpsc::Sender<Event>,
     prompts: Option<Prompts>,
     events: Events,
 ) -> Result<()> {
-    let mut password = None;
-    let mut generation = 0;
-    let mut failures = 0u32;
-    let mut dropped_at: Option<tokio::time::Instant> = None;
-    loop {
-        let future = connect(options.clone(), prompts.clone(), &mut password);
-        tokio::pin!(future);
-        let deadline = dropped_at.map(|since| since + Duration::from_secs(300));
-        let connected = loop {
-            tokio::select! {
-            _=tokio::time::sleep_until(deadline.unwrap_or_else(||tokio::time::Instant::now()+Duration::from_secs(3600))),if deadline.is_some()=>return Err(anyhow::anyhow!("automatic reconnection stopped after 300 seconds")),
-            result=&mut future=>break result,message=input.recv()=>match message {Some(message)=>offline(message,&mut size,&mut options),None=>return Ok(())}}
-        };
-        let result = match connected {
-            Ok(session) => {
-                generation += 1;
-                let started = tokio::time::Instant::now();
-                let result = run_channel(
-                    Arc::new(session),
-                    &mut options,
-                    &mut size,
-                    &mut input,
-                    &output,
-                    &events,
-                    generation,
-                )
-                .await;
-                if started.elapsed() > Duration::from_secs(30) {
-                    failures = 0;
-                    dropped_at = None;
-                }
-                result
+    run_with_sharing(
+        options,
+        size,
+        input,
+        output,
+        prompts,
+        events,
+        Sharing::default(),
+    )
+    .await
+}
+
+pub(super) struct OpenShell {
+    pub(super) link: Arc<ConnectionShare>,
+    pub(super) channel: ShellChannel,
+    published: ShareSlot,
+}
+
+async fn connect_shell(
+    options: SshOptions,
+    prompts: Option<Prompts>,
+    passwords: &mut [Option<Zeroizing<String>>],
+    source: Option<ConnectionShare>,
+    published: ShareSlot,
+    durable_peer: Option<String>,
+) -> Result<OpenShell> {
+    if let Some(link) = source.filter(|link| link.matches(&options, prompts.as_ref())) {
+        match link.open_shell().await {
+            Ok(channel) => {
+                return Ok(OpenShell {
+                    link: Arc::new(link),
+                    channel,
+                    published,
+                });
             }
-            Err(e) => Err(e),
-        };
-        let error = match result {
-            Ok(()) => return Ok(()),
-            Err(e) => e,
-        };
-        if error.downcast_ref::<Permanent>().is_some() || !options.player.reconnect {
-            return Err(error);
+            // The new pane can still get its own login on single-channel
+            // servers. No PTY, shell or application input was requested.
+            Err(error) => log::debug!(
+                "split channel unavailable, opening independent SSH connection: {error}"
+            ),
         }
-        let since = *dropped_at.get_or_insert_with(tokio::time::Instant::now);
-        if since.elapsed() >= Duration::from_secs(300) {
-            return Err(error.context("automatic reconnection stopped after 300 seconds"));
+    }
+    let link = Arc::new(
+        connect(
+            &options,
+            prompts.as_ref(),
+            passwords,
+            durable_peer.as_deref(),
+        )
+        .await?,
+    );
+    let channel = link.open_shell().await?;
+    Ok(OpenShell {
+        link,
+        channel,
+        published,
+    })
+}
+
+pub(crate) async fn run_with_sharing(
+    options: SshOptions,
+    size: TerminalSize,
+    input: mpsc::UnboundedReceiver<TransportInput>,
+    output: mpsc::Sender<Event>,
+    prompts: Option<Prompts>,
+    events: Events,
+    mut sharing: Sharing,
+) -> Result<()> {
+    options.validate_route()?;
+    let passwords = vec![None; options.proxy_jump.len() + 1];
+    let lifecycle = sharing.durable.take();
+    let game = (options.player.rustmush && !options.durable).then(game_resume::Pane::new);
+    let mut driver = Driver {
+        options,
+        size,
+        input,
+        output,
+        prompts,
+        events,
+        sharing,
+        passwords,
+        generation: 0,
+        game,
+    };
+    if let Some(worker) = lifecycle {
+        worker.serve(&mut driver).await
+    } else {
+        driver.run(&Program::Shell(None)).await
+    }
+}
+
+pub(super) struct Driver {
+    pub(super) options: SshOptions,
+    size: TerminalSize,
+    pub(super) input: mpsc::UnboundedReceiver<TransportInput>,
+    pub(super) output: mpsc::Sender<Event>,
+    prompts: Option<Prompts>,
+    events: Events,
+    sharing: Sharing,
+    passwords: Vec<Option<Zeroizing<String>>>,
+    generation: u64,
+    game: Option<game_resume::Pane>,
+}
+
+impl Driver {
+    pub(super) fn discard_input(&mut self, message: TransportInput) {
+        match message {
+            TransportInput::Raw(_, reply) => {
+                let _ = reply.send(Err(
+                    "No SSH shell is attached; input was not queued or sent".into(),
+                ));
+            }
+            TransportInput::Sftp(job) => {
+                let _ = job.reply.send(Err(
+                    "No SSH shell is attached; SFTP operation was not started".into(),
+                ));
+            }
+            other => offline(other, &mut self.size, &mut self.options),
         }
-        failures += 1;
-        let delay = Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
-        events.push(
-            "reconnecting",
-            serde_json::json!({"attempt":failures,"delay_seconds":delay.as_secs()}),
-        );
-        output
-            .send(Event::Status(format!(
-                "Link lost · reconnecting in {} s (attempt {failures}) · {error:#}",
-                delay.as_secs()
-            )))
-            .await?;
-        let wait =
-            tokio::time::sleep(delay.min(Duration::from_secs(300).saturating_sub(since.elapsed())));
-        tokio::pin!(wait);
+    }
+
+    pub(super) async fn run(&mut self, program: &Program) -> Result<()> {
+        program.validate_target(&self.options)?;
+        let mut failures = 0u32;
+        let mut dropped_at: Option<tokio::time::Instant> = None;
         loop {
-            tokio::select! {_=&mut wait=>break,message=input.recv()=>match message{Some(message)=>offline(message,&mut size,&mut options),None=>return Ok(())}}
+            let deadline = dropped_at.map(|since| since + Duration::from_secs(300));
+            let connected = {
+                let future = connect_shell(
+                    self.options.clone(),
+                    self.prompts.clone(),
+                    &mut self.passwords,
+                    self.sharing.offered.take(),
+                    self.sharing.published.clone(),
+                    program.peer_fingerprint(),
+                );
+                tokio::pin!(future);
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))), if deadline.is_some() => anyhow::bail!("automatic reconnection stopped after 300 seconds"),
+                        result = &mut future => break result,
+                        message = self.input.recv() => match message {
+                            Some(message) => offline(message, &mut self.size, &mut self.options),
+                            None => return Ok(()),
+                        }
+                    }
+                }
+            };
+            let result = match connected {
+                Ok(session) => {
+                    self.generation += 1;
+                    let started = tokio::time::Instant::now();
+                    let result = run_channel(session, self, program).await;
+                    if let Some(game) = &mut self.game {
+                        game.disconnected();
+                    }
+                    if started.elapsed() > Duration::from_secs(30) {
+                        failures = 0;
+                        dropped_at = None;
+                    }
+                    result
+                }
+                Err(e) => Err(e),
+            };
+            let error = match result {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            if matches!(program, Program::End(_))
+                || error.downcast_ref::<Permanent>().is_some()
+                || error.downcast_ref::<LifecycleError>().is_some()
+                || !self.options.player.reconnect
+            {
+                return Err(error);
+            }
+            let since = *dropped_at.get_or_insert_with(tokio::time::Instant::now);
+            if since.elapsed() >= Duration::from_secs(300) {
+                return Err(error.context("automatic reconnection stopped after 300 seconds"));
+            }
+            failures += 1;
+            program.reconnecting(&format!("Link lost: {error:#}"));
+            let delay = Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
+            self.events.push(
+                "reconnecting",
+                serde_json::json!({"attempt":failures,"delay_seconds":delay.as_secs()}),
+            );
+            self.output
+                .send(Event::Status(format!(
+                    "Link lost · reconnecting in {} s (attempt {failures}) · {error:#}",
+                    delay.as_secs()
+                )))
+                .await?;
+            let wait = tokio::time::sleep(
+                delay.min(Duration::from_secs(300).saturating_sub(since.elapsed())),
+            );
+            tokio::pin!(wait);
+            loop {
+                tokio::select! {
+                    _ = &mut wait => break,
+                    message = self.input.recv() => match message {
+                        Some(message) => self.discard_input(message),
+                        None => return Ok(()),
+                    }
+                }
+            }
         }
     }
 }
-async fn run_channel(
-    session: Arc<client::Handle<Handler>>,
-    options: &mut SshOptions,
-    size: &mut TerminalSize,
-    input: &mut mpsc::UnboundedReceiver<TransportInput>,
-    output: &mpsc::Sender<Event>,
-    events: &Events,
-    generation: u64,
-) -> Result<()> {
-    let mut channel = session.channel_open_session().await?;
+async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Program) -> Result<()> {
+    let Driver {
+        options,
+        size,
+        input,
+        output,
+        events,
+        generation,
+        game,
+        ..
+    } = driver;
+    let generation = *generation;
+    let original_size = *size;
+    let managed = !matches!(program, Program::Shell(_));
+    let probe = game
+        .as_mut()
+        .filter(|_| !managed)
+        .map(|g| g.probe(shell.link.fingerprint()));
+    let restoring = probe.as_ref().is_some_and(game_resume::Probe::redeeming);
+    let mut waiting_for_resume = restoring;
+    let mut queued_before_unlock = 0usize;
+    let mut early_data = Vec::new();
+    if managed {
+        let startup = program.prepare(&mut shell, options.clone(), original_size);
+        tokio::pin!(startup);
+        early_data = loop {
+            tokio::select! {
+                biased;
+                message = input.recv() => match message {Some(message) => offline(message,size,options),None => return Ok(())},
+                result = &mut startup => break result?,
+            }
+        };
+        if matches!(program, Program::End(_)) {
+            return Ok(());
+        }
+    }
+    if probe.is_some() {
+        shell
+            .channel
+            .close_game_session_on_drop(shell.link.as_ref().clone());
+    }
+    let channel = shell.channel.channel();
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let mut children = tokio::task::JoinSet::new();
-    children.spawn(crate::sftp::run(session.clone(), sftp_rx, cleanup_rx));
-    channel
-        .request_pty(
-            true,
-            "xterm-256color",
-            size.cols as u32,
-            size.rows as u32,
-            size.pixel_width as u32,
-            size.pixel_height as u32,
-            &[],
-        )
-        .await?;
-    channel.set_env(false, "COLORTERM", "truecolor").await?;
-    channel.request_shell(true).await?;
-    let mut pending = 2u8;
+    children.spawn(crate::sftp::run(shell.link.handle(), sftp_rx, cleanup_rx));
+    if !managed {
+        channel
+            .request_pty(
+                true,
+                "xterm-256color",
+                size.cols as u32,
+                size.rows as u32,
+                size.pixel_width as u32,
+                size.pixel_height as u32,
+                &[],
+            )
+            .await?;
+        channel.set_env(false, "COLORTERM", "truecolor").await?;
+        if let Some(probe) = &probe {
+            channel
+                .set_env(false, game_resume::ENVIRONMENT, probe.marker())
+                .await?;
+        }
+        channel.request_shell(true).await?;
+    } else if size.cols != original_size.cols
+        || size.rows != original_size.rows
+        || size.pixel_width != original_size.pixel_width
+        || size.pixel_height != original_size.pixel_height
+    {
+        channel
+            .window_change(
+                size.cols as u32,
+                size.rows as u32,
+                size.pixel_width as u32,
+                size.pixel_height as u32,
+            )
+            .await?;
+    }
+    let mut pending = if managed { 0 } else { 2u8 };
+    let (auth, mut auth_rx) = tokio::sync::oneshot::channel();
+    let mut probing = probe.is_some();
+    let mut auth_pending = probing;
+    let sideband = async {
+        probe
+            .expect("enabled game sideband")
+            .exchange(&shell.link, auth)
+            .await
+    };
+    tokio::pin!(sideband);
+    if managed {
+        shell.published.publish(&shell.link);
+        program.ready();
+        events.push(
+            "connected",
+            serde_json::json!({"generation":generation,"durable":true}),
+        );
+        output.send(Event::Connected(generation)).await?;
+        output
+            .send(Event::Status("Attached to verified durable shell".into()))
+            .await?;
+        for chunk in early_data.chunks(32 * 1024) {
+            output.send(Event::Data(chunk.to_vec())).await?;
+        }
+    }
     loop {
         tokio::select! {
-            message=input.recv()=>match message {
-                Some(TransportInput::Authenticate(auth))=>options.authentication=auth,
-                Some(TransportInput::Sftp(job))=>if job.reply.is_closed() && matches!(job.operation,crate::sftp::Operation::Close{..}) { let _=cleanup_tx.send(job); } else if let Err(error)=sftp_tx.try_send(job){let message=if matches!(&error,mpsc::error::TrySendError::Full(_)){"SFTP queue is full"}else{"SFTP worker is closed"};let _=error.into_inner().reply.send(Err(message.into()));},
-                Some(TransportInput::Data(bytes))=>channel.data(bytes.as_slice()).await?,Some(TransportInput::Raw(bytes,reply))=>{let result=channel.data(bytes.as_slice()).await;let _=reply.send(result.as_ref().map(|_|()).map_err(|e|e.to_string()));result?;},
-                Some(TransportInput::Resize(new))=>{*size=new;channel.window_change(size.cols as u32,size.rows as u32,size.pixel_width as u32,size.pixel_height as u32).await?;},None=>{session.disconnect(russh::Disconnect::ByApplication,"Tab closed","en").await?;return Ok(());}
-            },
+            outcome = &mut sideband, if probing => {
+                probing = false;
+                auth_pending = false;
+                if waiting_for_resume {
+                    queued_before_unlock = input.len();
+                    waiting_for_resume = false;
+                }
+                let status = game.as_mut().expect("enabled game sideband")
+                    .finish(shell.link.fingerprint(), outcome);
+                events.push("game-resume", serde_json::json!({"status": status}));
+                if restoring {
+                    let message = if status == "redeemed" {
+                        "RustMUSH session restored".into()
+                    } else {
+                        format!("RustMUSH resume {status} · using the current login")
+                    };
+                    output.send(Event::Status(message)).await?;
+                }
+            }
+            result = &mut auth_rx, if auth_pending => {
+                auth_pending = false;
+                if result.is_ok() && waiting_for_resume {
+                    queued_before_unlock = input.len();
+                    waiting_for_resume = false;
+                    events.push("game-resume", serde_json::json!({"status": "auth_required"}));
+                    output.send(Event::Status("RustMUSH resume requires game account login".into())).await?;
+                }
+            }
+            message = input.recv() => {
+                // Commands already queued when the welcome/restore gate opened
+                // belong to the previous input epoch, even when processed later.
+                let discard_input = waiting_for_resume || queued_before_unlock > 0;
+                queued_before_unlock = queued_before_unlock.saturating_sub(1);
+                match message {
+                    Some(TransportInput::Authenticate(auth)) => options.authentication = auth,
+                    Some(TransportInput::Sftp(job)) => {
+                        if job.reply.is_closed() && matches!(job.operation, crate::sftp::Operation::Close { .. }) {
+                            let _ = cleanup_tx.send(job);
+                        } else if let Err(error) = sftp_tx.try_send(job) {
+                            let message = if matches!(&error, mpsc::error::TrySendError::Full(_)) {
+                                "SFTP queue is full"
+                            } else {
+                                "SFTP worker is closed"
+                            };
+                            let _ = error.into_inner().reply.send(Err(message.into()));
+                        }
+                    }
+                    Some(TransportInput::Data(_)) if discard_input => {}
+                    Some(TransportInput::Raw(_, reply)) if discard_input => {
+                        let _ = reply.send(Err("RustMUSH resume is pending; input was not queued or sent".into()));
+                    }
+                    Some(TransportInput::Data(bytes)) => channel.data(bytes.as_slice()).await?,
+                    Some(TransportInput::Raw(bytes, reply)) => {
+                        let result = channel.data(bytes.as_slice()).await;
+                        let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+                        result?;
+                    }
+                    Some(TransportInput::Resize(new)) => {
+                        *size = new;
+                        channel.window_change(size.cols as u32, size.rows as u32,
+                            size.pixel_width as u32, size.pixel_height as u32).await?;
+                    }
+                    None => return Ok(()),
+                }
+            }
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
-                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
+                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or shell request ({pending} outstanding)"))),
-                Some(russh::ChannelMsg::ExitStatus{exit_status})=>{output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;session.disconnect(russh::Disconnect::ByApplication,"Remote process exited","en").await?;return Ok(());},
-                Some(russh::ChannelMsg::Close)=>{session.disconnect(russh::Disconnect::ByApplication,"Remote channel closed","en").await?;return Ok(());},None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
+                Some(russh::ChannelMsg::ExitStatus{exit_status})=>{output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;return Ok(());},
+                Some(russh::ChannelMsg::Close)=>return Ok(()),None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
             }
         }
     }

@@ -1,5 +1,6 @@
 /target/
 /.local/
 *.log
+*.w11term.lock
 /hostinger
 /hostinger.pub

@@ -45,10 +45,49 @@ transmissions to 48 MiB encoded / 32 MiB inflated, limits decoded kitty frames t
 are pruned when the table exceeds 32 MiB. Remote SSH peers cannot request local
 file, temporary-file, or shared-memory kitty transports. These limits cover direct
 replacement; they do not establish a global RAM limit for sixel, iTerm images,
-images retained in primary scrollback or other image protocols. APC buffers are capped at 48 MiB; oversized strings are discarded through their terminator. Kitty animations are capped at 256 frames / 32 MiB and accounted in the 64 MiB table. The separate CPU dedup cache retains at most 4 MiB, and clears on deletion, reset and animation edits. Chunked query/animation transmissions are explicitly unsupported.
-Large graphics or unused table entries may be rejected/evicted. The renderer still
-shows the first frame of animated images.
+images retained in primary scrollback or other image protocols. APC buffers are capped at 48 MiB; oversized strings are discarded through their terminator. Kitty animations are capped at 256 frames / 32 MiB and accounted in the 64 MiB table. The separate CPU dedup cache retains at most 4 MiB, and clears on deletion, reset and animation edits. Chunked animation frames share the direct transmission budget. Chunked queries are unsupported.
+Large graphics or unused table entries may be rejected or evicted.
 
 DA1 includes attribute 4 and XTVERSION identifies `w11term <package-version>`.
 Both replies are tested as actual parser response bytes, alongside negotiated
 press/repeat/release encoding and transport-reset behavior.
+
+## Animation and placement fixtures
+
+The session worker interprets kitty `a=a` for client-selected frames, loading
+and running modes, frame gaps and loop counts. It schedules the next visible
+frame with a monotonic timer. A stopped animation, an undisplayed image, and a
+loading animation waiting for another frame require no presentation timer.
+Each committed snapshot freezes the selected pixels. Frame edits under another
+image ID cannot change them. Direct `a=f` accepts bounded chunked input.
+
+`U=1` records a virtual placement. It acquires screen coordinates from actual
+U+10EEEE cells. The foreground color, underline color and up to three combining
+marks identify the image, placement, row and column. Omitted coordinates follow
+kitty's left-cell inheritance rules. The source glyphs remain in selectable
+terminal text. Relative `P,Q,H,V` placements follow their parent through
+repositioning, reflow and scrollback, including a parent outside the viewport.
+Deleting a parent removes its dependents. Cycles and missing parents return
+`ECYCLE` and `ENOPARENT`. Each terminal accepts up to 1,024 placements, a
+relative ancestry depth of 16, and 65,536 projected visible tiles per snapshot.
+
+`tests/fixtures/kitty/placements.vt` is the exact byte stream consumed by both
+renderers. `samples.json` gives zero-based cell centers and expected RGB values.
+It includes two differently colored placeholder cells, a blue relative child
+and the yellow second animation frame. Run the Windows Direct2D check with
+`cargo test --bin w11term offscreen_kitty_reference_cell_centers`. The engine
+fixtures are `cargo test --test kitty_graphics --test image_limits --test synchronized`.
+They also check loading, finite loops, signed gaps, fragmented transfers, old
+snapshots, resizing, scrolling, parent deletion and error replies.
+
+The `Kitty graphics reference` workflow runs Ubuntu 24.04's kitty 0.32.2
+under Xvfb using Mesa software GL. It compares an X11 capture against the
+same cell coordinates and uploads the PNG, measured grid, and package
+versions. On a Linux host with those packages installed, run
+`xvfb-run -a /usr/bin/python3 tests/kitty-reference.py artifacts` from the repo.
+The five colored sample points test placement and selected pixels. GPU interpolation,
+general deletion selectors, placeholders under every rendition attribute, and every
+possible compositing edge remain outside this fixture.
+
+[Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) and
+[kitty 0.32.2 placement implementation](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c)

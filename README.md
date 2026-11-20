@@ -1,12 +1,14 @@
 # w11term
 
-A Windows-native SSH terminal prototype in Rust. Windows Reactor supplies the window and hosts a GPU terminal surface. The shell runs on the SSH server; there is no ConPTY, local PowerShell, or cmd dependency.
+A Windows-native terminal in Rust. Windows Reactor hosts the window and GPU terminal surface. SSH panes connect directly through russh. Local shell profiles run Windows console programs through ConPTY.
 
 Terminal emulation is provided by **[wezterm-term](https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term)**, the terminal core from [WezTerm](https://wezterm.org/), by Wez Furlong and contributors. Its VT parser, screen model, scrollback/reflow, graphics protocols, and semantic prompt support are the foundation of w11term's terminal. The vendored crate retains its [original MIT license](vendor/wezterm-term/LICENSE.md); our local changes are documented in [PATCHES.md](vendor/wezterm-term/PATCHES.md).
 
 ## Run
 
-Requires Windows and the Rust MSVC toolchain with Visual Studio C++ Build Tools. The build stages the WinUI runtime beside the executable; there is no separate runtime installation step. The first build downloads Rust dependencies, a pinned WezTerm source revision, and Microsoft's runtime packages.
+GitHub Releases provides a Windows x64 ZIP containing the GUI, `w11term-cli.exe` and the Windows App Runtime. Extract the entire ZIP into one folder and launch `w11term.exe`. Each release includes a SHA-256 checksum. [Download a release](https://github.com/conclavio/w11term/releases)
+
+Building from source requires Windows and the Rust MSVC toolchain with Visual Studio C++ Build Tools. The first build downloads Rust dependencies, a pinned WezTerm source revision, and Microsoft's runtime packages. The build stages the WinUI runtime beside the executable.
 
 Launch the build with `cargo run --release`, `.\target\release\w11term.exe`, or
 `.\launch.ps1` from the project root. Copying only `w11term.exe` into another folder
@@ -25,6 +27,8 @@ cargo run -- --profile root
 cargo run -- --profile play-6789
 cargo run -- --profile play-6792
 cargo run -- --profile root --tab play-6789 --tab play-6792
+cargo run -- --workspace "Admin console"
+cargo run -- --profile "Windows PowerShell"
 cargo run -- --list-profiles
 cargo run -- ssh user@example.com --identity C:\path\to\id_ed25519
 cargo run -- ssh user@example.com --port 2222 --host-key SHA256:verified-fingerprint
@@ -37,19 +41,56 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 ## Tabs and profiles
 
-The native WinUI tab strip sits in the window title bar. Click **+** to choose a saved profile and open an independent SSH session; opening a profile more than once creates separate sessions. Drag tabs to reorder them and use their close buttons to disconnect. Closing the last tab closes the window. Background sessions retain their terminal state and continue receiving output; only the active terminal is rendered.
+The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
+
+Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
+
+Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
+
+Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
+
+Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.
+
+On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** or drop local files onto the drawer to upload into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
+
+**Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.
+
+Use **caret → Workspaces…** to name and save your current terminal tabs. A workspace remembers tab order, split directions and proportions, the focused pane in each tab and which tab you were using. Opening a workspace from this page adds its terminals to the current window. Launching with `--workspace "Admin console"` opens the saved layout in a new window.
+
+Each restored pane receives a new process-local control ID. SSH panes normally start a fresh shell. A saved durable pane can return to its original shell. Named profile references use the current profile settings. Ad-hoc SSH panes retain their connection options and key paths. Replay panes reference their original capture files. Workspaces are stored in `%LOCALAPPDATA%\w11term\workspaces.json`, or in `W11TERM_DATA_DIR` when set.
+
+**Settings → Import OpenSSH config** previews aliases from your Windows SSH config or another selected file. Pick an alias to see its destination, identity, jump hosts and any unsupported directives. Saving creates an editable w11term profile. Import reads the selected file and leaves it intact. Routes or trust settings that cannot be represented are flagged before saving.
+
+Imported `ProxyJump` routes use SSH `direct-tcpip` channels. Each jump host and the final destination have their own authentication and host-key checks. The resulting SSH shell and its SFTP drawer use the destination connection. For a manually configured profile, `proxy_jump` is an ordered array of objects with `host`, `user`, optional `port`, `auth` and optional `host_key`. Each hop supports the same authentication choices as the destination.
+
+| Pane action | Shortcut |
+| --- | --- |
+| Split right or below | Ctrl+Alt+Shift+Right or Down |
+| Focus a neighbor | Ctrl+Alt+Arrow |
+| Zoom pane or restore layout | Ctrl+Alt+Shift+Z |
+| Close focused pane | Ctrl+Alt+Shift+W |
 
 The **+ → New Profile…** form supports host, user, port, agent/key-file/none/password/keyboard-interactive authentication, an optional verified host fingerprint, device-key generation, and player preferences. **Save and connect** adds the profile to the selected configuration file and opens it. New Profile refuses duplicate names. **Settings → Profiles → Edit…** or **caret → Edit current profile…** opens an existing profile with its saved values. The editor supports renaming and all connection/player fields. **Save changes** updates it without opening or disconnecting a session; **Save and connect** opens the updated connection. Connection changes apply to new sessions; sound and game options update open tabs. Edits preserve unrelated fields and unchanged relative key paths, refuse name collisions, and report a conflict if the profile changed on disk while the editor was open. Saving preserves unrelated configuration fields and atomically replaces the file. Only the key file's path is stored; private key contents never go into the configuration.
+
+From the profile editor, **Duplicate saved profile…** opens a copy of the last saved settings, including key paths and custom fields. Give the copy a name, then choose **Save copy** or **Save and connect**. **Delete profile…** asks you to confirm the saved name. Open sessions in this window keep running independently, and key files stay on disk.
 
 The caret menu displays **On**/**Off** for fullscreen, mute, game mode, alternate-screen wheel keys, remote named sounds, and asset synchronization, using the active terminal’s effective settings. Terminal-only actions are disabled when a settings/form tab is selected.
 
 The **caret → Settings** command opens profile management, the terminal font selector and programming-ligatures toggle. The selector includes only installed Cascadia Code, Cascadia Mono, Consolas, JetBrains Mono, Monaspace-family, and Fira Code fonts. Changes apply across the window's terminal tabs and are saved automatically to `%LOCALAPPDATA%\w11term\settings.json`. `W11TERM_SETTINGS_PATH` can override that file for portable configuration or isolated tests. Settings and New Profile tabs use native controls and do not send their typing into an SSH session. The plus menu also includes the terminal lab.
 
-Ligatures default to enabled and use DirectWrite shaping for adjacent ASCII cells with matching attributes, preserving the terminal grid. Monaspace additionally enables its [documented programming-ligature feature sets](https://github.com/githubnext/monaspace#code-ligatures). Font changes recalculate cell geometry and resize existing sessions; PNG capture uses the same selected font and ligature setting.
+Programming ligatures default to enabled for adjacent ASCII cells with matching attributes. Monaspace also enables its programming-ligature feature sets. DirectWrite shapes connected scripts even with programming ligatures disabled. Font changes recalculate cell geometry and resize existing sessions. PNG capture uses the same font and shaping settings as the live pane. [Monaspace features](https://github.com/githubnext/monaspace#code-ligatures)
 
 SSH supports OpenSSH private keys supplied with `--identity`, protected w11term device keys, the Windows OpenSSH agent (the default for `ssh user@host`), `--auth none`, `--auth password`, and `--auth keyboard-interactive`. Password and MFA challenges use native dialogs; hidden answers never enter terminal input, profiles, event logs, or recordings. A successful password remains in memory only for reconnection; one-time codes are requested again. Passphrase-protected OpenSSH keys can be used through the agent.
 
-The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`; Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog. SSH config aliases and jump hosts remain deferred.
+The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`. Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog.
+
+## Durable Linux shells
+
+In the SSH profile editor, enable **Keep the remote shell running with zmx (Linux)** to let a remote PTY survive a network drop or a w11term restart. The Linux account needs a compatible zmx 1.x executable on its SSH command path and permission to run SSH exec requests. The tested version is 1.0.1. Save the workspace after the first attachment so you can reopen the same shell after closing the window.
+
+Use **caret → Panes → Remote session** to detach, reattach, or end the remote session. Ending requires confirmation. w11term checks the SSH destination, account, host fingerprint and remote session generation before accepting input. If recovery fails, the pane shows the outcome and offers an explicit choice to start a new durable shell or a plain SSH shell. Ordinary game profiles that accept only shell requests can keep using direct SSH.
+
+The Linux trial restored Vim's unsaved buffer, editing mode and current grid. An application using a static kitty image needs to redraw it after reattachment. [Linux trial and reproduction steps](docs/durable-linux-trial.md)
 
 ## Player profiles
 
@@ -183,22 +224,27 @@ from an administrator terminal; ordinary tests exercise medium/low isolation.
 This is a runnable foundation, not complete terminal conformance or a kitty/Ghostty performance result.
 
 - ANSI/DEC behavior, primary/alternate screens, scrollback/reflow, 256/true color, wide and combining text, basic mouse reporting, bracketed paste, and negotiated kitty key encoding are connected.
-- The engine has kitty/Sixel/iTerm image handling. The renderer draws static content and the first animation frame; animation scheduling and advanced protocol extensions remain work. The replacement/delete/resize audit is documented in [Graphics audit](docs/graphics-audit.md). It covers the cockpit's single-id replacement path and GPU eviction, with bounded direct transfers and image tables; it is not a claim of complete image-protocol conformance or a global memory bound across all retained scrollback images.
-- Text uses cached DirectWrite layouts, including color emoji and programming ligatures across matching ASCII cells. Full Unicode run shaping, full BiDi layout, italic rendering, underline variants, and exact cursor styling remain work.
-- Keyboard press/repeat/release and game-mode repeat suppression are connected. Complete physical-key/alternate-key handling and IME/TSF composition remain work.
-- Profile deletion and tab tear-out into separate windows are deferred. The [workspace and SSH roadmap](docs/terminal-workspaces-roadmap.md) covers native splits, a graphical SFTP drawer, durable remote sessions, terminal fidelity and accessibility, local PowerShell via ConPTY, and subsequent RustMUSH features.
+- The terminal displays kitty, sixel and iTerm images. Kitty supports timed or client-selected animation frames, Unicode placeholders and relative placements. The [graphics audit](docs/graphics-audit.md) documents reference fixtures, GPU cache eviction, transfer budgets and protocol coverage.
+- DirectWrite shapes text runs with matching attributes and supports italic, color emoji and five underline styles with independent decoration color. Bidirectional ordering uses the terminal's row direction with a left-to-right default. Selection, search highlights, URL hit testing and cursor placement share the displayed cell map. Copy and control-pipe text retain logical order. Each physical row resolves independently, including soft-wrapped rows. The replay fixture exercises mixed Hebrew and digits, Arabic joining, a Devanagari conjunct, italic and underline styles. [Replay fixture](tests/fixtures/complex-text.vt)
+- Windows input methods compose at the focused pane's caret. Committing sends the composed text once. The UI Automation Text and Text2 patterns expose the current viewport, selection and caret to assistive technology. See [IME behavior and manual checks](docs/ime.md).
+- Keyboard press, repeat, release and game-mode repeat suppression are connected. Physical and alternate key handling still have coverage gaps.
+- Tab tear-out into separate windows is deferred. The [workspace and SSH roadmap](docs/terminal-workspaces-roadmap.md) covers native splits, a graphical SFTP drawer, durable remote sessions, terminal fidelity and accessibility, local PowerShell via ConPTY, and subsequent RustMUSH features.
 
 ## Verify
 
 For visible typing-latency comparisons against WezTerm and Windows Terminal, see [the loopback SSH / Typometer setup](bench/README.md).
 
 ```powershell
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
 ```
 
 The integration tests start ephemeral **loopback-only** SSH servers with generated test keys. They verify both public-key and keyless authentication, PTY/shell setup, terminal query replies, keyboard roundtrip, and resizing without accessing a user server or credential. Unit tests cover profiles, fragmented UTF-8/VT traffic, alternate-screen restoration, reflow, bracketed paste, and kitty image/key state.
+
+Pull requests run the Rust suite and native Windows tests, including GUI automation, record/replay, ConPTY beside SSH, and a relocated release-package launch. The Rust job reports line coverage for `src/` and uploads LCOV and per-file JSON reports. Native GUI scenarios run in a separate job. Linux jobs check durable PTY recovery and compare graphics against upstream kitty. The Actions run includes the tested Windows x64 ZIP and checksum for download. [CI workflow](.github/workflows/windows-ci.yml)
+
+A merge into `main` reruns these checks at the merged commit. After they pass, GitHub publishes that run's verified ZIP and checksum under a `build-<commit>` release tag. Re-running the workflow preserves an existing published release. [GitHub Releases](https://github.com/conclavio/w11term/releases)
 
 The optional `ui-smoke` feature exercises the real native control lifecycle using only local terminal labs: independent tab buffers, switching, reordering, closing a background tab, Settings, and profile-form validation. It does not save a profile or connect to a server:
 
@@ -229,11 +275,11 @@ cargo run --example ssh_probe -- --profile play-6789
 cargo run --example ssh_probe -- --profile play-6792
 ```
 
-The terminal core is vendored from commit `e2a98e1b8af156988ad0ac778658ac27b60a55fb` with embedding fixes and extensions; see `vendor/wezterm-term/PATCHES.md`. Its shared crates remain pinned to that revision. `Cargo.lock` pins the resolved dependency graph. Treat upgrades as compatibility changes and rerun protocol and visual checks.
+The terminal core is vendored from commit `e2a98e1b8af156988ad0ac778658ac27b60a55fb` with embedding fixes and extensions; see `vendor/wezterm-term/PATCHES.md`. The escape parser is also vendored at that revision for animation controls and extended placement parameters. The other shared crates remain pinned to that revision. `Cargo.lock` pins the resolved dependency graph. Treat upgrades as compatibility changes and rerun protocol and visual checks.
 
 ## License
 
-w11term's original project code is licensed under [Apache-2.0](LICENSE). Vendored `wezterm-term` remains MIT-licensed, with its upstream copyright and license notices preserved. Other dependencies retain their respective licenses. See [NOTICE](NOTICE) for attribution.
+w11term's original project code is licensed under [Apache-2.0](LICENSE). Vendored `wezterm-term` and `wezterm-escape-parser` remain MIT-licensed, with their upstream copyright and license notices preserved. Other dependencies retain their respective licenses. See [NOTICE](NOTICE) for attribution.
 
 Control requests have separate ordinary-command and long-poll capacity. Overload
 returns a JSON `busy` error; that request was not executed. `sftp get` accepts
