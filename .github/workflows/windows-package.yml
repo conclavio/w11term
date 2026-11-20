@@ -1,0 +1,42 @@
+name: Windows release package
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and launch the release ZIP
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0-x86_64-pc-windows-msvc
+      CARGO_INCREMENTAL: '0'
+      ARCHIVE: w11term-windows-x64.zip
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      - run: cargo build --locked --release --bins
+      - name: Package the GUI, CLI and Windows runtime
+        run: ./scripts/package-windows.ps1 -BinaryDirectory "$PWD/target/release" -ArchivePath "$env:RUNNER_TEMP/$env:ARCHIVE"
+      - name: Start the extracted app and drive it with the shipped CLI
+        run: ./scripts/test-release-package.ps1 -ArchivePath "$env:RUNNER_TEMP/$env:ARCHIVE"
+      - name: Checksum the verified ZIP
+        working-directory: ${{ runner.temp }}
+        run: |
+          $digest = (Get-FileHash -LiteralPath $env:ARCHIVE -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP/$env:ARCHIVE.sha256", "$digest  $env:ARCHIVE`n", [Text.Encoding]::ASCII)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: w11term-windows-x64
+          path: |
+            ${{ runner.temp }}/w11term-windows-x64.zip
+            ${{ runner.temp }}/w11term-windows-x64.zip.sha256
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 14

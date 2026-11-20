@@ -54,3 +54,26 @@ impl Recorder {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starting_a_recording_preserves_existing_capture_or_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let capture = directory.path().join("session.vt");
+        let metadata = capture.with_extension("vt.json");
+
+        std::fs::write(&capture, b"existing capture").unwrap();
+        assert!(Recorder::start(&capture, Default::default()).is_err());
+        assert_eq!(std::fs::read(&capture).unwrap(), b"existing capture");
+        assert!(!metadata.exists());
+
+        std::fs::remove_file(&capture).unwrap();
+        std::fs::write(&metadata, b"existing metadata").unwrap();
+        assert!(Recorder::start(&capture, Default::default()).is_err());
+        assert_eq!(std::fs::read(&metadata).unwrap(), b"existing metadata");
+        assert!(!capture.exists(), "failed start left a partial capture");
+    }
+}

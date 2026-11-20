@@ -2301,7 +2301,7 @@ impl TerminalApp {
         for (name, label, value) in [
             (
                 "rustmush",
-                "Rustmush server (device-key enrollment)",
+                "RustMUSH server (device keys and session resume)",
                 draft.player.rustmush,
             ),
             (
@@ -2637,7 +2637,8 @@ impl Component for TerminalApp {
                     ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
                          || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
                          || std::env::var_os("W11TERM_FILE_SMOKE").is_some()))
-                     || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())));
+                     || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())
+                     || (ssh.user == "bench" && std::env::var_os("W11TERM_PROFILE_SMOKE").is_some())));
             assert!(
                 (matches!(options.source, Source::Demo) || loopback)
                     && options.extra_profiles.is_empty(),
@@ -4161,17 +4162,24 @@ impl TerminalApp {
                         std::env::var_os("W11TERM_SETTINGS_PATH").is_some(),
                         "font smoke needs isolated settings"
                     );
+                    let current = self.appearance.read().unwrap().font_family.clone();
                     let index = self
                         .fonts
                         .iter()
                         .position(|font| font == "Cascadia Code")
-                        .expect("font smoke requires Cascadia Code");
+                        .or_else(|| self.fonts.iter().position(|font| font != &current))
+                        .unwrap_or(0);
+                    let selected = self
+                        .fonts
+                        .get(index)
+                        .expect("font smoke needs an installed curated terminal font")
+                        .clone();
                     self.update(Message::Font(Some(index)), context);
                     self.update(Message::Ligatures(false), context);
-                    assert_eq!(self.appearance.read().unwrap().font_family, "Cascadia Code");
+                    assert_eq!(self.appearance.read().unwrap().font_family, selected);
                     assert!(!self.appearance.read().unwrap().ligatures);
                     let saved = Appearance::load(&Appearance::path().unwrap()).unwrap();
-                    assert_eq!(saved.font_family, "Cascadia Code");
+                    assert_eq!(saved.font_family, selected);
                     assert!(!saved.ligatures);
                     assert!(
                         self.appearance_error.is_none(),
@@ -4215,14 +4223,7 @@ impl TerminalApp {
         match step {
             0 => {
                 assert!(std::env::var_os("W11TERM_DATA_DIR").is_some());
-                // Represent the saved fixture with a lab until the editor connects to the echo peer.
-                let first = self.tabs.get_mut(1).unwrap();
-                first.label = "typo".into();
-                let Page::Terminal(live) = &mut first.page else {
-                    panic!("expected local lab")
-                };
-                live.profile_name = Some("typo".into());
-                *live.session.player.write().unwrap() = self.profiles["typo"].player.clone();
+                assert_eq!(self.tabs.get(1).unwrap().ssh_profile_name(), Some("typo"));
                 self.update(tab_menu_message("Mute: Off".into()), context);
                 let Page::Terminal(tab) = &self.tabs.get(1).unwrap().page else {
                     panic!()
@@ -4337,8 +4338,9 @@ impl TerminalApp {
             32 => {
                 let editor = self.tabs.active_id().unwrap();
                 let existing = self.tabs.entries().iter().find(|entry| {
-                    matches!(&entry.value.page, Page::Terminal(live) if matches!(live.source, Source::Ssh(_)))
-                }).unwrap();
+                    entry.value.ssh_profile_name() == Some("corrected")
+                        && matches!(&entry.value.page, Page::Terminal(live) if live.session.frames.load().connection_generation > 0)
+                }).expect("save-and-connect pane is connected to the loopback peer");
                 let pane = existing.value.pane_id().unwrap();
                 let entry = existing.id;
                 let options = self.profiles["corrected"].clone();

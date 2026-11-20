@@ -6,7 +6,9 @@ Terminal emulation is provided by **[wezterm-term](https://github.com/wezterm/we
 
 ## Run
 
-Requires Windows and the Rust MSVC toolchain with Visual Studio C++ Build Tools. The build stages the WinUI runtime beside the executable; there is no separate runtime installation step. The first build downloads Rust dependencies, a pinned WezTerm source revision, and Microsoft's runtime packages.
+GitHub Releases provides a Windows x64 ZIP containing the GUI, `w11term-cli.exe` and the Windows App Runtime. Extract the entire ZIP into one folder and launch `w11term.exe`. Each release includes a SHA-256 checksum. [Download a release](https://github.com/conclavio/w11term/releases)
+
+Building from source requires Windows and the Rust MSVC toolchain with Visual Studio C++ Build Tools. The first build downloads Rust dependencies, a pinned WezTerm source revision, and Microsoft's runtime packages. The build stages the WinUI runtime beside the executable.
 
 Launch the build with `cargo run --release`, `.\target\release\w11term.exe`, or
 `.\launch.ps1` from the project root. Copying only `w11term.exe` into another folder
@@ -233,12 +235,16 @@ This is a runnable foundation, not complete terminal conformance or a kitty/Ghos
 For visible typing-latency comparisons against WezTerm and Windows Terminal, see [the loopback SSH / Typometer setup](bench/README.md).
 
 ```powershell
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
 ```
 
 The integration tests start ephemeral **loopback-only** SSH servers with generated test keys. They verify both public-key and keyless authentication, PTY/shell setup, terminal query replies, keyboard roundtrip, and resizing without accessing a user server or credential. Unit tests cover profiles, fragmented UTF-8/VT traffic, alternate-screen restoration, reflow, bracketed paste, and kitty image/key state.
+
+Pull requests run the Rust suite and native Windows tests, including GUI automation, record/replay, ConPTY beside SSH, and a relocated release-package launch. The Rust job reports line coverage for `src/` and uploads LCOV and per-file JSON reports. Native GUI scenarios run in a separate job. Linux jobs check durable PTY recovery and compare graphics against upstream kitty. The Actions run includes the tested Windows x64 ZIP and checksum for download. [CI workflow](.github/workflows/windows-ci.yml)
+
+A merge into `main` reruns these checks at the merged commit. After they pass, GitHub publishes that run's verified ZIP and checksum under a `build-<commit>` release tag. Re-running the workflow preserves an existing published release. [GitHub Releases](https://github.com/conclavio/w11term/releases)
 
 The optional `ui-smoke` feature exercises the real native control lifecycle using only local terminal labs: independent tab buffers, switching, reordering, closing a background tab, Settings, and profile-form validation. It does not save a profile or connect to a server:
 

@@ -189,7 +189,8 @@ fn native_reader_reads_a_terminal_selection_and_tracks_focus_between_split_panes
         SafeArrayDestroy(bounds)?;
         assert_eq!(upper, 7, "one logical range should occupy two rectangles");
         assert!(rects[4] > rects[0] + 2.0 * rects[2]);
-        for (rect, expected) in rects.chunks_exact(4).zip(["A", "א"]) {
+        let (rectangles, _) = rects.as_chunks::<4>();
+        for (rect, expected) in rectangles.iter().zip(["A", "א"]) {
             let hit = right.RangeFromPoint(POINT {
                 x: (rect[0] + rect[2] / 2.0).round() as i32,
                 y: (rect[1] + rect[3] / 2.0).round() as i32,
