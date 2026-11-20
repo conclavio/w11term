@@ -1,4 +1,5 @@
 use super::durability::{LifecycleError, Program};
+use super::game_resume;
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use crate::{
     events::Events,
@@ -512,6 +513,7 @@ pub(crate) async fn run_with_sharing(
     options.validate_route()?;
     let passwords = vec![None; options.proxy_jump.len() + 1];
     let lifecycle = sharing.durable.take();
+    let game = (options.player.rustmush && !options.durable).then(game_resume::Pane::new);
     let mut driver = Driver {
         options,
         size,
@@ -522,6 +524,7 @@ pub(crate) async fn run_with_sharing(
         sharing,
         passwords,
         generation: 0,
+        game,
     };
     if let Some(worker) = lifecycle {
         worker.serve(&mut driver).await
@@ -540,6 +543,7 @@ pub(super) struct Driver {
     sharing: Sharing,
     passwords: Vec<Option<Zeroizing<String>>>,
     generation: u64,
+    game: Option<game_resume::Pane>,
 }
 
 impl Driver {
@@ -591,6 +595,9 @@ impl Driver {
                     self.generation += 1;
                     let started = tokio::time::Instant::now();
                     let result = run_channel(session, self, program).await;
+                    if let Some(game) = &mut self.game {
+                        game.disconnected();
+                    }
                     if started.elapsed() > Duration::from_secs(30) {
                         failures = 0;
                         dropped_at = None;
@@ -651,11 +658,19 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
         output,
         events,
         generation,
+        game,
         ..
     } = driver;
     let generation = *generation;
     let original_size = *size;
     let managed = !matches!(program, Program::Shell(_));
+    let probe = game
+        .as_mut()
+        .filter(|_| !managed)
+        .map(|g| g.probe(shell.link.fingerprint()));
+    let restoring = probe.as_ref().is_some_and(game_resume::Probe::redeeming);
+    let mut waiting_for_resume = restoring;
+    let mut queued_before_unlock = 0usize;
     let mut early_data = Vec::new();
     if managed {
         let startup = program.prepare(&mut shell, options.clone(), original_size);
@@ -670,6 +685,11 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
         if matches!(program, Program::End(_)) {
             return Ok(());
         }
+    }
+    if probe.is_some() {
+        shell
+            .channel
+            .close_game_session_on_drop(shell.link.as_ref().clone());
     }
     let channel = shell.channel.channel();
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
@@ -689,6 +709,11 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             )
             .await?;
         channel.set_env(false, "COLORTERM", "truecolor").await?;
+        if let Some(probe) = &probe {
+            channel
+                .set_env(false, game_resume::ENVIRONMENT, probe.marker())
+                .await?;
+        }
         channel.request_shell(true).await?;
     } else if size.cols != original_size.cols
         || size.rows != original_size.rows
@@ -705,6 +730,16 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             .await?;
     }
     let mut pending = if managed { 0 } else { 2u8 };
+    let (auth, mut auth_rx) = tokio::sync::oneshot::channel();
+    let mut probing = probe.is_some();
+    let mut auth_pending = probing;
+    let sideband = async {
+        probe
+            .expect("enabled game sideband")
+            .exchange(&shell.link, auth)
+            .await
+    };
+    tokio::pin!(sideband);
     if managed {
         shell.published.publish(&shell.link);
         program.ready();
@@ -722,12 +757,70 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     }
     loop {
         tokio::select! {
-            message=input.recv()=>match message {
-                Some(TransportInput::Authenticate(auth))=>options.authentication=auth,
-                Some(TransportInput::Sftp(job))=>if job.reply.is_closed() && matches!(job.operation,crate::sftp::Operation::Close{..}) { let _=cleanup_tx.send(job); } else if let Err(error)=sftp_tx.try_send(job){let message=if matches!(&error,mpsc::error::TrySendError::Full(_)){"SFTP queue is full"}else{"SFTP worker is closed"};let _=error.into_inner().reply.send(Err(message.into()));},
-                Some(TransportInput::Data(bytes))=>channel.data(bytes.as_slice()).await?,Some(TransportInput::Raw(bytes,reply))=>{let result=channel.data(bytes.as_slice()).await;let _=reply.send(result.as_ref().map(|_|()).map_err(|e|e.to_string()));result?;},
-                Some(TransportInput::Resize(new))=>{*size=new;channel.window_change(size.cols as u32,size.rows as u32,size.pixel_width as u32,size.pixel_height as u32).await?;},None=>return Ok(()),
-            },
+            outcome = &mut sideband, if probing => {
+                probing = false;
+                auth_pending = false;
+                if waiting_for_resume {
+                    queued_before_unlock = input.len();
+                    waiting_for_resume = false;
+                }
+                let status = game.as_mut().expect("enabled game sideband")
+                    .finish(shell.link.fingerprint(), outcome);
+                events.push("game-resume", serde_json::json!({"status": status}));
+                if restoring {
+                    let message = if status == "redeemed" {
+                        "RustMUSH session restored".into()
+                    } else {
+                        format!("RustMUSH resume {status} · using the current login")
+                    };
+                    output.send(Event::Status(message)).await?;
+                }
+            }
+            result = &mut auth_rx, if auth_pending => {
+                auth_pending = false;
+                if result.is_ok() && waiting_for_resume {
+                    queued_before_unlock = input.len();
+                    waiting_for_resume = false;
+                    output.send(Event::Status("RustMUSH resume requires game account login".into())).await?;
+                }
+            }
+            message = input.recv() => {
+                // Commands already queued when the welcome/restore gate opened
+                // belong to the previous input epoch, even when processed later.
+                let discard_input = waiting_for_resume || queued_before_unlock > 0;
+                queued_before_unlock = queued_before_unlock.saturating_sub(1);
+                match message {
+                    Some(TransportInput::Authenticate(auth)) => options.authentication = auth,
+                    Some(TransportInput::Sftp(job)) => {
+                        if job.reply.is_closed() && matches!(job.operation, crate::sftp::Operation::Close { .. }) {
+                            let _ = cleanup_tx.send(job);
+                        } else if let Err(error) = sftp_tx.try_send(job) {
+                            let message = if matches!(&error, mpsc::error::TrySendError::Full(_)) {
+                                "SFTP queue is full"
+                            } else {
+                                "SFTP worker is closed"
+                            };
+                            let _ = error.into_inner().reply.send(Err(message.into()));
+                        }
+                    }
+                    Some(TransportInput::Data(_)) if discard_input => {}
+                    Some(TransportInput::Raw(_, reply)) if discard_input => {
+                        let _ = reply.send(Err("RustMUSH resume is pending; input was not queued or sent".into()));
+                    }
+                    Some(TransportInput::Data(bytes)) => channel.data(bytes.as_slice()).await?,
+                    Some(TransportInput::Raw(bytes, reply)) => {
+                        let result = channel.data(bytes.as_slice()).await;
+                        let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+                        result?;
+                    }
+                    Some(TransportInput::Resize(new)) => {
+                        *size = new;
+                        channel.window_change(size.cols as u32, size.rows as u32,
+                            size.pixel_width as u32, size.pixel_height as u32).await?;
+                    }
+                    None => return Ok(()),
+                }
+            }
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
                 Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},

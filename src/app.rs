@@ -2301,7 +2301,7 @@ impl TerminalApp {
         for (name, label, value) in [
             (
                 "rustmush",
-                "Rustmush server (device-key enrollment)",
+                "RustMUSH server (device keys and session resume)",
                 draft.player.rustmush,
             ),
             (
