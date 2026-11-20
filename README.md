@@ -217,7 +217,7 @@ from an administrator terminal; ordinary tests exercise medium/low isolation.
 This is a runnable foundation, not complete terminal conformance or a kitty/Ghostty performance result.
 
 - ANSI/DEC behavior, primary/alternate screens, scrollback/reflow, 256/true color, wide and combining text, basic mouse reporting, bracketed paste, and negotiated kitty key encoding are connected.
-- The engine has kitty/Sixel/iTerm image handling. The renderer draws static content and the first animation frame; animation scheduling and advanced protocol extensions remain work. The replacement/delete/resize audit is documented in [Graphics audit](docs/graphics-audit.md). It covers the cockpit's single-id replacement path and GPU eviction, with bounded direct transfers and image tables; it is not a claim of complete image-protocol conformance or a global memory bound across all retained scrollback images.
+- The terminal displays kitty, sixel and iTerm images. Kitty supports timed or client-selected animation frames, Unicode placeholders and relative placements. The [graphics audit](docs/graphics-audit.md) documents reference fixtures, GPU cache eviction, transfer budgets and protocol coverage.
 - DirectWrite shapes text runs with matching attributes and supports italic, color emoji and five underline styles with independent decoration color. Bidirectional ordering uses the terminal's row direction with a left-to-right default. Selection, search highlights, URL hit testing and cursor placement share the displayed cell map. Copy and control-pipe text retain logical order. Each physical row resolves independently, including soft-wrapped rows. The replay fixture exercises mixed Hebrew and digits, Arabic joining, a Devanagari conjunct, italic and underline styles. [Replay fixture](tests/fixtures/complex-text.vt)
 - Windows input methods compose at the focused pane's caret. Committing sends the composed text once. The UI Automation Text and Text2 patterns expose the current viewport, selection and caret to assistive technology. See [IME behavior and manual checks](docs/ime.md).
 - Keyboard press, repeat, release and game-mode repeat suppression are connected. Physical and alternate key handling still have coverage gaps.
@@ -264,11 +264,11 @@ cargo run --example ssh_probe -- --profile play-6789
 cargo run --example ssh_probe -- --profile play-6792
 ```
 
-The terminal core is vendored from commit `e2a98e1b8af156988ad0ac778658ac27b60a55fb` with embedding fixes and extensions; see `vendor/wezterm-term/PATCHES.md`. Its shared crates remain pinned to that revision. `Cargo.lock` pins the resolved dependency graph. Treat upgrades as compatibility changes and rerun protocol and visual checks.
+The terminal core is vendored from commit `e2a98e1b8af156988ad0ac778658ac27b60a55fb` with embedding fixes and extensions; see `vendor/wezterm-term/PATCHES.md`. The escape parser is also vendored at that revision for animation controls and extended placement parameters. The other shared crates remain pinned to that revision. `Cargo.lock` pins the resolved dependency graph. Treat upgrades as compatibility changes and rerun protocol and visual checks.
 
 ## License
 
-w11term's original project code is licensed under [Apache-2.0](LICENSE). Vendored `wezterm-term` remains MIT-licensed, with its upstream copyright and license notices preserved. Other dependencies retain their respective licenses. See [NOTICE](NOTICE) for attribution.
+w11term's original project code is licensed under [Apache-2.0](LICENSE). Vendored `wezterm-term` and `wezterm-escape-parser` remain MIT-licensed, with their upstream copyright and license notices preserved. Other dependencies retain their respective licenses. See [NOTICE](NOTICE) for attribution.
 
 Control requests have separate ordinary-command and long-poll capacity. Overload
 returns a JSON `busy` error; that request was not executed. `sftp get` accepts

@@ -22,11 +22,12 @@ fn cpu_cache_is_bounded_and_released_on_delete_and_reconnect() {
         );
         assert!(terminal.image_cache_bytes() <= 4 * 1024 * 1024);
     }
-    assert!(terminal.image_cache_bytes() > 0);
+    // Mutable kitty image ids have independent ownership outside the CPU dedup cache.
+    assert_eq!(terminal.image_cache_bytes(), 0);
     terminal.advance_bytes(b"\x1b_Ga=d,d=A\x1b\\");
     assert_eq!(terminal.image_cache_bytes(), 0);
     send(&mut terminal, "a=t,f=32,s=1,v=1,i=1,q=2", &[1, 2, 3, 255]);
-    assert_eq!(terminal.image_cache_bytes(), 4);
+    assert_eq!(terminal.image_cache_bytes(), 0);
     terminal.reset_connection();
     assert_eq!(terminal.image_cache_bytes(), 0);
 }
@@ -112,7 +113,7 @@ fn exhausted_automatic_image_ids_reject_without_panicking_or_breaking_text() {
 }
 
 #[test]
-fn shared_image_mutations_remain_inside_the_table_budget() {
+fn independent_kitty_animations_remain_inside_the_table_budget() {
     let (writer, _) = tokio::sync::mpsc::unbounded_channel();
     let mut terminal = terminal::create(
         wezterm_term::TerminalSize {
@@ -135,16 +136,27 @@ fn shared_image_mutations_remain_inside_the_table_budget() {
             &pixels,
         );
     }
-    // One full-canvas append consumes the rest of the conservatively counted table budget.
-    for _ in 0..3 {
-        send(&mut terminal, "a=f,f=32,s=1,v=1,i=1,q=2", &[1, 2, 3, 255]);
+    terminal.advance_bytes(b"\x1b[2;1H\x1b_Ga=p,i=2,p=1,c=1,r=1,C=1,q=2\x1b\\");
+    // 32 MiB of base images plus two independently mutable animations leave
+    // room for exactly sixteen further 2 MiB frames.
+    for id in [1, 2] {
+        for _ in 0..8 {
+            send(
+                &mut terminal,
+                &format!("a=f,f=32,s=1,v=1,i={id},q=2"),
+                &[1, 2, 3, 255],
+            );
+        }
     }
+    send(&mut terminal, "a=f,f=32,s=1,v=1,i=2,q=2", &[1, 2, 3, 255]);
     let snapshot = terminal::Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
-    let images = snapshot
-        .rows
-        .iter()
-        .flat_map(|r| r.visible_cells())
-        .find_map(|c| c.attrs().images())
-        .unwrap();
-    assert_eq!(images[0].image_data().len(), 4 * 1024 * 1024);
+    for row in 0..2 {
+        let tile = snapshot.rows[row]
+            .get_cell(0)
+            .unwrap()
+            .attrs()
+            .images()
+            .unwrap();
+        assert_eq!(tile[0].image_data().len(), 18 * 1024 * 1024);
+    }
 }
