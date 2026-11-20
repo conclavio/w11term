@@ -103,6 +103,7 @@ impl ProfileStore {
             "Enter a host and user"
         );
         ensure!(options.port != 0, "Port must be between 1 and 65535");
+        options.validate_route()?;
         self.modify(|profiles, before| {
             if let Some(copy) = copy {
                 ensure!(
@@ -144,8 +145,13 @@ impl ProfileStore {
             if !keep_identity {
                 object.remove("identity");
             }
+            let keep_route =
+                expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
+            if !keep_route && options.proxy_jump.is_empty() {
+                object.remove("proxy_jump");
+            }
             for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
-                if key == "identity" && keep_identity {
+                if (key == "identity" && keep_identity) || (key == "proxy_jump" && keep_route) {
                     continue;
                 }
                 let mut value = value.clone();
@@ -246,6 +252,7 @@ mod tests {
                 identity: "local-key".into(),
             },
             host_key: None,
+            proxy_jump: Vec::new(),
             player: Default::default(),
         };
         store.add("new", &options).unwrap();
@@ -341,5 +348,56 @@ mod edit_tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(document["profiles"]["correct"].get("identity").is_none());
         assert_eq!(store.load().unwrap()["other"].host, "other.test");
+    }
+}
+
+#[cfg(test)]
+mod jump_tests {
+    use super::*;
+    use crate::options::Authentication;
+
+    #[test]
+    fn edits_preserve_relative_jump_identities_and_allow_clearing_the_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let doc = serde_json::json!({"profiles":{"destination":{
+            "host":"target", "user":"pilot", "auth":"agent",
+            "proxy_jump":[{"host":"gate","user":"pilot","auth":"identity",
+                 "identity":"keys/jump","custom":"keep"}]
+        }}});
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let old = store.load().unwrap()["destination"].clone();
+        assert_eq!(
+            old.proxy_jump[0].authentication,
+            Authentication::Identity {
+                identity: dir.path().join("keys/jump")
+            }
+        );
+        let mut edited = old.clone();
+        edited.port = 2200;
+        store
+            .edit("destination", "destination", &edited, &old)
+            .unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["profiles"]["destination"]["proxy_jump"],
+            doc["profiles"]["destination"]["proxy_jump"]
+        );
+        let (_, base) = store.inspect("destination").unwrap();
+        store.duplicate(&base, "second", &edited).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["profiles"]["second"]["proxy_jump"],
+            doc["profiles"]["destination"]["proxy_jump"]
+        );
+        let mut direct = edited.clone();
+        direct.proxy_jump.clear();
+        store
+            .edit("destination", "destination", &direct, &edited)
+            .unwrap();
+        assert_eq!(store.load().unwrap()["destination"], direct);
     }
 }

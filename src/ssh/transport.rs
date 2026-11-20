@@ -181,7 +181,7 @@ async fn authenticate(
                 let candidate = if let Some(value) = password.take() {
                     value
                 } else {
-                    let answer=prompts.ask(Question::Authentication{name:format!("Sign in as {}",options.user),instructions:if attempt==0{"Password is kept in memory for reconnection, never saved to the profile."}else{"Password rejected. Try again."}.into(),challenges:vec![Challenge{label:"Password".into(),echo:false}]}).await.map_err(|e|stop(e.to_string()))?;
+                    let answer=prompts.ask(Question::Authentication{name:format!("Sign in as {}@{}:{}",options.user,options.host,options.port),instructions:if attempt==0{"Password is kept in memory for reconnection, never saved to the profile."}else{"Password rejected. Try again."}.into(),challenges:vec![Challenge{label:"Password".into(),echo:false}]}).await.map_err(|e|stop(e.to_string()))?;
                     let Answer::Authentication(mut values) = answer else {
                         return Err(stop("authentication cancelled"));
                     };
@@ -246,7 +246,10 @@ async fn authenticate(
                         } else {
                             prompts
                                 .ask(Question::Authentication {
-                                    name,
+                                    name: format!(
+                                        "{}@{}:{} · {name}",
+                                        options.user, options.host, options.port
+                                    ),
                                     instructions,
                                     challenges: questions
                                         .into_iter()
@@ -279,9 +282,65 @@ async fn authenticate(
     Ok(())
 }
 async fn connect(
-    options: SshOptions,
-    prompts: Option<Prompts>,
+    options: &SshOptions,
+    prompts: Option<&Prompts>,
+    passwords: &mut [Option<Zeroizing<String>>],
+) -> Result<ConnectionShare> {
+    let route = options
+        .proxy_jump
+        .iter()
+        .cloned()
+        .map(SshOptions::from)
+        .chain(std::iter::once(options.clone()));
+    let mut upstream: Option<ConnectionShare> = None;
+    for (endpoint, password) in route.zip(passwords) {
+        let address = format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port);
+        let handle = if let Some(hop) = &upstream {
+            let handle = hop.handle();
+            let channel = tokio::time::timeout(
+                Duration::from_secs(15),
+                handle.channel_open_direct_tcpip(
+                    &endpoint.host,
+                    u32::from(endpoint.port),
+                    "127.0.0.1",
+                    0,
+                ),
+            )
+            .await
+            .with_context(|| format!("forward to {address} timed out"))?
+            .map_err(|error| {
+                let message = format!("jump host refused forward to {address}: {error}");
+                match error {
+                    russh::Error::ChannelOpenFailure(
+                        russh::ChannelOpenFailure::AdministrativelyProhibited
+                        | russh::ChannelOpenFailure::UnknownChannelType,
+                    ) => stop(message),
+                    _ => anyhow::Error::from(error).context(message),
+                }
+            })?;
+            handshake(&endpoint, prompts, password, channel.into_stream()).await
+        } else {
+            let stream = tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio::net::TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
+            )
+            .await
+            .with_context(|| format!("SSH TCP connection to {address} timed out"))?
+            .with_context(|| format!("connecting to {address}"))?;
+            stream.set_nodelay(true)?;
+            handshake(&endpoint, prompts, password, stream).await
+        }
+        .with_context(|| format!("SSH handshake or authentication for {address}"))?;
+        upstream = Some(ConnectionShare::new(handle, endpoint, prompts, upstream));
+    }
+    upstream.context("missing SSH destination")
+}
+
+async fn handshake(
+    options: &SshOptions,
+    prompts: Option<&Prompts>,
     password: &mut Option<Zeroizing<String>>,
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 ) -> Result<client::Handle<Handler>> {
     let config = Arc::new(client::Config {
         nodelay: true,
@@ -289,13 +348,6 @@ async fn connect(
         keepalive_max: 2,
         ..Default::default()
     });
-    let stream = tokio::time::timeout(
-        Duration::from_secs(15),
-        tokio::net::TcpStream::connect((options.host.as_str(), options.port)),
-    )
-    .await
-    .context("SSH TCP connection timed out")??;
-    stream.set_nodelay(true)?;
     let mut session = tokio::time::timeout(
         Duration::from_secs(300),
         client::connect_stream(
@@ -303,13 +355,13 @@ async fn connect(
             stream,
             Handler {
                 options: options.clone(),
-                prompts: prompts.clone(),
+                prompts: prompts.cloned(),
             },
         ),
     )
     .await
     .context("SSH handshake timed out")??;
-    authenticate(&mut session, &options, prompts.as_ref(), password).await?;
+    authenticate(&mut session, options, prompts, password).await?;
     Ok(session)
 }
 fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOptions) {
@@ -367,7 +419,7 @@ struct OpenShell {
 async fn connect_shell(
     options: SshOptions,
     prompts: Option<Prompts>,
-    password: &mut Option<Zeroizing<String>>,
+    passwords: &mut [Option<Zeroizing<String>>],
     source: Option<ConnectionShare>,
     published: ShareSlot,
 ) -> Result<OpenShell> {
@@ -387,8 +439,7 @@ async fn connect_shell(
             ),
         }
     }
-    let handle = connect(options.clone(), prompts.clone(), password).await?;
-    let link = Arc::new(ConnectionShare::new(handle, options, prompts.as_ref()));
+    let link = Arc::new(connect(&options, prompts.as_ref(), passwords).await?);
     let channel = link.open_shell().await?;
     Ok(OpenShell {
         link,
@@ -406,7 +457,8 @@ pub(crate) async fn run_with_sharing(
     events: Events,
     mut sharing: Sharing,
 ) -> Result<()> {
-    let mut password = None;
+    options.validate_route()?;
+    let mut passwords = vec![None; options.proxy_jump.len() + 1];
     let mut generation = 0;
     let mut failures = 0u32;
     let mut dropped_at: Option<tokio::time::Instant> = None;
@@ -414,7 +466,7 @@ pub(crate) async fn run_with_sharing(
         let future = connect_shell(
             options.clone(),
             prompts.clone(),
-            &mut password,
+            &mut passwords,
             sharing.offered.take(),
             sharing.published.clone(),
         );

@@ -385,6 +385,7 @@ async fn fixture_server(
         port,
         authentication: Authentication::None,
         host_key: Some(pin),
+        proxy_jump: Vec::new(),
         player: Default::default(),
     });
     (source, root, opens, server)

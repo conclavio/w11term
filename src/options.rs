@@ -67,8 +67,61 @@ pub struct SshOptions {
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_jump: Vec<JumpHost>,
     #[serde(default)]
     pub player: PlayerOptions,
+}
+
+pub const MAX_JUMPS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct JumpHost {
+    pub host: String,
+    pub user: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(flatten)]
+    pub authentication: Authentication,
+    pub host_key: Option<String>,
+}
+
+impl From<JumpHost> for SshOptions {
+    fn from(hop: JumpHost) -> Self {
+        Self {
+            host: hop.host,
+            user: hop.user,
+            port: hop.port,
+            authentication: hop.authentication,
+            host_key: hop.host_key,
+            proxy_jump: Vec::new(),
+            player: PlayerOptions::default(),
+        }
+    }
+}
+
+impl SshOptions {
+    pub(crate) fn validate_route(&self) -> Result<()> {
+        ensure!(
+            self.proxy_jump.len() <= MAX_JUMPS,
+            "at most {MAX_JUMPS} SSH jump hosts are supported"
+        );
+        for hop in &self.proxy_jump {
+            ensure!(
+                !hop.host.trim().is_empty() && !hop.user.trim().is_empty() && hop.port != 0,
+                "an SSH jump host requires a host, user and port"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authentications_mut(&mut self) -> impl Iterator<Item = &mut Authentication> {
+        std::iter::once(&mut self.authentication).chain(
+            self.proxy_jump
+                .iter_mut()
+                .map(|hop| &mut hop.authentication),
+        )
+    }
 }
 
 fn default_port() -> u16 {
@@ -121,7 +174,12 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
             !ssh.host.is_empty() && !ssh.user.is_empty() && ssh.port != 0,
             "profile {name}: host, user, and port must be nonempty"
         );
-        if let Authentication::Identity { identity } = &mut ssh.authentication {
+        ssh.validate_route()
+            .with_context(|| format!("profile {name}"))?;
+        for auth in ssh.authentications_mut() {
+            let Authentication::Identity { identity } = auth else {
+                continue;
+            };
             ensure!(
                 !identity.as_os_str().is_empty(),
                 "profile {name}: identity path is empty"
@@ -224,6 +282,7 @@ impl Options {
                         port: 22,
                         authentication: Authentication::Agent,
                         host_key: None,
+                        proxy_jump: Vec::new(),
                         player: Default::default(),
                     });
                 }
