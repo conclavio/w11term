@@ -28,7 +28,7 @@ try {
     @{
         custom = 42
         profiles = @{
-            typo = @{ host='127.0.0.1'; user='bench'; port=1; auth='identity'; identity='keys/test'; host_key=$server.host_key; player=@{rustmush=$true;remote_sounds=$false} }
+            typo = @{ host='127.0.0.1'; user='bench'; port=$port; auth='identity'; identity='keys/test'; host_key=$server.host_key; player=@{rustmush=$true;remote_sounds=$false} }
             other = @{ host='127.0.0.1'; user='bench'; port=1; auth='none'; custom=99 }
         }
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $profiles -Encoding utf8
@@ -39,7 +39,7 @@ try {
     $env:W11TERM_DATA_DIR = Join-Path $state 'data'
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'appearance.json'
     $stderr = Join-Path $state 'stderr.log'
-    $terminal = Start-Process -FilePath $gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError $stderr -RedirectStandardOutput (Join-Path $state 'stdout.log')
+    $terminal = Start-Process -FilePath $gui -ArgumentList @('--profile','typo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError $stderr -RedirectStandardOutput (Join-Path $state 'stdout.log')
     if (-not $terminal.WaitForExit(30000)) { throw "Profile smoke timed out: $state" }
     $log = Get-Content -LiteralPath $stderr -Raw
     if ($terminal.ExitCode -ne 0 -or $log -notmatch 'Profile UI smoke passed') { throw "Profile smoke failed: $log" }
