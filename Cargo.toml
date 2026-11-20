@@ -22,6 +22,7 @@ tempfile = "3"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 wezterm-term = { path = "vendor/wezterm-term" }
+wezterm-bidi = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb" }
 termwiz = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb" }
 wezterm-input-types = { git = "https://github.com/wezterm/wezterm", rev = "e2a98e1b8af156988ad0ac778658ac27b60a55fb" }
 russh = { version = "0.63.1", default-features = false, features = ["ring"] }
