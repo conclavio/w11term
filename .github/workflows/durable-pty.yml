@@ -1,0 +1,23 @@
+name: Durable Linux PTY
+on:
+  pull_request:
+    paths:
+      - 'tests/durable/**'
+      - '.github/workflows/durable-pty.yml'
+  push:
+    branches: [codex/durable-linux-trial]
+    paths: ['tests/durable/**', '.github/workflows/durable-pty.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Check the editor, image and input after losing the PTY client
+        run: sh tests/durable/run-linux.sh
