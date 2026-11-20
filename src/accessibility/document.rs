@@ -1,5 +1,6 @@
 use std::ops::Range;
-use w11term::{interaction::Point, terminal::Snapshot};
+use std::sync::Arc;
+use w11term::{interaction::Point, terminal::Snapshot, text_layout::CellMap};
 use windows::Win32::UI::Accessibility::*;
 
 // The terminal caps launch geometry to 1000×500. Limit an accessible snapshot
@@ -20,6 +21,7 @@ pub(super) struct Document {
     // still retain individual screen rows for geometric and TextUnit_Line queries.
     offsets: Vec<usize>,
     cols: Vec<usize>,
+    pub(super) cell_maps: Arc<[CellMap]>,
     final_col: usize,
     pub(super) starts: Vec<usize>,
     pub(super) first: isize,
@@ -33,6 +35,7 @@ impl Document {
             text: String::new(),
             offsets: vec![0],
             cols: vec![],
+            cell_maps: Arc::clone(frame.cell_maps()),
             final_col: 0,
             starts: vec![],
             first: frame.first_stable_row,

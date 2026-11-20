@@ -6,7 +6,7 @@ The bridge listens for composition on the window receiving input. It reads UTF-1
 
 ## Verification
 
-On Windows, build the GUI with `cargo build --features ui-smoke` and run `.\tests\ime-ui-smoke.ps1`. This opens a temporary terminal lab, splits it, sends native composition lifecycle messages, checks the candidate position and verifies a single commit containing CJK and supplementary-plane characters. The fixture supplies composition strings in place of an installed language IME. The regression tests also check cancellation and pixel conversion at 150% scaling.
+On Windows, build the GUI with `cargo build --features ui-smoke` and run `.\tests\ime-ui-smoke.ps1`. This opens a temporary terminal lab, splits it, and sends native composition messages. It checks the candidate origin at the displayed Hebrew letter in a mixed-direction row and verifies a single commit containing CJK and supplementary-plane characters. The fixture supplies composition strings in place of an installed language IME. The regression tests also check cancellation and pixel conversion at 150% scaling.
 
 The development machine has US English with the US keyboard enabled. Interactive candidate selection with a language IME needs a Windows session that already has one configured. To check it manually:
 

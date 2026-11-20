@@ -314,7 +314,11 @@ impl Renderer {
         if text.is_empty() || frame.cursor.y < 0 || frame.cursor.y as usize >= self.metrics.rows {
             return Ok(0.0);
         }
-        let x = PADDING + frame.cursor.x.min(self.metrics.cols.saturating_sub(1)) as f32 * cw;
+        let x = PADDING
+            + frame
+                .visual_cursor_column()
+                .min(self.metrics.cols.saturating_sub(1)) as f32
+                * cw;
         let y = PADDING + frame.cursor.y as f32 * ch;
         let layout = TextLayout::new(text, &self.normal, 1000000.0, ch)?;
         let width = layout
@@ -600,10 +604,10 @@ impl Renderer {
             }
         }
         self.draw_images(&native, frame, false)?;
+        let col = frame.visual_cursor_column();
         if frame.cursor_visible
             && let Ok(row) = usize::try_from(frame.cursor.y)
             && row < self.metrics.rows
-            && let Some(col) = frame.cell_map(row).map(|map| map.visual(frame.cursor.x))
             && col < self.metrics.cols
         {
             let x = PADDING + col as f32 * cw;

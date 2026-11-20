@@ -186,13 +186,15 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             } else {
                 self.doc.col(b)
             };
-            let left = f64::from(r.left) + g.padding + start_x as f64 * g.cell_width;
             let top = f64::from(r.top) + g.padding + row as f64 * g.cell_height;
-            let right = (f64::from(r.left) + g.padding + end_x as f64 * g.cell_width)
-                .min(f64::from(r.right));
             let bottom = (top + g.cell_height).min(f64::from(r.bottom));
-            if right > left && bottom > top {
-                values.extend([left, top, right - left, bottom - top]);
+            for visual in self.doc.cell_maps[row].visual_ranges(start_x..end_x) {
+                let left = f64::from(r.left) + g.padding + visual.start as f64 * g.cell_width;
+                let right = (f64::from(r.left) + g.padding + visual.end as f64 * g.cell_width)
+                    .min(f64::from(r.right));
+                if right > left && bottom > top {
+                    values.extend([left, top, right - left, bottom - top]);
+                }
             }
         }
         let raw = array(VT_R8, values.len())?;

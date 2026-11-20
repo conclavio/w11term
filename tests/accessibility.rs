@@ -175,14 +175,31 @@ fn native_reader_reads_a_terminal_selection_and_tracks_focus_between_split_panes
             word.GetEnclosingElement()?.CurrentBoundingRectangle()?,
             right.DocumentRange()?.GetText(-1)?.to_string()
         );
+        // A and Alef are adjacent in text but separated on screen by numbers
+        // and two other Hebrew letters. Narrator must receive both rectangles.
+        let mixed = doc.FindText(&BSTR::from("Aא"), false, false)?;
+        let bounds = mixed.GetBoundingRectangles()?;
+        let upper = SafeArrayGetUBound(bounds, 1)?;
+        let mut rects = [0.0f64; 8];
+        if upper == 7 {
+            for (index, value) in rects.iter_mut().enumerate() {
+                SafeArrayGetElement(bounds, &(index as i32), std::ptr::from_mut(value).cast())?;
+            }
+        }
+        SafeArrayDestroy(bounds)?;
+        assert_eq!(upper, 7, "one logical range should occupy two rectangles");
+        assert!(rects[4] > rects[0] + 2.0 * rects[2]);
+        for (rect, expected) in rects.chunks_exact(4).zip(["A", "א"]) {
+            let hit = right.RangeFromPoint(POINT {
+                x: (rect[0] + rect[2] / 2.0).round() as i32,
+                y: (rect[1] + rect[3] / 2.0).round() as i32,
+            })?;
+            hit.ExpandToEnclosingUnit(TextUnit_Character)?;
+            assert_eq!(hit.GetText(-1)?.to_string(), expected);
+        }
         word.Select()?;
         let wait = Instant::now() + Duration::from_secs(3);
-        while right
-            .GetSelection()?
-            .GetElement(0)?
-            .GetText(-1)?
-            != "reader"
-        {
+        while right.GetSelection()?.GetElement(0)?.GetText(-1)? != "reader" {
             anyhow::ensure!(
                 Instant::now() < wait,
                 "range.Select did not update terminal selection"

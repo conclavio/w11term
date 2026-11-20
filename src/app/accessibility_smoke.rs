@@ -73,7 +73,7 @@ impl TerminalApp {
                     {
                         tab.session
                             .input
-                            .send(Command::Text(format!("\x1b[2J\x1b[H{marker}")))
+                            .send(Command::Paste(format!("\x1b[2J\x1b[H{marker} Aאב12ג")))
                             .unwrap();
                     }
                     step

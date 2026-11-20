@@ -543,6 +543,13 @@ impl Snapshot {
         self.cell_maps().get(row)
     }
 
+    pub fn visual_cursor_column(&self) -> usize {
+        usize::try_from(self.cursor.y)
+            .ok()
+            .and_then(|row| self.cell_map(row))
+            .map_or(self.cursor.x, |map| map.visual(self.cursor.x))
+    }
+
     pub fn cell_maps(&self) -> &Arc<[crate::text_layout::CellMap]> {
         self.cell_maps.get_or_init(|| {
             self.rows

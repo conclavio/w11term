@@ -175,7 +175,7 @@ impl TerminalApp {
                     crate::input::ime::caret_box(
                         rect,
                         metrics.get(),
-                        frame.cursor.x,
+                        frame.visual_cursor_column(),
                         frame.cursor.y,
                     )
                 },
