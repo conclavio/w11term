@@ -8,7 +8,15 @@ use russh::{
     server,
 };
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
@@ -21,6 +29,7 @@ use w11term::{
 
 struct Request {
     value: Value,
+    peer: SocketAddr,
     channel: ChannelId,
     shell: ChannelId,
     handle: server::Handle,
@@ -41,6 +50,8 @@ impl Request {
     }
 }
 struct Peer {
+    addr: SocketAddr,
+    attempts: Arc<AtomicUsize>,
     req: mpsc::UnboundedSender<Request>,
     closed: mpsc::UnboundedSender<String>,
     shell: Option<ChannelId>,
@@ -113,6 +124,9 @@ impl server::Handler for Peer {
         name: &str,
         s: &mut server::Session,
     ) -> Result<()> {
+        if name == "rustmush-resume-v1" {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+        }
         if self.refuse || name != "rustmush-resume-v1" {
             s.channel_failure(c)?;
         } else {
@@ -136,6 +150,7 @@ impl server::Handler for Peer {
                     let value = serde_json::from_slice(&self.frame[4..])?;
                     self.req.send(Request {
                         value,
+                        peer: self.addr,
                         channel: c,
                         shell: self.shell.context("missing shell")?,
                         handle: s.handle(),
@@ -151,6 +166,7 @@ impl server::Handler for Peer {
 }
 struct Fixture {
     source: Source,
+    attempts: Arc<AtomicUsize>,
     requests: mpsc::UnboundedReceiver<Request>,
     closed: mpsc::UnboundedReceiver<String>,
     server: tokio::task::JoinHandle<()>,
@@ -168,6 +184,8 @@ impl Fixture {
         let port = listener.local_addr()?.port();
         let (req, requests) = mpsc::unbounded_channel();
         let (closed_tx, closed) = mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let peer_attempts = attempts.clone();
         let server = tokio::spawn(async move {
             let mut clients = tokio::task::JoinSet::new();
             let config = Arc::new(server::Config {
@@ -175,8 +193,10 @@ impl Fixture {
                 auth_rejection_time: Duration::ZERO,
                 ..Default::default()
             });
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok((stream, addr)) = listener.accept().await {
                 let peer = Peer {
+                    addr,
+                    attempts: peer_attempts.clone(),
                     req: req.clone(),
                     closed: closed_tx.clone(),
                     shell: None,
@@ -208,6 +228,7 @@ impl Fixture {
                     ..Default::default()
                 },
             }),
+            attempts,
             requests,
             closed,
             server,
@@ -219,10 +240,27 @@ impl Fixture {
             .with_context(|| format!("waiting for sideband: {}", pane.frames.load().status))?
             .context("missing game sideband request")
     }
+    async fn drop_and_redeem(&mut self, pane: &Session, ticket: &str) -> Result<Request> {
+        let issue = self.request(pane).await?;
+        assert_eq!(issue.value["op"], "issue");
+        issue
+            .answer(json!({"v":1,"status":"issued","ticket":ticket,"grace_seconds":120}))
+            .await?;
+        event(pane, "issued").await?;
+        raw(pane, b"drop-link").await?;
+        let redeem = self.request(pane).await?;
+        assert_eq!(
+            redeem.value,
+            json!({"v":1,"op":"redeem","pane":issue.value["pane"],"ticket":ticket})
+        );
+        Ok(redeem)
+    }
 }
 async fn event(session: &Session, status: &str) -> Result<()> {
+    event_after(session, status, 0).await
+}
+async fn event_after(session: &Session, status: &str, mut cursor: u64) -> Result<()> {
     timeout(Duration::from_secs(7), async {
-        let mut cursor = 0;
         loop {
             let batch = session.events.wait(cursor, Duration::from_secs(2)).await;
             if batch
@@ -374,6 +412,7 @@ async fn unknown_subsystem_and_silent_redeem_leave_an_interactive_terminal() -> 
     event(&pane, "unsupported").await?;
     raw(&pane, b"ordinary-login").await?;
     visible(&pane, "ordinary-login").await?;
+    assert_eq!(unsupported.attempts.load(Ordering::Relaxed), 1);
     let mut f = Fixture::start(false).await?;
     let pane = Session::start(f.source.clone());
     let issue = f.request(&pane).await?;
@@ -384,5 +423,116 @@ async fn unknown_subsystem_and_silent_redeem_leave_an_interactive_terminal() -> 
     event(&pane, "unavailable").await?;
     raw(&pane, b"shell-restored").await?;
     visible(&pane, "shell-restored").await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_redeem_reissues_on_the_same_shell_and_uses_the_new_ticket() -> Result<()> {
+    let mut f = Fixture::start(false).await?;
+    let pane = Session::start(f.source.clone());
+    let old = URL_SAFE_NO_PAD.encode([4; 32]);
+    let fresh = URL_SAFE_NO_PAD.encode([5; 32]);
+    let redeem = f.drop_and_redeem(&pane, &old).await?;
+    assert!(raw(&pane, b"stale-turn").await.is_err());
+    let cursor = pane.events.since(0).next;
+    redeem.answer(json!({"v":1,"status":"unavailable"})).await?;
+    event_after(&pane, "unavailable", cursor).await?;
+
+    let issue = f.request(&pane).await?;
+    assert_eq!((issue.peer, issue.shell), (redeem.peer, redeem.shell));
+    assert_ne!(issue.channel, redeem.channel);
+    let nonce = &redeem.value["pane"];
+    assert_eq!(issue.value, json!({"v":1,"op":"issue","pane":nonce}));
+    assert_eq!(issue.marker, redeem.marker);
+    issue
+        .answer(json!({"v":1,"status":"auth_required"}))
+        .await?;
+    event_after(&pane, "auth_required", cursor).await?;
+    raw(&pane, b"choose-pilot").await?;
+    visible(&pane, "choose-pilot").await?;
+    issue
+        .answer(json!({"v":1,"status":"issued","ticket":fresh,"grace_seconds":120}))
+        .await?;
+    event_after(&pane, "issued", cursor).await?;
+
+    raw(&pane, b"drop-link").await?;
+    let next = f.request(&pane).await?;
+    assert_ne!(next.peer, issue.peer);
+    assert_eq!(
+        next.value,
+        json!({"v":1,"op":"redeem","pane":nonce,"ticket":fresh})
+    );
+    next.answer(json!({"v":1,"status":"denied"})).await?;
+    let followup = f.request(&pane).await?;
+    assert_eq!(followup.value, json!({"v":1,"op":"issue","pane":nonce}));
+    let cursor = pane.events.since(0).next;
+    followup.answer(json!({"v":1,"status":"busy"})).await?;
+    event_after(&pane, "busy", cursor).await?;
+    raw(&pane, b"still-playing").await?;
+    visible(&pane, "still-playing").await?;
+    raw(&pane, b"drop-link").await?;
+    let next = f.request(&pane).await?;
+    assert_ne!(next.peer, followup.peer);
+    assert_eq!(next.value, json!({"v":1,"op":"issue","pane":nonce}));
+    assert_eq!(f.attempts.load(Ordering::Relaxed), 6);
+    let journal = serde_json::to_string(&pane.events.since(0))?;
+    for secret in [old.as_str(), fresh.as_str(), "stale-turn"] {
+        assert!(!journal.contains(secret));
+        assert!(
+            !pane
+                .frames
+                .load()
+                .rows
+                .iter()
+                .any(|line| line.as_str().contains(secret))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncated_rotation_reply_preserves_the_ticket_for_the_next_connection() -> Result<()> {
+    let mut f = Fixture::start(false).await?;
+    let pane = Session::start(f.source.clone());
+    let old = URL_SAFE_NO_PAD.encode([6; 32]);
+    let rotated = URL_SAFE_NO_PAD.encode([7; 32]);
+    let redeem = f.drop_and_redeem(&pane, &old).await?;
+    // Lose the end of a real rotation reply, then observe EOF on the subsystem
+    // while the primary channel can still deliver ordinary shell traffic.
+    let grant = serde_json::to_vec(
+        &json!({"v":1,"status":"redeemed","ticket":rotated,"grace_seconds":120}),
+    )?;
+    let packet = [
+        (grant.len() as u32).to_be_bytes().as_slice(),
+        &grant[..grant.len() - 1],
+    ]
+    .concat();
+    redeem
+        .handle
+        .data(redeem.channel, packet)
+        .await
+        .map_err(|_| anyhow::anyhow!("sideband closed"))?;
+    redeem
+        .handle
+        .eof(redeem.channel)
+        .await
+        .map_err(|_| anyhow::anyhow!("could not send sideband EOF"))?;
+    redeem
+        .handle
+        .close(redeem.channel)
+        .await
+        .map_err(|_| anyhow::anyhow!("could not close sideband"))?;
+    event(&pane, "unavailable").await?;
+    raw(&pane, b"shell-is-alive").await?;
+    visible(&pane, "shell-is-alive").await?;
+    assert_eq!(f.attempts.load(Ordering::Relaxed), 2);
+    raw(&pane, b"drop-link").await?;
+    let retry = f.request(&pane).await?;
+    assert_ne!(retry.peer, redeem.peer);
+    assert_eq!(retry.value, redeem.value);
+    retry
+        .answer(json!({"v":1,"status":"redeemed","ticket":rotated,"grace_seconds":120}))
+        .await?;
+    event(&pane, "redeemed").await?;
     Ok(())
 }
