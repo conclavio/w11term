@@ -15,6 +15,7 @@ $savedLocal = $env:LOCALAPPDATA
 $savedData = $env:W11TERM_DATA_DIR
 $savedSettings = $env:W11TERM_SETTINGS_PATH
 $gui = $null
+$pane = $null
 
 try {
     [void][IO.Directory]::CreateDirectory($state)
@@ -38,7 +39,7 @@ try {
         }
         Start-Sleep -Milliseconds 150
     } while ($startup.Elapsed.TotalSeconds -lt 30)
-    if (-not $pane.id) { throw "The packaged CLI could not find the packaged GUI's demo pane." }
+    if ($null -eq $pane -or -not $pane.id) { throw "The packaged CLI could not find the packaged GUI's demo pane." }
 
     $reply = & $cli --pid $gui.Id wait-for-text --pane $pane.id --timeout 5 'lab>' | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or -not $reply.ok -or -not $reply.result.matched) {
@@ -57,8 +58,8 @@ try {
     }
     Write-Output "Release ZIP verified: CLI read the demo prompt, rendered a PNG, and the GUI exited successfully."
 } catch {
-    foreach ($log in $diagnostics, (Join-Path $env:W11TERM_DATA_DIR 'startup.log' -ErrorAction SilentlyContinue)) {
-        if ($log -and (Test-Path -LiteralPath $log)) { Get-Content -LiteralPath $log -Tail 12 | Write-Warning }
+    foreach ($log in $diagnostics, (Join-Path $state 'app/startup.log')) {
+        if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 12 | Write-Warning }
     }
     throw
 } finally {
