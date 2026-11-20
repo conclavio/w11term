@@ -17,6 +17,7 @@ use w11term::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
     options::{Authentication, Options, Source, SshOptions},
+    pane_layout::{Axis, Direction},
     profiles::ProfileStore,
     session::{Command, Session},
     tabs::{TabId, Tabs},
@@ -28,7 +29,14 @@ use windows_reactor::*;
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
+mod pane_view;
+#[cfg(feature = "ui-smoke")]
+mod split_smoke;
+use pane_view::PaneSurface;
+
 struct LiveTab {
+    source: Source,
+    surface: PaneSurface,
     device_busy: bool,
     device_message: Option<String>,
     session: Session,
@@ -170,7 +178,24 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    for (prefix, axis) in [
+        ("Split right with ", Axis::Columns),
+        ("Split below with ", Axis::Rows),
+    ] {
+        if let Some(name) = label.strip_prefix(prefix) {
+            return Message::SplitPane(axis, Some(name.to_owned()));
+        }
+    }
     match label.split(": ").next().unwrap_or(&label) {
+        "Split right" => Message::SplitPane(Axis::Columns, None),
+        "Split below" => Message::SplitPane(Axis::Rows, None),
+        "Focus left" => Message::PaneNeighbor(Direction::Left),
+        "Focus right" => Message::PaneNeighbor(Direction::Right),
+        "Focus above" => Message::PaneNeighbor(Direction::Up),
+        "Focus below" => Message::PaneNeighbor(Direction::Down),
+        "Zoom pane" | "Restore panes" => Message::ZoomPane,
+        "Close pane" => Message::ClosePane,
+        "Move pane to new tab" => Message::MovePaneToTab,
         "Paste" => Message::Paste,
         "Paste raw (no bracketed paste)" => Message::PasteRaw,
         "Fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
@@ -198,6 +223,7 @@ pub enum Field {
 }
 
 pub struct TerminalApp {
+    active_group: Option<TabId>,
     windows: Rc<RefCell<crate::window_state::Windows>>,
     window_profile: Option<String>,
     window_restored: bool,
@@ -208,11 +234,10 @@ pub struct TerminalApp {
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<w11term::control::UiRequest>>>,
     control_task: Option<ComponentTask>,
     tabs: Tabs<AppTab>,
-    renderer: Rc<RefCell<Renderer>>,
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
-    frame_task: Option<ComponentTask>,
+    frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
     default_source: Source,
@@ -229,12 +254,22 @@ pub struct TerminalApp {
     appearance: Arc<RwLock<Appearance>>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
-    terminal_area: Rc<Cell<Option<(f32, f32, f32)>>>,
+    divider_drag: Rc<RefCell<Option<pane_view::DividerDrag>>>,
     mru: Vec<TabId>,
     switcher: Option<TabSwitcher>,
 }
 
 pub enum Message {
+    SplitPane(Axis, Option<String>),
+    PaneNeighbor(Direction),
+    ZoomPane,
+    ClosePane,
+    MovePaneToTab,
+    PaneFocus(TabId),
+    PaneRatio(u64, Vec<bool>, f64),
+    HoverPane(TabId),
+    DividerPress(u64, Vec<bool>, f64),
+    DividerEnd(u64, Vec<bool>),
     DeviceAction(bool),
     DeviceDone(TabId, bool, Result<String, String>),
     DraftBell(TabId, String),
@@ -305,6 +340,8 @@ fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            source: source.clone(),
+            surface: PaneSurface::default(),
             device_busy: false,
             device_message: None,
             session: Session::start_configured(source, size, osc52),
@@ -685,10 +722,10 @@ impl TerminalApp {
                 self.mru
                     .iter()
                     .copied()
-                    .filter(|id| self.tabs.get(*id).is_some())
+                    .filter(|id| self.tabs.headers().iter().any(|header| header.id == *id))
                     .collect()
             } else {
-                self.tabs.entries().iter().map(|tab| tab.id).collect()
+                self.tabs.headers().iter().map(|tab| tab.id).collect()
             };
             let ids: Vec<TabId> = ids;
             let index = ids
@@ -722,11 +759,14 @@ impl TerminalApp {
         kind: MouseEventKind,
         context: &ComponentContext<Self>,
     ) {
-        if self.tabs.active_id() != Some(id) {
+        if !self.tabs.visible(id) {
             return;
         }
+        if kind == MouseEventKind::Press && self.tabs.active_id() != Some(id) {
+            self.focus_pane(id, context);
+        }
+        self.keyboard.hover_pane(id);
         let preferences = self.appearance.read().unwrap().interaction.clone();
-        let metrics = self.metrics.get();
         let modifiers = crate::input::modifiers();
         let Some(AppTab {
             page: Page::Terminal(tab),
@@ -735,6 +775,7 @@ impl TerminalApp {
         else {
             return;
         };
+        let metrics = tab.surface.metrics.get();
         let frame = tab.session.frames.load();
         let x = (((pointer.x as f32 - PADDING).max(0.0) / metrics.cell_width).floor() as usize)
             .min(metrics.cols.saturating_sub(1));
@@ -747,7 +788,7 @@ impl TerminalApp {
         let link = link_at(&frame, point, preferences.detect_urls);
         if *tab.hover.borrow() != link {
             *tab.hover.borrow_mut() = link.clone();
-            self.invalidator.invalidate();
+            tab.surface.invalidator.invalidate();
         }
         let button = if pointer.is_left_button_pressed {
             MouseButton::Left
@@ -850,7 +891,7 @@ impl TerminalApp {
                     }
                     selection.observe(&frame);
                     *tab.selection.borrow_mut() = Some(selection);
-                    self.invalidator.invalidate();
+                    tab.surface.invalidator.invalidate();
                 }
             }
             MouseEventKind::Move if pointer.is_left_button_pressed => {
@@ -873,7 +914,7 @@ impl TerminalApp {
                         Message::DragScroll(id)
                     });
                 }
-                self.invalidator.invalidate();
+                tab.surface.invalidator.invalidate();
             }
             MouseEventKind::Release => {
                 tab.scroll_direction = 0;
@@ -888,12 +929,14 @@ impl TerminalApp {
                     selection.observe(&frame);
                     should_copy = preferences.copy_on_select && selection.active;
                 }
-                self.invalidator.invalidate();
+                tab.surface.invalidator.invalidate();
             }
             _ => {}
         }
         let selected = tab.selection.borrow().as_ref().is_some_and(|s| s.active);
-        self.keyboard.set_selection(selected);
+        if self.tabs.active_id() == Some(id) {
+            self.keyboard.set_selection(selected);
+        }
         if should_copy {
             self.copy();
             if kind == MouseEventKind::Press
@@ -958,26 +1001,18 @@ impl TerminalApp {
                 return;
             }
         };
-        if let Some((width, height, scale)) = self.terminal_area.get() {
-            let metrics = renderer.measure(width, height, scale);
-            self.metrics.set(metrics);
-            let size = TerminalSize {
-                cols: metrics.cols,
-                rows: metrics.rows,
-                pixel_width: (metrics.cols as f32 * metrics.cell_width * scale).round() as usize,
-                pixel_height: (metrics.rows as f32 * metrics.cell_height * scale).round() as usize,
-                dpi: (96.0 * scale).round() as u32,
-            };
-            for entry in self.tabs.entries() {
-                if let Page::Terminal(tab) = &entry.value.page {
-                    tab.selection.borrow_mut().take();
-                    tab.hover.borrow_mut().take();
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(tab) = &entry.value.page {
+                tab.selection.borrow_mut().take();
+                tab.hover.borrow_mut().take();
+                if let Some(size) = tab.surface.remeasure(&mut renderer) {
                     tab.last_size.set(Some(size));
                     let _ = tab.session.input.send(Command::Resize(size));
                 }
+                tab.surface.release();
+                tab.surface.invalidator.invalidate();
             }
         }
-        *self.renderer.borrow_mut() = renderer;
         self.keyboard.set_selection(false);
         self.save_preferences(appearance);
         self.invalidator.invalidate();
@@ -1139,8 +1174,8 @@ impl TerminalApp {
                 };
                 Some(Pane {
                     id: tab.session.pane_id,
-                    tab_id: entry.id,
-                    visible: self.tabs.active_id() == Some(entry.id),
+                    tab_id: self.tabs.group_id(entry.id)?,
+                    visible: self.tabs.visible(entry.id),
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
@@ -1165,41 +1200,63 @@ impl TerminalApp {
             Message::SyncSelection(epoch)
         });
     }
+    fn cancel_frame_tasks(&mut self) {
+        self.watch_epoch += 1;
+        for (_, task) in std::mem::take(&mut self.frame_tasks) {
+            task.cancel();
+        }
+    }
+
     fn watch_frames(&mut self, context: &ComponentContext<Self>) {
-        let Some(id) = self.tabs.active_id() else {
-            return;
-        };
-        let Some(AppTab {
-            page: Page::Terminal(tab),
-            ..
-        }) = self.tabs.get(id)
-        else {
-            return;
-        };
-        let frames = tab.session.frames.clone();
-        let generation = frames.load().generation;
-        let epoch = self.watch_epoch;
-        self.frame_task = Some(context.spawn_background_with_rejection(
-            move |cancel| {
-                frames.wait_for_change(generation, || cancel.is_cancelled());
-                Message::FrameReady(id, epoch)
-            },
-            Message::WatchRejected,
-        ));
+        for entry in self.tabs.entries() {
+            let id = entry.id;
+            if !self.tabs.visible(id) || self.frame_tasks.contains_key(&id) {
+                continue;
+            }
+            let Page::Terminal(tab) = &entry.value.page else {
+                continue;
+            };
+            let frames = tab.session.frames.clone();
+            let generation = frames.load().generation;
+            let epoch = self.watch_epoch;
+            self.frame_tasks.insert(
+                id,
+                context.spawn_background_with_rejection(
+                    move |cancel| {
+                        frames.wait_for_change(generation, || cancel.is_cancelled());
+                        Message::FrameReady(id, epoch)
+                    },
+                    Message::WatchRejected,
+                ),
+            );
+        }
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        let single = matches!(
+            self.tabs.active_layout(),
+            Some(w11term::pane_layout::Layout::Leaf(_))
+        );
         let profile = self
             .tabs
             .active()
-            .filter(|t| self.profiles.contains_key(&t.label))
+            .filter(|t| {
+                single
+                    && matches!(t.page, Page::Terminal(_))
+                    && self.profiles.contains_key(&t.label)
+            })
             .map(|t| t.label.clone());
+        let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
+        let group_changed = self.active_group != group;
+        self.active_group = group;
         if profile != self.window_profile {
             if let Some(previous) = self.window_profile.take() {
                 let _ = self.windows.borrow_mut().remember(&previous);
             }
             self.window_profile = profile;
-            self.restore_window();
+            if group_changed {
+                self.restore_window();
+            }
         }
         let windows = self.windows.clone();
         let profile = self.window_profile.clone();
@@ -1212,9 +1269,32 @@ impl TerminalApp {
             self.mru.retain(|i| *i != id);
             self.mru.insert(0, id);
         }
-        self.watch_epoch += 1;
-        if let Some(task) = self.frame_task.take() {
-            task.cancel();
+        self.cancel_frame_tasks();
+        self.divider_drag.borrow_mut().take();
+        if !single
+            || !matches!(
+                self.tabs.active(),
+                Some(AppTab {
+                    page: Page::Terminal(_),
+                    ..
+                })
+            )
+        {
+            crate::input::clear_grid();
+            self.initial_grid.set(None);
+        }
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(tab) = &entry.value.page {
+                if self.tabs.active_id() == Some(entry.id) {
+                    self.metrics = tab.surface.metrics.clone();
+                    self.invalidator = tab.surface.invalidator.clone();
+                }
+                if self.tabs.visible(entry.id) {
+                    tab.surface.invalidator.invalidate();
+                } else {
+                    tab.surface.window_hidden();
+                }
+            }
         }
         let target = match self.tabs.active() {
             Some(AppTab {
@@ -1224,6 +1304,19 @@ impl TerminalApp {
             _ => None,
         };
         self.keyboard.set_target(target);
+        self.keyboard
+            .set_wheel_panes(self.tabs.entries().iter().filter_map(|entry| {
+                let Page::Terminal(tab) = &entry.value.page else {
+                    return None;
+                };
+                self.tabs.visible(entry.id).then(|| {
+                    (
+                        entry.id,
+                        tab.session.input.clone(),
+                        tab.session.frames.clone(),
+                    )
+                })
+            }));
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
         }
@@ -1273,14 +1366,12 @@ impl TerminalApp {
     }
 
     fn close_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
-        let active = self.tabs.active_id() == Some(id);
+        let active = self.active_group == self.tabs.group_id(id);
         if active {
             self.keyboard.set_target(None);
-            if let Some(task) = self.frame_task.take() {
-                task.cancel();
-            }
+            self.cancel_frame_tasks();
         }
-        self.tabs.remove(id);
+        self.tabs.remove_group(id);
         self.publish_panes();
         if self.tabs.entries().is_empty() {
             let _ = context.window().request_close();
@@ -1300,6 +1391,120 @@ impl TerminalApp {
         ));
         self.sync_selection(context);
         self.activate(context);
+    }
+
+    fn focus_pane(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        if self.tabs.visible(id) && self.tabs.active_id() != Some(id) && self.tabs.select(id) {
+            self.activate(context);
+        }
+    }
+
+    fn split_pane(
+        &mut self,
+        axis: Axis,
+        profile: Option<String>,
+        context: &ComponentContext<Self>,
+    ) {
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let Some(AppTab {
+            label,
+            page: Page::Terminal(tab),
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let (label, source) = match profile {
+            Some(name) => {
+                let Some(options) = self.profiles.get(&name) else {
+                    return;
+                };
+                (name, Source::Ssh(options.clone()))
+            }
+            None => (label.clone(), tab.source.clone()),
+        };
+        let leaf = live_tab(
+            label,
+            source,
+            self.appearance.read().unwrap().interaction.osc52,
+        );
+        if self.tabs.split(id, leaf, axis).is_some() {
+            self.initial_grid.set(None);
+            self.sync_selection(context);
+            self.activate(context);
+        }
+    }
+
+    fn resize_split(&mut self, id: TabId, cols: usize, rows: usize) -> anyhow::Result<()> {
+        use w11term::pane_layout::Layout;
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            anyhow::bail!("pane is closed");
+        };
+        let layout = self.tabs.active_layout().context("no visible layout")?;
+        let (width, height, _) = tab
+            .surface
+            .area
+            .get()
+            .context("pane has not been drawn yet")?;
+        let metrics = tab.surface.metrics.get();
+        let mut edits = Vec::new();
+        for (axis, current, requested, extent, cell, padding) in [
+            (
+                Axis::Columns,
+                metrics.cols,
+                cols,
+                width,
+                metrics.cell_width,
+                2.0 * PADDING,
+            ),
+            (
+                Axis::Rows,
+                metrics.rows,
+                rows,
+                height,
+                metrics.cell_height,
+                2.0 * PADDING + STATUS_HEIGHT,
+            ),
+        ] {
+            if current == requested {
+                continue;
+            }
+            let (path, node, second_side) = layout.divider_for(id, axis).context(
+                "requested grid cannot fit on this axis within the visible split layout",
+            )?;
+            let Layout::Split { first, second, .. } = node else {
+                unreachable!()
+            };
+            let first_size = self
+                .layout_size(first)
+                .context("split is still being measured")?;
+            let second_size = self
+                .layout_size(second)
+                .context("split is still being measured")?;
+            let (a, b) = match axis {
+                Axis::Columns => (first_size.0, second_size.0),
+                Axis::Rows => (first_size.1, second_size.1),
+            };
+            // Aim inside the requested cell to absorb WinUI's physical-pixel rounding.
+            let delta = f64::from(padding + (requested as f32 + 0.25) * cell - extent);
+            let first_extent = if second_side { a - delta } else { a + delta };
+            let available = a + b;
+            anyhow::ensure!(
+                first_extent >= f64::from(padding + cell)
+                    && available - first_extent >= f64::from(padding + cell),
+                "requested grid does not fit while keeping both panes visible"
+            );
+            edits.push((path, first_extent / available));
+        }
+        for (path, ratio) in edits {
+            self.tabs.set_ratio(&path, ratio);
+        }
+        Ok(())
     }
 
     fn utility(&mut self, settings: bool, context: &ComponentContext<Self>) {
@@ -1492,7 +1697,7 @@ impl TerminalApp {
         let tab_strip = TabView::new()
             .height(44.0)
             .width(
-                (self.tabs.entries().len() as f64 * 110.0 + 16.0)
+                (self.tabs.headers().len() as f64 * 110.0 + 16.0)
                     .min((self.width - 300.0).max(160.0)),
             )
             .is_add_tab_button_visible(false)
@@ -1514,9 +1719,9 @@ impl TerminalApp {
             })
             .collection_slot(
                 TabViewSlot::TabItems,
-                self.tabs.entries().iter().map(|tab| {
+                self.tabs.headers().into_iter().map(|tab| {
                     KeyedView::new(
-                        tab.id.to_string(),
+                        self.tabs.group_id(tab.id).unwrap().to_string(),
                         TabViewItem::new()
                             .header(&tab.value.label)
                             .tag(tab.id.to_string())
@@ -1560,6 +1765,7 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
                 [
+                    self.pane_menu(),
                     MenuItem::item("paste", "Paste"),
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
@@ -1623,99 +1829,54 @@ impl TerminalApp {
             )
     }
 
-    fn terminal_view(&self, id: TabId, tab: &LiveTab, context: &ViewContext<Self>) -> View {
-        if let Some(error) = &tab.error {
-            return StackPanel::new().spacing(12.0).children((
-                TextBlock::new().text(format!("Unable to render terminal: {error}")),
-                Button::new()
-                    .on_click(context.callback(move |_| Message::RetryRender(id)))
-                    .content(TextBlock::new().text("Retry rendering")),
-            ));
+    fn pane_menu(&self) -> MenuItem {
+        if self.tabs.active().and_then(AppTab::pane_id).is_none() {
+            return MenuItem::disabled("panes", "Panes");
         }
-        let renderer = self.renderer.clone();
-        let frames = tab.session.frames.clone();
-        let metrics = self.metrics.clone();
-        let sender = tab.session.input.clone();
-        let last_size = tab.last_size.clone();
-        let error_sender = context.sender();
-        let geometry_sender = context.sender();
-        let initial_grid = self.initial_grid.clone();
-        let window_state = self.windows.clone();
-        let window_size = (self.width, self.window_height);
-        let terminal_area = self.terminal_area.clone();
-        let selection = tab.selection.clone();
-        let hover = tab.hover.clone();
-        let canvas: View = Canvas::invalidated(&self.invalidator, move |ctx| {
-            let frame = frames.load();
-            let measured = renderer.borrow_mut().draw(ctx, &frame)?;
-            renderer.borrow().draw_interaction(
-                ctx,
-                &frame,
-                selection.borrow().as_ref(),
-                hover.borrow().as_ref(),
-            )?;
-            metrics.set(measured);
-            if initial_grid
-                .get()
-                .is_none_or(|grid| grid == (measured.cols, measured.rows))
-            {
-                window_state.borrow_mut().grid = Some((measured.cols, measured.rows));
-            }
-            let scale = measured.scale;
-            terminal_area.set(Some((ctx.width, ctx.height, scale)));
-            crate::input::set_grid(
-                measured.cell_width,
-                measured.cell_height,
-                ctx.width,
-                ctx.height,
-                scale,
-            );
-            if let Some(((cols, rows), first)) =
-                initial_grid.correction((measured.cols, measured.rows))
-            {
-                geometry_sender.send(Message::Geometry(
-                    window_size.0
-                        + (cols as f32 * measured.cell_width + PADDING * 2.0 - ctx.width) as f64,
-                    window_size.1
-                        + (rows as f32 * measured.cell_height + PADDING * 2.0 + STATUS_HEIGHT
-                            - ctx.height) as f64,
-                    initial_grid.epoch(),
-                    first,
+        let mut items = vec![
+            MenuItem::item("split-right", "Split right"),
+            MenuItem::item("split-below", "Split below"),
+        ];
+        if !self.profiles.is_empty() {
+            for (key, label) in [
+                ("right-profile", "Split right with"),
+                ("below-profile", "Split below with"),
+            ] {
+                items.push(MenuItem::submenu(
+                    key,
+                    format!("{label} profile"),
+                    self.profiles
+                        .keys()
+                        .map(|name| MenuItem::item(name.clone(), format!("{label} {name}"))),
                 ));
-                return Ok(());
             }
-            let size = TerminalSize {
-                rows: measured.rows,
-                cols: measured.cols,
-                pixel_width: (measured.cols as f32 * measured.cell_width * scale).round() as usize,
-                pixel_height: (measured.rows as f32 * measured.cell_height * scale).round()
-                    as usize,
-                dpi: (96.0 * scale).round() as u32,
-            };
-            if last_size.replace(Some(size)) != Some(size) {
-                let _ = sender.send(Command::Resize(size));
+        }
+        if self
+            .tabs
+            .active_layout()
+            .is_some_and(|layout| matches!(layout, w11term::pane_layout::Layout::Split { .. }))
+        {
+            items.push(MenuItem::separator("pane-actions"));
+            for (key, label) in [
+                ("left", "Focus left"),
+                ("right", "Focus right"),
+                ("up", "Focus above"),
+                ("down", "Focus below"),
+            ] {
+                items.push(MenuItem::item(key, label));
             }
-            Ok(())
-        })
-        .on_error(move |error| {
-            error_sender.send(Message::RenderError(id, format!("{error:?}")));
-        })
-        .into();
-        Border::new()
-            .background(Color::rgb(14, 16, 20))
-            .capture_pointer_on_press(true)
-            .on_pointer_capture_lost(context.callback(move |_| Message::CaptureLost(id)))
-            .on_pointer_exited(context.callback(move |_| Message::PointerExit(id)))
-            .on_pointer_pressed(
-                context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Press)),
-            )
-            .on_pointer_released(
-                context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Release)),
-            )
-            .on_pointer_moved(
-                context.callback(move |p| Message::Pointer(id, p, MouseEventKind::Move)),
-            )
-            .content(canvas)
+            items.push(MenuItem::item(
+                "zoom-pane",
+                if self.tabs.zoomed() {
+                    "Restore panes"
+                } else {
+                    "Zoom pane"
+                },
+            ));
+            items.push(MenuItem::item("close-pane", "Close pane"));
+            items.push(MenuItem::item("move-pane", "Move pane to new tab"));
+        }
+        MenuItem::submenu("panes", "Panes", items)
     }
 
     fn profile_form(&self, id: TabId, draft: &ProfileDraft, context: &ViewContext<Self>) -> View {
@@ -2046,6 +2207,7 @@ impl Component for TerminalApp {
         })
         .expect("starting local control pipe");
         let mut app = Self {
+            active_group: None,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
             window_restored: options.cols.is_some() || options.rows.is_some(),
@@ -2055,11 +2217,10 @@ impl Component for TerminalApp {
             control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
             control_task: None,
             tabs,
-            renderer: Rc::new(RefCell::new(renderer)),
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
-            frame_task: None,
+            frame_tasks: BTreeMap::new(),
             watcher_retry: None,
             watch_epoch: 0,
             default_source: options.source.clone(),
@@ -2074,7 +2235,7 @@ impl Component for TerminalApp {
             appearance,
             fonts,
             appearance_error,
-            terminal_area: Rc::new(Cell::new(None)),
+            divider_drag: Rc::new(RefCell::new(None)),
             mru: Vec::new(),
             switcher: None,
             selection_pending: true,
@@ -2115,7 +2276,16 @@ impl Component for TerminalApp {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
-        if !matches!(&message, Message::FrameReady(..)) {
+        if !matches!(
+            &message,
+            Message::FrameReady(..)
+                | Message::PaneRatio(..)
+                | Message::DividerPress(..)
+                | Message::DividerEnd(..)
+                | Message::HoverPane(..)
+                | Message::PointerExit(..)
+                | Message::Pointer(_, _, MouseEventKind::Move)
+        ) {
             self.header.borrow_mut().take();
         }
         if matches!(&message, Message::Control(_)) {
@@ -2330,21 +2500,17 @@ impl Component for TerminalApp {
                 {
                     self.watch_control(context);
                 }
-                if self
-                    .frame_task
-                    .as_ref()
-                    .is_none_or(|task| task.status() == ComponentTaskStatus::Rejected)
-                {
-                    self.watch_frames(context);
-                }
+                self.frame_tasks
+                    .retain(|_, task| task.status() != ComponentTaskStatus::Rejected);
+                self.watch_frames(context);
                 if self
                     .control_task
                     .as_ref()
                     .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
                     && self
-                        .frame_task
-                        .as_ref()
-                        .is_none_or(|task| task.status() != ComponentTaskStatus::Rejected)
+                        .frame_tasks
+                        .values()
+                        .all(|task| task.status() != ComponentTaskStatus::Rejected)
                 {
                     self.watcher_retry = None;
                 }
@@ -2417,13 +2583,31 @@ impl Component for TerminalApp {
                     let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
                     return;
                 };
-                if self.tabs.active_id() == Some(tab_id) && self.windows.borrow().fullscreen() {
+                let split = self.tabs.visible(tab_id)
+                    && matches!(
+                        self.tabs.active_layout(),
+                        Some(w11term::pane_layout::Layout::Split { .. })
+                    );
+                if split && self.tabs.zoomed() {
+                    let _ =
+                        reply.send(Err("Unzoom the pane before resizing its split grid".into()));
+                    return;
+                }
+                if !split
+                    && self.tabs.active_id() == Some(tab_id)
+                    && self.windows.borrow().fullscreen()
+                {
                     let _ = reply.send(Err(
                         "Exit fullscreen before resizing the active window grid".into(),
                     ));
                     return;
                 }
-                if let Some(AppTab {
+                if split {
+                    if let Err(error) = self.resize_split(tab_id, cols, rows) {
+                        let _ = reply.send(Err(error.to_string()));
+                        return;
+                    }
+                } else if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get(tab_id)
@@ -2448,18 +2632,19 @@ impl Component for TerminalApp {
                             (rows as f64 - metrics.rows as f64) * metrics.cell_height as f64;
                         self.invalidator.invalidate();
                     }
-                    context.spawn_background(move |_| {
-                        std::thread::sleep(Duration::from_millis(300));
-                        Message::ControlResizeDone {
-                            pane,
-                            cols,
-                            rows,
-                            reply,
-                        }
-                    });
                 } else {
                     let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
+                    return;
                 }
+                context.spawn_background(move |_| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    Message::ControlResizeDone {
+                        pane,
+                        cols,
+                        rows,
+                        reply,
+                    }
+                });
             }
             Message::ControlResizeDone {
                 pane,
@@ -2622,7 +2807,8 @@ impl Component for TerminalApp {
             #[cfg(feature = "ui-smoke")]
             Message::Smoke(step) => self.smoke_step(step, context),
             Message::FrameReady(id, epoch) => {
-                if self.tabs.active_id() == Some(id) && self.watch_epoch == epoch {
+                if self.tabs.visible(id) && self.watch_epoch == epoch {
+                    self.frame_tasks.remove(&id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -2630,7 +2816,9 @@ impl Component for TerminalApp {
                     {
                         tab.error = None;
                     }
-                    self.connection_ui(id);
+                    if self.tabs.active_id() == Some(id) {
+                        self.connection_ui(id);
+                    }
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -2644,7 +2832,9 @@ impl Component for TerminalApp {
                             .is_some_and(|s| s.alternate != frame.alternate || s.cols != frame.cols)
                         {
                             tab.selection.borrow_mut().take();
-                            self.keyboard.set_selection(false);
+                            if self.tabs.active_id() == Some(id) {
+                                self.keyboard.set_selection(false);
+                            }
                         }
                         if let Some(selection) =
                             tab.selection.borrow_mut().as_mut().filter(|s| s.dragging)
@@ -2663,8 +2853,8 @@ impl Component for TerminalApp {
                                 });
                             }
                         }
+                        tab.surface.invalidator.invalidate();
                     }
-                    self.invalidator.invalidate();
                     self.watch_frames(context);
                 }
             }
@@ -2674,6 +2864,43 @@ impl Component for TerminalApp {
                 }
                 let _ = context.window().request_close();
             }
+            Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::PaneRatio(epoch, path, ratio) => {
+                if epoch == self.watch_epoch && self.dragging_divider(epoch, &path) {
+                    self.tabs.set_ratio(&path, ratio);
+                }
+            }
+            Message::PaneNeighbor(direction) => {
+                if self.tabs.focus_neighbor(direction) {
+                    self.activate(context);
+                }
+            }
+            Message::ZoomPane => {
+                if self.tabs.toggle_zoom() {
+                    self.activate(context);
+                }
+            }
+            Message::MovePaneToTab => {
+                if self.tabs.move_active_to_new_tab() {
+                    self.sync_selection(context);
+                    self.activate(context);
+                }
+            }
+            Message::ClosePane => {
+                if let Some(id) = self.tabs.active_id() {
+                    if self.tabs.active_layout().is_some_and(|layout| {
+                        matches!(layout, w11term::pane_layout::Layout::Split { .. })
+                    }) {
+                        self.keyboard.set_target(None);
+                        self.tabs.remove(id);
+                        self.sync_selection(context);
+                        self.activate(context);
+                    } else {
+                        self.close_tab(id, context);
+                    }
+                }
+            }
+            Message::SplitPane(axis, profile) => self.split_pane(axis, profile, context),
             Message::SyncSelection(epoch) => {
                 if self.selection_epoch == epoch {
                     self.selection_pending = false;
@@ -2683,7 +2910,7 @@ impl Component for TerminalApp {
                 if pending || self.selection_pending || epoch != self.selection_epoch {
                     return;
                 }
-                if let Some(id) = self.tabs.entries().get(index).map(|t| t.id)
+                if let Some(id) = self.tabs.headers().get(index).map(|t| t.id)
                     && self.tabs.active_id() != Some(id)
                 {
                     self.tabs.select(id);
@@ -2714,6 +2941,13 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
+                Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
+                Shortcut::FocusPane(direction) => {
+                    self.update(Message::PaneNeighbor(direction), context)
+                }
+                Shortcut::ZoomPane => self.update(Message::ZoomPane, context),
+                Shortcut::ClosePane => self.update(Message::ClosePane, context),
                 Shortcut::Fullscreen => {
                     if let Err(error) = self.windows.borrow_mut().toggle() {
                         log::warn!("Fullscreen: {error:#}");
@@ -2772,7 +3006,7 @@ impl Component for TerminalApp {
                     }
                 }
                 Shortcut::Select(index) => {
-                    if let Some(id) = self.tabs.entries().get(index).map(|t| t.id) {
+                    if let Some(id) = self.tabs.headers().get(index).map(|t| t.id) {
                         self.tabs.select(id);
                         self.activate(context);
                     }
@@ -2876,14 +3110,26 @@ impl Component for TerminalApp {
                     tab.clicked_link = None;
                 }
             }
+            Message::DividerPress(epoch, path, coordinate) => {
+                if epoch == self.watch_epoch {
+                    self.begin_divider(&path, coordinate);
+                }
+            }
+            Message::DividerEnd(epoch, path) => {
+                if self.dragging_divider(epoch, &path) {
+                    self.divider_drag.borrow_mut().take();
+                }
+            }
+            Message::HoverPane(id) => self.keyboard.hover_pane(id),
             Message::PointerExit(id) => {
+                self.keyboard.leave_pane(id);
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get(id)
                 {
                     tab.hover.borrow_mut().take();
-                    self.invalidator.invalidate();
+                    tab.surface.invalidator.invalidate();
                 }
             }
             Message::DragScroll(id) => {
@@ -3113,7 +3359,12 @@ impl Component for TerminalApp {
         });
         let content = if let Some(id) = self.tabs.active_id() {
             match &self.tabs.get(id).unwrap().page {
-                Page::Terminal(tab) => self.terminal_view(id, tab, context),
+                Page::Terminal(tab) => match self.tabs.active_layout() {
+                    Some(layout) if !self.tabs.zoomed() => {
+                        self.layout_view(layout, &mut Vec::new(), context)
+                    }
+                    _ => self.pane_view(id, tab, false, context),
+                },
                 Page::Settings => self.settings_view(context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
             }
@@ -3223,6 +3474,10 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_SPLIT_SMOKE").is_some() {
+            self.split_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_PROFILE_SMOKE").is_some() {
             self.profile_smoke_step(step, context);
             return;
