@@ -29,12 +29,16 @@ def image_trial(binary, env):
     name = "w11term-" + uuid.uuid4().hex
     transmit = b"\x1b_Ga=T,f=24,s=1,v=1,i=71,q=2;/wAA\x1b\\"
     program = ("import os, sys\n"
-               f"os.write(1, {transmit!r})\n"
+               "os.write(1, b'READY-FOR-IMAGE\\r\\n')\n"
                "for line in sys.stdin:\n"
+               f"    if line.strip() == 'paint': os.write(1, {transmit!r} + b'PAINTED-ONCE\\r\\n')\n"
                "    if line.strip() == 'probe': os.write(1, b'RESTORED-IMAGE-BARRIER\\r\\n')\n")
     client = Client([binary, "attach", name, sys.executable, "-c", program], env, (24, 80))
     try:
-        eventually(lambda: transmit in client.read(), "live kitty image did not reach the terminal")
+        eventually(lambda: b"READY-FOR-IMAGE" in client.read(), "graphics program did not start")
+        client.send(b"paint\r")
+        eventually(lambda: transmit in client.read() and b"PAINTED-ONCE" in client.output,
+                   "live kitty image did not reach the attached terminal")
         client.close()
         client = None
         client = Client([binary, "attach", name, "/bin/false"], env, (28, 100))
@@ -136,7 +140,10 @@ def run(binary, vim, directory):
     assert not daemon_info(), "probe created the missing session"
     size = (28, 94)
     new_size = (33, 107)
-    args = [binary, "attach", "--labels", "w11term_generation=" + generation, session, vim,
+    # Keep an interactive program and its parent shell alive in a known directory.
+    shell = 'cd "$HOME" && echo "$$" > shell.pid && "$@"; result=$?; exit "$result"'
+    args = [binary, "attach", "--labels", "w11term_generation=" + generation, session,
+            "/bin/sh", "-c", shell, "fixture", vim,
             "-Nu", "NONE", "-U", "NONE", "-i", "NONE", "-n", "--noplugin", "-N",
             "-S", str(Path(__file__).with_name("editor.vim").resolve()), str(source)]
     client = None
@@ -145,6 +152,7 @@ def run(binary, vim, directory):
         eventually(lambda: bool(client.read() and report_data() and same_generation()),
                    "editor did not start with its generation label")
         pid = report_data()["pid"]
+        shell_pid = int((directory / "shell.pid").read_text())
         daemon = daemon_info()["pid"]
         client.send(b"gQ")
         eventually(lambda: live_effects(client.read()), "missing live BEL, OSC 52, notification or sound")
@@ -180,6 +188,9 @@ def run(binary, vim, directory):
         assert (final["pid"], final["modified"], final["rows"], final["cols"]) == (pid, 1, *new_size), final
         assert not source.exists()
         print(f"zmx 1.0.1 restored Vim PID {pid}, its unsaved buffer and {new_size[1]}×{new_size[0]} PTY")
+        assert Path(f"/proc/{pid}/status").read_text().split("PPid:")[1].split()[0] == str(shell_pid)
+        assert Path(f"/proc/{shell_pid}/cwd").resolve() == directory.resolve()
+        print(f"The editor still belongs to shell PID {shell_pid} in its original directory.")
         print("First input stayed in insert mode; previous clipboard, sound, notification and bell did not replay.")
         lost, client = client, None
         lost.close()
