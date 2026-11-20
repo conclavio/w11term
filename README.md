@@ -186,7 +186,7 @@ This is a runnable foundation, not complete terminal conformance or a kitty/Ghos
 - The engine has kitty/Sixel/iTerm image handling. The renderer draws static content and the first animation frame; animation scheduling and advanced protocol extensions remain work. The replacement/delete/resize audit is documented in [Graphics audit](docs/graphics-audit.md). It covers the cockpit's single-id replacement path and GPU eviction, with bounded direct transfers and image tables; it is not a claim of complete image-protocol conformance or a global memory bound across all retained scrollback images.
 - Text uses cached DirectWrite layouts, including color emoji and programming ligatures across matching ASCII cells. Full Unicode run shaping, full BiDi layout, italic rendering, underline variants, and exact cursor styling remain work.
 - Keyboard press/repeat/release and game-mode repeat suppression are connected. Complete physical-key/alternate-key handling and IME/TSF composition remain work.
-- Terminal accessibility, split panes, tab tear-out into separate windows, profile editing/deletion, further Settings, and persistent remote sessions are deferred.
+- Profile deletion and tab tear-out into separate windows are deferred. The [workspace and SSH roadmap](docs/terminal-workspaces-roadmap.md) covers native splits, a graphical SFTP drawer, durable remote sessions, terminal fidelity and accessibility, local PowerShell via ConPTY, and subsequent RustMUSH features.
 
 ## Verify
 

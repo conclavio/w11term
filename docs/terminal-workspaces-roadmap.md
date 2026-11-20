@@ -1,0 +1,95 @@
+# Native workspaces and durable SSH sessions for w11term
+
+**Proposed design · 20 November 2026 · w11term baseline `001cddb`**
+
+A Windows user should be able to put a remote editor beside a build log, open a file drawer for either host, and add a local PowerShell pane to the same workspace. On a Linux host with session persistence enabled, reopening the workspace should also return the user to the editor or build that was already running. Windows owns layout, input and rendering. Native SSH profiles connect directly through russh. ConPTY provides a separate path for launching local console programs.
+
+## Ship order
+
+| Release | User-visible result | Remote requirement |
+| --- | --- | --- |
+| 1. Native splits and named workspaces | Split, focus, resize or zoom a pane and reopen a saved layout. | Ordinary SSH. Panes may connect to different hosts. |
+| 2. SFTP drawer and SSH profiles | Browse and transfer files beside a terminal, reuse SSH aliases and connect through a jump host. | The existing SSH connection and the host’s SFTP subsystem for file operations. |
+| 3. Optional durable Linux sessions | Return to the same running program after network loss, Windows sleep or a w11term restart. | A PTY owner on the target host. Trial zmx first and evaluate Herdr Core for remote session discovery. |
+| 4. Terminal fidelity and Windows accessibility | Compose text with a Windows IME, read terminal content with Narrator, and render a wider range of text and graphics correctly. | Applicable to every terminal pane. |
+| 5. Local PowerShell via ConPTY | Open a Windows shell beside a remote session from the same profile picker. | Runs entirely on Windows. |
+
+RustMUSH cockpit reattachment follows the general-purpose roadmap. A Windows machine and an ordinary Linux SSH host suffice to exercise all five releases.
+
+## Current capabilities
+
+Each terminal tab has its own session, scrollback, search state and programmable control surface. Scripts can target a background session by ID, write raw bytes, wait for a regex, read committed screen text, capture PNGs and record VT output. The same authenticated SSH connection also supports SFTP. Profiles already support creation, editing and renaming, plus key, agent, password and keyboard-interactive authentication. [Current features](../README.md#tabs-and-profiles) · [Control and SFTP API](../CONTROL.md)
+
+Today the pane registry publishes each terminal tab’s ID, and the UI watches frames from the selected tab. Reconnect opens a fresh SSH session and remote PTY. Window placement and local scrollback can survive events that end the remote foreground program. The renderer supports synchronized text and image updates, static kitty image replacement and sixel. Animated images display their first frame. The existing image audit covers replacement, deletion and resize. The loopback typing measurements cover a different workload from graphics or split-pane rendering. [Pane registry and frame watcher](../src/app.rs) · [SSH transport](../src/ssh/transport.rs) · [Graphics audit](graphics-audit.md) · [Benchmark scope](../bench/README.md)
+
+## Terminal comparison
+
+| Terminal | Relevant capability | Implication for w11term |
+| --- | --- | --- |
+| Windows Terminal | Native pane navigation, resizing and zoom. Stable 1.25 supports kitty keyboard. Sixel ships, and the kitty graphics implementation was an open PR on the comparison date. | Follow its Windows pane interactions. Expect the graphics gap on Windows to narrow. [Panes](https://learn.microsoft.com/en-us/windows/terminal/panes) · [Stable release](https://github.com/microsoft/terminal/releases/tag/v1.25.2733.0) · [Graphics PR](https://github.com/microsoft/terminal/pull/20872) |
+| kitty | Named sessions can recreate layouts, working directories and programs. Its graphics protocol specifies animation, relative placements and images anchored to text. | Borrow saved layout recipes and use kitty as a reference for rendering fixtures. [Sessions](https://sw.kovidgoyal.net/kitty/sessions/) · [Graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) |
+| WezTerm | A plain SSH split can open another session channel on one login. A remote mux domain can preserve running panes and present them in the native GUI. | Offer connection reuse and durable attachment as distinct choices. [SSH](https://wezterm.org/ssh.html) · [Multiplexing](https://wezterm.org/multiplexing.html) |
+| Alacritty | Vi-mode selection and regex hints let users select or act on screen text from the keyboard. | Build on literal find with keyboard selection of paths, IDs and URLs. [Features](https://alacritty.org/) |
+| Ghostty | Version 1.4 reports complete kitty graphics coverage, including animation and relative placements. | Use the same VT fixtures in kitty, Ghostty and w11term to compare observable behavior. [1.4 release](https://ghostty.org/docs/install/release-notes/1-4-0) |
+| Warp | Users can navigate command blocks and copy their output. Its newer SSH extension has a Windows-client limitation. | Use existing OSC 133 boundaries for **Copy last command output** and retain the exit status supplied by the shell. [Blocks](https://docs.warp.dev/terminal/blocks) · [SSH extension requirements](https://docs.warp.dev/terminal/warpify/ssh) |
+| Ptyxis | Searchable tab overview and a terminal inspector for hyperlinks and mouse coordinates. | Add a searchable session picker as workspaces grow. A capability inspector would help diagnose TUI behavior. [Features](https://devsuite.app/ptyxis/) |
+| Tabby | Nested splits, configurable keyboard chords, jump hosts and SSH forwarding. | Prioritize jump-host setup and remappable pane shortcuts for users whose editors claim the same keys. [Terminal and SSH features](https://github.com/Eugeny/tabby#terminal-features) |
+| Wave | An opt-in remote job manager keeps the shell and scrollback through link loss and client restarts. Its UI distinguishes attached and detached sessions. | Expose whether reconnect will open a shell or return to a running one. Make ending a durable session explicit. [Durable sessions](https://docs.waveterm.dev/durable-sessions) |
+| MobaXterm | An SSH session opens with a graphical drag-and-drop SFTP browser. | Surface the SFTP operations w11term already performs over the active connection. [Features](https://mobaxterm.mobatek.net/features.html) |
+
+## Release 1 · Native splits and named workspaces
+
+Give each terminal a process-local pane ID that remains stable when the pane moves, changes focus or is zoomed. A terminal tab owns a layout tree. Its leaves refer to panes and its branches store a horizontal or vertical split and divider proportion. A workspace saves the tab order, tree, profile references and focused leaf. On reopen, each leaf gets a fresh local ID. A durable remote session reference, when present, identifies what that leaf should reattach to.
+
+Each visible pane needs its own grid, frame subscription, selection and pointer coordinates. Keyboard input goes to the focused pane. Release held keys on the old pane when focus moves. Zoom temporarily gives one leaf the full tab and restores the previous proportions on exit. Hiding a pane leaves its SSH session running. **Split current host** can request another channel on the same authenticated connection when the endpoint, identity and trust settings match and the server permits it. Keep **Open profile** as an independent login and allow a split to use a different profile.
+
+Preserve the existing control API’s meaning of `--pane`. Keep one focused terminal marked `active` and expose tab membership and visibility separately. Retain the current single-pane resize behavior. For a visible split, adjust the layout to satisfy the requested cell grid or return a clear geometry error. File transfers, screenshots and raw writes directed at another pane must leave focus where the user put it. [Current control contract](../CONTROL.md#waiting-geometry-tabs-and-events)
+
+**Acceptance.** Open two loopback terminals with distinct output. Move the divider, zoom and restore a pane, and continue addressing both original IDs from the CLI. Verify each reported grid and PNG, keyboard input on the focused side, and uninterrupted output on the other. Reopen the saved workspace and check its profiles, proportions and focus.
+
+## Release 2 · SFTP drawer and SSH profiles
+
+Open the drawer for a specific pane and show the host and remote directory above the file list. Start with browse, upload, download, drag-and-drop and transfer progress. Use the existing SFTP worker and overwrite policy. Bind each transfer to its original pane even if the user changes tabs or focus. Use the SFTP working directory by default. Following the shell’s current directory is a separate feature and needs a remote directory report. [SFTP semantics](../CONTROL.md#sftp)
+
+Add duplicate and delete to the profile editor. Import common OpenSSH host settings and support `ProxyJump` with host-key verification for each hop. Show users which settings were imported and flag unsupported directives. [OpenSSH configuration](https://man.openbsd.org/ssh_config)
+
+**Acceptance.** Transfer a file while typing into another pane and verify the bytes at the destination. Exercise an overwrite refusal, a disconnect during upload and a server that declines SFTP. The drawer should report the outcome, including a possibly partial upload, and the terminal should remain usable when only SFTP fails. Connect through a test jump host and verify the destination’s host key independently.
+
+## Release 3 · Durable Linux sessions
+
+There are three separate recovery promises. A **saved workspace** can reopen the same profiles and geometry. **SSH reconnection** can establish a fresh login after the network returns. **Durable attachment** returns to the original shell, working directory and foreground process because a process on the Linux host kept the PTY alive. A background service on Windows could keep a connection open after the GUI exits, but it cannot provide target-side durability during a network outage.
+
+| Option | Mechanism and fit |
+| --- | --- |
+| Eternal Terminal | SSH bootstraps a separate encrypted TCP transport. The peers track sequence numbers and catch up missed bytes after reconnecting. ET 7.1 also supports named sessions. It is the reference for recovering from a Wi-Fi change mid-command. [Protocol](https://github.com/MisterTea/EternalTerminal/blob/master/docs/protocol.md) · [7.1 release](https://github.com/MisterTea/EternalTerminal/releases/tag/et-v7.1.0) |
+| zmx | A host-side process owns each named PTY, forwards live bytes and maintains a terminal model for reattachment. It leaves the layout to Windows. **First trial** for one durable shell per native pane over ordinary SSH. [Architecture](https://zmx.sh/architecture) · [SSH workflow](https://zmx.sh/ssh) |
+| Herdr Core | `hc connect` can expose terminal discovery, initial screen/history, live bytes, resize and observers over SSH stdio. **Second trial** if w11term needs to discover and display a host’s running terminals. Its viewer protocol is still in preview. [Core](https://github.com/herdrdev/herdr-core) · [Attach protocol](https://github.com/herdrdev/herdr-core/blob/master/schema/README.md) |
+| Zellij | Version 0.46 exposes a Rust library for building a Zellij distribution with bundled configuration, layouts and plugins. The documented entry point runs that application. Stock remote Zellij is a useful TUI compatibility target. Its attention inbox and pane previews also translate to a native workspace. [Distribution API](https://zellij.dev/documentation/distributions.html) · [0.46 release](https://zellij.dev/news/terminal-inbox-session-previews/) |
+| tmux control mode | Exposes pane output, IDs and layout changes to external clients. The strongest reason to build an adapter is to open sessions users already run in tmux. [Control mode](https://github.com/tmux/tmux/wiki/Control-Mode) |
+| Venti | A Linux mux with tiled and floating panes, zoom and pane-aware kitty/sixel graphics. Its graphics selection uses terminal identity. Test detection with w11term’s actual `TERM=xterm-256color` and placement while resizing. [Venti features and design](https://github.com/programmersd21/venti) |
+
+Make durability opt-in per profile. Distinguish **Detach**, **Reattach** and **End remote session**. Scope the saved remote reference to its host and user. If the helper is unavailable or the saved session has expired, report that and offer **Start new shell**. Some attach commands also create a session when the name is missing. The trial must detect that case before reporting successful recovery. SFTP can reopen on the new SSH connection independently of the shell.
+
+**Decision test.** Start an editor with an unsaved buffer and record the remote shell PID. Drop the transport, reconnect, then restart w11term and repeat. Verify the PID, buffer, current grid and first keystroke. Repeat with an alternate-screen TUI and a static image. Reconstructing a display must avoid replaying old clipboard writes, bells, sounds or user input. Use these results to choose a backend and document exactly what it restores.
+
+## Release 4 · Terminal fidelity and Windows accessibility
+
+Add Windows IME composition and candidate positioning for the focused pane. Expose terminal text, selection and caret through a Windows UI Automation text provider so Narrator can navigate output. Improve complex-script shaping, bidirectional layout, italic and underline rendering. Expand kitty graphics fixtures to cover animation timing, relative placements and placeholders across scroll and resize. [Windows Terminal accessibility design](https://github.com/microsoft/terminal/blob/main/doc/terminal-a11y-2023.md) · [Current graphics coverage](graphics-audit.md)
+
+**Acceptance.** Compose and commit text with a Windows IME while switching between panes, read a terminal selection with Narrator, and compare representative text and image fixtures against reference renders. Check that idle panes stay idle and a continuously updating pane leaves its neighbor responsive.
+
+## Release 5 · Local PowerShell via ConPTY
+
+Add **Local PowerShell** to the same **+** and split menus as SSH profiles. A local profile identifies a Windows executable, its arguments and an optional starting directory. Offer PowerShell 7 (`pwsh.exe`) when installed and Windows PowerShell (`powershell.exe`) under its own label. A saved workspace records which executable to launch. Reopening it starts a fresh local process.
+
+Choose the backend when opening the pane. An SSH pane exchanges terminal bytes directly with its russh channel, preserving the existing path for kitty graphics, keyboard negotiation and raw control writes. A local pane launches its child attached to a Windows pseudoconsole. w11term reads ConPTY’s output pipe into the same VT engine and renderer, writes terminal input to its input pipe, and passes cell-grid changes to `ResizePseudoConsole`. Only local sessions incur ConPTY’s translation and I/O costs. Keep SFTP and remote reattachment scoped to SSH panes. [Windows pseudoconsole lifecycle](https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session) · [Grid resizing](https://learn.microsoft.com/en-us/windows/console/resizepseudoconsole)
+
+**Acceptance.** Split a live SSH tab and select **Local PowerShell**. Verify that typing, Ctrl+C, resize and exit reach the intended pane, and that closing the local shell cleans up its child and pipe handles while the SSH session continues. Drive the remote pane through the CLI during local output and compare its received bytes and captured image with the direct-SSH fixture. Restore the layout and verify the local pane opens in its configured directory.
+
+## Subsequent features for RustMUSH
+
+**Resume the cockpit through the game gateway.** The port-22 `sshdoorway` terminates the player’s SSH connection and opens a separate upstream SSH connection to the instance. Its current teardown closes the upstream channel when the player drops. That is what lets the game apply linkdead rules. The per-instance gateway owns the SSH TUI and can also serve players who connect directly on 6789 or 6792. Use the doorway to forward an authenticated resume request and let the instance restore the character and view. This also allows a reconnect to arrive through a different doorway generation. [Doorway teardown](https://github.com/conclavio/rustmush/blob/5e697833a/crates/mush-sshdoorway/src/server.rs#L1472-L1482) · [Deployment and routes](https://github.com/conclavio/rustmush/blob/5e697833a/deploy/sshdoorway/README.md)
+
+**Restore the current view and control state.** Issue an opaque, expiring resume reference for a specific authenticated player, character and pane. The shared SSH username `play` cannot identify a player. After a drop, the game applies its normal grace and seat-ownership rules. A returning w11term supplies its current grid, and the gateway redraws the authoritative cockpit and HUD. RustMUSH’s web path already authorizes character resume and can replay sequenced game events. Its SSH TUI currently receives live events. Preserve useful message history separately from one-shot effects such as past sounds and clipboard writes. [Web resume](https://github.com/conclavio/rustmush/blob/5e697833a/crates/mush-gateway/src/web_bridge.rs#L570) · [SSH replay boundary](https://github.com/conclavio/rustmush/blob/5e697833a/crates/mush-net-ssh/src/tui/app.rs#L395-L405) · [Existing w11term game protocol](game-client-protocol.md)
+
+**Acceptance.** Drop a seated pilot while a turn key is held. Reconnect the same character inside grace through both supported routes and confirm seat reclamation, a fresh frame at the new size and correct input on the first keypress. After grace, show the game’s actual outcome, including the player-controlled `BOARD` path for eligible tanks. Also verify that a second account cannot resume that pane, that a queued turn or sound never fires on return, and that the base Windows workspace works against a server with no game extensions. [RustMUSH cockpit reconnection tests](https://github.com/conclavio/rustmush/blob/5e697833a/crates/mushd/tests/sim_lenses/sim_cockpit.rs#L829-L857)
