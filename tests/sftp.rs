@@ -318,10 +318,10 @@ impl russh_sftp::server::Handler for Files {
     }
 }
 
-async fn fixture(
+async fn fixture_server(
     reject: bool,
 ) -> (
-    Session,
+    Source,
     tempfile::TempDir,
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
@@ -353,14 +353,28 @@ async fn fixture(
             .unwrap()
             .await;
     });
-    let session = Session::start(Source::Ssh(SshOptions {
+    let source = Source::Ssh(SshOptions {
         host: "127.0.0.1".into(),
         user: "test".into(),
         port,
         authentication: Authentication::None,
         host_key: Some(pin),
         player: Default::default(),
-    }));
+    });
+    (source, root, opens, server)
+}
+
+async fn fixture(
+    reject: bool,
+) -> (
+    Session,
+    Source,
+    tempfile::TempDir,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (source, root, opens, server) = fixture_server(reject).await;
+    let session = Session::start(source.clone());
     tokio::time::timeout(Duration::from_secs(5), async {
         while session.frames.load().connection_generation == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -368,8 +382,12 @@ async fn fixture(
     })
     .await
     .expect("SSH fixture did not connect");
-    (session, root, opens, server)
+    (session, source, root, opens, server)
 }
+
+#[cfg(feature = "ui-smoke")]
+#[path = "sftp/native_gui.rs"]
+mod native_gui;
 async fn request(op: Value) -> control::Reply {
     let request: Request =
         serde_json::from_value(json!({"verb":"sftp","pane":1,"timeout_seconds":10,"operation":op}))
@@ -396,10 +414,77 @@ fn registry(session: &Session) -> Registry {
     r
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
+    use w11term::sftp::{Job, Operation};
+
+    async fn request(pane: &Session, operation: Operation) -> Result<Value, String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        pane.input
+            .send(Command::Sftp(Job {
+                operation,
+                deadline,
+                reply,
+            }))
+            .unwrap();
+        tokio::time::timeout_at(deadline, response)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    // The fixture accepts exactly one TCP connection.
+    let (original, source, root, opens, server) = fixture(false).await;
+    fs::write(root.path().join("from-second-pane"), b"").unwrap();
+    let child = Session::start_configured_with_connection(
+        source,
+        Default::default(),
+        false,
+        original.ssh_connection(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while child.ssh_connection().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("second pane must use the fixture's single connection");
+    let remote = request(&child, Operation::Opendir { path: "/".into() })
+        .await
+        .unwrap();
+    let handle = remote["handle"].as_u64().unwrap();
+    assert_eq!(
+        request(&original, Operation::Info).await.unwrap()["open_handles"],
+        0
+    );
+    assert!(
+        request(&original, Operation::Readdir { handle })
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        4,
+        "two shell and two SFTP channels"
+    );
+    drop(original);
+    let result = request(&child, Operation::Readdir { handle })
+        .await
+        .unwrap();
+    assert_eq!(result["entries"][0]["filename"], "from-second-pane");
+    request(&child, Operation::Close { handle }).await.unwrap();
+    drop(child);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_failure() {
     use sha2::{Digest, Sha256};
-    let (session, root, opens, server) = fixture(false).await;
+    let (session, _, root, opens, server) = fixture(false).await;
     let cache = tempfile::tempdir().unwrap();
     fs::write(root.path().join("small-reads"), []).unwrap();
     fs::create_dir_all(root.path().join("assets/sounds")).unwrap();
@@ -521,7 +606,7 @@ async fn asset_pack_sync_verifies_hashes_reuses_cache_and_preserves_old_pack_on_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
-    let (session, _root, _opens, server) = fixture(false).await;
+    let (session, _, _root, _opens, server) = fixture(false).await;
     session.player.write().unwrap().mute = true;
     session.player.write().unwrap().remote_sounds = Some(true);
     let registry = registry(&session);
@@ -619,7 +704,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
     tokio::time::timeout(Duration::from_secs(30),async {
-        let (session,root,opens,server)=fixture(false).await;
+        let (session,_,root,opens,server)=fixture(false).await;
         let panes=registry(&session);
         let discovery=tempfile::tempdir().unwrap();
         let control=control::Server::start_in_directory(panes,|_,_,_|anyhow::bail!("unused"),discovery.path().into()).unwrap();
@@ -693,7 +778,7 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         ok(json!({"op":"info"})).await;
         assert_eq!(opens.load(Ordering::Relaxed),3,"recovery opens only a new SFTP channel, not a new SSH transport");
         drop(control);drop(session);server.await.unwrap();
-        let (session,_root,_opens,server)=fixture(true).await;
+        let (session,_,_root,_opens,server)=fixture(true).await;
         let control=control::Server::start_in_directory(registry(&session),|_,_,_|anyhow::bail!("unused"),discovery.path().into()).unwrap();
         let r=request(json!({"op":"info"})).await;assert!(!r.ok);assert!(r.error.unwrap().contains("rejected"));
         let (tx,rx)=tokio::sync::oneshot::channel();session.input.send(Command::Raw(b"still here".to_vec(),tx)).unwrap();rx.await.unwrap().unwrap();

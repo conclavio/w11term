@@ -354,9 +354,15 @@ pub enum Message {
 }
 
 fn live_tab(label: String, source: Source, osc52: bool) -> AppTab {
-    live_tab_sized(label, source, TerminalSize::default(), osc52)
+    live_tab_sized(label, source, TerminalSize::default(), osc52, None)
 }
-fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool) -> AppTab {
+fn live_tab_sized(
+    label: String,
+    source: Source,
+    size: TerminalSize,
+    osc52: bool,
+    connection: Option<w11term::ssh::ConnectionShare>,
+) -> AppTab {
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
@@ -365,7 +371,7 @@ fn live_tab_sized(label: String, source: Source, size: TerminalSize, osc52: bool
             surface: PaneSurface::default(),
             device_busy: false,
             device_message: None,
-            session: Session::start_configured(source, size, osc52),
+            session: Session::start_configured_with_connection(source, size, osc52, connection),
             last_size: Rc::new(Cell::new(None)),
             error: None,
             selection: Rc::new(RefCell::new(None)),
@@ -1442,6 +1448,11 @@ impl TerminalApp {
         else {
             return;
         };
+        let connection = if profile.is_none() {
+            tab.session.ssh_connection()
+        } else {
+            None
+        };
         let profile_name = profile.or_else(|| tab.profile_name.clone());
         let (label, source) = match &profile_name {
             Some(name) => {
@@ -1452,10 +1463,12 @@ impl TerminalApp {
             }
             None => (label.clone(), tab.source.clone()),
         };
-        let leaf = live_tab(
+        let leaf = live_tab_sized(
             label,
             source,
+            TerminalSize::default(),
             self.appearance.read().unwrap().interaction.osc52,
+            connection,
         )
         .with_profile(profile_name);
         if self.tabs.split(id, leaf, axis).is_some() {
@@ -2214,14 +2227,20 @@ impl Component for TerminalApp {
             );
         } else {
             tabs.insert(
-                live_tab_sized(label.clone(), options.source.clone(), size, osc52)
+                live_tab_sized(label.clone(), options.source.clone(), size, osc52, None)
                     .with_profile(options.initial_profile.clone()),
             );
             for name in &options.extra_profiles {
                 if let Some(profile) = profiles.get(name) {
                     tabs.insert(
-                        live_tab_sized(name.clone(), Source::Ssh(profile.clone()), size, osc52)
-                            .with_profile(Some(name.clone())),
+                        live_tab_sized(
+                            name.clone(),
+                            Source::Ssh(profile.clone()),
+                            size,
+                            osc52,
+                            None,
+                        )
+                        .with_profile(Some(name.clone())),
                     );
                 }
             }
@@ -2293,9 +2312,12 @@ impl Component for TerminalApp {
         app.sync_selection(context);
         #[cfg(feature = "ui-smoke")]
         if std::env::var_os("W11TERM_UI_SMOKE").is_some() {
+            let loopback = std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
+                && matches!(&options.source, Source::Ssh(ssh) if ssh.host == "127.0.0.1" && ssh.user == "test" && ssh.host_key.is_some());
             assert!(
-                matches!(options.source, Source::Demo) && options.extra_profiles.is_empty(),
-                "UI smoke uses only the local lab"
+                (matches!(options.source, Source::Demo) || loopback)
+                    && options.extra_profiles.is_empty(),
+                "UI smoke requires a local lab or an explicit loopback fixture"
             );
             if std::env::var_os("W11TERM_PROFILE_SMOKE").is_some() {
                 let fixture = std::path::PathBuf::from(
@@ -2605,6 +2627,7 @@ impl Component for TerminalApp {
                         Source::Ssh(ssh),
                         size,
                         self.appearance.read().unwrap().interaction.osc52,
+                        None,
                     )
                     .with_profile(Some(profile));
                     let pane = tab.pane_id().expect("new terminal has a pane ID");

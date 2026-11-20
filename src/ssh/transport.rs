@@ -1,3 +1,4 @@
+use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use crate::{
     events::Events,
     options::{Authentication, SshOptions},
@@ -338,19 +339,85 @@ pub async fn run(
     run_configured(options, size, input, output, None, Events::default()).await
 }
 pub async fn run_configured(
+    options: SshOptions,
+    size: TerminalSize,
+    input: mpsc::UnboundedReceiver<TransportInput>,
+    output: mpsc::Sender<Event>,
+    prompts: Option<Prompts>,
+    events: Events,
+) -> Result<()> {
+    run_with_sharing(
+        options,
+        size,
+        input,
+        output,
+        prompts,
+        events,
+        Sharing::default(),
+    )
+    .await
+}
+
+struct OpenShell {
+    link: Arc<ConnectionShare>,
+    channel: ShellChannel,
+    published: ShareSlot,
+}
+
+async fn connect_shell(
+    options: SshOptions,
+    prompts: Option<Prompts>,
+    password: &mut Option<Zeroizing<String>>,
+    source: Option<ConnectionShare>,
+    published: ShareSlot,
+) -> Result<OpenShell> {
+    if let Some(link) = source.filter(|link| link.matches(&options, prompts.as_ref())) {
+        match link.open_shell().await {
+            Ok(channel) => {
+                return Ok(OpenShell {
+                    link: Arc::new(link),
+                    channel,
+                    published,
+                });
+            }
+            // The new pane can still get its own login on single-channel
+            // servers. No PTY, shell or application input was requested.
+            Err(error) => log::debug!(
+                "split channel unavailable, opening independent SSH connection: {error}"
+            ),
+        }
+    }
+    let handle = connect(options.clone(), prompts.clone(), password).await?;
+    let link = Arc::new(ConnectionShare::new(handle, options, prompts.as_ref()));
+    let channel = link.open_shell().await?;
+    Ok(OpenShell {
+        link,
+        channel,
+        published,
+    })
+}
+
+pub(crate) async fn run_with_sharing(
     mut options: SshOptions,
     mut size: TerminalSize,
     mut input: mpsc::UnboundedReceiver<TransportInput>,
     output: mpsc::Sender<Event>,
     prompts: Option<Prompts>,
     events: Events,
+    mut sharing: Sharing,
 ) -> Result<()> {
     let mut password = None;
     let mut generation = 0;
     let mut failures = 0u32;
     let mut dropped_at: Option<tokio::time::Instant> = None;
     loop {
-        let future = connect(options.clone(), prompts.clone(), &mut password);
+        let future = connect_shell(
+            options.clone(),
+            prompts.clone(),
+            &mut password,
+            sharing.offered.take(),
+            sharing.published.clone(),
+        );
         tokio::pin!(future);
         let deadline = dropped_at.map(|since| since + Duration::from_secs(300));
         let connected = loop {
@@ -363,7 +430,7 @@ pub async fn run_configured(
                 generation += 1;
                 let started = tokio::time::Instant::now();
                 let result = run_channel(
-                    Arc::new(session),
+                    session,
                     &mut options,
                     &mut size,
                     &mut input,
@@ -412,7 +479,7 @@ pub async fn run_configured(
     }
 }
 async fn run_channel(
-    session: Arc<client::Handle<Handler>>,
+    mut shell: OpenShell,
     options: &mut SshOptions,
     size: &mut TerminalSize,
     input: &mut mpsc::UnboundedReceiver<TransportInput>,
@@ -420,11 +487,11 @@ async fn run_channel(
     events: &Events,
     generation: u64,
 ) -> Result<()> {
-    let mut channel = session.channel_open_session().await?;
+    let channel = shell.channel.channel();
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let mut children = tokio::task::JoinSet::new();
-    children.spawn(crate::sftp::run(session.clone(), sftp_rx, cleanup_rx));
+    children.spawn(crate::sftp::run(shell.link.handle(), sftp_rx, cleanup_rx));
     channel
         .request_pty(
             true,
@@ -445,14 +512,14 @@ async fn run_channel(
                 Some(TransportInput::Authenticate(auth))=>options.authentication=auth,
                 Some(TransportInput::Sftp(job))=>if job.reply.is_closed() && matches!(job.operation,crate::sftp::Operation::Close{..}) { let _=cleanup_tx.send(job); } else if let Err(error)=sftp_tx.try_send(job){let message=if matches!(&error,mpsc::error::TrySendError::Full(_)){"SFTP queue is full"}else{"SFTP worker is closed"};let _=error.into_inner().reply.send(Err(message.into()));},
                 Some(TransportInput::Data(bytes))=>channel.data(bytes.as_slice()).await?,Some(TransportInput::Raw(bytes,reply))=>{let result=channel.data(bytes.as_slice()).await;let _=reply.send(result.as_ref().map(|_|()).map_err(|e|e.to_string()));result?;},
-                Some(TransportInput::Resize(new))=>{*size=new;channel.window_change(size.cols as u32,size.rows as u32,size.pixel_width as u32,size.pixel_height as u32).await?;},None=>{session.disconnect(russh::Disconnect::ByApplication,"Tab closed","en").await?;return Ok(());}
+                Some(TransportInput::Resize(new))=>{*size=new;channel.window_change(size.cols as u32,size.rows as u32,size.pixel_width as u32,size.pixel_height as u32).await?;},None=>return Ok(()),
             },
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
-                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
+                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link);events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or shell request ({pending} outstanding)"))),
-                Some(russh::ChannelMsg::ExitStatus{exit_status})=>{output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;session.disconnect(russh::Disconnect::ByApplication,"Remote process exited","en").await?;return Ok(());},
-                Some(russh::ChannelMsg::Close)=>{session.disconnect(russh::Disconnect::ByApplication,"Remote channel closed","en").await?;return Ok(());},None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
+                Some(russh::ChannelMsg::ExitStatus{exit_status})=>{output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;return Ok(());},
+                Some(russh::ChannelMsg::Close)=>return Ok(()),None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
             }
         }
     }
