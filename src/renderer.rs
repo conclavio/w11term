@@ -169,6 +169,39 @@ impl Renderer {
         self.draw_surface(ctx, ctx.width, ctx.height, ctx.device_changed(), frame)
     }
 
+    pub fn draw_preedit(
+        &self,
+        ctx: &DrawContext<'_>,
+        frame: &Snapshot,
+        text: &str,
+        cursor: u32,
+    ) -> windows_canvas::Result<f32> {
+        let cw = self.metrics.cell_width;
+        let ch = self.metrics.cell_height;
+        if text.is_empty() || frame.cursor.y < 0 || frame.cursor.y as usize >= self.metrics.rows {
+            return Ok(0.0);
+        }
+        let x = PADDING + frame.cursor.x.min(self.metrics.cols.saturating_sub(1)) as f32 * cw;
+        let y = PADDING + frame.cursor.y as f32 * ch;
+        let layout = TextLayout::new(text, &self.normal, 1000000.0, ch)?;
+        let width = layout
+            .metrics()
+            .width_including_trailing_whitespace
+            .max(1.0);
+        let cursor = layout.caret_bounds(cursor, false).left;
+        let origin = x.min((ctx.width - PADDING - width).max(PADDING));
+        // Scroll a long composition horizontally to keep its insertion point visible.
+        let origin = origin.min(ctx.width - PADDING - 2.0 - cursor);
+        let brush = ctx.create_solid_brush(ColorF::new(0.13, 0.16, 0.20, 1.0))?;
+        ctx.fill_rect(&Rect::from_xywh(origin, y, width + 2.0, ch), &brush);
+        brush.set_color(ColorF::new(0.97, 0.98, 1.0, 1.0));
+        ctx.draw_text_layout(windows_canvas::Vector2 { x: origin, y }, &layout, &brush);
+        brush.set_color(ColorF::new(0.44, 0.76, 1.0, 1.0));
+        ctx.fill_rect(&Rect::from_xywh(origin, y + ch - 1.5, width, 1.5), &brush);
+        ctx.fill_rect(&Rect::from_xywh(origin + cursor, y, 1.2, ch), &brush);
+        Ok(origin + cursor - x)
+    }
+
     pub fn draw_interaction(
         &self,
         ctx: &DrawContext<'_>,

@@ -33,6 +33,8 @@ mod config_import;
 mod file_drawer;
 use file_drawer::{FileAction, FileDrawer};
 mod durable_view;
+#[cfg(feature = "ui-smoke")]
+mod ime_smoke;
 mod pane_view;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
@@ -309,6 +311,7 @@ pub struct TerminalApp {
     fonts: Vec<String>,
     appearance_error: Option<String>,
     divider_drag: Rc<RefCell<Option<pane_view::DividerDrag>>>,
+    measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     mru: Vec<TabId>,
     switcher: Option<TabSwitcher>,
 }
@@ -1383,6 +1386,7 @@ impl TerminalApp {
             _ => None,
         };
         self.keyboard.set_target(target);
+        self.sync_ime_surface();
         self.keyboard
             .set_wheel_panes(self.tabs.entries().iter().filter_map(|entry| {
                 let Page::Terminal(tab) = &entry.value.page else {
@@ -2540,6 +2544,7 @@ impl Component for TerminalApp {
             fonts,
             appearance_error,
             divider_drag: Rc::new(RefCell::new(None)),
+            measured_layout: None,
             mru: Vec::new(),
             switcher: None,
             selection_pending: true,
@@ -3845,6 +3850,10 @@ impl TerminalApp {
         }
         if std::env::var_os("W11TERM_IMPORT_SMOKE").is_some() {
             self.import_smoke_step(step, context);
+            return;
+        }
+        if std::env::var_os("W11TERM_IME_SMOKE").is_some() {
+            self.ime_smoke_step(step, context);
             return;
         }
         if std::env::var_os("W11TERM_WORKSPACE_SMOKE").is_some() {

@@ -16,6 +16,8 @@ use presentation::Presentation;
 
 #[derive(Debug)]
 pub enum Command {
+    /// Input method committed text has no corresponding physical key presses.
+    Composed(String),
     Observe(tokio::sync::oneshot::Sender<tokio::sync::broadcast::Receiver<Vec<u8>>>),
     Record {
         path: Option<std::path::PathBuf>,
@@ -410,7 +412,7 @@ async fn run(
                 presentation.dirty=true;
             }
             command = commands.recv() => {
-                let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::ReloadDemo));
+                let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
@@ -465,6 +467,15 @@ async fn run(
                             else if let Err(error) = terminal::send_key(&mut terminal, &writer, KeyCode::Char(c), KeyModifiers::NONE, true) { result = Err(error); break; }
                         }
                         result
+                    }
+                    Some(Command::Composed(text)) => {
+                        scroll_offset = 0;
+                        if is_demo {
+                            for c in text.chars() {demo_key(&mut terminal,KeyCode::Char(c),KeyModifiers::NONE);}
+                            Ok(())
+                        } else {
+                            writer.send(TransportInput::Data(text.into_bytes())).map_err(|_|anyhow::anyhow!("terminal transport closed"))
+                        }
                     }
                     Some(Command::Resize(new_size)) => {
                         if size != new_size || (is_demo && !demo_loaded) {

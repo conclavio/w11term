@@ -2,6 +2,64 @@ use super::*;
 use w11term::pane_layout::{Axis, Layout};
 
 const DIVIDER: f64 = 6.0;
+type CanvasArea = Rc<Cell<Option<(f32, f32, f32)>>>;
+
+/// Locate a leaf using the measured canvases on both sides of every divider.
+/// The header occupies the space above the bottom-aligned terminal layout.
+pub(super) struct PaneGeometry {
+    layout: Layout,
+    focused: TabId,
+    areas: BTreeMap<TabId, CanvasArea>,
+}
+
+impl PaneGeometry {
+    fn rect(&self, client_height: i32) -> Option<(i32, i32, i32, i32)> {
+        let decorated = matches!(self.layout, Layout::Split { .. });
+        let border = if decorated { 1.0 } else { 0.0 };
+        fn measure(
+            node: &Layout,
+            data: &PaneGeometry,
+            border: f32,
+            target: &mut Option<(f32, f32)>,
+        ) -> Option<(f32, f32)> {
+            match node {
+                Layout::Leaf(id) => {
+                    if *id == data.focused {
+                        *target = Some((border, border));
+                    }
+                    let (w, h, _) = data.areas.get(id)?.get()?;
+                    Some((w + 2.0 * border, h + 2.0 * border))
+                }
+                Layout::Split {
+                    axis,
+                    first,
+                    second,
+                    ..
+                } => {
+                    let a = measure(first, data, border, target)?;
+                    let mut second_origin = None;
+                    let b = measure(second, data, border, &mut second_origin)?;
+                    if let Some((x, y)) = second_origin {
+                        *target = Some(match axis {
+                            Axis::Columns => (a.0 + DIVIDER as f32 + x, y),
+                            Axis::Rows => (x, a.1 + DIVIDER as f32 + y),
+                        });
+                    }
+                    Some(match axis {
+                        Axis::Columns => (a.0 + DIVIDER as f32 + b.0, a.1.max(b.1)),
+                        Axis::Rows => (a.0.max(b.0), a.1 + DIVIDER as f32 + b.1),
+                    })
+                }
+            }
+        }
+        let mut origin = None;
+        let (_, total_h) = measure(&self.layout, self, border, &mut origin)?;
+        let (x, y) = origin?;
+        let (w, h, scale) = self.areas.get(&self.focused)?.get()?;
+        let px = |v: f32| (v * scale).round() as i32;
+        Some((px(x), client_height - px(total_h - y), px(w), px(h)))
+    }
+}
 
 pub(super) struct DividerDrag {
     epoch: u64,
@@ -70,6 +128,62 @@ fn terminal_size(metrics: Metrics) -> TerminalSize {
 }
 
 impl TerminalApp {
+    fn pane_geometry(&self) -> Option<PaneGeometry> {
+        let focused = self.tabs.active_id()?;
+        let layout = if self.tabs.zoomed() {
+            Layout::Leaf(focused)
+        } else {
+            self.tabs.active_layout()?.clone()
+        };
+        let areas = layout
+            .leaves()
+            .into_iter()
+            .map(|id| {
+                let Page::Terminal(tab) = &self.tabs.get(id)?.page else {
+                    return None;
+                };
+                Some((id, tab.surface.area.clone()))
+            })
+            .collect::<Option<_>>()?;
+        Some(PaneGeometry {
+            layout,
+            focused,
+            areas,
+        })
+    }
+
+    pub(super) fn focused_pane_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        self.measured_layout
+            .as_ref()?
+            .rect(crate::input::ime::client_height()?)
+    }
+
+    pub(super) fn sync_ime_surface(&mut self) {
+        self.measured_layout = self.pane_geometry().map(Rc::new);
+        let surface = self.measured_layout.clone().and_then(|geometry| {
+            let Page::Terminal(tab) = &self.tabs.active()?.page else {
+                return None;
+            };
+            let metrics = tab.surface.metrics.clone();
+            let frames = tab.session.frames.clone();
+            Some(crate::input::ime::Surface::new(
+                tab.session.input.clone(),
+                tab.surface.invalidator.clone(),
+                move || {
+                    let rect = geometry.rect(crate::input::ime::client_height()?)?;
+                    let frame = frames.load();
+                    crate::input::ime::caret_box(
+                        rect,
+                        metrics.get(),
+                        frame.cursor.x,
+                        frame.cursor.y,
+                    )
+                },
+            ))
+        });
+        crate::input::ime::set_surface(surface);
+    }
+
     fn pane_canvas(
         &self,
         id: TabId,
@@ -117,6 +231,10 @@ impl TerminalApp {
             )?;
             metrics.set(measured);
             area.set(Some((ctx.width, ctx.height, measured.scale)));
+            if let Some(preedit) = crate::input::ime::preedit(&sender) {
+                let offset = renderer.draw_preedit(ctx, &frame, &preedit.text, preedit.cursor)?;
+                crate::input::ime::position_after_draw(offset, measured.scale);
+            }
             let window_mode = window_grid.get();
             if matches!(window_mode, WindowGrid::Terminal) {
                 if initial_grid
