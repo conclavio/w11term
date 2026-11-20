@@ -24,11 +24,17 @@ The original MIT license is preserved in `LICENSE.md`.
 - CPU dedup cache has a 4 MiB byte budget and is cleared on image deletion,
   connection reset and animation mutation. PNG decoding is explicitly PNG with
   allocation limits. Animations have 256-frame/32 MiB limits, grow the shared table
-  accounting, and direct chunk metadata is bounded. Chunked query/animation
-  transmissions are explicitly rejected rather than misdecoded.
+  accounting, and direct chunk metadata is bounded. Direct animation frames use
+  the same chunk accounting as image transmissions. Chunked queries are rejected.
 
 - Reconnection moves the previous primary viewport into scrollback before resetting the transport modes and exposing a clean live screen.
 
 - Automatic image-id exhaustion rejects without overflow; number aliases are only
   published after successful storage and are retired with deleted/pruned images.
-  Animation table accounting includes shared image aliases.
+  Mutable kitty image IDs have independent frame data and playback state.
+
+- The kitty model owns each image ID independently, schedules animation frames
+  and projects Unicode placeholder and relative placements onto snapshot rows.
+  The sister vendored escape parser at the same pinned revision preserves their
+  control parameters. The projection uses the Unicode 6.0 diacritic indices
+  published with kitty's graphics protocol. See `docs/graphics-audit.md`.

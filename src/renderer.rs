@@ -1280,6 +1280,52 @@ mod tests {
         assert_eq!(renderer.tile_bytes, 0);
     }
     #[test]
+    fn offscreen_kitty_reference_cell_centers() {
+        #[derive(serde::Deserialize)]
+        struct Sample {
+            column: usize,
+            row: usize,
+            rgb: [u8; 3],
+        }
+        let metrics = Renderer::new().unwrap().metrics;
+        let size = wezterm_term::TerminalSize {
+            cols: 16,
+            rows: 8,
+            dpi: 96,
+            pixel_width: (16.0 * metrics.cell_width).round() as usize,
+            pixel_height: (8.0 * metrics.cell_height).round() as usize,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(include_bytes!("../tests/fixtures/kitty/placements.vt"));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("w11term.png");
+        screenshot(&frame, size, &path).unwrap();
+        let actual = image::open(path).unwrap().into_rgb8();
+        let samples: Vec<Sample> =
+            serde_json::from_slice(include_bytes!("../tests/fixtures/kitty/samples.json")).unwrap();
+        for sample in samples {
+            let x =
+                ((sample.column as f32 + 0.5) * actual.width() as f32 / size.cols as f32) as u32;
+            let y = ((sample.row as f32 + 0.5) * actual.height() as f32 / size.rows as f32) as u32;
+            let pixel = actual.get_pixel(x, y);
+            for (a, b) in pixel.0.into_iter().zip(sample.rgb) {
+                // The default terminal palettes and native texture interpolation
+                // differ slightly. The samples are inside opaque color fields.
+                assert!(
+                    a.abs_diff(b) < 32,
+                    "({},{}) was {:?}, expected {:?}",
+                    sample.column,
+                    sample.row,
+                    pixel,
+                    sample.rgb
+                );
+            }
+        }
+    }
+
+    #[test]
     fn offscreen_png_contains_terminal_text_kitty_and_sixel_pixels() {
         use base64::Engine;
         use wezterm_term::TerminalSize;

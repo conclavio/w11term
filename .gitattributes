@@ -1,3 +1,4 @@
 * text=auto eol=lf
 vendor/wezterm-term/data/wezterm binary
 tests/fixtures/*.vt binary
+tests/fixtures/kitty/*.vt binary

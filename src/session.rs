@@ -398,7 +398,11 @@ async fn run(
                 connection: connection_generation,
             },
         );
+        let animation_deadline = presentation.animation_deadline(&terminal);
         tokio::select! {
+            _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if animation_deadline.is_some() => {
+                presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
+            },
             _=tokio::time::sleep_until(presentation.deadline.unwrap_or_else(||tokio::time::Instant::now()+std::time::Duration::from_secs(86400))),if presentation.deadline.is_some()=>{presentation.expire(&mut terminal);},
             _=prompts.changed()=>{},
             Some(notice)=notices.recv()=>match notice {

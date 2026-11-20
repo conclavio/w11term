@@ -419,10 +419,12 @@ pub struct Snapshot {
     pub size: TerminalSize,
     images: HashMap<usize, FrozenImage>,
     cell_maps: std::sync::OnceLock<Arc<[crate::text_layout::CellMap]>>,
+    projected: bool,
 }
 
 #[derive(Clone, Debug)]
 struct FrozenImage {
+    kitty_id: Option<u32>,
     hash: [u8; 32],
     data: Arc<wezterm_term::image::ImageDataType>,
 }
@@ -445,7 +447,8 @@ impl Snapshot {
         let start = screen.phys_row(0).saturating_sub(offset);
         let first_stable_row = screen.phys_to_stable_row_index(start);
         let alternate = terminal.is_alt_screen_active();
-        let lines = screen.lines_in_phys_range(start..start + screen.physical_rows);
+        let mut lines = screen.lines_in_phys_range(start..start + screen.physical_rows);
+        let projected = terminal.project_kitty_placements(&mut lines, start);
         let rows: Vec<Arc<Line>> = lines
             .into_iter()
             .enumerate()
@@ -460,6 +463,7 @@ impl Snapshot {
                     });
                 if let Some(old) = old_row
                     && old.current_seqno() == line.current_seqno()
+                    && (!(projected || previous.is_some_and(|old| old.projected)) || **old == line)
                 {
                     return Arc::clone(old);
                 }
@@ -476,10 +480,13 @@ impl Snapshot {
                         continue;
                     }
                     let guard = source.data();
+                    let index = terminal.kitty_animation_frame(tile.image_id());
                     use wezterm_term::image::ImageDataType;
                     let hash = match &*guard {
                         ImageDataType::Rgba8 { hash, .. } => *hash,
-                        ImageDataType::AnimRgba8 { hashes, .. } if !hashes.is_empty() => hashes[0],
+                        ImageDataType::AnimRgba8 { hashes, .. } if index < hashes.len() => {
+                            hashes[index]
+                        }
                         _ => source.hash(),
                     };
                     let frozen = previous
@@ -494,18 +501,19 @@ impl Snapshot {
                                     frames,
                                     hashes,
                                     ..
-                                } if !frames.is_empty() && !hashes.is_empty() => {
+                                } if index < frames.len() && index < hashes.len() => {
                                     ImageDataType::Rgba8 {
                                         width: *width,
                                         height: *height,
-                                        data: frames[0].clone(),
-                                        hash: hashes[0],
+                                        data: frames[index].clone(),
+                                        hash: hashes[index],
                                     }
                                 }
                                 data => data.clone(),
                             };
                             FrozenImage {
                                 hash,
+                                kitty_id: tile.image_id(),
                                 data: Arc::new(data),
                             }
                         });
@@ -535,6 +543,7 @@ impl Snapshot {
             size: terminal.get_size(),
             images,
             cell_maps: Default::default(),
+            projected,
         }
     }
 
@@ -565,6 +574,16 @@ impl Snapshot {
         source: &Arc<wezterm_term::image::ImageData>,
     ) -> &wezterm_term::image::ImageDataType {
         &self.images[&(Arc::as_ptr(source) as usize)].data
+    }
+
+    pub fn animation_deadline(
+        &self,
+        terminal: &wezterm_term::TerminalState,
+    ) -> Option<std::time::Instant> {
+        self.images
+            .values()
+            .filter_map(|img| terminal.kitty_animation_deadline_for(img.kitty_id?))
+            .min()
     }
 
     pub fn same_presentation(&self, old: &Self) -> bool {
