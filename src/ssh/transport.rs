@@ -734,11 +734,12 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     let mut probing = probe.is_some();
     let mut auth_pending = probing;
     let link = &shell.link;
-    let exchange = |probe: Option<game_resume::Probe>, auth| async move {
+    let exchange = |probe: Option<game_resume::Probe>, auth, previous| async move {
         let probe = probe.expect("enabled game sideband");
-        (probe.redeeming(), probe.exchange(link, auth).await)
+        let (outcome, follow_up) = probe.exchange(link, auth, previous).await;
+        (probe.redeeming(), outcome, follow_up)
     };
-    let sideband = exchange(probe, auth);
+    let sideband = exchange(probe, auth, None);
     tokio::pin!(sideband);
     if managed {
         shell.published.publish(&shell.link);
@@ -757,14 +758,13 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     }
     loop {
         tokio::select! {
-            (redeeming, outcome) = &mut sideband, if probing => {
+            (redeeming, outcome, follow_up) = &mut sideband, if probing => {
                 if waiting_for_resume {
                     queued_before_unlock = input.len();
                     waiting_for_resume = false;
                 }
                 // A final refusal allows one new issue on this primary channel.
                 // A missing reply leaves the previous proof for the next reconnect.
-                let reissue = redeeming && outcome.refused();
                 let pane = game.as_mut().expect("enabled game sideband");
                 let status = pane.finish(link.fingerprint(), outcome);
                 events.push("game-resume", serde_json::json!({"status": status}));
@@ -778,12 +778,12 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 } else if restoring && status == "issued" {
                     output.send(Event::Status("RustMUSH reconnect ticket renewed".into())).await?;
                 }
-                probing = reissue;
-                auth_pending = reissue;
-                if reissue {
+                probing = follow_up.is_some();
+                auth_pending = probing;
+                if let Some(previous) = follow_up {
                     let (auth, receiver) = tokio::sync::oneshot::channel();
                     auth_rx = receiver;
-                    sideband.set(exchange(Some(pane.probe(link.fingerprint())), auth));
+                    sideband.set(exchange(Some(pane.probe(link.fingerprint())), auth, Some(previous)));
                 }
             }
             result = &mut auth_rx, if auth_pending => {

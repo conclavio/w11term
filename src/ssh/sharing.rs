@@ -110,6 +110,13 @@ impl ShellChannel {
     pub(super) fn close_game_session_on_drop(&mut self, link: ConnectionShare) {
         self.game_connection = Some(link);
     }
+    /// Queue CLOSE in order with the caller's next channel open. If the send
+    /// is cancelled, the usual drop guard still releases the channel.
+    pub(super) async fn close(mut self) {
+        if self.channel().close().await.is_ok() {
+            self.channel.take();
+        }
+    }
 }
 
 impl Drop for ShellChannel {

@@ -63,6 +63,12 @@ struct Peer {
 }
 impl server::Handler for Peer {
     type Error = anyhow::Error;
+    async fn channel_close(&mut self, c: ChannelId, _: &mut server::Session) -> Result<()> {
+        if self.side == Some(c) {
+            self.side = None;
+        }
+        Ok(())
+    }
     async fn channel_eof(&mut self, c: ChannelId, _: &mut server::Session) -> Result<()> {
         if self.shell == Some(c) {
             let _ = self.closed.send(self.marker.clone());
@@ -82,7 +88,11 @@ impl server::Handler for Peer {
         reply: server::ChannelOpenHandle,
         _: &mut server::Session,
     ) -> Result<()> {
-        reply.accept().await;
+        // As on a RustMUSH doorway, the primary PTY and a single auxiliary
+        // channel can coexist. A new subsystem must follow the old CLOSE.
+        if self.side.is_none() {
+            reply.accept().await;
+        }
         Ok(())
     }
     async fn pty_request(

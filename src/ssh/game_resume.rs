@@ -1,5 +1,5 @@
 //! Private, opt-in RustMUSH control channel. No sideband bytes enter the VT stream.
-use super::sharing::ConnectionShare;
+use super::sharing::{ConnectionShare, ShellChannel};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -90,8 +90,18 @@ impl Probe {
     pub fn marker(&self) -> String {
         format!("{}:{}", self.operation(), self.pane)
     }
-    pub async fn exchange(&self, link: &ConnectionShare, auth: oneshot::Sender<()>) -> Outcome {
+    pub async fn exchange(
+        &self,
+        link: &ConnectionShare,
+        auth: oneshot::Sender<()>,
+        previous: Option<ShellChannel>,
+    ) -> (Outcome, Option<ShellChannel>) {
         let open = async {
+            // The doorway allows just the shell and one auxiliary channel. Put
+            // CLOSE on the SSH send queue before asking for the replacement.
+            if let Some(previous) = previous {
+                previous.close().await;
+            }
             let mut side = link.open_shell().await.map_err(|_| Outcome::Interrupted)?;
             let channel = side.channel();
             channel
@@ -125,8 +135,8 @@ impl Probe {
         let first_deadline = (Instant::now() + PROBE_TIMEOUT).min(final_deadline);
         let mut side = match timeout_at(first_deadline, open).await {
             Ok(Ok(side)) => side,
-            Ok(Err(outcome)) => return outcome,
-            Err(_) => return Outcome::Interrupted,
+            Ok(Err(outcome)) => return (outcome, None),
+            Err(_) => return (Outcome::Interrupted, None),
         };
         let mut reader = side.channel().make_reader();
         let first = if self.redeeming() {
@@ -135,18 +145,19 @@ impl Probe {
             final_deadline
         };
         let Ok(Some(mut response)) = timeout_at(first, read_response(&mut reader)).await else {
-            return Outcome::Interrupted;
+            return (Outcome::Interrupted, None);
         };
         if matches!(response, Response::AuthRequired) {
             let _ = auth.send(());
             let Ok(Some(final_response)) =
                 timeout_at(final_deadline, read_response(&mut reader)).await
             else {
-                return Outcome::Interrupted;
+                return (Outcome::Interrupted, None);
             };
             response = final_response;
         }
-        match response {
+        drop(reader);
+        let outcome = match response {
             Response::Issued {
                 ticket,
                 grace_seconds,
@@ -160,7 +171,9 @@ impl Probe {
             Response::Busy => Outcome::Busy,
             Response::Unavailable => Outcome::Unavailable,
             _ => Outcome::Interrupted,
-        }
+        };
+        let follow_up = self.redeeming() && outcome.refused();
+        (outcome, follow_up.then_some(side))
     }
 }
 #[derive(Serialize)]
