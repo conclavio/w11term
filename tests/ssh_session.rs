@@ -264,8 +264,10 @@ async fn roundtrip(allow_none: bool) {
             let registry = Registry::default();
             registry.replace([Pane {
                 id: 7,
+                tab_id: 2,
                 label: "loopback".into(),
                 active: false,
+                visible: false,
                 input: session.input.clone(),
             }]);
             let discovery = tempfile::tempdir().unwrap();
@@ -280,8 +282,10 @@ async fn roundtrip(allow_none: bool) {
             assert!(reply.ok, "{reply:?}");
             let sessions = &reply.result.unwrap()["sessions"];
             assert_eq!(sessions[0]["id"], 7);
+            assert_eq!(sessions[0]["tab_id"], 2);
             assert_eq!(sessions[0]["cols"], 100);
             assert_eq!(sessions[0]["active"], false);
+            assert_eq!(sessions[0]["visible"], false);
             let bytes = b"BOARD\r\x07\x1b[C\0\xff";
             let reply = control::call(
                 pid,

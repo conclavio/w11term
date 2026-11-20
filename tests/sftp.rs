@@ -387,8 +387,10 @@ fn registry(session: &Session) -> Registry {
     let r = Registry::default();
     r.replace([Pane {
         id: 1,
+        tab_id: 4,
         label: "test".into(),
         active: false,
+        visible: false,
         input: session.input.clone(),
     }]);
     r

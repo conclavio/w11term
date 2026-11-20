@@ -79,6 +79,8 @@ fn contain_worker_failure(
 }
 
 pub struct Session {
+    /// Process-local identity used by external clients across reconnects and layout changes.
+    pub pane_id: u64,
     pub prompts: crate::prompts::Prompts,
     pub events: crate::events::Events,
     pub player: Arc<std::sync::RwLock<crate::options::PlayerOptions>>,
@@ -105,6 +107,7 @@ impl Session {
         Self::start_configured(source, size, true)
     }
     pub fn start_configured(source: Source, size: TerminalSize, allow_clipboard: bool) -> Self {
+        static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
         let prompts = crate::prompts::Prompts::default();
         let events = crate::events::Events::default();
@@ -166,6 +169,7 @@ impl Session {
             })
             .expect("starting terminal worker");
         Self {
+            pane_id: NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             prompts,
             events,
             player,

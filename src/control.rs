@@ -143,8 +143,10 @@ impl Reply {
 #[derive(Clone)]
 pub struct Pane {
     pub id: u64,
+    pub tab_id: u64,
     pub label: String,
     pub active: bool,
+    pub visible: bool,
     pub input: mpsc::UnboundedSender<Command>,
 }
 #[derive(Clone, Default)]
@@ -343,10 +345,25 @@ impl Registry {
                 let panes: Vec<_> = self.0.lock().unwrap().values().cloned().collect();
                 let mut sessions = Vec::new();
                 for pane in panes {
-                    match Self::capture(&pane).await {
-                        Ok((frame, size)) => sessions.push(json!({"id":pane.id,"label":pane.label,"active":pane.active,"title":frame.title,"status":frame.status,"cols":size.cols,"rows":size.rows,"prompt":frame.prompt,"connection_generation":frame.connection_generation})),
-                        Err(error) => sessions.push(json!({"id":pane.id,"label":pane.label,"active":pane.active,"status":"unavailable","error":format!("{error:#}")})),
-                    }
+                    let mut session = match Self::capture(&pane).await {
+                        Ok((frame, size)) => json!({
+                            "title": frame.title,
+                            "status": frame.status,
+                            "cols": size.cols,
+                            "rows": size.rows,
+                            "prompt": frame.prompt,
+                            "connection_generation": frame.connection_generation,
+                        }),
+                        Err(error) => {
+                            json!({"status": "unavailable", "error": format!("{error:#}")})
+                        }
+                    };
+                    session["id"] = pane.id.into();
+                    session["tab_id"] = pane.tab_id.into();
+                    session["label"] = pane.label.into();
+                    session["active"] = pane.active.into();
+                    session["visible"] = pane.visible.into();
+                    sessions.push(session);
                 }
                 Ok(json!({"pid":std::process::id(),"sessions":sessions}))
             }

@@ -51,6 +51,8 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $text.text.Contains('Loopback SSH echo')) { throw 'SSH pane never became ready' }
     if ($listing.sessions.Count -ne 2 -or $listing.sessions[0].active -or -not $listing.sessions[1].active) { throw 'Unexpected initial session selection' }
+    if ($listing.sessions[0].visible -ne $false -or $listing.sessions[1].visible -ne $true) { throw 'Unexpected initial pane visibility' }
+    if ($null -eq $listing.sessions[0].tab_id -or $null -eq $listing.sessions[1].tab_id -or $listing.sessions[0].tab_id -eq $listing.sessions[1].tab_id) { throw 'Expected two distinct containing tabs' }
     foreach ($session in $listing.sessions) {
         if ($session.cols -ne 170 -or $session.rows -ne 48) { throw "Incorrect launch geometry: $($session | ConvertTo-Json -Compress)" }
     }
