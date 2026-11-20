@@ -8,6 +8,8 @@ Each opt-in game pane opens a dedicated SSH connection. The same verified destin
 
 The client verifies SSH host identity normally on every connection. A lease belongs to one live pane, destination identity and verified host-key fingerprint. Splitting/duplicating the pane starts a new lease. Closing it, reopening a saved workspace, ending the process, changing the verified fingerprint or reaching its disconnect deadline discards the lease. Durable Linux shell profiles use their own protocol.
 
+SSH password and keyboard-interactive authentication happen outside the terminal screen. RustMUSH's legacy in-game `connect <account> <password>` welcome command echoes its arguments into the terminal, so an active VT recorder can capture a password typed there. Resume tickets always travel on the private SSH subsystem.
+
 ## Wire format
 
 1. Before `shell`, the client requests its current PTY dimensions and sends an SSH environment request named `RUSTMUSH_RESUME_V1`. Its value is `issue:<pane>` on first use or `redeem:<pane>` on an eligible reconnect. `pane` is exactly 32 lowercase hex digits generated for this live pane. This public nonce correlates the primary channel to the control exchange. It conveys no authority. An environment request acknowledgement does not advertise support.

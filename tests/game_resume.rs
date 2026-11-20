@@ -243,7 +243,8 @@ async fn raw(session: &Session, data: &[u8]) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     session.input.send(Command::Raw(data.to_vec(), tx))?;
     timeout(Duration::from_secs(3), rx)
-        .await??
+        .await
+        .context("raw input acknowledgement timed out")??
         .map_err(anyhow::Error::msg)
 }
 async fn record(session: &Session, path: Option<PathBuf>) -> Result<()> {
@@ -298,7 +299,8 @@ async fn redeemed_ticket_stays_on_its_pane_and_out_of_vt_and_input() -> Result<(
     drop(adjacent);
     assert_eq!(
         timeout(Duration::from_secs(3), f.closed.recv())
-            .await?
+            .await
+            .context("peer did not observe primary shell EOF")?
             .as_deref(),
         Some(other.marker.as_str())
     );
@@ -326,17 +328,7 @@ async fn redeemed_ticket_stays_on_its_pane_and_out_of_vt_and_input() -> Result<(
     resume
         .answer(json!({"v":1,"status":"auth_required"}))
         .await?;
-    timeout(Duration::from_secs(2), async {
-        while !pane
-            .frames
-            .load()
-            .status
-            .contains("requires game account login")
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
+    event(&pane, "auth_required").await?;
     raw(&pane, b"fixture-login").await?;
     resume
         .handle

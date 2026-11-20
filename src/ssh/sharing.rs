@@ -114,7 +114,7 @@ impl ShellChannel {
 
 impl Drop for ShellChannel {
     fn drop(&mut self) {
-        if let Some(channel) = self.channel.take() {
+        if let Some(mut channel) = self.channel.take() {
             if let Some(link) = self.game_connection.take() {
                 // An explicit pane close revokes its game lease. Hold the
                 // transport until EOF/CLOSE have been queued before DISCONNECT.
@@ -123,6 +123,11 @@ impl Drop for ShellChannel {
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
                         let _ = channel.eof().await;
                         let _ = channel.close().await;
+                        while let Some(message) = channel.wait().await {
+                            if matches!(message, russh::ChannelMsg::Close) {
+                                break;
+                            }
+                        }
                     })
                     .await;
                     drop(link);

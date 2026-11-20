@@ -781,6 +781,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 if result.is_ok() && waiting_for_resume {
                     queued_before_unlock = input.len();
                     waiting_for_resume = false;
+                    events.push("game-resume", serde_json::json!({"status": "auth_required"}));
                     output.send(Event::Status("RustMUSH resume requires game account login".into())).await?;
                 }
             }
