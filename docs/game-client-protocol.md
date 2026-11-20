@@ -7,6 +7,8 @@ Servers must enable it explicitly for a known supporting client.
 
 ## Discovery and session setup
 
+RustMUSH profiles negotiate cockpit recovery over a separate SSH subsystem. [Authenticated session resume, version 1](game-resume.md)
+
 w11term requests a PTY with `TERM=xterm-256color` and sends an SSH environment
 request `COLORTERM=truecolor` before requesting the shell. Accept that request
 in the gateway and apply it to the player's terminal capability model.

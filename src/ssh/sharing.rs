@@ -63,6 +63,8 @@ impl ConnectionShare {
     pub(super) fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
         let connected = &self.0.options;
         !self.0.handle.is_closed()
+            && !connected.player.rustmush
+            && !options.player.rustmush
             && connected.host == options.host
             && connected.port == options.port
             && connected.user == options.user
@@ -86,24 +88,52 @@ impl ConnectionShare {
             let result = handle
                 .channel_open_session()
                 .await
-                .map(|channel| ShellChannel(Some(channel)));
+                .map(|channel| ShellChannel {
+                    channel: Some(channel),
+                    game_connection: None,
+                });
             let _ = send.send(result);
         });
         Ok(receive.await.context("SSH channel opener stopped")??)
     }
 }
 
-pub(super) struct ShellChannel(Option<Channel<client::Msg>>);
+pub(super) struct ShellChannel {
+    channel: Option<Channel<client::Msg>>,
+    game_connection: Option<ConnectionShare>,
+}
 
 impl ShellChannel {
     pub(super) fn channel(&mut self) -> &mut Channel<client::Msg> {
-        self.0.as_mut().unwrap()
+        self.channel.as_mut().unwrap()
+    }
+    pub(super) fn close_game_session_on_drop(&mut self, link: ConnectionShare) {
+        self.game_connection = Some(link);
     }
 }
 
 impl Drop for ShellChannel {
     fn drop(&mut self) {
-        if let Some(channel) = self.0.take() {
+        if let Some(mut channel) = self.channel.take() {
+            if let Some(link) = self.game_connection.take() {
+                // An explicit pane close revokes its game lease. Hold the
+                // transport until EOF/CLOSE have been queued before DISCONNECT.
+                let runtime = link.0.runtime.clone();
+                runtime.spawn(async move {
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        let _ = channel.eof().await;
+                        let _ = channel.close().await;
+                        while let Some(message) = channel.wait().await {
+                            if matches!(message, russh::ChannelMsg::Close) {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                    drop(link);
+                });
+                return;
+            }
             // ChannelStream supplies russh's asynchronous CLOSE guard. Pane
             // transports run on the shared runtime even during tab teardown.
             drop(channel.into_stream());
