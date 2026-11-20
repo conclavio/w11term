@@ -8,6 +8,7 @@ pub mod events;
 pub mod interaction;
 pub mod keys;
 pub mod options;
+pub mod pane_layout;
 pub mod profiles;
 pub mod prompts;
 pub mod recorder;

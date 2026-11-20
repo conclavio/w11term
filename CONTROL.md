@@ -95,7 +95,9 @@ Success returns `pane`, `matched`, `generation`, `cols`, `rows`, and matching sc
 `text`. It observes screen state, not every transient byte that may have appeared
 between snapshots.
 
-`resize` accepts the launch grid ranges. It resizes an active pane's window or a
+`resize` accepts the launch grid ranges. In a visible split it adjusts available dividers to reach the requested cell grid. Unzoom the focused pane before resizing it. A dimension fixed by the tab bounds, or a grid that leaves too little space for a sibling, produces a geometry error. The command keeps keyboard focus on its current pane.
+
+For a single pane it resizes an active pane's window or a
 background pane's PTY without selecting the pane or activating the window. Changes
 to the active grid require leaving fullscreen first. A grid that cannot fit the
 current display/window constraints fails clearly; geometry may

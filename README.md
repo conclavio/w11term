@@ -37,7 +37,16 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 ## Tabs and profiles
 
-The native WinUI tab strip sits in the window title bar. Click **+** to choose a saved profile and open an independent SSH session; opening a profile more than once creates separate sessions. Drag tabs to reorder them and use their close buttons to disconnect. Closing the last tab closes the window. Background sessions retain their terminal state and continue receiving output; only the active terminal is rendered.
+The native WinUI tab strip sits in the title bar. Click **+** to open a saved profile as an independent SSH session. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
+
+Use **caret → Panes** to split right or below with the current connection settings or another saved profile. The new pane starts an independent session. Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
+
+| Pane action | Shortcut |
+| --- | --- |
+| Split right or below | Ctrl+Alt+Shift+Right or Down |
+| Focus a neighbor | Ctrl+Alt+Arrow |
+| Zoom pane or restore layout | Ctrl+Alt+Shift+Z |
+| Close focused pane | Ctrl+Alt+Shift+W |
 
 The **+ → New Profile…** form supports host, user, port, agent/key-file/none/password/keyboard-interactive authentication, an optional verified host fingerprint, device-key generation, and player preferences. **Save and connect** adds the profile to the selected configuration file and opens it. New Profile refuses duplicate names. **Settings → Profiles → Edit…** or **caret → Edit current profile…** opens an existing profile with its saved values. The editor supports renaming and all connection/player fields. **Save changes** updates it without opening or disconnecting a session; **Save and connect** opens the updated connection. Connection changes apply to new sessions; sound and game options update open tabs. Edits preserve unrelated fields and unchanged relative key paths, refuse name collisions, and report a conflict if the profile changed on disk while the editor was open. Saving preserves unrelated configuration fields and atomically replaces the file. Only the key file's path is stored; private key contents never go into the configuration.
 
