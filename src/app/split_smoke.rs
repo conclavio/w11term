@@ -178,7 +178,7 @@ impl TerminalApp {
     }
 }
 
-async fn split_control(request: Request) -> anyhow::Result<serde_json::Value> {
+pub(super) async fn split_control(request: Request) -> anyhow::Result<serde_json::Value> {
     let reply = w11term::control::call(Some(std::process::id()), &request).await?;
     anyhow::ensure!(reply.ok, "{}", reply.error.unwrap_or_default());
     reply

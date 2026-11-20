@@ -183,9 +183,14 @@ impl TerminalApp {
                     return;
                 };
                 let name = alias.name.clone();
-                let feedback = match self.store.add(&name, &options) {
-                    Ok(()) => {
-                        self.profiles.insert(name.clone(), options);
+                let feedback = match self
+                    .store
+                    .add(&name, &options)
+                    .and_then(|_| self.store.catalog())
+                {
+                    Ok(catalog) => {
+                        self.profiles = catalog.profiles;
+                        self.local_profiles = catalog.local;
                         format!("Saved profile {name}")
                     }
                     Err(error) => format!("{error:#}"),
@@ -281,7 +286,8 @@ impl TerminalApp {
                 fields.push(text("host-warnings", alias.warnings.join("\n")));
             }
             let selected = page.selected.unwrap();
-            let exists = self.profiles.contains_key(&alias.name);
+            let exists = self.profiles.contains_key(&alias.name)
+                || self.local_profiles.contains_key(&alias.name);
             fields.push(KeyedView::new(
                 "save",
                 Button::new()

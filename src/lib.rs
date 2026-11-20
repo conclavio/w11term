@@ -1,6 +1,7 @@
 pub mod appearance;
 pub mod assets;
 pub mod clipboard;
+pub mod conpty;
 pub mod control;
 pub mod demo;
 pub mod durable;

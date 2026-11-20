@@ -275,6 +275,7 @@ async fn run(
     let (output_tx, mut output) = mpsc::channel(32);
     let is_demo = matches!(source, Source::Demo);
     let is_ssh = matches!(source, Source::Ssh(_));
+    let interactive = is_ssh || matches!(source, Source::Local(_));
     let endpoint = match &source {
         Source::Ssh(options) => format!("{}@{}:{}", options.user, options.host, options.port),
         _ => String::new(),
@@ -299,6 +300,18 @@ async fn run(
     let mut replay = None;
     let mut transports = tokio::task::JoinSet::new();
     match source {
+        Source::Local(shell) => {
+            status = format!("Starting {}…", shell.executable.display());
+            transports.spawn(async move {
+                if let Err(error) =
+                    crate::conpty::run(shell, size, transport_input, output_tx.clone()).await
+                {
+                    let _ = output_tx
+                        .send(ssh::Event::Status(format!("Local shell: {error:#}")))
+                        .await;
+                }
+            });
+        }
         Source::Ssh(options) => {
             status = format!(
                 "Connecting to {}@{}:{}…",
@@ -439,10 +452,10 @@ async fn run(
                         Ok(())
                     }
                     Some(Command::Raw(bytes, reply)) => {
-                        if is_ssh {
+                        if interactive {
                             if let Err(error) = writer.send(TransportInput::Raw(bytes, reply))
-                                && let TransportInput::Raw(_, reply) = error.0 { let _ = reply.send(Err("SSH connection is closed".into())); }
-                        } else { let _ = reply.send(Err("raw input requires an SSH session".into())); }
+                                && let TransportInput::Raw(_, reply) = error.0 { let _ = reply.send(Err("Terminal connection is closed".into())); }
+                        } else { let _ = reply.send(Err("raw input requires an SSH or local shell".into())); }
                         Ok(())
                     }
                     Some(Command::Capture(reply)) => {
@@ -543,6 +556,7 @@ async fn run(
             }
         }
     }
+    drop(output);
     transports.shutdown().await;
     if let Some(task) = asset_task {
         task.abort();

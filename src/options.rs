@@ -4,6 +4,8 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+mod local;
+pub use local::LocalOptions;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "auth", rename_all = "kebab-case")]
@@ -150,19 +152,65 @@ fn default_profiles_path() -> PathBuf {
     local
 }
 
-#[derive(Deserialize)]
-pub(crate) struct Profiles {
-    pub(crate) profiles: BTreeMap<String, SshOptions>,
+pub struct Profiles {
+    pub profiles: BTreeMap<String, SshOptions>,
+    pub local: BTreeMap<String, LocalOptions>,
+}
+
+impl Profiles {
+    pub fn source(&self, name: &str) -> Option<Source> {
+        profile_source(&self.profiles, &self.local, name)
+    }
+}
+
+pub fn profile_source(
+    ssh: &BTreeMap<String, SshOptions>,
+    local: &BTreeMap<String, LocalOptions>,
+    name: &str,
+) -> Option<Source> {
+    ssh.get(name)
+        .cloned()
+        .map(Source::Ssh)
+        .or_else(|| local.get(name).cloned().map(Source::Local))
 }
 
 pub(crate) fn load_profiles(path: &Path) -> Result<Profiles> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Profiles {
+                profiles: BTreeMap::new(),
+                local: LocalOptions::installed(),
+            });
+        }
+        result => result.with_context(|| format!("reading {}", path.display()))?,
+    };
     parse_profiles(&bytes, path)
 }
 
 pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
-    let mut profiles: Profiles =
+    #[derive(Deserialize)]
+    struct Document {
+        profiles: BTreeMap<String, serde_json::Value>,
+    }
+    let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let mut profiles = Profiles {
+        profiles: BTreeMap::new(),
+        local: LocalOptions::installed(),
+    };
+    for (name, value) in document.profiles {
+        if value.get("backend").and_then(|v| v.as_str()) == Some("local") {
+            let mut local: LocalOptions =
+                serde_json::from_value(value).with_context(|| format!("local profile {name}"))?;
+            local.resolve_paths(path)?;
+            profiles.local.insert(name, local);
+        } else {
+            let ssh =
+                serde_json::from_value(value).with_context(|| format!("SSH profile {name}"))?;
+            profiles.local.remove(&name);
+            profiles.profiles.insert(name, ssh);
+        }
+    }
     for (name, ssh) in &mut profiles.profiles {
         ensure!(
             crate::assets::name(&ssh.player.bell),
@@ -199,6 +247,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
 pub enum Source {
     Demo,
     Replay(PathBuf),
+    Local(LocalOptions),
     Ssh(SshOptions),
 }
 
@@ -324,7 +373,11 @@ impl Options {
             "--workspace cannot be combined with a terminal source, --tab, --list-profiles or --benchmark"
         );
         if list_profiles {
-            for (name, ssh) in load_profiles(&profiles_path)?.profiles {
+            let catalog = load_profiles(&profiles_path)?;
+            for (name, shell) in &catalog.local {
+                println!("{name:16} {} (local)", shell.executable.display());
+            }
+            for (name, ssh) in catalog.profiles {
                 println!(
                     "{name:16} {}@{}:{} ({})",
                     ssh.user,
@@ -347,21 +400,13 @@ impl Options {
         if !extra_profiles.is_empty() {
             let profiles = load_profiles(&profiles_path)?;
             for name in &extra_profiles {
-                ensure!(
-                    profiles.profiles.contains_key(name),
-                    "unknown profile {name}"
-                );
+                ensure!(profiles.source(name).is_some(), "unknown profile {name}");
             }
         }
         if let Some(name) = profile {
-            source = Source::Ssh(
-                load_profiles(&profiles_path)?
-                    .profiles
-                    .remove(&name)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("unknown profile {name}; use --list-profiles")
-                    })?,
-            );
+            source = load_profiles(&profiles_path)?
+                .source(&name)
+                .with_context(|| format!("unknown profile {name}; use --list-profiles"))?;
         }
         if let Source::Ssh(ssh) = &mut source {
             if let Some(port) = port {

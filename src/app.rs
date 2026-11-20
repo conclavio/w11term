@@ -16,7 +16,7 @@ use w11term::{
     interaction::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
-    options::{Authentication, Options, Source, SshOptions},
+    options::{Authentication, LocalOptions, Options, Source, SshOptions, profile_source},
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
@@ -31,12 +31,15 @@ const LAB: &str = "Terminal lab";
 
 mod config_import;
 mod file_drawer;
+mod local_profile;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
+#[cfg(feature = "ui-smoke")]
+mod local_smoke;
 mod pane_view;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
@@ -104,6 +107,7 @@ pub enum InteractionField {
 }
 enum Page {
     Terminal(LiveTab),
+    LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
     Workspaces(workspace_view::WorkspacePage),
     Settings,
@@ -127,6 +131,15 @@ impl AppTab {
             live.profile_name = name;
         }
         self
+    }
+
+    fn ssh_profile_name(&self) -> Option<&str> {
+        match &self.page {
+            Page::Terminal(live) if matches!(live.source, Source::Ssh(_)) => {
+                live.profile_name.as_deref()
+            }
+            _ => None,
+        }
     }
 
     fn pane_id(&self) -> Option<u64> {
@@ -302,6 +315,7 @@ pub struct TerminalApp {
     default_label: String,
     default_profile: Option<String>,
     profiles: BTreeMap<String, SshOptions>,
+    local_profiles: BTreeMap<String, LocalOptions>,
     store: ProfileStore,
     profile_error: Option<String>,
     width: f64,
@@ -320,6 +334,7 @@ pub struct TerminalApp {
 }
 
 pub enum Message {
+    LocalProfile(local_profile::Action),
     Files(FileAction),
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
@@ -449,6 +464,12 @@ fn live_tab_sized(
 
 fn source_label(source: &Source) -> String {
     match source {
+        Source::Local(shell) => shell
+            .executable
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
         Source::Demo => LAB.into(),
         Source::Replay(path) => format!("Replay · {}", path.display()),
         Source::Ssh(ssh) => format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
@@ -1140,6 +1161,27 @@ impl TerminalApp {
         if self.profiles.is_empty() {
             profiles.push(TextBlock::new().text("No saved profiles yet.").into());
         }
+        for name in self.local_profiles.keys() {
+            let name = name.clone();
+            profiles.push(
+                Button::new()
+                    .automation_name(format!("Edit local profile {name}"))
+                    .on_click(context.callback({
+                        let name = name.clone();
+                        move |_| {
+                            Message::LocalProfile(local_profile::Action::Open(Some(name.clone())))
+                        }
+                    }))
+                    .content(format!("Edit {name} · Local…")),
+            );
+        }
+        profiles.push(
+            Button::new()
+                .on_click(
+                    context.callback(|_| Message::LocalProfile(local_profile::Action::Open(None))),
+                )
+                .content("New local shell profile…"),
+        );
         if let Some(error) = &self.profile_error {
             profiles.push(
                 TextBlock::new()
@@ -1330,7 +1372,11 @@ impl TerminalApp {
             .tabs
             .active()
             .and_then(AppTab::profile_name)
-            .filter(|name| single && self.profiles.contains_key(*name))
+            .filter(|name| {
+                single
+                    && (self.profiles.contains_key(*name)
+                        || self.local_profiles.contains_key(*name))
+            })
             .map(str::to_owned);
         let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
         let group_changed = self.active_group != group;
@@ -1516,13 +1562,16 @@ impl TerminalApp {
         } else {
             None
         };
+        let explicit_profile = profile.is_some();
         let profile_name = profile.or_else(|| tab.profile_name.clone());
         let (label, source) = match &profile_name {
             Some(name) => {
-                let Some(options) = self.profiles.get(name) else {
-                    return;
+                let source = match profile_source(&self.profiles, &self.local_profiles, name) {
+                    Some(source) => source,
+                    None if !explicit_profile => tab.source.clone(),
+                    None => return,
                 };
-                (name.clone(), Source::Ssh(options.clone()))
+                (name.clone(), source)
             }
             None => (label.clone(), tab.source.clone()),
         };
@@ -1661,9 +1710,10 @@ impl TerminalApp {
             self.activate(context);
             return;
         }
-        match self.store.inspect(&name) {
-            Ok((profiles, base)) => {
-                self.profiles = profiles;
+        match self.store.inspect_catalog(&name) {
+            Ok((catalog, base)) => {
+                self.profiles = catalog.profiles;
+                self.local_profiles = catalog.local;
                 self.profile_error = None;
                 self.tabs.insert(AppTab {
                     label: format!("Edit {name}"),
@@ -1694,7 +1744,7 @@ impl TerminalApp {
         };
         let mut name = format!("{} copy", base.name);
         let mut index = 2;
-        while self.profiles.contains_key(&name) {
+        while self.profiles.contains_key(&name) || self.local_profiles.contains_key(&name) {
             name = format!("{} copy {index}", base.name);
             index += 1;
         }
@@ -1729,17 +1779,21 @@ impl TerminalApp {
         let Some(base) = draft.origin.editing() else {
             return;
         };
-        if let Err(error) = self.store.delete(base) {
-            draft.error = Some(format!("{error:#}"));
-            return;
-        }
+        let catalog = match self.store.delete(base).and_then(|_| self.store.catalog()) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                draft.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
         let name = base.name.clone();
-        self.profiles.remove(&name);
+        self.profiles = catalog.profiles;
+        self.local_profiles = catalog.local;
         let linked: Vec<_> = self
             .tabs
             .entries()
             .iter()
-            .filter(|tab| tab.value.profile_name() == Some(&name))
+            .filter(|tab| tab.value.ssh_profile_name() == Some(&name))
             .map(|tab| tab.id)
             .collect();
         for linked_id in linked {
@@ -1754,7 +1808,9 @@ impl TerminalApp {
                 }
             }
         }
-        if self.default_profile.as_ref() == Some(&name) {
+        if self.default_profile.as_ref() == Some(&name)
+            && matches!(self.default_source, Source::Ssh(_))
+        {
             self.default_profile = None;
             self.default_source = Source::Demo;
             self.default_label = LAB.into();
@@ -1825,8 +1881,9 @@ impl TerminalApp {
                 }
                 DraftOrigin::Copy(base) => self.store.duplicate(base, name, &options)?,
             }
-            let (profiles, saved) = self.store.inspect(name)?;
-            self.profiles = profiles;
+            let (catalog, saved) = self.store.inspect_catalog(name)?;
+            self.profiles = catalog.profiles;
+            self.local_profiles = catalog.local;
             self.profile_error = None;
             Ok(saved)
         })();
@@ -1836,7 +1893,9 @@ impl TerminalApp {
                 let name = draft.name.trim().to_owned();
                 if let Some(base) = draft.origin.editing() {
                     let original = &base.name;
-                    if self.default_profile.as_ref() == Some(original) {
+                    if self.default_profile.as_ref() == Some(original)
+                        && matches!(self.default_source, Source::Ssh(_))
+                    {
                         self.default_label = name.clone();
                         self.default_profile = Some(name.clone());
                         self.default_source = Source::Ssh(options.clone());
@@ -1845,7 +1904,7 @@ impl TerminalApp {
                         .tabs
                         .entries()
                         .iter()
-                        .filter(|entry| entry.value.profile_name() == Some(original.as_str()))
+                        .filter(|entry| entry.value.ssh_profile_name() == Some(original.as_str()))
                         .map(|entry| entry.id)
                         .collect();
                     for id in ids {
@@ -1937,6 +1996,11 @@ impl TerminalApp {
             .iter()
             .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
             .collect();
+        menu.extend(
+            self.local_profiles
+                .keys()
+                .map(|name| MenuItem::item(format!("local:{name}"), format!("{name} · Local"))),
+        );
         if self.profile_error.is_some() {
             menu.push(MenuItem::disabled("error", "Could not load profiles"));
         }
@@ -1958,8 +2022,9 @@ impl TerminalApp {
             _ => None,
         });
         let can_edit = self.tabs.active().is_some_and(|tab| {
-            tab.profile_name()
-                .is_some_and(|name| self.profiles.contains_key(name))
+            tab.profile_name().is_some_and(|name| {
+                self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
+            })
         });
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
@@ -2054,7 +2119,7 @@ impl TerminalApp {
         {
             items.push(menu);
         }
-        if !self.profiles.is_empty() {
+        if !self.profiles.is_empty() || !self.local_profiles.is_empty() {
             for (key, label) in [
                 ("right-profile", "Split right with"),
                 ("below-profile", "Split below with"),
@@ -2064,6 +2129,7 @@ impl TerminalApp {
                     format!("{label} profile"),
                     self.profiles
                         .keys()
+                        .chain(self.local_profiles.keys())
                         .map(|name| MenuItem::item(name.clone(), format!("{label} {name}"))),
                 ));
             }
@@ -2386,9 +2452,13 @@ impl Component for TerminalApp {
         .expect("installing terminal input adapter");
         let store = ProfileStore::new(options.profiles_path.clone())
             .expect("resolving profile configuration path");
-        let (profiles, profile_error) = match store.load() {
-            Ok(p) => (p, None),
-            Err(e) => (BTreeMap::new(), Some(format!("{e:#}"))),
+        let (profiles, local_profiles, profile_error) = match store.catalog() {
+            Ok(p) => (p.profiles, p.local, None),
+            Err(e) => (
+                BTreeMap::new(),
+                LocalOptions::installed(),
+                Some(format!("{e:#}")),
+            ),
         };
         let label = options
             .initial_profile
@@ -2476,17 +2546,10 @@ impl Component for TerminalApp {
                 .with_profile(options.initial_profile.clone()),
             );
             for name in &options.extra_profiles {
-                if let Some(profile) = profiles.get(name) {
+                if let Some(source) = profile_source(&profiles, &local_profiles, name) {
                     tabs.insert(
-                        live_tab_sized(
-                            name.clone(),
-                            Source::Ssh(profile.clone()),
-                            size,
-                            osc52,
-                            None,
-                            None,
-                        )
-                        .with_profile(Some(name.clone())),
+                        live_tab_sized(name.clone(), source, size, osc52, None, None)
+                            .with_profile(Some(name.clone())),
                     );
                 }
             }
@@ -2539,6 +2602,7 @@ impl Component for TerminalApp {
             default_label: label,
             default_profile: options.initial_profile.clone(),
             profiles,
+            local_profiles,
             store,
             profile_error,
             width: client_size.0,
@@ -2571,6 +2635,7 @@ impl Component for TerminalApp {
             let loopback = matches!(&options.source, Source::Ssh(ssh)
                 if ssh.host == "127.0.0.1" && ssh.host_key.is_some() &&
                     ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
                          || std::env::var_os("W11TERM_FILE_SMOKE").is_some()))
                      || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())));
             assert!(
@@ -2785,7 +2850,7 @@ impl Component for TerminalApp {
                 }
                 if let Some((label, auth)) = auth_update {
                     for entry in self.tabs.entries() {
-                        if entry.value.profile_name() == Some(label.as_str())
+                        if entry.value.ssh_profile_name() == Some(label.as_str())
                             && let Page::Terminal(tab) = &entry.value.page
                         {
                             let _ = tab.session.input.send(Command::Authenticate(auth.clone()));
@@ -2821,7 +2886,11 @@ impl Component for TerminalApp {
                     if let Source::Ssh(options) = &mut tab.source {
                         options.player = preferences.clone();
                     }
-                    if let Some(name) = tab.profile_name.clone() {
+                    if let Some(name) = tab
+                        .profile_name
+                        .clone()
+                        .filter(|_| matches!(tab.source, Source::Ssh(_)))
+                    {
                         if let Some(profile) = self.profiles.get_mut(&name) {
                             profile.player = preferences.clone();
                             if let Err(error) = self.store.update(&name, profile) {
@@ -2830,7 +2899,7 @@ impl Component for TerminalApp {
                         }
                         for entry in self.tabs.entries() {
                             if entry.id != id
-                                && entry.value.profile_name() == Some(name.as_str())
+                                && entry.value.ssh_profile_name() == Some(name.as_str())
                                 && let Page::Terminal(other) = &entry.value.page
                             {
                                 *other.session.player.write().unwrap() = preferences.clone();
@@ -2885,11 +2954,8 @@ impl Component for TerminalApp {
                 reply,
             }) => {
                 let result = (|| -> anyhow::Result<serde_json::Value> {
-                    let ssh = self
-                        .profiles
-                        .get(&profile)
-                        .with_context(|| format!("unknown profile {profile}"))?
-                        .clone();
+                    let source = profile_source(&self.profiles, &self.local_profiles, &profile)
+                        .with_context(|| format!("unknown profile {profile}"))?;
                     let metrics = self.metrics.get();
                     let explicit_grid = cols.is_some() || rows.is_some();
                     anyhow::ensure!(
@@ -2910,7 +2976,7 @@ impl Component for TerminalApp {
                     let previous = self.tabs.active_id();
                     let tab = live_tab_sized(
                         profile.clone(),
-                        Source::Ssh(ssh),
+                        source,
                         size,
                         self.appearance.read().unwrap().interaction.osc52,
                         None,
@@ -3370,8 +3436,7 @@ impl Component for TerminalApp {
                     self.default_label.clone(),
                     self.default_profile
                         .as_ref()
-                        .and_then(|name| self.profiles.get(name))
-                        .map(|options| Source::Ssh(options.clone()))
+                        .and_then(|name| profile_source(&self.profiles, &self.local_profiles, name))
                         .unwrap_or_else(|| self.default_source.clone()),
                     self.default_profile.clone(),
                     context,
@@ -3400,6 +3465,15 @@ impl Component for TerminalApp {
                     .map(|(n, p)| (n.clone(), p.clone()))
                 {
                     self.open(name.clone(), Source::Ssh(profile), Some(name), context);
+                } else if let Some(name) = label.strip_suffix(" · Local")
+                    && let Some(shell) = self.local_profiles.get(name)
+                {
+                    self.open(
+                        name.into(),
+                        Source::Local(shell.clone()),
+                        Some(name.into()),
+                        context,
+                    );
                 }
             }
             Message::EditProfile(name) => self.edit_profile(name, context),
@@ -3422,13 +3496,17 @@ impl Component for TerminalApp {
                     .tabs
                     .active()
                     .and_then(AppTab::profile_name)
-                    .filter(|name| self.profiles.contains_key(*name))
                     .map(str::to_owned)
                 {
-                    self.edit_profile(name, context);
+                    if self.profiles.contains_key(&name) {
+                        self.edit_profile(name, context);
+                    } else if self.local_profiles.contains_key(&name) {
+                        self.local_profile_action(local_profile::Action::Open(Some(name)), context);
+                    }
                 }
             }
             Message::SettingsMenu => self.utility(true, context),
+            Message::LocalProfile(action) => self.local_profile_action(action, context),
             Message::Workspace(action) => self.workspace_action(action, context),
             Message::ImportConfig(action) => self.import_action(action, context),
             Message::Paste => self.paste(false, context),
@@ -3791,6 +3869,7 @@ impl Component for TerminalApp {
                     _ => self.pane_view(id, tab, false, context),
                 },
                 Page::Settings => self.settings_view(context),
+                Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
@@ -3904,6 +3983,10 @@ impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
         if std::env::var_os("W11TERM_DURABLE_SMOKE").is_some() {
             self.durable_smoke_step(step, context);
+            return;
+        }
+        if let Some(dir) = std::env::var_os("W11TERM_LOCAL_SMOKE") {
+            self.local_smoke_step(step, std::path::Path::new(&dir), context);
             return;
         }
         if std::env::var_os("W11TERM_FILE_SMOKE").is_some() {
