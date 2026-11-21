@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = $State
 $profiles = Join-Path $State 'profiles.json'
 $label = 'Save scrollback as text' + [char]0x2026
 
@@ -138,10 +139,10 @@ try {
 
     $new = Join-Path $State '.\new.txt'
     $dialog = Open-Export -Menu
-    Set-Filename $dialog $new
     # Output that arrives while the user chooses the file belongs to the next capture.
     $null = Control @('send-text','--pane',"$remote",'--no-paste','arrived-after-picker')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','arrived-after-picker')
+    Set-Filename $dialog $new
     Click-DialogButton $dialog '1'
     Wait-Saved $new
 
@@ -157,6 +158,12 @@ try {
     $pickerHandle = [IntPtr]::new($dialog.Current.NativeWindowHandle)
     Click-DialogButton $dialog '1'
     $confirm = Wait-Until 'overwrite confirmation owned by the save dialog' { Owned-Dialog $pickerHandle 'Confirm Save As' }
+    $null = Wait-Until 'the overwrite prompt to name the fixture replace.txt' {
+        foreach ($node in $confirm.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition)) {
+            if ($node.Current.Name -match '(?i)(?<![\w.-])replace\.txt(?![\w.-])') { return $true }
+        }
+    }
     Click-DialogButton $confirm '6' # IDYES
     Wait-Saved $replacement
     foreach ($c in 'remote-resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
