@@ -12,9 +12,9 @@ use wezterm_term::{
 };
 
 mod export;
-mod keypad;
+mod kitty;
 pub(crate) use export::export_text;
-pub use keypad::KeypadKey;
+pub use kitty::KeypadKey;
 
 pub type Rgba = [f32; 4];
 
@@ -201,6 +201,14 @@ pub fn send_key_event(
 #[derive(Clone, Debug, Default)]
 pub struct KeyDetails {
     pub base: Option<char>,
+    /// Unshifted US PC-101 position when distinct from the active layout.
+    pub physical: Option<char>,
+    /// Active layout's Shift level for the same position, independent of Caps Lock.
+    pub shifted: Option<char>,
+    /// Text for this physical repeat under the current Windows modifier state.
+    pub repeat_text: Option<String>,
+    /// Right Alt and its synthesized Control were consumed by this layout.
+    pub altgr: bool,
     pub text: Option<String>,
     pub keypad: Option<KeypadKey>,
     pub leds: wezterm_input_types::KeyboardLedStatus,
@@ -220,9 +228,8 @@ pub fn send_key_event_detailed(
         let all = flags
             .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
         let reports = flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
-        if let Some(keypad) = details.keypad
-            && let Some(wire) = keypad.encode(flags, key, modifiers, details, down, repeat)
-        {
+        if let Some(native) = kitty::NativeKey::from_event(flags, key, details) {
+            let wire = native.encode(flags, key, modifiers, details, down, repeat);
             if !wire.is_empty() {
                 writer.send(TransportInput::Data(wire.into_bytes()))?;
             }
@@ -1401,6 +1408,178 @@ mod tests {
             "remote host must not receive local clipboard contents"
         );
         assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn printable_layout_keys_match_stock_kitty_wire_fixture() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Case {
+            logical: char,
+            shifted: char,
+            physical: char,
+            mods: Vec<String>,
+            flags: u8,
+            action: String,
+            text: Option<String>,
+            wire: String,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../tests/fixtures/keyboard/physical-layout.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let mut modifiers = KeyModifiers::NONE;
+            let mut details = KeyDetails {
+                base: Some(case.logical),
+                physical: Some(case.physical),
+                shifted: Some(case.shifted),
+                ..Default::default()
+            };
+            for modifier in &case.mods {
+                match modifier.as_str() {
+                    "CTRL" => modifiers |= KeyModifiers::CTRL,
+                    "SHIFT" => modifiers |= KeyModifiers::SHIFT,
+                    "CAPS_LOCK" => {
+                        details.leds |= wezterm_input_types::KeyboardLedStatus::CAPS_LOCK
+                    }
+                    "NUM_LOCK" => details.leds |= wezterm_input_types::KeyboardLedStatus::NUM_LOCK,
+                    _ => panic!("unknown modifier {case:?}"),
+                }
+            }
+            let character = case
+                .text
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or_else(|| {
+                    if modifiers.contains(KeyModifiers::SHIFT) {
+                        case.shifted
+                    } else {
+                        case.logical
+                    }
+                });
+            let (down, repeat) = match case.action.as_str() {
+                "press" => (true, false),
+                "repeat" => (true, true),
+                "release" => (false, false),
+                _ => panic!("unknown action {case:?}"),
+            };
+            let (writer, mut output) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            if case.flags != 0 {
+                terminal.advance_bytes(format!("\x1b[>{}u", case.flags));
+            }
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char(character),
+                modifiers,
+                down,
+                repeat,
+                &details,
+            )
+            .unwrap();
+            let actual = if case.wire.is_empty() {
+                vec![]
+            } else {
+                receive(&mut output)
+            };
+            assert_eq!(actual, case.wire.as_bytes(), "{case:?}");
+            assert!(output.try_recv().is_err(), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn equal_physical_keys_are_omitted_and_composed_layout_text_survives() {
+        for (flags, key, base, physical, text, down, repeat, expected) in [
+            (15, 'z', Some('z'), 'z', None, true, false, "\x1b[122;1u"),
+            (31, '@', None, 'q', None, true, false, "\x1b[64::113;;64u"),
+            (
+                31,
+                'é',
+                Some('é'),
+                'e',
+                None,
+                false,
+                false,
+                "\x1b[233::101;1:3u",
+            ),
+            (
+                31,
+                '´',
+                None,
+                'q',
+                Some("´q"),
+                true,
+                false,
+                "\x1b[180::113;;180:113u",
+            ),
+            (7, 'z', Some('z'), 'y', None, true, true, "z"),
+        ] {
+            let (writer, mut output) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            terminal.advance_bytes(format!("\x1b[>{flags}u"));
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+                down,
+                repeat,
+                &KeyDetails {
+                    base,
+                    physical: Some(physical),
+                    text: text.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(receive(&mut output), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn alternate_shift_level_is_selected_by_the_release_modifiers() {
+        let (writer, mut output) = mpsc::unbounded_channel();
+        let mut terminal = create(TerminalSize::default(), writer.clone());
+        terminal.advance_bytes(b"\x1b[>15u");
+        let details = KeyDetails {
+            base: Some('z'),
+            shifted: Some('Z'),
+            physical: Some('y'),
+            ..Default::default()
+        };
+        for (pressed_character, release_mods, expected) in [
+            ('z', KeyModifiers::SHIFT, "\x1b[122:90:121;2:3u"),
+            ('Z', KeyModifiers::NONE, "\x1b[122::121;1:3u"),
+        ] {
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char(pressed_character),
+                release_mods,
+                false,
+                false,
+                &details,
+            )
+            .unwrap();
+            assert_eq!(receive(&mut output), expected.as_bytes());
+        }
+        terminal.advance_bytes(b"\x1b[>31u");
+        let details = KeyDetails {
+            repeat_text: Some("Z".into()),
+            ..details
+        };
+        send_key_event_detailed(
+            &mut terminal,
+            &writer,
+            KeyCode::Char('z'),
+            KeyModifiers::SHIFT,
+            true,
+            true,
+            &details,
+        )
+        .unwrap();
+        assert_eq!(receive(&mut output), b"\x1b[122:90:121;2:2;90u");
     }
 
     #[test]
