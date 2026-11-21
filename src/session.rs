@@ -13,6 +13,8 @@ use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 mod launch;
 mod presentation;
+#[cfg(test)]
+mod synchronized_capture;
 use launch::Phase;
 use presentation::Presentation;
 

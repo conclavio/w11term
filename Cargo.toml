@@ -43,6 +43,9 @@ hmac = "0.13"
 zeroize = "1.9.1"
 rand = "0.10"
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [build-dependencies]
 windows-reactor-setup = "=0.100.0"
 
