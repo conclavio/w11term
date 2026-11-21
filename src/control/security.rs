@@ -44,6 +44,18 @@ struct Identity {
     sid: String,
     integrity: u32,
 }
+pub(super) fn current_scope() -> Result<(String, u32, u32)> {
+    let user = Identity::current()?;
+    let mut session = 0;
+    unsafe {
+        windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+            std::process::id(),
+            &mut session,
+        )?;
+    }
+    Ok((user.sid, user.integrity, session))
+}
+
 impl Identity {
     fn current() -> Result<Self> {
         let mut token = HANDLE::default();

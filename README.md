@@ -71,7 +71,9 @@ Check **Follow shell directory** in the drawer to track later directory changes 
 
 **Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.
 
-Use **caret → Workspaces…** to name and save your current terminal tabs. A workspace remembers tab order, split directions and proportions, the focused pane in each tab and which tab you were using. Opening a workspace from this page adds its terminals to the current window. Launching with `--workspace "Admin console"` opens the saved layout in a new window.
+Use **caret → Workspaces…** to name and save your current terminal tabs. A workspace remembers tab order, split directions and proportions, the focused pane in each tab and which tab you were using. Under **Switch workspace**, type part of a name and select the workspace to bring its live window forward. If the window has closed, w11term opens its saved layout. Saving a workspace associates the current window with that name.
+
+Use `w11term --switch-workspace "Admin console"` for the same behavior from a launcher. Workspaces match within the same Windows user, session, elevation level, workspace catalog and profile file. **Append in this window** adds a fresh copy of the layout to the current window. `w11term --workspace "Admin console"` always opens a new window. When multiple windows have the same workspace open, switching from one of those windows keeps its sessions selected. Switching from elsewhere lists the matching process IDs so you can choose the window yourself.
 
 Each restored pane receives a new process-local control ID. SSH panes normally start a fresh shell. A saved durable pane can return to its original shell. Named profile references use the current profile settings. Ad-hoc SSH panes retain their connection options and key paths. Replay panes reference their original capture files. Workspaces are stored in `%LOCALAPPDATA%\w11term\workspaces.json`, or in `W11TERM_DATA_DIR` when set.
 
