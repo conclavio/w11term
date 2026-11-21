@@ -9,7 +9,7 @@ use w11term::ssh::{FolderMountStatus, valid_mount_name};
 pub(super) const LABEL: &str = "Shared folders…";
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-fn token() -> u64 {
+pub(super) fn token() -> u64 {
     NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -454,7 +454,7 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         } else {
-            items.push(KeyedView::new("expired", TextBlock::new().text("The verified SSH connection has changed or closed. Reopen Shared folders from a connected SSH pane.").text_wrapping(TextWrapping::Wrap)));
+            items.push(KeyedView::new("expired", TextBlock::new().text("This folder view has expired. Reopen Shared folders from a connected SSH pane.").text_wrapping(TextWrapping::Wrap)));
         }
         ScrollViewer::new().content(
             StackPanel::new()

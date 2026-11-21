@@ -36,6 +36,7 @@ mod command_history;
 mod config_import;
 mod file_drawer;
 mod file_picker;
+mod folder_revoke;
 mod folder_shares;
 mod folder_sharing_state;
 mod keyboard_settings;
@@ -348,6 +349,7 @@ impl DraftOrigin {
 #[derive(Clone)]
 struct ProfileDraft {
     origin: DraftOrigin,
+    folder_revoke: folder_revoke::Editor,
     confirm_delete: bool,
     proxy_jump: Vec<w11term::options::JumpHost>,
     durable: bool,
@@ -371,6 +373,7 @@ impl Default for ProfileDraft {
     fn default() -> Self {
         Self {
             origin: DraftOrigin::New,
+            folder_revoke: Default::default(),
             confirm_delete: false,
             proxy_jump: Vec::new(),
             durable: false,
@@ -618,6 +621,7 @@ pub struct ExitedPane {
 pub enum Message {
     FolderAuthority,
     FolderShare(folder_shares::Action),
+    FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
     Export(scrollback_export::Action),
     TabTitle(tab_title::Action),
@@ -1800,6 +1804,15 @@ impl TerminalApp {
             .map(str::to_owned);
         let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
         let group_changed = self.active_group != group;
+        if group_changed
+            && let Some(previous) = self.active_group
+            && let Some(AppTab {
+                page: Page::NewProfile(draft),
+                ..
+            }) = self.tabs.get_mut(previous)
+        {
+            draft.folder_revoke.cancel_confirmation();
+        }
         self.active_group = group;
         if profile != self.window_profile {
             if let Some(previous) = self.window_profile.take() {
@@ -2392,6 +2405,7 @@ impl TerminalApp {
                         .with_profile(Some(name));
                     } else if let Page::NewProfile(editor) = &mut tab.page {
                         editor.origin = DraftOrigin::Edit(saved);
+                        editor.folder_revoke = Default::default();
                         editor.confirm_delete = false;
                         editor.name = name.clone();
                         editor.error = None;
@@ -2829,7 +2843,7 @@ impl TerminalApp {
                 .font_size(26.0)
                 .into(),
         ];
-        if draft.origin.editing().is_some() {
+        if let Some(base) = draft.origin.editing() {
             fields.push(TextBlock::new().text("Connection changes apply to new sessions. Sound and game options update open tabs.").text_wrapping(TextWrapping::Wrap).into());
             if let Some(pane) = self.folder_editor_target(draft) {
                 fields.push(
@@ -2841,6 +2855,7 @@ impl TerminalApp {
                         .content(folder_shares::LABEL),
                 );
             }
+            fields.push(self.folder_revoke_view(id, base, &draft.folder_revoke, context));
         }
         // Keep the feedback slot mounted so save/error messages do not remount inputs.
         if !draft.proxy_jump.is_empty() {
@@ -3472,6 +3487,9 @@ impl Component for TerminalApp {
         };
         match message {
             Message::FolderShare(action) => self.folder_action(action, context),
+            Message::FolderRevoke(id, ticket, action) => {
+                self.folder_revoke(id, ticket, action, context)
+            }
             Message::RestartExited(exit) => {
                 // A native menu may still be delivering a callback for a previous exit or pane.
                 if let Some(id) = self.tab_for_pane(exit.pane)

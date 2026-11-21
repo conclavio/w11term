@@ -85,11 +85,80 @@ function Send-ToShell([string]$Text) {
     foreach ($c in $Text.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10',$Text)
 }
-for ($launch = 1; $launch -le 2; $launch++) {
-    $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile','palette-ssh') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State "share-ui-$launch.log")
+function Test-OfflineRevoke {
+    $sessions = @((Control @('list')).sessions)
+    if ($sessions.Count -ne 1 -or $sessions[0].label -ne 'Palette PowerShell') { throw 'Expected only the local PowerShell pane' }
+    $local = $sessions[0].id
+    $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','PS ')
+    $before = Get-Content -Raw -LiteralPath $profiles
+    $oldToken = ($before | ConvertFrom-Json).profiles.'palette-ssh'.folder_share_id
+    if (!$oldToken) { throw 'Fixture is missing its saved folder permission' }
+
+    Run-Palette 'Settings'
+    Click 'Edit profile palette-ssh'
+    $muteLabel = 'Mute this profile'
+    $toggle = [System.Windows.Automation.TogglePattern]::Pattern
+    $box = Wait-Until 'unsaved player setting' { Find-Element $muteLabel ([System.Windows.Automation.ControlType]::CheckBox) }
+    if ($box.GetCurrentPattern($toggle).Current.ToggleState -ne 'Off') { throw 'Expected default mute state' }
+    $box.GetCurrentPattern($toggle).Toggle()
+    $revoke = 'Revoke all shared folders' + [char]0x2026
+    Click $revoke
+    Click 'Keep permissions'
+    $null = Wait-Until 'canceled revoke ready to retry' { $b = Find-Element $revoke $button; $b -and $b.Current.IsEnabled }
+    if ((Get-Content -Raw -LiteralPath $profiles) -cne $before) { throw 'Cancel modified the saved catalog' }
+    # A second window changes the saved profile while this confirmation is open.
+    Click $revoke
+    $concurrent = $before | ConvertFrom-Json
+    $concurrent.profiles.'palette-ssh' | Add-Member -NotePropertyName external_edit -NotePropertyValue 'preserve me'
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllText($profiles, ($concurrent | ConvertTo-Json -Depth 30), $utf8)
+    Click 'Confirm revoke all shared folders'
+    $null = Wait-Until 'stale editor refused before revoking' {
+        Find-Element 'Could not revoke folder permissions: Profile changed on disk; reopen it before revoking folder permissions'
+    }
+    $unchanged = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'
+    if ($unchanged.folder_share_id -cne $oldToken -or $unchanged.external_edit -cne 'preserve me') { throw 'Stale action changed the updated profile' }
+    [IO.File]::WriteAllText($profiles, $before, $utf8)
+    Click $revoke
+    Click 'Confirm revoke all shared folders'
+    $null = Wait-Until 'revoke confirmation names the saved profile' {
+        Find-Element ('Revoked all shared folders for ' + [char]0x201c + 'palette-ssh' + [char]0x201d + '.')
+    }
+    if ((Find-Element $revoke $button).Current.IsEnabled) { throw 'Already revoked permission remains actionable' }
+    if ((Find-Element $muteLabel).GetCurrentPattern($toggle).Current.ToggleState -ne 'On') { throw 'Revocation discarded the unsaved mute setting' }
+    $saved = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'
+    if ($saved.folder_share_id -or !$saved.folder_share_epoch -or $saved.player.mute) { throw 'Revocation did not retire the permission or saved unrelated edits' }
+    if (@((Control @('list')).sessions).Count -ne 1) { throw 'Revocation started an SSH connection' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'unrelated draft can still save' {
+        (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'.player.mute
+    }
+    $remote = (Control @('open','--profile','palette-ssh','--activate')).pane
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
+    Open-Shares
+    $null = Wait-Until 'reopened verified profile has no saved permissions' {
+        Find-Element 'Choose a Windows folder to mount under ~/windows/ on this SSH account.'
+    }
+    if (Find-Element '~/windows/Selected-folder') { throw 'A revoked grant remounted on reconnect' }
+    Pick-Folder 1
+    Wait-SelectedPath
+    Click 'Save folder'
+    $null = Wait-Until 'new explicit folder choice after revocation' {
+        $id = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'.folder_share_id
+        $id -and $id -cne $oldToken -and (Find-Element '~/windows/Selected-folder')
+    }
+    Send-ToShell 'share-shell-after-revocation'
+}
+for ($launch = 1; $launch -le 3; $launch++) {
+    $initialProfile = if ($launch -eq 3) { '"Palette PowerShell"' } else { 'palette-ssh' }
+    $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile',$initialProfile) -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State "share-ui-$launch.log")
     try {
         $window = Wait-InputWindow
         $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+        if ($launch -eq 3) {
+            Test-OfflineRevoke
+            continue
+        }
         $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
         $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
         if ($launch -eq 1) {
@@ -136,19 +205,23 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Wait-FailedMount
             Click 'Forget smoke-share'
             $null = Wait-Until 'forgotten share removed' { (Find-Element 'Requested removal of smoke-share') -and !(Find-Element '~/windows/smoke-share') }
+            if ((Test-Path -LiteralPath $consentFile) -and (Get-Content -Raw -LiteralPath $consentFile).Trim() -ne '[]') { throw 'A folder grant survived Forget' }
             Send-ToShell 'share-shell-after-restart'
             Run-Palette $menuName
             $null = Wait-Until 'palette opens verified panel' { Find-Element $identityLabel }
+            Pick-Folder 1
+            Wait-SelectedPath
+            Click 'Save folder'
+            $null = Wait-Until 'saved permission ready for offline revocation' { Find-Element 'Mount Selected-folder' $button }
             Click $add
             $dialog = Wait-Until 'owned picker before disconnect' { Folder-Dialog }
             Select-DialogItem $dialog $leaf
             $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64','BA==')
-            $stale = 'The verified SSH connection has changed or closed. Reopen Shared folders from a connected SSH pane.'
+            $stale = 'This folder view has expired. Reopen Shared folders from a connected SSH pane.'
             $null = Wait-Until 'verified connection revoked with the picker open' { Find-Element $stale }
             $null = Wait-Until 'finish stale real folder picker' { [FixtureDialog]::ClickButton($dialog, 1) }
             $null = Wait-Until 'stale picker completion safely discarded' { !(Folder-Dialog) -and (Find-Element $stale) }
             if ((Find-Element 'Mount name') -or (Find-Element $add)) { throw 'A stale picker returned folder access' }
-            if ((Test-Path -LiteralPath $consentFile) -and (Get-Content -Raw -LiteralPath $consentFile).Trim() -ne '[]') { throw 'A folder grant survived Forget' }
         }
     } catch {
         $log = Get-Content -LiteralPath (Join-Path $State "share-ui-$launch.log") -Tail 15 -ErrorAction SilentlyContinue

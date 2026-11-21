@@ -6,7 +6,7 @@ use shared::run_gui;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manages a verified profile's read-only folder consent with the native Windows folder picker"]
 async fn native_shared_folders_keep_consent_bound_to_the_verified_ssh_profile() {
-    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 3).await else {
         unreachable!()
     };
     let state = tempfile::tempdir().unwrap();
@@ -19,12 +19,12 @@ async fn native_shared_folders_keep_consent_bound_to_the_verified_ssh_profile() 
     drive_mixed_gui("folder-share-ui.ps1", &ssh, state.path());
     assert_eq!(
         fs::read(trace).unwrap(),
-        b"share-shell-before-restartshare-shell-after-restart\x04"
+        b"share-shell-before-restartshare-shell-after-restart\x04share-shell-after-revocation"
     );
     assert_eq!(fs::read(selected.join("sample.txt")).unwrap(), b"unchanged");
     assert!(
-        opens.load(Ordering::Relaxed) >= 4,
-        "two live shells and two refused mount attempts"
+        opens.load(Ordering::Relaxed) >= 7,
+        "three live shells and four refused mount attempts"
     );
     server.abort();
 }
