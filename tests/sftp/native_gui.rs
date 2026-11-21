@@ -134,6 +134,31 @@ fn drive_mixed_gui(script: &str, ssh: &SshOptions, state: &std::path::Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives OSC progress across a real SSH split, a reconnect and a PowerShell tab"]
+async fn native_terminal_progress_updates_background_tab_and_resets_on_reconnect() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 3).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    drive_mixed_gui("terminal-progress-ui.ps1", &ssh, state.path());
+    let mut expected = Vec::new();
+    for state in ["1;42", "4;68", "2", "0", "3", "0", "1;31"] {
+        expected.extend_from_slice(format!("\x1b]9;4;{state}\x07").as_bytes());
+    }
+    expected.extend_from_slice(b"\x04ssh-alive");
+    assert_eq!(fs::read(trace).unwrap(), expected);
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        3,
+        "two shells, one reconnect"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "creates remote folders through the native SFTP drawer while a PowerShell pane is live"]
 async fn native_new_folder_uses_the_selected_sftp_parent_and_preserves_existing_entries() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
