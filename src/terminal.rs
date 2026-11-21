@@ -2070,7 +2070,7 @@ mod tests {
             assert!(output.try_recv().is_err(), "query is still incomplete");
         }
         terminal.advance_bytes([0x1b]);
-        terminal.advance_bytes([b'\\']);
+        terminal.advance_bytes(b"\\");
         let TransportInput::Automatic(reply) = output.try_recv().unwrap() else {
             panic!("an SGR report must use the terminal reply transport");
         };
