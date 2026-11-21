@@ -33,6 +33,7 @@ pub enum Action {
     FindAllPanes,
     KeyboardHints,
     CopyMode,
+    ClearScrollback,
     NextTab,
     PreviousTab,
     NewTab,
@@ -144,6 +145,13 @@ pub const BINDINGS: &[Binding] = &[
         0x58,
         CTRL_SHIFT,
     ),
+    Binding::new(
+        ClearScrollback,
+        "clear_scrollback",
+        "Clear scrollback",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(Workspaces, "workspaces", "Workspaces", 0, Mods::NONE),
     Binding::new(NextTab, "next_tab", "Next tab", 0x09, Mods::CTRL),
     Binding::new(
@@ -204,6 +212,7 @@ impl Action {
                 | DuplicateTabLayout
                 | KeyboardHints
                 | CopyMode
+                | ClearScrollback
         )
     }
 }
@@ -438,6 +447,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn clear_scrollback_requires_an_explicit_pane_binding() {
+        let mut keys = Shortcuts::default();
+        assert_eq!(keys.get(ClearScrollback.binding()), None);
+        let chord: Chord = "F8".parse().unwrap();
+        keys.set(ClearScrollback, Some(chord)).unwrap();
+        let map = keys.keymap().unwrap();
+        assert_eq!(
+            map.resolve(chord.key, chord.mods, true, false),
+            Some(ClearScrollback)
+        );
+        assert_eq!(map.resolve(chord.key, chord.mods, false, false), None);
     }
 
     #[test]

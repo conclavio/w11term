@@ -127,6 +127,7 @@ pub struct Selection {
     pub dragging: bool,
     pub cols: usize,
     lines: BTreeMap<isize, Arc<wezterm_term::Line>>,
+    clear_generation: Option<u64>,
 }
 impl Selection {
     pub fn new(point: Point, block: bool, alternate: bool) -> Self {
@@ -139,9 +140,39 @@ impl Selection {
             dragging: true,
             cols: 0,
             lines: BTreeMap::new(),
+            clear_generation: None,
         }
     }
+    pub fn survives_scrollback_clear(&self, frame: &Snapshot) -> bool {
+        self.alternate
+            || self
+                .clear_generation
+                .is_none_or(|old| old == frame.scrollback_clear_generation)
+            || frame
+                .scrollback_clear_floor
+                .is_none_or(|floor| self.anchor.row.min(self.end.row) >= floor)
+    }
+
+    pub fn reconcile_scrollback_clear(&mut self, frame: &Snapshot) -> bool {
+        if !self.survives_scrollback_clear(frame) {
+            return false;
+        }
+        if self
+            .clear_generation
+            .replace(frame.scrollback_clear_generation)
+            != Some(frame.scrollback_clear_generation)
+            && !self.alternate
+            && let Some(floor) = frame.scrollback_clear_floor
+        {
+            self.lines = self.lines.split_off(&floor);
+        }
+        true
+    }
+
     pub fn observe(&mut self, frame: &Snapshot) {
+        if !self.reconcile_scrollback_clear(frame) {
+            return;
+        }
         if self.cols != 0 && self.cols != frame.cols {
             self.active = false;
             self.dragging = false;
@@ -191,8 +222,14 @@ impl Selection {
         };
         Some(start.min(cols)..end.min(cols))
     }
+    pub fn can_copy(&self, frame: &Snapshot) -> bool {
+        self.active
+            && self.alternate == frame.alternate
+            && self.cols == frame.cols
+            && self.survives_scrollback_clear(frame)
+    }
     pub fn text(&self, frame: &Snapshot, trim_block: bool) -> String {
-        if self.alternate != frame.alternate || self.cols != frame.cols || !self.active {
+        if !self.can_copy(frame) {
             return String::new();
         }
         let mut lines = self.lines.clone();
@@ -680,6 +717,27 @@ mod tests {
         assert!(!safe_url("file:///C:/Windows/notepad.exe"));
         assert!(!safe_url("https://example.com\nattack"));
     }
+    #[test]
+    fn clearing_scrollback_invalidates_only_selections_touching_erased_rows() {
+        let original = screen(b"old\r\nkeep\r\nlast", 12);
+        let first = original.first_stable_row;
+        let mut reversed = selection(&original, (2, 3), (0, 1), true);
+        let mut retained = selection(&original, (1, 0), (2, 3), false);
+        // "keep" was on screen at clear time, then ordinary output evicted it
+        // before the UI observed this frame. Its selection is still copyable.
+        let mut frame = screen(b"last\r\nnew", 12);
+        frame.first_stable_row = first + 2;
+        frame.oldest_stable_row = first + 2;
+        frame.scrollback_clear_generation += 1;
+        frame.scrollback_clear_floor = Some(first + 1);
+        // Copy can run before the UI has received the committed frame notification.
+        assert_eq!(reversed.text(&frame, true), "");
+        assert!(!reversed.reconcile_scrollback_clear(&frame));
+        assert!(retained.reconcile_scrollback_clear(&frame));
+        assert!(!retained.lines.contains_key(&first));
+        assert_eq!(retained.text(&frame, true), "keep\r\nlast");
+    }
+
     #[test]
     fn selection_remembers_rows_scrolled_out_of_the_viewport() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();

@@ -164,6 +164,7 @@ pub enum Shortcut {
     Paste,
     PasteRaw,
     ClearSelection,
+    ClearScrollback,
     Zoom(i32),
     ResetZoom,
     CommitTab,
@@ -1334,7 +1335,14 @@ impl State {
                             repeat: Some((mods, direction)),
                         });
                     }
-                    (self.shortcut)(shortcut);
+                    if shortcut == Shortcut::ClearScrollback {
+                        // Bind the destructive action to the pane receiving this keydown.
+                        if let Some(target) = &self.target {
+                            let _ = target.sender.send(Command::ClearScrollback);
+                        }
+                    } else {
+                        (self.shortcut)(shortcut);
+                    }
                 }
                 return true;
             }
@@ -1609,6 +1617,7 @@ impl From<Action> for Shortcut {
             Action::FindAllPanes => Self::FindAllPanes,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
+            Action::ClearScrollback => Self::ClearScrollback,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
             Action::NewTab => Self::NewTab,

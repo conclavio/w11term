@@ -507,6 +507,10 @@ pub struct Snapshot {
     pub bytes_received: u64,
     pub first_stable_row: isize,
     pub oldest_stable_row: isize,
+    /// Most recent successful local history clear. The floor is the first row
+    /// retained at the time of that clear, even if new output has since arrived.
+    pub scrollback_clear_generation: u64,
+    pub scrollback_clear_floor: Option<isize>,
     pub alternate: bool,
     pub mouse_grabbed: bool,
     pub search: Option<crate::search::SearchSnapshot>,
@@ -641,6 +645,8 @@ impl Snapshot {
             bytes_received,
             first_stable_row,
             oldest_stable_row: screen.phys_to_stable_row_index(0),
+            scrollback_clear_generation: 0,
+            scrollback_clear_floor: None,
             alternate,
             mouse_grabbed: terminal.is_mouse_grabbed(),
             search: None,
@@ -696,6 +702,7 @@ impl Snapshot {
         self.size == old.size
             && self.first_stable_row == old.first_stable_row
             && self.oldest_stable_row == old.oldest_stable_row
+            && self.scrollback_clear_generation == old.scrollback_clear_generation
             && self.scroll_offset == old.scroll_offset
             && self.alternate == old.alternate
             && self.cursor_visible == old.cursor_visible

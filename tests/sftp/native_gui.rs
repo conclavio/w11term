@@ -143,6 +143,22 @@ async fn native_profile_scrollback_limits_apply_to_new_panes_and_preserve_live_h
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "clears only the focused SSH pane's retained history in a mixed SSH and PowerShell split"]
+async fn native_clear_scrollback_preserves_the_ssh_prompt_and_neighboring_powershell_history() {
+    let mut history = String::from("ssh-archived-order\r\n");
+    for row in 0..140 {
+        history.push_str(&format!("ssh-history-{row:03}\r\n"));
+    }
+    history.push_str("ssh-history-ready\r\n");
+    run_palette_fixture(
+        "clear-scrollback-ui.ps1",
+        b"\x1b[?1049h\x1b[Halt-pilot\x1b[?1049l\r\nlive-heading\r\n\x1b]133;A\x07pilot> \x1b]133;B\x07status",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "locks and unlocks input in a live SSH and PowerShell split through the native UI"]
 async fn native_read_only_input_is_per_pane_in_a_mixed_split() {
     run_palette_fixture("read-only-pane-ui.ps1", b"resumed", None).await;
