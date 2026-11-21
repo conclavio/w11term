@@ -70,6 +70,7 @@ jobs:
           retention-days: 14
   native-e2e:
     name: Windows native end-to-end tests
+    needs: remote-mux
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -79,6 +80,15 @@ jobs:
       - *cargo-cache
       - name: Build the GUI, CLI and loopback SSH peer
         run: cargo build --locked --features ui-smoke --bins --example echo_server
+      - name: Download stock Linux mux frames
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: remote-mux-frames
+          path: .local/mux-frames
+      - name: Replay both terminal grids and verify rendered Sixel placement
+        env:
+          W11_MUX_CAPTURES: .local/mux-frames
+        run: cargo test --locked --features ui-smoke --test remote_mux -- --ignored
       - name: Set the desktop size for native resize and accessibility assertions
         run: Set-DisplayResolution -Width 1920 -Height 1080 -Force
       - name: Verify SSH splits, shortcuts, pane picker focus, file transfers, ConPTY, durable panes and accessibility
@@ -119,6 +129,22 @@ jobs:
 
   durable-linux:
     uses: ./.github/workflows/durable-pty.yml
+
+  remote-mux:
+    name: Stock Linux multiplexers over SSH
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - *checkout
+      - name: Exercise input, resize and graphics on both sides of a loopback SSH PTY
+        run: bash tests/durable/run-mux-linux.sh artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: remote-mux-frames
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 7
 
   kitty-reference:
     uses: ./.github/workflows/kitty-graphics.yml
