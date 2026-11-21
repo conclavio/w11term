@@ -20,7 +20,14 @@ pub(super) struct Panel {
     feedback: String,
     pending: Option<u64>,
     resolving: Option<u64>,
-    draft: Option<(PathBuf, String)>,
+    draft: Option<FolderDraft>,
+}
+
+#[derive(Clone)]
+struct FolderDraft {
+    path: PathBuf,
+    name: String,
+    auto_mount: bool,
 }
 
 pub enum Action {
@@ -33,6 +40,8 @@ pub enum Edit {
     Add,
     Picked(u64, Result<Option<PathBuf>, String>),
     Name(String),
+    DraftAutoMount(bool),
+    AutoMount(String, String, bool),
     Save,
     Cancel,
     Row(RowAction, String, PathBuf),
@@ -285,17 +294,34 @@ impl TerminalApp {
                     Err(error) => panel.feedback = error,
                     Ok(Some(path)) => {
                         let name = suggested_name(&path);
-                        panel.draft = Some((path, name));
+                        panel.draft = Some(FolderDraft {
+                            path,
+                            name,
+                            auto_mount: true,
+                        });
                     }
                     Ok(None) => {}
                 }
                 return;
             }
             Edit::Name(value) => {
-                if let Some((_, name)) = &mut panel.draft {
-                    *name = value;
+                if let Some(draft) = &mut panel.draft {
+                    draft.name = value;
                 }
                 return;
+            }
+            Edit::DraftAutoMount(enabled) => {
+                if let Some(draft) = &mut panel.draft {
+                    draft.auto_mount = enabled;
+                }
+                return;
+            }
+            Edit::AutoMount(name, id, enabled) => {
+                if panel.draft.is_some() || panel.pending.is_some() || panel.resolving.is_some() {
+                    return;
+                }
+                self.folder_auto_mount(&authority, &name, &id, enabled)
+                    .map(|()| String::new())
             }
             Edit::Cancel => {
                 panel.draft = None;
@@ -303,13 +329,18 @@ impl TerminalApp {
                 return;
             }
             Edit::Save => {
-                let Some((path, name)) = panel.draft.clone() else {
+                let Some(FolderDraft {
+                    path,
+                    name,
+                    auto_mount,
+                }) = panel.draft.clone()
+                else {
                     return;
                 };
                 if !valid_mount_name(&name) {
                     return;
                 }
-                self.folder_add(&authority, &name, path)
+                self.folder_add(&authority, &name, path, auto_mount)
                     .map(|()| format!("Requested read-only mount at ~/windows/{name}"))
             }
             Edit::Row(action, name, path) => {
@@ -499,6 +530,31 @@ impl TerminalApp {
                     row.status,
                     FolderMountStatus::Stopped | FolderMountStatus::Failed(_)
                 );
+                let preference = row.mount_on_connect.as_ref();
+                let grant_id = preference.map(|p| p.grant_id.clone());
+                let checked = preference.is_some_and(|p| p.enabled);
+                let name = row.name.clone();
+                let check = CheckBox::new()
+                    .automation_name(format!("Mount on connect for {name}"))
+                    .is_checked(checked)
+                    .is_enabled(
+                        preference.is_some_and(|p| !p.pending)
+                            && panel.draft.is_none()
+                            && panel.pending.is_none()
+                            && panel.resolving.is_none(),
+                    )
+                    .on_is_checked_changed(ctx.callback(move |value| match &grant_id {
+                        Some(id) if value != checked => {
+                            message(origin, Edit::AutoMount(name.clone(), id.clone(), value))
+                        }
+                        _ => Message::ControlIdle,
+                    }))
+                    .content("Mount on connect");
+                let mut status = status_text(&row.status);
+                if let Some(error) = preference.and_then(|p| p.error.as_deref()) {
+                    status.push('\n');
+                    status.push_str(error);
+                }
                 items.push(KeyedView::new(
                     format!("share/{}", row.name),
                     Border::new()
@@ -517,8 +573,9 @@ impl TerminalApp {
                                     .text(row.path.display().to_string())
                                     .text_wrapping(TextWrapping::Wrap),
                                 TextBlock::new()
-                                    .text(status_text(&row.status))
+                                    .text(status)
                                     .text_wrapping(TextWrapping::Wrap),
+                                check,
                                 StackPanel::new()
                                     .orientation(Orientation::Horizontal)
                                     .spacing(8.0)
@@ -556,12 +613,20 @@ impl TerminalApp {
                         ),
                 ));
             }
-            if let Some((path, name)) = &panel.draft {
+            if let Some(FolderDraft {
+                path,
+                name,
+                auto_mount,
+            }) = &panel.draft
+            {
                 items.push(KeyedView::new("draft", StackPanel::new().spacing(6.0).children((
                     TextBlock::new().text(path.display().to_string()).text_wrapping(TextWrapping::Wrap),
                     TextBlock::new().text("Mount name"),
                     TextBox::new().automation_name("Mount name").text(name)
                         .on_text_changed(ctx.callback(move |text| message(origin, Edit::Name(text)))),
+                    CheckBox::new().automation_name("Mount on connect").is_checked(*auto_mount)
+                        .on_is_checked_changed(ctx.callback(move |value| message(origin, Edit::DraftAutoMount(value))))
+                        .content("Mount on connect"),
                     TextBlock::new().text(if valid_mount_name(name) {
                         format!("Remember this folder and mount it read-only at ~/windows/{name}")
                     } else { "Use 1–64 letters, digits, dots, underscores or hyphens. Start with a letter or digit.".to_owned() }).text_wrapping(TextWrapping::Wrap),
@@ -613,6 +678,7 @@ mod tests {
             path: r"C:\selected".into(),
             status: FolderMountStatus::Mounted,
             mounted: Some(original.clone()),
+            mount_on_connect: None,
         }];
         assert!(still_mounted(&rows, "docs", &original));
         assert!(!still_mounted(&rows, "other", &original));

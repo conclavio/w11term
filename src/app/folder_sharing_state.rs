@@ -63,8 +63,25 @@ impl TerminalApp {
             .folders_for(auth)?
             .resolve_mounted(auth, name, generation))
     }
-    pub(super) fn folder_add(&self, auth: &Authority, name: &str, path: PathBuf) -> Result<()> {
-        self.folders_for(auth)?.add(auth, name, path)
+    pub(super) fn folder_add(
+        &self,
+        auth: &Authority,
+        name: &str,
+        path: PathBuf,
+        auto_mount: bool,
+    ) -> Result<()> {
+        self.folders_for(auth)?
+            .add_with_auto_mount(auth, name, path, auto_mount)
+    }
+    pub(super) fn folder_auto_mount(
+        &self,
+        auth: &Authority,
+        name: &str,
+        grant_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        self.folders_for(auth)?
+            .set_auto_mount(auth, name, grant_id, enabled)
     }
     pub(super) fn folder_mount(&self, auth: &Authority, name: &str) -> Result<()> {
         self.folders_for(auth)?.mount(auth, name)
