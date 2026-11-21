@@ -5257,7 +5257,8 @@ impl Component for TerminalApp {
         }) = self.tabs.active()
             && self.title_editor.is_none()
             && tab.session.frames.load().prompt.is_none()
-            && let Some(dialog) = tab.files.name_dialog(tab.session.pane_id, context)
+            && let Source::Ssh(ssh) = &tab.source
+            && let Some(dialog) = tab.files.name_dialog(tab.session.pane_id, ssh, context)
         {
             views.push(KeyedView::new("sftp-name-editor", dialog));
         }
