@@ -36,27 +36,7 @@ function Open-Shares {
     $null = Wait-Until 'verified profile, account, port and access mode' { Find-Element $identityLabel }
 }
 function Folder-Dialog {
-    foreach ($hwnd in [FixtureDialog]::Windows($app.Id)) {
-        if ([FixtureDialog]::GetWindow($hwnd, 4) -ne $window) { continue }
-        $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-        if ($element.Current.ClassName -eq '#32770' -and $element.Current.Name -eq 'Choose a folder to share') { return $hwnd }
-    }
-}
-function Select-FixtureFolder([IntPtr]$Dialog) {
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Dialog)
-    $byName = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::NameProperty, $leaf)
-    $selectable = [System.Windows.Automation.PropertyCondition]::new(
-        [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty, $true)
-    $match = [System.Windows.Automation.AndCondition]::new($byName, $selectable)
-    $null = Wait-Until "native picker to select the fixture child '$leaf'" {
-        $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $match)
-        if ($item) {
-            $selection = $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-            if (!$selection.Current.IsSelected) { $selection.Select() }
-            return $selection.Current.IsSelected
-        }
-    }
+    Find-OwnedDialog 'Choose a folder to share'
 }
 function Same-SelectedFolder([string]$Path) {
     # Only consider absolute paths on the disposable fixture's local drive.
@@ -83,7 +63,7 @@ function Wait-SelectedPath {
 function Pick-Folder([int]$ButtonId) {
     Click $add
     $dialog = Wait-Until 'owned native folder picker' { Folder-Dialog }
-    if ($ButtonId -eq 1) { Select-FixtureFolder $dialog }
+    if ($ButtonId -eq 1) { Select-DialogItem $dialog $leaf }
     $null = Wait-Until "folder picker button $ButtonId" { [FixtureDialog]::ClickButton($dialog, $ButtonId) }
     $null = Wait-Until 'folder picker dismissed' { !(Folder-Dialog) }
 }
@@ -161,7 +141,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
             $null = Wait-Until 'palette opens verified panel' { Find-Element $identityLabel }
             Click $add
             $dialog = Wait-Until 'owned picker before disconnect' { Folder-Dialog }
-            Select-FixtureFolder $dialog
+            Select-DialogItem $dialog $leaf
             $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64','BA==')
             $stale = 'The verified SSH connection has changed or closed. Reopen Shared folders from a connected SSH pane.'
             $null = Wait-Until 'verified connection revoked with the picker open' { Find-Element $stale }

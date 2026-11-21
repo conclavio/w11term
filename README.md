@@ -107,7 +107,7 @@ To give an ordinary SSH pane a startup command, choose **caret → Workspace sta
 
 The recipe belongs to that pane in the saved workspace and is bound to its SSH host, port and user. Editing the recipe leaves the running session alone. After the client sends a startup command, a lost connection leaves the pane available for inspection. Reopen the workspace explicitly to run the command again. Directory-only shells retain their normal reconnect behavior.
 
-**Settings → Import OpenSSH config** previews aliases from your Windows SSH config or another selected file. Pick an alias to see its destination, identity, jump hosts and any unsupported directives. Saving creates an editable w11term profile. Import reads the selected file and leaves it intact. Routes or trust settings that cannot be represented are flagged before saving.
+**Settings → Import OpenSSH config** previews aliases from your Windows SSH config. Choose **Browse…** to select a different file and preview it, or type a path and choose **Preview hosts**. Pick an alias to see its destination, identity, jump hosts and any unsupported directives. Saving creates an editable w11term profile. Import reads the selected file and leaves it intact. Routes or trust settings that cannot be represented are flagged before saving.
 
 If your config starts with `Include config.d/*.conf`, aliases and `ProxyJump` hosts in those local fragments appear in the same preview. Relative include paths start at `%USERPROFILE%\.ssh`, including when you select a config elsewhere. Matching filenames are read in lexical order. An `Include` inside a `Host` or `Match` block is flagged for the aliases it could affect. Saving a profile takes a snapshot of the settings you previewed.
 
