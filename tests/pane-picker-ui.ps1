@@ -69,8 +69,11 @@ try {
     $null = Wait-Until 'the bell to be read' { Find-Element "Read $dot $row Bell" }
     Invoke-Button (Wait-Until 'clear inbox action' { Find-Element 'Clear inbox' })
     $null = Wait-Until 'empty inbox' { Find-Element 'No bells or notifications' }
-    Picker-Query 'build-output'
-    Press-Key 13
+    $finished = [Text.Encoding]::UTF8.GetBytes("$([char]27)]9;build complete$([char]27)\")
+    $null = Control @('send-text','--pane',"$left",'--no-paste','--base64',[Convert]::ToBase64String($finished))
+    Invoke-Button (Wait-Until 'new notification while inbox is open' {
+        Find-Element "Unread $dot dev1 $dot Pane $left $dot build complete"
+    })
     Wait-Focus $left
 
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
