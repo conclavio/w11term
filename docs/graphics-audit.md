@@ -32,12 +32,11 @@ edits. Synchronized-output holds use those committed pixels for both Canvas and
 screenshots while the parser updates its separate working state. Unchanged frozen
 images are shared across snapshots rather than copied again for every cell or paint.
 
-The renderer sorts all visible tiles by z-index inside the below-text and above-text
-layers, including placements anchored in different cells. Stable ties preserve model
-order. This fixes traversal order overriding explicit z-indices. Cell backgrounds
-are painted first, then negative-z images, text, and nonnegative-z images. The full
-kitty negative-z/background interaction and every blend/placement extension have
-not been exhaustively compared against reference terminals.
+The renderer collects visible tiles once per paint. It draws images with
+`z < -1073741824` over the window background, then paints cell backgrounds.
+It draws the remaining negative-z images before glyphs and nonnegative-z images
+after glyphs. Each layer sorts placements by z-index and image ID. An overlap
+at equal z shows the higher numbered kitty image on top. [Kitty placement rules](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout)
 
 The engine's image table now counts replacement of id zero correctly, limits direct
 transmissions to 48 MiB encoded / 32 MiB inflated, limits decoded kitty frames to
@@ -71,8 +70,9 @@ Deleting a parent removes its dependents. Cycles and missing parents return
 `ECYCLE` and `ENOPARENT`. Each terminal accepts up to 1,024 placements, a
 relative ancestry depth of 16, and 65,536 projected visible tiles per snapshot.
 
-`tests/fixtures/kitty/placements.vt` is the exact byte stream consumed by all three
-renderers. `samples.json` gives zero-based cell centers and expected RGB values.
+`tests/fixtures/kitty/placements.vt` and `layers.vt` are the byte streams
+consumed in order by all three renderers. `samples.json` gives zero-based
+cell centers and expected RGB values.
 It includes two differently colored placeholder cells, a blue relative child
 and the yellow second animation frame. Run the Windows Direct2D check with
 `cargo test --bin w11term offscreen_kitty_reference_cell_centers`. The engine
@@ -104,7 +104,10 @@ single center pixel. Ghostty's default 10-pixel-wide cell puts the center
 between two pixels. On the red/green boundary its right-hand pixel already
 contains interpolated green. The Ghostty harness sets `adjust-cell-width=-1`
 for the pinned font and Xvfb display.
-The five colored sample points test placement and selected pixels. GPU interpolation,
+Eight samples in the seventh row exercise a default background, explicit cell
+backgrounds on both sides of the z threshold, negative and zero z across a
+solid glyph, and equal- and different-z image overlaps. The original five sample
+points exercise placement and selected animation frames. GPU interpolation,
 general deletion selectors, placeholders under every rendition attribute, and every
 possible compositing edge remain outside this fixture.
 
