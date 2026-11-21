@@ -11,7 +11,9 @@ use std::{
 };
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
+mod clipboard;
 mod launch;
+pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
 mod presentation;
 #[cfg(test)]
 mod synchronized_capture;
@@ -53,6 +55,7 @@ pub enum Command {
         repeat: bool,
     },
     Paste(String),
+    ClipboardPaste(ClipboardPaste, ClipboardReply),
     Text(String),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
@@ -438,6 +441,7 @@ async fn run(
     let mut connection_generation = 0;
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let mut inspecting = false;
+    let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
         if let Some(version) = pending_pack.next(
@@ -513,6 +517,7 @@ async fn run(
                 queued_before_connection = queued_before_connection.saturating_sub(1);
                 let command = if phase != Phase::Running || queued_offline {
                     match command {
+                        Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("No active terminal connection; clipboard text was not sent".into())); continue; }
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
@@ -523,6 +528,7 @@ async fn run(
                 } else { command };
                 let command = if read_only {
                     match command {
+                        Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("Pane input is read-only".into())); continue; }
                         Some(Command::Raw(_, reply)) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
@@ -533,10 +539,38 @@ async fn run(
                         other => other,
                     }
                 } else { command };
-                let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
+                let mut changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
+                    Some(Command::ClipboardPaste(request, reply)) => {
+                        use clipboard::Decision;
+                        if interactive && connection_generation == 0 {
+                            let _ = reply.send(Err("The terminal is still connecting. Paste again when it is ready.".into()));
+                            continue;
+                        }
+                        let action = request.evaluate(&clipboard_origin, connection_generation, terminal.bracketed_paste_enabled());
+                        match action {
+                            Err(error) => { let _ = reply.send(Err(error)); }
+                            Ok(Decision::Confirm(pending)) => { let _ = reply.send(Ok(Some(pending))); }
+                            Ok(Decision::Send { text, .. }) if text.is_empty() => { let _ = reply.send(Ok(None)); }
+                            Ok(Decision::Send { text, raw }) if interactive => {
+                                let bytes = if raw { text.into_bytes() } else {
+                                    scroll_offset = 0;
+                                    terminal.encode_paste(&text).into_bytes()
+                                };
+                                clipboard::write(&writer, connection_generation, bytes, reply);
+                            }
+                            Ok(Decision::Send { text, raw: false }) if is_demo => {
+                                changes_screen = true;
+                                scroll_offset = 0;
+                                presentation.advance(&mut terminal, text.replace('\n', "\r\n"), 0, &status, total_bytes);
+                                let _ = reply.send(Ok(None));
+                            }
+                            Ok(Decision::Send { .. }) => { let _ = reply.send(Err("Clipboard input requires an interactive terminal".into())); }
+                        }
+                        Ok(())
+                    }
                     Some(Command::RestartExited(ClaimedRestart(token))) => {
                         if phase == Phase::Exited && restartable && token == launch_id {
                             launch_id += 1;
