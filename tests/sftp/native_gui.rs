@@ -487,6 +487,62 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "filters a paginated SFTP listing while checking shell input and directory reads"]
+async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let parent = remote.path().join("shell directory");
+    let child = parent.join("nested");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(child.join("inside.txt"), []).unwrap();
+    let fillers = 38;
+    for index in 0..fillers {
+        fs::write(parent.join(format!("build-{index:02}.log")), []).unwrap();
+    }
+    fs::write(parent.join("zz-[Ångström].txt"), []).unwrap();
+    fs::write(parent.join("zz-Ångström.txt"), []).unwrap();
+    let keyboard = remote.path().join("keyboard-input.bin");
+    let wire = remote.path().join("listing-trace");
+    fs::write(&keyboard, []).unwrap();
+    fs::write(&wire, []).unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("filter-sftp-listing-ui.ps1", &ssh, state.path());
+
+    let trace = fs::read_to_string(wire).unwrap();
+    let mut listings: Vec<(&str, usize)> = vec![];
+    for request in trace.lines() {
+        if let Some(path) = request.strip_prefix("OPENDIR ") {
+            listings.push((path, 0));
+        } else {
+            assert_eq!(request, "READDIR");
+            listings.last_mut().expect("OPENDIR before READDIR").1 += 1;
+        }
+    }
+    // This fixture returns one entry per READDIR plus one final EOF. Only
+    // opening the drawer, refreshing, and entering the child may read a list.
+    assert_eq!(
+        listings,
+        [
+            ("/shell directory", fillers + 4),
+            ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
+        ]
+    );
+    assert_eq!(
+        fs::read(keyboard).unwrap(),
+        b"after-filter-donefilter-ssh-ready"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "creates remote folders through the native SFTP drawer while a PowerShell pane is live"]
 async fn native_new_folder_uses_the_selected_sftp_parent_and_preserves_existing_entries() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

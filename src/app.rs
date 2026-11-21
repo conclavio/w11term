@@ -1001,16 +1001,18 @@ impl TerminalApp {
         if prompt_id.is_some() {
             self.title_editor = None;
             tab.files.cancel_entry_dialog();
+            tab.files.end_filter_edit();
         }
+        let editing_files = tab.files.entry_dialog_open() || tab.files.filter_editing();
         self.clipboard.connection_changed(
             tab.session.pane_id,
             frame.connection_generation,
-            prompt_id.is_some() || tab.read_only.get() || tab.files.entry_dialog_open(),
+            prompt_id.is_some() || tab.read_only.get() || editing_files,
         );
         self.keyboard.set_modal(
             prompt_id.is_some()
                 || self.title_editor.is_some()
-                || tab.files.entry_dialog_open()
+                || editing_files
                 || self.clipboard.is_open(),
         );
         let choosing = tab.browsing_sessions();
@@ -1320,6 +1322,17 @@ impl TerminalApp {
     ) {
         if !self.tabs.visible(id) {
             return;
+        }
+        if kind == MouseEventKind::Press
+            && let Some(active) = self.tabs.active_id()
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(active)
+            && tab.files.filter_editing()
+        {
+            tab.files.end_filter_edit();
+            self.connection_ui(active);
         }
         if self
             .copy_mode
