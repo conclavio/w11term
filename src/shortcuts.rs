@@ -18,6 +18,10 @@ pub enum Action {
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    SwapPaneLeft,
+    SwapPaneRight,
+    SwapPaneUp,
+    SwapPaneDown,
     SplitRight,
     SplitBelow,
     ZoomPane,
@@ -76,6 +80,28 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(ResizeRight, "resize_right", "Resize right", 0x27, ALT_SHIFT),
     Binding::new(ResizeUp, "resize_up", "Resize up", 0x26, ALT_SHIFT),
     Binding::new(ResizeDown, "resize_down", "Resize down", 0x28, ALT_SHIFT),
+    Binding::new(
+        SwapPaneLeft,
+        "swap_pane_left",
+        "Swap pane left",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(
+        SwapPaneRight,
+        "swap_pane_right",
+        "Swap pane right",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(SwapPaneUp, "swap_pane_up", "Swap pane up", 0, Mods::NONE),
+    Binding::new(
+        SwapPaneDown,
+        "swap_pane_down",
+        "Swap pane down",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(SplitRight, "split_right", "Split right", 0x27, PANE),
     Binding::new(SplitBelow, "split_below", "Split below", 0x28, PANE),
     Binding::new(ZoomPane, "zoom_pane", "Zoom pane", 0x5a, PANE),
@@ -157,6 +183,10 @@ impl Action {
                 | ResizeRight
                 | ResizeUp
                 | ResizeDown
+                | SwapPaneLeft
+                | SwapPaneRight
+                | SwapPaneUp
+                | SwapPaneDown
                 | SplitRight
                 | SplitBelow
                 | ZoomPane
@@ -417,6 +447,28 @@ mod tests {
         );
         assert_eq!(map.resolve(chord.key, chord.mods, false, false), None);
         assert_eq!(map.resolve(chord.key, chord.mods, true, true), None);
+    }
+
+    #[test]
+    fn pane_swaps_are_individually_remappable_and_require_a_terminal() {
+        let actions = [SwapPaneLeft, SwapPaneRight, SwapPaneUp, SwapPaneDown];
+        let mut shortcuts = Shortcuts::default();
+        let chord: Chord = "F8".parse().unwrap();
+        for action in actions {
+            assert_eq!(shortcuts.get(action.binding()), None);
+            shortcuts.set(action, Some(chord)).unwrap();
+            let saved = serde_json::to_string(&shortcuts).unwrap();
+            assert!(saved.contains(action.binding().id));
+            let restored: Shortcuts = serde_json::from_str(&saved).unwrap();
+            let map = restored.keymap().unwrap();
+            assert_eq!(
+                map.resolve(chord.key, chord.mods, true, false),
+                Some(action)
+            );
+            assert_eq!(map.resolve(chord.key, chord.mods, false, false), None);
+            assert_eq!(map.resolve(chord.key, chord.mods, true, true), None);
+            shortcuts.restore(action).unwrap();
+        }
     }
 
     #[test]

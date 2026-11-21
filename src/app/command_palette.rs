@@ -9,6 +9,7 @@ pub enum CommandId {
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     DuplicateTabLayout(Option<TabId>),
+    SwapPanes(PaneSwap),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -124,7 +125,8 @@ impl TerminalApp {
     pub(super) fn command_rows(&self, query: &str) -> Vec<Row> {
         let mut rows = vec![];
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
-        menu_rows(self.caret_items(exited.is_some()), false, &mut rows);
+        let swaps = self.pane_swaps();
+        menu_rows(self.caret_items(exited.is_some(), &swaps), false, &mut rows);
         let origin = self.paste_origin();
         for row in &mut rows {
             if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
@@ -196,6 +198,11 @@ impl TerminalApp {
                     // when a control client switches tabs before we receive it.
                     row.id = CommandId::DuplicateTabLayout(self.tabs.active_group_id());
                 }
+                Shortcut::SwapPane(direction) => {
+                    if let Some(target) = swaps.get(direction) {
+                        row.id = CommandId::SwapPanes(target);
+                    }
+                }
                 Shortcut::FocusPane(dir) => {
                     row.enabled = self
                         .tabs
@@ -261,6 +268,7 @@ impl TerminalApp {
             CommandId::DuplicateTabLayout(group) => {
                 bind_tab_action(Message::Shortcut(Shortcut::DuplicateTabLayout), group)
             }
+            CommandId::SwapPanes(target) => Message::SwapPanes(target),
             CommandId::SharedFolders(Some(pane)) => {
                 Message::FolderShare(folder_shares::Action::Open(pane))
             }

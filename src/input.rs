@@ -98,6 +98,18 @@ struct WheelPanes {
 }
 
 impl WheelPanes {
+    fn swapped(&mut self, [first, second]: [u64; 2]) {
+        let replacement = match self.hovered {
+            Some(id) if id == first => second,
+            Some(id) if id == second => first,
+            _ => return,
+        };
+        self.hovered = self
+            .visible
+            .contains_key(&replacement)
+            .then_some(replacement);
+    }
+
     fn replace(
         &mut self,
         panes: impl IntoIterator<Item = (u64, mpsc::UnboundedSender<Command>, FrameStore)>,
@@ -144,6 +156,7 @@ pub enum Shortcut {
     SplitBelow,
     FocusPane(Direction),
     ResizePane(Direction),
+    SwapPane(Direction),
     ZoomPane,
     ClosePane,
     Select(usize),
@@ -322,6 +335,14 @@ impl KeyboardBridge {
                 && state.wheel_panes.visible.contains_key(&id)
             {
                 state.wheel_panes.hovered = Some(id);
+            }
+        });
+    }
+    pub fn panes_swapped(&self, pair: [u64; 2]) {
+        let _native = self.scope.enter();
+        with_input_mut(|input| {
+            if let Some(state) = input.as_mut() {
+                state.wheel_panes.swapped(pair);
             }
         });
     }
@@ -1565,6 +1586,10 @@ impl From<Action> for Shortcut {
             Action::ResizeRight => Self::ResizePane(Direction::Right),
             Action::ResizeUp => Self::ResizePane(Direction::Up),
             Action::ResizeDown => Self::ResizePane(Direction::Down),
+            Action::SwapPaneLeft => Self::SwapPane(Direction::Left),
+            Action::SwapPaneRight => Self::SwapPane(Direction::Right),
+            Action::SwapPaneUp => Self::SwapPane(Direction::Up),
+            Action::SwapPaneDown => Self::SwapPane(Direction::Down),
             Action::SplitRight => Self::SplitRight,
             Action::SplitBelow => Self::SplitBelow,
             Action::ZoomPane => Self::ZoomPane,
@@ -1992,6 +2017,15 @@ mod tests {
         assert_eq!(wheel_steps(panes.target().unwrap().1, 60), 1);
         panes.hovered = Some(6);
         assert_eq!(wheel_steps(panes.target().unwrap().1, 60), 1);
+
+        // Swapping exchanges the panes under a stationary pointer. Fractional
+        // deltas stay with their sessions; swapping elsewhere leaves hover alone.
+        panes.swapped([5, 6]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&left));
+        panes.swapped([6, 7]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&left));
+        panes.swapped([6, 5]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&right));
 
         panes.replace([(5, left.clone(), lab.frames.clone())]);
         assert_eq!(panes.hovered, None);

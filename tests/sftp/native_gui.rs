@@ -277,6 +277,53 @@ async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "swaps live SSH and PowerShell neighbors in a nested native workspace and reopens the saved layout"]
+async fn native_swap_neighbors_keeps_shells_and_persists_their_new_positions() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 4, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let data = state.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let shell = |slot, name| {
+        json!({"type":"leaf","slot":slot,"source":{"kind":"local","value":{
+            "name":name,"shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}
+        }}})
+    };
+    let workspace = json!({"active_tab":0,"tabs":[{
+        "title":"Operations","focused":1,"layout":{
+            "type":"split","axis":"columns","ratio":0.375,
+            "first":{"type":"leaf","slot":1,"source":{"kind":"saved_profile","value":"palette-ssh"}},
+            "second":{"type":"split","axis":"rows","ratio":0.3125,
+                "first":shell(2,"Upper PowerShell"),"second":shell(3,"Lower PowerShell")}
+        }
+    }]});
+    fs::write(
+        data.join("workspaces.json"),
+        serde_json::to_vec(&json!({"version":1,"workspaces":{"original":workspace}})).unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("swap-pane-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "one SSH login per launch"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one shell per transport"
+    );
+    assert_eq!(fs::read(trace).unwrap(), b"before/right/up/reopened/");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives OSC progress across a real SSH split, a reconnect and a PowerShell tab"]
 async fn native_terminal_progress_updates_background_tab_and_resets_on_reconnect() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 3).await else {
