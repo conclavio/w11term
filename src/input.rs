@@ -990,6 +990,11 @@ impl State {
                         if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, modifiers())
                             && (!repeat || key.repeats())
                         {
+                            if key == w11term::copy_mode::CopyKey::Cancel {
+                                // The UI dismisses the overlay asynchronously. Keep Escape's
+                                // release local, but let the next key use the terminal shortcuts.
+                                self.local_mode = None;
+                            }
                             (self.shortcut)(Shortcut::CopyKey(key));
                         }
                     } else if !repeat
@@ -2162,22 +2167,33 @@ mod tests {
         ] {
             assert!(state.handle(&event));
         }
-        state.local_mode = None;
+        // Escape and a new shortcut may already be in the Windows message queue
+        // before the component has processed the copy-mode dismissal.
+        let mut shortcuts = Shortcuts::default();
+        shortcuts
+            .set(Action::CommandPalette, Some("F7".parse().unwrap()))
+            .unwrap();
+        state.keymap = shortcuts.keymap().unwrap();
         assert!(state.handle(&key(WM_KEYDOWN, 0x1b, true)));
+        assert!(state.handle(&key(WM_CHAR, 0x1b, false)));
         assert!(state.handle(&key(WM_KEYUP, 0x1b, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x76, false)));
+        assert!(state.handle(&key(WM_KEYUP, 0x76, false)));
         use w11term::copy_mode::CopyKey;
         assert_eq!(
             *moves.borrow(),
             [
                 Shortcut::CopyKey(CopyKey::Up),
                 Shortcut::CopyKey(CopyKey::Up),
-                Shortcut::CopyKey(CopyKey::Cancel)
+                Shortcut::CopyKey(CopyKey::Cancel),
+                Shortcut::CommandPalette,
             ]
         );
         assert!(
             new_input.try_recv().is_err(),
             "copy mode or its closing key release reached the shell"
         );
+        state.picker = None;
         state.game_mode = true;
         let key_message = |message, repeat| MSG {
             message,

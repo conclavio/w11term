@@ -6,22 +6,39 @@ use shared::run_gui;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives the command palette across a loopback SSH session and a PowerShell tab"]
 async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
-    run_palette_fixture("command-palette-ui.ps1", b"after").await;
+    run_palette_fixture("command-palette-ui.ps1", b"after", None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "locks and unlocks input in a live SSH and PowerShell split through the native UI"]
 async fn native_read_only_input_is_per_pane_in_a_mixed_split() {
-    run_palette_fixture("read-only-pane-ui.ps1", b"resumed").await;
+    run_palette_fixture("read-only-pane-ui.ps1", b"resumed", None).await;
 }
 
-async fn run_palette_fixture(script: &str, expected_input: &[u8]) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches wrapped SSH history with native regex Find and resumes typing in both panes"]
+async fn native_regex_find_in_mixed_panes_keeps_search_input_off_the_wire() {
+    let filler = "x".repeat(360);
+    let mut history = format!(
+        "CaseOne-start{filler}-End-17\r\nCaseOne-start{filler}-End-29\r\ncaseone-start{filler}-end-31\r\n"
+    );
+    for row in 0..180 {
+        history.push_str(&format!("scrollback filler {row}\r\n"));
+    }
+    history.push_str("find-fixture-ready\r\n");
+    run_palette_fixture("regex-find-ui.ps1", b"find-ssh-resumed", Some(&history)).await;
+}
+
+async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Option<&str>) {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
         unreachable!()
     };
     let state = tempfile::tempdir().unwrap();
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
+    if let Some(history) = history {
+        fs::write(remote.path().join("copy-history.vt"), history).unwrap();
+    }
     fs::write(
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({"profiles":{

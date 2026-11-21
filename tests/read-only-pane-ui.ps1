@@ -7,17 +7,6 @@ $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 
-function Run-Palette([string]$Command) {
-    Press-Key 0x76 # F7 in the fixture's keymap
-    $field = Wait-Until 'command search focus' {
-        $entry = Find-Element 'Search commands'
-        if ($entry -and $entry.Current.HasKeyboardFocus) { $entry }
-    }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
-    Invoke-Button (Wait-Until $Command { Find-Element $Command ([System.Windows.Automation.ControlType]::Button) })
-    $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
-}
-
 function Assert-Locked([int]$Pane) {
     $null = Wait-Until "read-only flag for pane $Pane" { ((Control @('list')).sessions | Where-Object id -eq $Pane).read_only }
     $result = & $Cli --pid $app.Id send-text --pane $Pane --no-paste 'unexpected' | ConvertFrom-Json
@@ -29,7 +18,7 @@ function Assert-Locked([int]$Pane) {
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
-    $window = Wait-Until 'window handle' { $app.Refresh(); if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } }
+    $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
     $remote = (Control @('list')).sessions[0].id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')

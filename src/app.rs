@@ -94,9 +94,16 @@ struct Find {
     open: bool,
     query: String,
     sensitive: bool,
+    regex: bool,
+    pending: bool,
     epoch: u64,
     input: ElementRef<TextBox>,
     focused: bool,
+}
+#[derive(Clone, Copy)]
+pub enum FindOption {
+    Case,
+    Regex,
 }
 impl LiveTab {
     fn end_pointer_gesture(&mut self) {
@@ -160,10 +167,74 @@ impl Default for Find {
             open: false,
             query: String::new(),
             sensitive: false,
+            regex: false,
+            pending: false,
             epoch: 0,
             input: ElementRef::new(),
             focused: false,
         }
+    }
+}
+impl Find {
+    fn matches(&self, result: &w11term::search::SearchSnapshot) -> bool {
+        result.query == self.query
+            && result.sensitive == self.sensitive
+            && result.regex == self.regex
+    }
+
+    fn apply(&mut self, session: &Session) {
+        self.pending = session
+            .input
+            .send(Command::Search {
+                query: self.query.clone(),
+                sensitive: self.sensitive,
+                regex: self.regex,
+            })
+            .is_err();
+    }
+
+    fn limit_query(text: &mut String, regex: bool) {
+        let limit = w11term::search::MAX_QUERY_BYTES;
+        if text.len() > limit {
+            // Keep one overflowing scalar in regex mode so an oversized paste
+            // stays invalid until corrected. Literal Find retains its old cap.
+            let end = if regex {
+                text.ceil_char_boundary(limit + 1)
+            } else {
+                text.floor_char_boundary(limit)
+            };
+            text.truncate(end);
+        }
+    }
+
+    fn status(&self, result: Option<&w11term::search::SearchSnapshot>) -> String {
+        if self.query.is_empty() {
+            return "Find in scrollback".into();
+        }
+        let Some(result) = result.filter(|result| self.matches(result)) else {
+            return "Searching…".into();
+        };
+        if let Some(error) = &result.error {
+            return if self.regex {
+                format!("Invalid regex — {error}. Edit the pattern or turn off Regex.")
+            } else {
+                error.clone()
+            };
+        }
+        let mut count = if result.total == 0 {
+            "No matches".into()
+        } else {
+            format!(
+                "{} / {}{}",
+                result.selected.map_or(0, |i| i + 1),
+                result.total,
+                if result.truncated { "+" } else { "" }
+            )
+        };
+        if result.incomplete {
+            count.push_str(" · Some long lines were skipped");
+        }
+        count
     }
 }
 struct TabSwitcher {
@@ -598,7 +669,7 @@ pub enum Message {
     Geometry(f64, f64, u64, bool),
     GridFallback(u64),
     FindEdit(TabId, String),
-    FindCase(TabId, bool),
+    FindOption(TabId, FindOption, bool),
     FindApply(TabId, u64),
     FindFocus(TabId, u64, u8),
     FindFocusResult(TabId, u64, bool),
@@ -828,13 +899,14 @@ impl TerminalApp {
             return;
         };
         let configure = !tab.find.open
+            || tab.find.pending
             || tab
                 .session
                 .frames
                 .load()
                 .search
                 .as_ref()
-                .is_none_or(|s| s.query != tab.find.query || s.sensitive != tab.find.sensitive);
+                .is_none_or(|s| !tab.find.matches(s));
         tab.find.open = !close;
         if close {
             tab.find.focused = false;
@@ -845,10 +917,7 @@ impl TerminalApp {
             let _ = tab.session.input.send(Command::SearchClose);
         } else {
             if configure {
-                let _ = tab.session.input.send(Command::Search {
-                    query: tab.find.query.clone(),
-                    sensitive: tab.find.sensitive,
-                });
+                tab.find.apply(&tab.session);
             }
             if let Some(direction) = direction {
                 let _ = tab.session.input.send(Command::SearchNavigate(direction));
@@ -861,42 +930,20 @@ impl TerminalApp {
         }
         self.invalidator.invalidate();
     }
-    fn apply_find(&self, id: TabId, epoch: u64) {
+    fn apply_find(&mut self, id: TabId, epoch: u64) {
         if let Some(AppTab {
             page: Page::Terminal(tab),
             ..
-        }) = self.tabs.get(id)
+        }) = self.tabs.get_mut(id)
             && tab.find.open
             && tab.find.epoch == epoch
         {
-            let _ = tab.session.input.send(Command::Search {
-                query: tab.find.query.clone(),
-                sensitive: tab.find.sensitive,
-            });
+            tab.find.apply(&tab.session);
         }
     }
     fn find_view(&self, id: TabId, tab: &LiveTab, context: &ViewContext<Self>) -> View {
         let frame = tab.session.frames.load();
-        let count = if tab.find.query.is_empty() {
-            "Find in scrollback".to_string()
-        } else if let Some(search) = frame
-            .search
-            .as_ref()
-            .filter(|s| s.query == tab.find.query && s.sensitive == tab.find.sensitive)
-        {
-            if search.total == 0 {
-                "No matches".into()
-            } else {
-                format!(
-                    "{} / {}{}",
-                    search.selected.map_or(0, |i| i + 1),
-                    search.total,
-                    if search.truncated { "+" } else { "" }
-                )
-            }
-        } else {
-            "Searching…".into()
-        };
+        let status = tab.find.status(frame.search.as_ref());
         Border::new()
             .grid_row(1)
             .horizontal_alignment(HorizontalAlignment::Right)
@@ -908,10 +955,10 @@ impl TerminalApp {
             .width((self.width - 16.0).clamp(300.0, 600.0))
             .content(
                 Grid::new()
+                    .rows([GridLength::Auto, GridLength::Auto])
+                    .row_spacing(4.0)
                     .columns([
                         GridLength::STAR,
-                        GridLength::Auto,
-                        GridLength::Auto,
                         GridLength::Auto,
                         GridLength::Auto,
                         GridLength::Auto,
@@ -925,21 +972,8 @@ impl TerminalApp {
                             .on_text_changed(
                                 context.callback(move |text| Message::FindEdit(id, text)),
                             ),
-                        Border::new()
-                            .grid_column(1)
-                            .padding(6.0)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(TextBlock::new().text(count)),
-                        CheckBox::new()
-                            .grid_column(2)
-                            .automation_name("Match case")
-                            .is_checked(tab.find.sensitive)
-                            .on_is_checked_changed(
-                                context.callback(move |v| Message::FindCase(id, v)),
-                            )
-                            .content(TextBlock::new().text("Aa")),
                         Button::new()
-                            .grid_column(3)
+                            .grid_column(1)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Previous match (Shift+Enter)")
                             .on_click(
@@ -947,17 +981,47 @@ impl TerminalApp {
                             )
                             .content(TextBlock::new().text("↑")),
                         Button::new()
-                            .grid_column(4)
+                            .grid_column(2)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Next match (Enter)")
                             .on_click(context.callback(|_| Message::Shortcut(Shortcut::FindNext)))
                             .content(TextBlock::new().text("↓")),
                         Button::new()
-                            .grid_column(5)
+                            .grid_column(3)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Close find (Escape)")
                             .on_click(context.callback(|_| Message::Shortcut(Shortcut::FindClose)))
                             .content(TextBlock::new().text("×")),
+                        Grid::new()
+                            .grid_row(1)
+                            .grid_column_span(4)
+                            .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                            .column_spacing(12.0)
+                            .children((
+                                CheckBox::new()
+                                    .min_width(0.0)
+                                    .automation_name("Match case")
+                                    .is_checked(tab.find.sensitive)
+                                    .on_is_checked_changed(context.callback(move |v| {
+                                        Message::FindOption(id, FindOption::Case, v)
+                                    }))
+                                    .content("Match case"),
+                                CheckBox::new()
+                                    .grid_column(1)
+                                    .min_width(0.0)
+                                    .automation_name("Regular expression")
+                                    .is_checked(tab.find.regex)
+                                    .on_is_checked_changed(context.callback(move |v| {
+                                        Message::FindOption(id, FindOption::Regex, v)
+                                    }))
+                                    .content("Regex"),
+                                TextBlock::new()
+                                    .grid_column(2)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .automation_id("find-status")
+                                    .text(status)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )),
                     )),
             )
     }
@@ -1750,6 +1814,9 @@ impl TerminalApp {
             }) = self.tabs.get_mut(id)
             && tab.find.open
         {
+            if tab.find.pending {
+                tab.find.apply(&tab.session);
+            }
             tab.find.focused = false;
             let epoch = tab.find.epoch;
             context.spawn_background(move |_| {
@@ -4400,16 +4467,14 @@ impl Component for TerminalApp {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get_mut(id)
-                    && tab.find.query != text
+                    && tab.find.open
                 {
-                    if text.len() > 4096 {
-                        let mut end = 4096;
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        text.truncate(end);
+                    Find::limit_query(&mut text, tab.find.regex);
+                    if tab.find.query == text {
+                        return;
                     }
                     tab.find.query = text;
+                    tab.find.pending = true;
                     tab.find.epoch += 1;
                     let epoch = tab.find.epoch;
                     context.spawn_background(move |_| {
@@ -4418,16 +4483,24 @@ impl Component for TerminalApp {
                     });
                 }
             }
-            Message::FindCase(id, sensitive) => {
+            Message::FindOption(id, option, enabled) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get_mut(id)
+                    && tab.find.open
                 {
-                    tab.find.sensitive = sensitive;
+                    let flag = match option {
+                        FindOption::Case => &mut tab.find.sensitive,
+                        FindOption::Regex => &mut tab.find.regex,
+                    };
+                    if *flag == enabled {
+                        return;
+                    }
+                    *flag = enabled;
+                    Find::limit_query(&mut tab.find.query, tab.find.regex);
                     tab.find.epoch += 1;
-                    let epoch = tab.find.epoch;
-                    self.apply_find(id, epoch);
+                    tab.find.apply(&tab.session);
                 }
             }
             Message::FindApply(id, epoch) => self.apply_find(id, epoch),
@@ -5372,6 +5445,58 @@ impl TerminalApp {
             std::thread::sleep(Duration::from_millis(400));
             Message::Smoke(step + 1)
         });
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::Find;
+    use w11term::search::{MAX_QUERY_BYTES, SearchSnapshot};
+
+    #[test]
+    fn oversized_regex_retains_one_complete_overflowing_character() {
+        let prefix = "a".repeat(MAX_QUERY_BYTES - 1);
+        let mut regex = format!("{prefix}🦀rest");
+        let mut literal = regex.clone();
+        Find::limit_query(&mut regex, true);
+        Find::limit_query(&mut literal, false);
+        assert_eq!(regex, format!("{prefix}🦀"));
+        assert_eq!(literal, prefix);
+    }
+
+    #[test]
+    fn status_ignores_an_earlier_query_or_option_during_debounce() {
+        let find = Find {
+            query: "abc".into(),
+            regex: true,
+            sensitive: true,
+            ..Find::default()
+        };
+        let result = SearchSnapshot {
+            query: find.query.clone(),
+            regex: true,
+            sensitive: true,
+            total: 3,
+            selected: Some(0),
+            ..SearchSnapshot::default()
+        };
+        assert_eq!(find.status(Some(&result)), "1 / 3");
+        for stale in [
+            SearchSnapshot {
+                query: "ab".into(),
+                ..result.clone()
+            },
+            SearchSnapshot {
+                regex: false,
+                ..result.clone()
+            },
+            SearchSnapshot {
+                sensitive: false,
+                ..result
+            },
+        ] {
+            assert_eq!(find.status(Some(&stale)), "Searching…");
+        }
     }
 }
 
