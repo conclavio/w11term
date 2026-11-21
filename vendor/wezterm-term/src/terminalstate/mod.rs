@@ -7,7 +7,7 @@ use crate::color::{ColorPalette, RgbColor};
 use crate::config::{BidiMode, NewlineCanon};
 use log::debug;
 use num_traits::ToPrimitive;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{channel, Sender};
@@ -251,11 +251,19 @@ impl ScreenOrAlt {
     }
 }
 
-/// Frozen plain text and optional exit status of the most recently completed command.
+/// Frozen visible text and optional exit status from shell integration markers.
 #[derive(Debug)]
 pub struct CompletedCommand {
+    pub id: u64,
+    pub command: Option<String>,
     pub exit_code: Option<i32>,
     pub output: Result<String, &'static str>,
+}
+
+impl CompletedCommand {
+    fn text_bytes(&self) -> usize {
+        self.command.as_ref().map_or(0, String::len) + self.output.as_ref().map_or(0, String::len)
+    }
 }
 
 /// Manages the state for the terminal
@@ -372,7 +380,10 @@ pub struct TerminalState {
     // Keep the wire authority, since URL normalization maps file://localhost
     // to an empty host. The SSH client must validate the reported destination.
     current_dir: Option<(Url, Arc<str>)>,
-    last_command: Option<Arc<CompletedCommand>>,
+    command_history: Arc<VecDeque<Arc<CompletedCommand>>>,
+    next_command_id: u64,
+    capturing_shell_input: bool,
+    command_label: Option<String>,
 
     term_program: String,
     term_version: String,
@@ -619,7 +630,10 @@ impl TerminalState {
             alert_handler: None,
             download_handler: None,
             current_dir: None,
-            last_command: None,
+            command_history: Arc::default(),
+            next_command_id: 1,
+            capturing_shell_input: false,
+            command_label: None,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
             writer,
@@ -725,7 +739,11 @@ impl TerminalState {
     }
 
     pub fn last_command(&self) -> Option<&Arc<CompletedCommand>> {
-        self.last_command.as_ref()
+        self.command_history.back()
+    }
+
+    pub fn command_history(&self) -> &Arc<VecDeque<Arc<CompletedCommand>>> {
+        &self.command_history
     }
 
     fn shell_column(&self) -> usize {
@@ -736,7 +754,7 @@ impl TerminalState {
         }
     }
 
-    fn begin_command_output(&mut self) {
+    fn mark_shell_position(&mut self) {
         if !self.is_alt_screen_active() {
             self.screen.command_start = Some((
                 self.screen.visible_row_to_stable_row(self.cursor.y),
@@ -745,11 +763,67 @@ impl TerminalState {
         }
     }
 
+    fn begin_command_input(&mut self) {
+        if !self.is_alt_screen_active() {
+            self.command_label = None;
+            self.capturing_shell_input = true;
+            self.mark_shell_position();
+        }
+    }
+
+    fn begin_command_output(&mut self) {
+        if !self.is_alt_screen_active() {
+            self.command_label = if self.capturing_shell_input {
+                let col = self.shell_column();
+                self.screen
+                    .take_command_text(self.cursor.y, col, 4096)
+                    .ok()
+                    .and_then(|mut text| {
+                        text.truncate(text.trim_end_matches(['\r', '\n']).len());
+                        (!text.is_empty()).then_some(text)
+                    })
+            } else {
+                None
+            };
+            self.capturing_shell_input = false;
+            self.mark_shell_position();
+        }
+    }
+
+    fn next_shell_prompt(&mut self) {
+        if !self.is_alt_screen_active() {
+            if !self.capturing_shell_input && self.screen.command_start.is_some() {
+                self.finish_command_output(None);
+            }
+            self.capturing_shell_input = false;
+            self.screen.command_start = None;
+            self.command_label = None;
+        }
+    }
+
     fn finish_command_output(&mut self, exit_code: Option<i32>) {
         if !self.is_alt_screen_active() {
+            if self.capturing_shell_input {
+                self.screen.command_start = None;
+                self.capturing_shell_input = false;
+            }
             let col = self.shell_column();
-            let output = self.screen.finish_command_output(self.cursor.y, col);
-            self.last_command = Some(Arc::new(CompletedCommand { exit_code, output }));
+            let output = self
+                .screen
+                .take_command_text(self.cursor.y, col, 1024 * 1024);
+            let command = Arc::new(CompletedCommand {
+                id: self.next_command_id,
+                command: self.command_label.take(),
+                exit_code,
+                output,
+            });
+            self.next_command_id += 1;
+            let history = Arc::make_mut(&mut self.command_history);
+            history.push_back(command);
+            let mut bytes: usize = history.iter().map(|entry| entry.text_bytes()).sum();
+            while history.len() > 64 || bytes > 4 * 1024 * 1024 {
+                bytes -= history.pop_front().unwrap().text_bytes();
+            }
         }
     }
 

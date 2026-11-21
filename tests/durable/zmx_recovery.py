@@ -1,26 +1,20 @@
 """Run on Linux with zmx 1.0.1, Python 3 and Vim. Does not require sshd."""
 import argparse
-import errno
-import fcntl
 import json
 import os
 from pathlib import Path
-import pty
 import re
-import select
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
-import termios
-import time
 import uuid
+
+from linux_pty import Client, TIMEOUT, eventually
 
 
 OSC = re.compile(rb"\x1b\]([^\x07\x1b]*)(?:\x07|\x1b\\)")
 EFFECTS = {b"52;c;Zml4dHVyZQ==", b"9;w11-notification", b"440;1;play;shot"}
-TIMEOUT = 15
 
 
 def image_trial(binary, env):
@@ -51,54 +45,6 @@ def image_trial(binary, env):
         if client is not None:
             client.close()
         subprocess.run([binary, "kill", name, "--force"], env=env, capture_output=True, timeout=TIMEOUT)
-
-
-def eventually(check, explanation):
-    deadline = time.monotonic() + TIMEOUT
-    while time.monotonic() < deadline:
-        if check():
-            return
-        time.sleep(0.03)
-    raise AssertionError(explanation)
-
-
-class Client:
-    """An SSH PTY's terminal-facing side; closing the master simulates losing SSH."""
-
-    def __init__(self, args, env, size):
-        self.fd, slave = pty.openpty()
-        self.output = bytearray()
-        try:
-            rows, cols = size
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-            self.process = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave,
-                                            start_new_session=True, env=env, close_fds=True)
-        except BaseException:
-            os.close(self.fd)
-            raise
-        finally:
-            os.close(slave)
-
-    def read(self, timeout=0.03):
-        if select.select([self.fd], [], [], timeout)[0]:
-            try:
-                self.output.extend(os.read(self.fd, 65536))
-            except OSError as e:
-                if e.errno != errno.EIO:
-                    raise
-        return bytes(self.output)
-
-    def send(self, data):
-        os.write(self.fd, data)
-
-    def close(self):
-        os.close(self.fd)
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
-            raise AssertionError("attachment client did not exit after terminal transport loss")
 
 
 def run(binary, vim, directory):

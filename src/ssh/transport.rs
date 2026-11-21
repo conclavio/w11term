@@ -461,6 +461,26 @@ pub(super) struct OpenShell {
     published: ShareSlot,
 }
 
+pub(super) async fn request_terminal(
+    channel: &russh::Channel<client::Msg>,
+    options: &SshOptions,
+    size: TerminalSize,
+) -> Result<()> {
+    channel
+        .request_pty(
+            true,
+            options.terminal_type.as_str(),
+            size.cols as u32,
+            size.rows as u32,
+            size.pixel_width as u32,
+            size.pixel_height as u32,
+            &[],
+        )
+        .await?;
+    channel.set_env(false, "COLORTERM", "truecolor").await?;
+    Ok(())
+}
+
 async fn connect_shell(
     options: SshOptions,
     prompts: Option<Prompts>,
@@ -745,18 +765,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     let mut children = tokio::task::JoinSet::new();
     children.spawn(crate::sftp::run(shell.link.handle(), sftp_rx, cleanup_rx));
     if !managed {
-        channel
-            .request_pty(
-                true,
-                "xterm-256color",
-                size.cols as u32,
-                size.rows as u32,
-                size.pixel_width as u32,
-                size.pixel_height as u32,
-                &[],
-            )
-            .await?;
-        channel.set_env(false, "COLORTERM", "truecolor").await?;
+        request_terminal(channel, options, *size).await?;
         if let Some(probe) = &probe {
             channel
                 .set_env(false, game_resume::ENVIRONMENT, probe.marker())

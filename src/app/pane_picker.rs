@@ -400,6 +400,7 @@ impl TerminalApp {
     }
 
     pub(super) fn open_picker(&mut self, ctx: &ComponentContext<Self>) {
+        self.close_copy_mode();
         self.close_hints();
         if self.picker.is_some() {
             return;

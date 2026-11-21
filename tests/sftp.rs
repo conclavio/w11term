@@ -55,6 +55,24 @@ impl server::Handler for Peer {
         s.channel_success(c)?;
         Ok(())
     }
+    #[cfg(feature = "ui-smoke")]
+    async fn window_change_request(
+        &mut self,
+        channel: ChannelId,
+        cols: u32,
+        rows: u32,
+        _: u32,
+        _: u32,
+        session: &mut server::Session,
+    ) -> anyhow::Result<()> {
+        if self.root.join("keyboard-input.bin").exists() {
+            session.data(
+                channel,
+                format!("\r\nssh-grid-{cols}x{rows}\r\n").into_bytes(),
+            )?;
+        }
+        Ok(())
+    }
     async fn exec_request(
         &mut self,
         c: ChannelId,
@@ -87,7 +105,12 @@ impl server::Handler for Peer {
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
         s.channel_success(c)?;
         s.data(c, b"ready\r\n".as_slice())?;
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("copy-history.vt").is_file() {
+            s.data(c, fs::read(self.root.join("copy-history.vt"))?)?;
+        }
         if self.root.join("shell directory").is_dir() {
+            s.data(c, b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07first result\r\n\x1b]133;D;0\x07".as_slice())?;
             s.data(
                 c,
                 b"\x1b]133;A\x07$ \x1b]133;B\x07status\r\n\x1b]133;C\x07".as_slice(),
@@ -443,6 +466,7 @@ async fn fixture_connections(reject: bool, connections: usize) -> FixtureServer 
         }
     });
     let source = Source::Ssh(SshOptions {
+        terminal_type: Default::default(),
         host: "127.0.0.1".into(),
         user: "test".into(),
         port,

@@ -15,7 +15,7 @@ use windows::{
     core::w,
 };
 
-const MAX_TEXT: usize = 1024 * 1024;
+pub(crate) const MAX_TEXT: usize = 1024 * 1024;
 enum Request {
     Read(mpsc::SyncSender<Result<String>>),
     Write(String, Option<mpsc::SyncSender<Result<()>>>),

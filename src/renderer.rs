@@ -62,6 +62,7 @@ impl CellHit {
 /// First renderer: cached DirectWrite layouts + GPU-resident Direct2D images.
 /// The engine/transport boundary allows an atlas renderer to replace this independently.
 pub struct Renderer {
+    pub copy_cursor: Option<w11term::interaction::Point>,
     normal: TextFormat,
     bold: TextFormat,
     small: TextFormat,
@@ -257,6 +258,7 @@ impl Renderer {
             ..Metrics::default()
         };
         Ok(Self {
+            copy_cursor: None,
             normal,
             bold,
             small: TextFormat::new("Segoe UI", 11.0)?.with_word_wrapping(WordWrapping::NoWrap),
@@ -697,17 +699,37 @@ impl Renderer {
             }
         }
         self.draw_images(&native, frame, false)?;
-        let col = frame.visual_cursor_column();
-        if frame.cursor_visible
-            && let Ok(row) = usize::try_from(frame.cursor.y)
+        let (row, col, visible) = self.copy_cursor.map_or_else(
+            || {
+                (
+                    frame.cursor.y as isize,
+                    frame.visual_cursor_column(),
+                    frame.cursor_visible,
+                )
+            },
+            |point| {
+                let row = point.row - frame.first_stable_row;
+                let col = usize::try_from(row)
+                    .ok()
+                    .and_then(|r| frame.cell_map(r))
+                    .map_or(point.col, |map| map.visual(point.col));
+                (row, col, true)
+            },
+        );
+        if visible
+            && let Ok(row) = usize::try_from(row)
             && row < self.metrics.rows
             && col < self.metrics.cols
         {
             let x = PADDING + col as f32 * cw;
-            let y = PADDING + frame.cursor.y as f32 * ch;
+            let y = PADDING + row as f32 * ch;
             brush.set_color(color(rgba(frame.palette.cursor_bg)));
             use termwiz::surface::CursorShape;
-            match frame.cursor.shape {
+            match if self.copy_cursor.is_some() {
+                CursorShape::SteadyBlock
+            } else {
+                frame.cursor.shape
+            } {
                 CursorShape::SteadyBar | CursorShape::BlinkingBar => {
                     ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, ch), &brush)
                 }
@@ -735,7 +757,7 @@ impl Renderer {
                 ""
             }
         );
-        if let Some(code) = frame.last_command.as_ref().and_then(|c| c.exit_code) {
+        if let Some(code) = frame.command_history.back().and_then(|c| c.exit_code) {
             use std::fmt::Write as _;
             let _ = write!(label, "   ·   exit {code}");
         }

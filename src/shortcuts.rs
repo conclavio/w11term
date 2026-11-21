@@ -14,6 +14,10 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
     SplitRight,
     SplitBelow,
     ZoomPane,
@@ -21,6 +25,7 @@ pub enum Action {
     MovePane,
     PanePicker,
     KeyboardHints,
+    CopyMode,
     NextTab,
     PreviousTab,
     NewTab,
@@ -56,6 +61,7 @@ impl Binding {
 }
 const CTRL_ALT: Mods = Mods::CTRL.union(Mods::ALT);
 const CTRL_SHIFT: Mods = Mods::CTRL.union(Mods::SHIFT);
+const ALT_SHIFT: Mods = Mods::ALT.union(Mods::SHIFT);
 const PANE: Mods = CTRL_ALT.union(Mods::SHIFT);
 use Action::*;
 pub const BINDINGS: &[Binding] = &[
@@ -63,6 +69,10 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(FocusRight, "focus_right", "Focus right", 0x27, CTRL_ALT),
     Binding::new(FocusUp, "focus_up", "Focus above", 0x26, CTRL_ALT),
     Binding::new(FocusDown, "focus_down", "Focus below", 0x28, CTRL_ALT),
+    Binding::new(ResizeLeft, "resize_left", "Resize left", 0x25, ALT_SHIFT),
+    Binding::new(ResizeRight, "resize_right", "Resize right", 0x27, ALT_SHIFT),
+    Binding::new(ResizeUp, "resize_up", "Resize up", 0x26, ALT_SHIFT),
+    Binding::new(ResizeDown, "resize_down", "Resize down", 0x28, ALT_SHIFT),
     Binding::new(SplitRight, "split_right", "Split right", 0x27, PANE),
     Binding::new(SplitBelow, "split_below", "Split below", 0x28, PANE),
     Binding::new(ZoomPane, "zoom_pane", "Zoom pane", 0x5a, PANE),
@@ -74,6 +84,13 @@ pub const BINDINGS: &[Binding] = &[
         "keyboard_hints",
         "Keyboard hints",
         0x48,
+        CTRL_SHIFT,
+    ),
+    Binding::new(
+        CopyMode,
+        "copy_mode",
+        "Keyboard copy mode",
+        0x58,
         CTRL_SHIFT,
     ),
     Binding::new(Workspaces, "workspaces", "Workspaces", 0, Mods::NONE),
@@ -112,12 +129,17 @@ impl Action {
                 | FocusRight
                 | FocusUp
                 | FocusDown
+                | ResizeLeft
+                | ResizeRight
+                | ResizeUp
+                | ResizeDown
                 | SplitRight
                 | SplitBelow
                 | ZoomPane
                 | ClosePane
                 | MovePane
                 | KeyboardHints
+                | CopyMode
         )
     }
 }

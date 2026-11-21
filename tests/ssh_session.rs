@@ -16,6 +16,7 @@ use wezterm_term::{KeyCode, KeyModifiers, TerminalSize};
 #[derive(Debug, PartialEq)]
 enum Observed {
     Pty(String, u32, u32),
+    Env(String, String),
     Resize(u32, u32),
     Data(Vec<u8>),
 }
@@ -78,6 +79,18 @@ impl server::Handler for Peer {
         session.channel_success(channel)?;
         Ok(())
     }
+    async fn env_request(
+        &mut self,
+        _: ChannelId,
+        name: &str,
+        value: &str,
+        _: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        self.events
+            .send(Observed::Env(name.into(), value.into()))
+            .unwrap();
+        Ok(())
+    }
     async fn shell_request(
         &mut self,
         channel: ChannelId,
@@ -120,15 +133,15 @@ impl server::Handler for Peer {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_pty_roundtrip_queries_input_and_resize() {
-    roundtrip(false).await;
+    roundtrip(false, None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyless_ssh_roundtrip_without_an_agent() {
-    roundtrip(true).await;
+    roundtrip(true, Some("xterm-sixel")).await;
 }
 
-async fn roundtrip(allow_none: bool) {
+async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
     tokio::time::timeout(Duration::from_secs(10), async {
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -174,6 +187,9 @@ async fn roundtrip(allow_none: bool) {
         };
         let session = Session::start_sized(
             Source::Ssh(SshOptions {
+                terminal_type: terminal_type
+                    .map(|name| name.to_owned().try_into().unwrap())
+                    .unwrap_or_default(),
                 host: "127.0.0.1".into(),
                 user: "terminal-test".into(),
                 port,
@@ -194,10 +210,14 @@ async fn roundtrip(allow_none: bool) {
         assert_eq!(
             next(&mut observed, &session).await,
             Observed::Pty(
-                "xterm-256color".into(),
+                terminal_type.unwrap_or("xterm-256color").into(),
                 initial_size.cols as u32,
                 initial_size.rows as u32
             )
+        );
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Env("COLORTERM".into(), "truecolor".into())
         );
         assert_eq!(
             next(&mut observed, &session).await,
