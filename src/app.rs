@@ -783,6 +783,7 @@ impl TerminalApp {
             return;
         };
         let frame = tab.session.frames.load();
+        tab.files.observe_connection(frame.connection_generation);
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
         if self.hints.borrow().as_ref().is_some_and(|h| {
             h.pane == id
@@ -818,9 +819,11 @@ impl TerminalApp {
         }
         if prompt_id.is_some() {
             self.title_editor = None;
+            tab.files.cancel_folder();
         }
-        self.keyboard
-            .set_modal(prompt_id.is_some() || self.title_editor.is_some());
+        self.keyboard.set_modal(
+            prompt_id.is_some() || self.title_editor.is_some() || tab.files.editing_folder(),
+        );
         let choosing = tab.browsing_sessions();
         if changed {
             self.keyboard
@@ -1695,9 +1698,8 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
-        if self.title_editor.take().is_some() {
-            self.keyboard.set_modal(false);
-        }
+        self.title_editor = None;
+        self.cancel_inactive_folder_editor();
         self.close_copy_mode();
         self.close_hints();
         self.sync_inspector();
@@ -1779,6 +1781,9 @@ impl TerminalApp {
             )),
             _ => None,
         };
+        if target.is_none() {
+            self.keyboard.set_modal(false);
+        }
         self.keyboard.set_target(target);
         self.sync_ime_surface();
         self.keyboard
@@ -4730,6 +4735,16 @@ impl Component for TerminalApp {
         }
         if let Some(editor) = &self.title_editor {
             views.push(KeyedView::new("rename-tab", editor.view(context)));
+        }
+        if let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.active()
+            && self.title_editor.is_none()
+            && tab.session.frames.load().prompt.is_none()
+            && let Some(dialog) = tab.files.folder_dialog(tab.session.pane_id, context)
+        {
+            views.push(KeyedView::new("new-sftp-folder", dialog));
         }
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {

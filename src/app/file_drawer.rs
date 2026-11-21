@@ -16,6 +16,9 @@ pub enum FileAction {
     Close(u64),
     Browse(u64, u64, String),
     Choose(u64, String),
+    NewFolder(u64, u64, String),
+    FolderName(u64, u64, u64, String),
+    FinishFolder(u64, u64, u64, ContentDialogResult),
     Page(u64, usize),
     Replace(u64, u64, bool),
     Pick(u64, u64, String, Option<String>),
@@ -35,7 +38,9 @@ pub(super) struct FileDrawer {
     entries: Vec<Entry>,
     page: usize,
     selected: Option<String>,
-    reveal_name: Option<String>,
+    reveal: Option<RevealTarget>,
+    editor: Option<FolderEditor>,
+    editor_serial: u64,
     replace: bool,
     picking: bool,
     parsing: bool,
@@ -51,11 +56,30 @@ pub struct Entry {
     directory: Option<bool>,
 }
 
+enum RevealTarget {
+    Existing(String),
+    CreatedFolder(String),
+}
+impl RevealTarget {
+    fn name(&self) -> &str {
+        match self {
+            Self::Existing(name) | Self::CreatedFolder(name) => name,
+        }
+    }
+}
+
+struct FolderEditor {
+    serial: u64,
+    parent: String,
+    name: String,
+}
+
 enum Step {
     Canonical,
     Listing(String),
     Upload(String),
     Download(String),
+    CreateFolder { parent: String, name: String },
 }
 
 struct Pending {
@@ -72,6 +96,35 @@ fn remote_child(directory: &str, name: &str) -> Result<String> {
         "Invalid remote filename"
     );
     Ok(format!("{}/{}", directory.trim_end_matches('/'), name))
+}
+
+fn new_folder_path(parent: &str, name: &str) -> Result<String> {
+    // Windows SFTP servers can interpret a backslash as a path separator, too.
+    ensure!(
+        !name.trim().is_empty() && !name.contains('\\') && !name.chars().any(char::is_control),
+        "Enter one folder name without path separators or control characters"
+    );
+    remote_child(parent, name)
+}
+
+// The SFTP response can already be ready when the reconnect frame reaches
+// the UI before its polling timer. Keep a known result without resubmission.
+fn folder_reconnect_status(
+    name: &str,
+    reply: &mut oneshot::Receiver<Result<Value, String>>,
+) -> String {
+    match reply.try_recv() {
+        Ok(Ok(_)) => format!("Created folder {name} before SSH reconnected. Refresh to browse."),
+        Ok(Err(error)) => format!("Could not create folder {name}: {error}"),
+        // An admitted worker request has a PendingReply guard that explicitly
+        // delivers an unknown-outcome error if the worker stops in flight.
+        Err(oneshot::error::TryRecvError::Closed) => {
+            format!("SSH reconnected before creation of {name} started.")
+        }
+        Err(oneshot::error::TryRecvError::Empty) => format!(
+            "SSH reconnected during creation of {name}. The outcome is unknown. Refresh to check."
+        ),
+    }
 }
 
 /// OSC 7 is a path hint for the existing SFTP connection. Preserve the raw
@@ -241,8 +294,97 @@ fn pick_local(owner: usize, remote: Option<&str>) -> Result<Option<PathBuf>> {
 }
 
 impl FileDrawer {
+    pub(super) fn editing_folder(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    pub(super) fn cancel_folder(&mut self) {
+        if self.editor.take().is_some() {
+            self.cached.get_mut().take();
+        }
+    }
+
+    fn begin_folder(&mut self, parent: String) -> Result<()> {
+        ensure!(
+            self.open && !self.busy() && self.directory.as_ref() == Some(&parent),
+            "The directory changed. Open New folder again."
+        );
+        self.editor_serial = self.editor_serial.wrapping_add(1);
+        self.editor = Some(FolderEditor {
+            serial: self.editor_serial,
+            parent,
+            name: String::new(),
+        });
+        Ok(())
+    }
+
+    fn finish_folder(
+        &mut self,
+        serial: u64,
+        result: ContentDialogResult,
+    ) -> Result<Option<(FolderEditor, String)>> {
+        if !self.editor.as_ref().is_some_and(|e| e.serial == serial) {
+            return Ok(None);
+        }
+        let editor = self.editor.take().unwrap();
+        if result != ContentDialogResult::Primary {
+            return Ok(None);
+        }
+        ensure!(
+            self.open && self.directory.as_ref() == Some(&editor.parent),
+            "The directory changed. Open New folder again."
+        );
+        let path = new_folder_path(&editor.parent, &editor.name)?;
+        Ok(Some((editor, path)))
+    }
+
+    pub(super) fn folder_dialog(
+        &self,
+        pane: u64,
+        context: &ViewContext<TerminalApp>,
+    ) -> Option<View> {
+        let editor = self.editor.as_ref()?;
+        let serial = editor.serial;
+        let generation = self.generation;
+        let valid = new_folder_path(&editor.parent, &editor.name);
+        let mut fields = vec![KeyedView::new(
+            "name",
+            TextBox::new()
+                .automation_name("Folder name")
+                .text(&editor.name)
+                .on_text_changed(context.callback(move |name| {
+                    Message::Files(FileAction::FolderName(pane, generation, serial, name))
+                })),
+        )];
+        if !editor.name.is_empty()
+            && let Err(error) = &valid
+        {
+            fields.push(KeyedView::new(
+                "error",
+                TextBlock::new().text(error.to_string()),
+            ));
+        }
+        Some(
+            ContentDialog::new()
+                .title("New folder")
+                .primary_button_text("Create")
+                .is_primary_button_enabled(valid.is_ok())
+                .close_button_text("Cancel")
+                .is_open(true)
+                .on_closed(context.callback(move |result| {
+                    Message::Files(FileAction::FinishFolder(pane, generation, serial, result))
+                }))
+                .content(
+                    StackPanel::new()
+                        .spacing(8.0)
+                        .min_width(300.0)
+                        .keyed_children(fields),
+                ),
+        )
+    }
+
     pub(super) fn awaiting_native_result(&self) -> bool {
-        self.picking || self.parsing
+        self.picking || self.parsing || self.editing_folder()
     }
 
     pub(super) fn bind_window(&mut self, sender: LocalSender<Message>) {
@@ -253,27 +395,29 @@ impl FileDrawer {
     }
 
     pub(super) fn busy(&self) -> bool {
-        self.picking || self.parsing || self.pending.is_some()
+        self.awaiting_native_result() || self.pending.is_some()
     }
 
     pub(super) fn observe_connection(&mut self, generation: u64) {
         if self.generation == generation {
             return;
         }
-        let status = if self
-            .pending
-            .as_ref()
-            .is_some_and(|p| matches!(p.step, Step::Upload(_)))
-        {
-            "SSH reconnected during upload. The remote file may be incomplete. Refresh to browse."
-        } else {
-            "SSH connected. Refresh to browse."
+        let status = match self.pending.as_mut() {
+            Some(Pending { step: Step::CreateFolder { name, .. }, reply, .. }) => {
+                folder_reconnect_status(name, reply)
+            }
+            Some(Pending { step: Step::Upload(_), .. }) =>
+                "SSH reconnected during upload. The remote file may be incomplete. Refresh to browse.".into(),
+            _ => match &self.reveal {
+                Some(RevealTarget::CreatedFolder(name)) => format!("Created folder {name} before SSH reconnected. Refresh to browse."),
+                _ => "SSH connected. Refresh to browse.".into(),
+            }
         };
         *self = Self {
             open: self.open,
             following: self.following,
             generation,
-            status: status.into(),
+            status,
             ..Self::default()
         };
     }
@@ -348,6 +492,11 @@ impl FileDrawer {
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
                 .children((
+                    button(
+                        "New folder",
+                        writable,
+                        NewFolder(pane, generation, folder.into()),
+                    ),
                     button(
                         "Open folder",
                         ready && selected.is_some_and(|e| e.directory != Some(false)),
@@ -514,6 +663,8 @@ impl FileDrawer {
         session
             .input
             .send(Command::Sftp(Job {
+                expected_generation: matches!(step, Step::CreateFolder { .. })
+                    .then_some(self.generation),
                 operation,
                 progress: tx_progress,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
@@ -538,7 +689,7 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.status = "Reading directory…".into();
-        self.reveal_name = None;
+        self.reveal = None;
         self.job(
             id,
             session,
@@ -603,6 +754,11 @@ impl FileDrawer {
                 }
                 return Ok(());
             }
+            Err(oneshot::error::TryRecvError::Closed)
+                if matches!(pending.step, Step::CreateFolder { .. }) =>
+            {
+                Err("SSH connection closed before folder creation started.".into())
+            }
             Err(oneshot::error::TryRecvError::Closed) => Err("SSH connection closed".into()),
             Ok(result) => result,
         };
@@ -611,6 +767,9 @@ impl FileDrawer {
         let reply = match result {
             Ok(reply) => reply,
             Err(error) => {
+                if let Step::CreateFolder { name, .. } = &step {
+                    bail!("Could not create folder {name}: {error}");
+                }
                 if let Step::Upload(name) = &step {
                     if !self.replace && self.entries.iter().any(|entry| &entry.name == name) {
                         bail!("Upload of {name} failed (replacing files is off): {error}");
@@ -674,6 +833,19 @@ impl FileDrawer {
                     self.upload_next(id, session, context)?;
                 }
             }
+            Step::CreateFolder { parent, name } => {
+                self.status = format!("Created folder {name}");
+                self.reveal = Some(RevealTarget::CreatedFolder(name));
+                self.job(
+                    id,
+                    session,
+                    Operation::Ls {
+                        path: parent.clone(),
+                    },
+                    Step::Listing(parent),
+                    context,
+                )?;
+            }
             Step::Download(name) => {
                 self.status = format!("Downloaded {name} ({} bytes)", reply["bytes_transferred"])
             }
@@ -711,6 +883,29 @@ impl LiveTab {
 }
 
 impl TerminalApp {
+    pub(super) fn cancel_inactive_folder_editor(&mut self) {
+        let inactive = self
+            .tabs
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.value.page {
+                Page::Terminal(tab)
+                    if Some(entry.id) != self.tabs.active_id() && tab.files.editing_folder() =>
+                {
+                    Some(entry.id)
+                }
+                _ => None,
+            });
+        if let Some(id) = inactive
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+        {
+            tab.files.cancel_folder();
+        }
+    }
+
     pub(super) fn with_file_drawer(&self, content: View, context: &ViewContext<Self>) -> View {
         let Some(AppTab {
             page: Page::Terminal(tab),
@@ -753,6 +948,9 @@ impl TerminalApp {
             | Reveal(id, ..)
             | Browse(id, ..)
             | Choose(id, _)
+            | NewFolder(id, ..)
+            | FolderName(id, ..)
+            | FinishFolder(id, ..)
             | Page(id, _)
             | Replace(id, ..)
             | Pick(id, ..)
@@ -778,21 +976,28 @@ impl TerminalApp {
         let session = &tab.session;
         let files = &mut tab.files;
         let frame = session.frames.load();
+        let was_editing = files.editing_folder();
         files.observe_connection(frame.connection_generation);
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
+        if matches!(&action, NewFolder(_, g, ..) | FolderName(_, g, ..) | FinishFolder(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
         {
+            if was_editing && visible && !files.editing_folder() {
+                self.connection_ui(id);
+            }
             return;
         }
-        if !matches!(action, Tick(_)) {
+        if !matches!(action, Tick(_) | FolderName(..)) {
             files.cached.borrow_mut().take();
         }
         let result = (|| -> Result<()> {
             match action {
                 Toggle => {
                     files.open = !files.open;
+                    if !files.open {
+                        files.cancel_folder();
+                    }
                     self.initial_grid.set(None);
                     crate::input::clear_grid();
                     if files.open && files.directory.is_none() && !files.busy() {
@@ -810,6 +1015,7 @@ impl TerminalApp {
                     }
                 }
                 Close(_) => {
+                    files.cancel_folder();
                     files.open = false;
                 }
                 Follow(_, _, enabled) => {
@@ -825,7 +1031,7 @@ impl TerminalApp {
                         self.initial_grid.set(None);
                         crate::input::clear_grid();
                         files.browse(pane, session, directory, context)?;
-                        files.reveal_name = name;
+                        files.reveal = name.map(RevealTarget::Existing);
                     }
                 }
                 Tick(_) => files.tick(pane, session, context)?,
@@ -838,10 +1044,19 @@ impl TerminalApp {
                     if files.status == "Reading directory…" {
                         files.status.clear();
                     }
-                    if let Some(name) = files.reveal_name.take() {
-                        if let Some(i) = files.entries.iter().position(|entry| entry.name == name) {
+                    if let Some(target) = files.reveal.take() {
+                        let name = target.name();
+                        if let Some(i) = files.entries.iter().position(|entry| {
+                            entry.name == name
+                                && (!matches!(target, RevealTarget::CreatedFolder(_))
+                                    || entry.directory != Some(false))
+                        }) {
                             files.page = i / PAGE_SIZE;
-                            files.selected = Some(name);
+                            files.selected = Some(name.into());
+                        } else if matches!(target, RevealTarget::CreatedFolder(_)) {
+                            files.status = format!(
+                                "Created folder {name}, but it is no longer listed as a folder"
+                            );
                         } else {
                             files.status = format!("No entry named {name} in this directory");
                         }
@@ -871,7 +1086,35 @@ impl TerminalApp {
                         files.upload_next(pane, session, context)?;
                     }
                 }
+                FolderName(_, _, serial, name) => {
+                    if let Some(editor) = files.editor.as_mut().filter(|e| e.serial == serial) {
+                        editor.name = name;
+                    }
+                }
+                FinishFolder(_, _, serial, result) => {
+                    if let Some((FolderEditor { parent, name, .. }, path)) =
+                        files.finish_folder(serial, result)?
+                    {
+                        files.status = format!("Creating folder {name}…");
+                        files.job(
+                            pane,
+                            session,
+                            Operation::Mkdir {
+                                path,
+                                attrs: Default::default(),
+                            },
+                            Step::CreateFolder { parent, name },
+                            context,
+                        )?;
+                    }
+                }
                 _ if files.busy() || !files.open => {}
+                NewFolder(_, _, parent)
+                    if frame.prompt.is_none() && self.title_editor.is_none() =>
+                {
+                    files.begin_folder(parent)?;
+                }
+                NewFolder(..) => {}
                 Browse(_, _, path) => {
                     if files.directory.as_ref() != Some(&path) {
                         files.following = false;
@@ -933,11 +1176,19 @@ impl TerminalApp {
         })();
         if let Err(error) = result {
             files.uploads.clear();
-            files.status = format!("{error:#}");
+            files.status = match files.reveal.take() {
+                Some(RevealTarget::CreatedFolder(name)) => {
+                    format!("Created folder {name}, but refreshing the directory failed: {error:#}")
+                }
+                _ => format!("{error:#}"),
+            };
             files.cached.borrow_mut().take();
         }
         if visible {
             tab.follow_shell_directory(&frame, context);
+            if was_editing != tab.files.editing_folder() {
+                self.connection_ui(id);
+            }
         }
     }
 }
@@ -1256,6 +1507,108 @@ mod tests {
         for invalid in ["", ".", "..", "a/b", "bad\0name"] {
             assert!(remote_child("/", invalid).is_err());
         }
+    }
+
+    #[test]
+    fn new_folder_is_one_remote_component_and_preserves_unicode_and_spaces() {
+        assert_eq!(
+            new_folder_path("/work/", " Résumé 2026 ").unwrap(),
+            "/work/ Résumé 2026 "
+        );
+        for name in [
+            "",
+            " \t ",
+            ".",
+            "..",
+            "a/b",
+            "/abs",
+            r"a\b",
+            r"..\escape",
+            "bad\0name",
+            "line\nbreak",
+        ] {
+            assert!(new_folder_path("/work", name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn folder_dialog_captures_parent_and_defers_follow_until_its_own_completion() {
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 4,
+            following: true,
+            directory: Some("/work".into()),
+            ..Default::default()
+        };
+        assert!(drawer.begin_folder("/obsolete".into()).is_err());
+        drawer.begin_folder("/work".into()).unwrap();
+        let first = drawer.editor_serial;
+        let changed = Some(Arc::from("file://server/new"));
+        assert!(drawer.follow_target(&changed, "server").is_none());
+        drawer.cancel_folder();
+        drawer.begin_folder("/work".into()).unwrap();
+        let current = drawer.editor_serial;
+        drawer.editor.as_mut().unwrap().name = "prepared".into();
+        assert!(
+            drawer
+                .finish_folder(first, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert!(drawer.editing_folder());
+        let (editor, path) = drawer
+            .finish_folder(current, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (&*editor.parent, &*editor.name, &*path),
+            ("/work", "prepared", "/work/prepared")
+        );
+        assert!(
+            drawer
+                .finish_folder(current, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            drawer.follow_target(&changed, "server").as_deref(),
+            Some("/new")
+        );
+        drawer.begin_folder("/work".into()).unwrap();
+        drawer.directory = Some("/other".into());
+        assert!(
+            drawer
+                .finish_folder(drawer.editor_serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+        drawer.begin_folder("/other".into()).unwrap();
+        drawer.observe_connection(5);
+        assert!(
+            drawer
+                .finish_folder(drawer.editor_serial, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert!(drawer.directory.is_none());
+    }
+
+    #[test]
+    fn folder_reconnect_status_keeps_success_failure_and_unknown_outcomes_distinct() {
+        let (pending, mut reply) = oneshot::channel();
+        assert!(folder_reconnect_status("test", &mut reply).contains("outcome is unknown"));
+        pending.send(Ok(json!({}))).unwrap();
+        assert!(folder_reconnect_status("test", &mut reply).starts_with("Created folder test"));
+        let (pending, mut reply) = oneshot::channel();
+        pending.send(Err("permission denied".into())).unwrap();
+        assert_eq!(
+            folder_reconnect_status("test", &mut reply),
+            "Could not create folder test: permission denied"
+        );
+        let (pending, mut reply) = oneshot::channel();
+        drop(pending);
+        assert!(
+            folder_reconnect_status("test", &mut reply).contains("before creation of test started")
+        );
     }
 
     #[test]
