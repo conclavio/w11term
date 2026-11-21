@@ -86,6 +86,29 @@ impl LocalOptions {
         Ok(())
     }
 
+    /// Verify the configured directory and explicit program path before a
+    /// multi-pane launch. Bare command names retain CreateProcess lookup.
+    pub fn check_launch_paths(&self) -> Result<()> {
+        if let Some(cwd) = &self.cwd {
+            ensure!(
+                cwd.is_dir(),
+                "Local working directory is unavailable: {}",
+                cwd.display()
+            );
+        }
+        let executable = &self.executable;
+        if executable.is_absolute() {
+            ensure!(
+                executable.is_file()
+                    || (executable.extension().is_none()
+                        && executable.with_extension("exe").is_file()),
+                "Local executable is unavailable: {}",
+                executable.display()
+            );
+        }
+        Ok(())
+    }
+
     pub fn installed() -> BTreeMap<String, Self> {
         let mut shells = BTreeMap::new();
         let mut add = |label: &str, path: PathBuf| {
