@@ -11,6 +11,7 @@ pub(super) fn menu_action(label: &str) -> Option<Action> {
     Some(match label {
         "Detach from remote session" => Action::Run(DurableAction::Detach),
         "Reattach to remote session" => Action::Run(DurableAction::Reattach),
+        "Find remote sessions again" => Action::Run(DurableAction::Refresh),
         "End remote session…" => Action::ConfirmEnd(true),
         "Cancel ending session" => Action::ConfirmEnd(false),
         "Confirm end remote session" => Action::Run(DurableAction::End),
@@ -51,6 +52,9 @@ pub(super) fn pane_menu(live: &LiveTab) -> Option<MenuItem> {
         if state.permits(action) {
             actions.push(MenuItem::item(key, label));
         }
+    }
+    if !state.phase.is_browser() && state.permits(DurableAction::Refresh) {
+        actions.push(MenuItem::item("find-again", "Find remote sessions again"));
     }
     if state.permits(DurableAction::End) {
         if live.confirm_end {
@@ -158,8 +162,11 @@ impl TerminalApp {
                     return;
                 }
                 live.confirm_end = false;
+                let browsing = command == DurableAction::Refresh;
                 if let Err(error) = live.session.durable_action(command) {
                     live.device_message = Some(format!("Remote session: {error:#}"));
+                } else if browsing {
+                    live.discovery_page = Some(0);
                 }
             }
             Action::ConfirmEnd(value) => live.confirm_end = value,
