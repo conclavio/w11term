@@ -855,10 +855,10 @@ impl TerminalApp {
         }
         if prompt_id.is_some() {
             self.title_editor = None;
-            tab.files.cancel_folder();
+            tab.files.cancel_name_edit();
         }
         self.keyboard.set_modal(
-            prompt_id.is_some() || self.title_editor.is_some() || tab.files.editing_folder(),
+            prompt_id.is_some() || self.title_editor.is_some() || tab.files.editing_name(),
         );
         let choosing = tab.browsing_sessions();
         if changed {
@@ -1756,7 +1756,7 @@ impl TerminalApp {
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
         self.title_editor = None;
-        self.cancel_inactive_folder_editor();
+        self.cancel_inactive_name_editor();
         self.close_copy_mode();
         self.close_hints();
         self.sync_inspector();
@@ -4927,9 +4927,9 @@ impl Component for TerminalApp {
         }) = self.tabs.active()
             && self.title_editor.is_none()
             && tab.session.frames.load().prompt.is_none()
-            && let Some(dialog) = tab.files.folder_dialog(tab.session.pane_id, context)
+            && let Some(dialog) = tab.files.name_dialog(tab.session.pane_id, context)
         {
-            views.push(KeyedView::new("new-sftp-folder", dialog));
+            views.push(KeyedView::new("sftp-name-editor", dialog));
         }
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {
