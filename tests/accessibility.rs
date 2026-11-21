@@ -228,6 +228,34 @@ fn native_reader_reads_a_terminal_selection_and_tracks_focus_between_split_panes
             }
         }
         client.RemoveAllEventHandlers()?;
+        let marker = std::fs::read_to_string(gui.state.path().join("right-reader"))?;
+        let hwnd: usize = marker.split_whitespace().next().unwrap().parse()?;
+        let root = client.ElementFromHandle(HWND(hwnd as *mut _))?;
+        for (command, cell, target) in [
+            ("plain", "1, 1", "None"),
+            ("osc", "1, 2", "https://osc.example/test"),
+            ("detected", "1, 3", "https://text.example/path"),
+            ("neighbor", "Outside grid", "None"),
+        ] {
+            let pending = gui.state.path().join("pending-pointer");
+            std::fs::write(&pending, command)?;
+            std::fs::rename(pending, gui.state.path().join("pointer"))?;
+            for label in [
+                format!("Pointer cell   {cell}"),
+                format!("Hyperlink   {target}"),
+            ] {
+                let condition =
+                    client.CreatePropertyCondition(UIA_NamePropertyId, &label.as_str().into())?;
+                let wait = Instant::now() + Duration::from_secs(5);
+                while root.FindFirst(TreeScope_Descendants, &condition).is_err() {
+                    anyhow::ensure!(
+                        Instant::now() < wait,
+                        "inspector did not expose {label:?} after {command}"
+                    );
+                    std::thread::sleep(Duration::from_millis(35));
+                }
+            }
+        }
         std::fs::write(gui.state.path().join("switch"), b"")?;
         let left = read_pane(&client, gui.state.path(), "left-reader")?;
         assert!(

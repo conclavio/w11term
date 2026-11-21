@@ -9,6 +9,34 @@ pub(super) struct Inspection {
     pub(super) modes: Option<TerminalModes>,
     input: tokio::sync::mpsc::UnboundedSender<Command>,
     readout: View,
+    pointer: PointerReadout,
+}
+
+#[derive(Default)]
+struct PointerReadout {
+    position: Option<(f64, f64)>,
+    cell: Option<(usize, usize)>,
+    target: Option<String>,
+}
+
+// Remote hyperlink labels are display-only. Limit them to one short line.
+fn target_label(uri: &str) -> String {
+    let mut chars = uri.chars().map(|c| match c {
+        '\u{061c}'
+        | '\u{200e}'
+        | '\u{200f}'
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{2028}'
+        | '\u{2029}' => '�',
+        c if c.is_control() => '�',
+        c => c,
+    });
+    let mut label: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        label.push('…');
+    }
+    label
 }
 
 impl Drop for Inspection {
@@ -67,6 +95,44 @@ fn mouse_label(modes: TerminalModes) -> String {
 }
 
 impl Inspection {
+    pub(super) fn clear_pointer(&mut self) {
+        self.pointer = Default::default();
+    }
+
+    pub(super) fn observe_pointer(
+        &mut self,
+        pos: (f64, f64),
+        hit: &crate::renderer::CellHit,
+        frame: &w11term::terminal::Snapshot,
+        link: Option<&Link>,
+    ) {
+        self.pointer.position = Some(pos);
+        if hit.inside && hit.col < frame.cols && hit.row < frame.rows.len() {
+            self.pointer.cell = Some((hit.col + 1, hit.row + 1));
+            self.pointer.target = link.map(|value| target_label(&value.uri));
+        } else {
+            self.pointer.cell = None;
+            self.pointer.target = None;
+        }
+    }
+
+    pub(super) fn refresh_pointer(
+        &mut self,
+        metrics: Metrics,
+        frame: &w11term::terminal::Snapshot,
+        detect_urls: bool,
+    ) {
+        if let Some((x, y)) = self.pointer.position {
+            let hit = metrics.hit(x, y);
+            let link = if hit.inside {
+                link_at(frame, hit.point(frame), detect_urls)
+            } else {
+                None
+            };
+            self.observe_pointer((x, y), &hit, frame, link.as_ref());
+        }
+    }
+
     pub(super) fn refresh(&mut self, current: Option<TerminalModes>) {
         if self.modes == current {
             return;
@@ -128,6 +194,16 @@ impl Inspection {
                                 .content("×"),
                         )),
                     self.readout.clone(),
+                    TextBlock::new().text(self.pointer.cell.map_or_else(
+                        || "Pointer cell   Outside grid".into(),
+                        |(col, row)| format!("Pointer cell   {col}, {row}"),
+                    )),
+                    TextBlock::new()
+                        .text(format!(
+                            "Hyperlink   {}",
+                            self.pointer.target.as_deref().unwrap_or("None")
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
                 )),
             )
     }
@@ -162,6 +238,7 @@ impl TerminalApp {
             modes: None,
             input,
             readout: TextBlock::new().text(status).into(),
+            pointer: Default::default(),
         });
     }
 }
@@ -171,6 +248,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn viewport_cells_use_pane_dips_and_resolve_the_visible_scrollback_frame() {
+        let (input, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut inspector = Inspection {
+            pane: 1,
+            modes: None,
+            input,
+            readout: TextBlock::new().into(),
+            pointer: Default::default(),
+        };
+        let (writer, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(
+            TerminalSize {
+                rows: 3,
+                cols: 40,
+                ..Default::default()
+            },
+            writer,
+        );
+        terminal.advance_bytes(b"one\r\ntwo\r\nthree\r\nhttps://scroll.example/\r\nlive\r\nend");
+        let frame = |offset| {
+            w11term::terminal::Snapshot::capture(&terminal, None, 1, offset, String::new(), 0)
+        };
+        let scrolled = frame(1);
+        assert!(scrolled.first_stable_row > 0);
+        let metrics = Metrics {
+            cell_width: 8.5,
+            cell_height: 16.25,
+            cols: 40,
+            rows: 3,
+            scale: 1.5,
+        };
+        let pos = (
+            (PADDING + 2.5 * metrics.cell_width) as f64,
+            (PADDING + 1.5 * metrics.cell_height) as f64,
+        );
+        let hit = metrics.hit(pos.0, pos.1);
+        assert_eq!(hit.point(&scrolled).row, scrolled.first_stable_row + 1);
+        inspector.pointer.position = Some(pos);
+        inspector.refresh_pointer(metrics, &scrolled, true);
+        assert_eq!(inspector.pointer.cell, Some((3, 2)));
+        assert_eq!(
+            inspector.pointer.target.as_deref(),
+            Some("https://scroll.example/")
+        );
+        inspector.refresh_pointer(metrics, &scrolled, false);
+        assert!(inspector.pointer.target.is_none());
+        inspector.refresh_pointer(metrics, &frame(0), true);
+        assert!(inspector.pointer.target.is_none());
+        for (x, y) in [
+            (pos.0, 0.0),
+            (0.0, pos.1),
+            (pos.0, (PADDING + 3.0 * metrics.cell_height) as f64),
+            ((PADDING + 40.0 * metrics.cell_width) as f64, pos.1),
+        ] {
+            inspector.pointer.position = Some((x, y));
+            inspector.refresh_pointer(metrics, &scrolled, true);
+            assert!(inspector.pointer.cell.is_none());
+        }
+        inspector.clear_pointer();
+        assert!(inspector.pointer.position.is_none());
+    }
+
+    #[test]
+    fn remote_targets_are_bounded_single_line_plain_text() {
+        let label = target_label(&format!("https://example/\u{202e}\n{}", "é".repeat(400)));
+        assert_eq!(label.chars().count(), 161);
+        assert!(label.starts_with("https://example/��"));
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
     fn a_cleared_observation_advances_the_watcher_baseline() {
         let (input, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut inspector = Inspection {
@@ -178,6 +326,7 @@ mod tests {
             modes: None,
             input,
             readout: TextBlock::new().text("Waiting").into(),
+            pointer: Default::default(),
         };
         let modes = TerminalModes {
             cols: 80,
