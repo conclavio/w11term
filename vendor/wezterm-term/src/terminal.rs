@@ -33,13 +33,14 @@ pub trait DeviceControlHandler: Send + Sync {
     fn handle_device_control(&mut self, _control: wezterm_escape_parser::DeviceControlMode);
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum Progress {
     #[default]
     None,
     Percentage(u8),
     Error(u8),
+    Paused(u8),
     Indeterminate,
 }
 

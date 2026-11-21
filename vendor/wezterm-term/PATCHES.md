@@ -52,3 +52,8 @@ The original MIT license is preserved in `LICENSE.md`.
   reset notifications as the parser processes them. This lets the command
   completion watch observe a short command even when several complete in one
   input batch or its output has already left scrollback.
+
+- OSC 9;4 retains the percentage of a paused operation. Error and paused
+  states with an omitted or zero value reuse the previous percentage, including
+  across indeterminate updates. A fresh warning starts at 10%, matching Windows
+  Terminal. RIS and transport reset clear both the state and the stored value.

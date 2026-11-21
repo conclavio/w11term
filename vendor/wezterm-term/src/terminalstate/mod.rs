@@ -365,6 +365,8 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    // OSC 9;4 preserves the previous value while the bar is indeterminate.
+    progress_value: u8,
 
     palette: Option<ColorPalette>,
 
@@ -655,6 +657,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            progress_value: 0,
         }
     }
 
@@ -747,7 +750,7 @@ impl TerminalState {
     }
 
     pub fn get_progress(&self) -> Progress {
-        self.progress.clone()
+        self.progress
     }
 
     /// Returns the current working directory associated with the

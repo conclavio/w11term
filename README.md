@@ -51,6 +51,8 @@ Use **Ctrl+Shift+P** or **caret → Find pane…** to search every terminal pane
 
 The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
+Builds, deployments, and other programs that emit **OSC 9;4** can report progress in the tab header and on the window’s Windows taskbar button. The header shows a percentage, **Paused**, **Error**, or **In progress**. When several panes report at once, an error takes priority, followed by paused, normal, and indeterminate progress. Within the same state the least complete operation wins. Clearing a pane’s progress reveals the next one. [Windows Terminal progress sequences](https://learn.microsoft.com/en-us/windows/terminal/tutorials/progress-bar-sequences)
+
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
 
 Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.

@@ -140,6 +140,15 @@ impl server::Handler for Peer {
                     .open(self.root.join("keyboard-input.bin"))?
                     .write_all(data)?;
             }
+            #[cfg(feature = "ui-smoke")]
+            if data == b"\x04" && self.root.join("disconnect-on-eot").is_file() {
+                s.disconnect(
+                    russh::Disconnect::ByApplication,
+                    "test connection loss",
+                    "en",
+                )?;
+                return Ok(());
+            }
             s.data(c, data.to_vec())?;
         }
         Ok(())
