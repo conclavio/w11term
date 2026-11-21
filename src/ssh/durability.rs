@@ -276,18 +276,7 @@ impl Program {
             format!("zmx attach {} /bin/false", reference.name)
         };
         let channel = shell.channel.channel();
-        channel
-            .request_pty(
-                true,
-                "xterm-256color",
-                size.cols as u32,
-                size.rows as u32,
-                size.pixel_width as u32,
-                size.pixel_height as u32,
-                &[],
-            )
-            .await?;
-        channel.set_env(false, "COLORTERM", "truecolor").await?;
+        super::transport::request_terminal(channel, &options, size).await?;
         channel.exec(true, attach).await?;
         let mut early = Vec::new();
         tokio::time::timeout(Duration::from_secs(10), async {

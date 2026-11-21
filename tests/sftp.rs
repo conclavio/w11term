@@ -466,6 +466,7 @@ async fn fixture_connections(reject: bool, connections: usize) -> FixtureServer 
         }
     });
     let source = Source::Ssh(SshOptions {
+        terminal_type: Default::default(),
         host: "127.0.0.1".into(),
         user: "test".into(),
         port,

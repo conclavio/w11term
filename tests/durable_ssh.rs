@@ -67,6 +67,8 @@ struct Backend {
     commands: Vec<String>,
     input: Vec<Vec<u8>>,
     grids: Vec<(u32, u32)>,
+    terminal_types: Vec<String>,
+    environments: Vec<(String, String)>,
     missing_program: bool,
     hold_once: bool,
     replace_on_resume: bool,
@@ -99,7 +101,7 @@ impl server::Handler for Peer {
     async fn pty_request(
         &mut self,
         c: ChannelId,
-        _: &str,
+        term: &str,
         columns: u32,
         rows: u32,
         _: u32,
@@ -107,8 +109,24 @@ impl server::Handler for Peer {
         _: &[(russh::Pty, u32)],
         s: &mut server::Session,
     ) -> Result<()> {
-        self.backend.lock().unwrap().grids.push((columns, rows));
+        let mut backend = self.backend.lock().unwrap();
+        backend.grids.push((columns, rows));
+        backend.terminal_types.push(term.into());
         s.channel_success(c)?;
+        Ok(())
+    }
+    async fn env_request(
+        &mut self,
+        _: ChannelId,
+        name: &str,
+        value: &str,
+        _: &mut server::Session,
+    ) -> Result<()> {
+        self.backend
+            .lock()
+            .unwrap()
+            .environments
+            .push((name.into(), value.into()));
         Ok(())
     }
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> Result<()> {
@@ -317,7 +335,8 @@ async fn native_find_session_on_plain_ssh_profile() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_client_discovers_an_existing_pty_then_attaches_on_its_verified_connection() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    fixture.options.terminal_type = "xterm-sixel".to_owned().try_into().unwrap();
     let ref1 = existing_session(&fixture);
     let browser = Session::discover_durable(fixture.options.clone(), Default::default(), false);
     phase(&browser, DurablePhase::Choosing).await;
@@ -364,6 +383,8 @@ async fn fresh_client_discovers_an_existing_pty_then_attaches_on_its_verified_co
     let b = fixture.peer.backend.lock().unwrap();
     assert_eq!(b.authenticated, 1);
     assert_eq!(b.input, [b"after selection".to_vec()]);
+    assert_eq!(b.terminal_types, ["xterm-sixel"]);
+    assert_eq!(b.environments, [("COLORTERM".into(), "truecolor".into())]);
     let probe = format!("zmx get {} w11term_generation", ref1.name);
     assert_eq!(
         &b.commands[2..],

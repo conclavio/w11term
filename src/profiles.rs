@@ -242,6 +242,9 @@ impl ProfileStore {
             }
             let keep_route =
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
+            if options.terminal_type.is_default() {
+                object.remove("terminal_type");
+            }
             if !keep_route && options.proxy_jump.is_empty() {
                 object.remove("proxy_jump");
             }
@@ -341,6 +344,7 @@ mod tests {
         let store = ProfileStore::new(path.clone()).unwrap();
         let options = SshOptions {
             host: "new.test".into(),
+            terminal_type: Default::default(),
             user: "root".into(),
             port: 22,
             authentication: Authentication::Identity {
@@ -415,12 +419,17 @@ mod edit_tests {
         let mut changed = original.clone();
         changed.host = "fixed.test".into();
         changed.port = 6792;
+        changed.terminal_type = "xterm-sixel".to_owned().try_into().unwrap();
         store.edit("typo", "correct", &changed, &original).unwrap();
         let document: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(document["theme"], "dark");
         assert_eq!(document["profiles"]["correct"]["custom"], 42);
         assert_eq!(document["profiles"]["correct"]["identity"], "keys/id");
+        assert_eq!(
+            document["profiles"]["correct"]["terminal_type"],
+            "xterm-sixel"
+        );
         assert_eq!(
             document["profiles"]["correct"]["player"]["device_key"],
             "keys/device"
@@ -437,12 +446,18 @@ mod edit_tests {
         assert_eq!(std::fs::read(&path).unwrap(), saved);
         let mut keyless = changed.clone();
         keyless.authentication = Authentication::None;
+        keyless.terminal_type = Default::default();
         store
             .edit("correct", "correct", &keyless, &changed)
             .unwrap();
         let document: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(document["profiles"]["correct"].get("identity").is_none());
+        assert!(
+            document["profiles"]["correct"]
+                .get("terminal_type")
+                .is_none()
+        );
         assert_eq!(store.load().unwrap()["other"].host, "other.test");
     }
 }
