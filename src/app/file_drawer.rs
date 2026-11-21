@@ -43,8 +43,8 @@ pub(super) struct FileDrawer {
     page: usize,
     selected: Option<String>,
     reveal: Option<RevealTarget>,
-    editor: Option<NameEditor>,
-    editor_serial: u64,
+    dialog: Option<EntryDialog>,
+    dialog_serial: u64,
     replace: bool,
     picking: bool,
     parsing: bool,
@@ -103,7 +103,7 @@ impl RevealTarget {
     }
 }
 
-struct NameEditor {
+struct EntryDialog {
     serial: u64,
     parent: String,
     name: String,
@@ -125,7 +125,7 @@ impl EditAction {
     }
 }
 
-impl NameEditor {
+impl EntryDialog {
     fn destination(&self) -> Result<String> {
         match &self.action {
             EditAction::Rename(original) => {
@@ -364,17 +364,17 @@ fn dialog_filename(remote: &str) -> &str {
 }
 
 impl FileDrawer {
-    pub(super) fn editing_name(&self) -> bool {
-        self.editor.is_some()
+    pub(super) fn entry_dialog_open(&self) -> bool {
+        self.dialog.is_some()
     }
 
-    pub(super) fn cancel_name_edit(&mut self) {
+    pub(super) fn cancel_entry_dialog(&mut self) {
         if self.identifying_delete() {
             self.pending.take();
             self.status.clear();
             self.cached.get_mut().take();
         }
-        if self.editor.take().is_some() {
+        if self.dialog.take().is_some() {
             self.cached.get_mut().take();
         }
     }
@@ -455,9 +455,9 @@ impl FileDrawer {
                 "The server did not identify the listed entry as the selected type"
             );
         }
-        self.editor_serial = self.editor_serial.wrapping_add(1);
-        self.editor = Some(NameEditor {
-            serial: self.editor_serial,
+        self.dialog_serial = self.dialog_serial.wrapping_add(1);
+        self.dialog = Some(EntryDialog {
+            serial: self.dialog_serial,
             parent,
             name: action
                 .original()
@@ -471,36 +471,36 @@ impl FileDrawer {
         &mut self,
         serial: u64,
         result: ContentDialogResult,
-    ) -> Result<Option<(NameEditor, String)>> {
-        if !self.editor.as_ref().is_some_and(|e| e.serial == serial) {
+    ) -> Result<Option<(EntryDialog, String)>> {
+        if !self.dialog.as_ref().is_some_and(|e| e.serial == serial) {
             return Ok(None);
         }
-        let editor = self.editor.take().unwrap();
+        let dialog = self.dialog.take().unwrap();
         if result != ContentDialogResult::Primary {
             return Ok(None);
         }
         ensure!(
-            self.open && self.directory.as_ref() == Some(&editor.parent),
+            self.open && self.directory.as_ref() == Some(&dialog.parent),
             "The directory changed. Open the file action again."
         );
-        if let Some(entry) = editor.action.original() {
+        if let Some(entry) = dialog.action.original() {
             self.check_selected(entry)?;
         }
-        let path = editor.destination()?;
-        Ok(Some((editor, path)))
+        let path = dialog.destination()?;
+        Ok(Some((dialog, path)))
     }
 
-    pub(super) fn name_dialog(
+    pub(super) fn entry_dialog(
         &self,
         pane: u64,
         ssh: &SshOptions,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
-        let editor = self.editor.as_ref()?;
-        let serial = editor.serial;
+        let dialog = self.dialog.as_ref()?;
+        let serial = dialog.serial;
         let generation = self.generation;
-        let valid = editor.destination();
-        if let EditAction::Delete(_, kind) = &editor.action {
+        let valid = dialog.destination();
+        if let EditAction::Delete(_, kind) = &dialog.action {
             let title = match kind {
                 EntryKind::File => "Delete remote file?",
                 EntryKind::Directory => "Delete remote folder?",
@@ -528,7 +528,7 @@ impl FileDrawer {
                     ),
             );
         }
-        let (title, label, confirm) = if matches!(editor.action, EditAction::Rename(_)) {
+        let (title, label, confirm) = if matches!(dialog.action, EditAction::Rename(_)) {
             ("Rename entry", "New name", "Rename")
         } else {
             ("New folder", "Folder name", "Create")
@@ -537,12 +537,12 @@ impl FileDrawer {
             "name",
             TextBox::new()
                 .automation_name(label)
-                .text(&editor.name)
+                .text(&dialog.name)
                 .on_text_changed(context.callback(move |name| {
                     Message::Files(FileAction::EditName(pane, generation, serial, name))
                 })),
         )];
-        if !editor.name.is_empty()
+        if !dialog.name.is_empty()
             && let Err(error) = &valid
         {
             fields.push(KeyedView::new(
@@ -570,11 +570,11 @@ impl FileDrawer {
     }
 
     pub(super) fn awaiting_native_result(&self) -> bool {
-        self.picking || self.parsing || self.editing_name()
+        self.picking || self.parsing || self.entry_dialog_open()
     }
 
     pub(super) fn bind_window(&mut self, sender: LocalSender<Message>) {
-        self.cancel_name_edit();
+        self.cancel_entry_dialog();
         self.cached.get_mut().take();
         if let Some(pending) = &self.pending {
             *pending.destination.borrow_mut() = sender;
@@ -1195,7 +1195,7 @@ impl TerminalApp {
         Ok(())
     }
 
-    pub(super) fn cancel_inactive_name_editor(&mut self) {
+    pub(super) fn cancel_inactive_entry_dialog(&mut self) {
         let inactive = self
             .tabs
             .entries()
@@ -1203,7 +1203,7 @@ impl TerminalApp {
             .find_map(|entry| match &entry.value.page {
                 Page::Terminal(tab)
                     if Some(entry.id) != self.tabs.active_id()
-                        && (tab.files.editing_name() || tab.files.identifying_delete()) =>
+                        && (tab.files.entry_dialog_open() || tab.files.identifying_delete()) =>
                 {
                     Some(entry.id)
                 }
@@ -1215,7 +1215,7 @@ impl TerminalApp {
                 ..
             }) = self.tabs.get_mut(id)
         {
-            tab.files.cancel_name_edit();
+            tab.files.cancel_entry_dialog();
         }
     }
 
@@ -1303,14 +1303,14 @@ impl TerminalApp {
             && self.picker.is_none()
             && self.switcher.is_none()
             && !self.clipboard.is_open();
-        let was_editing = files.editing_name();
+        let dialog_was_open = files.entry_dialog_open();
         files.observe_connection(frame.connection_generation);
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
         if matches!(&action, NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
         {
-            if was_editing && visible && !files.editing_name() {
+            if dialog_was_open && visible && !files.entry_dialog_open() {
                 self.connection_ui(id);
             }
             return;
@@ -1323,7 +1323,7 @@ impl TerminalApp {
                 Toggle => {
                     files.open = !files.open;
                     if !files.open {
-                        files.cancel_name_edit();
+                        files.cancel_entry_dialog();
                     }
                     self.initial_grid.set(None);
                     crate::input::clear_grid();
@@ -1342,7 +1342,7 @@ impl TerminalApp {
                     }
                 }
                 Close(_) => {
-                    files.cancel_name_edit();
+                    files.cancel_entry_dialog();
                     files.open = false;
                 }
                 Follow(_, _, enabled) => {
@@ -1391,19 +1391,19 @@ impl TerminalApp {
                     }
                 }
                 EditName(_, _, serial, name) => {
-                    if let Some(editor) = files.editor.as_mut().filter(|e| {
+                    if let Some(dialog) = files.dialog.as_mut().filter(|e| {
                         e.serial == serial && !matches!(e.action, EditAction::Delete(..))
                     }) {
-                        editor.name = name;
+                        dialog.name = name;
                     }
                 }
                 FinishEdit(_, _, serial, result) => {
                     if !may_open_dialog {
-                        files.cancel_name_edit();
+                        files.cancel_entry_dialog();
                         return Ok(());
                     }
                     if let Some((
-                        NameEditor {
+                        EntryDialog {
                             parent,
                             name,
                             action,
@@ -1564,7 +1564,7 @@ impl TerminalApp {
         }
         if visible {
             tab.follow_shell_directory(&frame, context);
-            if was_editing != tab.files.editing_name() {
+            if dialog_was_open != tab.files.entry_dialog_open() {
                 self.connection_ui(id);
             }
         }
@@ -1926,28 +1926,28 @@ mod tests {
         drawer
             .begin_edit("/work".into(), EditAction::Create)
             .unwrap();
-        let first = drawer.editor_serial;
+        let first = drawer.dialog_serial;
         let changed = Some(Arc::from("file://server/new"));
         assert!(drawer.follow_target(&changed, "server").is_none());
-        drawer.cancel_name_edit();
+        drawer.cancel_entry_dialog();
         drawer
             .begin_edit("/work".into(), EditAction::Create)
             .unwrap();
-        let current = drawer.editor_serial;
-        drawer.editor.as_mut().unwrap().name = "prepared".into();
+        let current = drawer.dialog_serial;
+        drawer.dialog.as_mut().unwrap().name = "prepared".into();
         assert!(
             drawer
                 .finish_edit(first, ContentDialogResult::Primary)
                 .unwrap()
                 .is_none()
         );
-        assert!(drawer.editing_name());
-        let (editor, path) = drawer
+        assert!(drawer.entry_dialog_open());
+        let (dialog, path) = drawer
             .finish_edit(current, ContentDialogResult::Primary)
             .unwrap()
             .unwrap();
         assert_eq!(
-            (&*editor.parent, &*editor.name, &*path),
+            (&*dialog.parent, &*dialog.name, &*path),
             ("/work", "prepared", "/work/prepared")
         );
         assert!(
@@ -1966,7 +1966,7 @@ mod tests {
         drawer.directory = Some("/other".into());
         assert!(
             drawer
-                .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
                 .is_err()
         );
         drawer
@@ -1975,7 +1975,7 @@ mod tests {
         drawer.observe_connection(5);
         assert!(
             drawer
-                .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
                 .unwrap()
                 .is_none()
         );
@@ -2006,15 +2006,15 @@ mod tests {
             drawer.begin_edit(source.parent.clone(), EditAction::Rename(source.clone()))
         };
         begin(&mut drawer).unwrap();
-        assert_eq!(drawer.editor.as_ref().unwrap().name, source.name);
-        assert!(drawer.editor.as_ref().unwrap().destination().is_err()); // unchanged
+        assert_eq!(drawer.dialog.as_ref().unwrap().name, source.name);
+        assert!(drawer.dialog.as_ref().unwrap().destination().is_err()); // unchanged
         assert!(
             drawer
                 .follow_target(&Some(Arc::from("file://host/elsewhere")), "host")
                 .is_none()
         );
-        drawer.editor.as_mut().unwrap().name = "new name 雪".into();
-        let old = drawer.editor_serial;
+        drawer.dialog.as_mut().unwrap().name = "new name 雪".into();
+        let old = drawer.dialog_serial;
         assert!(
             drawer
                 .finish_edit(old, ContentDialogResult::None)
@@ -2022,20 +2022,20 @@ mod tests {
                 .is_none()
         );
         begin(&mut drawer).unwrap();
-        let current = drawer.editor_serial;
+        let current = drawer.dialog_serial;
         assert!(
             drawer
                 .finish_edit(old, ContentDialogResult::Primary)
                 .unwrap()
                 .is_none()
         );
-        drawer.editor.as_mut().unwrap().name = "new name 雪".into();
-        let (editor, path) = drawer
+        drawer.dialog.as_mut().unwrap().name = "new name 雪".into();
+        let (dialog, path) = drawer
             .finish_edit(current, ContentDialogResult::Primary)
             .unwrap()
             .unwrap();
         assert_eq!(path, "/work/new name 雪");
-        assert_eq!(editor.action.original().unwrap().name, "alias");
+        assert_eq!(dialog.action.original().unwrap().name, "alias");
         assert!(
             drawer
                 .finish_edit(current, ContentDialogResult::Primary)
@@ -2044,11 +2044,11 @@ mod tests {
         );
 
         begin(&mut drawer).unwrap();
-        drawer.editor.as_mut().unwrap().name = "new".into();
+        drawer.dialog.as_mut().unwrap().name = "new".into();
         drawer.listing_revision += 1; // same parent and filename in a replacement listing
         assert!(
             drawer
-                .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
                 .is_err()
         );
         assert!(begin(&mut drawer).is_err());
@@ -2165,7 +2165,7 @@ mod tests {
                     .confirm_identified(entry.clone(), &attrs(unsupported))
                     .is_err()
             );
-            assert!(!drawer.editing_name());
+            assert!(!drawer.entry_dialog_open());
         }
         let link = attrs(Some(0o120777));
         drawer.listing_revision += 1;
@@ -2175,8 +2175,8 @@ mod tests {
         assert!(drawer.confirm_identified(entry.clone(), &link).is_err());
         drawer.selected = Some(entry.name.clone());
         drawer.confirm_identified(entry.clone(), &link).unwrap();
-        let old = drawer.editor_serial;
-        drawer.cancel_name_edit();
+        let old = drawer.dialog_serial;
+        drawer.cancel_entry_dialog();
         drawer.confirm_identified(entry.clone(), &link).unwrap();
         assert!(
             drawer
@@ -2184,7 +2184,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let serial = drawer.editor_serial;
+        let serial = drawer.dialog_serial;
         drawer.selected = None;
         assert!(
             drawer
@@ -2193,24 +2193,24 @@ mod tests {
         );
         drawer.selected = Some(entry.name.clone());
         drawer.confirm_identified(entry.clone(), &link).unwrap();
-        let (editor, path) = drawer
-            .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+        let (dialog, path) = drawer
+            .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
             .unwrap()
             .unwrap();
         assert_eq!(path, "/work/unknown");
         assert!(matches!(
-            editor.action,
+            dialog.action,
             EditAction::Delete(_, EntryKind::Symlink)
         ));
         assert!(
             drawer
-                .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
                 .unwrap()
                 .is_none()
         );
 
         drawer.confirm_identified(entry, &link).unwrap();
-        let serial = drawer.editor_serial;
+        let serial = drawer.dialog_serial;
         drawer.observe_connection(3);
         assert!(
             drawer
