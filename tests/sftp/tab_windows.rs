@@ -41,7 +41,7 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     };
     let leaf = |slot, source: Value| json!({"type":"leaf","slot":slot,"source":source});
     let workspace = json!({"active_tab":0,"tabs":[
-        {"focused":1,"layout":{"type":"split","axis":"columns","ratio":0.5,
+        {"title":"Cockpit tools","focused":1,"layout":{"type":"split","axis":"columns","ratio":0.375,
             "first":leaf(1,json!({"kind":"saved_profile","value":"window-ssh"})),
             "second":leaf(2,local("Moved PowerShell"))}},
         {"focused":3,"layout":leaf(3,local("Source PowerShell"))}

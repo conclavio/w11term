@@ -110,14 +110,17 @@ function Close-FixtureWindow([IntPtr]$Hwnd) {
 }
 
 function Expect-Group([int]$Count, [long]$OldWindow) {
-    return Wait-Until 'both split panes to be registered in another window' {
+    return Wait-Until 'both panes and their titled 3:5 split to appear in another window' {
         $all = @((Control @('list')).sessions)
         $remote = $all | Where-Object id -eq $ssh.id
         $local = $all | Where-Object id -eq $moved.id
         if ($all.Count -eq $Count -and $local -and $remote -and $remote.window_id -and
             $remote.window_id -ne $OldWindow -and $remote.window_id -eq $local.window_id -and
             $remote.tab_id -eq $ssh.tab_id -and $local.tab_id -eq $ssh.tab_id -and
-            $remote.visible -and $local.visible -and $remote.connection_generation -eq $ssh.connection_generation) {
+            $remote.visible -and $local.visible -and $remote.connection_generation -eq $ssh.connection_generation -and
+            $remote.tab_title -eq 'Cockpit tools' -and $local.tab_title -eq $remote.tab_title -and
+            $remote.cols -gt 4 -and $local.cols -gt 4 -and
+            [Math]::Abs($remote.cols - 0.375 * ($remote.cols + $local.cols)) -le 2) {
             return $remote.window_id
         }
     }

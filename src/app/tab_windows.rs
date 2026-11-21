@@ -37,12 +37,37 @@ pub(super) struct Transfer {
     panes: Vec<u64>,
     source: LocalSender<Message>,
     pub(super) target: RefCell<Option<LocalSender<Message>>>,
-    payload: RefCell<Option<Tabs<AppTab>>>,
+    payload: RefCell<Option<OfferedTab<AppTab>>>,
     pin: RefCell<Option<PaneTransfer>>,
-    index: Cell<usize>,
-    selected: Cell<bool>,
     phase: Cell<TransferPhase>,
     started: Instant,
+}
+
+struct OfferedTab<T> {
+    tab: Tabs<T>,
+    index: usize,
+    was_selected: bool,
+    fallback_group: Option<TabId>,
+}
+
+impl<T> OfferedTab<T> {
+    fn take(source: &mut Tabs<T>, group: TabId, index: usize) -> Option<Self> {
+        let was_selected = source.active_group_id() == Some(group);
+        let tab = source.take_group(group)?;
+        Some(Self {
+            tab,
+            index,
+            was_selected,
+            fallback_group: source.active_group_id(),
+        })
+    }
+
+    fn return_to(self, source: &mut Tabs<T>) {
+        // The automatic fallback may still be active with a different focused split.
+        // A different surviving tab reflects a newer choice in the source window.
+        let select = self.was_selected && source.active_group_id() == self.fallback_group;
+        source.restore_group(self.tab, self.index, select);
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -205,8 +230,6 @@ impl TerminalApp {
             target: Default::default(),
             payload: Default::default(),
             pin: Default::default(),
-            index: Default::default(),
-            selected: Default::default(),
             phase: Default::default(),
             started: Instant::now(),
         });
@@ -258,11 +281,6 @@ impl TerminalApp {
             return;
         };
         offer.pin.replace(Some(pin));
-        offer.index.set(index);
-        offer.selected.set(self.tabs.active_index() == Some(index));
-        if offer.selected.get() {
-            self.keyboard.set_target(None);
-        }
         for leaf in leaves {
             if let Some(AppTab {
                 page: Page::Terminal(tab),
@@ -273,7 +291,14 @@ impl TerminalApp {
             }
         }
         self.cancel_frame_tasks();
-        offer.payload.replace(self.tabs.take_group(offer.group));
+        let Some(payload) = OfferedTab::take(&mut self.tabs, offer.group, index) else {
+            self.cancel_transfer(id, ctx);
+            return;
+        };
+        if payload.was_selected {
+            self.keyboard.set_target(None);
+        }
+        offer.payload.replace(Some(payload));
         offer.phase.set(TransferPhase::Offered);
         self.mru_groups.retain(|g| *g != offer.group);
         self.sync_selection(ctx);
@@ -291,9 +316,10 @@ impl TerminalApp {
         else {
             return;
         };
-        let Some(mut group) = offer.payload.take() else {
+        let Some(payload) = offer.payload.take() else {
             return;
         };
+        let mut group = payload.tab;
         let leaves: Vec<_> = group.entries().iter().map(|t| t.id).collect();
         for leaf in leaves {
             if let Some(AppTab {
@@ -352,9 +378,8 @@ impl TerminalApp {
         }
         offer.phase.set(TransferPhase::Canceled);
         self.outgoing = None;
-        if let Some(group) = offer.payload.take() {
-            self.tabs
-                .restore_group(group, offer.index.get(), offer.selected.get());
+        if let Some(payload) = offer.payload.take() {
+            payload.return_to(&mut self.tabs);
             self.activate(ctx);
             self.sync_selection(ctx);
         }
@@ -389,6 +414,36 @@ impl Drop for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_keeps_a_newer_source_tab_and_recognizes_the_fallback_by_group() {
+        let mut source = Tabs::default();
+        let first = source.insert("first");
+        let moving = source.insert("moving");
+        let fallback = source.insert("fallback");
+        let sibling = source.split(fallback, "second pane", Axis::Rows).unwrap();
+        let group = source.group_id(moving).unwrap();
+        source.select(moving);
+
+        let offer = OfferedTab::take(&mut source, group, 1).unwrap();
+        assert_eq!(source.active_id(), Some(sibling));
+        source.select(first);
+        offer.return_to(&mut source);
+        assert_eq!(source.active_id(), Some(first));
+        assert_eq!(source.headers()[1].id, moving);
+
+        source.select(moving);
+        let offer = OfferedTab::take(&mut source, group, 1).unwrap();
+        source.select(fallback);
+        offer.return_to(&mut source);
+        assert_eq!(source.active_id(), Some(moving));
+        assert_eq!(source.headers()[1].id, moving);
+
+        source.select(first);
+        let background = OfferedTab::take(&mut source, group, 1).unwrap();
+        background.return_to(&mut source);
+        assert_eq!(source.active_id(), Some(first));
+    }
 
     #[test]
     fn transfer_deadline_covers_window_binding_offer_and_unclaimed_payload() {
