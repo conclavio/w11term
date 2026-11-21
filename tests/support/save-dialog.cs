@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -13,11 +15,28 @@ public static class FixtureDialog {
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr size, StringBuilder text, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr size, string text, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern uint GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, uint size, uint flags);
+
+    private static string DiskPath(string path) {
+        using (var file = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+            var result = new StringBuilder(32768);
+            uint count = GetFinalPathNameByHandle(file.SafeFileHandle, result, (uint)result.Capacity, 0);
+            if (count == 0 || count >= result.Capacity) throw new IOException("Cannot resolve saved path: " + path);
+            return result.ToString();
+        }
+    }
+
+    public static bool SameFile(string selected, string reported) {
+        if (!File.Exists(selected) || !File.Exists(reported)) return false;
+        return String.Equals(DiskPath(selected), DiskPath(reported), StringComparison.OrdinalIgnoreCase);
+    }
 
     public static IntPtr[] Windows(uint process) {
         var result = new List<IntPtr>();
@@ -55,8 +74,10 @@ public static class FixtureDialog {
         bool clicked = false;
         EnumChildWindows(dialog, (hwnd, _) => {
             if (GetDlgCtrlID(hwnd) != id || !IsControl(hwnd, "Button")) return true;
-            // A Save click can open an overwrite dialog. Posting leaves its owner responsive.
-            clicked = PostMessage(hwnd, 0x00F5, IntPtr.Zero, IntPtr.Zero); // BM_CLICK
+            // BM_CLICK can be ignored on an inactive desktop. Post the enabled
+            // button's BN_CLICKED notification to its parent. WM_COMMAND still
+            // runs the dialog's own validation and overwrite confirmation.
+            clicked = PostMessage(GetParent(hwnd), 0x0111, (IntPtr)id, hwnd);
             return !clicked;
         }, IntPtr.Zero);
         return clicked;
