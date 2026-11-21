@@ -381,6 +381,8 @@ pub enum Message {
     AttentionChanged,
     ToggleInspector,
     PickerQuery(String),
+    PickerHover(u64),
+    PickerFrame(u64, u64),
     PickerChoose(u64),
     PickerFocus(u8),
     LocalProfile(local_profile::Action),
@@ -2832,6 +2834,8 @@ impl Component for TerminalApp {
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
                 | Message::PickerQuery(..)
+                | Message::PickerHover(..)
+                | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
                 | Message::PaneRatio(..)
                 | Message::DividerPress(..)
@@ -2867,7 +2871,9 @@ impl Component for TerminalApp {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
-            Message::PickerQuery(query) => self.filter_picker(query),
+            Message::PickerQuery(query) => self.filter_picker(query, context),
+            Message::PickerHover(pane) => self.hover_picker(pane, context),
+            Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::Files(action) => self.file_action(action, context),
@@ -3120,10 +3126,12 @@ impl Component for TerminalApp {
                 self.frame_tasks
                     .retain(|_, task| task.status() != ComponentTaskStatus::Rejected);
                 self.watch_frames(context);
-                if self
-                    .control_task
-                    .as_ref()
-                    .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
+                let preview_ready = self.watch_picker_preview(context);
+                if preview_ready
+                    && self
+                        .control_task
+                        .as_ref()
+                        .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
                     && self
                         .frame_tasks
                         .values()
@@ -3593,6 +3601,7 @@ impl Component for TerminalApp {
                 Shortcut::PickerMove(delta) => {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);
+                        self.sync_picker_preview(context);
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
