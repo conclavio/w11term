@@ -111,5 +111,20 @@ points exercise placement and selected animation frames. GPU interpolation,
 general deletion selectors, placeholders under every rendition attribute, and every
 possible compositing edge remain outside this fixture.
 
+The equal-z sample transmits image 70 before 71, then places 71 before 70.
+Both reference terminals show 71 on top. Ghostty 1.4.0 and w11term use the
+client's image ID to break ties. Kitty 0.32.2 uses an internal ID assigned at
+transmission, so reversing transmission order can change its result. The
+protocol leaves overlapping placements with identical image ID and z-index
+unspecified. [Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout) · [Ghostty ID ordering](https://github.com/ghostty-org/ghostty/blob/v1.4.0/src/renderer/image.zig#L535-L553) · [Kitty ID allocation](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L381-L391) · [Kitty sort](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L1090-L1117)
+
+An explicit RGB cell background equal to the terminal default covers a
+below-background image in w11term and Ghostty 1.4.0. Kitty 0.32.2 compares
+resolved RGB values and lets the image show through that cell. The shared
+fixture uses blue against a black default. The w11term-only native test
+`offscreen_explicit_default_rgb_covers_a_below_background_image` checks
+explicit black beside a default cell over the same red image.
+[Ghostty background opacity](https://github.com/ghostty-org/ghostty/blob/v1.4.0/src/renderer/generic.zig#L3203-L3225) · [Kitty color resolution](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/cell_vertex.glsl#L153-L165) · [Kitty background comparison](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/cell_vertex.glsl#L196-L204)
+
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) and
 [kitty 0.32.2 placement implementation](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c)

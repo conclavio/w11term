@@ -1448,6 +1448,45 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_explicit_default_rgb_covers_a_below_background_image() {
+        let size = wezterm_term::TerminalSize {
+            cols: 3,
+            rows: 2,
+            pixel_width: 30,
+            pixel_height: 40,
+            dpi: 96,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x1b\\",
+            "\x1b[1;2H\x1b[48;2;0;0;0m \x1b[49m",
+            "\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[1;1H\x1b_Ga=p,i=1,p=1,z=-2147483648,c=1,r=1,C=1,q=2\x1b\\",
+            "\x1b[1;2H\x1b_Ga=p,i=1,p=2,z=-2147483648,c=1,r=1,C=1,q=2\x1b\\",
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert_eq!(rgba(frame.palette.background), [0.0, 0.0, 0.0, 1.0]);
+        let covered = frame.rows[0].get_cell(1).unwrap();
+        assert!(
+            covered
+                .attrs()
+                .images()
+                .unwrap()
+                .iter()
+                .any(|tile| tile.image_id() == Some(1) && tile.z_index() == i32::MIN)
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("explicit-background.png");
+        screenshot(&frame, size, &path).unwrap();
+        let actual = image::open(path).unwrap().into_rgb8();
+        let y = actual.height() / 4;
+        let cell = |col: u32| actual.get_pixel((2 * col + 1) * actual.width() / 6, y).0;
+        assert_eq!(cell(0), [255, 0, 0], "default background shows the image");
+        assert_eq!(cell(1), [0, 0, 0], "explicit RGB paints over the image");
+    }
+
+    #[test]
     fn offscreen_kitty_reference_cell_centers() {
         #[derive(serde::Deserialize)]
         struct Sample {
