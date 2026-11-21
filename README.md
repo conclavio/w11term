@@ -216,8 +216,9 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Shift+PageUp / Shift+PageDown | Browse scrollback by one visible page |
 | Ctrl+Shift+Home / Ctrl+Shift+End | Oldest retained history / return to the live screen |
 | Ctrl+Shift+Up / Ctrl+Shift+Down | Previous / next OSC 133 prompt |
-| Ctrl+Shift+F | Find in scrollback; case toggle, highlighted matches, and a match counter |
-| Ctrl+Shift+K | Search terminal actions and launch profiles |\n| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
+| Ctrl+Shift+F | Find text or a regular expression in the current pane’s scrollback |
+| Ctrl+Shift+K | Search terminal actions and launch profiles |
+| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
 | Enter in find / F3; Shift+Enter / Shift+F3 | Next / previous find result, wrapping at either end |
 | Escape in find | Close find and restore terminal keyboard input |
 | Mouse wheel | Scrollback using Windows' wheel-line/page preference, including accumulated fractional deltas; remote wheel events when mouse reporting is enabled |
@@ -227,7 +228,9 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 
 Hold Shift to select or right-click paste when a remote TUI enables mouse reporting. Selection retains scrolled rows, joins soft-wrapped lines, and copies graphemes without font/color formatting. Native pointer capture lets dragging continue outside the canvas, with automatic scroll at its top/bottom edges.
 
-Find is local to each tab and searches literal text across retained history and the current screen, joining soft-wrapped lines and preserving Unicode cell coordinates. It defaults to case-insensitive Unicode lowercase matching (no regex or canonical-normalization conversion). The query is capped at 4096 UTF-8 bytes, with at most 10,000 results (`+` indicates additional matches). Search text stays in the native find box until Escape closes it. Counts refresh after a short debounce while output is arriving; ordinary scrolling stays anchored to retained rows as new output arrives.
+Find searches the current pane’s retained history and visible screen. It starts with a case-insensitive literal search using Unicode lowercase matching. Turn on **Regex** for patterns such as `error\s+[0-9]+`, or **Match case** to distinguish uppercase and lowercase. Matches can span a line wrapped by the terminal and stop at a hard newline. Enter and Shift+Enter move between highlighted matches. Escape closes Find and restores terminal input. Reopening Find restores that pane’s query and both options.
+
+Queries accept up to 4,096 UTF-8 bytes. The match count refreshes as output arrives, and `+` indicates more than 10,000 matches. If a pattern is invalid, the Find bar shows the reason as you edit. Regex search skips logical lines larger than 64 KiB and shows when the results are incomplete. Ordinary scrolling stays anchored to retained rows as new output arrives.
 
 The alternate screen has no local scrollback. A TUI receives wheel reports when it enables mouse reporting. For other TUIs, **Alternate-screen wheel keys** enables the arrow-key fallback used by pagers. It defaults to on for standard profiles and off in game mode. Shift+wheel scrolls local primary-screen history and has no effect on the alternate screen. Find on the alternate screen searches its current contents. Returning to the primary screen restores its history position.
 
