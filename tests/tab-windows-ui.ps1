@@ -109,6 +109,19 @@ function Expect-Text([int]$Pane, [string]$Value) {
     $null = Control @('wait-for-text','--pane',"$Pane",'--timeout','15',$Value)
 }
 
+function Expect-Focus([IntPtr]$Hwnd, [int]$Pane, [string]$Stage) {
+    try {
+        $null = Wait-Until "$Stage (pane $Pane, HWND $Hwnd)" {
+            $active = @((Control @('list')).sessions | Where-Object active)
+            $active.Count -eq 1 -and $active[0].id -eq $Pane -and
+                [TabFixtureWindows]::GetForegroundWindow() -eq $Hwnd
+        }
+    } catch {
+        $panes = (Control @('list')).sessions | Select-Object id,label,window_id,tab_id,active,visible,cols,rows
+        throw "$Stage expected pane $Pane in HWND $Hwnd; foreground $([TabFixtureWindows]::GetForegroundWindow()); panes: $($panes | ConvertTo-Json -Compress)"
+    }
+}
+
 function Shell-State([int]$Pane, [string]$Label, [IntPtr]$Hwnd = [IntPtr]::Zero, [switch]$Init) {
     $line = if ($Init) { '$global:WindowNonce=[guid]::NewGuid().ToString("N"); ' } else { '' }
     $line += "'$Label=' + " + '$PID + "/" + $global:WindowNonce'
@@ -188,21 +201,21 @@ try {
         throw 'The source tab identity changed'
     }
     Use-Window $destination
-    Wait-Focus $ssh.id
+    Expect-Focus $destination $ssh.id 'Destination initially keeps the SSH pane focused'
     Type-In $destination 'ssh-probe/'
     Expect-Text $ssh.id 'ssh-probe/'
     $window = $destination
     Press-Key 0x77 # F8 focuses the right PowerShell pane
-    Wait-Focus $moved.id
+    Expect-Focus $destination $moved.id 'F8 selects the destination PowerShell pane'
     if ((Shell-State $moved.id 'movedAfter' $destination) -ne $localIdentity) { throw 'Moved PowerShell restarted' }
     Use-Window $origin
-    Wait-Focus $anchor.id
+    Expect-Focus $origin $anchor.id 'Returning to the source selects its PowerShell pane'
     if ((Shell-State $anchor.id 'sourceAfter' $origin) -ne $anchorIdentity) { throw 'Source PowerShell restarted' }
     Use-Window $destination
-    Wait-Focus $moved.id # source focus must not replace this window's remembered focused pane
+    Expect-Focus $destination $moved.id 'Returning to the destination restores its PowerShell focus'
     $window = $destination
     Press-Key 0x78 # F9 focuses the left SSH pane
-    Wait-Focus $ssh.id
+    Expect-Focus $destination $ssh.id 'F9 selects the destination SSH pane'
 
     Write-Output "Verified per-window input; closing $FirstClose first"
     if ($FirstClose -eq 'Origin') {
