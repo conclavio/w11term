@@ -2,7 +2,7 @@ use super::Event;
 use std::{
     collections::VecDeque,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 const CAPACITY: usize = 128;
@@ -10,6 +10,7 @@ const CAPACITY: usize = 128;
 #[derive(Clone, Debug)]
 pub struct Notice {
     arrival: u64,
+    flash_pending: bool,
     pub pane: u64,
     pub source: Arc<str>,
     pub sequence: u64,
@@ -70,9 +71,13 @@ impl Inbox {
         }
     }
 
-    pub(super) fn receive(&self, pane: u64, source: &Arc<str>, event: &Event) {
+    pub(super) fn receive(&self, pane: u64, source: &Arc<str>, event: &Event, live: bool) {
         let message = match event.kind.as_str() {
             "bell" => "Bell".to_owned(),
+            "command-finished" => event.data["exit_code"].as_i64().map_or_else(
+                || "Command finished · exit status unavailable".into(),
+                |code| format!("Command finished · exit code {code}"),
+            ),
             "notification" => event.data["summary"]
                 .as_str()
                 .map_or_else(|| notification_text(&event.data), str::to_owned),
@@ -88,11 +93,20 @@ impl Inbox {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             pane,
+            flash_pending: live && event.kind == "command-finished",
             source: source.clone(),
             sequence: event.sequence,
             message,
             unread: true,
         });
+        self.wake_ui(state);
+    }
+
+    pub(super) fn refresh(&self) {
+        self.wake_ui(self.state.lock().unwrap());
+    }
+
+    fn wake_ui(&self, mut state: MutexGuard<'_, State>) {
         if !state.wake_pending {
             state.wake_pending = true;
             drop(state);
@@ -100,8 +114,18 @@ impl Inbox {
         }
     }
 
-    pub fn acknowledge_wake(&self) {
-        self.state.lock().unwrap().wake_pending = false;
+    /// Acknowledge this batch and consume its taskbar flash request, if any.
+    /// A notice can request a flash only once, even when moved between windows.
+    pub fn acknowledge_wake(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !std::mem::take(&mut state.wake_pending) {
+            return false;
+        }
+        let mut flash = false;
+        for item in &mut state.rows {
+            flash |= std::mem::take(&mut item.flash_pending) && item.unread;
+        }
+        flash
     }
 
     pub(super) fn same_window(&self, other: &Self) -> bool {
@@ -123,6 +147,7 @@ impl Inbox {
         }
         let mut dest = target.state.lock().unwrap();
         dest.rows.extend(moved);
+        dest.wake_pending = true;
         dest.rows
             .make_contiguous()
             .sort_by_key(|notice| notice.arrival);
@@ -184,6 +209,43 @@ mod tests {
     use crate::events::Events;
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_new_unread_command_completions_flash_the_current_owner_once() {
+        let source = Inbox::new(|| {});
+        let target = Inbox::new(|| {});
+        let journal = Events::default();
+        source.refresh();
+        assert!(source.rows().is_empty());
+        assert!(!source.acknowledge_wake());
+        journal.push("command-finished", json!({"exit_code": null}));
+        journal.connect_inbox(7, "SSH", &source);
+        assert_eq!(
+            source.rows()[0].message,
+            "Command finished · exit status unavailable"
+        );
+        assert!(!source.acknowledge_wake());
+
+        journal.push("bell", Value::Null);
+        journal.push("notification", json!({"body":"command-finished"}));
+        assert!(!source.acknowledge_wake());
+        journal.push(
+            "command-finished",
+            json!({"exit_code": 17, "body":"private"}),
+        );
+        journal.push("command-finished", json!({"exit_code": 17}));
+        journal.connect_inbox(7, "SSH", &target);
+        assert!(!source.acknowledge_wake());
+        assert_eq!(target.rows()[0].message, "Command finished · exit code 17");
+        assert!(target.acknowledge_wake());
+        assert!(!target.acknowledge_wake());
+
+        journal.connect_inbox(7, "SSH", &source);
+        assert!(!source.acknowledge_wake());
+        journal.push("command-finished", json!({"exit_code": 0}));
+        source.mark_all_read();
+        assert!(!source.acknowledge_wake());
+    }
 
     #[test]
     fn moving_panes_keeps_inbox_order_and_read_state_and_routes_new_alerts() {

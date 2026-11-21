@@ -538,6 +538,21 @@ impl TerminalApp {
         self.start_picker(Mode::Commands, ctx);
     }
 
+    pub(super) fn refresh_open_commands(&mut self) {
+        let Some(picker) = self.picker.as_ref().filter(|p| p.mode == Mode::Commands) else {
+            return;
+        };
+        let commands = self.command_rows(&picker.query);
+        let selected = picker
+            .commands
+            .get(picker.selected)
+            .and_then(|previous| commands.iter().position(|row| row.id == previous.id))
+            .unwrap_or_else(|| picker.selected.min(commands.len().saturating_sub(1)));
+        let picker = self.picker.as_mut().unwrap();
+        picker.commands = commands;
+        picker.selected = selected;
+    }
+
     pub(super) fn choose_command(
         &mut self,
         id: command_palette::CommandId,
