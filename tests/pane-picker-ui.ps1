@@ -36,9 +36,28 @@ try {
     $null = Control @('send-text','--pane',"$left",'--no-paste','--base64',$osc)
     $null = Wait-Until 'remote window title' { (Control @('get-text','--pane',"$left")).title -eq 'build-output' }
 
+    Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
+    Invoke-Button (Wait-Until 'inspector menu item' { Find-Element 'Terminal inspector: Off' })
+    $null = Wait-Until 'initial primary screen' { Find-Element 'Screen   Primary' }
+    $paste = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$([char]27)[?2004h"))
+    $null = Control @('send-text','--pane',"$left",'--no-paste','--base64',$paste)
+    $null = Wait-Until 'mode change without any screen output' { Find-Element 'Bracketed paste   On' }
+    $modes = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$([char]27)[?1049h$([char]27)[?1003;1006h$([char]27)[>3u"))
+    $null = Control @('send-text','--pane',"$left",'--no-paste','--base64',$modes)
+    foreach ($row in 'Screen   Alternate','Mouse reporting   all motion (SGR cells)','Bracketed paste   On','Keyboard   Kitty 3 (disambiguate, event types)') {
+        $null = Wait-Until "inspector row $row" { Find-Element $row }
+    }
+    # Labels can cover any cell, including cells behind the inspector.
+    Press-Key 0x77
+    $null = Wait-Until 'inspector to yield the viewport to keyboard hints' { -not (Find-Element 'Close terminal inspector') }
+    Press-Key 27
+    $null = Wait-Until 'inspector to return on Escape' { (Find-Element 'Close terminal inspector') -and (Find-Element 'Screen   Alternate') }
+    Wait-Focus $left
+
     Picker-Query 'DEV2'
     Press-Key 13
     Wait-Focus $right
+    $null = Wait-Until 'inspector follows focused pane' { (Find-Element 'Bracketed paste   Off') -and (Find-Element 'Screen   Primary') }
     Assert-Input $right 'after-enter' @($left,$local)
 
     Picker-Query 'build-output'
@@ -50,6 +69,9 @@ try {
     Picker-Query 'build-output'
     Press-Key 13
     Wait-Focus $left
+    $null = Wait-Until 'inspector returns to original pane modes' { Find-Element 'Bracketed paste   On' }
+    Invoke-Button (Wait-Until 'close inspector' { Find-Element 'Close terminal inspector' })
+    $null = Wait-Until 'inspector dismissal' { -not (Find-Element 'Close terminal inspector') }
     Picker-Query 'navigator@127.0.0.1'
     Press-Key 13
     Wait-Focus $right

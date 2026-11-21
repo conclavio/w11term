@@ -69,6 +69,12 @@ async fn native_pane_picker_routes_keys_across_tabs_and_restores_focus_on_escape
     let mut dev2 = dev1.clone();
     dev2.user = "navigator".into();
     let state = tempfile::tempdir().unwrap();
+    // An unmodified key exercises the editable hints action on the fixture window.
+    fs::write(
+        state.path().join("appearance.json"),
+        br#"{"shortcuts":{"keyboard_hints":"F8"}}"#,
+    )
+    .unwrap();
     let data = state.path().join("data");
     fs::create_dir(&data).unwrap();
     fs::write(
