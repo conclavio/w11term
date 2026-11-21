@@ -196,6 +196,48 @@ async fn native_scrollback_export_saves_the_selected_pane_and_respects_cancel_an
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "restarts exited SSH and PowerShell panes from the native menus without replacing their split"]
+async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 3, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let auth = remote.path().join("authenticated-users");
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&auth, []).unwrap();
+    fs::write(&trace, []).unwrap();
+    fs::write(remote.path().join("exit-on-eot"), []).unwrap();
+    fs::write(remote.path().join("sftp-proof.bin"), [0, 9, 255]).unwrap();
+    let mut history = String::from("archived SSH 雪\r\n");
+    for row in 0..120 {
+        history.push_str(&format!("SSH output row {row}\r\n"));
+    }
+    history.push_str("before SSH exit\r\n");
+    fs::write(state.path().join("ssh-history.vt"), &history).unwrap();
+    drive_mixed_gui("restart-exited-pane-ui.ps1", &ssh, state.path());
+    let mut expected_input = history.into_bytes();
+    expected_input.extend_from_slice(b"\x04restarted-ssh-neighbor-alive");
+    assert_eq!(fs::read(trace).unwrap(), expected_input);
+    assert_eq!(
+        fs::read_to_string(auth)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["test", "test"]
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 2, "two SSH transports");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        4,
+        "one shell and one SFTP channel per login"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "creates remote folders through the native SFTP drawer while a PowerShell pane is live"]
 async fn native_new_folder_uses_the_selected_sftp_parent_and_preserves_existing_entries() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
