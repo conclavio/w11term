@@ -164,6 +164,9 @@ impl TerminalApp {
             let Page::Terminal(tab) = &self.tabs.active()?.page else {
                 return None;
             };
+            if tab.browsing_sessions() {
+                return None;
+            }
             let metrics = tab.surface.metrics.clone();
             let frames = tab.session.frames.clone();
             Some(crate::input::ime::Surface::new(
@@ -330,6 +333,18 @@ impl TerminalApp {
                             .content(TextBlock::new().text("Retry rendering")),
                     )),
                 ),
+        };
+        let content = if let Some(browser) = session_browser::discovery_view(id, tab, context) {
+            // Keep the terminal surface mounted to measure this leaf. Every
+            // neighbor in a split uses its dimensions for accessibility and IME.
+            Grid::new().children((
+                content,
+                Border::new()
+                    .background(Color::rgb(14, 16, 20))
+                    .content(browser),
+            ))
+        } else {
+            content
         };
         if decorate {
             let color = if self.tabs.active_id() == Some(id) {

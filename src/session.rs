@@ -137,7 +137,29 @@ impl Session {
         connection: Option<ssh::ConnectionShare>,
         saved: Option<crate::durable::DurableReference>,
     ) -> Self {
-        Self::start_worker(source, size, allow_clipboard, connection, Some(saved))
+        Self::start_worker(
+            source,
+            size,
+            allow_clipboard,
+            connection,
+            Some(ssh::DurableStart::Attach(saved)),
+        )
+    }
+
+    /// Discover existing PTYs without creating a remote shell or a saved workspace reference.
+    pub fn discover_durable(
+        mut options: crate::options::SshOptions,
+        size: TerminalSize,
+        allow_clipboard: bool,
+    ) -> Self {
+        options.durable = true;
+        Self::start_worker(
+            Source::Ssh(options),
+            size,
+            allow_clipboard,
+            None,
+            Some(ssh::DurableStart::Discover),
+        )
     }
 
     pub fn durable_state(&self) -> Option<ssh::DurableState> {
@@ -156,7 +178,7 @@ impl Session {
         size: TerminalSize,
         allow_clipboard: bool,
         connection: Option<ssh::ConnectionShare>,
-        saved: Option<Option<crate::durable::DurableReference>>,
+        saved: Option<ssh::DurableStart>,
     ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
@@ -540,6 +562,7 @@ async fn run(
                 match event {
                     ssh::Event::Data(bytes) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes); }
                     ssh::Event::Status(message) => { log::info!("{message}"); status = message; }
+                    ssh::Event::SessionListUpdated(message) => { status = message; presentation.refresh_view = true; }
                     ssh::Event::Connected(generation)=>{if generation>1{terminal.reset_connection();scroll_offset=0;}presentation.dirty=true;connection_generation=generation;},
                 }
                 // Coalesce a bounded amount of already-arrived output per snapshot.
@@ -547,6 +570,7 @@ async fn run(
                     match output.try_recv() {
                         Ok(ssh::Event::Data(bytes)) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes); }
                         Ok(ssh::Event::Status(message)) => status = message,
+                        Ok(ssh::Event::SessionListUpdated(message)) => { status = message; presentation.refresh_view = true; }
                         Ok(ssh::Event::Connected(generation))=>{if generation>1{terminal.reset_connection();scroll_offset=0;}presentation.dirty=true;connection_generation=generation;},
                         Err(_) => break,
                     }

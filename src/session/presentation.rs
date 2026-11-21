@@ -20,6 +20,7 @@ pub(super) struct Presentation {
     live: FrameStore,
     pending: Option<(Snapshot, Snapshot)>,
     generation: u64,
+    pub refresh_view: bool,
     pub dirty: bool,
     pub deadline: Option<Instant>,
 }
@@ -32,6 +33,7 @@ impl Presentation {
             live,
             pending: None,
             generation,
+            refresh_view: false,
             dirty: true,
             deadline: None,
         }
@@ -117,7 +119,8 @@ impl Presentation {
                 );
             }
         }
-        let view_changed = !view.same_presentation(&self.frames.load());
+        let view_changed =
+            std::mem::take(&mut self.refresh_view) || !view.same_presentation(&self.frames.load());
         let live_changed = !live.same_presentation(&self.live.load());
         if view_changed || live_changed {
             self.generation += 1;
