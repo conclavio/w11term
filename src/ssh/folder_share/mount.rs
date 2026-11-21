@@ -291,15 +291,19 @@ async fn run(
         }
     };
     revoked.store(true, Ordering::Release);
-    let cleanup = timeout(Duration::from_secs(12), async {
-        if !closed {
-            finish(&mut shell, mounted).await;
+    let shutdown = async {
+        if closed {
+            (true, String::new())
+        } else {
+            finish(shell, mounted).await
         }
-        verify(&link, &remote, true).await
-    })
-    .await
-    .context("Could not confirm SSHFS unmounted before timeout")
-    .and_then(|r| r);
+    };
+    let absent = async {
+        timeout(Duration::from_secs(12), verify(&link, &remote, true))
+            .await
+            .context("Timed out verifying the SSHFS generation is absent from Linux mountinfo")?
+    };
+    let cleanup = confirm_shutdown(mounted, shutdown, absent).await;
     match (result, cleanup) {
         (Err(start), Err(stop)) => Err(anyhow::anyhow!(
             "{start:#}. Mount cleanup unconfirmed: {stop:#}"
@@ -308,19 +312,64 @@ async fn run(
     }
 }
 
-async fn finish(shell: &mut ShellChannel, mounted: bool) {
+async fn confirm_shutdown(
+    mounted: bool,
+    shutdown: impl Future<Output = (bool, String)>,
+    absent: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    // Before a mount has been seen, an early empty mount table cannot prove
+    // that the remote startup script has stopped. Once verified, mountinfo
+    // can confirm removal even if inherited stderr delays SSH CLOSE.
+    let ((exited, stderr), absent) = if mounted {
+        tokio::join!(shutdown, absent)
+    } else {
+        (shutdown.await, absent.await)
+    };
+    let result = absent.and_then(|()| {
+        ensure!(
+            mounted || exited,
+            "Could not confirm the SSHFS startup process exited"
+        );
+        Ok(())
+    });
+    if stderr.is_empty() {
+        result
+    } else {
+        result.with_context(|| format!("SSHFS shutdown: {stderr}"))
+    }
+}
+
+async fn finish(mut shell: ShellChannel, mounted: bool) -> (bool, String) {
     let ch = shell.channel();
     // A verified read-only mount has a separate fusermount3 auto-unmount
     // helper. Killing this channel's SSHFS process lets that helper match the
     // generation-specific subtype without SSHFS performing its normal unmount
     // by pathname. Let a partially started helper finish initialization.
-    let _ = ch.signal(if mounted { Sig::KILL } else { Sig::TERM }).await;
-    let _ = ch.eof().await;
-    while let Some(message) = ch.wait().await {
-        if matches!(message, ChannelMsg::Close) {
-            break;
+    let mut stderr = Vec::new();
+    let mut exited = false;
+    let _ = timeout(Duration::from_secs(2), async {
+        let _ = ch.signal(if mounted { Sig::KILL } else { Sig::TERM }).await;
+        let _ = ch.eof().await;
+        loop {
+            match ch.wait().await {
+                Some(ChannelMsg::Close) | None => {
+                    exited = true;
+                    break;
+                }
+                Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. }) => {
+                    exited = true
+                }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    let take = data.len().min(2048 - stderr.len());
+                    stderr.extend_from_slice(&data[..take]);
+                }
+                _ => {}
+            }
         }
-    }
+    })
+    .await;
+    let _ = timeout(Duration::from_secs(1), shell.close()).await;
+    (exited, diagnostic(String::from_utf8_lossy(&stderr).trim()))
 }
 
 enum Request {
@@ -457,6 +506,39 @@ async fn serve(
 mod tests {
     use super::*;
     use russh_sftp::protocol::{RealPath, Status};
+
+    #[tokio::test]
+    async fn verified_mount_can_disappear_before_ssh_close_but_startup_must_exit() -> Result<()> {
+        let (probed, seen) = oneshot::channel();
+        let drain = async {
+            seen.await.unwrap();
+            (false, String::new())
+        };
+        let kernel_absence = async {
+            probed.send(()).unwrap();
+            Ok(())
+        };
+        timeout(
+            Duration::from_secs(2),
+            confirm_shutdown(true, drain, kernel_absence),
+        )
+        .await??;
+
+        let (done, confirmed) = oneshot::channel();
+        let drain = async {
+            done.send(()).unwrap();
+            (false, String::new())
+        };
+        let kernel_absence = async {
+            confirmed.await.unwrap();
+            Ok(())
+        };
+        let error = confirm_shutdown(false, drain, kernel_absence)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("startup process exited"));
+        Ok(())
+    }
 
     #[test]
     fn mount_names_are_portable_components_transported_as_data() {
