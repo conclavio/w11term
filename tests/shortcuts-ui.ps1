@@ -17,12 +17,16 @@ function Set-FocusRight([string]$Before, [string]$After) {
     $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     if ($value.Current.Value -ne $Before) { throw "Expected $Before in Focus right, found $($value.Current.Value)" }
     $value.SetValue($After)
-    Invoke-Button (Wait-Until 'save binding' { Find-Element 'Save shortcut' })
-    $null = Wait-Until "saved $After binding" {
-        if (Test-Path -LiteralPath $env:W11TERM_SETTINGS_PATH) {
-            (Get-Content -Raw -LiteralPath $env:W11TERM_SETTINGS_PATH | ConvertFrom-Json).shortcuts.focus_right -eq $After
-        }
+    $save = Wait-Until "editor to recognize $After" {
+        $button = Find-Element 'Save shortcut'
+        if ($button -and $button.Current.IsEnabled -and $value.Current.Value -eq $After) { return $button }
     }
+    Invoke-Button $save
+    # The editor returns to the action list after committing the file. Repeated
+    # reads during Save can lock the destination against replacement on Windows.
+    $null = Wait-Until "saved $After binding" { Find-Element 'Edit Focus right' }
+    $saved = (Get-Content -Raw -LiteralPath $env:W11TERM_SETTINGS_PATH | ConvertFrom-Json).shortcuts.focus_right
+    if ($saved -ne $After) { throw "Expected saved $After binding, found '$saved'" }
     Invoke-Button (Wait-Until 'back to settings' { Find-Element 'Back to settings' })
     Picker-Query 'fixture-ssh'
     Press-Key 13
@@ -49,9 +53,9 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Set-FocusRight 'F7' 'F8'
         }
         Press-Key 0x76
-        $wanted = [string]::new([char]27, 1) + '[18~'
+        $f7Length = ([string][char]27 + '[18~').Length
         $null = Wait-Until 'released F7 on the SSH wire' {
-            [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Trace)) -ceq ($wanted * $launch)
+            (Get-Item -LiteralPath $Trace).Length -ge ($f7Length * $launch)
         }
         Wait-Focus $remote
         Press-Key 0x77
