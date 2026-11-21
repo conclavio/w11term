@@ -51,6 +51,8 @@ Use **caret → Panes** to split right or below. Splitting the current host open
 
 Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.
 
+To move a running shell beside one in another tab, choose **caret → Panes → Move pane to existing tab…**. Search for the destination by title, profile or SSH address and press Enter or click it. Press an arrow key or choose **Move left**, **Move right**, **Move above** or **Move below**. Escape cancels at either step. The moved pane keeps focus, scrollback and its control ID. SSH channels and local processes keep running. The source tab closes if its last pane moves. You can assign a shortcut in Keyboard settings.
+
 Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
 
 Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.

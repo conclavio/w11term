@@ -214,17 +214,29 @@ impl Layout {
 
     /// Put a new pane immediately to the right of or below the target.
     pub fn split(&mut self, target: u64, new_id: u64, axis: Axis) -> bool {
+        let side = match axis {
+            Axis::Columns => Direction::Right,
+            Axis::Rows => Direction::Down,
+        };
+        self.insert_beside(target, new_id, side)
+    }
+
+    pub(crate) fn insert_beside(&mut self, target: u64, new_id: u64, side: Direction) -> bool {
         if self.bounds(new_id).is_some() {
             return false;
         }
         let Some(target_node) = self.leaf_mut(target) else {
             return false;
         };
+        let (first, second) = match side {
+            Direction::Left | Direction::Up => (new_id, target),
+            Direction::Right | Direction::Down => (target, new_id),
+        };
         *target_node = Self::Split {
-            axis,
+            axis: side.axis(),
             ratio: 0.5,
-            first: Box::new(Self::Leaf(target)),
-            second: Box::new(Self::Leaf(new_id)),
+            first: Box::new(Self::Leaf(first)),
+            second: Box::new(Self::Leaf(second)),
         };
         true
     }

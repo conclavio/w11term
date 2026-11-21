@@ -154,6 +154,35 @@ impl<T> Tabs<T> {
         self.insert_group(id, value);
         true
     }
+
+    /// Move the existing entry beside a leaf in another group, then focus it.
+    pub fn move_to_existing_tab(&mut self, source: TabId, target: TabId, side: Direction) -> bool {
+        let Some(target_group) = self.group_id(target) else {
+            return false;
+        };
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == source) else {
+            return false;
+        };
+        let source_group = entry.group;
+        if source_group == target_group {
+            return false;
+        }
+        let destination = self
+            .groups
+            .iter_mut()
+            .find(|g| g.id == target_group)
+            .expect("entry has a group");
+        if !destination.layout.insert_beside(target, source, side) {
+            return false;
+        }
+        entry.group = target_group;
+        destination.focused = source;
+        destination.zoomed = false;
+        self.active_group = Some(target_group);
+        self.remove_from_layout(source_group, source);
+        true
+    }
+
     pub fn split(&mut self, target: TabId, value: T, axis: Axis) -> Option<TabId> {
         let group_id = self.group_id(target)?;
         let group = self.groups.iter_mut().find(|g| g.id == group_id)?;
@@ -202,10 +231,14 @@ impl<T> Tabs<T> {
     pub fn remove(&mut self, id: TabId) -> Option<T> {
         let index = self.entries.iter().position(|t| t.id == id)?;
         let removed = self.entries.remove(index);
+        self.remove_from_layout(removed.group, id);
+        Some(removed.value)
+    }
+    fn remove_from_layout(&mut self, group_id: TabId, id: TabId) {
         let group_index = self
             .groups
             .iter()
-            .position(|g| g.id == removed.group)
+            .position(|g| g.id == group_id)
             .expect("entry has a group");
         let group = &mut self.groups[group_index];
         let layout = std::mem::replace(&mut group.layout, Layout::Leaf(id));
@@ -228,7 +261,6 @@ impl<T> Tabs<T> {
         } else {
             self.remove_header(group_index);
         }
-        Some(removed.value)
     }
     fn remove_header(&mut self, index: usize) {
         let group = self.groups.remove(index);
@@ -290,6 +322,90 @@ mod tests {
         assert!(!tabs.visible(second));
         assert!(tabs.remove_group(first));
         assert_eq!(tabs.active_id(), Some(second));
+    }
+
+    #[test]
+    fn moving_a_singleton_preserves_its_entry_and_the_destination_header() {
+        for (side, toward_target) in [
+            (Direction::Left, Direction::Right),
+            (Direction::Right, Direction::Left),
+            (Direction::Up, Direction::Down),
+            (Direction::Down, Direction::Up),
+        ] {
+            let mut tabs = Tabs::default();
+            let source = tabs.insert(Box::new("SSH"));
+            let unrelated = tabs.insert(Box::new("another tab"));
+            let target = tabs.insert(Box::new("PowerShell"));
+            let identity = std::ptr::from_ref(tabs.get(source).unwrap().as_ref());
+            tabs.select(source);
+            assert!(tabs.move_to_existing_tab(source, target, side));
+            assert_eq!(tabs.active_id(), Some(source));
+            assert_eq!(tabs.group_id(source), Some(target));
+            assert_eq!(tabs.group_id(target), Some(target));
+            assert_eq!(
+                tabs.headers().iter().map(|t| t.id).collect::<Vec<_>>(),
+                [unrelated, source]
+            );
+            assert_eq!(tabs.entries().len(), 3);
+            assert!(std::ptr::eq(identity, tabs.get(source).unwrap().as_ref()));
+            assert!(tabs.visible(source) && tabs.visible(target));
+            assert!(tabs.focus_neighbor(toward_target));
+            assert_eq!(tabs.active_id(), Some(target));
+        }
+    }
+
+    #[test]
+    fn moving_a_nested_pane_collapses_only_its_old_split_and_reveals_its_new_neighbor() {
+        let mut tabs = Tabs::default();
+        let old_left = tabs.insert("left");
+        let source = tabs.split(old_left, "moving", Axis::Columns).unwrap();
+        let old_bottom = tabs.split(source, "bottom", Axis::Rows).unwrap();
+        assert!(tabs.set_ratio(&[], 0.375));
+        tabs.select(source);
+        assert!(tabs.toggle_zoom());
+
+        let target_top = tabs.insert("top");
+        let target = tabs.split(target_top, "target", Axis::Rows).unwrap();
+        assert!(tabs.set_ratio(&[], 0.75));
+        tabs.select(target_top);
+        assert!(tabs.toggle_zoom());
+        tabs.select(source);
+        assert!(tabs.move_to_existing_tab(source, target, Direction::Left));
+
+        let layout = tabs.active_layout().unwrap();
+        assert_eq!(layout.leaves(), [target_top, source, target]);
+        assert_eq!(layout.bounds(target_top).unwrap().bottom, 0.75);
+        assert_eq!(layout.bounds(source).unwrap().right, 0.5);
+        assert_eq!(tabs.active_id(), Some(source));
+        assert!(!tabs.zoomed());
+        let old = tabs.layout_for(old_left).unwrap();
+        assert_eq!(old.leaves(), [old_left, old_bottom]);
+        assert_eq!(old.bounds(old_left).unwrap().right, 0.375);
+        assert!(tabs.select_index(0));
+        assert_eq!(tabs.active_id(), Some(old_left));
+        assert!(tabs.zoomed());
+    }
+
+    #[test]
+    fn invalid_moves_preserve_both_groups_focus_and_zoom() {
+        let mut tabs = Tabs::default();
+        let target = tabs.insert("other");
+        let source = tabs.insert("source");
+        let sibling = tabs.split(source, "sibling", Axis::Rows).unwrap();
+        assert!(tabs.toggle_zoom());
+        let original = tabs.active_layout().unwrap().clone();
+        for (from, to) in [
+            (source, source),
+            (source, sibling),
+            (99, target),
+            (source, 99),
+        ] {
+            assert!(!tabs.move_to_existing_tab(from, to, Direction::Right));
+            assert_eq!(tabs.active_layout(), Some(&original));
+            assert_eq!(tabs.layout_for(target), Some(&Layout::Leaf(target)));
+            assert_eq!(tabs.active_id(), Some(sibling));
+            assert!(tabs.zoomed());
+        }
     }
     #[test]
     fn close_and_reorder_preserve_the_selected_session() {

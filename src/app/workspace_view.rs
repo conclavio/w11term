@@ -248,10 +248,9 @@ impl TerminalApp {
             .collect();
         // The manager itself is a utility tab. Save the most recently visited terminal group.
         let active_tab = self
-            .mru
+            .mru_groups
             .iter()
-            .filter_map(|id| self.tabs.group_id(*id))
-            .find_map(|group| {
+            .find_map(|&group| {
                 headers
                     .iter()
                     .position(|h| self.tabs.group_id(h.id) == Some(group))

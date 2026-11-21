@@ -211,15 +211,31 @@ impl Choice {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Mode {
+    Focus,
+    Destination { source: TabId },
+    Placement { source: TabId, target: TabId },
+}
+
 pub(super) struct Picker {
+    mode: Mode,
     query: String,
     input: ElementRef<TextBox>,
+    default_side: ElementRef<Button>,
     matches: Vec<Choice>,
     selected: usize,
     preview: Option<Preview>,
 }
 
 impl Picker {
+    pub(super) fn placement(&self) -> Option<(TabId, TabId)> {
+        match self.mode {
+            Mode::Placement { source, target } => Some((source, target)),
+            _ => None,
+        }
+    }
+
     fn filter(choices: Vec<Choice>, query: &str) -> Vec<Choice> {
         let needle = query.trim().to_lowercase();
         let mut matches: Vec<_> = choices
@@ -231,6 +247,9 @@ impl Picker {
     }
 
     pub(super) fn move_by(&mut self, amount: isize) {
+        if self.placement().is_some() {
+            return;
+        }
         self.selected = self
             .selected
             .saturating_add_signed(amount)
@@ -238,6 +257,63 @@ impl Picker {
     }
 
     pub(super) fn view(&self, app: &TerminalApp, ctx: &ViewContext<TerminalApp>) -> View {
+        match self.placement() {
+            Some((source, target)) => self.placement_view(source, target, app.width, ctx),
+            None => self.search_view(app, ctx),
+        }
+    }
+
+    fn placement_view(
+        &self,
+        source: TabId,
+        target: TabId,
+        width: f64,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
+        let caption = self
+            .matches
+            .get(self.selected)
+            .map(Choice::caption)
+            .unwrap_or_default();
+        let side = |side, label, row, column| {
+            let button = Button::new()
+                .grid_row(row)
+                .grid_column(column)
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .automation_name(label)
+                .on_click(ctx.callback(move |_| Message::PlacePane(source, target, side)));
+            let button = if side == Direction::Right {
+                button.element_ref(&self.default_side)
+            } else {
+                button
+            };
+            button.content(label)
+        };
+        let content = StackPanel::new().spacing(8.0).children((
+            TextBlock::new()
+                .text(format!("Place pane relative to {caption}"))
+                .text_wrapping(TextWrapping::Wrap),
+            TextBlock::new().text("Press an arrow key or choose a side."),
+            Grid::new()
+                .rows([GridLength::Auto, GridLength::Auto])
+                .columns([GridLength::STAR, GridLength::STAR])
+                .row_spacing(6.0)
+                .column_spacing(6.0)
+                .children((
+                    side(Direction::Left, "Move left", 0, 0),
+                    side(Direction::Right, "Move right", 0, 1),
+                    side(Direction::Up, "Move above", 1, 0),
+                    side(Direction::Down, "Move below", 1, 1),
+                )),
+            Button::new()
+                .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerCancel)))
+                .content("Cancel"),
+        ));
+        Self::overlay(content, (width - 32.0).clamp(1.0, 500.0))
+    }
+
+    fn search_view(&self, app: &TerminalApp, ctx: &ViewContext<TerminalApp>) -> View {
+        let moving = matches!(self.mode, Mode::Destination { .. });
         let wide = app.width >= 800.0;
         let preview_height = if wide {
             (app.window_height - 160.0).clamp(0.0, 300.0)
@@ -258,8 +334,16 @@ impl Picker {
                 TextBox::new()
                     .element_ref(&self.input)
                     .text(&self.query)
-                    .placeholder_text("Search by title, profile or user@host")
-                    .automation_name("Find pane")
+                    .placeholder_text(if moving {
+                        "Find a destination by title, profile or user@host"
+                    } else {
+                        "Search by title, profile or user@host"
+                    })
+                    .automation_name(if moving {
+                        "Find destination pane"
+                    } else {
+                        "Find pane"
+                    })
                     .on_text_changed(ctx.callback(Message::PickerQuery)),
                 Button::new()
                     .grid_column(1)
@@ -291,7 +375,11 @@ impl Picker {
         if self.matches.is_empty() {
             children.push(KeyedView::new(
                 "empty",
-                TextBlock::new().text("No matching panes"),
+                TextBlock::new().text(if moving && self.query.is_empty() {
+                    "Open a terminal in another tab to move this pane."
+                } else {
+                    "No matching panes"
+                }),
             ));
         } else if self.matches.len() > page_size {
             let last = (first + page_size).min(self.matches.len());
@@ -355,6 +443,13 @@ impl Picker {
             }
             _ => results,
         };
+        Self::overlay(
+            StackPanel::new().spacing(6.0).children((search, body)),
+            (app.width - 32.0).clamp(1.0, if wide { 1060.0 } else { 660.0 }),
+        )
+    }
+
+    fn overlay(content: View, width: f64) -> View {
         Border::new()
             .grid_row_span(2)
             .background(Color::argb(112, 0, 0, 0))
@@ -362,20 +457,27 @@ impl Picker {
                 Border::new()
                     .vertical_alignment(VerticalAlignment::Top)
                     .horizontal_alignment(HorizontalAlignment::Center)
-                    .width((app.width - 32.0).clamp(1.0, if wide { 1060.0 } else { 660.0 }))
+                    .width(width)
                     .margin(16.0)
                     .padding(12.0)
                     .corner_radius(8.0)
                     .background(Color::rgb(40, 42, 48))
-                    .content(StackPanel::new().spacing(6.0).children((search, body))),
+                    .content(content),
             )
     }
 }
 
 impl TerminalApp {
-    fn picker_choices(&self) -> Vec<Choice> {
+    fn picker_choices(&self, mode: Mode) -> Vec<Choice> {
+        let excluded = match mode {
+            Mode::Destination { source } => self.tabs.group_id(source),
+            _ => None,
+        };
         let mut choices = vec![];
         for (tab, header) in self.tabs.headers().into_iter().enumerate() {
+            if excluded.is_some() && self.tabs.group_id(header.id) == excluded {
+                continue;
+            }
             if let Some(layout) = self.tabs.layout_for(header.id) {
                 for (pane, leaf) in layout.leaves().into_iter().enumerate() {
                     if let Some(AppTab {
@@ -400,6 +502,26 @@ impl TerminalApp {
     }
 
     pub(super) fn open_picker(&mut self, ctx: &ComponentContext<Self>) {
+        self.start_picker(Mode::Focus, ctx);
+    }
+
+    pub(super) fn open_move_picker(&mut self, ctx: &ComponentContext<Self>) {
+        if let Some(source) = self.move_source() {
+            self.start_picker(Mode::Destination { source }, ctx);
+        } else if self.picker.is_none() {
+            self.keyboard.set_picker(false);
+        }
+    }
+
+    pub(super) fn move_source(&self) -> Option<TabId> {
+        let id = self.tabs.active_id()?;
+        let Page::Terminal(live) = &self.tabs.get(id)?.page else {
+            return None;
+        };
+        (live.prompt_id.is_none() && live.session.prompts.current().is_none()).then_some(id)
+    }
+
+    fn start_picker(&mut self, mode: Mode, ctx: &ComponentContext<Self>) {
         self.close_copy_mode();
         self.close_hints();
         if self.picker.is_some() {
@@ -408,14 +530,16 @@ impl TerminalApp {
         if self.switcher.is_some() {
             self.finish_switcher(false, ctx);
         }
-        let matches = self.picker_choices();
+        let matches = self.picker_choices(mode);
         let active = self.tabs.active().and_then(AppTab::pane_id);
         let selected = matches
             .iter()
             .position(|row| Some(row.pane) == active)
             .unwrap_or(0);
         self.picker = Some(Picker {
+            mode,
             input: ElementRef::new(),
+            default_side: ElementRef::new(),
             query: String::new(),
             matches,
             selected,
@@ -429,11 +553,16 @@ impl TerminalApp {
     pub(super) fn focus_picker_input(&self, attempt: u8, ctx: &ComponentContext<Self>) {
         let Some(picker) = &self.picker else { return };
         let sender = ctx.sender();
-        let queued = picker.input.request_focus_result(move |result| {
+        let retry = move |result: Result<bool, FocusError>| {
             if !result.unwrap_or(false) && attempt < 4 {
                 sender.send(Message::PickerFocus(attempt + 1));
             }
-        });
+        };
+        let queued = if picker.placement().is_some() {
+            picker.default_side.request_focus_result(retry)
+        } else {
+            picker.input.request_focus_result(retry)
+        };
         if !queued && attempt < 4 {
             ctx.spawn_background(move |_| {
                 std::thread::sleep(Duration::from_millis(20));
@@ -443,14 +572,11 @@ impl TerminalApp {
     }
 
     pub(super) fn filter_picker(&mut self, query: String, ctx: &ComponentContext<Self>) {
-        if self
-            .picker
-            .as_ref()
-            .is_none_or(|picker| picker.query == query)
-        {
+        let Some(picker) = &self.picker else { return };
+        if picker.placement().is_some() || picker.query == query {
             return;
         }
-        let matches = Picker::filter(self.picker_choices(), &query);
+        let matches = Picker::filter(self.picker_choices(picker.mode), &query);
         if let Some(picker) = &mut self.picker {
             picker.query = query;
             picker.matches = matches;
@@ -461,6 +587,7 @@ impl TerminalApp {
 
     pub(super) fn hover_picker(&mut self, pane: u64, ctx: &ComponentContext<Self>) {
         if let Some(picker) = &mut self.picker
+            && picker.placement().is_none()
             && let Some(index) = picker.matches.iter().position(|row| row.pane == pane)
             && index != picker.selected
         {
@@ -471,6 +598,9 @@ impl TerminalApp {
 
     pub(super) fn sync_picker_preview(&mut self, ctx: &ComponentContext<Self>) {
         let Some(picker) = &self.picker else { return };
+        if picker.placement().is_some() {
+            return;
+        }
         let selected = picker.matches.get(picker.selected).map(|row| row.pane);
         if selected == picker.preview.as_ref().map(|preview| preview.pane) {
             return;
@@ -527,7 +657,10 @@ impl TerminalApp {
         let Some(picker) = &mut self.picker else {
             return;
         };
-        if !picker.matches.iter().any(|row| row.pane == pane) {
+        let Some(index) = picker.matches.iter().position(|row| row.pane == pane) else {
+            return;
+        };
+        if picker.placement().is_some() {
             return;
         }
         let Some(id) = id else {
@@ -537,12 +670,53 @@ impl TerminalApp {
             self.sync_picker_preview(ctx);
             return;
         };
+        if let Mode::Destination { source } = picker.mode {
+            if self.tabs.active_id() != Some(source)
+                || self.tabs.group_id(source) == self.tabs.group_id(id)
+            {
+                self.close_picker(ctx);
+                return;
+            }
+            picker.selected = index;
+            picker.mode = Mode::Placement { source, target: id };
+            picker.preview = None;
+            self.keyboard.set_picker_placement();
+            self.focus_picker_input(0, ctx);
+            return;
+        }
         self.tabs.select(id);
         if matches!(self.tabs.get(id), Some(AppTab { page: Page::Terminal(live), .. }) if live.find.open)
         {
             self.find(true, None, ctx);
         }
         self.sync_selection(ctx);
+        self.close_picker(ctx);
+    }
+
+    pub(super) fn place_pane(
+        &mut self,
+        source: TabId,
+        target: TabId,
+        side: Direction,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.picker.as_ref().and_then(Picker::placement) != Some((source, target)) {
+            return;
+        }
+        let source_was_single = matches!(
+            self.tabs.active_layout(),
+            Some(w11term::pane_layout::Layout::Leaf(_))
+        );
+        let old_group = self.tabs.group_id(source);
+        if self.move_source() == Some(source)
+            && self.tabs.get(target).and_then(AppTab::pane_id).is_some()
+            && self.tabs.move_to_existing_tab(source, target, side)
+        {
+            if source_was_single {
+                self.mru_groups.retain(|g| Some(*g) != old_group);
+            }
+            self.sync_selection(ctx);
+        }
         self.close_picker(ctx);
     }
 

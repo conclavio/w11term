@@ -334,6 +334,7 @@ fn tab_menu_message(label: String) -> Message {
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
         "Move pane to new tab" => Message::MovePaneToTab,
+        "Move pane to existing tab…" => Message::Shortcut(Shortcut::MovePaneToExistingTab),
         "Paste" => Message::Paste,
         "Paste raw (no bracketed paste)" => Message::PasteRaw,
         "Fullscreen (F11)" => Message::Shortcut(Shortcut::Fullscreen),
@@ -410,7 +411,7 @@ pub struct TerminalApp {
     appearance_error: Option<String>,
     divider_drag: Rc<RefCell<Option<pane_view::DividerDrag>>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
-    mru: Vec<TabId>,
+    mru_groups: Vec<TabId>,
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
@@ -425,6 +426,7 @@ pub enum Message {
     PickerHover(u64),
     PickerFrame(u64, u64),
     PickerChoose(u64),
+    PlacePane(TabId, TabId, Direction),
     PickerFocus(u8),
     LocalProfile(local_profile::Action),
     Files(FileAction),
@@ -947,16 +949,16 @@ impl TerminalApp {
             return;
         }
         if self.switcher.is_none() {
-            let ids = if mode == TabSwitcherMode::Mru {
-                self.mru
-                    .iter()
-                    .copied()
-                    .filter(|id| self.tabs.headers().iter().any(|header| header.id == *id))
-                    .collect()
-            } else {
-                self.tabs.headers().iter().map(|tab| tab.id).collect()
-            };
-            let ids: Vec<TabId> = ids;
+            let mut ids: Vec<_> = self.tabs.headers().iter().map(|tab| tab.id).collect();
+            if mode == TabSwitcherMode::Mru {
+                // A tab's focused pane can move to another tab. The group keeps its history.
+                ids.sort_by_cached_key(|&id| {
+                    self.tabs
+                        .group_id(id)
+                        .and_then(|group| self.mru_groups.iter().position(|&g| g == group))
+                        .unwrap_or(usize::MAX)
+                });
+            }
             let index = ids
                 .iter()
                 .position(|id| Some(*id) == self.tabs.active_id())
@@ -1565,9 +1567,9 @@ impl TerminalApp {
                 let _ = windows.borrow_mut().remember(name);
             }
         });
-        if let Some(id) = self.tabs.active_id() {
-            self.mru.retain(|i| *i != id);
-            self.mru.insert(0, id);
+        if let Some(group) = group {
+            self.mru_groups.retain(|g| *g != group);
+            self.mru_groups.insert(0, group);
         }
         self.cancel_frame_tasks();
         self.divider_drag.borrow_mut().take();
@@ -1667,12 +1669,16 @@ impl TerminalApp {
     }
 
     fn close_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
-        let active = self.active_group == self.tabs.group_id(id);
+        let Some(group) = self.tabs.group_id(id) else {
+            return;
+        };
+        let active = self.active_group == Some(group);
         if active {
             self.keyboard.set_target(None);
             self.cancel_frame_tasks();
         }
         self.tabs.remove_group(id);
+        self.mru_groups.retain(|g| *g != group);
         self.publish_panes();
         if self.tabs.entries().is_empty() {
             let _ = context.window().request_close();
@@ -2304,9 +2310,22 @@ impl TerminalApp {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
             return MenuItem::disabled("panes", "Panes");
         }
+        let action = KeyAction::MovePaneToExistingTab;
+        let binding = action.binding();
+        let move_item = if self.move_source().is_some_and(|source| {
+            self.tabs
+                .headers()
+                .iter()
+                .any(|tab| tab.id != source && tab.value.pane_id().is_some())
+        }) {
+            self.binding_menu(binding.id, binding.label, action)
+        } else {
+            MenuItem::disabled(binding.id, binding.label)
+        };
         let mut items = vec![
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            move_item,
             self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
         ];
@@ -2889,7 +2908,7 @@ impl Component for TerminalApp {
             appearance_error,
             divider_drag: Rc::new(RefCell::new(None)),
             measured_layout: None,
-            mru: Vec::new(),
+            mru_groups: Vec::new(),
             switcher: None,
             picker: None,
             hints: Default::default(),
@@ -3000,6 +3019,9 @@ impl Component for TerminalApp {
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
+            Message::PlacePane(source, target, side) => {
+                self.place_pane(source, target, side, context)
+            }
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::Files(action) => self.file_action(action, context),
             Message::AccessibleSelection(request) => {
@@ -3730,6 +3752,14 @@ impl Component for TerminalApp {
             }
             Message::Shortcut(shortcut) => match shortcut {
                 Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::MovePaneToExistingTab => self.open_move_picker(context),
+                Shortcut::PickerPlace(side) => {
+                    if let Some((source, target)) =
+                        self.picker.as_ref().and_then(|picker| picker.placement())
+                    {
+                        self.place_pane(source, target, side, context);
+                    }
+                }
                 Shortcut::CopyMode => self.open_copy_mode(),
                 Shortcut::CopyKey(key) => self.copy_key(key, context),
                 Shortcut::KeyboardHints => self.open_hints(),
@@ -4876,6 +4906,14 @@ impl TerminalApp {
                 let prompt = tab.session.prompts.current().unwrap();
                 assert_eq!(tab.prompt_id, Some(prompt.id));
                 assert!(!self.keyboard.has_target());
+                self.update(
+                    tab_menu_message("Move pane to existing tab…".into()),
+                    context,
+                );
+                assert!(
+                    self.picker.is_none(),
+                    "a pane move cannot take focus from an SSH prompt"
+                );
                 if step == 3 {
                     self.update(
                         Message::PromptEdit(1, prompt.id, 0, "pilot".into()),
@@ -5090,6 +5128,10 @@ mod profile_ui_tests {
             matches!(tab_menu_message("Split right with tests    F8".into()),
             Message::SplitPane(Axis::Columns,Some(name)) if name=="tests    F8")
         );
+        assert!(matches!(
+            tab_menu_message("Move pane to existing tab…    F8".into()),
+            Message::Shortcut(Shortcut::MovePaneToExistingTab)
+        ));
     }
     #[test]
     fn state_labels_dispatch_the_same_action_before_and_after_toggling() {
