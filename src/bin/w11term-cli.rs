@@ -24,7 +24,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
                 .with_context(|| format!("{arg} requires a value"))
         };
         match arg.as_str() {
-            "wait-for-text" | "events" | "open" | "resize" | "record" | "save-text"
+            "wait-for-text" | "events" | "open" | "resize" | "record" | "save-text" | "restart"
                 if verb.is_none() =>
             {
                 ensure!(

@@ -85,12 +85,22 @@ fn write_input(
 pub async fn run(
     options: LocalOptions,
     size: TerminalSize,
+    input: mpsc::UnboundedReceiver<TransportInput>,
+    output: mpsc::Sender<Event>,
+) -> Result<()> {
+    run_generation(options, size, input, output, 1).await
+}
+
+pub(crate) async fn run_generation(
+    options: LocalOptions,
+    size: TerminalSize,
     mut input: mpsc::UnboundedReceiver<TransportInput>,
     output: mpsc::Sender<Event>,
+    generation: u64,
 ) -> Result<()> {
     let signal =
         Arc::new(unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, true, false, None)?.0) });
-    let _shutdown = Shutdown(signal.clone());
+    let shutdown = Shutdown(signal.clone());
     let Launch {
         input: write,
         output: read,
@@ -128,7 +138,7 @@ pub async fn run(
             Err(std::io::Error::last_os_error()).context("wait for local process")
         }
     });
-    let _ = output.send(Event::Connected(1)).await;
+    let _ = output.send(Event::Connected(generation)).await;
     let _ = output.send(Event::Status("Local shell".into())).await;
     let forward_input = async {
         while let Some(command) = input.recv().await {
@@ -160,13 +170,21 @@ pub async fn run(
         }
         anyhow::Ok(())
     };
-    tokio::select! {
-        result = finished => result?,
-        _ = forward_input => {}
-        result = &mut writer => {
-            result??;
-        }
-        _ = output.closed() => {}
+    tokio::pin!(finished);
+    let writer_result = tokio::select! {
+        result = &mut finished => return result,
+        _ = forward_input => None,
+        result = &mut writer => Some(result),
+        _ = output.closed() => return Ok(()),
+    };
+    // Closing stdin or losing the writer can race the child's last writes.
+    // Stop the job and let ClosePseudoConsole flush into the live reader.
+    drop(shutdown);
+    drop(write_tx);
+    finished.await?;
+    match writer_result {
+        Some(result) => result??,
+        None => writer.await??,
     }
     Ok(())
 }

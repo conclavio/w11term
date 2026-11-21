@@ -47,7 +47,8 @@ try {
     $info = Get-Content -LiteralPath $ready -Raw | ConvertFrom-Json
     $sshProfile = @{host='127.0.0.1'; user='bench'; port=$port; auth='none'; host_key=$info.host_key}
     $profiles = Join-Path $state 'profiles.json'
-    @{profiles=@{first=$sshProfile; second=$sshProfile}} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $profiles
+    $localProfile = @{backend='local'; executable='powershell.exe'; args=@('-NoProfile','-NoLogo')}
+    @{profiles=@{first=$sshProfile; second=$sshProfile; 'restart-local'=$localProfile}} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $profiles
     # Keep every native window within a small CI desktop, including the restored grid.
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'first', '--tab', 'second', '--cols', '80', '--rows', '24') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'gui.log') -RedirectStandardError (Join-Path $state 'gui.err')
     Wait-ControlManifest
@@ -121,6 +122,32 @@ try {
     if ($LASTEXITCODE -ne 1 -or $errorReply.ok -or $errorReply.error -notmatch 'unknown pane') { throw 'Missing pane should fail with JSON' }
     $errorReply = & $ctl --pid 4294967295 list | ConvertFrom-Json
     if ($LASTEXITCODE -ne 1 -or $errorReply.ok -or $errorReply.error -notmatch 'nothing was started') { throw 'Missing instance should fail without starting anything' }
+    $localPane = [string](Invoke-Control @('open', '--profile', 'restart-local')).pane
+    $null = Invoke-Control @('wait-for-text', '--pane', $localPane, '--timeout', '15', 'PS ')
+    $null = Invoke-Control @('send-text', '--pane', $localPane, '--no-paste', '--base64', 'ZXhpdCAxMg0=')
+    $cursor = 0
+    $exitEvent = $null
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $batch = Invoke-Control @('events', '--pane', $localPane, '--since', [string]$cursor, '--timeout', '2')
+        foreach ($event in $batch.journal.events) {
+            if ($event.kind -eq 'pane-exited') { $exitEvent = $event.data.exit_token }
+        }
+        $cursor = $batch.journal.next
+    } while (($null -eq $exitEvent -or $null -eq $batch.restart_token) -and [DateTime]::UtcNow -lt $deadline)
+    $exitToken = [string]$batch.restart_token
+    if (!$exitToken -or $exitToken -ne [string]$exitEvent) { throw 'Exited local pane did not report its restart token' }
+    $result = Invoke-Control @('restart', '--pane', $localPane, '--exit-token', $exitToken)
+    if (!$result.accepted -or $result.pane -ne $localPane) { throw 'Restart did not accept the exited pane' }
+    $again = & $ctl --pid $terminal.Id restart --pane $localPane --exit-token $exitToken | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $again.ok) { throw 'A single exit token started another local process twice' }
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $restarted = (Invoke-Control @('list')).sessions | Where-Object id -eq $localPane
+        if ($restarted.connection_generation -ge 2) { break }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if ($restarted.active -or $restarted.connection_generation -lt 2) { throw 'Restart changed focus or lost the new connection generation' }
     $null = $terminal.CloseMainWindow()
     if (-not $terminal.WaitForExit(5000)) { throw 'GUI failed to close' }
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'second') -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'restored.log') -RedirectStandardError (Join-Path $state 'restored.err')
@@ -139,7 +166,7 @@ try {
     $null = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '5', 'TAPE')
     $replayed = Invoke-Control @('get-text', '--pane', '1')
     if ($replayed.cols -ne $live.cols -or $replayed.rows -ne $live.rows -or $replayed.text -cne $live.text) { throw 'Replay did not reproduce the recorded grid and screen contents' }
-    Write-Output "Control smoke passed. Verified loopback SSH, native CLI control, window restore, and VT record/replay. Artifacts: $state"
+    Write-Output "Control smoke passed. Verified loopback SSH, background PowerShell restart, window restore, and VT record/replay. Artifacts: $state"
 } finally {
     if ($terminal -and -not $terminal.HasExited) {
         $null = $terminal.CloseMainWindow()

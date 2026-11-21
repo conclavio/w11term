@@ -724,6 +724,13 @@ impl TerminalState {
         self.alert_handler.replace(handler);
     }
 
+    /// Replace the input/reply sink when the host launches a new transport.
+    /// Bytes still queued on the old writer remain bound to the old sink.
+    pub fn replace_writer(&mut self, writer: Box<dyn std::io::Write + Send>) {
+        self.writer = BufWriter::new(Box::new(ThreadedWriter::new(writer)));
+        self.parser_reply_writer = None;
+    }
+
     pub fn set_download_handler(&mut self, handler: &Arc<dyn DownloadHandler>) {
         self.download_handler.replace(handler.clone());
     }
@@ -1093,6 +1100,14 @@ impl TerminalState {
         if self.focus_tracking {
             write!(self.writer, "{}{}", CSI, if focused { "I" } else { "O" }).ok();
             self.writer.flush().ok();
+        }
+        self.set_focus_without_reporting(focused);
+    }
+
+    /// Keep local focus current while no interactive peer can receive events.
+    pub fn set_focus_without_reporting(&mut self, focused: bool) {
+        if focused == self.focused {
+            return;
         }
         self.focused = focused;
         if !focused {

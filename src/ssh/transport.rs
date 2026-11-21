@@ -667,7 +667,7 @@ impl Driver {
             };
             let result = match connected {
                 Ok(session) => {
-                    self.generation += 1;
+                    self.generation = self.sharing.next_generation();
                     let started = tokio::time::Instant::now();
                     let result = run_channel(session, self, program).await;
                     self.output.send(Event::Disconnected).await?;
@@ -758,6 +758,8 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     let restoring = probe.as_ref().is_some_and(game_resume::Probe::redeeming);
     let mut waiting_for_resume = restoring;
     let mut queued_before_unlock = 0usize;
+    let mut process_exited = false;
+    let mut output_eof = false;
     let mut early_data = Vec::new();
     if managed {
         let startup = program.prepare(&mut shell, options.clone(), original_size);
@@ -884,6 +886,15 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 }
             }
             message = input.recv() => {
+                if process_exited {
+                    match message {
+                        Some(TransportInput::Raw(_, reply)) => { let _ = reply.send(Err("Remote process exited; input was not sent".into())); }
+                        Some(TransportInput::Sftp(job)) => { let _ = job.reply.send(Err("Remote process exited; SFTP operation was not started".into())); }
+                        Some(_) => {}
+                        None => return Ok(()),
+                    }
+                    continue;
+                }
                 // Commands already queued when the welcome/restore gate opened
                 // belong to the previous input epoch, even when processed later.
                 let discard_input = waiting_for_resume || queued_before_unlock > 0;
@@ -915,8 +926,13 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
                 Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),
-                Some(russh::ChannelMsg::ExitStatus{exit_status})=>{output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;return Ok(());},
-                Some(russh::ChannelMsg::Close)=>return Ok(()),None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
+                // Exit status is advisory until EOF/close; the peer can still
+                // deliver final terminal bytes after reporting it.
+                Some(russh::ChannelMsg::ExitStatus{exit_status})=>{process_exited=true;output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;if output_eof{return Ok(());}},
+                Some(russh::ChannelMsg::Close)=>return Ok(()),
+                Some(russh::ChannelMsg::Eof)=>{if process_exited{return Ok(())} output_eof=true;},
+                None if process_exited => return Ok(()),
+                None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
             }
         }
     }

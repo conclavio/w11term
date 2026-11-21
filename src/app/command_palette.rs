@@ -5,6 +5,7 @@ use w11term::shortcuts::BINDINGS;
 pub enum CommandId {
     Menu(String),
     SaveScrollback(Option<u64>),
+    RestartExited(Option<ExitedPane>),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -45,7 +46,8 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                 enabled,
             } => {
                 if (!enabled && key == "panes".into())
-                    || (!profiles && key == "save-scrollback".into())
+                    || (!profiles
+                        && (key == "save-scrollback".into() || key == "restart-exited".into()))
                 {
                     continue;
                 }
@@ -116,7 +118,8 @@ fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
 impl TerminalApp {
     pub(super) fn command_rows(&self, query: &str) -> Vec<Row> {
         let mut rows = vec![];
-        menu_rows(self.caret_items(), false, &mut rows);
+        let exited = self.tabs.active().and_then(AppTab::exited_pane);
+        menu_rows(self.caret_items(exited.is_some()), false, &mut rows);
         menu_rows(self.profile_items(), true, &mut rows);
         let live = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live),
@@ -124,6 +127,12 @@ impl TerminalApp {
         });
         let tab_count = self.tabs.headers().len();
         let pane = live.map(|tab| tab.session.pane_id);
+        rows.push(Row {
+            id: CommandId::RestartExited(exited),
+            label: RESTART_EXITED_PANE.into(),
+            chord: String::new(),
+            enabled: exited.is_some(),
+        });
         rows.push(Row {
             id: CommandId::SaveScrollback(pane),
             label: scrollback_export::LABEL.into(),
@@ -224,6 +233,8 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::RestartExited(Some(exit)) => Message::RestartExited(exit),
+            CommandId::RestartExited(None) => return,
             CommandId::SaveScrollback(pane) => {
                 Message::Export(scrollback_export::Action::Start(pane))
             }
