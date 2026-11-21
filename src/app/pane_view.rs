@@ -219,6 +219,7 @@ impl TerminalApp {
         let selection = tab.selection.clone();
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
+        let copy_mode = self.copy_mode.clone();
         #[cfg(feature = "ui-smoke")]
         let paint_count = surface.paint_count.clone();
         let canvas: View = Canvas::invalidated(&surface.invalidator, move |ctx| {
@@ -228,11 +229,15 @@ impl TerminalApp {
             let hints = hints.as_ref().filter(|h| h.pane == id);
             let frame = hints.map_or_else(|| frames.load(), |h| h.frame.clone());
             let mut renderer = renderer.borrow_mut();
+            let mode = copy_mode.borrow();
+            let mode = mode.as_ref().filter(|m| m.pane == id);
+            renderer.copy_cursor = mode.map(|m| m.state.cursor);
+            let marked = mode.and_then(|m| m.state.selection());
             let measured = renderer.draw(ctx, &frame)?;
             renderer.draw_interaction(
                 ctx,
                 &frame,
-                selection.borrow().as_ref(),
+                marked.as_ref().or(selection.borrow().as_ref()),
                 hover.borrow().as_ref(),
             )?;
             if let Some(hints) = hints {
@@ -352,7 +357,20 @@ impl TerminalApp {
         } else {
             content
         };
-        let content = if let Some(hints) = self.hints.borrow().as_ref().filter(|h| h.pane == id) {
+        let instructions = self
+            .copy_mode
+            .borrow()
+            .as_ref()
+            .filter(|m| m.pane == id)
+            .map(|m| m.instructions().to_owned())
+            .or_else(|| {
+                self.hints
+                    .borrow()
+                    .as_ref()
+                    .filter(|h| h.pane == id)
+                    .map(|h| h.instructions())
+            });
+        let content = if let Some(instructions) = instructions {
             Grid::new().children((
                 content,
                 Border::new()
@@ -361,7 +379,7 @@ impl TerminalApp {
                     .vertical_alignment(VerticalAlignment::Bottom)
                     .content(
                         TextBlock::new()
-                            .text(hints.instructions())
+                            .text(instructions)
                             .text_wrapping(TextWrapping::Wrap),
                     ),
             ))
@@ -500,6 +518,45 @@ impl TerminalApp {
                     Axis::Rows => (aw.max(bw), ah + DIVIDER + bh),
                 })
             }
+        }
+    }
+
+    pub(super) fn keyboard_resize(&mut self, direction: Direction) {
+        if self.tabs.zoomed() {
+            return;
+        }
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let Some(layout) = self.tabs.active_layout() else {
+            return;
+        };
+        let metrics = tab.surface.metrics.get();
+        // Each split leaf also has a one-DIP border on both sides of its canvas.
+        let minimum = 2.0
+            + f64::from(
+                2.0 * PADDING
+                    + match direction.axis() {
+                        Axis::Columns => metrics.cell_width,
+                        Axis::Rows => STATUS_HEIGHT + metrics.cell_height,
+                    },
+            );
+        let edit = layout.keyboard_resize(id, direction, minimum, DIVIDER, |node| {
+            let (w, h) = self.layout_size(node)?;
+            Some(match direction.axis() {
+                Axis::Columns => w,
+                Axis::Rows => h,
+            })
+        });
+        if let Some((path, ratio)) = edit {
+            self.tabs.set_ratio(&path, ratio);
         }
     }
 

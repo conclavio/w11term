@@ -58,12 +58,40 @@ for ($launch = 1; $launch -le 2; $launch++) {
             (Get-Item -LiteralPath $Trace).Length -ge ($f7Length * $launch)
         }
         Wait-Focus $remote
+        $before = (Control @('list')).sessions
+        $remoteWidth = ($before | Where-Object id -eq $remote).cols
+        $localWidth = ($before | Where-Object id -eq $local).cols
+        Post-Key 0x100 0x78 # F9, resize right
+        $wider = Wait-Until 'SSH to grow and PowerShell to shrink' {
+            $now = (Control @('list')).sessions
+            if (($now | Where-Object id -eq $remote).cols -gt $remoteWidth -and
+                ($now | Where-Object id -eq $local).cols -lt $localWidth) { $now }
+        }
+        $ssh = $wider | Where-Object id -eq $remote
+        $repeating = [FixtureMessages]::PostMessage($window, 0x100, [UIntPtr]::new([uint32]0x78), [IntPtr]::new(0x40000000))
+        if (!$repeating) { throw 'Could not post the held resize key to the fixture' }
+        Post-Key 0x101 0x78
+        $held = Wait-Until 'the held key to keep resizing' {
+            $current = (Control @('list')).sessions | Where-Object id -eq $remote
+            if ($current.cols -gt $ssh.cols) { $current }
+        }
+        $null = Control @('wait-for-text','--pane',"$remote",'--timeout','12',"ssh-grid-$($held.cols)x$($held.rows)")
+        Wait-Focus $remote
         Press-Key 0x77
         Wait-Focus $local
-        # Splitting the string makes the echoed command distinct from its result.
-        foreach ($ch in "'local-' + 'result-$launch'".ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
+        Press-Key 0x79 # F10, resize left from the other side of the divider
+        Press-Key 0x79
+        $localGrid = Wait-Until 'PowerShell to regain its original columns' {
+            $now = (Control @('list')).sessions
+            $shell = $now | Where-Object id -eq $local
+            if ($shell.cols -eq $localWidth -and ($now | Where-Object id -eq $remote).cols -eq $remoteWidth) { $shell }
+        }
+        Wait-Focus $local
+        # Ask the shell itself for its ConPTY dimensions, distinct from the echoed command.
+        $command = '"local-{0}x{1}" -f [Console]::WindowWidth,[Console]::WindowHeight'
+        foreach ($ch in $command.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
         Press-Key 13
-        $null = Control @('wait-for-text','--pane',"$local",'--timeout','12',"local-result-$launch")
+        $null = Control @('wait-for-text','--pane',"$local",'--timeout','12',"local-$($localGrid.cols)x$($localGrid.rows)")
     } finally {
         if (!$app.HasExited) {
             $null = $app.CloseMainWindow()

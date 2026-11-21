@@ -98,10 +98,11 @@ impl Screen {
         self.command_start = None;
     }
 
-    pub(crate) fn finish_command_output(
+    pub(crate) fn take_command_text(
         &mut self,
         end_row: VisibleRowIndex,
         end_col: usize,
+        max_bytes: usize,
     ) -> Result<String, &'static str> {
         let (start_row, start_col) = self
             .command_start
@@ -116,7 +117,6 @@ impl Screen {
         }
         // Match the embedding's plain-text clipboard limit. Never silently
         // substitute a partial command or allocate an unbounded second history.
-        const MAX_OUTPUT: usize = 1024 * 1024;
         let mut output = String::new();
         for row in start..=end {
             let line = &self.lines[row];
@@ -139,7 +139,7 @@ impl Screen {
                     pending_spaces += 1;
                     continue;
                 }
-                if output.len() + pending_spaces + cell.str().len() > MAX_OUTPUT {
+                if output.len() + pending_spaces + cell.str().len() > max_bytes {
                     return Err("Command output exceeds the 1 MiB clipboard limit");
                 }
                 output.extend(std::iter::repeat_n(' ', pending_spaces));
@@ -147,7 +147,7 @@ impl Screen {
                 output.push_str(cell.str());
             }
             if hard_break {
-                if output.len() + 2 > MAX_OUTPUT {
+                if output.len() + 2 > max_bytes {
                     return Err("Command output exceeds the 1 MiB clipboard limit");
                 }
                 output.push_str("\r\n");

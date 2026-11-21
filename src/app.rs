@@ -33,6 +33,7 @@ const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
 mod attention;
+mod command_history;
 mod config_import;
 mod file_drawer;
 mod keyboard_settings;
@@ -45,6 +46,7 @@ mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
 mod inspector;
+mod keyboard_copy;
 mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
@@ -134,6 +136,7 @@ enum SettingsEditor {
 }
 enum Page {
     Attention,
+    CommandHistory(command_history::HistoryPage),
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
@@ -317,12 +320,17 @@ fn tab_menu_message(label: String) -> Message {
         }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
+        "Command history" => Message::History(command_history::Action::Open),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
         "Focus below" => Message::PaneNeighbor(Direction::Down),
+        "Resize left" => Message::Shortcut(Shortcut::ResizePane(Direction::Left)),
+        "Resize right" => Message::Shortcut(Shortcut::ResizePane(Direction::Right)),
+        "Resize up" => Message::Shortcut(Shortcut::ResizePane(Direction::Up)),
+        "Resize down" => Message::Shortcut(Shortcut::ResizePane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
         "Move pane to new tab" => Message::MovePaneToTab,
@@ -340,6 +348,7 @@ fn tab_menu_message(label: String) -> Message {
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
+        "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
         _ => Message::ControlIdle,
     }
@@ -405,6 +414,7 @@ pub struct TerminalApp {
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
+    copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
 }
 
 pub enum Message {
@@ -450,6 +460,7 @@ pub enum Message {
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
     CopyLastCommand,
+    History(command_history::Action),
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
     Discovery(session_browser::Action),
@@ -478,6 +489,7 @@ pub enum Message {
     PasteRaw,
     Paste,
     RawPaste(Result<(), String>),
+    CopyResult(TabId, u64, Result<(), String>),
     Pointer(TabId, PointerEventInfo, MouseEventKind),
     RenderError(TabId, String),
     RetryRender(TabId),
@@ -703,6 +715,7 @@ impl TerminalApp {
             )
     }
     fn find(&mut self, close: bool, direction: Option<isize>, context: &ComponentContext<Self>) {
+        self.close_copy_mode();
         let Some(id) = self.tabs.active_id() else {
             return;
         };
@@ -978,7 +991,13 @@ impl TerminalApp {
         if !self.tabs.visible(id) {
             return;
         }
-        if self.hints.borrow().as_ref().is_some_and(|h| h.pane == id) {
+        if self
+            .copy_mode
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.pane == id)
+            || self.hints.borrow().as_ref().is_some_and(|h| h.pane == id)
+        {
             return;
         }
         if kind == MouseEventKind::Press && self.tabs.active_id() != Some(id) {
@@ -1507,6 +1526,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.close_copy_mode();
         self.close_hints();
         self.sync_inspector();
         if self.picker.take().is_some() {
@@ -2287,6 +2307,7 @@ impl TerminalApp {
         let mut items = vec![
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
         ];
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
@@ -2306,6 +2327,7 @@ impl TerminalApp {
                 ),
                 None => MenuItem::item("copy-last-output", "Copy last command output"),
             });
+            items.push(MenuItem::item("command-history", "Command history"));
             if let Some(menu) = durable_view::pane_menu(live) {
                 items.push(menu);
             }
@@ -2338,6 +2360,25 @@ impl TerminalApp {
                 ("down", KeyAction::FocusDown),
             ] {
                 items.push(self.binding_menu(key, action.binding().label, action));
+            }
+            if !self.tabs.zoomed()
+                && let Some(id) = self.tabs.active_id()
+                && let Some(layout) = self.tabs.active_layout()
+            {
+                for (axis, actions) in [
+                    (
+                        Axis::Columns,
+                        [KeyAction::ResizeLeft, KeyAction::ResizeRight],
+                    ),
+                    (Axis::Rows, [KeyAction::ResizeUp, KeyAction::ResizeDown]),
+                ] {
+                    if layout.divider_for(id, axis).is_some() {
+                        for action in actions {
+                            let binding = action.binding();
+                            items.push(self.binding_menu(binding.id, binding.label, action));
+                        }
+                    }
+                }
             }
             items.push(self.binding_menu(
                 "zoom-pane",
@@ -2852,6 +2893,7 @@ impl Component for TerminalApp {
             switcher: None,
             picker: None,
             hints: Default::default(),
+            copy_mode: Default::default(),
             selection_pending: true,
             selection_epoch: 0,
         };
@@ -2946,13 +2988,14 @@ impl Component for TerminalApp {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.active()
-                    && let Some(command) = &tab.session.frames.load().last_command
+                    && let Some(command) = tab.session.frames.load().command_history.back()
                     && let Ok(text) = &command.output
                     && let Err(error) = w11term::clipboard::write(text)
                 {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
+            Message::History(action) => self.handle_history(action, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
@@ -2970,6 +3013,7 @@ impl Component for TerminalApp {
                     && self.switcher.is_none()
                     && self.picker.is_none()
                     && self.hints.borrow().is_none()
+                    && self.copy_mode.borrow().is_none()
                 {
                     let frame = tab.session.frames.load();
                     if frame.generation == request.generation {
@@ -3558,6 +3602,7 @@ impl Component for TerminalApp {
                         }
                     }
                     if self.tabs.active_id() == Some(id) {
+                        self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
                     if let Some(AppTab {
@@ -3685,6 +3730,8 @@ impl Component for TerminalApp {
             }
             Message::Shortcut(shortcut) => match shortcut {
                 Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::CopyMode => self.open_copy_mode(),
+                Shortcut::CopyKey(key) => self.copy_key(key, context),
                 Shortcut::KeyboardHints => self.open_hints(),
                 Shortcut::HintKey(key) => self.hint_key(key, context),
                 Shortcut::PickerAccept => self.accept_picker(context),
@@ -3696,6 +3743,7 @@ impl Component for TerminalApp {
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
+                Shortcut::ResizePane(direction) => self.keyboard_resize(direction),
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)
@@ -3832,6 +3880,9 @@ impl Component for TerminalApp {
             Message::ImportConfig(action) => self.import_action(action, context),
             Message::Paste => self.paste(false, context),
             Message::PasteRaw => self.paste(true, context),
+            Message::CopyResult(pane, request, result) => {
+                self.finish_keyboard_copy(pane, request, result)
+            }
             Message::RawPaste(result) => {
                 if let Err(error) = result {
                     log::warn!("Raw paste: {error}");
@@ -4167,6 +4218,11 @@ impl Component for TerminalApp {
             && self.hints.borrow().is_none()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
+            let marked = self
+                .copy_mode
+                .borrow()
+                .as_ref()
+                .and_then(|m| m.state.selection());
             let metrics = tab.surface.metrics.get();
             let sender = context.sender();
             self.accessible.update(
@@ -4181,7 +4237,7 @@ impl Component for TerminalApp {
                         cell_height: f64::from(metrics.cell_height * metrics.scale),
                         padding: f64::from(PADDING * metrics.scale),
                     },
-                    selection: tab.selection.borrow().as_ref(),
+                    selection: marked.as_ref().or(tab.selection.borrow().as_ref()),
                 },
                 move |request| {
                     sender.send(Message::AccessibleSelection(request));
@@ -4223,6 +4279,7 @@ impl Component for TerminalApp {
                 },
                 Page::Settings(None) => self.settings_view(context),
                 Page::Attention => self.attention_view(context),
+                Page::CommandHistory(page) => self.history_view(page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,
@@ -4255,6 +4312,7 @@ impl Component for TerminalApp {
         ];
         if let Some(inspection) = &self.inspection
             && self.hints.borrow().is_none()
+            && self.copy_mode.borrow().is_none()
         {
             views.push(KeyedView::new(
                 "terminal-inspector",

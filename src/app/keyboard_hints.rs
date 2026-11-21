@@ -91,6 +91,7 @@ impl Hints {
 
 impl TerminalApp {
     pub(super) fn open_hints(&mut self) {
+        self.close_copy_mode();
         let Some(id) = self.tabs.active_id() else {
             self.keyboard.set_hints(false);
             return;

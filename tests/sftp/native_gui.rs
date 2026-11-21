@@ -4,6 +4,57 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives keyboard copy mode against a loopback SSH peer"]
+async fn native_keyboard_copy_reads_scrollback_and_keeps_mode_keys_off_the_wire() {
+    let (Source::Ssh(profile), remote, _, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let mut history = String::from("\x1b[2J\x1b[3J\x1b[H\x1b[32mhistory-start\x1b[0m\r\n");
+    for row in 0..180 {
+        history.push_str(&format!("fixture line {row}\r\n"));
+    }
+    history.push_str("history-end\x1b[>3u");
+    fs::write(remote.path().join("copy-history.vt"), history).unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":{"copy-fixture":profile}})).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.path().join("appearance.json"),
+        br#"{"shortcuts":{"copy_mode":"F8"}}"#,
+    )
+    .unwrap();
+    let result = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-STA", "-File"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/keyboard-copy-ui.ps1"))
+        .args([
+            "-Gui",
+            env!("CARGO_BIN_EXE_w11term"),
+            "-Cli",
+            env!("CARGO_BIN_EXE_w11term-cli"),
+        ])
+        .arg("-State")
+        .arg(state.path())
+        .arg("-Trace")
+        .arg(&trace)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
+    );
+    assert_eq!(fs::read(trace).unwrap(), b"!");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "saves a startup command in the native workspace editor and reopens it over SSH"]
 async fn native_workspace_startup_is_sent_only_by_the_reopened_pane() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 2).await else {
@@ -58,6 +109,11 @@ async fn native_shortcut_rebind_releases_previous_key_and_persists_after_restart
     let state = tempfile::tempdir().unwrap();
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
+    fs::write(
+        state.path().join("appearance.json"),
+        br#"{"shortcuts":{"resize_right":"F9","resize_left":"F10"}}"#,
+    )
+    .unwrap();
     let data = state.path().join("data");
     fs::create_dir(&data).unwrap();
     fs::write(
@@ -98,8 +154,8 @@ async fn native_shortcut_rebind_releases_previous_key_and_persists_after_restart
         String::from_utf8_lossy(&output.stderr),
         fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
     );
-    // Only the released F7 reached SSH on each launch. F8 and subsequent
-    // text were consumed locally or directed to the neighboring PowerShell.
+    // Only the released F7 reached SSH on each launch. Resize and focus
+    // chords were consumed locally, and the text went to PowerShell.
     assert_eq!(fs::read(trace).unwrap(), b"\x1b[18~\x1b[18~");
     assert_eq!(opens.load(Ordering::Relaxed), 2);
     server.abort();
