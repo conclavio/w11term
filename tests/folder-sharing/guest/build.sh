@@ -88,6 +88,8 @@ chroot "$root" useradd --create-home --user-group --shell /bin/sh w11fixture
 chroot "$root" usermod --password 'x' w11fixture
 install -m 0755 "$here/init" "$root/init"
 install -m 0644 "$here/sshd_config" "$root/etc/ssh/w11term-fixture.conf"
+# An initramfs boot has no distro service to populate the mount table link.
+ln -sfn /proc/self/mounts "$root/etc/mtab"
 rm -f "$root"/etc/ssh/ssh_host_* "$root/etc/machine-id"
 rm -rf "$root/var/lib/apt/lists" "$root/var/cache/apt/archives" "$root/var/log"
 mkdir -p "$root/var/log" "$root/dev"
