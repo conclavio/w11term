@@ -53,6 +53,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    startup: Option<w11term::workspace::SshStartup>,
     observed_frame: u64,
     files: Box<FileDrawer>,
     discovery_page: Option<usize>,
@@ -282,6 +283,9 @@ fn tab_menu_message(label: String) -> Message {
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         "SFTP files" => Message::Files(FileAction::Toggle),
+        "Workspace startup…" => {
+            Message::Workspace(workspace_view::WorkspaceAction::ConfigureStartup)
+        }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
         "Split right" => Message::SplitPane(Axis::Columns, None),
@@ -480,6 +484,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            startup: None,
             observed_frame: 0,
             files: Box::default(),
             discovery_page: None,
@@ -2113,6 +2118,12 @@ impl TerminalApp {
                 self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
             })
         });
+        let workspace_startup = match self.tabs.active().map(|tab| &tab.page) {
+            Some(Page::Terminal(live)) if matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush) => {
+                MenuItem::item("workspace-startup", "Workspace startup…")
+            }
+            _ => MenuItem::disabled("workspace-startup", "Workspace startup…"),
+        };
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2128,6 +2139,7 @@ impl TerminalApp {
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
                     self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
+                    workspace_startup,
                     self.discovery_menu(),
                     state_menu_item(
                         "inspector",

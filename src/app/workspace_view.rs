@@ -1,15 +1,28 @@
 use super::*;
-use w11term::workspace::{SavedLayout, SavedSource, Workspace, WorkspaceStore};
+use w11term::workspace::{SavedLayout, SavedSource, SshStartup, Workspace, WorkspaceStore};
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {
     name: String,
     names: Vec<String>,
     status: String,
+    startup: Option<StartupEditor>,
+}
+
+struct StartupEditor {
+    pane: TabId,
+    destination: String,
+    directory: String,
+    command: String,
 }
 
 pub enum WorkspaceAction {
     Show,
+    ConfigureStartup,
+    StartupDirectory(TabId, String),
+    StartupCommand(TabId, String),
+    ApplyStartup(TabId),
+    CancelStartup(TabId),
     Name(TabId, String),
     Save(TabId),
     Open(TabId, String),
@@ -22,6 +35,100 @@ impl TerminalApp {
         context: &ComponentContext<Self>,
     ) {
         match action {
+            WorkspaceAction::ConfigureStartup => {
+                let Some(pane) = self.tabs.active_id() else {
+                    return;
+                };
+                let Some(AppTab {
+                    page: Page::Terminal(live),
+                    ..
+                }) = self.tabs.get(pane)
+                else {
+                    return;
+                };
+                if !matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush)
+                {
+                    return;
+                }
+                let draft = StartupEditor {
+                    pane,
+                    destination: source_label(&live.source),
+                    directory: live
+                        .startup
+                        .as_ref()
+                        .map(|s| s.directory.clone())
+                        .unwrap_or_default(),
+                    command: live
+                        .startup
+                        .as_ref()
+                        .map(|s| s.command.clone())
+                        .unwrap_or_default(),
+                };
+                self.workspace_action(WorkspaceAction::Show, context);
+                if let Some(page) = self
+                    .tabs
+                    .active_id()
+                    .and_then(|id| self.workspace_page_mut(id))
+                {
+                    page.status.clear();
+                    page.startup = Some(draft);
+                }
+            }
+            WorkspaceAction::StartupDirectory(id, value) => {
+                if let Some(draft) = self.workspace_page_mut(id).and_then(|p| p.startup.as_mut()) {
+                    draft.directory = value;
+                }
+            }
+            WorkspaceAction::StartupCommand(id, value) => {
+                if let Some(draft) = self.workspace_page_mut(id).and_then(|p| p.startup.as_mut()) {
+                    draft.command = value;
+                }
+            }
+            WorkspaceAction::CancelStartup(id) => {
+                if let Some(page) = self.workspace_page_mut(id) {
+                    page.startup = None;
+                    page.status.clear();
+                }
+            }
+            WorkspaceAction::ApplyStartup(id) => {
+                let Some(draft) = self.workspace_page_mut(id).and_then(|p| p.startup.take()) else {
+                    return;
+                };
+                let result = (|| -> anyhow::Result<()> {
+                    let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.get_mut(draft.pane)
+                    else {
+                        anyhow::bail!("The SSH pane was closed")
+                    };
+                    let Source::Ssh(ssh) = &live.source else {
+                        anyhow::bail!("The pane requires SSH")
+                    };
+                    live.startup = if draft.directory.is_empty() && draft.command.is_empty() {
+                        None
+                    } else {
+                        Some(SshStartup::new(
+                            ssh,
+                            draft.directory.clone(),
+                            draft.command.clone(),
+                        )?)
+                    };
+                    Ok(())
+                })();
+                if let Some(page) = self.workspace_page_mut(id) {
+                    match result {
+                        Ok(()) => {
+                            page.status =
+                                "Save or update the workspace to keep these settings.".into();
+                        }
+                        Err(error) => {
+                            page.status = error.to_string();
+                            page.startup = Some(draft);
+                        }
+                    }
+                }
+            }
             WorkspaceAction::Show => {
                 let page = self
                     .tabs
@@ -41,6 +148,7 @@ impl TerminalApp {
                     id
                 };
                 if let Some(page) = self.workspace_page_mut(id) {
+                    page.startup = None;
                     match WorkspaceStore::open().and_then(|store| store.load()) {
                         Ok(catalog) => page.names = catalog.into_keys().collect(),
                         Err(error) => page.status = format!("{error:#}"),
@@ -147,6 +255,12 @@ impl TerminalApp {
             } else {
                 SavedSource::capture(&live.source, live.profile_name.as_deref())?
             };
+            if let Some(launch) = &live.startup {
+                return Ok(SavedSource::Startup {
+                    connection: Box::new(source),
+                    launch: launch.clone(),
+                });
+            }
             source.with_session(
                 live.session
                     .durable_state()
@@ -161,6 +275,59 @@ impl TerminalApp {
         page: &WorkspacePage,
         context: &ViewContext<Self>,
     ) -> View {
+        if let Some(editor) = &page.startup {
+            let directory = TextBox::new()
+                .automation_name("Remote starting directory")
+                .text(&editor.directory)
+                .placeholder_text("/home/me/project")
+                .on_text_changed(context.callback(move |value| {
+                    Message::Workspace(WorkspaceAction::StartupDirectory(id, value))
+                }));
+            let command = TextBox::new()
+                .automation_name("Remote startup command")
+                .text(&editor.command)
+                .placeholder_text("tail -f build.log")
+                .on_text_changed(context.callback(move |value| {
+                    Message::Workspace(WorkspaceAction::StartupCommand(id, value))
+                }));
+            let buttons = StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    Button::new()
+                        .on_click(context.callback(move |_| {
+                            Message::Workspace(WorkspaceAction::ApplyStartup(id))
+                        }))
+                        .content("Apply to pane"),
+                    Button::new()
+                        .on_click(context.callback(move |_| {
+                            Message::Workspace(WorkspaceAction::CancelStartup(id))
+                        }))
+                        .content("Cancel"),
+                ));
+            let instructions = "These values apply when you next open this pane from a saved workspace. Leave both empty for the default shell.";
+            let panel = StackPanel::new()
+                .margin(32.0)
+                .spacing(10.0)
+                .max_width(600.0)
+                .children((
+                    TextBlock::new()
+                        .text(format!("Workspace startup · {}", editor.destination))
+                        .font_size(22.0),
+                    TextBlock::new()
+                        .text(instructions)
+                        .text_wrapping(TextWrapping::Wrap),
+                    TextBlock::new().text("Remote starting directory"),
+                    directory,
+                    TextBlock::new().text("Remote command"),
+                    command,
+                    buttons,
+                    TextBlock::new()
+                        .text(&page.status)
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            return ScrollViewer::new().content(panel);
+        }
         let name = page.name.trim();
         let save_label = if page.names.iter().any(|entry| entry == name) {
             "Update saved workspace"
@@ -264,6 +431,19 @@ pub(super) fn append_resolved_workspace(
                 osc52,
                 saved.session().cloned(),
             );
+        }
+        if let (SavedSource::Startup { launch, .. }, Source::Ssh(options)) = (saved, &source) {
+            let session = Session::start_workspace_ssh(
+                options.clone(),
+                TerminalSize::default(),
+                osc52,
+                launch.clone(),
+            );
+            let mut tab = live_tab_for_session(label, source, session).with_profile(profile_name);
+            if let Page::Terminal(live) = &mut tab.page {
+                live.startup = Some(launch.clone());
+            }
+            return tab;
         }
         live_tab_sized(
             label,
