@@ -198,12 +198,37 @@ fn default_profiles_path() -> PathBuf {
     local
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Profiles {
     pub profiles: BTreeMap<String, SshOptions>,
     pub local: BTreeMap<String, LocalOptions>,
+    /// Each available name once, including discovered local shells.
+    pub profile_order: Vec<String>,
+    pub(crate) has_explicit_order: bool,
+}
+
+impl Default for Profiles {
+    fn default() -> Self {
+        let local = LocalOptions::installed();
+        Self {
+            profile_order: local.keys().cloned().collect(),
+            profiles: BTreeMap::new(),
+            local,
+            has_explicit_order: false,
+        }
+    }
 }
 
 impl Profiles {
+    fn cli_order(&self) -> Vec<&String> {
+        if self.has_explicit_order {
+            self.profile_order.iter().collect()
+        } else {
+            // --list-profiles historically prints local shells first.
+            self.local.keys().chain(self.profiles.keys()).collect()
+        }
+    }
+
     pub fn source(&self, name: &str) -> Option<Source> {
         profile_source(&self.profiles, &self.local, name)
     }
@@ -223,10 +248,7 @@ pub fn profile_source(
 pub(crate) fn load_profiles(path: &Path) -> Result<Profiles> {
     let bytes = match std::fs::read(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Profiles {
-                profiles: BTreeMap::new(),
-                local: LocalOptions::installed(),
-            });
+            return Ok(Profiles::default());
         }
         result => result.with_context(|| format!("reading {}", path.display()))?,
     };
@@ -237,12 +259,19 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
     #[derive(Deserialize)]
     struct Document {
         profiles: BTreeMap<String, serde_json::Value>,
+        #[serde(default)]
+        profile_order: Option<serde_json::Value>,
     }
     let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let explicit_order: Option<Vec<String>> = document
+        .profile_order
+        .map(serde_json::from_value)
+        .transpose()
+        .context("profile_order must be an array of profile names")?;
     let mut profiles = Profiles {
-        profiles: BTreeMap::new(),
-        local: LocalOptions::installed(),
+        has_explicit_order: explicit_order.is_some(),
+        ..Profiles::default()
     };
     for (name, value) in document.profiles {
         if value.get("backend").and_then(|v| v.as_str()) == Some("local") {
@@ -286,6 +315,17 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
             }
         }
     }
+    let mut seen = std::collections::HashSet::new();
+    let known = explicit_order
+        .iter()
+        .flatten()
+        .filter(|name| profiles.profiles.contains_key(*name) || profiles.local.contains_key(*name));
+    profiles.profile_order = known
+        .chain(profiles.profiles.keys())
+        .chain(profiles.local.keys())
+        .filter(|name| seen.insert(name.as_str()))
+        .cloned()
+        .collect();
     Ok(profiles)
 }
 
@@ -424,23 +464,24 @@ impl Options {
         );
         if list_profiles {
             let catalog = load_profiles(&profiles_path)?;
-            for (name, shell) in &catalog.local {
-                println!("{name:16} {} (local)", shell.executable.display());
-            }
-            for (name, ssh) in catalog.profiles {
-                println!(
-                    "{name:16} {}@{}:{} ({})",
-                    ssh.user,
-                    ssh.host,
-                    ssh.port,
-                    match ssh.authentication {
-                        Authentication::None => "none",
-                        Authentication::Agent => "agent",
-                        Authentication::Identity { .. } => "identity",
-                        Authentication::Password => "password",
-                        Authentication::KeyboardInteractive => "keyboard-interactive",
-                    }
-                );
+            for name in catalog.cli_order() {
+                if let Some(shell) = catalog.local.get(name) {
+                    println!("{name:16} {} (local)", shell.executable.display());
+                } else if let Some(ssh) = catalog.profiles.get(name) {
+                    println!(
+                        "{name:16} {}@{}:{} ({})",
+                        ssh.user,
+                        ssh.host,
+                        ssh.port,
+                        match ssh.authentication {
+                            Authentication::None => "none",
+                            Authentication::Agent => "agent",
+                            Authentication::Identity { .. } => "identity",
+                            Authentication::Password => "password",
+                            Authentication::KeyboardInteractive => "keyboard-interactive",
+                        }
+                    );
+                }
             }
             return Ok(None);
         }
@@ -532,6 +573,56 @@ fn value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalized_menu_and_cli_orders_preserve_their_defaults_without_an_explicit_order() {
+        let mut doc = serde_json::json!({"profiles":{
+            "Zulu":{"host":"z.test","user":"z","auth":"none"},
+            "Alpha":{"host":"a.test","user":"a","auth":"none"},
+            "Lima":{"backend":"local","executable":"cmd.exe"}
+        }});
+        let read = |doc: &serde_json::Value| {
+            parse_profiles(
+                &serde_json::to_vec(doc).unwrap(),
+                Path::new("profiles.json"),
+            )
+        };
+        let default = read(&doc).unwrap();
+        assert_eq!(
+            default.profile_order,
+            default
+                .profiles
+                .keys()
+                .chain(default.local.keys())
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            default.cli_order(),
+            default
+                .local
+                .keys()
+                .chain(default.profiles.keys())
+                .collect::<Vec<_>>()
+        );
+        doc["profile_order"] = serde_json::json!(["Lima", "missing", "Zulu", "Lima"]);
+        let custom = read(&doc).unwrap();
+        assert_eq!(&custom.profile_order[..3], &["Lima", "Zulu", "Alpha"]);
+        assert_eq!(
+            custom.cli_order(),
+            custom.profile_order.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(custom.profile_order.len(), default.profile_order.len());
+        for bad in [serde_json::json!("Lima"), serde_json::json!(["Zulu", 42])] {
+            doc["profile_order"] = bad;
+            assert!(
+                read(&doc)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("profile_order must be an array of profile names")
+            );
+        }
+    }
 
     #[test]
     fn a_workspace_is_the_only_launch_source_and_overridden_profiles_are_ad_hoc() {
