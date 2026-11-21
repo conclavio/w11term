@@ -30,6 +30,7 @@ pub enum Action {
     MovePaneToExistingTab,
     CommandPalette,
     PanePicker,
+    FindAllPanes,
     KeyboardHints,
     CopyMode,
     NextTab,
@@ -122,6 +123,13 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
+    Binding::new(
+        FindAllPanes,
+        "find_all_panes",
+        "Find in all panes",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(
         KeyboardHints,
         "keyboard_hints",
@@ -429,6 +437,24 @@ mod tests {
                     binding.action.requires_terminal()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn find_all_panes_can_be_bound_from_a_terminal_or_a_utility_tab() {
+        let mut shortcuts = Shortcuts::default();
+        assert_eq!(shortcuts.get(FindAllPanes.binding()), None);
+        let chord: Chord = "F8".parse().unwrap();
+        shortcuts.set(FindAllPanes, Some(chord)).unwrap();
+        let json = serde_json::to_string(&shortcuts).unwrap();
+        assert_eq!(json, r#"{"find_all_panes":"F8"}"#);
+        let restored: Shortcuts = serde_json::from_str(&json).unwrap();
+        let map = restored.keymap().unwrap();
+        for in_terminal in [false, true] {
+            assert_eq!(
+                map.resolve(chord.key, chord.mods, in_terminal, false),
+                Some(FindAllPanes)
+            );
         }
     }
 

@@ -137,6 +137,9 @@ impl server::Handler for Peer {
                 channel,
                 b"\x1b[3 q\x1b[?12l\x1bP$q q\x1b\\\x1b[0 q".as_slice(),
             )?;
+        } else if data == b"\x1bP1$r4 q\x1b\\" {
+            // Stock Vim probes for undercurl and resets the pen in the same write.
+            session.data(channel, b"\x1b[0m\x1b[4:3m\x1bP$qm\x1b\\\x1b[0m".as_slice())?;
         } else if let Some(bytes) = data.strip_prefix(b"\0sync:") {
             session.data(channel, bytes.to_vec())?;
         }
@@ -239,6 +242,10 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
         assert_eq!(
             next(&mut observed, &session).await,
             Observed::Data(b"\x1bP1$r4 q\x1b\\".to_vec())
+        );
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(b"\x1bP1$r0;4:3m\x1b\\".to_vec())
         );
         session
             .input

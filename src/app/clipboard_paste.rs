@@ -164,7 +164,7 @@ impl TerminalApp {
         self.clipboard.clear();
         if was_open {
             let other_modal = self.title_editor.is_some() || self.tabs.active().is_some_and(|tab| matches!(
-                &tab.page, Page::Terminal(live) if live.session.frames.load().prompt.is_some() || live.files.editing_name()));
+                &tab.page, Page::Terminal(live) if live.session.frames.load().prompt.is_some() || live.files.entry_dialog_open()));
             self.keyboard.set_modal(other_modal);
         }
     }

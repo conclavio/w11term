@@ -14,6 +14,8 @@ use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 mod clipboard;
 mod launch;
 pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
+#[cfg(test)]
+mod pane_search_tests;
 mod presentation;
 #[cfg(test)]
 mod synchronized_capture;
@@ -78,6 +80,15 @@ pub enum Command {
     },
     SearchNavigate(isize),
     SearchClose,
+    SearchPreview {
+        query: String,
+        reply: tokio::sync::oneshot::Sender<crate::search::PaneSearchPreview>,
+    },
+    SearchReveal {
+        query: String,
+        anchor: crate::search::PaneSearchAnchor,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     Wheel(isize, KeyModifiers),
     Mouse(MouseEvent),
     Focus(bool),
@@ -436,6 +447,7 @@ async fn run(
         presentation.advance(&mut terminal, bytes, 0, &status, total_bytes);
     }
     let mut search = crate::search::Search::default();
+    let mut search_origin = Arc::new(());
     let mut search_dirty = false;
     let mut search_refresh = tokio::time::Instant::now();
     let mut connection_generation = 0;
@@ -575,6 +587,7 @@ async fn run(
                         if phase == Phase::Exited && restartable && token == launch_id {
                             launch_id += 1;
                             phase = Phase::Restarting { reset: true };
+                            search_origin = Arc::new(());
                             terminal.reset_connection();
                             scroll_offset = 0;
                             last_mouse.button = wezterm_term::MouseButton::None;
@@ -713,6 +726,25 @@ async fn run(
                         scroll_offset=search.navigate(direction,&terminal,scroll_offset);Ok(())
                     }
                     Some(Command::SearchClose) => {search.open=false;Ok(())}
+                    Some(Command::SearchPreview { query, reply }) => {
+                        let preview = crate::search::PaneSearchPreview::scan(&terminal, &search_origin, query, || reply.is_closed());
+                        let _ = reply.send(preview);
+                        Ok(())
+                    }
+                    Some(Command::SearchReveal { query, anchor, reply }) => {
+                        let prepared = anchor.prepare_reveal(&terminal, &search_origin, query, scroll_offset, || reply.is_closed());
+                        if let Some((next, offset)) = prepared {
+                            if reply.send(true).is_ok() {
+                                search = next;
+                                search_dirty = false;
+                                scroll_offset = offset;
+                                presentation.dirty = true;
+                            }
+                        } else {
+                            let _ = reply.send(false);
+                        }
+                        Ok(())
+                    }
                     Some(Command::Wheel(lines, modifiers)) => {
                         terminal::scroll_wheel(&mut terminal,&mut scroll_offset,last_mouse,lines,modifiers,player.read().unwrap().alternate_scroll_enabled())
                     }
@@ -787,6 +819,7 @@ async fn run(
                             presentation.refresh_view = true;
                         }
                         ssh::Event::Connected(generation) => {
+                            search_origin = Arc::new(());
                             if matches!(phase, Phase::Restarting { .. }) {
                                 // Anything already waiting in this FIFO predates the ready frame.
                                 // Apply local configuration, but never deliver its queued user input.
