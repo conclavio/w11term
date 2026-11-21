@@ -511,6 +511,9 @@ async fn fixture(
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
+#[cfg(feature = "ui-smoke")]
+#[path = "sftp/tab_windows.rs"]
+mod tab_windows;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_workspace_exec_reply_does_not_dispatch_command_again() {

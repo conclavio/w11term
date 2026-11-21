@@ -205,8 +205,9 @@ impl TerminalApp {
                 page.switching = true;
                 page.status = format!("Switching to {name}…");
                 let profiles = self.store.path().to_owned();
+                let window_id = self.registry.window_id();
                 context.spawn_background(move |_| {
-                    let result = crate::workspace_window::switch(&name, &profiles)
+                    let result = crate::workspace_window::switch(&name, &profiles, window_id)
                         .map_err(|error| format!("{error:#}"));
                     Message::Workspace(WorkspaceAction::Switched(id, result))
                 });
@@ -234,6 +235,7 @@ impl TerminalApp {
                         self.store.path(),
                         &workspace,
                         &self._control,
+                        self.registry.window_id(),
                     )
                 });
                 if let Some(page) = self.workspace_page_mut(id) {

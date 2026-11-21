@@ -37,10 +37,16 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
-    /// Attach once, forwarding any alerts that arrived during pane startup.
+    /// Attach a pane to its owning window, preserving acknowledgements when it moves.
     pub fn connect_inbox(&self, pane: u64, label: &str, inbox: &Inbox) {
         let mut state = self.state.lock().unwrap();
-        if state.inbox.is_none() {
+        if let Some((_, _, old)) = &state.inbox {
+            if old.same_window(inbox) {
+                return;
+            }
+            old.move_pane_to(pane, inbox);
+            state.inbox = Some((pane, Arc::from(label), inbox.clone()));
+        } else {
             let label = Arc::from(label);
             for event in &state.events {
                 inbox.receive(pane, &label, event);
