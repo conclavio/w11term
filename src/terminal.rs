@@ -97,8 +97,18 @@ pub enum TransportInput {
     /// Parser-generated reply on a viewer transport that distinguishes it from user input.
     Automatic(Vec<u8>),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// A GUI clipboard write is valid only for the shell that was
+    /// active when the paste was requested.
+    Clipboard {
+        connection: u64,
+        bytes: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Resize(TerminalSize),
 }
+
+pub(crate) const STALE_PASTE: &str =
+    "The pane connection changed. Paste again to use the new connection.";
 
 struct ReplyWriter {
     sender: mpsc::UnboundedSender<TransportInput>,
@@ -2046,6 +2056,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receive(&mut rx), b"a");
+    }
+
+    #[test]
+    fn encoding_a_confirmed_clipboard_paste_uses_the_existing_wire_format_without_writing() {
+        let (mut terminal, mut rx) = engine();
+        let text = "one\n界\x1b[201~\r\ntwo";
+        for (mode, expected) in [
+            (b"\x1b[?2004l".as_slice(), "one\r界\rtwo"),
+            (
+                b"\x1b[?2004h".as_slice(),
+                "\x1b[200~one\n界\r\ntwo\x1b[201~",
+            ),
+        ] {
+            terminal.advance_bytes(mode);
+            assert_eq!(terminal.encode_paste(text), expected);
+            assert!(rx.try_recv().is_err());
+            terminal.send_paste(text).unwrap();
+            assert_eq!(receive(&mut rx), expected.as_bytes());
+        }
     }
 
     #[test]
