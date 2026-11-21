@@ -108,11 +108,11 @@ impl TerminalApp {
                     live.startup = if draft.directory.is_empty() && draft.command.is_empty() {
                         None
                     } else {
-                        Some(SshStartup::new(
+                        Some(Box::new(SshStartup::new(
                             ssh,
                             draft.directory.clone(),
                             draft.command.clone(),
-                        )?)
+                        )?))
                     };
                     Ok(())
                 })();
@@ -255,7 +255,7 @@ impl TerminalApp {
             } else {
                 SavedSource::capture(&live.source, live.profile_name.as_deref())?
             };
-            if let Some(launch) = &live.startup {
+            if let Some(launch) = live.startup.as_deref() {
                 return Ok(SavedSource::Startup {
                     connection: Box::new(source),
                     launch: launch.clone(),
@@ -441,7 +441,7 @@ pub(super) fn append_resolved_workspace(
             );
             let mut tab = live_tab_for_session(label, source, session).with_profile(profile_name);
             if let Page::Terminal(live) = &mut tab.page {
-                live.startup = Some(launch.clone());
+                live.startup = Some(Box::new(launch.clone()));
             }
             return tab;
         }

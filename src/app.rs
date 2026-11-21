@@ -55,7 +55,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
-    startup: Option<w11term::workspace::SshStartup>,
+    startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
     files: Box<FileDrawer>,
     discovery_page: Option<usize>,
