@@ -21,6 +21,7 @@ use windows::Win32::{
     Foundation::{ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
 };
+mod find;
 mod registry;
 mod security;
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
@@ -89,6 +90,12 @@ pub enum Request {
     },
     GetText {
         pane: u64,
+    },
+    FindText {
+        pattern: String,
+        pane: Option<u64>,
+        #[serde(default)]
+        all_panes: bool,
     },
     SaveText {
         pane: u64,
@@ -417,6 +424,11 @@ impl Registry {
                     .map_err(anyhow::Error::msg)?;
                 Ok(json!({"pane":pane,"bytes_written":count}))
             }
+            Request::FindText {
+                pattern,
+                pane,
+                all_panes,
+            } => self.find_text(pattern, pane, all_panes).await,
             Request::GetText { pane } => {
                 let (frame, size) = Self::capture(&self.pane(pane)?).await?;
                 let lines: Vec<_> = frame

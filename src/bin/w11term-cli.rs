@@ -24,7 +24,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
                 .with_context(|| format!("{arg} requires a value"))
         };
         match arg.as_str() {
-            "wait-for-text" | "events" | "open" | "resize" | "record" | "save-text" | "restart"
+            "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
+            | "save-text" | "restart"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -158,6 +159,37 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn find_text_requires_an_explicit_scope_and_keeps_literal_input() {
+        let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));
+        let (pid, request) = parse_args(&[
+            "--pid",
+            "42",
+            "--pane",
+            "7",
+            "find-text",
+            "--",
+            "--Some Text",
+        ])
+        .unwrap();
+        assert_eq!(pid, Some(42));
+        assert!(
+            matches!(request, Request::FindText { pattern, pane: Some(7), all_panes: false } if pattern == "--Some Text")
+        );
+        assert!(matches!(
+            parse_args(&["find-text", "--all-panes", "  x "]).unwrap().1,
+            Request::FindText { pattern, pane: None, all_panes: true } if pattern == "  x "
+        ));
+        for args in [
+            &["find-text", "x"][..],
+            &["find-text", "--pane", "7", "--all-panes", "x"],
+            &["find-text", "--all-panes", ""],
+            &["find-text", "--all-panes", "--regex", "x"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn raw_bytes_and_required_options() {
         let p = |a: &[&str]| parse(a.iter().map(|s| s.to_string()));
