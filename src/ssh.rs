@@ -2,6 +2,8 @@
 mod durability;
 #[cfg(test)]
 mod folder_mount_fixture;
+#[cfg(test)]
+mod folder_share;
 mod game_resume;
 mod herdr;
 mod known_hosts;

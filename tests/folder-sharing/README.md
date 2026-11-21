@@ -1,8 +1,8 @@
 # Windows to Linux folder mount pilot
 
-This fixture tests the transport proposed for per-profile folder sharing. A native Windows w11term session logs into a disposable Linux guest. Its interactive shell stays open while a second SSH channel starts the guest’s stock SSHFS process in passive mode. SSHFS sends SFTP requests over that channel to Windows. Linux reads a binary fixture through an ordinary FUSE mount path, attempts a write, unmounts, and checks the original shell.
+This fixture tests read-only access to a selected Windows folder. A native Windows w11term session logs into a disposable Linux guest. Its interactive shell stays open while a second SSH channel starts the guest’s stock SSHFS process in passive mode. SSHFS sends SFTP requests over that channel to Windows. Linux lists the selected directory, reads binary files including one under a Unicode directory name, attempts a write, unmounts and checks the original shell.
 
-The Windows test serves a fixed file from its temporary directory. Running it does not select a directory for sharing in w11term. General directory traversal, writable exports, reconnect and the profile UI are separate acceptance cases.
+The fixture creates two sibling Windows directories on NTFS. Only one is selected for export. Linux compares the SHA-256 hash of a 98,321-byte file to the hash computed on Windows and checks that a junction and a hard link into the other directory are inaccessible. Access to user folders from a running application, per-folder writes and remount after reconnect remain on the roadmap.
 
 ## Run the fixture
 

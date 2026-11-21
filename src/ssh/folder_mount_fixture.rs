@@ -1,4 +1,5 @@
-//! Transport pilot only. Peer paths select one of two virtual entries; none are opened on Windows.
+//! Check an actual selected Windows folder from an unprivileged Linux shell.
+use super::folder_share::{Export, Root, valid_read_path_encoding};
 use super::{ConnectionShare, durability::bounded_command, sharing::ShellChannel};
 use crate::{
     options::{Authentication, Source, SshOptions},
@@ -10,8 +11,9 @@ use russh::{
     ChannelMsg,
     keys::{HashAlg, PublicKey},
 };
-use russh_sftp::protocol::*;
-use std::{collections::HashMap, env, fs, os::windows::fs::FileExt, sync::Arc, time::Duration};
+use russh_sftp::protocol::{Packet, Version};
+use sha2::{Digest, Sha256};
+use std::{env, fs, process::Command as ProcessCommand, sync::Arc, time::Duration};
 use tokio::{
     task::JoinSet,
     time::{Instant, sleep, timeout},
@@ -21,156 +23,7 @@ const NAME: &str = "windows-binary.bin";
 const CONTENT: &[u8] = b"w11term\x00\xff\x80\r\npassive SSHFS\x1b\xfe\x02";
 const MAX_PACKET: usize = 64 * 1024;
 
-#[derive(Clone, Copy)]
-enum Node {
-    Root,
-    File,
-}
-impl Node {
-    fn lookup(path: &str) -> Option<Self> {
-        match path {
-            "." | "/" => Some(Self::Root),
-            "/windows-binary.bin" => Some(Self::File),
-            _ => None,
-        }
-    }
-    fn attrs(self) -> FileAttributes {
-        let (permissions, size) = match self {
-            Self::Root => (0o040555, 0),
-            Self::File => (0o100444, CONTENT.len() as u64),
-        };
-        FileAttributes {
-            permissions: Some(permissions),
-            size: Some(size),
-            ..FileAttributes::empty()
-        }
-    }
-}
-
-struct FixedExport {
-    file: fs::File,
-    handles: HashMap<String, (Node, bool)>,
-    next: u64,
-    read_bytes: usize,
-}
-
-impl FixedExport {
-    fn new(file: fs::File) -> Self {
-        Self {
-            file,
-            handles: HashMap::new(),
-            next: 1,
-            read_bytes: 0,
-        }
-    }
-    fn open(&mut self, id: u32, node: Node) -> Result<Packet, StatusCode> {
-        if self.handles.len() == 16 {
-            return Err(StatusCode::Failure);
-        }
-        let handle = self.next.to_string();
-        self.next += 1;
-        self.handles.insert(handle.clone(), (node, false));
-        Ok(Handle { id, handle }.into())
-    }
-    fn request(&mut self, packet: Packet) -> Result<Packet, StatusCode> {
-        let id = packet.get_request_id();
-        let lookup = |path: &str| Node::lookup(path).ok_or(StatusCode::NoSuchFile);
-        match packet {
-            Packet::Init(init) if init.version == 3 => Ok(Version::new().into()),
-            Packet::RealPath(p) => {
-                let node = lookup(&p.path)?;
-                let name = match node {
-                    Node::Root => "/".into(),
-                    Node::File => format!("/{NAME}"),
-                };
-                Ok(Name {
-                    id,
-                    files: vec![File::new(name, node.attrs())],
-                }
-                .into())
-            }
-            Packet::Stat(p) => Ok(Attrs {
-                id,
-                attrs: lookup(&p.path)?.attrs(),
-            }
-            .into()),
-            Packet::Lstat(p) => Ok(Attrs {
-                id,
-                attrs: lookup(&p.path)?.attrs(),
-            }
-            .into()),
-            Packet::Fstat(p) => {
-                let (node, _) = self.handles.get(&p.handle).ok_or(StatusCode::Failure)?;
-                Ok(Attrs {
-                    id,
-                    attrs: node.attrs(),
-                }
-                .into())
-            }
-            Packet::Open(p) => {
-                if p.pflags.bits() != OpenFlags::READ.bits() {
-                    return Err(StatusCode::PermissionDenied);
-                }
-                if !matches!(lookup(&p.filename)?, Node::File) {
-                    return Err(StatusCode::Failure);
-                }
-                self.open(id, Node::File)
-            }
-            Packet::OpenDir(p) if matches!(lookup(&p.path)?, Node::Root) => {
-                self.open(id, Node::Root)
-            }
-            Packet::ReadDir(p) => match self.handles.get_mut(&p.handle) {
-                Some((Node::Root, sent)) if !*sent => {
-                    *sent = true;
-                    Ok(Name {
-                        id,
-                        files: vec![File::new(NAME, Node::File.attrs())],
-                    }
-                    .into())
-                }
-                Some((Node::Root, _)) => Err(StatusCode::Eof),
-                _ => Err(StatusCode::Failure),
-            },
-            Packet::Read(p) if matches!(self.handles.get(&p.handle), Some((Node::File, _))) => {
-                if p.offset >= CONTENT.len() as u64 {
-                    return Err(StatusCode::Eof);
-                }
-                let mut bytes = vec![0; (p.len as usize).min(CONTENT.len())];
-                let n = self
-                    .file
-                    .seek_read(&mut bytes, p.offset)
-                    .map_err(|_| StatusCode::Failure)?;
-                bytes.truncate(n);
-                self.read_bytes += n;
-                Ok(Data { id, data: bytes }.into())
-            }
-            Packet::Close(p) if self.handles.remove(&p.handle).is_some() => {
-                Ok(status(id, StatusCode::Ok))
-            }
-            Packet::Write(_)
-            | Packet::SetStat(_)
-            | Packet::FSetStat(_)
-            | Packet::Remove(_)
-            | Packet::Rename(_)
-            | Packet::MkDir(_)
-            | Packet::RmDir(_)
-            | Packet::Symlink(_) => Err(StatusCode::PermissionDenied),
-            _ => Err(StatusCode::OpUnsupported),
-        }
-    }
-}
-
-fn status(id: u32, code: StatusCode) -> Packet {
-    Status {
-        id,
-        status_code: code,
-        error_message: String::new(),
-        language_tag: String::new(),
-    }
-    .into()
-}
-
-async fn serve(mut shell: ShellChannel, mount: &str, mut export: FixedExport) -> Result<usize> {
+async fn serve(mut shell: ShellChannel, mount: &str, mut export: Export) -> Result<()> {
     let channel = shell.channel();
     channel
         .exec(true, format!("exec sshfs -f -o passive,ro :/ {mount}"))
@@ -178,6 +31,7 @@ async fn serve(mut shell: ShellChannel, mount: &str, mut export: FixedExport) ->
     let mut frames = BytesMut::new();
     let mut stderr = Vec::new();
     let mut accepted = false;
+    let mut initialized = false;
     let mut status_code = None;
     loop {
         match channel.wait().await {
@@ -203,11 +57,22 @@ async fn serve(mut shell: ShellChannel, mount: &str, mut export: FixedExport) ->
                         break;
                     }
                     frames.advance(4);
-                    let request = Packet::try_from(&mut frames.split_to(len).freeze())?;
-                    let id = request.get_request_id();
-                    let reply = export
-                        .request(request)
-                        .unwrap_or_else(|code| status(id, code));
+                    let mut body = frames.split_to(len).freeze();
+                    ensure!(
+                        valid_read_path_encoding(&body),
+                        "invalid SFTP path encoding"
+                    );
+                    let request = Packet::try_from(&mut body)?;
+                    ensure!(body.is_empty(), "trailing SFTP input");
+                    let reply = match request {
+                        Packet::Init(init) if !initialized && init.version >= 3 => {
+                            initialized = true;
+                            Version::new().into()
+                        }
+                        Packet::Init(_) => bail!("unexpected SFTP initialization"),
+                        _ if !initialized => bail!("expected SFTP initialization"),
+                        request => export.reply(request),
+                    };
                     channel.data_bytes(Bytes::try_from(reply)?).await?;
                 }
             }
@@ -217,11 +82,11 @@ async fn serve(mut shell: ShellChannel, mount: &str, mut export: FixedExport) ->
         }
     }
     ensure!(
-        accepted && status_code == Some(0) && frames.is_empty(),
+        accepted && initialized && status_code == Some(0) && frames.is_empty(),
         "SSHFS stopped with {status_code:?}: {}",
         String::from_utf8_lossy(&stderr)
     );
-    Ok(export.read_bytes)
+    Ok(())
 }
 
 async fn checked(link: &ConnectionShare, command: &str) -> Result<Vec<u8>> {
@@ -264,7 +129,7 @@ async fn shell_pid(pane: &Session, label: &str) -> Result<u32> {
     }
 }
 
-async fn check_mount(link: &ConnectionShare, mount: &str) -> Result<()> {
+async fn check_mount(link: &ConnectionShare, mount: &str, tile_digest: &str) -> Result<()> {
     let record = format!("awk '$5 == \"{mount}\" {{ print }}' /proc/self/mountinfo");
     loop {
         let bytes = checked(link, &record).await?;
@@ -286,14 +151,30 @@ async fn check_mount(link: &ConnectionShare, mount: &str) -> Result<()> {
         }
         sleep(Duration::from_millis(100)).await;
     }
+    let listing = checked(
+        link,
+        &format!("LC_ALL=C ls -1A --quoting-style=literal {mount}"),
+    )
+    .await?;
     ensure!(
-        checked(link, &format!("ls -1A {mount}")).await? == format!("{NAME}\n").as_bytes(),
-        "unexpected exported entries"
+        listing == format!("sprites 雪\n{NAME}\n").as_bytes(),
+        "unexpected exported entries: {}",
+        String::from_utf8_lossy(&listing)
     );
     ensure!(
         checked(link, &format!("cat {mount}/{NAME}")).await? == CONTENT,
         "guest read different bytes"
     );
+    let hash = checked(link, &format!("sha256sum < '{mount}/sprites 雪/tile.bin'")).await?;
+    ensure!(
+        std::str::from_utf8(&hash)?.split_whitespace().next() == Some(tile_digest),
+        "nested file changed across multiple SFTP reads"
+    );
+    checked(
+        link,
+        &format!("test ! -e '{mount}/other-folder/secret' && test ! -e '{mount}/other-file'"),
+    )
+    .await?;
     checked(
         link,
         &format!("if (printf X >> {mount}/{NAME}); then exit 1; fi"),
@@ -347,10 +228,40 @@ async fn native_windows_passive_sshfs() -> Result<()> {
         "unexpected SSH host identity"
     );
     let before = timeout(Duration::from_secs(6), shell_pid(&pane, "BEFORE_MOUNT")).await??;
-    let root = tempfile::tempdir()?;
-    let path = root.path().join(NAME);
+    let fixture = tempfile::tempdir()?;
+    let selected = fixture.path().join("selected");
+    let outside = fixture.path().join("sibling");
+    fs::create_dir(&selected)?;
+    fs::create_dir(&outside)?;
+    fs::create_dir(selected.join("sprites 雪"))?;
+    let mut tiles = vec![0u8; 96 * 1024 + 17];
+    rand::fill(&mut tiles);
+    let tile_digest = format!("{:x}", Bytes::copy_from_slice(&Sha256::digest(&tiles)));
+    fs::write(selected.join("sprites 雪").join("tile.bin"), tiles)?;
+    let secret = outside.join("secret");
+    fs::write(&secret, b"sibling data")?;
+    fs::hard_link(&secret, selected.join("other-file"))?;
+    // All shell arguments are fixed. A junction works on a stock, unelevated Windows host.
+    let junction = ProcessCommand::new("cmd.exe")
+        .current_dir(fixture.path())
+        .args([
+            "/d",
+            "/c",
+            "mklink",
+            "/j",
+            r"selected\other-folder",
+            "sibling",
+        ])
+        .output()?;
+    ensure!(
+        junction.status.success(),
+        "creating fixture junction: {}",
+        String::from_utf8_lossy(&junction.stderr)
+    );
+    ensure!(fs::read(selected.join("other-folder").join("secret"))? == b"sibling data");
+    let path = selected.join(NAME);
     fs::write(&path, CONTENT)?;
-    let export = FixedExport::new(fs::File::open(&path)?);
+    let export = Export::new(Root::open(&selected)?);
     let mount = format!("/tmp/w11term-mount-{:032x}", rand::random::<u128>());
     let shell = timeout(Duration::from_secs(6), link.open_shell()).await??;
     checked(&link, &format!("umask 077 && mkdir {mount}")).await?;
@@ -359,7 +270,7 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     servers.spawn(async move { serve(shell, &mount_arg, export).await });
     let verified = timeout(Duration::from_secs(24), async {
         tokio::select! {
-            result = check_mount(&link, &mount) => result,
+            result = check_mount(&link, &mount, &tile_digest) => result,
             ended = servers.join_next() => bail!("SSHFS quit before mount verification: {ended:?}"),
         }
     })
@@ -378,12 +289,12 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     let cleanup = checked(&link, &unmount).await;
     verified?;
     cleanup?;
-    let read = timeout(Duration::from_secs(6), servers.join_next())
+    timeout(Duration::from_secs(6), servers.join_next())
         .await?
         .context("SSHFS task missing")???;
     ensure!(
-        read >= CONTENT.len() && fs::read(path)? == CONTENT,
-        "Windows fixture changed or was not read"
+        fs::read(path)? == CONTENT && fs::read(secret)? == b"sibling data",
+        "Windows fixture changed"
     );
     let after = timeout(Duration::from_secs(6), shell_pid(&pane, "AFTER_MOUNT")).await??;
     let still_live = pane
@@ -393,81 +304,5 @@ async fn native_windows_passive_sshfs() -> Result<()> {
         after == before && Arc::ptr_eq(&still_live.handle(), &link.handle()),
         "shell or transport replaced"
     );
-    Ok(())
-}
-
-#[test]
-fn fixed_mount_export_rejects_writes_and_never_maps_peer_paths_to_windows() {
-    let mut export = FixedExport::new(tempfile::tempfile().unwrap());
-    for path in [
-        "/../other",
-        r"C:\Windows",
-        "/windows-binary.bin:stream",
-        "/new-file",
-    ] {
-        assert!(Node::lookup(path).is_none());
-    }
-    for flags in [
-        OpenFlags::WRITE,
-        OpenFlags::READ | OpenFlags::TRUNCATE,
-        OpenFlags::CREATE,
-    ] {
-        let request = Open {
-            id: 7,
-            filename: format!("/{NAME}"),
-            pflags: flags,
-            attrs: FileAttributes::empty(),
-        };
-        assert!(matches!(
-            export.request(request.into()),
-            Err(StatusCode::PermissionDenied)
-        ));
-    }
-    assert!(export.handles.is_empty());
-}
-
-#[test]
-fn fixed_mount_export_reads_exact_offsets_then_expires_the_handle() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join(NAME);
-    fs::write(&path, CONTENT)?;
-    let mut export = FixedExport::new(fs::File::open(path)?);
-    let open = Open {
-        id: 1,
-        filename: format!("/{NAME}"),
-        pflags: OpenFlags::READ,
-        attrs: FileAttributes::empty(),
-    };
-    let Ok(Packet::Handle(Handle { handle, .. })) = export.request(open.into()) else {
-        bail!("could not open the virtual file");
-    };
-    let read = |offset| Read {
-        id: 2,
-        handle: handle.clone(),
-        offset,
-        len: u32::MAX,
-    };
-    let Ok(Packet::Data(data)) = export.request(read(7).into()) else {
-        bail!("could not read binary fixture");
-    };
-    ensure!(data.data == CONTENT[7..]);
-    assert!(matches!(
-        export.request(read(u64::MAX).into()),
-        Err(StatusCode::Eof)
-    ));
-    assert!(matches!(
-        export.request(
-            Close {
-                id: 3,
-                handle: handle.clone()
-            }
-            .into()
-        ),
-        Ok(Packet::Status(Status {
-            status_code: StatusCode::Ok,
-            ..
-        }))
-    ));
-    assert!(export.request(read(0).into()).is_err());
     Ok(())
 }
