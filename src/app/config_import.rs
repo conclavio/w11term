@@ -354,7 +354,15 @@ impl TerminalApp {
                         context,
                     );
                     let alias = self.import_page_mut(id).unwrap().alias().unwrap();
-                    assert!(alias.options.is_none() && !alias.warnings.is_empty());
+                    assert!(alias.options.is_none());
+                    assert!(
+                        alias.warnings.iter().any(|warning| {
+                            warning.contains("30-blocked.conf:3")
+                                && warning.to_lowercase().contains("proxycommand")
+                        }),
+                        "Missing fragment and line for refused route: {:?}",
+                        alias.warnings
+                    );
                     self.update(
                         Message::ImportConfig(Action::Save(id, revision, unusable)),
                         context,
@@ -374,13 +382,16 @@ impl TerminalApp {
                 let alias = page.alias().unwrap();
                 assert_eq!(alias.name, "via");
                 let options = alias.options.as_ref().unwrap();
+                assert_eq!(options.host, "target.test");
+                assert_eq!(options.user, "pilot");
                 assert_eq!(options.port, 2222);
                 assert_eq!(options.proxy_jump[0].host, "gateway.test");
                 assert!(
                     alias
                         .warnings
                         .iter()
-                        .any(|w| w.to_lowercase().contains("serveraliveinterval"))
+                        .any(|w| w.contains("10-destination.conf:6")
+                            && w.to_lowercase().contains("serveraliveinterval"))
                 );
                 self.update(
                     Message::ImportConfig(Action::Save(id, revision, selected)),
@@ -416,8 +427,12 @@ impl TerminalApp {
                 };
                 let hops = draft.proxy_jump.clone();
                 assert_eq!(hops.len(), 1);
+                self.update(Message::TerminalPreset(id, Some(1)), context);
                 self.save_profile_action(id, false, context);
-                assert_eq!(self.store.load().unwrap()["via"].proxy_jump, hops);
+                let saved = self.store.load().unwrap();
+                assert_eq!(saved.len(), 1);
+                assert_eq!(saved["via"].proxy_jump, hops);
+                assert_eq!(saved["via"].terminal_type.as_str(), TerminalType::SIXEL);
                 eprintln!("OpenSSH import UI smoke passed");
                 self.update(Message::CloseWindow, context);
                 return;

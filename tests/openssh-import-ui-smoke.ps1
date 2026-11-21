@@ -5,27 +5,55 @@ $gui = (Resolve-Path -LiteralPath $GuiPath).Path
 $state = (New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot ('..\.local\openssh-import-smoke\' + [guid]::NewGuid().ToString('N')))).FullName
 $config = Join-Path $state 'config'
 $profiles = Join-Path $state 'profiles.json'
+$fragments = (New-Item -ItemType Directory -Path (Join-Path $state 'host fragments')).FullName
 $data = (New-Item -ItemType Directory -Path (Join-Path $state 'data')).FullName
 $variables = @('W11TERM_DATA_DIR','W11TERM_SETTINGS_PATH','W11TERM_UI_SMOKE','W11TERM_IMPORT_SMOKE')
 $previous = @{}
 foreach ($name in $variables) { $previous[$name] = [Environment]::GetEnvironmentVariable($name,'Process') }
 $terminal = $null
+$utf8 = [Text.UTF8Encoding]::new($false)
+function Write-Config([string]$Path, [string]$Content) {
+    [IO.File]::WriteAllText($Path, $Content, $utf8)
+    # Windows OpenSSH checks the ACL on Include files. These new fixture files
+    # can inherit writable runner or sandbox groups from the checkout.
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        [Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+function Ssh-Reference([string]$Alias) {
+    $lines = & $sshExe -T -G -F $config $Alias
+    if ($LASTEXITCODE -ne 0) { throw "ssh.exe -G failed for fixture alias $Alias ($LASTEXITCODE)" }
+    $endpoint = @{}
+    foreach ($line in $lines) {
+        if ($line -cmatch '^(hostname|user|port|proxyjump) (.*)$') { $endpoint[$Matches[1]] = $Matches[2] }
+    }
+    return $endpoint
+}
 try {
-    $fixture = @'
+    # Absolute local paths keep both readers inside the selected fixture even
+    # when the system client's -F config lives outside the user's SSH directory.
+    Write-Config $config ('Include "' + $fragments.Replace('\','/') + '/*.conf"')
+    Write-Config (Join-Path $fragments '10-destination.conf') @'
 Host via
     HostName target.test
     User pilot
     Port 2222
     ProxyJump gateway
     ServerAliveInterval 15
+'@
+    Write-Config (Join-Path $fragments '20-gateway.conf') @'
 Host gateway
     HostName gateway.test
     User jump
-Host blocked
-    ProxyCommand example-command %h
+    Port 2201
 '@
-    $utf8 = [Text.UTF8Encoding]::new($false)
-    [IO.File]::WriteAllText($config,$fixture,$utf8)
+    Write-Config (Join-Path $fragments '30-blocked.conf') @'
+# This alias cannot be represented by a native SSH profile.
+Host blocked
+    ProxyCommand never-executed %h
+'@
     [IO.File]::WriteAllText($profiles,'{"profiles":{}}',$utf8)
     $env:W11TERM_DATA_DIR = $data
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
@@ -34,12 +62,30 @@ Host blocked
     $log = Join-Path $state 'stderr.log'
     $terminal = Start-Process -FilePath $gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError $log
     if (-not $terminal.WaitForExit(30000) -or $terminal.ExitCode -ne 0 -or -not (Select-String -LiteralPath $log -SimpleMatch 'OpenSSH import UI smoke passed')) {
-        throw "OpenSSH import smoke failed. See $log"
+        throw "OpenSSH import smoke failed ($log). $((Get-Content -LiteralPath $log -Tail 15) -join [Environment]::NewLine)"
     }
     $saved = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
-    if ($saved.psobject.Properties.Name.Count -ne 1 -or $saved.via.proxy_jump[0].host -ne 'gateway.test') { throw "Unexpected saved profiles. See $profiles" }
+    $via = $saved.via
+    if (@($saved.psobject.Properties).Count -ne 1 -or $via.host -cne 'target.test' -or $via.user -cne 'pilot' -or $via.port -ne 2222 -or $via.proxy_jump.Count -ne 1 -or $via.terminal_type -cne 'xterm-sixel') {
+        throw "Unexpected saved destination or profile edit. See $profiles"
+    }
+    $hop = $via.proxy_jump[0]
+    if ($hop.host -cne 'gateway.test' -or $hop.user -cne 'jump' -or $hop.port -ne 2201) { throw "Unexpected saved included gateway. See $profiles" }
+    $sshExe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
+    if (Test-Path -LiteralPath $sshExe -PathType Leaf) {
+        $expected = Ssh-Reference 'via'
+        $gateway = Ssh-Reference 'gateway'
+        if ($expected.proxyjump -cne 'gateway' -or $expected.hostname -cne $via.host -or $expected.user -cne $via.user -or [int]$expected.port -ne $via.port -or
+            $gateway.hostname -cne $hop.host -or $gateway.user -cne $hop.user -or [int]$gateway.port -ne $hop.port) {
+            throw "Saved profile differs from Windows OpenSSH -G. See $profiles"
+        }
+        Write-Output 'Windows OpenSSH -G independently confirmed the destination and gateway.'
+    }
     Write-Output "OpenSSH import native smoke passed. Artifacts in $state"
 } finally {
     if ($terminal -and -not $terminal.HasExited) { $terminal.Kill(); $terminal.WaitForExit() }
-    foreach ($name in $variables) { [Environment]::SetEnvironmentVariable($name,$previous[$name],'Process') }
+    foreach ($name in $variables) {
+        if ($null -eq $previous[$name]) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+        else { [Environment]::SetEnvironmentVariable($name,$previous[$name],'Process') }
+    }
 }
