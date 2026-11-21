@@ -1,5 +1,6 @@
 """Run w11term's exact discovery, PTY attach and proof against a private stock server."""
 import contextlib
+import errno
 import fcntl
 import os
 import pathlib
@@ -13,7 +14,7 @@ import time
 
 
 def run(*args):
-    return subprocess.check_output(args, text=True).strip()
+    return subprocess.check_output(args, encoding="utf-8").strip()
 
 
 def until(predicate):
@@ -45,9 +46,9 @@ def exercise(directory):
     helper = directory / "commands"
     source = pathlib.Path(__file__).with_name("tmux_commands.rs")
     subprocess.run(["rustc", "--edition=2024", source, "-o", helper], check=True)
-    name = "ops 'weekly' $(display)"
+    name = "ops 'réseau' $(display)"
     run("tmux", "-f", "/dev/null", "new-session", "-ds", name, "exec cat")
-    run("tmux", "new-window", "-d", "-t", name)
+    run("tmux", "new-window", "-d", "-t", name + ":")
     run("tmux", "new-session", "-ds", "unrelated", "exec cat")
     rows = [line.split(" ", 4) for line in run(helper, "list").splitlines()]
     row = next(row for row in rows if row[4] == name)
@@ -58,8 +59,8 @@ def exercise(directory):
         until(lambda: subprocess.run([helper, "proof", *old, client]).returncode == 0)
         assert run("tmux", "list-clients", "-F", "#{client_width}x#{client_height}") == "109x27"
         os.write(fd, b"W11_TMUX_SELECTED\r")
-        until(lambda: "W11_TMUX_SELECTED" in run("tmux", "capture-pane", "-pt", old[0]))
-        assert "W11_TMUX_SELECTED" not in run("tmux", "capture-pane", "-pt", "unrelated")
+        until(lambda: "W11_TMUX_SELECTED" in run("tmux", "capture-pane", "-pt", old[0] + ":"))
+        assert "W11_TMUX_SELECTED" not in run("tmux", "capture-pane", "-pt", "unrelated:")
     assert len(run(helper, "list").splitlines()) == 2
     run("tmux", "kill-server")
     until(lambda: subprocess.run(["tmux", "-N", "list-sessions"], capture_output=True).returncode != 0)
@@ -76,7 +77,7 @@ def exercise(directory):
                 if not os.read(fd, 4096):
                     break
             except OSError as e:
-                if e.errno != 5:  # EIO marks a closed Linux PTY.
+                if e.errno != errno.EIO:  # A closed Linux PTY.
                     raise
                 break
     assert run(helper, "list").split(" ", 4) == new and new[3] == "0"
@@ -84,7 +85,7 @@ def exercise(directory):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as temp:
-        os.environ.update(TMUX_TMPDIR=temp, TERM="xterm-256color")
+        os.environ.update(TMUX_TMPDIR=temp, TERM="xterm-256color", LC_ALL="C")
         os.environ.pop("TMUX", None)
         try:
             exercise(pathlib.Path(temp))

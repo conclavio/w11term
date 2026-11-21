@@ -161,14 +161,23 @@ impl server::Handler for Peer {
             let mut b = self.backend.lock().unwrap();
             b.commands.push(command.into());
             match args.as_slice() {
-                ["env", "LC_ALL=C", "tmux", "-N", "list-sessions", ..] => {
-                    match (&b.tmux_name, b.tmux_available) {
-                        (Some(name), _) => (0, format!("$7\t11\t2345\t2\t1\t{name}\n"), false),
-                        (None, true) => (0, String::new(), false),
-                        (None, false) => (127, String::new(), false),
-                    }
-                }
-                ["sh", "-c", ..] if command.contains("tmux -N if-shell -F -t '$7:'") => {
+                [
+                    "env",
+                    "LC_ALL=C",
+                    "tmux",
+                    "-uN",
+                    "-L",
+                    "default",
+                    "list-sessions",
+                    ..,
+                ] => match (&b.tmux_name, b.tmux_available) {
+                    (Some(name), _) => (0, format!("$7\t11\t2345\t2\t1\t{name}\n"), false),
+                    (None, true) => (0, String::new(), false),
+                    (None, false) => (127, String::new(), false),
+                },
+                ["sh", "-c", ..]
+                    if command.contains("tmux -uN -L default if-shell -F -t '$7:'") =>
+                {
                     assert!(command.contains("11/2345/$7}"));
                     assert!(command.contains(r"'attach-session -t \$7'"));
                     s.data(c, b"56\r\n".as_slice())?;
@@ -179,7 +188,16 @@ impl server::Handler for Peer {
                         return Ok(());
                     }
                 }
-                ["tmux", "-N", "list-clients", "-t", "'$7'", ..] => {
+                [
+                    "tmux",
+                    "-N",
+                    "-L",
+                    "default",
+                    "list-clients",
+                    "-t",
+                    "'$7'",
+                    ..,
+                ] => {
                     let hold = std::mem::take(&mut b.hold_once);
                     (0, "11/2345/$7/56\n".into(), hold)
                 }
@@ -385,7 +403,7 @@ async fn fresh_client_discovers_an_existing_pty_then_attaches_on_its_verified_co
     {
         let b = fixture.peer.backend.lock().unwrap();
         assert_eq!(&b.commands[..2], ["zmx version", "zmx list"]);
-        assert!(b.commands[2].contains("tmux -N list-sessions"));
+        assert!(b.commands[2].contains("tmux -uN -L default list-sessions"));
         assert_eq!(b.commands.len(), 3);
         assert!(b.grids.is_empty());
         assert!(b.input.is_empty());
@@ -441,7 +459,7 @@ async fn native_find_tmux_session_on_plain_ssh_profile() {
     assert!(
         b.commands
             .iter()
-            .any(|cmd| cmd.contains("tmux -N if-shell"))
+            .any(|cmd| cmd.contains("tmux -uN -L default if-shell"))
     );
     assert!(
         b.commands

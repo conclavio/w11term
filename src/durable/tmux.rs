@@ -2,7 +2,9 @@
 //! enter a command. Session names are display text, and may change at any time.
 use std::collections::BTreeSet;
 
-pub(crate) const LIST: &str = "env LC_ALL=C tmux -N list-sessions -F '#{session_id}\t#{pid}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{session_name}'";
+// The C locale makes socket errors recognizable. -u is also needed here:
+// tmux's non-UTF-8 client replaces tabs and non-ASCII names with underscores.
+pub(crate) const LIST: &str = "env LC_ALL=C tmux -uN -L default list-sessions -F '#{session_id}\t#{pid}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{session_name}'";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Target {
@@ -43,7 +45,7 @@ impl Target {
         // attach. IDs can be reused after a restart, and names may resemble IDs.
         // The shell exec preserves its PID so startup can verify *this* client.
         format!(
-            r#"sh -c 'echo "$$"; exec "$@"' w11term tmux -N if-shell -F -t '${id}:' '#{{==:#{{pid}}/#{{session_created}}/#{{session_id}},{server}/{created}/${id}}}' 'attach-session -t \${id}' 'display-message -p "Selected tmux session is gone"'"#,
+            r#"sh -c 'echo "$$"; exec "$@"' w11term tmux -uN -L default if-shell -F -t '${id}:' '#{{==:#{{pid}}/#{{session_created}}/#{{session_id}},{server}/{created}/${id}}}' 'attach-session -t \${id}' 'display-message -p "Selected tmux session is gone"'"#,
             id = self.id,
             server = self.server,
             created = self.created
@@ -51,7 +53,7 @@ impl Target {
     }
     pub(crate) fn clients(self) -> String {
         format!(
-            "tmux -N list-clients -t '${}' -F '#{{pid}}/#{{session_created}}/#{{session_id}}/#{{client_pid}}'",
+            "tmux -N -L default list-clients -t '${}' -F '#{{pid}}/#{{session_created}}/#{{session_id}}/#{{client_pid}}'",
             self.id
         )
     }
