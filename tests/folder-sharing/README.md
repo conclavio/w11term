@@ -1,8 +1,10 @@
-# Windows to Linux folder mount pilot
+# Windows to Linux folder mount acceptance test
 
-This fixture tests read-only access to a selected Windows folder. A native Windows w11term session logs into a disposable Linux guest. Its interactive shell stays open while a second SSH channel starts the guest’s stock SSHFS process in passive mode. SSHFS sends SFTP requests over that channel to Windows. Linux lists the selected directory, reads binary files including one under a Unicode directory name, attempts a write, unmounts and checks the original shell.
+This test grants an SSH profile read-only access to a temporary Windows directory through w11term’s folder-sharing API. An unprivileged account on a disposable Linux guest mounts it under `~/windows/` using stock SSHFS in passive mode. The test checks Linux’s mount table for the read-only flag and the identifier of the mount that w11term started.
 
-The fixture creates two sibling Windows directories on NTFS. Only one is selected for export. Linux compares the SHA-256 hash of a 98,321-byte file to the hash computed on Windows and checks that a junction and a hard link into the other directory are inaccessible. Access to user folders from a running application, per-folder writes and remount after reconnect remain on the roadmap.
+Linux reads binary data, compares a 98,321-byte file under a Unicode name against its Windows SHA-256 digest, and tries to write. A sibling’s data must stay inaccessible through both an NTFS junction and a hard link. A second mount request at the same name must preserve the first mount. A nonempty Linux destination and a symlink to an empty directory must also be refused.
+
+The original interactive shell must keep its PID through explicit unmount and dropping a mount handle. The test then disconnects the SSH transport and checks that the mount disappears. A fresh pane opens the same temporary profile and grant store, remounts the saved folder, and forgets it. Linux must see the mount disappear again while its new shell remains usable. Reopening the profile must show an empty grant list.
 
 ## Run the fixture
 
