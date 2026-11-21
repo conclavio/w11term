@@ -23,6 +23,9 @@ const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 )]
 pub enum SavedSource {
     SavedProfile(String),
+    /// An explicit session browser on a saved SSH account. Reopening an
+    /// unselected browser lists sessions again without creating a shell.
+    Discovery(String),
     Local {
         name: Option<String>,
         shell: crate::options::LocalOptions,
@@ -60,10 +63,17 @@ impl SavedSource {
 
     pub fn profile_name(&self) -> Option<&str> {
         match self {
-            Self::SavedProfile(name) => Some(name),
+            Self::SavedProfile(name) | Self::Discovery(name) => Some(name),
             Self::Local { name, .. } => name.as_deref(),
             Self::Durable { connection, .. } => connection.profile_name(),
             _ => None,
+        }
+    }
+    pub fn is_discovery(&self) -> bool {
+        match self {
+            Self::Discovery(_) => true,
+            Self::Durable { connection, .. } => connection.is_discovery(),
+            _ => false,
         }
     }
     /// Supply a profile name only when the pane was opened from that profile.
@@ -115,13 +125,18 @@ impl SavedSource {
                 session,
             } => {
                 ensure!(
-                    matches!(connection.as_ref(), Self::Ssh(_) | Self::SavedProfile(_)),
+                    matches!(
+                        connection.as_ref(),
+                        Self::Ssh(_) | Self::SavedProfile(_) | Self::Discovery(_)
+                    ),
                     "A durable reference requires an SSH connection"
                 );
                 connection.validate()?;
                 session.validate()?;
             }
-            Self::SavedProfile(name) => ensure!(!name.trim().is_empty(), "Missing profile name"),
+            Self::SavedProfile(name) | Self::Discovery(name) => {
+                ensure!(!name.trim().is_empty(), "Missing profile name")
+            }
             Self::Demo => {}
             Self::Local { name, shell } => {
                 ensure!(
@@ -174,12 +189,20 @@ impl SavedSource {
                 );
                 source
             }
-            Self::SavedProfile(name) => Source::Ssh(
-                profiles
+            Self::SavedProfile(name) | Self::Discovery(name) => {
+                let mut options = profiles
                     .get(name)
                     .with_context(|| format!("Unknown workspace profile {name}"))?
-                    .clone(),
-            ),
+                    .clone();
+                if matches!(self, Self::Discovery(_)) {
+                    ensure!(
+                        !options.player.rustmush,
+                        "Remote shell discovery requires an SSH shell profile"
+                    );
+                    options.durable = true;
+                }
+                Source::Ssh(options)
+            }
             Self::Demo => Source::Demo,
             Self::Local { shell, .. } => {
                 if let Some(cwd) = &shell.cwd {
@@ -553,6 +576,24 @@ mod tests {
         let sources = captured.resolve_sources(&profiles).unwrap();
         assert_eq!(sources[&2], Source::Ssh(ssh("new-host.example")));
         assert_eq!(sources[&3], Source::Replay(replay));
+    }
+
+    #[test]
+    fn saved_host_browser_reopens_unselected_or_pinned_without_changing_profile_defaults() {
+        let options = ssh("host.example");
+        let source = SavedSource::Discovery("work".into());
+        let profiles = BTreeMap::from([("work".into(), options.clone())]);
+        assert!(source.is_discovery() && source.session().is_none());
+        assert!(matches!(source.resolve(&profiles).unwrap(), Source::Ssh(s) if s.durable));
+        assert!(!profiles["work"].durable);
+        let reference = DurableReference::new(&options, &format!("SHA256:{}", "A".repeat(43)));
+        let saved = source.with_session(Some(reference.clone())).unwrap();
+        let saved: SavedSource =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(saved.is_discovery() && saved.session() == Some(&reference));
+        assert!(saved.resolve(&profiles).is_ok());
+        let other = BTreeMap::from([("work".into(), ssh("other.example"))]);
+        assert!(saved.resolve(&other).is_err());
     }
 
     #[test]

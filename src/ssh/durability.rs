@@ -4,7 +4,10 @@ use super::{
     ConnectionShare,
     transport::{Driver, Event, OpenShell},
 };
-use crate::{durable::DurableReference, options::SshOptions};
+use crate::{
+    durable::{DiscoveredSession, DurableReference},
+    options::SshOptions,
+};
 use anyhow::{Context, Result, bail, ensure};
 use russh::ChannelMsg;
 use std::{
@@ -16,6 +19,8 @@ use wezterm_term::TerminalSize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurablePhase {
+    Discovering,
+    Choosing,
     Connecting,
     Attached,
     Detached,
@@ -26,8 +31,15 @@ pub enum DurablePhase {
     Direct,
     Failed,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl DurablePhase {
+    pub fn is_browser(self) -> bool {
+        matches!(self, Self::Discovering | Self::Choosing)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableAction {
+    Refresh,
+    Choose(DurableReference),
     Detach,
     Reattach,
     End,
@@ -40,12 +52,17 @@ pub struct DurableState {
     pub phase: DurablePhase,
     pub reference: Option<DurableReference>,
     pub detail: String,
+    pub candidates: Arc<[DiscoveredSession]>,
 }
 impl DurableState {
     pub fn permits(&self, action: DurableAction) -> bool {
         use DurableAction::*;
         use DurablePhase::*;
         match action {
+            Refresh => self.phase == Choosing,
+            Choose(reference) => {
+                self.phase == Choosing && self.candidates.iter().any(|s| s.reference == reference)
+            }
             Detach => matches!(self.phase, Attached | Reconnecting) && self.reference.is_some(),
             Reattach => {
                 matches!(self.phase, Detached | Missing | Failed | Unavailable)
@@ -80,12 +97,29 @@ pub(crate) struct Worker {
     model: Model,
     requests: mpsc::Receiver<DurableAction>,
 }
+pub(crate) enum Start {
+    Attach(Option<DurableReference>),
+    Discover,
+}
 impl DurableControl {
-    pub(crate) fn new(reference: Option<DurableReference>) -> (Self, Worker) {
+    pub(crate) fn new(start: Start) -> (Self, Worker) {
+        let (phase, reference, detail) = match start {
+            Start::Discover => (
+                DurablePhase::Discovering,
+                None,
+                "Looking for remote sessions…",
+            ),
+            Start::Attach(reference) => (
+                DurablePhase::Connecting,
+                reference,
+                "Connecting to durable shell",
+            ),
+        };
         let model = Model(Arc::new(Mutex::new(DurableState {
-            phase: DurablePhase::Connecting,
+            phase,
             reference,
-            detail: "Connecting to durable shell".into(),
+            detail: detail.into(),
+            candidates: Arc::new([]),
         })));
         let (requests, receiver) = mpsc::channel(1);
         (
@@ -105,13 +139,21 @@ impl DurableControl {
     pub(crate) fn action(&self, action: DurableAction) -> Result<()> {
         let mut state = self.model.0.lock().unwrap();
         ensure!(
-            state.permits(action),
+            state.permits(action.clone()),
             "This action is unavailable for the current durable shell state"
         );
+        let refreshing = action == DurableAction::Refresh;
         self.requests
             .try_send(action)
             .context("A durable shell action is already pending or the pane has closed")?;
-        state.phase = DurablePhase::Connecting;
+        if refreshing {
+            state.candidates = Arc::new([]);
+        }
+        state.phase = if refreshing {
+            DurablePhase::Discovering
+        } else {
+            DurablePhase::Connecting
+        };
         state.detail = "Applying durable shell action".into();
         Ok(())
     }
@@ -130,6 +172,7 @@ fn failure(phase: DurablePhase, message: impl Into<String>) -> anyhow::Error {
 }
 
 pub(super) enum Program {
+    Discover,
     Shell(Option<Model>),
     Attach(Model),
     End(Model),
@@ -138,7 +181,7 @@ impl Program {
     pub(super) fn peer_fingerprint(&self) -> Option<String> {
         match self {
             Self::Attach(model) | Self::End(model) => model.reference().map(|r| r.host_key),
-            Self::Shell(_) => None,
+            Self::Shell(_) | Self::Discover => None,
         }
     }
     pub(super) fn validate_target(&self, options: &SshOptions) -> Result<()> {
@@ -184,7 +227,7 @@ impl Program {
         use DurablePhase::*;
         let model = match self {
             Self::Attach(model) | Self::End(model) => model,
-            Self::Shell(_) => unreachable!(),
+            Self::Shell(_) | Self::Discover => unreachable!(),
         };
         let saved = model.reference();
         if let Some(reference) = &saved {
@@ -198,21 +241,7 @@ impl Program {
                 ));
             }
         }
-        let version = command(&shell.link, "zmx version").await?;
-        ensure!(
-            version.status == 0,
-            failure(
-                Unavailable,
-                "Unable to run zmx on this SSH account. Start a direct shell or install zmx on the remote host."
-            )
-        );
-        ensure!(
-            compatible_version(&version.stdout),
-            failure(
-                Unavailable,
-                "Unsupported zmx version. Durable shells require zmx 1.x, starting with 1.0.1."
-            )
-        );
+        check_version(&shell.link).await?;
         let create = saved.is_none();
         let reference =
             saved.unwrap_or_else(|| DurableReference::new(&options, shell.link.fingerprint()));
@@ -347,6 +376,13 @@ fn compatible_version(output: &[u8]) -> bool {
 }
 
 async fn command(link: &ConnectionShare, text: &str) -> Result<CommandResult> {
+    bounded_command(link, text, 8192).await
+}
+async fn bounded_command(
+    link: &ConnectionShare,
+    text: &str,
+    limit: usize,
+) -> Result<CommandResult> {
     tokio::time::timeout(Duration::from_secs(6), async {
         let mut guard = link.open_shell().await.map_err(|e| {
             if link.handle().is_closed() {
@@ -367,7 +403,7 @@ async fn command(link: &ConnectionShare, text: &str) -> Result<CommandResult> {
             match channel.wait().await {
                 Some(ChannelMsg::Data { data }) => {
                     size += data.len();
-                    if size <= 8192 {
+                    if size <= limit {
                         stdout.extend_from_slice(&data);
                     }
                 }
@@ -383,7 +419,7 @@ async fn command(link: &ConnectionShare, text: &str) -> Result<CommandResult> {
                 _ => {}
             }
             ensure!(
-                size <= 8192,
+                size <= limit,
                 failure(
                     DurablePhase::Unavailable,
                     "Unexpected output from remote zmx command"
@@ -396,6 +432,36 @@ async fn command(link: &ConnectionShare, text: &str) -> Result<CommandResult> {
     })
     .await
     .context("Timed out waiting for the remote zmx command")?
+}
+async fn check_version(link: &ConnectionShare) -> Result<()> {
+    let version = command(link, "zmx version").await?;
+    ensure!(
+        version.status == 0,
+        failure(
+            DurablePhase::Unavailable,
+            "Unable to run zmx on this SSH account. Start a direct shell or install zmx on the remote host."
+        )
+    );
+    ensure!(
+        compatible_version(&version.stdout),
+        failure(
+            DurablePhase::Unavailable,
+            "Unsupported zmx version. Durable shells require zmx 1.x, starting with 1.0.1."
+        )
+    );
+    Ok(())
+}
+pub(super) async fn discover(
+    link: &ConnectionShare,
+    options: &SshOptions,
+) -> Result<Vec<DiscoveredSession>> {
+    check_version(link).await?;
+    let listing = bounded_command(link, "zmx list", 1024 * 1024).await?;
+    ensure!(
+        listing.status == 0,
+        "zmx could not list sessions on this account"
+    );
+    crate::durable::parse_listing(&listing.stdout, options, link.fingerprint())
 }
 async fn read_generation(
     link: &ConnectionShare,
@@ -422,9 +488,29 @@ async fn verify(link: &ConnectionShare, reference: &DurableReference) -> Result<
 impl Worker {
     pub(super) async fn serve(mut self, driver: &mut Driver) -> Result<()> {
         use DurablePhase::*;
-        let mut next = Some(Program::Attach(self.model.clone()));
+        let mut next = Some(if self.model.0.lock().unwrap().phase == Discovering {
+            Program::Discover
+        } else {
+            Program::Attach(self.model.clone())
+        });
         loop {
             if let Some(program) = next.take() {
+                let execute = async {
+                    if matches!(program, Program::Discover) {
+                        let entries = driver.discover_sessions().await?;
+                        let mut state = self.model.0.lock().unwrap();
+                        state.detail = match entries.len() {
+                            0 => "No compatible remote sessions found".into(),
+                            1 => "1 remote session".into(),
+                            count => format!("{count} remote sessions"),
+                        };
+                        state.candidates = entries.into();
+                        state.phase = Choosing;
+                        Ok(())
+                    } else {
+                        driver.run(&program).await
+                    }
+                };
                 let result = tokio::select! {
                     biased;
                     action=self.requests.recv()=>{
@@ -432,9 +518,13 @@ impl Worker {
                         next=self.transition(action);
                         continue;
                     },
-                    result=driver.run(&program)=>result
+                    result=execute=>result
                 };
                 match result {
+                    Ok(()) if matches!(program, Program::Discover) => {}
+                    Err(error) if matches!(program, Program::Discover) => {
+                        self.model.set(Choosing, format!("{error:#}"))
+                    }
                     Ok(()) if matches!(program, Program::End(_)) => {
                         self.model.0.lock().unwrap().reference = None;
                         self.model.set(Ended, "Remote durable shell ended");
@@ -454,8 +544,15 @@ impl Worker {
                     }
                 }
             }
-            let detail = self.model.0.lock().unwrap().detail.clone();
-            driver.output.send(Event::Status(detail)).await?;
+            let update = {
+                let state = self.model.0.lock().unwrap();
+                if state.phase == Choosing {
+                    Event::SessionListUpdated(state.detail.clone())
+                } else {
+                    Event::Status(state.detail.clone())
+                }
+            };
+            driver.output.send(update).await?;
             loop {
                 tokio::select! {
                     biased;
@@ -472,6 +569,19 @@ impl Worker {
     fn transition(&self, action: DurableAction) -> Option<Program> {
         use DurableAction::*;
         match action {
+            Refresh => {
+                self.model
+                    .set(DurablePhase::Discovering, "Looking for remote sessions…");
+                Some(Program::Discover)
+            }
+            Choose(reference) => {
+                let mut state = self.model.0.lock().unwrap();
+                state.reference = Some(reference);
+                state.candidates = Arc::new([]);
+                state.phase = DurablePhase::Connecting;
+                state.detail = "Reattaching to the selected remote PTY".into();
+                Some(Program::Attach(self.model.clone()))
+            }
             Detach => {
                 self.model.set(
                     DurablePhase::Detached,

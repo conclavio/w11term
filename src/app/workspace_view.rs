@@ -138,7 +138,16 @@ impl TerminalApp {
             let Page::Terminal(live) = &tab.page else {
                 anyhow::bail!("Expected a terminal pane")
             };
-            SavedSource::capture(&live.source, live.profile_name.as_deref())?.with_session(
+            let source = if live.discovery_page.is_some() {
+                SavedSource::Discovery(
+                    live.profile_name
+                        .clone()
+                        .context("Missing discovery profile")?,
+                )
+            } else {
+                SavedSource::capture(&live.source, live.profile_name.as_deref())?
+            };
+            source.with_session(
                 live.session
                     .durable_state()
                     .and_then(|state| state.reference),
@@ -248,6 +257,14 @@ pub(super) fn append_resolved_workspace(
         let label = profile_name
             .clone()
             .unwrap_or_else(|| source_label(&source));
+        if let (true, Source::Ssh(options)) = (saved.is_discovery(), &source) {
+            return session_browser::discovery_tab(
+                label,
+                options.clone(),
+                osc52,
+                saved.session().cloned(),
+            );
+        }
         live_tab_sized(
             label,
             source,
