@@ -10,6 +10,7 @@ const PAGE_SIZE: usize = 32;
 #[derive(Clone)]
 pub enum FileAction {
     Toggle,
+    OpenHere,
     Close(u64),
     Browse(u64, u64, String),
     Choose(u64, String),
@@ -65,6 +66,66 @@ fn remote_child(directory: &str, name: &str) -> Result<String> {
         "Invalid remote filename"
     );
     Ok(format!("{}/{}", directory.trim_end_matches('/'), name))
+}
+
+/// OSC 7 is a path hint for the existing SFTP connection. Preserve the raw
+/// authority: a URL library can normalize an explicit "localhost" to "".
+fn shell_directory(report: Option<&str>, host: &str) -> Option<String> {
+    let raw = report?;
+    let (scheme, rest) = raw.split_once("://")?;
+    let (authority, path) = rest.split_once('/')?;
+    if !scheme.eq_ignore_ascii_case("file")
+        || raw.chars().any(char::is_control)
+        || raw.contains(['?', '#', '\\'])
+    {
+        return None;
+    }
+    if !authority.is_empty() {
+        fn ip(value: &str) -> Option<std::net::IpAddr> {
+            value
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .unwrap_or(value)
+                .parse()
+                .ok()
+        }
+        let matches = match (ip(authority), ip(host)) {
+            (Some(a), Some(b)) => a == b,
+            _ => authority
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(host.trim_end_matches('.')),
+        };
+        if !matches || authority.contains(['@', '%']) {
+            return None;
+        }
+    }
+    let mut decoded = Vec::with_capacity(path.len() + 1);
+    decoded.push(b'/');
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        let byte = if byte == b'%' {
+            let high = char::from(bytes.next()?).to_digit(16)?;
+            let low = char::from(bytes.next()?).to_digit(16)?;
+            let value = (high * 16 + low) as u8;
+            if value == b'/' {
+                return None;
+            }
+            value
+        } else {
+            byte
+        };
+        decoded.push(byte);
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    if path.starts_with("//")
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 fn directory_entries(reply: &Value) -> Result<Vec<Entry>> {
@@ -613,7 +674,7 @@ impl TerminalApp {
     pub(super) fn file_action(&mut self, action: FileAction, context: &ComponentContext<Self>) {
         use FileAction::*;
         let pane = match &action {
-            Toggle => match self.tabs.active().and_then(AppTab::pane_id) {
+            Toggle | OpenHere => match self.tabs.active().and_then(AppTab::pane_id) {
                 Some(id) => id,
                 None => return,
             },
@@ -639,12 +700,13 @@ impl TerminalApp {
         else {
             return;
         };
-        if !matches!(tab.source, Source::Ssh(_)) {
+        let Source::Ssh(ssh) = &tab.source else {
             return;
-        }
+        };
         let session = &tab.session;
         let files = &mut tab.files;
-        files.observe_connection(session.frames.load().connection_generation);
+        let frame = session.frames.load();
+        files.observe_connection(frame.connection_generation);
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
@@ -663,6 +725,16 @@ impl TerminalApp {
                     crate::input::clear_grid();
                     if files.open && files.directory.is_none() && !files.busy() {
                         files.browse(pane, session, ".".into(), context)?;
+                    }
+                }
+                OpenHere => {
+                    files.open = true;
+                    self.initial_grid.set(None);
+                    crate::input::clear_grid();
+                    if !files.busy() {
+                        let path = shell_directory(frame.reported_directory.as_deref(), &ssh.host)
+                            .unwrap_or_else(|| ".".into());
+                        files.browse(pane, session, path, context)?;
                     }
                 }
                 Close(_) => {
@@ -794,16 +866,27 @@ impl TerminalApp {
             vec![local.join("upload.bin")],
         );
         let next = match step {
-            0 if tab.session.frames.load().connection_generation == 0 => 0,
+            0 if tab.session.frames.load().reported_directory.is_none() => 0,
             0 => {
+                let frame = tab.session.frames.load();
+                let command = frame.last_command.as_ref().expect("fixture shell status");
+                assert_eq!(command.output.as_deref(), Ok("fixture status\r\n"));
+                assert_eq!(command.exit_code, Some(7));
+                assert_eq!(frame.copy_output_unavailable(), None);
                 self.file_action(FileAction::Toggle, context);
                 1
             }
             _ if files.busy() => step,
             1 => {
-                assert!(
-                    files.directory.is_some(),
-                    "Unable to read fixture directory: {status}"
+                assert_eq!(files.directory.as_deref(), Some("/"), "{status}");
+                self.update(super::tab_menu_message("Open files here".into()), context);
+                6
+            }
+            6 => {
+                assert_eq!(
+                    files.directory.as_deref(),
+                    Some("/shell directory"),
+                    "{status}"
                 );
                 self.file_action(upload, context);
                 // The transfer should still finish on its original SSH channel after
@@ -886,6 +969,41 @@ impl TerminalApp {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shell_directory_uses_only_an_absolute_path_on_this_ssh_host() {
+        let path = |url| shell_directory(Some(url), "Host.Example");
+        assert_eq!(
+            path("file://HOST.EXAMPLE/home/%E6%97%A5%20A+B").as_deref(),
+            Some("/home/日 A+B")
+        );
+        assert_eq!(path("file:///").as_deref(), Some("/"));
+        assert_eq!(
+            shell_directory(Some("file://[::1]/src"), "::1").as_deref(),
+            Some("/src")
+        );
+        assert!(shell_directory(None, "host.example").is_none());
+        for url in [
+            "file://elsewhere/tmp",
+            "file://localhost/tmp",
+            "file://host.example:22/tmp",
+            "file://user@host.example/tmp",
+            "https://host.example/tmp",
+            "file:relative",
+            "file:////share",
+            "file:///a/%2E%2e/b",
+            "file:///%00",
+            "file:///%7f",
+            "file:///%2f",
+            "file:///%5c",
+            "file:///one?two",
+            "file:///one#two",
+            "file:///%",
+            "file:///%FF",
+        ] {
+            assert!(path(url).is_none(), "{url}");
+        }
+    }
 
     #[test]
     fn remote_paths_and_directory_types_use_sftp_semantics() {

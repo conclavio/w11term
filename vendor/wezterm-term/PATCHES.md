@@ -38,3 +38,10 @@ The original MIT license is preserved in `LICENSE.md`.
   The sister vendored escape parser at the same pinned revision preserves their
   control parameters. The projection uses the Unicode 6.0 diacritic indices
   published with kitty's graphics protocol. See `docs/graphics-audit.md`.
+
+- `screen.rs` and `terminalstate/` retain a primary-screen OSC 133 command's
+  output boundaries across scrolling and reflow. On completion they expose
+  bounded plain text and the numeric exit status. The sibling escape parser
+  preserves the distinction between a missing status and exit code zero.
+  OSC 7 retains the original URI alongside the parsed URL so the embedding can
+  validate the authority before using it for the pane's SFTP drawer.
