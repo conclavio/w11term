@@ -128,7 +128,23 @@ impl Session {
         allow_clipboard: bool,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
-        Self::start_worker(source, size, allow_clipboard, connection, None)
+        Self::start_worker(source, size, allow_clipboard, connection, None, None)
+    }
+
+    pub fn start_workspace_ssh(
+        options: crate::options::SshOptions,
+        size: TerminalSize,
+        allow_clipboard: bool,
+        startup: crate::workspace::SshStartup,
+    ) -> Self {
+        Self::start_worker(
+            Source::Ssh(options),
+            size,
+            allow_clipboard,
+            None,
+            None,
+            Some(startup),
+        )
     }
 
     pub fn start_durable(
@@ -144,6 +160,7 @@ impl Session {
             allow_clipboard,
             connection,
             Some(ssh::DurableStart::Attach(saved)),
+            None,
         )
     }
 
@@ -160,6 +177,7 @@ impl Session {
             allow_clipboard,
             None,
             Some(ssh::DurableStart::Discover),
+            None,
         )
     }
 
@@ -180,6 +198,7 @@ impl Session {
         allow_clipboard: bool,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<ssh::DurableStart>,
+        startup: Option<crate::workspace::SshStartup>,
     ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
@@ -223,6 +242,7 @@ impl Session {
             published: ssh_connection.clone(),
             offered: connection.filter(|_| matches!(source, Source::Ssh(_))),
             durable: lifecycle,
+            startup,
         };
         let worker = thread::Builder::new()
             .name("terminal-session".into())
