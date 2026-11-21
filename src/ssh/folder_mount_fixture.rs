@@ -83,6 +83,7 @@ async fn sftp(pane: &Session, auth: &Authority, operation: Operation) -> Result<
             deadline,
             reply,
             progress: None,
+            cancel: None,
         }))
         .map_err(|_| anyhow::anyhow!("terminal session exited"))?;
     tokio::time::timeout_at(deadline, answer)

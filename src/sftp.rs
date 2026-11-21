@@ -9,11 +9,12 @@ use russh_sftp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -239,6 +240,25 @@ pub struct TransferProgress {
     pub total: Option<u64>,
 }
 
+/// Explicit user cancellation belongs to one transfer, independent of its reply
+/// receiver. An admitted SFTP request still receives its status before CLOSE.
+#[derive(Clone, Debug, Default)]
+pub struct TransferCancel(Arc<AtomicBool>);
+
+impl TransferCancel {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+fn cancelled_transfer(local: &Path, remote: &str, bytes: u64, partial: bool) -> Value {
+    json!({"cancelled":true, "local":local, "remote":remote, "bytes_transferred":bytes, "remote_may_be_partial":partial})
+}
+
 fn report(progress: Option<&watch::Sender<TransferProgress>>, bytes: u64, total: Option<u64>) {
     if let Some(progress) = progress {
         progress.send_replace(TransferProgress {
@@ -259,6 +279,9 @@ pub struct Job {
     pub deadline: Instant,
     pub reply: oneshot::Sender<JobResult>,
     pub progress: Option<watch::Sender<TransferProgress>>,
+    /// Used by native Get/Put only. A stopped transfer replies with cancelled,
+    /// bytes_transferred and remote_may_be_partial after closing its handle.
+    pub cancel: Option<TransferCancel>,
 }
 
 // The SSH transport aborts its SFTP worker when the connection goes away.
@@ -271,18 +294,27 @@ struct PendingReply {
 enum JobStage {
     Ordinary,
     Upload,
+    NativeUpload {
+        remote: String,
+        open_dispatched: bool,
+        confirmed: u64,
+    },
     Checking(&'static str),
     AwaitingStatus(&'static str),
 }
 
 impl JobStage {
-    fn interrupted(&self) -> &'static str {
+    fn interrupted(&self) -> Cow<'static, str> {
         match self {
-            Self::Ordinary => "SFTP operation interrupted; outcome may be unknown",
+            Self::Ordinary => "SFTP operation interrupted; outcome may be unknown".into(),
             Self::Upload => {
-                "SFTP upload interrupted; remote destination may contain a partial file"
+                "SFTP upload interrupted; remote destination may contain a partial file".into()
             }
-            Self::Checking(message) | Self::AwaitingStatus(message) => message,
+            Self::NativeUpload { remote, open_dispatched: true, confirmed } =>
+                format!("Upload interrupted after {confirmed} confirmed bytes; remote destination {remote} may contain a partial file").into(),
+            Self::NativeUpload { open_dispatched: false, .. } =>
+                "Upload interrupted before opening the remote destination; 0 confirmed bytes".into(),
+            Self::Checking(message) | Self::AwaitingStatus(message) => (*message).into(),
         }
     }
 }
@@ -321,6 +353,7 @@ pub(crate) async fn run(
             deadline,
             reply,
             progress,
+            cancel,
         } = job;
         if expected_generation.is_none() {
             let missing = match operation {
@@ -349,6 +382,13 @@ pub(crate) async fn run(
         if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
             continue;
         }
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+            && let Operation::Put { local, remote, .. } | Operation::Get { local, remote, .. } =
+                &operation
+        {
+            let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
+            continue;
+        }
         let detached_close = reply.is_closed() && matches!(operation, Operation::Close { .. });
         let deadline = if detached_close {
             Instant::now() + Duration::from_secs(15)
@@ -367,15 +407,20 @@ pub(crate) async fn run(
         );
         let mut reply = PendingReply {
             sender: Some(reply),
-            stage: match operation {
+            stage: match &operation {
+                Operation::Put { remote, .. } if cancel.is_some() => JobStage::NativeUpload {
+                    remote: remote.clone(),
+                    open_dispatched: false,
+                    confirmed: 0,
+                },
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
             },
         };
-        // Finish an admitted request even if its caller disappears. Cancelling a
-        // read must not reset the shared SFTP channel and invalidate CLI handles.
+        // Detaching a caller does not cancel a transfer. Only its explicit
+        // cancellation handle stops it, without resetting other CLI handles.
         let result = match tokio::time::timeout_at(deadline, async {
             if engine.is_none() {
                 engine = Some(Engine::connect(&session).await?);
@@ -383,7 +428,12 @@ pub(crate) async fn run(
             engine
                 .as_mut()
                 .unwrap()
-                .execute(operation, progress.as_ref(), &mut reply.stage)
+                .execute(
+                    operation,
+                    progress.as_ref(),
+                    cancel.as_ref(),
+                    &mut reply.stage,
+                )
                 .await
         })
         .await
@@ -398,9 +448,20 @@ pub(crate) async fn run(
                     engine = None;
                 }
                 if matches!(reply.stage, JobStage::Checking(_))
-                    || (lost && matches!(reply.stage, JobStage::AwaitingStatus(_)))
+                    || matches!(
+                        reply.stage,
+                        JobStage::NativeUpload {
+                            open_dispatched: true,
+                            ..
+                        }
+                    )
+                    || (lost
+                        && matches!(
+                            reply.stage,
+                            JobStage::AwaitingStatus(_) | JobStage::NativeUpload { .. }
+                        ))
                 {
-                    result.context(reply.stage.interrupted())
+                    result.with_context(|| reply.stage.interrupted())
                 } else if lost {
                     result.context("SFTP channel failed; outcome may be unknown; handles invalidated, do not blindly retry")
                 } else {
@@ -411,7 +472,9 @@ pub(crate) async fn run(
                 engine = None;
                 if matches!(
                     reply.stage,
-                    JobStage::Checking(_) | JobStage::AwaitingStatus(_)
+                    JobStage::Checking(_)
+                        | JobStage::AwaitingStatus(_)
+                        | JobStage::NativeUpload { .. }
                 ) {
                     Err(anyhow::anyhow!(
                         "SFTP timed out; {}; handles invalidated",
@@ -554,6 +617,7 @@ impl Engine {
         &mut self,
         op: Operation,
         progress: Option<&watch::Sender<TransferProgress>>,
+        cancel: Option<&TransferCancel>,
         stage: &mut JobStage,
     ) -> Result<Value> {
         use Operation::*;
@@ -569,14 +633,17 @@ impl Engine {
                 overwrite,
                 max_bytes,
             } => {
-                self.get(remote, local, overwrite, max_bytes, progress)
+                self.get(remote, local, overwrite, max_bytes, progress, cancel)
                     .await?
             }
             Put {
                 local,
                 remote,
                 overwrite,
-            } => self.put(local, remote, overwrite, progress).await?,
+            } => {
+                self.put(local, remote, overwrite, progress, cancel, stage)
+                    .await?
+            }
             Opendir { path } => {
                 let h = self.raw.opendir(path).await?.handle;
                 self.remember(h, true).await?
@@ -817,7 +884,12 @@ impl Engine {
         overwrite: bool,
         max_bytes: Option<u64>,
         progress: Option<&watch::Sender<TransferProgress>>,
+        cancel: Option<&TransferCancel>,
     ) -> Result<Value> {
+        let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
+        if cancelled() {
+            return Ok(cancelled_transfer(&local, &remote, 0, false));
+        }
         ensure!(local.is_absolute(), "local path must be absolute");
         if !overwrite {
             ensure!(
@@ -829,9 +901,25 @@ impl Engine {
             .parent()
             .context("local destination has no parent")?
             .to_owned();
-        let temp =
-            tokio::task::spawn_blocking(move || tempfile::NamedTempFile::new_in(parent)).await??;
+        let before_create = cancel.cloned();
+        let Some(temp) = tokio::task::spawn_blocking(move || {
+            if before_create
+                .as_ref()
+                .is_some_and(TransferCancel::is_cancelled)
+            {
+                Ok(None)
+            } else {
+                tempfile::NamedTempFile::new_in(parent).map(Some)
+            }
+        })
+        .await??
+        else {
+            return Ok(cancelled_transfer(&local, &remote, 0, false));
+        };
         let mut file = tokio::fs::File::from_std(temp.reopen()?);
+        if cancelled() {
+            return Ok(cancelled_transfer(&local, &remote, 0, false));
+        }
         let h = self
             .raw
             .open(&remote, OpenFlags::READ, FileAttributes::empty())
@@ -839,7 +927,7 @@ impl Engine {
             .handle;
         let copied = async {
             // Some servers omit size or disallow FSTAT on readable files.
-            let total = if progress.is_some() {
+            let total = if progress.is_some() && !cancelled() {
                 match self.raw.fstat(&h).await {
                     Ok(reply) => reply.attrs.size,
                     Err(error) if transport_error(&error) => return Err(error.into()),
@@ -850,9 +938,12 @@ impl Engine {
             };
             report(progress, 0, total);
             let mut offset = 0u64;
-            loop {
+            while !cancelled() {
                 match self.raw.read(&h, offset, self.read_size as u32).await {
                     Ok(data) => {
+                        if cancelled() {
+                            break;
+                        }
                         ensure!(
                             data.data.len() <= self.read_size,
                             "server returned more SFTP data than requested"
@@ -876,7 +967,9 @@ impl Engine {
                     Err(e) => return Err(e.into()),
                 }
             }
-            file.sync_all().await?;
+            if !cancelled() {
+                file.sync_all().await?;
+            }
             Ok::<u64, anyhow::Error>(offset)
         }
         .await;
@@ -884,15 +977,29 @@ impl Engine {
         let bytes = copied?;
         closed?;
         drop(file);
+        if cancelled() {
+            return Ok(cancelled_transfer(&local, &remote, bytes, false));
+        }
+        // This check runs inside the blocking task, so cancellation while the
+        // task is queued cannot install the temporary file. Once persist starts,
+        // the actual commit result wins even if a cancellation arrives later.
         let destination = local.clone();
-        tokio::task::spawn_blocking(move || {
+        let cancel = cancel.cloned();
+        let committed = tokio::task::spawn_blocking(move || -> Result<bool> {
+            if cancel.as_ref().is_some_and(TransferCancel::is_cancelled) {
+                return Ok(false);
+            }
             if overwrite {
                 temp.persist(destination)
             } else {
                 temp.persist_noclobber(destination)
-            }
+            }?;
+            Ok(true)
         })
         .await??;
+        if !committed {
+            return Ok(cancelled_transfer(&local, &remote, bytes, false));
+        }
         Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
     }
     async fn put(
@@ -901,7 +1008,13 @@ impl Engine {
         remote: String,
         overwrite: bool,
         progress: Option<&watch::Sender<TransferProgress>>,
+        cancel: Option<&TransferCancel>,
+        stage: &mut JobStage,
     ) -> Result<Value> {
+        let cancelled = || cancel.is_some_and(TransferCancel::is_cancelled);
+        if cancelled() {
+            return Ok(cancelled_transfer(&local, &remote, 0, false));
+        }
         ensure!(local.is_absolute(), "local path must be absolute");
         let mut file = tokio::fs::File::open(&local)
             .await
@@ -917,32 +1030,60 @@ impl Engine {
             } else {
                 OpenFlags::EXCLUDE
             };
-        let h = self
-            .raw
-            .open(&remote, flags, FileAttributes::empty())
-            .await?
-            .handle;
+        if cancelled() {
+            return Ok(cancelled_transfer(&local, &remote, 0, false));
+        }
+        if let JobStage::NativeUpload {
+            open_dispatched, ..
+        } = stage
+        {
+            *open_dispatched = true;
+        }
+        let h = match self.raw.open(&remote, flags, FileAttributes::empty()).await {
+            Ok(h) => h.handle,
+            Err(error) => {
+                if !transport_error(&error)
+                    && let JobStage::NativeUpload {
+                        open_dispatched, ..
+                    } = stage
+                {
+                    *open_dispatched = false;
+                }
+                return Err(error.into());
+            }
+        };
         let copied = async {
             let mut buf = vec![0; self.write_size];
             let mut offset = 0u64;
-            loop {
+            while !cancelled() {
                 let len = file.read(&mut buf).await?;
-                if len == 0 {
+                if cancelled() {
                     break;
+                }
+                if len == 0 {
+                    // All writes are acknowledged. A late click during CLOSE
+                    // cannot turn a completed upload into a partial one.
+                    return Ok::<_, anyhow::Error>((offset, true));
                 }
                 self.raw.write(&h, offset, buf[..len].to_vec()).await?;
                 offset = offset
                     .checked_add(len as u64)
                     .context("file size overflow")?;
+                if let JobStage::NativeUpload { confirmed, .. } = stage {
+                    *confirmed = offset;
+                }
                 report(progress, offset, total);
             }
-            Ok::<u64, anyhow::Error>(offset)
+            Ok((offset, false))
         }
         .await;
         let closed = self.raw.close(h).await;
-        let bytes =
+        let (bytes, complete) =
             copied.context("upload failed; remote destination may contain a partial file")?;
         closed.context("upload close failed; remote contents are uncertain")?;
+        if !complete {
+            return Ok(cancelled_transfer(&local, &remote, bytes, true));
+        }
         Ok(json!({"local":local,"remote":remote,"bytes_transferred":bytes}))
     }
 }
