@@ -81,6 +81,14 @@ Select a file or directory and choose **Rename…** to change its name in the cu
 
 SFTP v3 requires the server to reject an existing destination. If another process creates the name between the check and the rename, enforcement depends on the server and filesystem. [SFTP v3 rename semantics](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5) · [OpenSSH implementation](https://github.com/openssh/openssh-portable/blob/V_10_2_P1/sftp-server.c#L1187-L1249)
 
+### Share a Windows folder with Linux
+
+Connect to a saved SSH profile, open **caret → Shared folders… → Add folder…**, and choose a local NTFS directory. Check the displayed SSH account, host and fingerprint. Enter a mount name and select **Save folder**. For example, sharing `C:\Projects\sprites` as `sprites` makes its files available **read-only** at `~/windows/sprites` on Linux. Other programs running as that Linux account can read them.
+
+**Unmount** stops the current export. **Mount** retries it. **Forget** revokes the saved permission. Reconnecting the same profile can remount its folders. A changed host key, account, profile identity or replaced Windows directory requires a new selection. Windows keeps the grants under `%LOCALAPPDATA%\w11term\folder-shares`. A copied profile carries only an opaque identifier. Drive roots, junctions, reparse points and multiply linked files are excluded.
+
+The remote account needs SSH exec channels, stock SSHFS 3, FUSE access and ordinary Linux shell utilities, including util-linux. w11term uses a separate channel on the existing SSH connection and creates private mount directories under the account’s home. A conflicting mount, nonempty destination or unavailable SSHFS appears in **Shared folders**. The interactive shell remains available. [SSHFS passive mode](https://github.com/libfuse/sshfs/blob/ba33bab77006cfb81cbd6ecc44a8fc2728d24793/sshfs.rst#L150-L154)
+
 The **Inbox** button beside the tab menu shows how many bells and terminal notifications are unread across this window. The inbox keeps the newest 128 alerts, including alerts from background tabs and splits. Select a message to mark it read and focus its source pane. **Mark all read** acknowledges the remaining messages, and **Clear inbox** empties the list. Both leave the per-pane control event journals available to scripts.
 
 Choose **caret → Panes → Open files here** to open the drawer at the directory the focused shell last reported with OSC 7. For example, `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s existing SSH connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. An absent, invalid or foreign-host report opens the usual SFTP working directory.

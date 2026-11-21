@@ -8,6 +8,13 @@ on:
       - tests/folder-sharing/**
       - src/ssh.rs
       - src/ssh/**
+      - src/folder_grants.rs
+      - src/folder_grants/**
+      - src/session.rs
+      - src/profiles.rs
+      - src/app/folder_sharing_state.rs
+      - src/app/folder_shares.rs
+      - Cargo.toml
       - Cargo.lock
 
 permissions:

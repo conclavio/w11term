@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use russh::{Channel, client};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use tokio::{runtime, sync::oneshot};
+use tokio::{
+    runtime,
+    sync::{oneshot, watch},
+};
 
 // A socket and its russh driver must outlive whichever terminal opened it.
 // Terminal parsing and presentation continue on each pane's own worker.
@@ -78,6 +81,15 @@ impl ConnectionShare {
     }
     pub(super) fn fingerprint(&self) -> &str {
         &self.0.fingerprint
+    }
+    pub(crate) fn verified_endpoint(&self) -> (&str, &str, u16, &str) {
+        let options = &self.0.options;
+        (
+            &options.host,
+            &options.user,
+            options.port,
+            &self.0.fingerprint,
+        )
     }
     pub(super) async fn open_shell(&self) -> Result<ShellChannel> {
         // russh doesn't close a bare Channel on drop. An opener cancelled
@@ -152,21 +164,45 @@ impl Drop for ShellChannel {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct ShareSlot(Arc<Mutex<Weak<ConnectionShare>>>);
+pub(crate) struct ShareSlot(Arc<Mutex<(u64, Weak<ConnectionShare>)>>, watch::Sender<()>);
+
+pub(super) struct PublishedShell(ShareSlot, Weak<ConnectionShare>);
+
+impl Drop for PublishedShell {
+    fn drop(&mut self) {
+        let mut state = self.0.0.lock().unwrap();
+        if state.1.ptr_eq(&self.1) {
+            state.1 = Weak::new();
+            self.0.1.send_replace(());
+        }
+    }
+}
 
 impl ShareSlot {
     pub(crate) fn current(&self) -> Option<ConnectionShare> {
-        self.0
-            .lock()
-            .unwrap()
+        self.generation().map(|(_, link)| link)
+    }
+    pub(crate) fn generation(&self) -> Option<(u64, ConnectionShare)> {
+        let state = self.0.lock().unwrap();
+        state
+            .1
             .upgrade()
             .filter(|share| !share.0.handle.is_closed())
-            .map(|share| (*share).clone())
+            .map(|share| (state.0, (*share).clone()))
+    }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
+        self.1.subscribe()
+    }
+    pub(super) fn shell_lifetime(&self, link: &Arc<ConnectionShare>) -> PublishedShell {
+        PublishedShell(self.clone(), Arc::downgrade(link))
     }
     pub(super) fn publish(&self, local: &Arc<ConnectionShare>) {
         // Each pane owns its own outer Arc. Its offer expires on disconnect
         // even when other panes continue to use the underlying Link.
-        *self.0.lock().unwrap() = Arc::downgrade(local);
+        let mut state = self.0.lock().unwrap();
+        state.0 += 1;
+        state.1 = Arc::downgrade(local);
+        self.1.send_replace(());
     }
 }
 

@@ -14,6 +14,19 @@ pub struct ProfileStore {
     path: PathBuf,
 }
 
+const SHARE_TOKEN: &str = "folder_share_id";
+
+fn share_token(entry: &serde_json::Value) -> Result<Option<String>> {
+    let Some(value) = entry.get(SHARE_TOKEN) else {
+        return Ok(None);
+    };
+    let token = value
+        .as_str()
+        .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .context("Invalid folder-sharing profile identifier")?;
+    Ok(Some(token.to_owned()))
+}
+
 #[derive(Clone)]
 pub struct LocalProfileSnapshot {
     pub name: String,
@@ -47,6 +60,38 @@ fn order_after_edit(
 impl ProfileStore {
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// The portable profile contains an opaque identifier. Folder paths and
+    /// permissions live in a separate Windows-user store bound to the SSH peer.
+    pub(crate) fn folder_token(
+        &self,
+        authority: &crate::folder_grants::Authority,
+        issue: bool,
+    ) -> Result<Option<String>> {
+        let (_, snapshot) = self.inspect_catalog(&authority.profile)?;
+        authority.check_profile(&snapshot.options)?;
+        let current = share_token(&snapshot.raw)?;
+        if current.is_some() || !issue {
+            return Ok(current);
+        }
+        let mut token = None;
+        self.modify(|profiles, catalog| {
+            let options = catalog
+                .profiles
+                .get(&authority.profile)
+                .context("SSH profile was removed")?;
+            authority.check_profile(options)?;
+            let profile = profiles
+                .get_mut(&authority.profile)
+                .context("SSH profile was removed")?;
+            let key =
+                share_token(profile)?.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
+            profile[SHARE_TOKEN] = key.clone().into();
+            token = Some(key);
+            Ok(None)
+        })?;
+        Ok(token)
     }
 
     pub fn new(path: PathBuf) -> Result<Self> {
@@ -295,6 +340,18 @@ impl ProfileStore {
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             let object = value.as_object_mut().context("profile must be an object")?;
+            if original != Some(name)
+                || original
+                    .and_then(|key| catalog.profiles.get(key))
+                    .is_some_and(|old| {
+                        !old.host.eq_ignore_ascii_case(&options.host)
+                            || old.user != options.user
+                            || old.port != options.port
+                            || old.host_key != options.host_key
+                    })
+            {
+                object.remove(SHARE_TOKEN);
+            }
             let keep_identity = expected
                 .is_some_and(|previous| previous.authentication == options.authentication)
                 && matches!(
