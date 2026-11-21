@@ -16,7 +16,24 @@ INITIAL = (30, 100)
 RESIZED = (38, 126)
 CSI = rb"\x1b\["
 SIXEL = re.compile(rb"\x1b\[[0-9]+;[0-9]+H\x1bP[0-9;]*q[^\x1b]+\x1b\\")
-PROBES = re.compile(CSI + rb"(?:0?c|14t|16t|18t)")
+# Zellij 0.46.0 probes both uncompressed and compressed Kitty transfers.
+# Windows replay compares the *entire* reply stream with the native engine,
+# including any probes for which w11term sends nothing.
+REPLIES = {
+    b"\x1b[c": b"\x1b[?65;4;6;18;22;52c",
+    b"\x1b[0c": b"\x1b[?65;4;6;18;22;52c",
+    b"\x1b[14t": b"\x1b[4;%d;%dt",
+    b"\x1b[16t": b"\x1b[6;18;9t",
+    b"\x1b[18t": b"\x1b[8;%d;%dt",
+    b"\x1b]11;?\x1b\\": b"\x1b]11;rgb:0e14/1020/13f7\x1b\\",
+    b"\x1b]10;?\x1b\\": b"\x1b]10;rgb:dc28/e146/e8f4\x1b\\",
+    b"\x1b[?2026$p": b"\x1b[?2026;2$y",
+    b"\x1b[?2027$p": b"\x1b[?2027;3$y",
+    b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\": b"\x1b_Gi=31;OK\x1b\\",
+    b"\x1b_Ga=q,i=32,s=4,v=4,t=d,f=24,o=z;eJxjYCANAAAAMAAB\x1b\\": b"\x1b_Gi=32;OK\x1b\\",
+}
+PROBES = re.compile(b"|".join(map(re.escape, REPLIES)))
+PROBE_TAIL = max(map(len, REPLIES)) - 1
 
 
 def pixels(rows, cols):
@@ -29,19 +46,24 @@ class Capture:
         self.report = report
         self.scanned = 0
         self.size = INITIAL
+        self.replies = bytearray()
 
     def read(self):
         data = self.client.read()
         # Queries may straddle SSH packets. Rescan a short tail and answer each
         # complete query exactly once with the native terminal's DA1 / geometry.
         rows, cols, width, height = pixels(*self.size)
-        for match in PROBES.finditer(data, max(0, self.scanned - 8)):
+        for match in PROBES.finditer(data, max(0, self.scanned - PROBE_TAIL)):
             if match.end() <= self.scanned:
                 continue
-            code = match.group()[2:]
-            reply = {b"14t": f"4;{height};{width}t", b"16t": "6;18;9t",
-                     b"18t": f"8;{rows};{cols}t"}.get(code, "?65;4;6;18;22;52c")
-            self.client.send(b"\x1b[" + reply.encode())
+            query = match.group()
+            reply = REPLIES[query]
+            if query == b"\x1b[14t":
+                reply = reply % (height, width)
+            elif query == b"\x1b[18t":
+                reply = reply % (rows, cols)
+            self.client.send(reply)
+            self.replies.extend(reply)
         self.scanned = len(data)
         return data
 
@@ -98,10 +120,9 @@ def run(args, root, name, mux, term):
     else:
         (config / "zellij").mkdir(parents=True)
         (config / "zellij/config.kdl").write_text("show_startup_tips false\nshow_release_notes false\n")
-        layout = directory / "layout.kdl"
-        layout.write_text(f'layout {{\n pane command="{sys.executable}" {{\n'
-                          f'  args "{pane}"\n }}\n}}\n')
-        command = [binary, "--new-session-with-layout", str(layout), "--session", name]
+        # An explicit initial command suppresses Zellij's first-run desktop
+        # integration wizard, which otherwise receives our pane's first key.
+        command = [binary, "attach", "--create", name, "--", sys.executable, str(pane)]
         stop = [binary, "kill-session", name]
 
     ssh_env = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor"}
@@ -122,6 +143,8 @@ def run(args, root, name, mux, term):
         capture.flush_frame()
         first = bytes(client.output)
         (args.out / f"{name}-first.vt").write_bytes(first)
+        (args.out / f"{name}-first.replies").write_bytes(capture.replies)
+        capture.replies.clear()
         capture.size = RESIZED
         client.resize(*pixels(*RESIZED))
         resized = capture.wait("FIRST", initial)
@@ -131,6 +154,7 @@ def run(args, root, name, mux, term):
         capture.flush_frame()
         second = bytes(client.output[len(first):])
         (args.out / f"{name}-moved.vt").write_bytes(second)
+        (args.out / f"{name}-moved.replies").write_bytes(capture.replies)
         for frame in [first, second]:
             graphics = SIXEL.search(frame)
             if name == "venti-sixel":
@@ -154,7 +178,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mux-") as tmp:
+        failures = []
         for case in [("zellij", "zellij", "xterm-256color"),
                      ("venti-default", "venti", "xterm-256color"),
                      ("venti-sixel", "venti", "xterm-sixel")]:
-            run(args, Path(tmp), *case)
+            try:
+                run(args, Path(tmp), *case)
+            except Exception as error:
+                error.add_note(case[0])
+                failures.append(error)
+        if failures:
+            raise ExceptionGroup("Remote mux checks failed", failures)
