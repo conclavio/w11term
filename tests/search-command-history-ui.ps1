@@ -20,7 +20,7 @@ function Click([string]$Label) {
     })
 }
 function Search([string]$Text) {
-    $field = Wait-Until 'command search field' { Find-Element 'Search commands' $edit }
+    $field = Wait-Until 'command search field' { Find-Element 'Search command history' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
 }
 

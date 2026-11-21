@@ -334,8 +334,8 @@ impl TerminalApp {
                     )),
                 TextBox::new()
                     .grid_row(2)
-                    .automation_name("Search commands")
-                    .placeholder_text("Search commands")
+                    .automation_name("Search command history")
+                    .placeholder_text("Search command history")
                     .text(&page.query)
                     .on_text_changed(ctx.callback(move |text| action(HistoryAction::Search(text)))),
                 ScrollViewer::new()
