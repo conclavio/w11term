@@ -503,6 +503,45 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn keyboard_resize(&mut self, direction: Direction) {
+        if self.tabs.zoomed() {
+            return;
+        }
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let Some(layout) = self.tabs.active_layout() else {
+            return;
+        };
+        let metrics = tab.surface.metrics.get();
+        // Each split leaf also has a one-DIP border on both sides of its canvas.
+        let minimum = 2.0
+            + f64::from(
+                2.0 * PADDING
+                    + match direction.axis() {
+                        Axis::Columns => metrics.cell_width,
+                        Axis::Rows => STATUS_HEIGHT + metrics.cell_height,
+                    },
+            );
+        let edit = layout.keyboard_resize(id, direction, minimum, DIVIDER, |node| {
+            let (w, h) = self.layout_size(node)?;
+            Some(match direction.axis() {
+                Axis::Columns => w,
+                Axis::Rows => h,
+            })
+        });
+        if let Some((path, ratio)) = edit {
+            self.tabs.set_ratio(&path, ratio);
+        }
+    }
+
     pub(super) fn begin_divider(&self, path: &[bool], position: f64) {
         self.divider_drag.borrow_mut().take();
         let Some(mut node) = self.tabs.active_layout() else {

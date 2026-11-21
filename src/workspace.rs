@@ -655,6 +655,12 @@ mod tests {
         let mut split = Layout::Leaf(51);
         split.split(51, 244, Axis::Rows);
         split.set_ratio(&[], 0.6875);
+        let (path, ratio) = split
+            .keyboard_resize(244, crate::pane_layout::Direction::Down, 72.0, 6.0, |_| {
+                Some(800.0)
+            })
+            .unwrap();
+        assert!(split.set_ratio(&path, ratio));
         let captured = Workspace::capture([(&Layout::Leaf(71), 71), (&split, 244)], 1, |id| {
             Ok(match id {
                 51 => SavedSource::SavedProfile("admin".into()),
@@ -668,6 +674,10 @@ mod tests {
         store.save("lab", &demo()).unwrap();
         let saved = store.load().unwrap();
         assert_eq!(saved["ops"], captured);
+        let SavedLayout::Split { ratio, .. } = &saved["ops"].tabs[1].layout else {
+            panic!("saved split missing");
+        };
+        assert!((*ratio - 0.7375).abs() < 1e-9);
         assert_eq!(saved["lab"], demo());
         assert!(captured.resolve_sources(&BTreeMap::new()).is_err());
         let profiles = BTreeMap::from([("admin".to_owned(), ssh("new-host.example"))]);
