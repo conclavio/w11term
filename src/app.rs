@@ -1647,6 +1647,13 @@ impl TerminalApp {
             }));
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
+            if let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+            {
+                tab.follow_shell_directory(&tab.session.frames.load(), context);
+            }
         }
         self.keyboard.set_search(
             matches!(self.tabs.active(),Some(AppTab{page:Page::Terminal(tab),..}) if tab.find.open && tab.prompt_id.is_none()),
@@ -3647,6 +3654,7 @@ impl Component for TerminalApp {
             Message::FrameReady(id, epoch) => {
                 if self.tabs.visible(id) && self.watch_epoch == epoch {
                     self.frame_tasks.remove(&id);
+                    let active = self.tabs.active_id() == Some(id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -3674,6 +3682,9 @@ impl Component for TerminalApp {
                         }
                         tab.error = None;
                         tab.files.observe_connection(frame.connection_generation);
+                        if active {
+                            tab.follow_shell_directory(&frame, context);
+                        }
                         let unavailable = frame.copy_output_unavailable();
                         if tab.copy_output_unavailable != unavailable {
                             tab.copy_output_unavailable = unavailable;
@@ -3686,7 +3697,7 @@ impl Component for TerminalApp {
                             self.header.borrow_mut().take();
                         }
                     }
-                    if self.tabs.active_id() == Some(id) {
+                    if active {
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
