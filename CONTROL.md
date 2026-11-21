@@ -39,6 +39,10 @@ Omit `--pid` when exactly one process is running. Each process serves all its wi
 $screen = & $ctl --pid 12345 get-text --pane $pane | ConvertFrom-Json
 if ($screen.result.text -notmatch 'fps=') { throw 'HUD missing' }
 
+& $ctl --pid 12345 find-text --pane $pane 'connection reset'
+$found = & $ctl --pid 12345 find-text --all-panes 'connection reset' | ConvertFrom-Json
+$found.result.panes | Where-Object { $_.count -gt 0 }
+
 & $ctl --pid 12345 screenshot --pane $pane .\frame.png
 & $ctl --pid 12345 save-text --pane $pane .\shell-transcript.txt
 ```
@@ -90,6 +94,12 @@ Direct protocol screenshot paths must be absolute. The CLI resolves relative pat
 Each entry also has a `label` and `status`. Available sessions report `title`, `cols`, `rows`, `connection_generation`, and `prompt`. An unavailable session retains its IDs and flags and reports an `error`. Prompts expose public challenge metadata only. The connection generation increases after each new SSH login. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels.
 
 ## Waiting, geometry, tabs, and events
+
+`find-text` searches each selected pane’s retained scrollback and visible screen once. Use `--pane ID` for one pane or `--all-panes` for every pane in the process, across all its windows. Matching uses a case-insensitive Unicode literal, joins soft wraps, and stops at hard line breaks. Text can be up to 4,096 UTF-8 bytes. Use `--` before a pattern beginning with two hyphens. An alternate-screen pane searches its current screen.
+
+The JSON `panes` array is sorted by pane ID. Each row includes `pane`, `tab_id`, `window_id`, `count`, `truncated`, and `first`. A match includes a plain-text `excerpt`, a stable buffer `row` and a zero-based cell `column`. An empty result has a count of zero and `first: null`. A count of 10,000 with `truncated: true` means there are additional matches. The coordinates describe the buffer at search time and can go stale after output, resize or reconnection.
+
+All-pane results retain a row with an `error` for a closed, timed-out or mid-synchronized-frame pane. Other panes still return their results. A failure for an explicitly selected pane returns a CLI error. Searching preserves focus, scroll positions and any open Find queries.
 
 ```powershell
 & $ctl --pid 12345 wait-for-text --pane $pane --regex --timeout 15 'fps=\d+'
