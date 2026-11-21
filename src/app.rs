@@ -30,6 +30,7 @@ use windows_reactor::*;
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
+mod attention;
 mod config_import;
 mod file_drawer;
 mod keyboard_settings;
@@ -129,6 +130,7 @@ enum SettingsEditor {
     Patterns(pattern_settings::PatternPage),
 }
 enum Page {
+    Attention,
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
@@ -286,6 +288,7 @@ fn tab_menu_message(label: String) -> Message {
         .map_or(label.as_str(), |(name, _)| name);
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
+        "Attention inbox" => Message::Attention(attention::Action::Open),
         "SFTP files" => Message::Files(FileAction::Toggle),
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
@@ -327,7 +330,13 @@ pub enum Field {
     Fingerprint,
 }
 
+enum UiWork {
+    Control(w11term::control::UiRequest),
+    AttentionChanged,
+}
+
 pub struct TerminalApp {
+    inbox: w11term::events::Inbox,
     show_inspector: bool,
     inspection: Option<inspector::Inspection>,
     accessible: crate::accessibility::Bridge,
@@ -339,7 +348,7 @@ pub struct TerminalApp {
     keyboard: KeyboardBridge,
     _control: Server,
     registry: Registry,
-    control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<w11term::control::UiRequest>>>,
+    control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiWork>>>,
     control_task: Option<ComponentTask>,
     tabs: Tabs<AppTab>,
     metrics: Rc<Cell<Metrics>>,
@@ -373,8 +382,12 @@ pub struct TerminalApp {
 }
 
 pub enum Message {
+    Attention(attention::Action),
+    AttentionChanged,
     ToggleInspector,
     PickerQuery(String),
+    PickerHover(u64),
+    PickerFrame(u64, u64),
     PickerChoose(u64),
     PickerFocus(u8),
     LocalProfile(local_profile::Action),
@@ -548,7 +561,8 @@ impl TerminalApp {
                         .unwrap()
                         .recv_timeout(Duration::from_millis(200))
                     {
-                        Ok(request) => return Message::Control(request),
+                        Ok(UiWork::Control(request)) => return Message::Control(request),
+                        Ok(UiWork::AttentionChanged) => return Message::AttentionChanged,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(_) => return Message::ControlIdle,
                     }
@@ -1392,6 +1406,11 @@ impl TerminalApp {
                 let Page::Terminal(tab) = &entry.value.page else {
                     return None;
                 };
+                tab.session.events.connect_inbox(
+                    tab.session.pane_id,
+                    &entry.value.label,
+                    &self.inbox,
+                );
                 Some(Pane {
                     id: tab.session.pane_id,
                     tab_id: self.tabs.group_id(entry.id)?,
@@ -2059,7 +2078,7 @@ impl TerminalApp {
             .height(44.0)
             .width(
                 (self.tabs.headers().len() as f64 * 110.0 + 16.0)
-                    .min((self.width - 300.0).max(160.0)),
+                    .min((self.width - 390.0).max(140.0)),
             )
             .is_add_tab_button_visible(false)
             .can_reorder_tabs(true)
@@ -2135,6 +2154,7 @@ impl TerminalApp {
                 [
                     self.pane_menu(),
                     self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
+                    MenuItem::item("inbox", "Attention inbox"),
                     MenuItem::item("paste", "Paste"),
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
@@ -2198,12 +2218,16 @@ impl TerminalApp {
                         GridLength::Auto,
                         GridLength::Auto,
                         GridLength::Auto,
+                        GridLength::Auto,
                         GridLength::STAR,
                     ])
                     .children((
                         tab_strip,
                         Border::new().grid_column(1).content(plus),
                         Border::new().grid_column(2).content(caret),
+                        Border::new()
+                            .grid_column(3)
+                            .content(self.inbox_button(context)),
                     )),
             )
     }
@@ -2699,13 +2723,17 @@ impl Component for TerminalApp {
             )
         });
         let registry = Registry::default();
-        let (control_sender, control_rx) =
-            std::sync::mpsc::sync_channel::<w11term::control::UiRequest>(8);
+        let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
+        let wake = control_sender.clone();
+        let inbox = w11term::events::Inbox::new(move || {
+            // If full, a control message will already wake the UI to read the latest count.
+            let _ = wake.try_send(UiWork::AttentionChanged);
+        });
         registry.set_ui(move |request| {
             if let Err(
-                std::sync::mpsc::TrySendError::Full(request)
-                | std::sync::mpsc::TrySendError::Disconnected(request),
-            ) = control_sender.try_send(request)
+                std::sync::mpsc::TrySendError::Full(UiWork::Control(request))
+                | std::sync::mpsc::TrySendError::Disconnected(UiWork::Control(request)),
+            ) = control_sender.try_send(UiWork::Control(request))
             {
                 request.fail("GUI control queue is unavailable or full");
             }
@@ -2717,6 +2745,7 @@ impl Component for TerminalApp {
         })
         .expect("starting local control pipe");
         let mut app = Self {
+            inbox,
             accessible: Default::default(),
             active_group: None,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
@@ -2820,6 +2849,8 @@ impl Component for TerminalApp {
                     pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
                 )
                 | Message::PickerQuery(..)
+                | Message::PickerHover(..)
+                | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
                 | Message::PaneRatio(..)
                 | Message::DividerPress(..)
@@ -2830,10 +2861,13 @@ impl Component for TerminalApp {
         ) {
             self.header.borrow_mut().take();
         }
-        if matches!(&message, Message::Control(_)) {
+        if matches!(&message, Message::Control(_) | Message::AttentionChanged) {
+            self.inbox.acknowledge_wake();
             self.watch_control(context);
         }
         match message {
+            Message::Attention(action) => self.handle_attention(action, context),
+            Message::AttentionChanged => {}
             Message::ToggleInspector => {
                 self.show_inspector = !self.show_inspector;
                 self.sync_inspector();
@@ -2852,7 +2886,9 @@ impl Component for TerminalApp {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
-            Message::PickerQuery(query) => self.filter_picker(query),
+            Message::PickerQuery(query) => self.filter_picker(query, context),
+            Message::PickerHover(pane) => self.hover_picker(pane, context),
+            Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::Files(action) => self.file_action(action, context),
@@ -3105,10 +3141,12 @@ impl Component for TerminalApp {
                 self.frame_tasks
                     .retain(|_, task| task.status() != ComponentTaskStatus::Rejected);
                 self.watch_frames(context);
-                if self
-                    .control_task
-                    .as_ref()
-                    .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
+                let preview_ready = self.watch_picker_preview(context);
+                if preview_ready
+                    && self
+                        .control_task
+                        .as_ref()
+                        .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
                     && self
                         .frame_tasks
                         .values()
@@ -3578,6 +3616,7 @@ impl Component for TerminalApp {
                 Shortcut::PickerMove(delta) => {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);
+                        self.sync_picker_preview(context);
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
@@ -4081,6 +4120,7 @@ impl Component for TerminalApp {
                     _ => self.pane_view(id, tab, false, context),
                 },
                 Page::Settings(None) => self.settings_view(context),
+                Page::Attention => self.attention_view(context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,

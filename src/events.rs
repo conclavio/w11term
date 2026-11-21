@@ -7,6 +7,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
+mod inbox;
+pub use inbox::Inbox;
 
 const CAPACITY: usize = 4096;
 #[derive(Clone, Debug, Serialize)]
@@ -27,6 +29,7 @@ pub struct Batch {
 struct State {
     next: u64,
     events: VecDeque<Event>,
+    inbox: Option<(u64, Arc<str>, Inbox)>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Events {
@@ -34,10 +37,26 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
+    /// Attach once, forwarding any alerts that arrived during pane startup.
+    pub fn connect_inbox(&self, pane: u64, label: &str, inbox: &Inbox) {
+        let mut state = self.state.lock().unwrap();
+        if state.inbox.is_none() {
+            let label = Arc::from(label);
+            for event in &state.events {
+                inbox.receive(pane, &label, event);
+            }
+            state.inbox = Some((pane, label, inbox.clone()));
+        }
+    }
+
     pub fn push(&self, kind: &str, data: Value) {
         let serialized = serde_json::to_string(&data).unwrap_or_default();
         let data = if serialized.len() > 4096 {
-            serde_json::json!({"truncated":true,"preview":serialized.chars().take(1024).collect::<String>()})
+            let mut preview = serde_json::json!({"truncated":true,"preview":serialized.chars().take(1024).collect::<String>()});
+            if kind == "notification" {
+                preview["summary"] = inbox::notification_text(&data).into();
+            }
+            preview
         } else {
             data
         };
@@ -48,12 +67,16 @@ impl Events {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        state.events.push_back(Event {
+        let event = Event {
             sequence,
             timestamp_ms,
             kind: kind.into(),
             data,
-        });
+        };
+        if let Some((pane, label, inbox)) = &state.inbox {
+            inbox.receive(*pane, label, &event);
+        }
+        state.events.push_back(event);
         if state.events.len() > CAPACITY {
             state.events.pop_front();
         }
