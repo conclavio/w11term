@@ -28,7 +28,7 @@ impl TerminalApp {
         };
         match edit {
             Edit::Show => {
-                *page = Some(KeyboardPage::default());
+                *page = Some(SettingsEditor::Keyboard(KeyboardPage::default()));
                 return;
             }
             Edit::Back => {
@@ -37,7 +37,7 @@ impl TerminalApp {
             }
             _ => {}
         }
-        let Some(page) = page.as_mut() else {
+        let Some(SettingsEditor::Keyboard(page)) = page.as_mut() else {
             return;
         };
         let mut appearance = self.appearance.read().unwrap().clone();

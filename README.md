@@ -154,6 +154,10 @@ The benchmark measures **only VT parsing and scrollback**. It excludes snapshot 
 
 On an SSH pane, **R** reveals a selected Unix path in the existing SFTP drawer and selects its directory entry. Relative paths use the OSC 7 directory reported by that SSH host when hints opened. Absolute paths work without a directory report. Local Windows paths and paths with no usable remote base can still be copied.
 
+Use **Settings → Hint patterns** to add, edit or remove named regular expressions. For example, an **Issue** pattern with `\bOPS-[0-9]+\b` labels issue numbers such as `OPS-104`. Select its label and press **Enter** or **C** to copy exactly the matched text. When the entire match is a supported URL, **O** opens it. For a recognized remote path, **R** reveals it in SFTP.
+
+Patterns match across soft wraps within a visible logical line. Explicit OSC 8 links take priority, followed by custom patterns in saved order, then automatic links and paths. Patterns use Rust regex syntax and must consume at least one character. You can save up to 16 patterns. Each invocation considers up to 512 custom matches across 256 KiB of viewport text and skips logical lines longer than 16 KiB.
+
 For focus-independent automation, raw SSH input, screen text, PNG capture, and launch geometry, see [External control](CONTROL.md).
 
 | Input | Behavior |

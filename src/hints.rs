@@ -4,18 +4,38 @@ use crate::{
     terminal::Snapshot,
 };
 use std::{ops::Range, sync::LazyLock};
+mod patterns;
+pub use patterns::{MAX_PATTERNS, Patterns};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Url(String),
     Path(String),
+    Pattern { name: String, text: String },
 }
 
 impl Target {
     pub fn text(&self) -> &str {
         match self {
-            Self::Url(s) | Self::Path(s) => s,
+            Self::Url(s) | Self::Path(s) | Self::Pattern { text: s, .. } => s,
         }
+    }
+
+    pub fn file_path(&self) -> Option<&str> {
+        match self {
+            Self::Path(path) => Some(path),
+            Self::Pattern { text, .. } if self.pattern_url().is_none() => path_token(text, true),
+            _ => None,
+        }
+    }
+
+    pub fn pattern_url(&self) -> Option<String> {
+        let Self::Pattern { text, .. } = self else {
+            return None;
+        };
+        text_urls(text)
+            .find(|(span, _)| span.start == 0 && span.end == text.len())
+            .map(|(_, url)| url)
     }
 }
 
@@ -31,7 +51,7 @@ struct Cell {
     start: usize,
     row: usize,
     col: usize,
-    linked: bool,
+    occupied: bool,
 }
 
 fn diagnostic_path(token: &str) -> &str {
@@ -82,16 +102,37 @@ fn path_token(token: &str, quoted: bool) -> Option<&str> {
         .then_some(path)
 }
 
-fn line_targets(text: &str, cells: &[Cell], detect_urls: bool, hints: &mut Vec<Hint>) {
+// A pattern is local configuration, but the haystack comes from the remote pane.
+// Skip oversized logical lines intact to preserve boundary and anchor semantics.
+const MAX_PATTERN_LINE: usize = 16 * 1024;
+const MAX_PATTERN_VIEW: usize = 256 * 1024;
+const MAX_PATTERN_MATCHES: usize = 512;
+
+struct Scan<'a> {
+    patterns: &'a Patterns,
+    bytes_left: usize,
+    matches_left: usize,
+}
+
+fn line_targets(
+    text: &str,
+    cells: &mut [Cell],
+    detect_urls: bool,
+    scan: &mut Scan<'_>,
+    hints: &mut Vec<Hint>,
+) {
     static TOKENS: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(r#""([^"]+)"|'([^']+)'|`([^`]+)`|([^\s"'`<>]+)"#).unwrap()
     });
     let mut urls: Vec<_> = text_urls(text).collect();
     let mut add = |range: Range<usize>, target| {
-        let cells = &cells[cells.partition_point(|c| c.start < range.start)
-            ..cells.partition_point(|c| c.start < range.end)];
-        if let Some(first) = cells.first()
-            && !cells.iter().any(|c| c.linked)
+        let first = cells
+            .partition_point(|c| c.start <= range.start)
+            .saturating_sub(1);
+        let end = cells.partition_point(|c| c.start < range.end);
+        let segment = &mut cells[first..end];
+        if let Some(first) = segment.first()
+            && !segment.iter().any(|c| c.occupied)
         {
             hints.push(Hint {
                 target,
@@ -99,8 +140,30 @@ fn line_targets(text: &str, cells: &[Cell], detect_urls: bool, hints: &mut Vec<H
                 col: first.col,
                 label: String::new(),
             });
+            for cell in segment {
+                cell.occupied = true;
+            }
         }
     };
+    if !scan.patterns.is_empty() && text.len() <= MAX_PATTERN_LINE && text.len() <= scan.bytes_left
+    {
+        scan.bytes_left -= text.len();
+        for pattern in scan.patterns.rules() {
+            if scan.matches_left == 0 {
+                break;
+            }
+            for m in pattern.regex.find_iter(text).take(scan.matches_left) {
+                scan.matches_left -= 1;
+                add(
+                    m.range(),
+                    Target::Pattern {
+                        name: pattern.name.clone(),
+                        text: m.as_str().into(),
+                    },
+                );
+            }
+        }
+    }
     let mut next_url = 0;
     for captures in TOKENS.captures_iter(text) {
         let token = captures.iter().skip(1).flatten().next().unwrap();
@@ -126,10 +189,23 @@ fn line_targets(text: &str, cells: &[Cell], detect_urls: bool, hints: &mut Vec<H
 }
 
 pub fn viewport(frame: &Snapshot, detect_urls: bool) -> Vec<Hint> {
+    viewport_with_patterns(frame, detect_urls, &Patterns::default())
+}
+
+pub fn viewport_with_patterns(
+    frame: &Snapshot,
+    detect_urls: bool,
+    patterns: &Patterns,
+) -> Vec<Hint> {
     let mut hints = Vec::new();
     let mut text = String::new();
     let mut cells = Vec::new();
     let mut previous_link = None;
+    let mut scan = Scan {
+        patterns,
+        bytes_left: MAX_PATTERN_VIEW,
+        matches_left: MAX_PATTERN_MATCHES,
+    };
     for (row, line) in frame.rows.iter().enumerate() {
         for cell in line
             .visible_cells()
@@ -153,12 +229,12 @@ pub fn viewport(frame: &Snapshot, detect_urls: bool) -> Vec<Hint> {
                 start: text.len(),
                 row,
                 col,
-                linked: link.is_some(),
+                occupied: link.is_some(),
             });
             text.push_str(cell.str());
         }
         if !line.last_cell_was_wrapped() || row + 1 == frame.rows.len() {
-            line_targets(&text, &cells, detect_urls, &mut hints);
+            line_targets(&text, &mut cells, detect_urls, &mut scan, &mut hints);
             text.clear();
             cells.clear();
             previous_link = None;
@@ -249,5 +325,66 @@ mod tests {
         assert_eq!(h.len(), 27);
         assert_eq!(h[0].label, "aa");
         assert_eq!(h[26].label, "ba");
+    }
+
+    #[test]
+    fn named_patterns_match_whole_logical_lines_and_reserve_only_their_cells() {
+        let mut rules = Patterns::default();
+        rules.save(None, "Ticket", r"OPS-[0-9]+").unwrap();
+        rules.save(None, "Number", r"[0-9]+").unwrap();
+        let frame = screen(
+            "界 OPS-\x1b[32m104\x1b[m 7\r\n\x1b]8;;https://example.org\x07OPS-16\x1b]8;;\x07\r\n\x1b]8;;file:///x\x07OPS-17\x1b]8;;\x07",
+            7,
+            8,
+        );
+        let hints = viewport_with_patterns(&frame, true, &rules);
+        assert_eq!(
+            hints.iter().map(|h| h.target.text()).collect::<Vec<_>>(),
+            ["OPS-104", "7", "https://example.org"]
+        );
+        assert_eq!((hints[0].row, hints[0].col), (0, 3));
+        assert!(matches!(&hints[0].target, Target::Pattern { name, .. } if name == "Ticket"));
+        assert!(matches!(&hints[1].target, Target::Pattern { name, .. } if name == "Number"));
+        assert!(
+            viewport_with_patterns(&screen("OPS-\r\n104", 10, 2), false, &rules)
+                .iter()
+                .all(|h| h.target.text() != "OPS-104")
+        );
+    }
+
+    #[test]
+    fn pattern_actions_require_a_whole_recognized_url_or_path_and_preserve_copy_text() {
+        let mut rules = Patterns::default();
+        rules.save(None, "Item", r"\S+").unwrap();
+        let hints = viewport_with_patterns(
+            &screen("www.example.org src/a.rs file:///x", 60, 2),
+            true,
+            &rules,
+        );
+        assert_eq!(hints[0].target.text(), "www.example.org");
+        assert_eq!(
+            hints[0].target.pattern_url().as_deref(),
+            Some("https://www.example.org")
+        );
+        assert_eq!(hints[1].target.file_path(), Some("src/a.rs"));
+        assert_eq!(hints[2].target.text(), "file:///x");
+        assert_eq!(hints[2].target.pattern_url(), None);
+        assert_eq!(hints[2].target.file_path(), None);
+    }
+
+    #[test]
+    fn dense_patterns_and_oversized_logical_lines_respect_the_scan_budget() {
+        let mut rules = Patterns::default();
+        rules.save(None, "Letter", "x").unwrap();
+        let frame = screen(&"x".repeat(MAX_PATTERN_MATCHES + 64), 128, 6);
+        assert_eq!(
+            viewport_with_patterns(&frame, false, &rules).len(),
+            MAX_PATTERN_MATCHES
+        );
+        let oversized = format!("{}\r\nx", "x".repeat(MAX_PATTERN_LINE + 1));
+        let frame = screen(&oversized, 256, 68);
+        let hints = viewport_with_patterns(&frame, false, &rules);
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].row > 0);
     }
 }

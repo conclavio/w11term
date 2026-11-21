@@ -35,6 +35,7 @@ mod config_import;
 mod file_drawer;
 mod keyboard_settings;
 mod local_profile;
+mod pattern_settings;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
@@ -124,13 +125,17 @@ pub enum InteractionField {
     DetectUrls,
     Osc52,
 }
+enum SettingsEditor {
+    Keyboard(keyboard_settings::KeyboardPage),
+    Patterns(pattern_settings::PatternPage),
+}
 enum Page {
     Attention,
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
     Workspaces(workspace_view::WorkspacePage),
-    Settings(Option<keyboard_settings::KeyboardPage>),
+    Settings(Option<SettingsEditor>),
     NewProfile(ProfileDraft),
 }
 struct AppTab {
@@ -432,6 +437,7 @@ pub enum Message {
     ProfileMenu(String),
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
+    Patterns(pattern_settings::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
     Font(Option<usize>),
@@ -1286,6 +1292,12 @@ impl TerminalApp {
                 .content("Import OpenSSH config…"),
         );
         children.splice(1..1, profiles);
+        children.insert(
+            1,
+            Button::new()
+                .on_click(context.callback(|_| Message::Patterns(pattern_settings::Edit::Show)))
+                .content("Hint patterns"),
+        );
         children.insert(
             1,
             Button::new()
@@ -2833,6 +2845,9 @@ impl Component for TerminalApp {
             Message::FrameReady(..)
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
+                | Message::Patterns(
+                    pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
+                )
                 | Message::PickerQuery(..)
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
@@ -3734,6 +3749,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
+            Message::Patterns(edit) => self.edit_patterns(edit),
             Message::SettingsMenu => self.utility(true, context),
             Message::LocalProfile(action) => self.local_profile_action(action, context),
             Message::Workspace(action) => self.workspace_action(action, context),
@@ -4105,9 +4121,16 @@ impl Component for TerminalApp {
                 },
                 Page::Settings(None) => self.settings_view(context),
                 Page::Attention => self.attention_view(context),
-                Page::Settings(Some(page)) => keyboard_settings::keyboard_view(
+                Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
+                    keyboard_settings::keyboard_view(
+                        page,
+                        &self.appearance.read().unwrap().shortcuts,
+                        context,
+                    )
+                }
+                Page::Settings(Some(SettingsEditor::Patterns(page))) => pattern_settings::view(
                     page,
-                    &self.appearance.read().unwrap().shortcuts,
+                    &self.appearance.read().unwrap().hint_patterns,
                     context,
                 ),
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
