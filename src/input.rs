@@ -449,15 +449,24 @@ impl KeyboardBridge {
             }
         });
     }
-    pub fn reset_keys(&self) {
+    pub fn reset_keys(&self, sender: &mpsc::UnboundedSender<Command>) {
         let _native = self.scope.enter();
-        with_input(|i| {
-            if let Some(s) = i.borrow_mut().as_mut() {
+        let owns_input = with_input_mut(|input| {
+            if let Some(s) = input
+                && s.target
+                    .as_ref()
+                    .is_some_and(|target| target.sender.same_channel(sender))
+            {
                 s.pressed.clear();
                 s.details.clear();
                 s.surrogate = None;
+                return true;
             }
+            false
         });
+        if owns_input {
+            ime::cancel();
+        }
     }
     pub fn set_game_mode(&self, game: bool) {
         let _native = self.scope.enter();

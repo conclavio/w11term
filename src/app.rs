@@ -29,6 +29,7 @@ use windows_reactor::*;
 
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
+const RESTART_EXITED_PANE: &str = "Restart exited pane";
 
 mod attention;
 mod command_history;
@@ -109,6 +110,12 @@ pub enum FindOption {
     Regex,
 }
 impl LiveTab {
+    fn reset_transport_input(&mut self, keyboard: &KeyboardBridge) {
+        self.remote_mouse = RemoteMouse::default();
+        self.end_pointer_gesture();
+        keyboard.reset_keys(&self.session.input);
+    }
+
     fn end_pointer_gesture(&mut self) {
         if let Some(release) = self.remote_mouse.release() {
             let _ = self.session.input.send(Command::Mouse(release));
@@ -150,6 +157,9 @@ impl RemoteMouse {
                         button: held.button,
                         ..event
                     };
+                } else if event.button != MouseButton::None {
+                    // A drag that began in another pane or transport is not this stream's input.
+                    return None;
                 }
             }
         }
@@ -274,6 +284,16 @@ struct AppTab {
 }
 
 impl AppTab {
+    fn exited_pane(&self) -> Option<ExitedPane> {
+        let Page::Terminal(live) = &self.page else {
+            return None;
+        };
+        Some(ExitedPane {
+            pane: live.session.pane_id,
+            token: live.session.events.restart_token()?,
+        })
+    }
+
     fn profile_name(&self) -> Option<&str> {
         match &self.page {
             Page::Terminal(live) => live.profile_name.as_deref(),
@@ -575,7 +595,14 @@ pub struct TerminalApp {
     copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExitedPane {
+    pane: u64,
+    token: u64,
+}
+
 pub enum Message {
+    RestartExited(ExitedPane),
     Export(scrollback_export::Action),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
@@ -824,8 +851,7 @@ impl TerminalApp {
         }
         if tab.connection_generation != frame.connection_generation {
             tab.connection_generation = frame.connection_generation;
-            tab.remote_mouse = RemoteMouse::default();
-            self.keyboard.reset_keys();
+            tab.reset_transport_input(&self.keyboard);
         }
         if prompt_id.is_some() {
             self.title_editor = None;
@@ -2434,6 +2460,7 @@ impl TerminalApp {
                 context.callback(Message::ProfileMenu),
             ));
         let pane = self.tabs.active().and_then(AppTab::pane_id);
+        let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2441,13 +2468,15 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                self.caret_items(),
-                context.callback(move |label| {
-                    if label == scrollback_export::LABEL {
+                self.caret_items(exited.is_some()),
+                context.callback(move |label: String| match label.as_str() {
+                    scrollback_export::LABEL => {
                         Message::Export(scrollback_export::Action::Start(pane))
-                    } else {
-                        tab_menu_message(label)
                     }
+                    RESTART_EXITED_PANE => {
+                        exited.map_or(Message::ControlIdle, Message::RestartExited)
+                    }
+                    _ => tab_menu_message(label),
                 }),
             ));
         TitleBar::new()
@@ -2500,7 +2529,7 @@ impl TerminalApp {
         menu
     }
 
-    fn caret_items(&self) -> Vec<MenuItem> {
+    fn caret_items(&self, can_restart: bool) -> Vec<MenuItem> {
         let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
@@ -2528,7 +2557,7 @@ impl TerminalApp {
                 "Command palette…",
                 KeyAction::CommandPalette,
             ),
-            self.pane_menu(),
+            self.pane_menu(can_restart),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             MenuItem::item("inbox", "Attention inbox"),
@@ -2602,7 +2631,7 @@ impl TerminalApp {
             .map_or_else(|| label.to_owned(), |chord| format!("{label}    {chord}"));
         MenuItem::item(key, description)
     }
-    fn pane_menu(&self) -> MenuItem {
+    fn pane_menu(&self, can_restart: bool) -> MenuItem {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
             return MenuItem::disabled("panes", "Panes");
         }
@@ -2621,6 +2650,7 @@ impl TerminalApp {
         let mut items = vec![
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            command_menu_item("restart-exited", RESTART_EXITED_PANE, can_restart),
             move_item,
             if self.outgoing.is_none() && self.incoming.is_none() {
                 MenuItem::item("move-tab-window", "Move tab to new window")
@@ -3367,6 +3397,25 @@ impl Component for TerminalApp {
             other => other,
         };
         match message {
+            Message::RestartExited(exit) => {
+                // A native menu may still be delivering a callback for a previous exit or pane.
+                if let Some(id) = self.tab_for_pane(exit.pane)
+                    && let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    && live.session.events.restart_token() == Some(exit.token)
+                {
+                    match live.session.restart_exited(exit.token) {
+                        Ok(()) => live.reset_transport_input(&self.keyboard),
+                        Err(error) => {
+                            self.window_error =
+                                Some(format!("Could not restart pane {}: {error:#}", exit.pane));
+                        }
+                    }
+                }
+                self.refresh_open_commands();
+            }
             Message::Export(action) => {
                 self.export_scrollback(action, context);
                 self.refresh_open_commands();

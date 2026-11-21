@@ -603,6 +603,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_new_transport_ignores_an_old_drag_until_a_fresh_press() {
+        let event = |kind, button| MouseEvent {
+            kind,
+            button,
+            x: 3,
+            y: 1,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut remote = RemoteMouse::default();
+        let drag = event(MouseEventKind::Move, MouseButton::Left);
+        let release = event(MouseEventKind::Release, MouseButton::None);
+        assert!(remote.event(drag).is_none());
+        assert!(remote.event(release).is_none());
+        assert!(
+            remote
+                .event(event(MouseEventKind::Move, MouseButton::None))
+                .is_some()
+        );
+        assert!(
+            remote
+                .event(event(MouseEventKind::Press, MouseButton::Left))
+                .is_some()
+        );
+        assert!(remote.event(drag).is_some());
+        assert_eq!(remote.event(release).unwrap().button, MouseButton::Left);
+    }
+
+    #[test]
     fn dragging_uses_window_coordinates_and_requires_same_view_and_divider() {
         let drag = DividerDrag {
             epoch: 7,
