@@ -4,6 +4,8 @@ This test grants an SSH profile read-only access to a temporary Windows director
 
 Linux reads binary data, compares a 98,321-byte file under a Unicode name against its Windows SHA-256 digest, and tries to write. A sibling’s data must stay inaccessible through both an NTFS junction and a hard link. A second mount request at the same name must preserve the first mount. A nonempty Linux destination and a symlink to an empty directory must also be refused.
 
+After unmounting, the test replaces the Windows directory at its saved path. The manager must report the replacement and leave Linux unmounted. Restoring the original directory must allow the saved grant to mount again.
+
 The original interactive shell must keep its PID through explicit unmount and dropping a mount handle. The test then disconnects the SSH transport and checks that the mount disappears. A fresh pane opens the same temporary profile and grant store, remounts the saved folder, and forgets it. Linux must see the mount disappear again while its new shell remains usable. Reopening the profile must show an empty grant list.
 
 ## Run the fixture

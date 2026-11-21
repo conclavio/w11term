@@ -368,6 +368,34 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     manager.unmount(&auth, &name)?;
     wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Stopped)).await?;
     wait_detached(&link, &remote).await?;
+
+    let original = fixture.path().join("original");
+    fs::rename(&selected, &original)?;
+    fs::create_dir(&selected)?;
+    fs::write(selected.join(NAME), b"unapproved replacement")?;
+    manager.mount(&auth, &name)?;
+    let refusal = wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted))
+        .await
+        .err()
+        .context("the saved grant mounted a replacement Windows directory")?;
+    ensure!(
+        refusal.to_string().contains("directory was replaced"),
+        "unexpected refusal for a replaced directory: {refusal:#}"
+    );
+    wait_detached(&link, &remote).await?;
+    fs::rename(&selected, fixture.path().join("replacement"))?;
+    fs::rename(&original, &selected)?;
+    manager.mount(&auth, &name)?;
+    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted)).await?;
+    let restored = check_mount(&link, &remote, &tile_digest).await?;
+    ensure!(
+        restored != initial,
+        "restoring the original reused its old mount"
+    );
+    manager.unmount(&auth, &name)?;
+    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Stopped)).await?;
+    wait_detached(&link, &remote).await?;
+
     let manual = FolderMount::start(link.clone(), FolderRoot::open(&selected)?, &name)?;
     wait_status(
         || Ok(Some(manual.status())),
@@ -376,7 +404,7 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     )
     .await?;
     ensure!(
-        check_mount(&link, &remote, &tile_digest).await? != initial,
+        check_mount(&link, &remote, &tile_digest).await? != restored,
         "new mount reused its generation"
     );
     drop(manual);
