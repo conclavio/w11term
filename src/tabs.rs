@@ -14,6 +14,12 @@ pub struct PaneSwap {
     direction: Direction,
 }
 
+impl PaneSwap {
+    pub fn panes(self) -> [TabId; 2] {
+        [self.source, self.neighbor]
+    }
+}
+
 // A pane can change windows without changing its tab or layout IDs.
 fn next_id() -> TabId {
     static NEXT: AtomicU64 = AtomicU64::new(1);
