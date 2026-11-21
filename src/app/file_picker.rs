@@ -1,8 +1,15 @@
 use anyhow::{Context, Result, anyhow};
-use std::{cell::RefCell, ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf, rc::Rc};
+use std::{
+    cell::RefCell,
+    ffi::OsString,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 use windows::{
     Win32::{
         Foundation::{ERROR_CANCELLED, HWND},
+        Storage::FileSystem::GetDriveTypeW,
         System::Com::*,
         UI::Shell::*,
     },
@@ -11,9 +18,38 @@ use windows::{
 
 pub(super) enum Purpose {
     Open,
+    SshConfig(PathBuf),
     Folder,
     Save(String),
     Scrollback,
+}
+
+fn local_config_folder(dialog: &IFileDialog, config: &Path) {
+    use std::path::{Component, Prefix};
+    let Some(folder) = config.parent().filter(|path| path.is_absolute()) else {
+        return;
+    };
+    let Some(Component::Prefix(prefix)) = folder.components().next() else {
+        return;
+    };
+    let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
+        return;
+    };
+    let drive = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
+    unsafe {
+        // A typed UNC path or disconnected mapped drive is not a starting folder.
+        if !matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) {
+            return;
+        }
+        let wide: Vec<_> = folder.as_os_str().encode_wide().chain(Some(0)).collect();
+        // The proposed parent (such as ~/.ssh) may not exist yet. In that case
+        // leave the file dialog's normal starting directory available.
+        if let Ok(item) =
+            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None)
+        {
+            let _ = dialog.SetFolder(&item);
+        }
+    }
 }
 
 pub(super) struct Selection {
@@ -104,7 +140,10 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
             }
         }
         let _apartment = Apartment;
-        let clsid = if matches!(purpose, Purpose::Open | Purpose::Folder) {
+        let clsid = if matches!(
+            purpose,
+            Purpose::Open | Purpose::SshConfig(_) | Purpose::Folder
+        ) {
             FileOpenDialog
         } else {
             FileSaveDialog
@@ -114,6 +153,13 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
         let confirmed = Rc::new(RefCell::new(None));
         let cookie = match purpose {
             Purpose::Open => None,
+            Purpose::SshConfig(current) => {
+                dialog.SetTitle(w!("Open OpenSSH config"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                // Leave file types unrestricted: OpenSSH usually names this file "config".
+                local_config_folder(&dialog, &current);
+                None
+            }
             Purpose::Folder => {
                 dialog.SetTitle(w!("Choose a folder to share"))?;
                 options |= FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
