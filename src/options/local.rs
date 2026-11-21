@@ -12,9 +12,27 @@ pub struct LocalOptions {
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub powershell_integration: bool,
 }
 
 impl LocalOptions {
+    /// Only append a startup file when all existing arguments have an
+    /// unambiguous, interactive meaning in both PowerShell 5.1 and 7.
+    pub fn supports_powershell_integration(executable: &Path, args: &[String]) -> bool {
+        executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("powershell.exe") || name.eq_ignore_ascii_case("pwsh.exe")
+            })
+            && args.iter().all(|arg| {
+                ["-NoProfile", "-NoLogo", "-NoExit", "-STA", "-MTA"]
+                    .iter()
+                    .any(|flag| arg.eq_ignore_ascii_case(flag))
+            })
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.executable.as_os_str().is_empty(),
@@ -73,6 +91,7 @@ impl LocalOptions {
                     executable: path,
                     args: vec![],
                     cwd: None,
+                    powershell_integration: false,
                 });
             }
         };
@@ -104,6 +123,84 @@ mod tests {
         options::{Options, Source},
         profiles::ProfileStore,
     };
+
+    #[test]
+    fn powershell_integration_requires_an_unambiguous_interactive_invocation() {
+        let supports = |exe: &str, args: &[&str]| {
+            LocalOptions::supports_powershell_integration(
+                Path::new(exe),
+                &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert!(supports(r"C:\Program Files\PowerShell\7\PWSH.exe", &[]));
+        assert!(supports(
+            "POWERSHELL.EXE",
+            &["-nOpROFILE", "-NoLOGO", "-noexit"]
+        ));
+        assert!(supports("pwsh.exe", &["-MTA"]));
+        for exe in [
+            "cmd.exe",
+            "powershell.cmd",
+            "pwsh.exe.cmd",
+            "other-pwsh.exe",
+            "pwsh",
+        ] {
+            assert!(!supports(exe, &[]), "{exe}");
+        }
+        for args in [
+            vec!["-NoExit", "-CoMManD", "Get-Date"],
+            vec!["-File", "build.ps1", "-NoLogo"],
+            vec!["-EncodedCommand", "AAAA"],
+            vec!["-c", "-"],
+            vec!["-NonInteractive"],
+            vec!["tool.ps1"],
+            vec!["-"],
+            vec!["-SSHServerMode"],
+            vec!["-OutputFormat", "XML"],
+            vec!["-Help"],
+            vec!["--"],
+            vec![""],
+        ] {
+            assert!(!supports("pwsh.exe", &args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn powershell_integration_is_opt_in_for_saved_and_discovered_shells() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"old":{"backend":"local","executable":"pwsh.exe","untouched":17}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let installed = LocalOptions::installed();
+        assert!(
+            installed
+                .values()
+                .all(|shell| !shell.powershell_integration)
+        );
+        for name in std::iter::once("old").chain(installed.keys().map(String::as_str)) {
+            let original = store.inspect_local(name).unwrap();
+            assert!(!original.options.powershell_integration);
+            let mut edited = original.options.clone();
+            edited.powershell_integration = true;
+            store.save_local(Some(&original), name, &edited).unwrap();
+            let enabled = store.inspect_local(name).unwrap();
+            assert_eq!(enabled.options, edited);
+            edited.powershell_integration = false;
+            store.save_local(Some(&enabled), name, &edited).unwrap();
+            assert_eq!(store.inspect_local(name).unwrap().options, original.options);
+        }
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(doc["profiles"]["old"]["untouched"], 17);
+        assert!(
+            doc["profiles"]["old"]
+                .get("powershell_integration")
+                .is_none()
+        );
+    }
     #[test]
     fn local_profile_round_trip_preserves_arguments_and_refuses_stale_or_cross_backend_edits() {
         let temp = tempfile::tempdir().unwrap();
@@ -118,6 +215,7 @@ mod tests {
             executable: r"bin\tool.exe".into(),
             args: vec!["".into(), "windows path with spaces".into()],
             cwd: Some("working".into()),
+            powershell_integration: false,
         };
         assert!(store.save_local(None, "ssh", &shell).is_err());
         store.save_local(None, "build", &shell).unwrap();

@@ -154,6 +154,11 @@ impl ProfileStore {
                 );
             }
             fields.insert("args".into(), serde_json::to_value(&shell.args)?);
+            if shell.powershell_integration {
+                fields.insert("powershell_integration".into(), true.into());
+            } else {
+                fields.remove("powershell_integration");
+            }
             if stored.is_none_or(|base| base.options.cwd != shell.cwd) {
                 fields.insert("cwd".into(), serde_json::to_value(&shell.cwd)?);
             }
