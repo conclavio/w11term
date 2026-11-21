@@ -563,6 +563,7 @@ mod tests {
         SshOptions {
             host: host.into(),
             user: "tester".into(),
+            terminal_type: Default::default(),
             port: 22,
             authentication: Authentication::Agent,
             host_key: None,

@@ -226,6 +226,7 @@ impl Fixture {
         });
         Ok(Self {
             source: Source::Ssh(SshOptions {
+                terminal_type: Default::default(),
                 host: "127.0.0.1".into(),
                 user: "play".into(),
                 port,

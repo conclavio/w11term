@@ -60,12 +60,57 @@ impl PlayerOptions {
     }
 }
 
+/// The terminfo name sent in SSH's PTY request.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String")]
+pub struct TerminalType(Box<str>);
+
+impl TerminalType {
+    pub const DEFAULT: &str = "xterm-256color";
+    pub const SIXEL: &str = "xterm-sixel";
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        self.as_str() == Self::DEFAULT
+    }
+}
+
+impl Default for TerminalType {
+    fn default() -> Self {
+        Self(Self::DEFAULT.into())
+    }
+}
+
+impl TryFrom<String> for TerminalType {
+    type Error = anyhow::Error;
+
+    fn try_from(name: String) -> Result<Self> {
+        ensure!(
+            name.len() <= 64
+                && name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)),
+            "Enter a terminal type of 1–64 ASCII characters starting with a letter or digit. Use letters, digits, dots, underscores, plus signs or hyphens."
+        );
+        Ok(Self(name.into_boxed_str()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SshOptions {
     pub host: String,
     pub user: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "TerminalType::is_default")]
+    pub terminal_type: TerminalType,
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
@@ -96,6 +141,7 @@ impl From<JumpHost> for SshOptions {
             host: hop.host,
             user: hop.user,
             port: hop.port,
+            terminal_type: TerminalType::default(),
             authentication: hop.authentication,
             host_key: hop.host_key,
             proxy_jump: Vec::new(),
@@ -332,6 +378,7 @@ impl Options {
                         host: host.into(),
                         user: user.into(),
                         port: 22,
+                        terminal_type: TerminalType::default(),
                         authentication: Authentication::Agent,
                         host_key: None,
                         proxy_jump: Vec::new(),
@@ -557,6 +604,46 @@ mod tests {
             assert!(
                 !profiles[name].player.alternate_scroll_enabled(),
                 "bundled game profiles must not turn the camera with wheel-generated arrows"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_terminal_types_round_trip_and_reject_invalid_names() {
+        let legacy = serde_json::json!({"host":"server","user":"pilot","auth":"none"});
+        let profile: SshOptions = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(profile.terminal_type.as_str(), TerminalType::DEFAULT);
+        assert!(
+            serde_json::to_value(profile)
+                .unwrap()
+                .get("terminal_type")
+                .is_none()
+        );
+        for name in ["xterm-sixel", "screen-256color", "My_TERM.1+test"] {
+            let mut value = legacy.clone();
+            value["terminal_type"] = name.into();
+            let profile: SshOptions = serde_json::from_value(value).unwrap();
+            assert_eq!(profile.terminal_type.as_str(), name);
+            assert_eq!(
+                serde_json::to_value(profile).unwrap()["terminal_type"],
+                name
+            );
+        }
+        for invalid in [
+            "",
+            "-x",
+            "a/b",
+            "x term",
+            "x\0y",
+            "x\n",
+            "térm",
+            &"a".repeat(65),
+        ] {
+            let mut value = legacy.clone();
+            value["terminal_type"] = invalid.into();
+            assert!(
+                serde_json::from_value::<SshOptions>(value).is_err(),
+                "{invalid:?}"
             );
         }
     }

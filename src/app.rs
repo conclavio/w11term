@@ -16,7 +16,9 @@ use w11term::{
     interaction::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
-    options::{Authentication, LocalOptions, Options, Source, SshOptions, profile_source},
+    options::{
+        Authentication, LocalOptions, Options, Source, SshOptions, TerminalType, profile_source,
+    },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
@@ -203,6 +205,8 @@ struct ProfileDraft {
     host: String,
     user: String,
     port: String,
+    terminal_preset: usize,
+    custom_terminal: String,
     identity: String,
     fingerprint: String,
     authentication: usize,
@@ -224,6 +228,8 @@ impl Default for ProfileDraft {
             host: String::new(),
             user: String::new(),
             port: "22".into(),
+            terminal_preset: 0,
+            custom_terminal: String::new(),
             identity: String::new(),
             fingerprint: String::new(),
             authentication: 0,
@@ -236,6 +242,15 @@ impl Default for ProfileDraft {
 }
 
 impl ProfileDraft {
+    fn terminal_type(&self) -> anyhow::Result<TerminalType> {
+        let name = match self.terminal_preset {
+            0 => TerminalType::DEFAULT,
+            1 => TerminalType::SIXEL,
+            _ => &self.custom_terminal,
+        };
+        TerminalType::try_from(name.to_owned())
+    }
+
     fn from_options(name: String, options: &SshOptions) -> Self {
         let (authentication, identity) = match &options.authentication {
             Authentication::Agent => (0, String::new()),
@@ -251,6 +266,12 @@ impl ProfileDraft {
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
+            terminal_preset: match options.terminal_type.as_str() {
+                TerminalType::DEFAULT => 0,
+                TerminalType::SIXEL => 1,
+                _ => 2,
+            },
+            custom_terminal: options.terminal_type.as_str().into(),
             identity,
             fingerprint: options.host_key.clone().unwrap_or_default(),
             authentication,
@@ -330,6 +351,7 @@ pub enum Field {
     Host,
     User,
     Port,
+    CustomTerminal,
     Identity,
     Fingerprint,
 }
@@ -461,6 +483,7 @@ pub enum Message {
     RetryRender(TabId),
     Edit(TabId, Field, String),
     Auth(TabId, Option<usize>),
+    TerminalPreset(TabId, Option<usize>),
     SaveProfile(TabId),
     SaveProfileOnly(TabId),
     EditProfile(String),
@@ -1986,6 +2009,7 @@ impl TerminalApp {
             };
             let options = SshOptions {
                 host: host.into(),
+                terminal_type: draft.terminal_type()?,
                 user: user.into(),
                 port: draft
                     .port
@@ -2383,6 +2407,35 @@ impl TerminalApp {
                         .automation_name(label)
                         .on_text_changed(context.callback(move |v| Message::Edit(id, field, v))),
                 )),
+            );
+        }
+        fields.push(
+            StackPanel::new().spacing(5.0).children((
+                TextBlock::new().text("SSH terminal type (TERM)"),
+                ComboBox::new()
+                    .items_source([
+                        "xterm-256color (default)",
+                        "xterm-sixel (Sixel graphics)",
+                        "Custom…",
+                    ])
+                    .selected_index(draft.terminal_preset)
+                    .automation_name("SSH terminal type")
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .on_selection_changed(
+                        context.callback(move |v| Message::TerminalPreset(id, v)),
+                    ),
+            )),
+        );
+        if draft.terminal_preset == 2 {
+            fields.push(
+                TextBox::new()
+                    .text(&draft.custom_terminal)
+                    .placeholder_text("Terminfo name on the remote host")
+                    .automation_name("Custom SSH terminal type")
+                    .on_text_changed(
+                        context.callback(move |v| Message::Edit(id, Field::CustomTerminal, v)),
+                    )
+                    .into(),
             );
         }
         fields.push(
@@ -3986,6 +4039,7 @@ impl Component for TerminalApp {
                         Field::Host => &mut draft.host,
                         Field::User => &mut draft.user,
                         Field::Port => &mut draft.port,
+                        Field::CustomTerminal => &mut draft.custom_terminal,
                         Field::Identity => &mut draft.identity,
                         Field::Fingerprint => &mut draft.fingerprint,
                     };
@@ -4010,6 +4064,19 @@ impl Component for TerminalApp {
                 }
             }
             Message::Auth(_, None) => {}
+            Message::TerminalPreset(id, selected) => {
+                if let Some(AppTab {
+                    page: Page::NewProfile(draft),
+                    ..
+                }) = self.tabs.get_mut(id)
+                    && let Some(index @ 0..=2) = selected
+                    && index != draft.terminal_preset
+                {
+                    draft.terminal_preset = index;
+                    draft.saved = false;
+                    draft.error = None;
+                }
+            }
             Message::SaveProfile(id) => self.save_profile(id, context),
             Message::SaveProfileOnly(id) => self.save_profile_action(id, false, context),
             Message::Pointer(id, pointer, kind) => self.pointer(id, pointer, kind, context),
@@ -4564,6 +4631,10 @@ impl TerminalApp {
                 assert_eq!(draft.name, "typo");
                 assert_eq!(draft.host, "127.0.0.1");
                 assert_eq!(
+                    draft.terminal_type().unwrap().as_str(),
+                    TerminalType::DEFAULT
+                );
+                assert_eq!(
                     draft.authentication, 1,
                     "native mounting changed the saved auth choice"
                 );
@@ -4575,6 +4646,7 @@ impl TerminalApp {
                 assert!(draft.error.as_ref().unwrap().contains("already exists"));
                 self.update(Message::Edit(id, Field::Name, "corrected".into()), context);
                 self.update(Message::Auth(id, Some(2)), context);
+                self.update(Message::TerminalPreset(id, Some(1)), context);
                 self.update(
                     Message::Edit(
                         id,
@@ -4627,11 +4699,21 @@ impl TerminalApp {
                 };
                 assert!(matches!(draft.origin, DraftOrigin::Copy(_)));
                 assert_eq!(draft.name, "corrected copy");
+                assert_eq!(draft.terminal_type().unwrap().as_str(), TerminalType::SIXEL);
                 assert_eq!(draft.authentication, 2);
                 self.update(Message::Edit(copy, Field::Name, "second".into()), context);
+                self.update(Message::TerminalPreset(copy, Some(2)), context);
+                self.update(
+                    Message::Edit(copy, Field::CustomTerminal, "vt220".into()),
+                    context,
+                );
                 self.update(Message::SaveProfileOnly(copy), context);
                 assert!(
                     self.profiles.contains_key("corrected") && self.profiles.contains_key("second")
+                );
+                assert_eq!(
+                    self.store.load().unwrap()["second"].terminal_type.as_str(),
+                    "vt220"
                 );
                 self.update(Message::DeleteProfile(copy), context);
             }
@@ -4986,6 +5068,7 @@ mod profile_ui_tests {
         ] {
             let options = SshOptions {
                 host: "test.invalid".into(),
+                terminal_type: Default::default(),
                 user: "pilot+character".into(),
                 port: 6792,
                 authentication,
