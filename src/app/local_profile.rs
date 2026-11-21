@@ -110,7 +110,8 @@ impl TerminalApp {
                     executable: draft.executable.trim().into(),
                     args: draft.args.clone(),
                     cwd: (!draft.cwd.trim().is_empty()).then(|| draft.cwd.trim().into()),
-                    powershell_integration: draft.powershell_integration && draft.supports_integration(),
+                    powershell_integration: draft.powershell_integration
+                        && draft.supports_integration(),
                 };
                 let result = self
                     .store
