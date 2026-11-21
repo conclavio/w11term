@@ -10,11 +10,11 @@ The original interactive shell must keep its PID through explicit unmount and dr
 
 ## Run the fixture
 
-The **Windows folder mount pilot** GitHub Actions workflow builds the guest from Ubuntu packages and runs the test on Windows under QEMU software emulation. The guest SSH listener is forwarded to a Windows loopback port. The runner generates a fresh SSH identity and checks the guest host key against the key on its serial console.
+The **Windows folder mount pilot** GitHub Actions workflow builds two guests from Ubuntu packages and runs them under QEMU on Windows. Both use the same Ubuntu GA kernel. The Ubuntu 26.04 userspace exercises the complete mount lifecycle. The Ubuntu 24.04 userspace checks that w11term identifies its FUSE 3.14 helper and refuses to start a mount while keeping the shell usable. Each guest's SSH listener is forwarded to a Windows loopback port. The runner generates a fresh SSH identity per boot and checks the host key against the guest serial console.
 
 To reproduce with your own test machines:
 
-1. On a disposable x86-64 Ubuntu 24.04 builder, run `sudo bash tests/folder-sharing/guest/build.sh /tmp/sshfs-guest`. Copy its output directory to the Windows test machine.
+1. On a disposable x86-64 Ubuntu 24.04 builder, run `sudo bash tests/folder-sharing/guest/build.sh /tmp/sshfs-guest resolute`. Copy its output directory to the Windows test machine. To reproduce the older-helper check, build the `noble` suite and pass `-LegacyFuse` to the Windows script.
 2. In the Windows checkout, run `cargo test --locked --lib --no-run`. Cargo prints the path of the library test executable.
 3. In PowerShell 7.4 or later, run the command below with QEMU and OpenSSH's `ssh-keygen.exe` available. Substitute the actual executable path printed by Cargo.
 
