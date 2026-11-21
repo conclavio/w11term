@@ -70,7 +70,6 @@ jobs:
           retention-days: 14
   native-e2e:
     name: Windows native end-to-end tests
-    needs: remote-mux
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -80,15 +79,6 @@ jobs:
       - *cargo-cache
       - name: Build the GUI, CLI and loopback SSH peer
         run: cargo build --locked --features ui-smoke --bins --example echo_server
-      - name: Download stock Linux mux frames
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: remote-mux-frames
-          path: .local/mux-frames
-      - name: Replay both terminal grids and verify rendered Sixel placement
-        env:
-          W11_MUX_CAPTURES: .local/mux-frames
-        run: cargo test --locked --features ui-smoke --test remote_mux -- --ignored
       - name: Set the desktop size for native resize and accessibility assertions
         run: Set-DisplayResolution -Width 1920 -Height 1080 -Force
       - name: Verify SSH splits, shortcuts, pane picker focus, file transfers, ConPTY, durable panes and accessibility
@@ -115,6 +105,19 @@ jobs:
         run: powershell.exe -NoProfile -NonInteractive -STA -File ./tests/hint-patterns-ui.ps1 -VerifyClipboard
       - name: Compose and commit text through the native IME interface
         run: ./tests/ime-ui-smoke.ps1
+      - name: Build the mux replay test using the existing native build
+        run: |
+          cargo test --locked --features ui-smoke --test remote_mux --no-run
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $binary = @(Get-ChildItem target/debug/deps/remote_mux-*.exe)
+          if ($binary.Count -ne 1) { throw "Expected one mux replay test executable" }
+          Copy-Item -LiteralPath $binary[0].FullName -Destination "$env:RUNNER_TEMP/mux-replay.exe"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-mux-replay
+          path: ${{ runner.temp }}/mux-replay.exe
+          if-no-files-found: error
+          retention-days: 1
       - name: Save failing GUI logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -149,13 +152,31 @@ jobs:
   kitty-reference:
     uses: ./.github/workflows/kitty-graphics.yml
 
+  mux-replay:
+    name: Replay stock mux frames on Windows
+    needs: [remote-mux, native-e2e]
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: remote-mux-frames
+          path: frames
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-mux-replay
+      - name: Verify query replies, input, pane resize and rendered Sixel placement
+        env:
+          W11_MUX_CAPTURES: frames
+        run: ./mux-replay.exe --ignored
+
   package:
     uses: ./.github/workflows/windows-package.yml
 
   publish:
     name: Publish the verified merge build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, native-e2e, durable-linux, kitty-reference, package]
+    needs: [test, native-e2e, durable-linux, kitty-reference, mux-replay, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
