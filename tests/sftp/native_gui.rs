@@ -40,6 +40,17 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "samples a cursor cell on the focused native SSH canvas"]
+async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
+    run_palette_fixture(
+        "cursor-blink-ui.ps1",
+        b"\x1b[?25h\x1b[5 q\x1b[6 q\x1b[?12h\x1b[?12l",
+        Some("\x1b[2J\x1b[4;4HBlinkProbe\x1b[4;4H\x1b[6 q\x1b[?25l"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "watches OSC 133 commands in a background SSH tab while a real PowerShell stays active"]
 async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
