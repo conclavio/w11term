@@ -32,6 +32,8 @@ struct State {
     progress: wezterm_term::Progress,
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
+    restart_token: Option<u64>,
+    restart_closed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +72,57 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
+    pub fn restart_token(&self) -> Option<u64> {
+        self.state.lock().unwrap().restart_token
+    }
+
+    pub(crate) fn restart_exited(
+        &self,
+        input: &tokio::sync::mpsc::UnboundedSender<crate::session::Command>,
+        token: u64,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        anyhow::ensure!(
+            state.restart_token == Some(token),
+            "Pane is running, unavailable, or the exit token has expired"
+        );
+        state.restart_token = None;
+        if let Some((_, _, inbox)) = &state.inbox {
+            inbox.refresh();
+        }
+        input
+            .send(crate::session::Command::RestartExited(
+                crate::session::ClaimedRestart(token),
+            ))
+            .map_err(|_| anyhow::anyhow!("The terminal pane has closed"))
+    }
+
+    pub(crate) fn pane_exited(&self, token: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.restart_closed {
+            return;
+        }
+        state.restart_token = Some(token);
+        if let Some((_, _, inbox)) = &state.inbox {
+            inbox.refresh();
+        }
+        self.append(
+            state,
+            "pane-exited",
+            serde_json::json!({"exit_token":token}),
+        );
+    }
+
+    pub(crate) fn close_restart(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.restart_closed = true;
+        if state.restart_token.take().is_some()
+            && let Some((_, _, inbox)) = &state.inbox
+        {
+            inbox.refresh();
+        }
+    }
+
     /// None while disconnected or on streams that may repaint historical bytes.
     pub fn command_watch(&self) -> Option<bool> {
         self.state.lock().unwrap().watch_state()

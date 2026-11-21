@@ -27,7 +27,16 @@ struct Peer {
 }
 impl server::Handler for Peer {
     type Error = anyhow::Error;
-    async fn auth_none(&mut self, _: &str) -> anyhow::Result<server::Auth> {
+    async fn auth_none(&mut self, _user: &str) -> anyhow::Result<server::Auth> {
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("authenticated-users").is_file() {
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.root.join("authenticated-users"))?,
+                "{_user}"
+            )?;
+        }
         Ok(server::Auth::Accept)
     }
     async fn channel_open_session(
@@ -139,6 +148,13 @@ impl server::Handler for Peer {
                     .append(true)
                     .open(self.root.join("keyboard-input.bin"))?
                     .write_all(data)?;
+            }
+            #[cfg(feature = "ui-smoke")]
+            if data == b"\x04" && self.root.join("exit-on-eot").is_file() {
+                s.exit_status_request(c, 23)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
             }
             #[cfg(feature = "ui-smoke")]
             if data == b"\x04" && self.root.join("disconnect-on-eot").is_file() {

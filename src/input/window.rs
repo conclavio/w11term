@@ -376,17 +376,29 @@ mod tests {
                 lab.frames.clone(),
                 Rc::new(Cell::new(false)),
             )));
-            ime::set_surface(Some(ime::Surface::new(tx, Default::default(), || None)));
+            ime::set_surface(Some(ime::Surface::new(
+                tx.clone(),
+                Default::default(),
+                || None,
+            )));
             assert!(matches!(rx.try_recv(), Ok(Command::Focus(false))));
-            (bridge, window, rx)
+            (bridge, window, tx, rx)
         };
-        let (a, wa, mut rx_a) = setup();
-        let (b, wb, mut rx_b) = setup();
+        let (a, wa, tx_a, mut rx_a) = setup();
+        let (b, wb, tx_b, mut rx_b) = setup();
         let activate = |hwnd, value| unsafe {
             SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(value as usize)), None);
         };
         let _guard_a = a.scope().enter();
         activate(wa.0, WA_ACTIVE);
+        ime::smoke::start();
+        ime::smoke::update(None, Some("before restart"), 14);
+        a.reset_keys(&tx_b); // A sibling's new transport does not own this edit.
+        assert!(ime::active());
+        a.reset_keys(&tx_a);
+        assert!(!ime::active());
+        ime::smoke::update(Some("old transport"), None, 0);
+        ime::smoke::end();
         ime::smoke::start();
         ime::smoke::update(None, Some("pending"), 7);
         assert!(ime::active());
