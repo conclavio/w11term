@@ -13,4 +13,4 @@ AllowAgentForwarding no
 AllowTcpForwarding no
 X11Forwarding no
 PrintMotd no
-Subsystem sftp internal-sftp
+Subsystem sftp internal-sftp -d /tmp

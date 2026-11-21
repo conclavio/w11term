@@ -1,12 +1,14 @@
 //! Exercise profile grants and live Windows exports through a real Linux FUSE mount.
 use super::{
-    ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, durability::bounded_command,
+    ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, MountedFolder,
+    durability::bounded_command,
 };
 use crate::{
     folder_grants::{Authority, FolderScope, PaneShares},
     options::{Authentication, Source, SshOptions},
     profiles::ProfileStore,
     session::{Command, Session},
+    sftp::{Job, Operation},
 };
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
@@ -69,6 +71,56 @@ async fn shell_probe(pane: &Session, label: &str, script: &str) -> Result<u32> {
 async fn mount_record(link: &ConnectionShare, mount: &str) -> Result<Vec<u8>> {
     let record = format!("awk '$5 == \"{mount}\" {{ print }}' /proc/self/mountinfo");
     checked(link, &record).await
+}
+
+async fn sftp(pane: &Session, auth: &Authority, operation: Operation) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    pane.input
+        .send(Command::Sftp(Job {
+            operation,
+            expected_generation: Some(auth.connection_generation()),
+            deadline,
+            reply,
+            progress: None,
+        }))
+        .map_err(|_| anyhow::anyhow!("terminal session exited"))?;
+    tokio::time::timeout_at(deadline, answer)
+        .await
+        .context("guest SFTP operation timed out")??
+        .map_err(anyhow::Error::msg)
+}
+
+async fn check_drawer_path(pane: &Session, auth: &Authority, folder: &MountedFolder) -> Result<()> {
+    let cwd = sftp(pane, auth, Operation::Realpath { path: ".".into() }).await?;
+    ensure!(
+        cwd["entries"][0]["filename"] == "/tmp",
+        "unexpected SFTP working directory: {cwd}"
+    );
+    let listed = sftp(
+        pane,
+        auth,
+        Operation::ListMountedFolder {
+            path: folder.path.clone(),
+        },
+    )
+    .await?;
+    let mut names = Vec::new();
+    for entry in listed["entries"]
+        .as_array()
+        .context("invalid SFTP listing")?
+    {
+        let name = entry["filename"].as_str().context("invalid entry name")?;
+        if !matches!(name, "." | "..") {
+            names.push(name);
+        }
+    }
+    names.sort_unstable();
+    ensure!(
+        names == ["sprites 雪", NAME],
+        "wrong entries at the verified mount: {names:?}"
+    );
+    Ok(())
 }
 
 async fn check_mount(link: &ConnectionShare, mount: &str, tile_digest: &str) -> Result<String> {
@@ -414,6 +466,12 @@ async fn individual_grants(options: &SshOptions) -> Result<()> {
         .await
         .context("initial saved grant mount")?;
     let initial = check_mount(&link, &remote, &tile_digest).await?;
+    let folder = manager.resolve_mounted(&auth, &name, &initial)()?;
+    ensure!(
+        folder.path == remote && folder.generation == initial,
+        "descriptor disagrees with mountinfo: {folder:?}"
+    );
+    check_drawer_path(&pane, &auth, &folder).await?;
 
     // Another lease on this name, even with a different root, must leave the first mount intact.
     expect_refused(
@@ -449,6 +507,16 @@ async fn individual_grants(options: &SshOptions) -> Result<()> {
     unmount_profile(&manager, &auth, &link, &name, &remote)
         .await
         .context("first explicit unmount after collision and destination checks")?;
+    ensure!(
+        manager
+            .rows(&auth)?
+            .iter()
+            .any(|row| row.name == name && row.mounted.is_none())
+    );
+    ensure!(
+        manager.resolve_mounted(&auth, &name, &initial)().is_err(),
+        "unmounted generation still resolves"
+    );
 
     let original = fixture.path().join("original");
     fs::rename(&selected, &original)?;
@@ -472,6 +540,12 @@ async fn individual_grants(options: &SshOptions) -> Result<()> {
     ensure!(
         restored != initial,
         "restoring the original reused its old mount"
+    );
+    let new_folder = manager.resolve_mounted(&auth, &name, &restored)()?;
+    ensure!(new_folder.path == folder.path && new_folder.generation == restored);
+    ensure!(
+        manager.resolve_mounted(&auth, &name, &initial)().is_err(),
+        "retired mount resolves after remount"
     );
     unmount_profile(&manager, &auth, &link, &name, &remote)
         .await

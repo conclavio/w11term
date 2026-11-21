@@ -22,6 +22,8 @@ use tokio::{
 };
 
 const MAX_PACKET: usize = 64 * 1024;
+const MAX_MOUNT_PATH: usize = 4096;
+const MAX_MOUNT_RECORD: usize = 4096;
 
 pub fn valid_mount_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -40,10 +42,22 @@ pub enum FolderMountStatus {
     Failed(String),
 }
 
+/// The exact Linux path inspected for this owner-only SSHFS generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountedFolder {
+    pub generation: String,
+    pub path: String,
+}
+
+struct MountState {
+    status: FolderMountStatus,
+    folder: Option<MountedFolder>,
+}
+
 /// Owns a single export. Dropping the owner revokes new reads and requests
 /// teardown even if the pane that opened it is already gone.
 pub struct FolderMount {
-    state: Arc<Mutex<FolderMountStatus>>,
+    state: Arc<Mutex<MountState>>,
     revoked: Arc<AtomicBool>,
     stop: watch::Sender<bool>,
 }
@@ -52,7 +66,10 @@ impl FolderMount {
     pub fn start(connection: ConnectionShare, root: Root, name: &str) -> Result<Self> {
         ensure!(valid_mount_name(name), "Invalid Linux mount name");
         ensure!(!connection.handle().is_closed(), "SSH connection is closed");
-        let state = Arc::new(Mutex::new(FolderMountStatus::Starting));
+        let state = Arc::new(Mutex::new(MountState {
+            status: FolderMountStatus::Starting,
+            folder: None,
+        }));
         let revoked = root.revoked.clone();
         let (stop, receiver) = watch::channel(false);
         let mount = Self {
@@ -64,7 +81,9 @@ impl FolderMount {
         NETWORK.spawn(async move {
             let result = run(connection, remote, root, &state, &revoked, receiver).await;
             revoked.store(true, Ordering::Release);
-            *state.lock().unwrap() = match result {
+            let mut state = state.lock().unwrap();
+            state.folder = None;
+            state.status = match result {
                 Ok(()) => FolderMountStatus::Stopped,
                 Err(e) => FolderMountStatus::Failed(diagnostic(&format!("{e:#}"))),
             };
@@ -72,16 +91,24 @@ impl FolderMount {
         Ok(mount)
     }
     pub fn status(&self) -> FolderMountStatus {
-        self.state.lock().unwrap().clone()
+        self.state.lock().unwrap().status.clone()
+    }
+    pub fn mounted_folder(&self) -> Option<MountedFolder> {
+        let state = self.state.lock().unwrap();
+        if self.revoked.load(Ordering::Acquire) {
+            return None;
+        }
+        state.folder.clone()
     }
     pub fn unmount(&self) {
         let mut state = self.state.lock().unwrap();
         if matches!(
-            *state,
+            state.status,
             FolderMountStatus::Starting | FolderMountStatus::Mounted
         ) {
             self.revoked.store(true, Ordering::Release);
-            *state = FolderMountStatus::Unmounting;
+            state.folder = None;
+            state.status = FolderMountStatus::Unmounting;
             self.stop.send_replace(true);
         }
     }
@@ -103,13 +130,13 @@ fn diagnostic(message: &str) -> String {
 // No user-supplied text is shell source. A validated name travels as one base64
 // argument with no shell metacharacters; $2 is a client-generated hex token.
 struct Remote {
-    name_arg: String,
+    name: String,
     token: String,
 }
 impl Remote {
     fn new(name: &str) -> Self {
         Self {
-            name_arg: STANDARD.encode(name),
+            name: name.to_owned(),
             token: format!("w11term-{:032x}", rand::random::<u128>()),
         }
     }
@@ -117,7 +144,7 @@ impl Remote {
         format!(
             "exec /bin/sh -c '{}' w11term {} {}",
             script.replace('\'', "'\\''"),
-            self.name_arg,
+            STANDARD.encode(&self.name),
             self.token
         )
     }
@@ -170,8 +197,10 @@ exec sshfs -f -o "passive,ro,auto_unmount,subtype=sshfs.$2,fsname=$2" :/ .
 const PROBE: &str = r#"set -eu
 PATH=/usr/sbin:/usr/bin:/sbin:/bin; LC_ALL=C; export PATH LC_ALL
 name=$(printf '%s' "$1" | base64 -d)
+target="$HOME/windows/$name"
 printf '%s ' "$(id -u)"
-findmnt --kernel --raw --noheadings --nocanonicalize --mountpoint "$HOME/windows/$name" --output FSTYPE,SOURCE,VFS-OPTIONS,FS-OPTIONS
+findmnt --kernel --raw --noheadings --nocanonicalize --mountpoint "$target" --output FSTYPE,SOURCE,VFS-OPTIONS,FS-OPTIONS
+if [ "${#target}" -le 4096 ]; then printf '\000%s' "$target"; fi
 "#;
 
 // Search kernel mountinfo by the generation's subtype, even if a parent was
@@ -197,15 +226,24 @@ fn check_helper_version(stdout: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn verify(link: &ConnectionShare, remote: &Remote, absent: bool) -> Result<()> {
+async fn verify(
+    link: &ConnectionShare,
+    remote: &Remote,
+    absent: bool,
+) -> Result<Option<MountedFolder>> {
     let command = remote.command(if absent { ABSENT } else { PROBE });
     loop {
-        let answer = bounded_command(link, &command, 4096).await?;
+        let limit = if absent {
+            MAX_MOUNT_RECORD
+        } else {
+            MAX_MOUNT_RECORD + 1 + MAX_MOUNT_PATH
+        };
+        let answer = bounded_command(link, &command, limit).await?;
         if absent && answer.status == 0 {
-            return Ok(());
+            return Ok(None);
         }
         if !absent && answer.status == 0 {
-            return verify_record(std::str::from_utf8(&answer.stdout)?, &remote.token);
+            return verify_record(&answer.stdout, &remote.token, &remote.name);
         }
         ensure!(
             answer.status == 1,
@@ -216,7 +254,16 @@ async fn verify(link: &ConnectionShare, remote: &Remote, absent: bool) -> Result
     }
 }
 
-fn verify_record(text: &str, token: &str) -> Result<()> {
+fn verify_record(bytes: &[u8], token: &str, name: &str) -> Result<Option<MountedFolder>> {
+    // findmnt checks this exact mountpoint without canonicalization. Keep its
+    // ASCII record separate from the raw Linux pathname (which need not be UTF-8).
+    let mut parts = bytes.splitn(2, |&b| b == 0);
+    let record = parts.next().unwrap();
+    ensure!(
+        record.len() <= MAX_MOUNT_RECORD,
+        "Linux mount record is too long"
+    );
+    let text = std::str::from_utf8(record)?;
     let fields: Vec<_> = text.split_ascii_whitespace().collect();
     let [uid, fs_type, source, vfs_options, fs_options] = fields.as_slice() else {
         bail!("Could not identify one Linux mount at the destination");
@@ -238,14 +285,30 @@ fn verify_record(text: &str, token: &str) -> Result<()> {
                 .any(|s| matches!(s, "allow_other" | "allow_root")),
         "SSHFS did not mount read-only with owner-only access"
     );
-    Ok(())
+    let Some(path) = parts
+        .next()
+        .filter(|b| b.len() <= MAX_MOUNT_PATH)
+        .and_then(|b| std::str::from_utf8(b).ok())
+    else {
+        return Ok(None);
+    };
+    let valid = path.strip_prefix('/').is_some_and(|relative| {
+        relative
+            .split('/')
+            .all(|part| !matches!(part, "" | "." | ".."))
+    }) && path.rsplit('/').take(2).eq([name, "windows"])
+        && !path.chars().any(char::is_control);
+    Ok(valid.then(|| MountedFolder {
+        generation: token.to_owned(),
+        path: path.to_owned(),
+    }))
 }
 
 async fn run(
     link: ConnectionShare,
     remote: Remote,
     root: Root,
-    state: &Mutex<FolderMountStatus>,
+    state: &Mutex<MountState>,
     revoked: &Arc<AtomicBool>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -308,12 +371,14 @@ async fn run(
                     break done;
                 }
                 confirmed = &mut ready, if enable.is_some() => {
-                    if let Err(e) = confirmed.context("Timed out verifying the Linux mount").and_then(|r| r) {
-                        break Err(e);
-                    }
-                    let mut status = state.lock().unwrap();
-                    if *status != FolderMountStatus::Starting {break Ok(());}
-                    *status = FolderMountStatus::Mounted;
+                    let folder = match confirmed.context("Timed out verifying the Linux mount").and_then(|r| r) {
+                        Ok(folder) => folder,
+                        Err(e) => break Err(e),
+                    };
+                    let mut state = state.lock().unwrap();
+                    if state.status != FolderMountStatus::Starting {break Ok(());}
+                    state.folder = folder;
+                    state.status = FolderMountStatus::Mounted;
                     mounted = true;
                     let _ = enable.take().unwrap().send(());
                 }
@@ -332,6 +397,7 @@ async fn run(
         timeout(Duration::from_secs(12), verify(&link, &remote, true))
             .await
             .context("Timed out verifying the SSHFS generation is absent from Linux mountinfo")?
+            .map(|_| ())
     };
     let cleanup = confirm_shutdown(mounted, shutdown, absent).await;
     match (result, cleanup) {
@@ -616,7 +682,7 @@ mod tests {
         let remote = Remote::new(name);
         let command = remote.command(START);
         assert!(!command.contains(name));
-        assert_eq!(STANDARD.decode(&remote.name_arg).unwrap(), name.as_bytes());
+        assert!(command.contains(&format!(" {} ", STANDARD.encode(name))));
         assert_ne!(remote.token, Remote::new(name).token);
     }
 
@@ -624,7 +690,10 @@ mod tests {
     fn readiness_requires_the_exact_mount_generation_owner_and_access() {
         let valid =
             "1001 fuse.sshfs.w11term-test w11term-test ro,nosuid rw,user_id=1001,group_id=1001";
-        assert!(verify_record(valid, "w11term-test").is_ok());
+        assert_eq!(
+            verify_record(valid.as_bytes(), "w11term-test", "hud").unwrap(),
+            None
+        );
         for mismatch in [
             valid.replace("user_id=1001", "user_id=0"),
             valid.replace("ro,nosuid", "rw,nosuid"),
@@ -632,9 +701,53 @@ mod tests {
             valid.replace("group_id=1001", "allow_root"),
             format!("{valid}\n{valid}"),
         ] {
-            assert!(verify_record(&mismatch, "w11term-test").is_err());
+            assert!(
+                verify_record(
+                    format!("{mismatch}\0/home/test/windows/hud").as_bytes(),
+                    "w11term-test",
+                    "hud"
+                )
+                .is_err()
+            );
         }
-        assert!(verify_record(valid, "w11term-other").is_err());
+        assert!(verify_record(valid.as_bytes(), "w11term-other", "hud").is_err());
+    }
+
+    #[test]
+    fn mount_path_is_optional_lossless_and_bound_to_the_verified_record() {
+        let record = b"1001 fuse.sshfs.w11term-test w11term-test ro rw,user_id=1001\n\0";
+        let inspect = |path: &[u8]| {
+            verify_record(&[record.as_slice(), path].concat(), "w11term-test", "hud").unwrap()
+        };
+        let valid = "/srv/a 雪/'$()\\name/windows/hud";
+        assert_eq!(
+            inspect(valid.as_bytes()),
+            Some(MountedFolder {
+                generation: "w11term-test".into(),
+                path: valid.into()
+            })
+        );
+        for invalid in [
+            b"".as_slice(),
+            b"relative/windows/hud",
+            b"/bad/../windows/hud",
+            b"/./windows/hud",
+            b"/duplicate//windows/hud",
+            b"/a/\0b/windows/hud",
+            b"/line\nbreak/windows/hud",
+            b"/bad\xff/windows/hud",
+            "/control\u{0085}/windows/hud".as_bytes(),
+            b"/unrelated",
+            b"/home/test/other/hud",
+            b"/home/test/windows/other",
+            b"/home/test/windows/hud/",
+        ] {
+            assert_eq!(inspect(invalid), None, "{invalid:?}");
+        }
+        let suffix = "/windows/hud";
+        let longest = format!("/{}{suffix}", "a".repeat(MAX_MOUNT_PATH - suffix.len() - 1));
+        assert_eq!(inspect(longest.as_bytes()).unwrap().path, longest);
+        assert_eq!(inspect(format!("/x{}", &longest[1..]).as_bytes()), None);
     }
 
     #[test]
@@ -644,13 +757,22 @@ mod tests {
         for initial in [FolderMountStatus::Starting, FolderMountStatus::Mounted] {
             let root = Root::open(temp.path())?;
             let (stop, watch) = watch::channel(false);
+            let folder = (initial == FolderMountStatus::Mounted).then(|| MountedFolder {
+                generation: "fixture".into(),
+                path: "/home/test/windows/hud".into(),
+            });
             let mount = FolderMount {
-                state: Arc::new(Mutex::new(initial.clone())),
+                state: Arc::new(Mutex::new(MountState {
+                    status: initial.clone(),
+                    folder: folder.clone(),
+                })),
                 revoked: root.revoked.clone(),
                 stop,
             };
+            assert_eq!(mount.mounted_folder(), folder);
             if initial == FolderMountStatus::Mounted {
                 mount.unmount();
+                assert_eq!(mount.mounted_folder(), None);
                 mount.unmount();
                 assert_eq!(mount.status(), FolderMountStatus::Unmounting);
             }

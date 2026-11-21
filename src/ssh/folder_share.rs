@@ -4,4 +4,4 @@ mod mount;
 mod protocol;
 
 pub use filesystem::Root as FolderRoot;
-pub use mount::{FolderMount, FolderMountStatus, valid_mount_name};
+pub use mount::{FolderMount, FolderMountStatus, MountedFolder, valid_mount_name};
