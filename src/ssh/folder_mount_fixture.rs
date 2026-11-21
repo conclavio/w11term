@@ -435,15 +435,15 @@ async fn old_fusermount_refuses_before_export() -> Result<()> {
 async fn native_windows_passive_sshfs() -> Result<()> {
     let options = options()?;
     individual_grants(&options).await?;
-    writable_grants(&options)
-        .await
-        .context("writable folder through Linux SSHFS")?;
     profile_revocation(&options)
         .await
         .context("profile-wide folder permissions")
 }
 
-async fn writable_grants(options: &SshOptions) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the disposable Linux FUSE guest and pinned loopback SSH supplied by the mount runner"]
+async fn native_windows_writable_sshfs() -> Result<()> {
+    let options = &options()?;
     let temp = tempfile::tempdir()?;
     let dir = temp.path();
     let catalog = dir.join("profiles.json");
@@ -527,6 +527,43 @@ async fn writable_grants(options: &SshOptions) -> Result<()> {
     let append = format!("exec 8>>'{mount}/journal' && printf fresh >&8; w11result=$?");
     ensure!(shell_probe(&observer, "FRESH_FD", &append).await? == 0);
     ensure!(fs::read(writable.join("journal"))? == b"ackfresh");
+    // A second manager for the same profile can forget one folder while the
+    // first manager is serving it. Keep its other mounts in their original pane.
+    for name in [writer, witness] {
+        let id = saved_preference(&manager, &auth, name, true).await?;
+        manager.set_auto_mount(&auth, name, &id, false)?;
+        saved_preference(&manager, &auth, name, false).await?;
+    }
+    let once = "forget-writer";
+    let disposable = dir.join(once);
+    fs::create_dir(&disposable)?;
+    manager.add_with_access(&auth, once, disposable.clone(), false, true)?;
+    wait_profile(&manager, &auth, once, Some(FolderMountStatus::Mounted)).await?;
+    let open = format!("exec 9>>'{HOME}/windows/{once}/note' && printf initial >&9; w11result=$?");
+    ensure!(shell_probe(&observer, "FORGET_OPEN", &open).await? == 0);
+    let editor = observer.profile_folders(scope());
+    let editor_auth = ready_authority(&editor).await?;
+    wait_profile(
+        &editor,
+        &editor_auth,
+        once,
+        Some(FolderMountStatus::Stopped),
+    )
+    .await?;
+    editor.forget(&editor_auth, once)?;
+    wait_profile(&editor, &editor_auth, once, None).await?;
+    ensure!(
+        shell_probe(
+            &observer,
+            "FORGOTTEN_FD",
+            "printf later >&9; w11result=$?; exec 9>&-"
+        )
+        .await?
+            != 0
+    );
+    ensure!(fs::read(disposable.join("note"))? == b"initial");
+    ensure!(shell_probe(&observer, "SIBLING_FD", "printf sibling >&8; w11result=$?").await? == 0);
+    ensure!(fs::read(writable.join("journal"))? == b"ackfreshsibling");
     revoke_in_other_process(dir, "linux")?;
     ensure!(
         shell_probe(
@@ -537,7 +574,7 @@ async fn writable_grants(options: &SshOptions) -> Result<()> {
         .await?
             != 0
     );
-    ensure!(fs::read(writable.join("journal"))? == b"ackfresh");
+    ensure!(fs::read(writable.join("journal"))? == b"ackfreshsibling");
     wait_detached(&observer_link, &mount).await?;
     ensure!(shell_pid(&observer, "WRITER_STILL_HERE").await? == observer_pid);
     close_transport(&next_link).await?;
