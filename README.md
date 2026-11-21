@@ -179,6 +179,8 @@ Dropped transports reconnect in the same tab, with 1/2/4/8/10-second backoff and
 
 Applications that negotiate the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) can distinguish keypad Enter and Num Lock-off navigation from the main Enter and navigation cluster. With disambiguation enabled, printable keypad digits and operators still type the text produced by the active Windows layout. Report-all mode identifies the physical keypad function, including a localized decimal key, and reports associated text when requested.
 
+Applications that request alternate keys can also recognize shortcuts by their physical position on a standard US PC keyboard. For example, Ctrl+с on a Russian layout can report both Cyrillic `с` and the physical `c` key. The application chooses which identity to bind. Ordinary text follows the active Windows layout. [Kitty alternate key reporting](https://sw.kovidgoyal.net/kitty/keyboard-protocol/#key-codes)
+
 Game mode suppresses held-key repeats while preserving the initial press and final release. Normal terminal mode sends negotiated kitty repeat event type 2 and release type 3. The caret menu toggles game mode and mute for the active saved profile. **F11** or the caret menu toggles borderless fullscreen. Normal window size and position are remembered per profile in `%LOCALAPPDATA%\w11term\windows.json`, clamped to the current monitor on restore. Explicit launch `--cols`/`--rows` takes precedence. The status bar displays columns × rows throughout resizing.
 
 Alternate-screen wheel-to-arrow compatibility is disabled by default in game mode.
@@ -334,7 +336,7 @@ This is a runnable foundation, not complete terminal conformance or a kitty/Ghos
 - The terminal displays kitty, sixel and iTerm images. Kitty supports timed or client-selected animation frames, Unicode placeholders and relative placements. The [graphics audit](docs/graphics-audit.md) documents reference fixtures, GPU cache eviction, transfer budgets and protocol coverage.
 - DirectWrite shapes text runs with matching attributes and supports italic, color emoji and five underline styles with independent decoration color. Bidirectional ordering uses the terminal's row direction with a left-to-right default. Selection, search highlights, URL hit testing and cursor placement share the displayed cell map. Copy and control-pipe text retain logical order. Each physical row resolves independently, including soft-wrapped rows. The replay fixture exercises mixed Hebrew and digits, Arabic joining, a Devanagari conjunct, italic and underline styles. [Replay fixture](tests/fixtures/complex-text.vt)
 - Windows input methods compose at the focused pane's caret. Committing sends the composed text once. The UI Automation Text and Text2 patterns expose the current viewport, selection and caret to assistive technology. See [IME behavior and manual checks](docs/ime.md).
-- Keyboard press, repeat, release and game-mode repeat suppression are connected. Physical and alternate key handling still have coverage gaps.
+- Keyboard tests exercise press, repeat, release, game-mode repeat suppression, keypad functions and alternate physical positions for printable keys.
 - The [workspace and SSH roadmap](docs/terminal-workspaces-roadmap.md) covers native splits, a graphical SFTP drawer, durable remote sessions, terminal fidelity and accessibility, local PowerShell via ConPTY, and subsequent RustMUSH features.
 
 ## Verify
