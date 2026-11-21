@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 use w11term::profiles::LocalProfileSnapshot;
 
 #[derive(Default)]
@@ -8,7 +9,14 @@ pub(super) struct Draft {
     executable: String,
     args: Vec<String>,
     cwd: String,
+    powershell_integration: bool,
     error: String,
+}
+
+impl Draft {
+    fn supports_integration(&self) -> bool {
+        LocalOptions::supports_powershell_integration(Path::new(self.executable.trim()), &self.args)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -23,6 +31,7 @@ pub enum Action {
     Field(TabId, Field, String),
     AddArgument(TabId),
     RemoveArgument(TabId, usize),
+    PowerShellIntegration(TabId, bool),
     Save(TabId),
 }
 
@@ -47,6 +56,7 @@ impl TerminalApp {
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_default();
                             draft.args = base.options.args.clone();
+                            draft.powershell_integration = base.options.powershell_integration;
                             draft.original = Some(base);
                         }
                         Err(error) => {
@@ -67,6 +77,7 @@ impl TerminalApp {
             Action::Save(id)
             | Action::Field(id, ..)
             | Action::AddArgument(id)
+            | Action::PowerShellIntegration(id, _)
             | Action::RemoveArgument(id, _) => id,
         };
         let Some(AppTab {
@@ -88,6 +99,7 @@ impl TerminalApp {
                 }
             },
             Action::AddArgument(_) => draft.args.push(String::new()),
+            Action::PowerShellIntegration(_, enabled) => draft.powershell_integration = enabled,
             Action::RemoveArgument(_, index) => {
                 if index < draft.args.len() {
                     draft.args.remove(index);
@@ -98,6 +110,7 @@ impl TerminalApp {
                     executable: draft.executable.trim().into(),
                     args: draft.args.clone(),
                     cwd: (!draft.cwd.trim().is_empty()).then(|| draft.cwd.trim().into()),
+                    powershell_integration: draft.powershell_integration && draft.supports_integration(),
                 };
                 let result = self
                     .store
@@ -202,6 +215,17 @@ impl TerminalApp {
                 .on_click(context.callback(move |_| Message::LocalProfile(Action::AddArgument(id))))
                 .content("Add argument"),
         );
+        if draft.supports_integration() {
+            fields.push(
+                CheckBox::new()
+                    .automation_name("Enable command history and completion alerts in PowerShell")
+                    .is_checked(draft.powershell_integration)
+                    .on_is_checked_changed(context.callback(move |enabled| {
+                        Message::LocalProfile(Action::PowerShellIntegration(id, enabled))
+                    }))
+                    .content("Enable command history and completion alerts in PowerShell"),
+            );
+        }
         fields.push(
             Button::new()
                 .on_click(context.callback(move |_| Message::LocalProfile(Action::Save(id))))

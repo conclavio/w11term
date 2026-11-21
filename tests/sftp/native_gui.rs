@@ -52,6 +52,21 @@ async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "enables PowerShell shell integration in Settings and observes a real command beside SSH"]
+async fn native_powershell_shell_integration_records_history_and_completion() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("powershell-integration-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(trace).unwrap(), b"neighbor-ok");
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
 async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
     run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
