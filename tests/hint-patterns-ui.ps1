@@ -53,7 +53,8 @@ function Save-Rule([string]$Name, [string]$Expression) {
     }
 }
 function Show-Patterns {
-    Run-Palette 'Settings'
+    Click 'Tab menu'
+    Invoke-Button (Wait-Until 'settings menu' { Find-Element 'Settings' ([System.Windows.Automation.ControlType]::MenuItem) })
     Click 'Hint patterns'
 }
 function Show-Pane {
@@ -121,7 +122,7 @@ function Stop-Fixture {
 try {
     $env:W11TERM_DATA_DIR = $state
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
-    [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"command_palette":"F7","keyboard_hints":"F8"}}')
+    [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"keyboard_hints":"F8"}}')
     for ($launch = 1; $launch -le 2; $launch++) {
         $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--replay', ('"' + $replay + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $state "run-$launch.log")
         $window = Wait-InputWindow
