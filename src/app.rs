@@ -302,6 +302,10 @@ fn tab_menu_message(label: String) -> Message {
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
         "Focus below" => Message::PaneNeighbor(Direction::Down),
+        "Resize left" => Message::Shortcut(Shortcut::ResizePane(Direction::Left)),
+        "Resize right" => Message::Shortcut(Shortcut::ResizePane(Direction::Right)),
+        "Resize up" => Message::Shortcut(Shortcut::ResizePane(Direction::Up)),
+        "Resize down" => Message::Shortcut(Shortcut::ResizePane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
         "Move pane to new tab" => Message::MovePaneToTab,
@@ -2315,6 +2319,25 @@ impl TerminalApp {
             ] {
                 items.push(self.binding_menu(key, action.binding().label, action));
             }
+            if !self.tabs.zoomed()
+                && let Some(id) = self.tabs.active_id()
+                && let Some(layout) = self.tabs.active_layout()
+            {
+                for (axis, actions) in [
+                    (
+                        Axis::Columns,
+                        [KeyAction::ResizeLeft, KeyAction::ResizeRight],
+                    ),
+                    (Axis::Rows, [KeyAction::ResizeUp, KeyAction::ResizeDown]),
+                ] {
+                    if layout.divider_for(id, axis).is_some() {
+                        for action in actions {
+                            let binding = action.binding();
+                            items.push(self.binding_menu(binding.id, binding.label, action));
+                        }
+                    }
+                }
+            }
             items.push(self.binding_menu(
                 "zoom-pane",
                 if self.tabs.zoomed() {
@@ -3643,6 +3666,7 @@ impl Component for TerminalApp {
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
+                Shortcut::ResizePane(direction) => self.keyboard_resize(direction),
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)
