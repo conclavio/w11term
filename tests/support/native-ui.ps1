@@ -35,6 +35,29 @@ function Wait-Until([string]$Description, [scriptblock]$Probe) {
     } while ([DateTime]::UtcNow -lt $until)
     throw "Timed out waiting for $Description"
 }
+function Find-OwnedDialog([string]$Title) {
+    foreach ($hwnd in [FixtureDialog]::Windows($app.Id)) {
+        if ([FixtureDialog]::GetWindow($hwnd, 4) -ne $window) { continue }
+        $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        if ($element.Current.ClassName -eq '#32770' -and $element.Current.Name -eq $Title) { return $hwnd }
+    }
+}
+function Select-DialogItem([IntPtr]$Dialog, [string]$Name) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Dialog)
+    $byName = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+    $selectable = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty, $true)
+    $match = [System.Windows.Automation.AndCondition]::new($byName, $selectable)
+    $null = Wait-Until "native picker selection '$Name'" {
+        $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $match)
+        if ($item) {
+            $selection = $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            if (!$selection.Current.IsSelected) { $selection.Select() }
+            return $selection.Current.IsSelected
+        }
+    }
+}
 function Wait-InputWindow {
     # The GUI replaces its bootstrap title only after installing the HWND's input route.
     $prefix = 'w11term ' + [char]0xb7 + ' '
