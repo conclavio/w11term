@@ -6,14 +6,20 @@ on:
     paths:
       - .github/workflows/folder-mount-pilot.yml
       - tests/folder-sharing/**
+      - tests/support/native-ui.ps1
+      - tests/support/clipboard.ps1
+      - tests/support/save-dialog.cs
       - src/ssh.rs
       - src/ssh/**
       - src/folder_grants.rs
       - src/folder_grants/**
       - src/session.rs
       - src/profiles.rs
+      - src/profiles/folder_permissions.rs
       - src/app/folder_sharing_state.rs
       - src/app/folder_shares.rs
+      - src/app/file_drawer.rs
+      - src/app/folder_revoke.rs
       - Cargo.toml
       - Cargo.lock
 
@@ -88,6 +94,8 @@ jobs:
           })
           if ($binary.Count -ne 1) { throw 'Expected one w11term library test executable' }
           "MOUNT_TEST_EXE=$($binary[0].executable)" >> $env:GITHUB_ENV
+      - name: Stage the native GUI and CLI for mounted-folder actions
+        run: cargo build --locked --features ui-smoke --bins
       - name: Install QEMU for the disposable runner
         uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
         with:
@@ -103,7 +111,8 @@ jobs:
         run: |
           ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-noble" `
             -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE -LegacyFuse
-      - name: Mount, read, unmount and check the original SSH shell on Ubuntu 26.04
+      - name: Verify real SSHFS mounts and the native Files and clipboard actions on Ubuntu 26.04
         run: |
           ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-resolute" `
-            -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE
+            -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE `
+            -GuiExecutable target/debug/w11term.exe -CliExecutable target/debug/w11term-cli.exe -CheckClipboard

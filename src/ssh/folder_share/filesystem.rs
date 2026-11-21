@@ -1,8 +1,9 @@
-//! A read-only capability for one selected directory on a local NTFS volume.
-//! Only drive selection opens a DOS path. Every later lookup opens a single
-//! name relative to an already checked directory handle, without reparsing.
+//! A capability for one selected directory on a local NTFS volume.
+//! After drive selection, walks open one name relative to a checked directory
+//! handle without reparsing. TxF requires a volume path; the writer pins its
+//! ancestors and checks the resulting primary link and parent before commit.
 //! A renamed root continues to refer to the originally selected directory.
-//! Hard-link counts are checked on admission. Already-open files identify the
+//! Read-only hard-link counts are checked on admission. Already-open files identify the
 //! same object even if a local owner later changes its contents or link count.
 use std::{
     fs::{File, OpenOptions},
@@ -39,6 +40,8 @@ use windows::{
     },
     core::{PCWSTR, PWSTR},
 };
+mod write;
+pub(super) use write::PendingWrite;
 
 const MAX_ENTRIES: usize = 4096;
 const MAX_COMPONENTS: usize = 64;
@@ -51,8 +54,11 @@ const SHARE_IN_PLACE: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE
 
 pub struct Root {
     directory: File,
+    writable: bool,
+    write_location: Option<Arc<write::PinnedDirectory>>,
     cursor: std::sync::Mutex<()>,
     pub(super) revoked: Arc<AtomicBool>,
+    profile_permission: Option<crate::profiles::FolderGrantGate>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -202,6 +208,24 @@ fn relative(
     rights: FILE_ACCESS_RIGHTS,
     share: FILE_SHARE_MODE,
 ) -> io::Result<File> {
+    open_relative(
+        parent,
+        name,
+        rights,
+        share,
+        FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+    )
+}
+
+fn open_relative(
+    parent: &File,
+    name: &str,
+    rights: FILE_ACCESS_RIGHTS,
+    share: FILE_SHARE_MODE,
+    disposition: windows::Wdk::Storage::FileSystem::NTCREATEFILE_CREATE_DISPOSITION,
+    options: windows::Wdk::Storage::FileSystem::NTCREATEFILE_CREATE_OPTIONS,
+) -> io::Result<File> {
     // All callers validate the component, including entries returned by NTFS.
     let mut wide: Vec<u16> = name.encode_utf16().collect();
     let length = (wide.len() * 2) as u16;
@@ -219,8 +243,7 @@ fn relative(
     };
     let mut opened = HANDLE::default();
     let mut status = IO_STATUS_BLOCK::default();
-    // Synchronous handle, no create/truncate or backup intent. The parent, name,
-    // IOSB and out handle all remain live for the duration of the call.
+    // The parent, name, IOSB and out handle remain live through NtCreateFile.
     nt_result(unsafe {
         NtCreateFile(
             &mut opened,
@@ -230,8 +253,8 @@ fn relative(
             None,
             FILE_FLAGS_AND_ATTRIBUTES(0),
             share,
-            FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            disposition,
+            options,
             None,
             0,
         )
@@ -254,7 +277,7 @@ fn describe(file: &File, name: &str) -> io::Result<Entry> {
         return Err(excluded());
     }
     if name != "/" && name.encode_utf16().count() <= 12 {
-        check_primary_name(file)?;
+        primary_link(file)?;
     }
     let len = if is_dir {
         0
@@ -271,7 +294,7 @@ fn describe(file: &File, name: &str) -> io::Result<Entry> {
 // A DOS alias can have an arbitrary 8.3 spelling. Query the primary basename
 // from the opened object itself so such an alias cannot expose a name that
 // directory enumeration deliberately omits (e.g. a trailing period).
-fn check_primary_name(file: &File) -> io::Result<()> {
+fn primary_link(file: &File) -> io::Result<(u64, String)> {
     #[repr(C, align(8))]
     struct SingleLink {
         needed: u32,
@@ -323,7 +346,7 @@ fn check_primary_name(file: &File) -> io::Result<()> {
     if !valid_component(&primary) {
         return Err(excluded());
     }
-    Ok(())
+    Ok((link.parent_id as u64, primary))
 }
 
 impl Entry {
@@ -390,6 +413,10 @@ fn check_active(revoked: &AtomicBool) -> io::Result<()> {
 }
 
 impl Root {
+    pub(crate) fn directory_handle(&self) -> &File {
+        &self.directory
+    }
+
     /// Select an absolute drive-letter directory below the root of local NTFS.
     /// Whole drives, UNC/device paths, and reparse points anywhere in the
     /// selected path are refused.
@@ -416,9 +443,35 @@ impl Root {
         selected.entry.directory()?;
         Ok(Self {
             directory: selected.file,
+            writable: false,
+            write_location: None,
             cursor: std::sync::Mutex::new(()),
             revoked,
+            profile_permission: None,
         })
+    }
+
+    pub(crate) fn with_profile_permission(
+        mut self,
+        gate: crate::profiles::FolderGrantGate,
+    ) -> Self {
+        self.profile_permission = Some(gate);
+        self
+    }
+
+    // Runs on the blocking SFTP worker. A profile editor in another process can
+    // retire this token while Linux holds a file handle or a directory snapshot.
+    pub(super) fn permits_request(&self) -> bool {
+        if self.revoked.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(permission) = &self.profile_permission
+            && !matches!(permission.revoked(), Ok(false))
+        {
+            self.revoked.store(true, Ordering::Release);
+            return false;
+        }
+        true
     }
 
     /// Identify the selected directory itself across rename or reopen on the same volume.

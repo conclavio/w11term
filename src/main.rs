@@ -2,6 +2,7 @@
 
 mod accessibility;
 mod app;
+mod cursor_blink;
 mod input;
 mod native_drawing;
 mod renderer;

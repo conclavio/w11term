@@ -12,9 +12,9 @@ use wezterm_term::{
 };
 
 mod export;
-mod keypad;
+mod kitty;
 pub(crate) use export::export_text;
-pub use keypad::KeypadKey;
+pub use kitty::KeypadKey;
 
 pub type Rgba = [f32; 4];
 
@@ -97,8 +97,18 @@ pub enum TransportInput {
     /// Parser-generated reply on a viewer transport that distinguishes it from user input.
     Automatic(Vec<u8>),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// A GUI clipboard write is valid only for the shell that was
+    /// active when the paste was requested.
+    Clipboard {
+        connection: u64,
+        bytes: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Resize(TerminalSize),
 }
+
+pub(crate) const STALE_PASTE: &str =
+    "The pane connection changed. Paste again to use the new connection.";
 
 struct ReplyWriter {
     sender: mpsc::UnboundedSender<TransportInput>,
@@ -201,6 +211,14 @@ pub fn send_key_event(
 #[derive(Clone, Debug, Default)]
 pub struct KeyDetails {
     pub base: Option<char>,
+    /// Unshifted US PC-101 position when distinct from the active layout.
+    pub physical: Option<char>,
+    /// Active layout's Shift level for the same position, independent of Caps Lock.
+    pub shifted: Option<char>,
+    /// Text for this physical repeat under the current Windows modifier state.
+    pub repeat_text: Option<String>,
+    /// Right Alt and its synthesized Control were consumed by this layout.
+    pub altgr: bool,
     pub text: Option<String>,
     pub keypad: Option<KeypadKey>,
     pub leds: wezterm_input_types::KeyboardLedStatus,
@@ -220,9 +238,8 @@ pub fn send_key_event_detailed(
         let all = flags
             .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
         let reports = flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
-        if let Some(keypad) = details.keypad
-            && let Some(wire) = keypad.encode(flags, key, modifiers, details, down, repeat)
-        {
+        if let Some(native) = kitty::NativeKey::from_event(flags, key, details) {
+            let wire = native.encode(flags, key, modifiers, details, down, repeat);
             if !wire.is_empty() {
                 writer.send(TransportInput::Data(wire.into_bytes()))?;
             }
@@ -1404,6 +1421,178 @@ mod tests {
     }
 
     #[test]
+    fn printable_layout_keys_match_stock_kitty_wire_fixture() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Case {
+            logical: char,
+            shifted: char,
+            physical: char,
+            mods: Vec<String>,
+            flags: u8,
+            action: String,
+            text: Option<String>,
+            wire: String,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../tests/fixtures/keyboard/physical-layout.json"
+        ))
+        .unwrap();
+        for case in cases {
+            let mut modifiers = KeyModifiers::NONE;
+            let mut details = KeyDetails {
+                base: Some(case.logical),
+                physical: Some(case.physical),
+                shifted: Some(case.shifted),
+                ..Default::default()
+            };
+            for modifier in &case.mods {
+                match modifier.as_str() {
+                    "CTRL" => modifiers |= KeyModifiers::CTRL,
+                    "SHIFT" => modifiers |= KeyModifiers::SHIFT,
+                    "CAPS_LOCK" => {
+                        details.leds |= wezterm_input_types::KeyboardLedStatus::CAPS_LOCK
+                    }
+                    "NUM_LOCK" => details.leds |= wezterm_input_types::KeyboardLedStatus::NUM_LOCK,
+                    _ => panic!("unknown modifier {case:?}"),
+                }
+            }
+            let character = case
+                .text
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or_else(|| {
+                    if modifiers.contains(KeyModifiers::SHIFT) {
+                        case.shifted
+                    } else {
+                        case.logical
+                    }
+                });
+            let (down, repeat) = match case.action.as_str() {
+                "press" => (true, false),
+                "repeat" => (true, true),
+                "release" => (false, false),
+                _ => panic!("unknown action {case:?}"),
+            };
+            let (writer, mut output) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            if case.flags != 0 {
+                terminal.advance_bytes(format!("\x1b[>{}u", case.flags));
+            }
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char(character),
+                modifiers,
+                down,
+                repeat,
+                &details,
+            )
+            .unwrap();
+            let actual = if case.wire.is_empty() {
+                vec![]
+            } else {
+                receive(&mut output)
+            };
+            assert_eq!(actual, case.wire.as_bytes(), "{case:?}");
+            assert!(output.try_recv().is_err(), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn equal_physical_keys_are_omitted_and_composed_layout_text_survives() {
+        for (flags, key, base, physical, text, down, repeat, expected) in [
+            (15, 'z', Some('z'), 'z', None, true, false, "\x1b[122;1u"),
+            (31, '@', None, 'q', None, true, false, "\x1b[64::113;;64u"),
+            (
+                31,
+                'é',
+                Some('é'),
+                'e',
+                None,
+                false,
+                false,
+                "\x1b[233::101;1:3u",
+            ),
+            (
+                31,
+                '´',
+                None,
+                'q',
+                Some("´q"),
+                true,
+                false,
+                "\x1b[180::113;;180:113u",
+            ),
+            (7, 'z', Some('z'), 'y', None, true, true, "z"),
+        ] {
+            let (writer, mut output) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            terminal.advance_bytes(format!("\x1b[>{flags}u"));
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char(key),
+                KeyModifiers::NONE,
+                down,
+                repeat,
+                &KeyDetails {
+                    base,
+                    physical: Some(physical),
+                    text: text.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(receive(&mut output), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn alternate_shift_level_is_selected_by_the_release_modifiers() {
+        let (writer, mut output) = mpsc::unbounded_channel();
+        let mut terminal = create(TerminalSize::default(), writer.clone());
+        terminal.advance_bytes(b"\x1b[>15u");
+        let details = KeyDetails {
+            base: Some('z'),
+            shifted: Some('Z'),
+            physical: Some('y'),
+            ..Default::default()
+        };
+        for (pressed_character, release_mods, expected) in [
+            ('z', KeyModifiers::SHIFT, "\x1b[122:90:121;2:3u"),
+            ('Z', KeyModifiers::NONE, "\x1b[122::121;1:3u"),
+        ] {
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char(pressed_character),
+                release_mods,
+                false,
+                false,
+                &details,
+            )
+            .unwrap();
+            assert_eq!(receive(&mut output), expected.as_bytes());
+        }
+        terminal.advance_bytes(b"\x1b[>31u");
+        let details = KeyDetails {
+            repeat_text: Some("Z".into()),
+            ..details
+        };
+        send_key_event_detailed(
+            &mut terminal,
+            &writer,
+            KeyCode::Char('z'),
+            KeyModifiers::SHIFT,
+            true,
+            true,
+            &details,
+        )
+        .unwrap();
+        assert_eq!(receive(&mut output), b"\x1b[122:90:121;2:2;90u");
+    }
+
+    #[test]
     fn keypad_matches_stock_kitty_wire_fixture() {
         #[derive(serde::Deserialize, Debug)]
         struct Case {
@@ -1728,6 +1917,37 @@ mod tests {
             _ => panic!("unexpected resize"),
         }
     }
+    #[test]
+    fn cursor_blink_mode_preserves_shape_and_reports_the_latest_request() {
+        use termwiz::surface::CursorShape::*;
+        let (mut terminal, mut replies) = engine();
+        for (request, expected, answer) in [
+            ("", Default, 2),
+            ("\x1b[?12h", BlinkingBlock, 1),
+            ("\x1b[?12l", SteadyBlock, 2),
+            ("\x1b[4 q\x1b[?12h", BlinkingUnderline, 1),
+            ("\x1b[?12l", SteadyUnderline, 2),
+            ("\x1b[5 q", BlinkingBar, 1),
+            ("\x1b[?12l", SteadyBar, 2),
+            ("\x1b[?12h", BlinkingBar, 1),
+            ("\x1b[2 q", SteadyBlock, 2),
+            ("\x1b[1 q\x1b[?25l", BlinkingBlock, 1),
+            ("\x1b[0 q", Default, 2),
+            ("\x1b[?12h\x1bc", Default, 2),
+        ] {
+            terminal.advance_bytes(request.as_bytes());
+            terminal.advance_bytes(b"\x1b[?12$p");
+            assert_eq!(terminal.cursor_pos().shape, expected);
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1b[?12;{answer}$y").as_bytes()
+            );
+        }
+        terminal.advance_bytes(b"\x1b[?12h");
+        terminal.reset_connection();
+        terminal.advance_bytes(b"\x1b[?12$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?12;2$y");
+    }
     fn text(t: &Terminal) -> String {
         let s = t.screen();
         s.lines_in_phys_range(s.phys_row(0)..s.phys_row(0) + s.physical_rows)
@@ -1735,6 +1955,145 @@ mod tests {
             .map(|l| l.as_str().trim_end().to_owned())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn cursor_style_status_string_round_trips_every_shape_and_tracks_mode_12() {
+        let (mut terminal, mut replies) = engine();
+        let query = b"\x1bP$q q\x1b\\";
+        terminal.advance_bytes(query);
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0 q\x1b\\");
+        for selector in 0..=6 {
+            terminal.advance_bytes(format!("\x1b[{selector} q"));
+            for &byte in query {
+                terminal.advance_bytes([byte]);
+            }
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1bP1$r{selector} q\x1b\\").as_bytes()
+            );
+        }
+        for (mode, expected) in [("h", 5), ("l", 6)] {
+            terminal.advance_bytes(format!("\x1b[?12{mode}"));
+            terminal.advance_bytes(query);
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1bP1$r{expected} q\x1b\\").as_bytes()
+            );
+        }
+        terminal.advance_bytes(b"\x1bP$q\"p\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r65;1\"p\x1b\\");
+        terminal.advance_bytes(b"\x1bP$qunknown\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn vim_undercurl_probe_reports_the_rendition_at_the_query() {
+        let (mut terminal, mut replies) = engine();
+        // Vim's term.c sends the reset after the query in the same write.
+        terminal.advance_bytes(b"\x1b[0m\x1b[4:3m\x1bP$qm\x1b\\\x1b[0m");
+        let reply = receive(&mut replies);
+        assert!(
+            sgr_parameters(&reply)
+                .split(';')
+                .any(|param| param == "4:3")
+        );
+        assert_eq!(terminal.pen(), CellAttributes::default());
+        terminal.advance_bytes(b"\x1bP$qm\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0m\x1b\\");
+    }
+
+    fn sgr_parameters(reply: &[u8]) -> &str {
+        let response = std::str::from_utf8(reply).unwrap();
+        let params = response
+            .strip_prefix("\x1bP1$r")
+            .and_then(|report| report.strip_suffix("m\x1b\\"))
+            .expect("expected a valid, ST-terminated SGR status string");
+        assert!(
+            params
+                .bytes()
+                .all(|c| c.is_ascii_digit() || matches!(c, b':' | b';'))
+        );
+        params
+    }
+
+    #[test]
+    fn rendition_reports_restore_the_complete_pen_on_another_terminal() {
+        let (mut source, mut replies) = engine();
+        let (mut restored, _) = engine();
+        // Change one pen in sequence, including partial resets and all three
+        // color channels. The report must restore the pen even over prior styles.
+        for settings in [
+            "0",
+            "1;3;4:3;5;7;8;9;53;73;38:2::1:2:3;48:2::4:5:6;58:2::7:8:9",
+            "2;21;6;74;38;5;200;48;5;17;58;5;245",
+            "22;23;28;39;59",
+            "24;25;27;29;49;55;75",
+            "31;104;4;58:5:2",
+            "97;45;4:4",
+            "4:5;38:6::11:12:13:91;48:6::14:15:16:125;58:6::17:18:19:159",
+            "4:0;59;39;49",
+        ] {
+            source.advance_bytes(format!("\x1b[{settings}m"));
+            let expected = source.pen();
+            source.advance_bytes(b"\x1bP$qm\x1b\\");
+            let reply = receive(&mut replies);
+            let params = sgr_parameters(&reply);
+            for starting in ["0", "0;1;3;4:2;6;7;8;9;53;73;92;106;58;5;99"] {
+                restored.advance_bytes(format!("\x1b[{starting}m\x1b[{params}m"));
+                assert_eq!(
+                    restored.pen(),
+                    expected,
+                    "input {settings}, report {params}, starting {starting}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_rendition_query_only_emits_a_reply_and_keeps_local_metadata() {
+        let (writer, mut output) = mpsc::unbounded_channel();
+        let mut terminal = create(TerminalSize::default(), writer.clone());
+        // The framed viewer distinguishes automatic replies from user input.
+        enter_herdr_viewer(&mut terminal, &writer, &crate::events::Events::default());
+        terminal
+            .advance_bytes(b"sample\x1b]133;B\x07\x1b[3m\x1b]8;;https://example.com/private\x1b\\");
+        let original_pen = terminal.pen();
+        assert!(original_pen.hyperlink().is_some());
+        assert_ne!(
+            original_pen.semantic_type(),
+            CellAttributes::default().semantic_type()
+        );
+        let before = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        for &byte in b"\x1bP$qm" {
+            terminal.advance_bytes([byte]);
+            assert!(output.try_recv().is_err(), "query is still incomplete");
+        }
+        terminal.advance_bytes([0x1b]);
+        terminal.advance_bytes(b"\\");
+        let TransportInput::Automatic(reply) = output.try_recv().unwrap() else {
+            panic!("an SGR report must use the terminal reply transport");
+        };
+        let params = sgr_parameters(&reply);
+        let (mut other, _) = engine();
+        other.advance_bytes(format!("\x1b[{params}m"));
+        let mut expected = CellAttributes::default();
+        expected.set_italic(true);
+        assert_eq!(other.pen(), expected);
+        assert_eq!(terminal.pen(), original_pen);
+        assert!(before.same_presentation(&Snapshot::capture(
+            &terminal,
+            Some(&before),
+            2,
+            0,
+            String::new(),
+            0
+        )));
+        terminal.advance_bytes(b"\x1bP$q!m\x1b\\");
+        assert!(
+            matches!(output.try_recv(), Ok(TransportInput::Automatic(bytes)) if bytes == b"\x1bP0$r\x1b\\")
+        );
+        assert!(output.try_recv().is_err(), "no extra replies or user input");
     }
 
     #[test]
@@ -1867,6 +2226,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(receive(&mut rx), b"a");
+    }
+
+    #[test]
+    fn encoding_a_confirmed_clipboard_paste_uses_the_existing_wire_format_without_writing() {
+        let (mut terminal, mut rx) = engine();
+        let text = "one\n界\x1b[201~\r\ntwo";
+        for (mode, expected) in [
+            (b"\x1b[?2004l".as_slice(), "one\r界\rtwo"),
+            (
+                b"\x1b[?2004h".as_slice(),
+                "\x1b[200~one\n界\r\ntwo\x1b[201~",
+            ),
+        ] {
+            terminal.advance_bytes(mode);
+            assert_eq!(terminal.encode_paste(text), expected);
+            assert!(rx.try_recv().is_err());
+            terminal.send_paste(text).unwrap();
+            assert_eq!(receive(&mut rx), expected.as_bytes());
+        }
     }
 
     #[test]

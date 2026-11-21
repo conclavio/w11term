@@ -25,6 +25,17 @@ public static class FixtureMessages {
 }
 '@
 
+# The SSH fixture opens this file for append on each DATA packet. Keep the
+# reader open across delivery so every packet can be traced even during a poll.
+function Open-PeerTraceReader([string]$Path) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    return [IO.BinaryReader]::new($stream)
+}
+function Read-PeerTrace([IO.BinaryReader]$Reader) {
+    $Reader.BaseStream.Position = 0
+    return ,$Reader.ReadBytes([int]$Reader.BaseStream.Length)
+}
+
 function Wait-Until([string]$Description, [scriptblock]$Probe) {
     $until = [DateTime]::UtcNow.AddSeconds(15)
     do {
@@ -96,6 +107,15 @@ function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Typ
 }
 function Invoke-Button($Element) {
     $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+}
+function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$State) {
+    Wait-Until "enabled checkbox '$Name' in state $State" {
+        $element = Find-Element $Name ([System.Windows.Automation.ControlType]::CheckBox)
+        if ($element -and $element.Current.IsEnabled) {
+            $pattern = $element.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+            if ($pattern.Current.ToggleState -eq $State) { $pattern }
+        }
+    }
 }
 function Post-Key([uint32]$Message, [uint32]$Key) {
     # Address this process's window. This never types into the foreground application.

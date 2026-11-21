@@ -1,9 +1,12 @@
-//! Windows-user permissions for read-only exports from a named SSH pane.
+//! Windows-user permissions for selected folders exported from a named SSH pane.
+mod protected_paths;
 mod store;
 use crate::{
     options::SshOptions,
+    profiles::FolderEpoch,
     ssh::{
-        ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, ShareSlot, valid_mount_name,
+        ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, MountedFolder, ShareSlot,
+        valid_mount_name,
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -43,8 +46,13 @@ pub struct Authority {
     pub fingerprint: String,
     pub pane: u64,
     generation: u64,
+    epoch: FolderEpoch,
 }
 impl Authority {
+    pub fn connection_generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn check_profile(&self, options: &SshOptions) -> Result<()> {
         ensure!(
             self.host.eq_ignore_ascii_case(&options.host)
@@ -64,14 +72,28 @@ impl Authority {
 pub struct FolderRow {
     pub name: String,
     pub path: PathBuf,
+    pub writable: bool,
     pub status: FolderMountStatus,
+    pub mounted: Option<MountedFolder>,
+    pub mount_on_connect: Option<MountPreference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountPreference {
+    pub grant_id: String,
+    pub enabled: bool,
+    pub pending: bool,
+    pub error: Option<String>,
 }
 
 struct Row {
     path: PathBuf,
+    writable: bool,
     grant: Option<Grant>,
     mount: Option<FolderMount>,
     status: FolderMountStatus,
+    saving_preference: bool,
+    preference_error: Option<String>,
 }
 impl Row {
     fn status(&self) -> FolderMountStatus {
@@ -99,8 +121,9 @@ struct Core {
 
 enum Action {
     Refresh,
-    Add(Authority, String, PathBuf),
-    Mount(Authority, String, String),
+    Add(Authority, String, PathBuf, bool, bool),
+    Mount(Authority, Grant),
+    SetAutoMount(Authority, Grant, bool),
     Forget(Authority, String, Option<String>),
 }
 
@@ -182,11 +205,72 @@ impl PaneShares {
             .map(|(name, row)| FolderRow {
                 name: name.clone(),
                 path: row.path.clone(),
+                writable: row.writable,
                 status: row.status(),
+                mounted: row.mount.as_ref().and_then(FolderMount::mounted_folder),
+                mount_on_connect: row.grant.as_ref().map(|grant| MountPreference {
+                    grant_id: grant.id.clone(),
+                    enabled: grant.auto_mount,
+                    pending: row.saving_preference,
+                    error: row.preference_error.clone(),
+                }),
             })
             .collect())
     }
+
+    /// Recheck saved consent on a blocking worker, then resolve the exact mount
+    /// the user clicked. A remount may reuse both the Linux and Windows paths.
+    pub fn resolve_mounted(
+        &self,
+        auth: &Authority,
+        name: &str,
+        generation: &str,
+    ) -> impl FnOnce() -> Result<MountedFolder> + Send + 'static + use<> {
+        let core = self.core.clone();
+        let auth = auth.clone();
+        let name = name.to_owned();
+        let generation = generation.to_owned();
+        move || {
+            let grants = core.current_store(&auth)?.read()?;
+            let state = core.check(&auth)?;
+            let row = state
+                .rows
+                .get(&name)
+                .context("This folder is no longer shared")?;
+            ensure!(
+                row.grant
+                    .as_ref()
+                    .is_some_and(|grant| grants.iter().any(|saved| saved.same_selection(grant))),
+                "Folder permission changed"
+            );
+            row.mount
+                .as_ref()
+                .and_then(FolderMount::mounted_folder)
+                .filter(|mount| mount.generation == generation)
+                .context("This folder mount has ended or changed")
+        }
+    }
     pub fn add(&self, auth: &Authority, name: &str, path: PathBuf) -> Result<()> {
+        self.add_with_auto_mount(auth, name, path, true)
+    }
+    pub fn add_with_auto_mount(
+        &self,
+        auth: &Authority,
+        name: &str,
+        path: PathBuf,
+        auto_mount: bool,
+    ) -> Result<()> {
+        self.add_with_access(auth, name, path, auto_mount, false)
+    }
+
+    pub fn add_with_access(
+        &self,
+        auth: &Authority,
+        name: &str,
+        path: PathBuf,
+        auto_mount: bool,
+        writable: bool,
+    ) -> Result<()> {
         ensure!(
             valid_mount_name(name),
             "Use a Linux mount name of 1–64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
@@ -203,19 +287,49 @@ impl PaneShares {
             !state.rows.contains_key(name),
             "This Linux mount name is already in use"
         );
-        self.queue(Action::Add(auth.clone(), name.into(), path.clone()))?;
+        self.queue(Action::Add(
+            auth.clone(),
+            name.into(),
+            path.clone(),
+            auto_mount,
+            writable,
+        ))?;
         state.rows.insert(
             name.into(),
             Row {
                 path,
+                writable,
                 grant: None,
                 mount: None,
                 status: FolderMountStatus::Starting,
+                saving_preference: false,
+                preference_error: None,
             },
         );
         Ok(())
     }
     pub fn mount(&self, auth: &Authority, name: &str) -> Result<()> {
+        self.mount_if_current(auth, name, None)
+    }
+
+    /// A button drawn for a read-only share must not start a later writable
+    /// grant that happens to use the same name and local folder.
+    pub fn mount_selected(
+        &self,
+        auth: &Authority,
+        name: &str,
+        grant_id: &str,
+        writable: bool,
+    ) -> Result<()> {
+        self.mount_if_current(auth, name, Some((grant_id, writable)))
+    }
+
+    fn mount_if_current(
+        &self,
+        auth: &Authority,
+        name: &str,
+        expected: Option<(&str, bool)>,
+    ) -> Result<()> {
         let mut state = self.core.check(auth)?;
         let row = state
             .rows
@@ -226,15 +340,44 @@ impl PaneShares {
             .as_ref()
             .context("This permission was not saved; forget the row and add the folder again")?;
         ensure!(
+            expected.is_none_or(|(id, writable)| grant.id == id && grant.writable == writable),
+            "This shared folder has changed. Review the current list."
+        );
+        ensure!(
             matches!(
                 row.status(),
                 FolderMountStatus::Stopped | FolderMountStatus::Failed(_)
             ),
             "Folder is already active"
         );
-        self.queue(Action::Mount(auth.clone(), name.into(), grant.id.clone()))?;
+        self.queue(Action::Mount(auth.clone(), grant.clone()))?;
         row.mount.take();
         row.status = FolderMountStatus::Starting;
+        Ok(())
+    }
+    pub fn set_auto_mount(
+        &self,
+        auth: &Authority,
+        name: &str,
+        grant_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let mut state = self.core.check(auth)?;
+        let row = state
+            .rows
+            .get_mut(name)
+            .context("Shared folder was removed")?;
+        let grant = row
+            .grant
+            .as_ref()
+            .filter(|g| g.id == grant_id)
+            .context("Folder permission changed")?;
+        if row.saving_preference || grant.auto_mount == enabled {
+            return Ok(());
+        }
+        self.queue(Action::SetAutoMount(auth.clone(), grant.clone(), enabled))?;
+        row.saving_preference = true;
+        row.preference_error = None;
         Ok(())
     }
     pub fn unmount(&self, auth: &Authority, name: &str) -> Result<()> {
@@ -325,17 +468,32 @@ impl Core {
                     wake();
                 }
             }
-            Action::Add(auth, name, path) => {
-                if let Err(e) = self.add(&auth, &name, path) {
+            Action::Add(auth, name, path, auto_mount, writable) => {
+                if let Err(e) = self.add(&auth, &name, path, auto_mount, writable) {
                     self.failed(&auth, &name, e);
                 }
             }
-            Action::Mount(auth, name, id) => {
-                let result = self
-                    .saved(&auth, &name, &id)
-                    .and_then(|grant| self.start(&auth, &grant, None));
-                if let Err(e) = result {
-                    self.failed(&auth, &name, e);
+            Action::Mount(auth, grant) => {
+                if let Err(e) = self.start(&auth, &grant, None) {
+                    self.failed(&auth, &grant.name, e);
+                }
+            }
+            Action::SetAutoMount(auth, grant, enabled) => {
+                let saved = self
+                    .current_store(&auth)
+                    .and_then(|store| store.set_auto_mount(&grant, enabled));
+                if let Ok(mut state) = self.check(&auth)
+                    && let Some(row) = state.rows.get_mut(&grant.name)
+                    && let Some(current) = row.grant.as_mut().filter(|g| g.same_selection(&grant))
+                {
+                    row.saving_preference = false;
+                    match saved {
+                        Ok(()) => current.auto_mount = enabled,
+                        Err(e) => {
+                            row.preference_error =
+                                Some(format!("Could not save mount preference: {e:#}"))
+                        }
+                    }
                 }
             }
             Action::Forget(auth, name, id) => {
@@ -355,9 +513,9 @@ impl Core {
         }
     }
     fn refresh(&self) {
-        let expected = self.slot.generation().map(|(generation, link)| {
+        let expected = self.slot.generation().and_then(|(generation, link)| {
             let (host, user, port, key) = link.verified_endpoint();
-            Authority {
+            let mut auth = Authority {
                 profile: self.scope.profile.clone(),
                 host: host.to_ascii_lowercase(),
                 user: user.into(),
@@ -365,28 +523,25 @@ impl Core {
                 fingerprint: key.into(),
                 pane: self.pane,
                 generation,
-            }
+                epoch: FolderEpoch::default(),
+            };
+            let (epoch, store) = Store::inspect(&self.scope, &auth).ok()?;
+            auth.epoch = epoch;
+            Some((auth, store))
         });
         {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 return;
             }
-            if state.auth != expected {
+            if state.auth.as_ref() != expected.as_ref().map(|(auth, _)| auth) {
                 state.rows.clear();
                 state.auth = None;
                 state.error = None;
             }
         }
-        let Some(auth) = expected else { return };
-        let store = match Store::for_profile(&self.scope, &auth, false) {
-            Ok(store) => store,
-            Err(_) => {
-                let mut state = self.state.lock().unwrap();
-                state.rows.clear();
-                state.auth = None;
-                return;
-            }
+        let Some((auth, store)) = expected else {
+            return;
         };
         let saved = store.as_ref().map(Store::read).transpose();
         let additions = {
@@ -404,9 +559,16 @@ impl Core {
                 }
             };
             state.error = None;
-            state
-                .rows
-                .retain(|_, row| row.grant.as_ref().is_none_or(|g| grants.contains(g)));
+            state.rows.retain(|_, row| {
+                let Some(current) = &mut row.grant else {
+                    return true;
+                };
+                let Some(saved) = grants.iter().find(|g| g.same_selection(current)) else {
+                    return false;
+                };
+                current.auto_mount = saved.auto_mount;
+                true
+            });
             let mut additions = Vec::new();
             for grant in grants {
                 if !state.rows.contains_key(&grant.name) {
@@ -414,12 +576,21 @@ impl Core {
                         grant.name.clone(),
                         Row {
                             path: grant.path.clone(),
+                            writable: grant.writable,
                             grant: Some(grant.clone()),
                             mount: None,
-                            status: FolderMountStatus::Starting,
+                            status: if grant.auto_mount {
+                                FolderMountStatus::Starting
+                            } else {
+                                FolderMountStatus::Stopped
+                            },
+                            saving_preference: false,
+                            preference_error: None,
                         },
                     );
-                    additions.push(grant);
+                    if grant.auto_mount {
+                        additions.push(grant);
+                    }
                 }
             }
             additions
@@ -430,26 +601,38 @@ impl Core {
             }
         }
     }
-    fn saved(&self, auth: &Authority, name: &str, id: &str) -> Result<Grant> {
+    fn current_store(&self, auth: &Authority) -> Result<Store> {
         drop(self.check(auth)?);
-        Store::for_profile(&self.scope, auth, false)?
-            .context("Profile has no folder permissions")?
-            .read()?
-            .into_iter()
-            .find(|g| g.name == name && g.id == id)
-            .context("Shared folder was removed or replaced")
+        let (epoch, store) = Store::inspect(&self.scope, auth)?;
+        ensure!(epoch == auth.epoch, "This shared-folder view has expired");
+        store.context("Profile has no folder permissions")
     }
-    fn add(&self, auth: &Authority, name: &str, path: PathBuf) -> Result<()> {
+    fn add(
+        &self,
+        auth: &Authority,
+        name: &str,
+        path: PathBuf,
+        auto_mount: bool,
+        writable: bool,
+    ) -> Result<()> {
         drop(self.check(auth)?);
-        let root = FolderRoot::open(&path).context("Opening the selected local NTFS directory")?;
+        let mut root = FolderRoot::open(&path)
+            .context("Opening the selected local NTFS directory")?
+            .with_write_access(writable);
+        if writable {
+            root.pin_write_location()
+                .context("Pinning the selected writable folder")?;
+            protected_paths::check(&root, &self.scope)?;
+        }
         let grant = Grant {
             id: format!("{:032x}", rand::random::<u128>()),
             name: name.into(),
             identity: root.identity()?,
             path,
+            auto_mount,
+            writable,
         };
-        let store =
-            Store::for_profile(&self.scope, auth, true)?.context("Missing profile identity")?;
+        let store = Store::issue(&self.scope, auth, &auth.epoch)?;
         drop(self.check(auth)?);
         store.add(grant.clone())?;
         {
@@ -471,16 +654,26 @@ impl Core {
             root.identity()? == grant.identity,
             "The selected Windows directory was replaced. Forget this permission and choose the folder again"
         );
+        let store = self.current_store(auth)?;
         ensure!(
-            self.saved(auth, &grant.name, &grant.id)? == *grant,
+            store.read()?.iter().any(|g| g.same_selection(grant)),
             "Folder permission changed"
         );
+        let mut root = root.with_write_access(grant.writable);
+        if grant.writable {
+            root.pin_write_location()
+                .context("Pinning the saved writable folder")?;
+            protected_paths::check(&root, &self.scope)?;
+        }
+        let root = root.with_profile_permission(store.revocation_gate(grant)?);
         let mut state = self.check(auth)?;
         let row = state
             .rows
             .get_mut(&grant.name)
             .context("Shared folder was removed")?;
-        if row.status != FolderMountStatus::Starting || row.grant.as_ref() != Some(grant) {
+        if row.status != FolderMountStatus::Starting
+            || !row.grant.as_ref().is_some_and(|g| g.same_selection(grant))
+        {
             return Ok(());
         }
         row.mount = Some(FolderMount::start(self.live(auth)?, root, &grant.name)?);
@@ -497,9 +690,7 @@ impl Core {
                 id.is_none_or(|id| id == grant.id),
                 "Shared folder was replaced"
             );
-            if let Some(store) = Store::for_profile(&self.scope, auth, false)? {
-                store.remove(&grant)?;
-            }
+            self.current_store(auth)?.remove(&grant)?;
         }
         self.check(auth)?.rows.remove(name);
         Ok(())
