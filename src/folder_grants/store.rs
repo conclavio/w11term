@@ -14,6 +14,8 @@ pub(super) struct Grant {
     pub identity: String,
     #[serde(default = "mount_by_default", skip_serializing_if = "is_enabled")]
     pub auto_mount: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writable: bool,
 }
 
 fn mount_by_default() -> bool {
@@ -30,6 +32,7 @@ impl Grant {
             && self.name == other.name
             && self.path == other.path
             && self.identity == other.identity
+            && self.writable == other.writable
     }
 }
 
@@ -235,6 +238,7 @@ mod tests {
             id: format!("{id:032x}"),
             identity: "ntfs-v1:volume:directory".into(),
             auto_mount: true,
+            writable: false,
             path,
         }
     }
@@ -257,12 +261,15 @@ mod tests {
         let other_writer = Store::inspect(&scope, &auth)?.1.unwrap();
         let mut second = grant(dir.path().join("second"), 2);
         second.name = "music".into();
+        second.writable = true;
         other_writer.add(second.clone())?;
         let grants = store.read()?;
         assert!(!grants[0].auto_mount && grants[0].same_selection(&first));
         assert_eq!(grants[1], second);
         let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&store.path)?)?;
         assert_eq!(json[0]["auto_mount"], false);
+        assert!(json[0].get("writable").is_none());
+        assert_eq!(json[1]["writable"], true);
         assert!(json[1].get("auto_mount").is_none());
         store.set_auto_mount(&grants[0], true)?;
         let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&store.path)?)?;
@@ -293,6 +300,10 @@ mod tests {
             },
             Grant {
                 identity: "ntfs-v1:replacement".into(),
+                ..first.clone()
+            },
+            Grant {
+                writable: true,
                 ..first.clone()
             },
         ] {

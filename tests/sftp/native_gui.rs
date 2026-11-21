@@ -4,7 +4,7 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "manages a verified profile's read-only folder consent with the native Windows folder picker"]
+#[ignore = "manages a verified profile's read-only and writable folder consent with the native Windows folder picker"]
 async fn native_shared_folders_keep_consent_bound_to_the_verified_ssh_profile() {
     let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 3).await else {
         unreachable!()
@@ -25,8 +25,9 @@ async fn native_shared_folders_keep_consent_bound_to_the_verified_ssh_profile() 
         b"share-shell-before-restartshare-shell-after-restart\x04share-shell-after-revocation"
     );
     assert_eq!(fs::read(selected.join("sample.txt")).unwrap(), b"unchanged");
-    assert!(
-        opens.load(Ordering::Relaxed) >= 7,
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        7,
         "three live shells and four refused mount attempts"
     );
     server.abort();
