@@ -1,93 +1,22 @@
-//! Check an actual selected Windows folder from an unprivileged Linux shell.
-use super::folder_share::{Export, Root, valid_read_path_encoding};
-use super::{ConnectionShare, durability::bounded_command, sharing::ShellChannel};
+//! Exercise profile grants and live Windows exports through a real Linux FUSE mount.
+use super::{
+    ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, durability::bounded_command,
+};
 use crate::{
+    folder_grants::{Authority, FolderScope, PaneShares},
     options::{Authentication, Source, SshOptions},
     session::{Command, Session},
 };
 use anyhow::{Context, Result, bail, ensure};
-use bytes::{Buf, Bytes, BytesMut};
-use russh::{
-    ChannelMsg,
-    keys::{HashAlg, PublicKey},
-};
-use russh_sftp::protocol::{Packet, Version};
+use bytes::Bytes;
+use russh::keys::{HashAlg, PublicKey};
 use sha2::{Digest, Sha256};
-use std::{env, fs, process::Command as ProcessCommand, sync::Arc, time::Duration};
-use tokio::{
-    task::JoinSet,
-    time::{Instant, sleep, timeout},
-};
+use std::{env, fs, path::Path, process::Command as ProcessCommand, sync::Arc, time::Duration};
+use tokio::time::{Instant, sleep, timeout};
 
 const NAME: &str = "windows-binary.bin";
 const CONTENT: &[u8] = b"w11term\x00\xff\x80\r\npassive SSHFS\x1b\xfe\x02";
-const MAX_PACKET: usize = 64 * 1024;
-
-async fn serve(mut shell: ShellChannel, mount: &str, mut export: Export) -> Result<()> {
-    let channel = shell.channel();
-    channel
-        .exec(true, format!("exec sshfs -f -o passive,ro :/ {mount}"))
-        .await?;
-    let mut frames = BytesMut::new();
-    let mut stderr = Vec::new();
-    let mut accepted = false;
-    let mut initialized = false;
-    let mut status_code = None;
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Success) => accepted = true,
-            Some(ChannelMsg::Failure) => bail!("sshd refused the SSHFS exec channel"),
-            Some(ChannelMsg::ExtendedData { data, .. }) => {
-                let take = data.len().min(4096 - stderr.len());
-                stderr.extend_from_slice(&data[..take]);
-            }
-            Some(ChannelMsg::Data { data }) => {
-                ensure!(
-                    accepted && frames.len() + data.len() <= 2 * MAX_PACKET,
-                    "invalid SSHFS input window"
-                );
-                frames.extend_from_slice(&data);
-                while frames.len() >= 4 {
-                    let len = u32::from_be_bytes(frames[..4].try_into()?) as usize;
-                    ensure!(
-                        (1..=MAX_PACKET).contains(&len),
-                        "invalid SFTP packet length"
-                    );
-                    if frames.len() < 4 + len {
-                        break;
-                    }
-                    frames.advance(4);
-                    let mut body = frames.split_to(len).freeze();
-                    ensure!(
-                        valid_read_path_encoding(&body),
-                        "invalid SFTP path encoding"
-                    );
-                    let request = Packet::try_from(&mut body)?;
-                    ensure!(body.is_empty(), "trailing SFTP input");
-                    let reply = match request {
-                        Packet::Init(init) if !initialized && init.version >= 3 => {
-                            initialized = true;
-                            Version::new().into()
-                        }
-                        Packet::Init(_) => bail!("unexpected SFTP initialization"),
-                        _ if !initialized => bail!("expected SFTP initialization"),
-                        request => export.reply(request),
-                    };
-                    channel.data_bytes(Bytes::try_from(reply)?).await?;
-                }
-            }
-            Some(ChannelMsg::ExitStatus { exit_status }) => status_code = Some(exit_status),
-            Some(ChannelMsg::Close) | None => break,
-            _ => {}
-        }
-    }
-    ensure!(
-        accepted && initialized && status_code == Some(0) && frames.is_empty(),
-        "SSHFS stopped with {status_code:?}: {}",
-        String::from_utf8_lossy(&stderr)
-    );
-    Ok(())
-}
+const HOME: &str = "/home/w11fixture";
 
 async fn checked(link: &ConnectionShare, command: &str) -> Result<Vec<u8>> {
     let result = bounded_command(link, command, 8192).await?;
@@ -108,7 +37,10 @@ async fn shell_pid(pane: &Session, label: &str) -> Result<u32> {
             ack,
         ))
         .map_err(|_| anyhow::anyhow!("interactive pane closed"))?;
-    acknowledged.await?.map_err(anyhow::Error::msg)?;
+    timeout(Duration::from_secs(5), acknowledged)
+        .await
+        .context("interactive shell did not accept the PID probe")??
+        .map_err(anyhow::Error::msg)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let frame = pane.frames.load();
@@ -129,28 +61,34 @@ async fn shell_pid(pane: &Session, label: &str) -> Result<u32> {
     }
 }
 
-async fn check_mount(link: &ConnectionShare, mount: &str, tile_digest: &str) -> Result<()> {
+async fn check_mount(link: &ConnectionShare, mount: &str, tile_digest: &str) -> Result<String> {
     let record = format!("awk '$5 == \"{mount}\" {{ print }}' /proc/self/mountinfo");
-    loop {
-        let bytes = checked(link, &record).await?;
-        if !bytes.is_empty() {
-            let line = std::str::from_utf8(&bytes)?;
-            let (fields, fs) = line.split_once(" - ").context("malformed mountinfo")?;
-            ensure!(
-                fs.split_whitespace().next() == Some("fuse.sshfs"),
-                "wrong mount: {line}"
-            );
-            ensure!(
-                fields
-                    .split_whitespace()
-                    .nth(5)
-                    .is_some_and(|opts| opts.split(',').any(|s| s == "ro")),
-                "writable mount: {line}"
-            );
-            break;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
+    let bytes = checked(link, &record).await?;
+    let line = std::str::from_utf8(&bytes)?;
+    let (fields, fs) = line
+        .split_once(" - ")
+        .context("mount reported Mounted without a Linux mountinfo entry")?;
+    let mut info = fs.split_whitespace();
+    let source = info
+        .next()
+        .and_then(|kind| kind.strip_prefix("fuse.sshfs."))
+        .context("unexpected filesystem type")?;
+    let token = source
+        .strip_prefix("w11term-")
+        .context("absent mount generation")?;
+    ensure!(
+        token.len() == 32
+            && token.bytes().all(|b| b.is_ascii_hexdigit())
+            && info.next() == Some(source),
+        "mount source and generation differ: {line}"
+    );
+    ensure!(
+        fields
+            .split_whitespace()
+            .nth(5)
+            .is_some_and(|opts| opts.split(',').any(|s| s == "ro")),
+        "writable mount: {line}"
+    );
     let listing = checked(
         link,
         &format!("LC_ALL=C ls -1A --quoting-style=literal {mount}"),
@@ -180,16 +118,14 @@ async fn check_mount(link: &ConnectionShare, mount: &str, tile_digest: &str) -> 
         &format!("if (printf X >> {mount}/{NAME}); then exit 1; fi"),
     )
     .await?;
-    Ok(())
+    Ok(source.to_owned())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires the disposable Linux FUSE guest and pinned loopback SSH supplied by the mount runner"]
-async fn native_windows_passive_sshfs() -> Result<()> {
+fn options() -> Result<SshOptions> {
     let port = env::var("W11TERM_MOUNT_TEST_PORT")?.parse::<u16>()?;
     let key = PublicKey::from_openssh(&env::var("W11TERM_MOUNT_TEST_HOST_KEY")?)?;
     let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
-    let options = SshOptions {
+    Ok(SshOptions {
         host: "127.0.0.1".into(),
         port,
         user: "w11fixture".into(),
@@ -198,7 +134,7 @@ async fn native_windows_passive_sshfs() -> Result<()> {
                 .context("missing temporary client key")?
                 .into(),
         },
-        host_key: Some(fingerprint.clone()),
+        host_key: Some(fingerprint),
         proxy_jump: vec![],
         terminal_type: Default::default(),
         durable: false,
@@ -206,8 +142,11 @@ async fn native_windows_passive_sshfs() -> Result<()> {
             reconnect: false,
             ..Default::default()
         },
-    };
-    let pane = Session::start_configured(Source::Ssh(options), Default::default(), false);
+    })
+}
+
+async fn login(options: &SshOptions) -> Result<(Session, ConnectionShare)> {
+    let pane = Session::start_configured(Source::Ssh(options.clone()), Default::default(), false);
     let link = timeout(Duration::from_secs(20), async {
         loop {
             if let Some(link) = pane.ssh_connection() {
@@ -224,10 +163,188 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     .await
     .context("loopback SSH login timed out")??;
     ensure!(
-        link.fingerprint() == fingerprint,
+        Some(link.fingerprint()) == options.host_key.as_deref(),
         "unexpected SSH host identity"
     );
-    let before = timeout(Duration::from_secs(6), shell_pid(&pane, "BEFORE_MOUNT")).await??;
+    Ok((pane, link))
+}
+
+async fn ready_authority(manager: &PaneShares) -> Result<Authority> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(authority) = manager.authority() {
+            return Ok(authority);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "profile sharing did not bind to the verified SSH pane"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_status(
+    get: impl Fn() -> Result<Option<FolderMountStatus>>,
+    expected: Option<FolderMountStatus>,
+    name: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = get()?;
+        if status == expected {
+            return Ok(());
+        }
+        if let Some(FolderMountStatus::Failed(error)) = &status {
+            bail!("mount {name}: {error}");
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "mount {name}: expected {expected:?}, received {status:?}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_profile(
+    manager: &PaneShares,
+    auth: &Authority,
+    name: &str,
+    expected: Option<FolderMountStatus>,
+) -> Result<()> {
+    wait_status(
+        || {
+            Ok(manager
+                .rows(auth)?
+                .into_iter()
+                .find(|row| row.name == name)
+                .map(|row| row.status))
+        },
+        expected,
+        name,
+    )
+    .await
+}
+
+async fn expect_refused(
+    link: &ConnectionShare,
+    path: &Path,
+    name: &str,
+    explanations: &[&str],
+) -> Result<()> {
+    ensure!(
+        super::valid_mount_name(name),
+        "invalid test mount name: {name}"
+    );
+    let root = FolderRoot::open(path)?;
+    let error = match FolderMount::start(link.clone(), root, name) {
+        Err(error) => format!("{error:#}"),
+        Ok(mount) => {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match mount.status() {
+                    FolderMountStatus::Starting => {}
+                    FolderMountStatus::Failed(error) => break error,
+                    state => bail!("unsafe mount {name} reached {state:?}"),
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "timed out waiting for mount {name} to be refused"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    ensure!(
+        explanations.iter().any(|s| error.contains(s)),
+        "unexpected reason for refusing {name}: {error}"
+    );
+    Ok(())
+}
+
+async fn wait_detached(link: &ConnectionShare, mount: &str) -> Result<()> {
+    let record = format!("awk '$5 == \"{mount}\" {{ print }}' /proc/self/mountinfo");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !checked(link, &record).await?.is_empty() {
+        ensure!(
+            Instant::now() < deadline,
+            "detached share is still mounted at {mount}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    checked(link, &format!("test ! -e {mount}/{NAME}")).await?;
+    Ok(())
+}
+
+async fn unmount_profile(
+    manager: &PaneShares,
+    auth: &Authority,
+    link: &ConnectionShare,
+    name: &str,
+    remote: &str,
+) -> Result<()> {
+    manager.unmount(auth, name)?;
+    if let Err(error) = wait_profile(manager, auth, name, Some(FolderMountStatus::Stopped)).await {
+        // The process status and kernel mount record tell us whether the
+        // daemon, its auto-unmount helper, or only the SSH channel survived.
+        let inspect = r#"awk -v path="$1" '$5 == path' /proc/self/mountinfo
+for proc in /proc/[0-9]*; do
+  read -r comm < "$proc/comm" 2>/dev/null || continue
+  case "$comm" in sshfs|fusermount3) awk '/^(Name|State|Pid|PPid):/' "$proc/status";; esac
+done"#;
+        // $1 is a fixture-generated absolute path.
+        let details = checked(link, &format!("set -- {remote}; {inspect}")).await;
+        return Err(error.context(format!(
+            "unmount {remote}; guest state: {}",
+            match details {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => format!("{error:#}"),
+            }
+        )));
+    }
+    wait_detached(link, remote).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the disposable Linux guest with its stock pre-3.15 FUSE helper"]
+async fn old_fusermount_refuses_before_export() -> Result<()> {
+    let (pane, link) = login(&options()?).await?;
+    let pid = shell_pid(&pane, "BEFORE_OLD_HELPER").await?;
+    let output = checked(&link, "fusermount3 --version").await?;
+    let version = std::str::from_utf8(&output)?
+        .trim()
+        .strip_prefix("fusermount3 version: ")
+        .context("unrecognized guest FUSE helper")?;
+    ensure!(
+        version.starts_with("3.14."),
+        "the legacy test requires a real 3.14.x helper, found {version}"
+    );
+
+    let clean_home = format!("test ! -e {HOME}/windows");
+    checked(&link, &clean_home).await?;
+    let fixture = tempfile::tempdir()?;
+    fs::write(fixture.path().join(NAME), CONTENT)?;
+    let name = format!("legacy-{:016x}", rand::random::<u64>());
+    expect_refused(
+        &link,
+        fixture.path(),
+        &name,
+        &[&format!("Found fusermount3 {version}. Upgrade")],
+    )
+    .await?;
+    wait_detached(&link, &format!("{HOME}/windows/{name}")).await?;
+    checked(&link, &clean_home)
+        .await
+        .context("old helper created a mount or lock directory")?;
+    ensure!(shell_pid(&pane, "AFTER_OLD_HELPER").await? == pid);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the disposable Linux FUSE guest and pinned loopback SSH supplied by the mount runner"]
+async fn native_windows_passive_sshfs() -> Result<()> {
+    let options = options()?;
+    let (pane, link) = login(&options).await?;
+    let before = shell_pid(&pane, "BEFORE_MOUNT").await?;
     let fixture = tempfile::tempdir()?;
     let selected = fixture.path().join("selected");
     let outside = fixture.path().join("sibling");
@@ -261,48 +378,164 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     ensure!(fs::read(selected.join("other-folder").join("secret"))? == b"sibling data");
     let path = selected.join(NAME);
     fs::write(&path, CONTENT)?;
-    let export = Export::new(Root::open(&selected)?);
-    let mount = format!("/tmp/w11term-mount-{:032x}", rand::random::<u128>());
-    let shell = timeout(Duration::from_secs(6), link.open_shell()).await??;
-    checked(&link, &format!("umask 077 && mkdir {mount}")).await?;
-    let mut servers = JoinSet::new();
-    let mount_arg = mount.clone();
-    servers.spawn(async move { serve(shell, &mount_arg, export).await });
-    let verified = timeout(Duration::from_secs(24), async {
-        tokio::select! {
-            result = check_mount(&link, &mount, &tile_digest) => result,
-            ended = servers.join_next() => bail!("SSHFS quit before mount verification: {ended:?}"),
-        }
-    })
-    .await
-    .context("SSHFS mount/read timed out")
-    .and_then(|result| result);
-    // Clean up only our freshly created, private directory, even when checks fail.
-    let mounted =
-        format!("awk '$5 == \"{mount}\" {{present=1}} END {{exit !present}}' /proc/self/mountinfo");
-    let unmount = format!(
-        "set -e
-         if {mounted}; then fusermount3 -u {mount}; fi
-         if {mounted}; then echo 'mount still present' >&2; exit 1; fi
-         rmdir {mount}"
-    );
-    let cleanup = checked(&link, &unmount).await;
-    verified?;
-    cleanup?;
-    timeout(Duration::from_secs(6), servers.join_next())
-        .await?
-        .context("SSHFS task missing")???;
+    let name = format!("ci-{:016x}", rand::random::<u64>());
+    let remote = format!("{HOME}/windows/{name}");
+    let catalog = fixture.path().join("profiles.json");
+    fs::write(
+        &catalog,
+        serde_json::to_vec(&serde_json::json!({"profiles":{"linux": &options}}))?,
+    )?;
+    let scope = || {
+        FolderScope::new(
+            catalog.clone(),
+            "linux".into(),
+            fixture.path().join("grants"),
+        )
+    };
+    let manager = pane.profile_folders(scope());
+    let auth = ready_authority(&manager).await?;
+    manager.add(&auth, &name, selected.clone())?;
+    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted))
+        .await
+        .context("initial saved grant mount")?;
+    let initial = check_mount(&link, &remote, &tile_digest).await?;
+
+    // Another lease on this name, even with a different root, must leave the first mount intact.
+    expect_refused(
+        &link,
+        &outside,
+        &name,
+        &["holds this name", "already mounted"],
+    )
+    .await?;
     ensure!(
-        fs::read(path)? == CONTENT && fs::read(secret)? == b"sibling data",
-        "Windows fixture changed"
+        initial == check_mount(&link, &remote, &tile_digest).await?,
+        "collision replaced the original mount"
     );
-    let after = timeout(Duration::from_secs(6), shell_pid(&pane, "AFTER_MOUNT")).await??;
+    let nonempty = format!("{name}-occupied");
+    let symlink = format!("{name}-link");
+    let occupied = format!("{HOME}/windows/{nonempty}");
+    let alias = format!("{HOME}/windows/{symlink}");
+    let empty_target = format!("/tmp/{name}-elsewhere");
+    checked(&link, &format!("set -e; mkdir -m 700 {occupied} {empty_target}; printf preserved > {occupied}/sentinel; ln -s {empty_target} {alias}")).await?;
+    expect_refused(&link, &selected, &nonempty, &["not empty"]).await?;
+    expect_refused(&link, &selected, &symlink, &["symbolic link"]).await?;
+    ensure!(checked(&link, &format!("cat {occupied}/sentinel")).await? == b"preserved");
+    ensure!(
+        checked(&link, &format!("readlink {alias}")).await?
+            == format!("{empty_target}\n").as_bytes()
+    );
+    checked(
+        &link,
+        &format!("set -e; rm -- {alias} {occupied}/sentinel; rmdir -- {occupied} {empty_target}"),
+    )
+    .await?;
+
+    unmount_profile(&manager, &auth, &link, &name, &remote)
+        .await
+        .context("first explicit unmount after collision and destination checks")?;
+
+    let original = fixture.path().join("original");
+    fs::rename(&selected, &original)?;
+    fs::create_dir(&selected)?;
+    fs::write(selected.join(NAME), b"unapproved replacement")?;
+    manager.mount(&auth, &name)?;
+    let refusal = wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted))
+        .await
+        .err()
+        .context("the saved grant mounted a replacement Windows directory")?;
+    ensure!(
+        refusal.to_string().contains("directory was replaced"),
+        "unexpected refusal for a replaced directory: {refusal:#}"
+    );
+    wait_detached(&link, &remote).await?;
+    fs::rename(&selected, fixture.path().join("replacement"))?;
+    fs::rename(&original, &selected)?;
+    manager.mount(&auth, &name)?;
+    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted)).await?;
+    let restored = check_mount(&link, &remote, &tile_digest).await?;
+    ensure!(
+        restored != initial,
+        "restoring the original reused its old mount"
+    );
+    unmount_profile(&manager, &auth, &link, &name, &remote)
+        .await
+        .context("unmount after restoring the original Windows directory")?;
+
+    let manual = FolderMount::start(link.clone(), FolderRoot::open(&selected)?, &name)?;
+    wait_status(
+        || Ok(Some(manual.status())),
+        Some(FolderMountStatus::Mounted),
+        &name,
+    )
+    .await?;
+    ensure!(
+        check_mount(&link, &remote, &tile_digest).await? != restored,
+        "new mount reused its generation"
+    );
+    drop(manual);
+    wait_detached(&link, &remote).await?;
+    manager.mount(&auth, &name)?;
+    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted)).await?;
+    let before_disconnect = check_mount(&link, &remote, &tile_digest).await?;
+    ensure!(shell_pid(&pane, "AFTER_MOUNT").await? == before);
     let still_live = pane
         .ssh_connection()
         .context("interactive SSH connection lost")?;
     ensure!(
-        after == before && Arc::ptr_eq(&still_live.handle(), &link.handle()),
-        "shell or transport replaced"
+        Arc::ptr_eq(&still_live.handle(), &link.handle()),
+        "original SSH transport was replaced"
+    );
+
+    link.handle()
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "isolated mount reconnect test",
+            "en",
+        )
+        .await?;
+    let (new_pane, new_link) = login(&options).await?;
+    ensure!(
+        !Arc::ptr_eq(&new_link.handle(), &link.handle()),
+        "fixture did not open a fresh authenticated connection"
+    );
+    // Keep the old manager and lease alive until the guest confirms transport
+    // loss itself revoked the mount.
+    wait_detached(&new_link, &remote).await?;
+    drop(manager);
+    drop(pane);
+    let new_pid = shell_pid(&new_pane, "RECONNECTED").await?;
+    let reopened = new_pane.profile_folders(scope());
+    let new_auth = ready_authority(&reopened).await?;
+    wait_profile(
+        &reopened,
+        &new_auth,
+        &name,
+        Some(FolderMountStatus::Mounted),
+    )
+    .await?;
+    ensure!(
+        check_mount(&new_link, &remote, &tile_digest).await? != before_disconnect,
+        "saved grant reused its stale mount"
+    );
+    ensure!(
+        reopened.forget(&auth, &name).is_err(),
+        "previous pane authority could change a new mount"
+    );
+    reopened.forget(&new_auth, &name)?;
+    wait_profile(&reopened, &new_auth, &name, None).await?;
+    wait_detached(&new_link, &remote).await?;
+    drop(reopened);
+    let after_forget = new_pane.profile_folders(scope());
+    let auth = ready_authority(&after_forget).await?;
+    ensure!(
+        after_forget.rows(&auth)?.is_empty(),
+        "the forgotten grant reappeared when the saved profile was reopened"
+    );
+    ensure!(shell_pid(&new_pane, "AFTER_FORGET").await? == new_pid);
+    ensure!(
+        fs::read(path)? == CONTENT && fs::read(secret)? == b"sibling data",
+        "Windows fixture changed"
     );
     Ok(())
 }

@@ -11,6 +11,7 @@ use windows::{
 
 pub(super) enum Purpose {
     Open,
+    Folder,
     Save(String),
     Scrollback,
 }
@@ -27,6 +28,20 @@ fn shell_path(item: &IShellItem) -> wincore::Result<PathBuf> {
         CoTaskMemFree(Some(wide.0.cast()));
         Ok(path.into())
     }
+}
+
+#[cfg(feature = "ui-smoke")]
+fn fixture_picker_folder(dialog: &IFileDialog, variable: &str) -> wincore::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    let Some(folder) = std::env::var_os(variable) else {
+        return Ok(false);
+    };
+    let path: Vec<_> = folder.encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None)?;
+        dialog.SetFolder(&item)?;
+    }
+    Ok(true)
 }
 
 // FOS_OVERWRITEPROMPT lets the shell ask for confirmation. Remember the destination it
@@ -89,7 +104,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
             }
         }
         let _apartment = Apartment;
-        let clsid = if matches!(purpose, Purpose::Open) {
+        let clsid = if matches!(purpose, Purpose::Open | Purpose::Folder) {
             FileOpenDialog
         } else {
             FileSaveDialog
@@ -99,6 +114,13 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
         let confirmed = Rc::new(RefCell::new(None));
         let cookie = match purpose {
             Purpose::Open => None,
+            Purpose::Folder => {
+                dialog.SetTitle(w!("Choose a folder to share"))?;
+                options |= FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                #[cfg(feature = "ui-smoke")]
+                fixture_picker_folder(&dialog, "W11TERM_FOLDER_SHARE_SMOKE_DIR")?;
+                None
+            }
             Purpose::Save(suggestion) => {
                 let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
@@ -106,13 +128,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
             }
             Purpose::Scrollback => {
                 #[cfg(feature = "ui-smoke")]
-                if let Some(folder) = std::env::var_os("W11TERM_EXPORT_SMOKE_DIR") {
-                    use std::os::windows::ffi::OsStrExt;
-                    // Isolate the real Shell picker, including its suggested file.
-                    let path: Vec<_> = folder.encode_wide().chain(Some(0)).collect();
-                    let item: IShellItem =
-                        SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None)?;
-                    dialog.SetFolder(&item)?;
+                if fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")? {
                     options |= FOS_DONTADDTORECENT;
                 }
                 dialog.SetTitle(w!("Save scrollback as text"))?;

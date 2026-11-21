@@ -5,6 +5,7 @@ use w11term::shortcuts::BINDINGS;
 pub enum CommandId {
     Menu(String),
     SaveScrollback(Option<u64>),
+    SharedFolders(Option<u64>),
     RestartExited(Option<ExitedPane>),
     Profile(String),
     Shortcut(Shortcut),
@@ -47,7 +48,9 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
             } => {
                 if (!enabled && key == "panes".into())
                     || (!profiles
-                        && (key == "save-scrollback".into() || key == "restart-exited".into()))
+                        && (key == "save-scrollback".into()
+                            || key == "restart-exited".into()
+                            || key == "shared-folders".into()))
                 {
                     continue;
                 }
@@ -127,6 +130,12 @@ impl TerminalApp {
         });
         let tab_count = self.tabs.headers().len();
         let pane = live.map(|tab| tab.session.pane_id);
+        rows.push(Row {
+            id: CommandId::SharedFolders(pane),
+            label: folder_shares::LABEL.into(),
+            chord: String::new(),
+            enabled: pane.and_then(|p| self.folder_authority(p)).is_some(),
+        });
         rows.push(Row {
             id: CommandId::RestartExited(exited),
             label: RESTART_EXITED_PANE.into(),
@@ -233,6 +242,10 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::SharedFolders(Some(pane)) => {
+                Message::FolderShare(folder_shares::Action::Open(pane))
+            }
+            CommandId::SharedFolders(None) => return,
             CommandId::RestartExited(Some(exit)) => Message::RestartExited(exit),
             CommandId::RestartExited(None) => return,
             CommandId::SaveScrollback(pane) => {

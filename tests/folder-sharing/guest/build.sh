@@ -3,13 +3,15 @@
 set -euo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive
 umask 022
-if [[ $# != 1 || $EUID != 0 || $(dpkg --print-architecture) != amd64 ]]; then
-    echo "Usage: sudo bash tests/folder-sharing/guest/build.sh OUTPUT (Ubuntu 24.04 amd64)" >&2
+if [[ $# -lt 1 || $# -gt 2 || $EUID != 0 || $(dpkg --print-architecture) != amd64 ]]; then
+    echo "Usage: sudo bash tests/folder-sharing/guest/build.sh OUTPUT [resolute|noble] (Ubuntu 24.04 amd64 builder)" >&2
     exit 2
 fi
 # shellcheck source=/dev/null
 source /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 ]] || { echo "Ubuntu 24.04 required" >&2; exit 2; }
+suite=${2:-resolute}
+[[ $suite == resolute || $suite == noble ]] || { echo "Unknown guest suite: $suite" >&2; exit 2; }
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 mkdir -p -- "$1"
 out=$(cd -- "$1" && pwd)
@@ -24,16 +26,16 @@ apt-get -qq install -y --no-install-recommends mmdebstrap ubuntu-keyring kmod cp
 
 # Install SSH and FUSE only in the guest. mmdebstrap runs maintainer scripts
 # inside its private root and suppresses service startup during the bootstrap.
-# Noble's base-files owns the /usr symlinks and provides usr-is-merged.
+# Each guest runs its distribution's packaged SSHFS and setuid FUSE helper.
 mmdebstrap --mode=root --variant=minbase --architectures=amd64 \
     --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
     --include=openssh-server,sshfs,fuse3,busybox-static,iproute2,util-linux,mount \
     --dpkgopt='path-exclude=/usr/share/doc/*' \
     --dpkgopt='path-exclude=/usr/share/man/*' \
-    noble "$root" \
-    'deb http://archive.ubuntu.com/ubuntu noble main universe' \
-    'deb http://archive.ubuntu.com/ubuntu noble-updates main universe' \
-    'deb http://security.ubuntu.com/ubuntu noble-security main universe'
+    "$suite" "$root" \
+    "deb http://archive.ubuntu.com/ubuntu $suite main universe" \
+    "deb http://archive.ubuntu.com/ubuntu $suite-updates main universe" \
+    "deb http://security.ubuntu.com/ubuntu $suite-security main universe"
 
 # Pick one signed, general-purpose Ubuntu kernel and its own modules. The
 # runner's booted kernel may be an Azure flavour, with a different ABI/config.
@@ -105,6 +107,7 @@ install -m 0644 "$kernel/boot/vmlinuz-$abi" "$out/vmlinuz"
 (cd "$root"; find . -print0 | sort -z | cpio --null --quiet -o -H newc | gzip -1) >"$out/initramfs.gz"
 {
     echo "Kernel: $kernel_pkg"
+    echo "Guest suite: $suite"
     (cd "$work/debs"; sha256sum -- *.deb)
     chroot "$root" dpkg-query -W
     (cd "$out"; sha256sum vmlinuz initramfs.gz)

@@ -8,6 +8,7 @@ pub mod demo;
 pub mod durable;
 pub mod enroll;
 pub mod events;
+pub mod folder_grants;
 pub mod hints;
 pub mod interaction;
 pub mod keys;
