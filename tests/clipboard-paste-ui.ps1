@@ -66,11 +66,10 @@ function Expect-Bytes([string]$Append) {
     $want = [Convert]::ToBase64String($expected.ToArray())
     try {
         $null = Wait-Until "exactly $($expected.Count) SSH input bytes" {
-            try { [Convert]::ToBase64String([IO.File]::ReadAllBytes($trace)) -ceq $want }
-            catch [IO.IOException] { $false }
+            [Convert]::ToBase64String((Read-PeerTrace $traceReader)) -ceq $want
         }
     } catch {
-        $got = [IO.File]::ReadAllBytes($trace)
+        $got = Read-PeerTrace $traceReader
         $i = 0
         while ($i -lt $expected.Count -and $i -lt $got.Length -and $expected[$i] -eq $got[$i]) { $i++ }
         throw "$_ Received $($got.Length) bytes; first difference at $i."
@@ -135,6 +134,7 @@ function Back-ToSsh {
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
+    $traceReader = Open-PeerTraceReader $trace
     $window = Wait-InputWindow
     $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
     $remote = (Control @('list')).sessions[0].id
@@ -241,6 +241,7 @@ try {
 } catch {
     throw "$_ at $($_.ScriptStackTrace). Peer received $((Get-Item -LiteralPath $trace).Length) bytes."
 } finally {
+    if ($traceReader) { $traceReader.Dispose() }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
