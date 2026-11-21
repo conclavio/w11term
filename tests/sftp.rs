@@ -55,6 +55,35 @@ impl server::Handler for Peer {
         s.channel_success(c)?;
         Ok(())
     }
+    async fn exec_request(
+        &mut self,
+        c: ChannelId,
+        command: &[u8],
+        s: &mut server::Session,
+    ) -> anyhow::Result<()> {
+        let trace = self.root.join("workspace-exec.bin");
+        if !trace.exists() {
+            s.channel_failure(c)?;
+            return Ok(());
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .open(trace)?
+            .write_all(command)?;
+        let drop_once = self.root.join("drop-before-exec-reply");
+        if drop_once.exists() {
+            fs::remove_file(drop_once)?;
+            s.disconnect(
+                russh::Disconnect::ByApplication,
+                "fixture lost link before exec reply",
+                "en",
+            )?;
+            return Ok(());
+        }
+        s.channel_success(c)?;
+        s.data(c, b"workspace-command-started\r\n".as_slice())?;
+        Ok(())
+    }
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
         s.channel_success(c)?;
         s.data(c, b"ready\r\n".as_slice())?;
@@ -450,6 +479,71 @@ async fn fixture(
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_workspace_exec_reply_does_not_dispatch_command_again() {
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let trace = remote.path().join("workspace-exec.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(remote.path().join("drop-before-exec-reply"), []).unwrap();
+    let command = "make deploy";
+    let startup = w11term::workspace::SshStartup::new(&ssh, String::new(), command.into()).unwrap();
+    let session = Session::start_workspace_ssh(ssh, Default::default(), false, startup);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !session
+            .frames
+            .load()
+            .status
+            .contains("Workspace command interrupted")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "Expected final interruption status, got {:?}; channels {}, recorded {:?}",
+            session.frames.load().status,
+            opens.load(Ordering::Relaxed),
+            fs::read_to_string(&trace)
+        )
+    });
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(fs::read(trace).unwrap(), command.as_bytes());
+    drop(session);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let trace = remote.path().join("workspace-exec.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(remote.path().join("drop-before-exec-reply"), []).unwrap();
+    let startup = w11term::workspace::SshStartup::new(&ssh, "/work".into(), String::new()).unwrap();
+    let session = Session::start_workspace_ssh(ssh, Default::default(), false, startup);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while session.frames.load().connection_generation != 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("directory-only shell should reconnect after the first exec loses its reply");
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        fs::read_to_string(trace).unwrap(),
+        r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/work'"#.repeat(2)
+    );
+    drop(session);
+    server.abort();
+}
+
 async fn request(op: Value) -> control::Reply {
     let request: Request =
         serde_json::from_value(json!({"verb":"sftp","pane":1,"timeout_seconds":10,"operation":op}))

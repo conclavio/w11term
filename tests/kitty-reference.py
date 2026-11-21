@@ -1,5 +1,5 @@
-"""Capture the checked-in VT fixture from a real kitty under Xvfb on Linux."""
-import fcntl
+"""Capture the shared VT fixture from kitty or Ghostty under Xvfb on Linux."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -7,7 +7,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 
 from PIL import Image
@@ -16,60 +15,99 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "kitty"
 
 
 def display(ready):
+    import fcntl
+    import termios
+
     sys.stdout.buffer.write((FIXTURE / "placements.vt").read_bytes())
     sys.stdout.buffer.flush()
-    rows, cols, width, height = struct.unpack(
-        "HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, bytes(8))
-    )
-    ready.write_text(json.dumps([cols, rows, width, height]))
-    time.sleep(35)
+    # GTK can resize the PTY after launching this command. Publish measured
+    # geometry atomically so a capture never reads a partial or stale startup grid.
+    previous = None
+    deadline = time.monotonic() + 50
+    while time.monotonic() < deadline:
+        rows, cols, width, height = struct.unpack(
+            "HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, bytes(8))
+        )
+        geometry = [cols, rows, width, height]
+        if cols and rows and geometry != previous:
+            pending = ready.with_suffix(".tmp")
+            pending.write_text(json.dumps(geometry))
+            pending.replace(ready)
+            previous = geometry
+        time.sleep(0.05)
 
 
-def compare(png, geometry):
+def compare(png, geometry, report):
     cols, rows, width, height = geometry
     with Image.open(png) as image:
         image = image.convert("RGB")
-        # The isolated kitty process has no padding, tab bar, or decorations.
+        # The Linux terminals use zero padding and no client decorations.
         cell_width = (width or image.width) / cols
         cell_height = (height or image.height) / rows
+        measured = []
         for item in json.loads((FIXTURE / "samples.json").read_text()):
             x = int((item["column"] + 0.5) * cell_width)
             y = int((item["row"] + 0.5) * cell_height)
-            actual = image.getpixel((x, y))
-            if any(abs(a - b) >= 32 for a, b in zip(actual, item["rgb"])):
-                raise ValueError(f"{item}: pixel ({x},{y}) was {actual}")
+            actual = image.getpixel((x, y)) if x < image.width and y < image.height else None
+            passed = actual is not None and all(abs(a - b) < 32 for a, b in zip(actual, item["rgb"]))
+            measured.append({**item, "pixel": [x, y], "actual": actual, "passed": passed})
+        report.write_text(json.dumps({"image_size": image.size, "samples": measured}, indent=2))
+        failures = [sample for sample in measured if not sample["passed"]]
+        if failures:
+            raise ValueError(f"Cell color mismatch in {png}: {failures}")
 
 
-def capture(output):
-    output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as state:
-        ready = Path(state) / "geometry"
-        cmd = ["kitty", "--config", "NONE", "--title", "w11term-graphics-reference"]
+def launch_command(terminal, title):
+    if terminal == "kitty":
+        cmd = ["kitty", "--config", "NONE", "--title", title]
         for option in ("linux_display_server=x11", "remember_window_size=no",
                        "initial_window_width=40c", "initial_window_height=12c",
                        "window_padding_width=0", "hide_window_decorations=yes",
                        "background=#000000", "cursor_blink_interval=0"):
             cmd.extend(["--override", option])
+        return cmd
+    return [
+        "ghostty", "--config-default-files=false", "--gtk-single-instance=false",
+        f"--title={title}", "--window-decoration=none", "--window-show-tab-bar=never",
+        "--window-width=40", "--window-height=12", "--window-padding-x=0",
+        "--window-padding-y=0", "--window-padding-balance=false", "--background=000000",
+        "--font-family=DejaVu Sans Mono", "--shell-integration=none", "-e",
+    ]
+
+
+def capture(output, terminal):
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as state, (output / f"{terminal}.log").open("w") as log:
+        ready = Path(state) / "geometry"
+        title = f"w11term-{terminal}-reference-{os.getpid()}"
+        cmd = launch_command(terminal, title)
         cmd.extend([sys.executable, str(Path(__file__).resolve()), "--display", str(ready)])
-        env = {**os.environ, "LIBGL_ALWAYS_SOFTWARE": "1", "KITTY_CONFIG_DIRECTORY": state}
-        proc = subprocess.Popen(cmd, env=env)
+        env = {**os.environ, "LIBGL_ALWAYS_SOFTWARE": "1"}
+        if terminal == "kitty":
+            env["KITTY_CONFIG_DIRECTORY"] = state
+        else:
+            env.update(GDK_BACKEND="x11", GSK_RENDERER="gl", GDK_SCALE="1",
+                       XDG_CONFIG_HOME=state, XDG_STATE_HOME=state)
+        proc = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + 30
             while not ready.exists() and time.monotonic() < deadline:
                 if proc.poll() is not None:
-                    raise RuntimeError(f"kitty exited with {proc.returncode}")
+                    raise RuntimeError(f"{terminal} exited with {proc.returncode}. See {log.name}")
                 time.sleep(0.05)
-            geometry = json.loads(ready.read_text())
-            (output / "geometry.json").write_text(json.dumps(geometry))
+            if not ready.exists():
+                raise RuntimeError(f"Timed out waiting for the PTY in {terminal}. See {log.name}")
             wid = subprocess.check_output(
-                ["xdotool", "search", "--onlyvisible", "--name", "^w11term-graphics-reference$"],
-                text=True, timeout=4
+                ["xdotool", "search", "--sync", "--onlyvisible", "--name", f"^{title}$"],
+                text=True, timeout=6
             ).splitlines()[-1]
-            png = output / "kitty.png"
+            png = output / f"{terminal}.png"
             while True:
+                geometry = json.loads(ready.read_text())
+                (output / "geometry.json").write_text(json.dumps(geometry))
                 subprocess.run(["import", "-window", wid, str(png)], check=True, timeout=5)
                 try:
-                    compare(png, geometry)
+                    compare(png, geometry, output / "samples.json")
                     break
                 except ValueError:
                     if time.monotonic() >= deadline:
@@ -85,7 +123,11 @@ def capture(output):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "--display":
+    if sys.argv[1:2] == ["--display"]:
         display(Path(sys.argv[2]))
     else:
-        capture(Path(sys.argv[1]))
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("output", type=Path)
+        parser.add_argument("--terminal", choices=("kitty", "ghostty"), default="kitty")
+        args = parser.parse_args()
+        capture(args.output, args.terminal)

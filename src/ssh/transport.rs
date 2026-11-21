@@ -513,6 +513,9 @@ pub(crate) async fn run_with_sharing(
 ) -> Result<()> {
     options.validate_route()?;
     let passwords = vec![None; options.proxy_jump.len() + 1];
+    if let Some(startup) = &sharing.startup {
+        startup.check_target(&options)?;
+    }
     let lifecycle = sharing.durable.take();
     let game = (options.player.rustmush && !options.durable).then(game_resume::Pane::new);
     let mut driver = Driver {
@@ -525,6 +528,7 @@ pub(crate) async fn run_with_sharing(
         sharing,
         passwords,
         generation: 0,
+        command_dispatched: false,
         game,
     };
     if let Some(worker) = lifecycle {
@@ -544,6 +548,7 @@ pub(super) struct Driver {
     sharing: Sharing,
     passwords: Vec<Option<Zeroizing<String>>>,
     generation: u64,
+    command_dispatched: bool,
     game: Option<game_resume::Pane>,
 }
 
@@ -646,6 +651,11 @@ impl Driver {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             };
+            if self.command_dispatched && error.downcast_ref::<Permanent>().is_none() {
+                return Err(error.context(
+                    "Workspace command interrupted; reopen the workspace to run it again",
+                ));
+            }
             if matches!(program, Program::End(_))
                 || error.downcast_ref::<Permanent>().is_some()
                 || error.downcast_ref::<LifecycleError>().is_some()
@@ -695,6 +705,8 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
         events,
         generation,
         game,
+        sharing,
+        command_dispatched,
         ..
     } = driver;
     let generation = *generation;
@@ -750,7 +762,12 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 .set_env(false, game_resume::ENVIRONMENT, probe.marker())
                 .await?;
         }
-        channel.request_shell(true).await?;
+        if let Some(startup) = &sharing.startup {
+            *command_dispatched = !startup.command.is_empty();
+            channel.exec(true, startup.exec_request()).await?;
+        } else {
+            channel.request_shell(true).await?;
+        }
     } else if size.cols != original_size.cols
         || size.rows != original_size.rows
         || size.pixel_width != original_size.pixel_width
@@ -873,7 +890,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
                 Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
-                Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or shell request ({pending} outstanding)"))),
+                Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),
                 Some(russh::ChannelMsg::ExitStatus{exit_status})=>{output.send(Event::Status(format!("Remote process exited ({exit_status})"))).await?;return Ok(());},
                 Some(russh::ChannelMsg::Close)=>return Ok(()),None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
             }

@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 const VERSION: u32 = 1;
 const MAX_DEPTH: usize = 32;
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+mod startup;
+pub use startup::SshStartup;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -35,6 +37,10 @@ pub enum SavedSource {
     /// Connection options contain authentication methods and key paths; live
     /// passwords, private key material and authentication answers live elsewhere.
     Ssh(SshOptions),
+    Startup {
+        connection: Box<SavedSource>,
+        launch: SshStartup,
+    },
     Durable {
         connection: Box<SavedSource>,
         session: DurableReference,
@@ -65,7 +71,9 @@ impl SavedSource {
         match self {
             Self::SavedProfile(name) | Self::Discovery(name) => Some(name),
             Self::Local { name, .. } => name.as_deref(),
-            Self::Durable { connection, .. } => connection.profile_name(),
+            Self::Durable { connection, .. } | Self::Startup { connection, .. } => {
+                connection.profile_name()
+            }
             _ => None,
         }
     }
@@ -120,6 +128,14 @@ impl SavedSource {
 
     fn validate(&self) -> Result<()> {
         match self {
+            Self::Startup { connection, launch } => {
+                ensure!(
+                    matches!(connection.as_ref(), Self::SavedProfile(_) | Self::Ssh(_)),
+                    "Workspace startup requires an SSH connection"
+                );
+                connection.validate()?;
+                launch.validate()?;
+            }
             Self::Durable {
                 connection,
                 session,
@@ -178,6 +194,14 @@ impl SavedSource {
     pub fn resolve(&self, profiles: &BTreeMap<String, SshOptions>) -> Result<Source> {
         self.validate()?;
         Ok(match self {
+            Self::Startup { connection, launch } => {
+                let source = connection.resolve(profiles)?;
+                let Source::Ssh(options) = &source else {
+                    anyhow::bail!("Workspace startup requires SSH")
+                };
+                launch.check_target(options)?;
+                source
+            }
             Self::Durable {
                 connection,
                 session,
@@ -545,6 +569,80 @@ mod tests {
             proxy_jump: Vec::new(),
             durable: false,
             player: Default::default(),
+        }
+    }
+
+    #[test]
+    fn startup_exec_preserves_the_command_and_quotes_directory_arguments() {
+        let opts = ssh("dev.example");
+        let build = "printf '%s' \"$PWD\"";
+        let recipe = |dir: &str, cmd: &str| SshStartup::new(&opts, dir.into(), cmd.into());
+        assert_eq!(recipe("", build).unwrap().exec_request(), build);
+        assert_eq!(
+            recipe("/a'b/$user", "").unwrap().exec_request(),
+            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/a'\''b/$user'"#
+        );
+        assert_eq!(
+            recipe("/a b", build).unwrap().exec_request(),
+            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -c "$2"' w11term '/a b' 'printf '\''%s'\'' "$PWD"'"#
+        );
+        for (dir, command) in [
+            ("", ""),
+            ("relative/dir", build),
+            ("/dir\0", ""),
+            ("", "a\0b"),
+        ] {
+            assert!(recipe(dir, command).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_startup_remains_bound_to_its_ordinary_ssh_account() {
+        let opts = ssh("dev.example");
+        let launch = SshStartup::new(&opts, "/work".into(), "make".into()).unwrap();
+        let source = SavedSource::Startup {
+            connection: Box::new(SavedSource::SavedProfile("dev".into())),
+            launch: launch.clone(),
+        };
+        let saved: SavedSource =
+            serde_json::from_slice(&serde_json::to_vec(&source).unwrap()).unwrap();
+        assert_eq!(saved, source);
+        assert_eq!(saved.profile_name(), Some("dev"));
+        let resolve = |opts| saved.resolve(&BTreeMap::from([("dev".into(), opts)]));
+        assert_eq!(resolve(opts.clone()).unwrap(), Source::Ssh(opts.clone()));
+        let mut game = opts.clone();
+        game.player.rustmush = true;
+        for changed in [
+            ssh("other.example"),
+            SshOptions {
+                port: 2222,
+                ..opts.clone()
+            },
+            SshOptions {
+                user: "other".into(),
+                ..opts.clone()
+            },
+            SshOptions {
+                durable: true,
+                ..opts
+            },
+            game,
+        ] {
+            assert!(resolve(changed).is_err());
+        }
+        for connection in [
+            SavedSource::Demo,
+            SavedSource::Discovery("dev".into()),
+            saved,
+        ] {
+            assert!(
+                SavedSource::Startup {
+                    connection: Box::new(connection),
+                    launch: launch.clone()
+                }
+                .validate()
+                .is_err()
+            );
         }
     }
 

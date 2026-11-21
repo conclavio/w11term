@@ -35,6 +35,7 @@ windows-core-next = { package = "windows-core", version = "=0.100.0" }
 windows-numerics = "0.3"
 russh-sftp = "3"
 regex = "1.13.1"
+regex-syntax = "0.8"
 sha2 = "0.11.1"
 sha1 = "0.11"
 hmac = "0.13"

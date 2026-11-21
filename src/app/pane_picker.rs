@@ -1,4 +1,158 @@
 use super::*;
+use w11term::terminal::{FrameStore, Snapshot};
+
+struct Preview {
+    pane: u64,
+    frames: FrameStore,
+    frame: Rc<RefCell<Arc<Snapshot>>>,
+    summary: String,
+    invalidator: Invalidator,
+    canvas: Option<View>,
+    watch: Option<ComponentTask>,
+}
+
+impl Preview {
+    fn new(pane: u64, frames: FrameStore, appearance: &Appearance) -> Self {
+        let snapshot = frames.load();
+        let summary = preview_summary(&snapshot);
+        let frame = Rc::new(RefCell::new(snapshot));
+        let invalidator = Invalidator::default();
+        let canvas = Renderer::with_size(
+            &appearance.font_family,
+            appearance.ligatures,
+            appearance.font_size,
+        )
+        .map(|renderer| {
+            let renderer = RefCell::new(renderer);
+            let frame = Rc::clone(&frame);
+            Canvas::invalidated(&invalidator, move |ctx| {
+                renderer.borrow_mut().draw_preview(
+                    ctx,
+                    ctx.width,
+                    ctx.height,
+                    ctx.device_changed(),
+                    &frame.borrow(),
+                )
+            })
+            .on_error(|error| log::warn!("Drawing pane preview: {error:?}"))
+            .into()
+        })
+        .inspect_err(|error| log::warn!("Creating pane preview: {error}"))
+        .ok();
+        Self {
+            pane,
+            frames,
+            frame,
+            summary,
+            invalidator,
+            canvas,
+            watch: None,
+        }
+    }
+
+    fn watch(&mut self, ctx: &ComponentContext<TerminalApp>) -> bool {
+        if self
+            .watch
+            .as_ref()
+            .is_none_or(|task| task.status() == ComponentTaskStatus::Rejected)
+        {
+            let pane = self.pane;
+            let generation = self.frame.borrow().generation;
+            let frames = self.frames.clone();
+            self.watch = Some(ctx.spawn_background_with_rejection(
+                move |cancel| {
+                    frames.wait_for_change(generation, || cancel.is_cancelled());
+                    Message::PickerFrame(pane, generation)
+                },
+                Message::WatchRejected,
+            ));
+        }
+        self.watch
+            .as_ref()
+            .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
+    }
+
+    fn refresh(&mut self, pane: u64, generation: u64, ctx: &ComponentContext<TerminalApp>) {
+        if self.pane != pane || self.frame.borrow().generation != generation {
+            return;
+        }
+        let latest = self.frames.load();
+        if latest.generation != generation {
+            self.summary = preview_summary(&latest);
+            self.frame.replace(latest);
+            self.invalidator.invalidate();
+        }
+        self.watch.take();
+        self.watch(ctx);
+    }
+}
+
+impl Drop for Preview {
+    fn drop(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            watch.cancel();
+        }
+    }
+}
+
+// Sample nearby rows for the screen reader. The canvas shows the whole grid.
+fn preview_summary(frame: &Snapshot) -> String {
+    const MAX_COLUMNS: usize = 1024;
+    const MAX_CHARS: usize = 120;
+    let Some(last_row) = frame.rows.len().checked_sub(1) else {
+        return String::new();
+    };
+    let cursor_row = usize::try_from(frame.cursor.y)
+        .ok()
+        .and_then(|y| y.checked_add(frame.scroll_offset))
+        .filter(|&y| y <= last_row);
+    let anchor = cursor_row.unwrap_or(last_row);
+    let nearby = (anchor.saturating_sub(6)..=anchor)
+        .rev()
+        .chain(anchor + 1..=(anchor + 2).min(last_row));
+    let mut lines = Vec::new();
+    for row in nearby {
+        // Line's cell iterator advances from the beginning. Bound that work as
+        // well as the string, including an unusually long combining sequence.
+        let start = if Some(row) == cursor_row {
+            frame
+                .cursor
+                .x
+                .min(MAX_COLUMNS)
+                .saturating_sub(MAX_CHARS / 2)
+        } else {
+            0
+        };
+        let mut sample = String::new();
+        let mut remaining = MAX_CHARS;
+        for cell in frame.rows[row]
+            .visible_cells()
+            .take_while(|c| c.cell_index() < frame.cols.min(MAX_COLUMNS))
+            .skip_while(|c| c.cell_index() < start)
+        {
+            for ch in cell.str().chars().take(remaining) {
+                sample.push(ch);
+                remaining -= 1;
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        let text = sample.trim();
+        if !text.is_empty() {
+            lines.push((row, text.to_owned()));
+            if lines.len() == 2 {
+                break;
+            }
+        }
+    }
+    lines.sort_by_key(|(row, _)| *row);
+    lines
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
 
 struct Choice {
     pane: u64,
@@ -62,6 +216,7 @@ pub(super) struct Picker {
     input: ElementRef<TextBox>,
     matches: Vec<Choice>,
     selected: usize,
+    preview: Option<Preview>,
 }
 
 impl Picker {
@@ -83,43 +238,55 @@ impl Picker {
     }
 
     pub(super) fn view(&self, app: &TerminalApp, ctx: &ViewContext<TerminalApp>) -> View {
-        let page_size = ((app.window_height - 145.0) / 42.0).clamp(1.0, 8.0) as usize;
+        let wide = app.width >= 800.0;
+        let preview_height = if wide {
+            (app.window_height - 160.0).clamp(0.0, 300.0)
+        } else {
+            ((app.window_height - 240.0) * 0.45).clamp(0.0, 170.0)
+        };
+        let preview_space = if wide || self.preview.is_none() {
+            0.0
+        } else {
+            preview_height + 30.0
+        };
+        let page_size =
+            ((app.window_height - 145.0 - preview_space) / 42.0).clamp(1.0, 8.0) as usize;
         let first = self.selected / page_size * page_size;
-        let mut children = vec![KeyedView::new(
-            "search",
-            Grid::new()
-                .columns([GridLength::STAR, GridLength::Auto])
-                .children((
-                    TextBox::new()
-                        .element_ref(&self.input)
-                        .text(&self.query)
-                        .placeholder_text("Search by title, profile or user@host")
-                        .automation_name("Find pane")
-                        .on_text_changed(ctx.callback(Message::PickerQuery)),
-                    Button::new()
-                        .grid_column(1)
-                        .style(ButtonStyle::Subtle)
-                        .automation_name("Close pane picker")
-                        .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerCancel)))
-                        .content(TextBlock::new().text("×")),
-                )),
-        )];
+        let search = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .children((
+                TextBox::new()
+                    .element_ref(&self.input)
+                    .text(&self.query)
+                    .placeholder_text("Search by title, profile or user@host")
+                    .automation_name("Find pane")
+                    .on_text_changed(ctx.callback(Message::PickerQuery)),
+                Button::new()
+                    .grid_column(1)
+                    .style(ButtonStyle::Subtle)
+                    .automation_name("Close pane picker")
+                    .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerCancel)))
+                    .content(TextBlock::new().text("×")),
+            ));
+        let mut children = Vec::new();
         for (i, row) in self.matches.iter().enumerate().skip(first).take(page_size) {
             let id = row.pane;
             let caption = row.caption();
-            children.push(KeyedView::new(
-                format!("pane-{id}"),
-                Button::new()
-                    .automation_name(&caption)
-                    .horizontal_alignment(HorizontalAlignment::Stretch)
-                    .style(if i == self.selected {
-                        ButtonStyle::Accent
-                    } else {
-                        ButtonStyle::Subtle
-                    })
-                    .on_click(ctx.callback(move |_| Message::PickerChoose(id)))
-                    .content(TextBlock::new().text(caption)),
-            ));
+            let button = Button::new()
+                .automation_name(&caption)
+                .horizontal_alignment(HorizontalAlignment::Stretch)
+                .style(if i == self.selected {
+                    ButtonStyle::Accent
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .on_click(ctx.callback(move |_| Message::PickerChoose(id)))
+                .content(TextBlock::new().text(caption));
+            let mut hit = Border::new();
+            if i != self.selected {
+                hit = hit.on_pointer_moved(ctx.callback(move |_| Message::PickerHover(id)));
+            }
+            children.push(KeyedView::new(format!("pane-{id}"), hit.content(button)));
         }
         if self.matches.is_empty() {
             children.push(KeyedView::new(
@@ -154,6 +321,40 @@ impl Picker {
                     )),
             ));
         }
+        let results = StackPanel::new().spacing(4.0).keyed_children(children);
+        let body: View = match (&self.preview, self.matches.get(self.selected)) {
+            (Some(preview), Some(row)) => {
+                let label = format!("Preview of {}", row.caption());
+                let visual: View = match &preview.canvas {
+                    Some(canvas) if preview_height >= 48.0 => {
+                        Border::new().height(preview_height).content(canvas.clone())
+                    }
+                    _ => TextBlock::new().text(&preview.summary).into(),
+                };
+                let preview = StackPanel::new()
+                    .grid_column(if wide { 1 } else { 0 })
+                    .grid_row(if wide { 0 } else { 1 })
+                    .spacing(4.0)
+                    .children((
+                        TextBlock::new()
+                            .text(&label)
+                            .automation_name(format!("{label}. {}", preview.summary)),
+                        visual,
+                    ));
+                if wide {
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::STAR])
+                        .column_spacing(12.0)
+                        .children((results, preview))
+                } else {
+                    Grid::new()
+                        .rows([GridLength::Auto, GridLength::Auto])
+                        .row_spacing(6.0)
+                        .children((results, preview))
+                }
+            }
+            _ => results,
+        };
         Border::new()
             .grid_row_span(2)
             .background(Color::argb(112, 0, 0, 0))
@@ -161,12 +362,12 @@ impl Picker {
                 Border::new()
                     .vertical_alignment(VerticalAlignment::Top)
                     .horizontal_alignment(HorizontalAlignment::Center)
-                    .width((app.width - 32.0).clamp(240.0, 660.0))
+                    .width((app.width - 32.0).clamp(1.0, if wide { 1060.0 } else { 660.0 }))
                     .margin(16.0)
                     .padding(12.0)
                     .corner_radius(8.0)
                     .background(Color::rgb(40, 42, 48))
-                    .content(StackPanel::new().spacing(4.0).keyed_children(children)),
+                    .content(StackPanel::new().spacing(6.0).children((search, body))),
             )
     }
 }
@@ -217,7 +418,9 @@ impl TerminalApp {
             query: String::new(),
             matches,
             selected,
+            preview: None,
         });
+        self.sync_picker_preview(ctx);
         self.keyboard.set_picker(true);
         self.focus_picker_input(0, ctx);
     }
@@ -238,7 +441,7 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn filter_picker(&mut self, query: String) {
+    pub(super) fn filter_picker(&mut self, query: String, ctx: &ComponentContext<Self>) {
         if self
             .picker
             .as_ref()
@@ -251,6 +454,59 @@ impl TerminalApp {
             picker.query = query;
             picker.matches = matches;
             picker.selected = 0;
+        }
+        self.sync_picker_preview(ctx);
+    }
+
+    pub(super) fn hover_picker(&mut self, pane: u64, ctx: &ComponentContext<Self>) {
+        if let Some(picker) = &mut self.picker
+            && let Some(index) = picker.matches.iter().position(|row| row.pane == pane)
+            && index != picker.selected
+        {
+            picker.selected = index;
+            self.sync_picker_preview(ctx);
+        }
+    }
+
+    pub(super) fn sync_picker_preview(&mut self, ctx: &ComponentContext<Self>) {
+        let Some(picker) = &self.picker else { return };
+        let selected = picker.matches.get(picker.selected).map(|row| row.pane);
+        if selected == picker.preview.as_ref().map(|preview| preview.pane) {
+            return;
+        }
+        let preview = selected.and_then(|pane| {
+            let Page::Terminal(live) = &self.tabs.get(self.tab_for_pane(pane)?)?.page else {
+                return None;
+            };
+            Some(Preview::new(
+                pane,
+                live.session.frames.clone(),
+                &self.appearance.read().unwrap(),
+            ))
+        });
+        self.picker.as_mut().unwrap().preview = preview;
+        self.watch_picker_preview(ctx);
+    }
+
+    pub(super) fn watch_picker_preview(&mut self, ctx: &ComponentContext<Self>) -> bool {
+        self.picker
+            .as_mut()
+            .and_then(|picker| picker.preview.as_mut())
+            .is_none_or(|p| p.watch(ctx))
+    }
+
+    pub(super) fn picker_frame(
+        &mut self,
+        pane: u64,
+        generation: u64,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if let Some(preview) = self
+            .picker
+            .as_mut()
+            .and_then(|picker| picker.preview.as_mut())
+        {
+            preview.refresh(pane, generation, ctx);
         }
     }
 
@@ -277,6 +533,7 @@ impl TerminalApp {
             // A pane can close while its previously rendered result is being chosen.
             picker.matches.retain(|row| row.pane != pane);
             picker.move_by(0);
+            self.sync_picker_preview(ctx);
             return;
         };
         self.tabs.select(id);
@@ -299,6 +556,28 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spoken_preview_samples_the_cursor_neighborhood_on_large_sparse_screens() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(
+            TerminalSize {
+                cols: 500,
+                rows: 64,
+                ..Default::default()
+            },
+            tx,
+        );
+        terminal.advance_bytes(b"old headline\x1b[60;1Hunrelated footer\x1b[12;1Hbuild completed\x1b[13;465Hhidden-marker-live");
+        let snapshot = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert_eq!(
+            preview_summary(&snapshot),
+            "build completed / hidden-marker-live"
+        );
+
+        terminal.advance_bytes(b"\x1b[30;1H");
+        let snapshot = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+        assert_eq!(preview_summary(&snapshot), "");
+    }
     fn row(pane: u64, title: &str, label: &str, destination: &str) -> Choice {
         Choice {
             pane,

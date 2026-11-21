@@ -3467,6 +3467,7 @@ dependencies = [
  "log",
  "rand 0.10.3",
  "regex",
+ "regex-syntax",
  "russh",
  "russh-sftp",
  "semver",
