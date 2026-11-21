@@ -56,6 +56,7 @@ mod pane_view;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
+mod tab_title;
 mod workspace_view;
 use pane_view::PaneSurface;
 
@@ -322,6 +323,7 @@ fn tab_menu_message(label: String) -> Message {
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         "Attention inbox" => Message::Attention(attention::Action::Open),
+        "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
         "SFTP files" => Message::Files(FileAction::Toggle),
         "Workspace startup…" => {
             Message::Workspace(workspace_view::WorkspaceAction::ConfigureStartup)
@@ -423,11 +425,13 @@ pub struct TerminalApp {
     mru_groups: Vec<TabId>,
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
+    title_editor: Option<tab_title::Editor>,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
     copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
 }
 
 pub enum Message {
+    TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
     ToggleInspector,
@@ -664,7 +668,11 @@ impl TerminalApp {
             tab.connection_generation = frame.connection_generation;
             self.keyboard.reset_keys();
         }
-        self.keyboard.set_modal(prompt_id.is_some());
+        if prompt_id.is_some() {
+            self.title_editor = None;
+        }
+        self.keyboard
+            .set_modal(prompt_id.is_some() || self.title_editor.is_some());
         let choosing = tab.browsing_sessions();
         if changed {
             self.keyboard
@@ -1475,6 +1483,10 @@ impl TerminalApp {
                 Some(Pane {
                     id: tab.session.pane_id,
                     tab_id: self.tabs.group_id(entry.id)?,
+                    tab_title: self
+                        .tabs
+                        .title_for(entry.id)
+                        .map(|title| title.as_str().to_owned()),
                     visible: self.tabs.visible(entry.id),
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
@@ -1538,6 +1550,9 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        if self.title_editor.take().is_some() {
+            self.keyboard.set_modal(false);
+        }
         self.close_copy_mode();
         self.close_hints();
         self.sync_inspector();
@@ -2170,7 +2185,7 @@ impl TerminalApp {
                     KeyedView::new(
                         self.tabs.group_id(tab.id).unwrap().to_string(),
                         TabViewItem::new()
-                            .header(&tab.value.label)
+                            .header(self.tab_label(tab.id))
                             .tag(tab.id.to_string())
                             .is_closable(true),
                     )
@@ -2273,6 +2288,7 @@ impl TerminalApp {
                 KeyAction::CommandPalette,
             ),
             self.pane_menu(),
+            command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             MenuItem::item("inbox", "Attention inbox"),
             command_menu_item("paste", "Paste", player.is_some()),
@@ -2954,6 +2970,7 @@ impl Component for TerminalApp {
             mru_groups: Vec::new(),
             switcher: None,
             picker: None,
+            title_editor: None,
             hints: Default::default(),
             copy_mode: Default::default(),
             selection_pending: true,
@@ -3014,6 +3031,7 @@ impl Component for TerminalApp {
         if !matches!(
             &message,
             Message::FrameReady(..)
+                | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
                 | Message::Patterns(
@@ -3037,6 +3055,7 @@ impl Component for TerminalApp {
             self.watch_control(context);
         }
         match message {
+            Message::TabTitle(action) => self.edit_tab_title(action),
             Message::Attention(action) => self.handle_attention(action, context),
             Message::AttentionChanged => {}
             Message::ToggleInspector => {
@@ -4291,6 +4310,7 @@ impl Component for TerminalApp {
             && self.switcher.is_none()
             && self.picker.is_none()
             && self.hints.borrow().is_none()
+            && self.title_editor.is_none()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
             let marked = self
@@ -4323,9 +4343,8 @@ impl Component for TerminalApp {
         }
         let title = self
             .tabs
-            .active()
-            .map(|t| t.label.as_str())
-            .unwrap_or("Terminal");
+            .active_id()
+            .map_or("Terminal", |id| self.tab_label(id));
         context.window_title(format!("w11term · {title}"));
         context.window_visuals(
             WindowVisuals::new()
@@ -4411,7 +4430,7 @@ impl Component for TerminalApp {
                 .filter_map(|(index, id)| {
                     self.tabs
                         .get(*id)
-                        .map(|tab| (index, *id, tab.label.clone()))
+                        .map(|_| (index, *id, self.tab_label(*id).to_owned()))
                 })
                 .map(|(index, id, label)| {
                     KeyedView::new(
@@ -4448,6 +4467,9 @@ impl Component for TerminalApp {
         }
         if let Some(picker) = &self.picker {
             views.push(KeyedView::new("pane-picker", picker.view(self, context)));
+        }
+        if let Some(editor) = &self.title_editor {
+            views.push(KeyedView::new("rename-tab", editor.view(context)));
         }
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {

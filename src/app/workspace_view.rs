@@ -264,7 +264,7 @@ impl TerminalApp {
                 header.id,
             )
         });
-        Workspace::capture(layouts, active_tab, |id| {
+        let mut workspace = Workspace::capture(layouts, active_tab, |id| {
             let tab = self.tabs.get(id).context("Workspace pane was closed")?;
             let Page::Terminal(live) = &tab.page else {
                 anyhow::bail!("Expected a terminal pane")
@@ -289,7 +289,11 @@ impl TerminalApp {
                     .durable_state()
                     .and_then(|state| state.reference),
             )
-        })
+        })?;
+        for (tab, header) in workspace.tabs.iter_mut().zip(headers) {
+            tab.title = self.tabs.title_for(header.id).cloned();
+        }
+        Ok(workspace)
     }
 
     pub(super) fn workspace_view(
@@ -530,6 +534,7 @@ fn restore_tabs<T>(
     for (index, tab) in workspace.tabs.iter().enumerate() {
         let (slot, source) = first_leaf(&tab.layout);
         let entry = tabs.insert(create(slot, source));
+        tabs.set_group_title(entry, tab.title.clone());
         let mut ids = BTreeMap::new();
         restore_split(tabs, &tab.layout, entry, &mut vec![], &mut ids, &mut create);
         let focused = ids[&tab.focused];
@@ -553,6 +558,13 @@ impl TerminalApp {
                 self.update(Message::SplitPane(Axis::Rows, None), context);
             }
             1 => {
+                let group = self.tabs.group_id(self.tabs.active_id().unwrap()).unwrap();
+                self.edit_tab_title(tab_title::Action::Show);
+                self.edit_tab_title(tab_title::Action::Edit(group, "Operations".into()));
+                self.edit_tab_title(tab_title::Action::Finish(
+                    group,
+                    ContentDialogResult::Primary,
+                ));
                 let epoch = self.watch_epoch;
                 self.update(Message::DividerPress(epoch, vec![], 3.0), context);
                 self.update(Message::PaneRatio(epoch, vec![], 0.6), context);
@@ -580,6 +592,8 @@ impl TerminalApp {
                 assert_eq!(workspace.active_tab, 0);
                 assert_eq!(workspace.tabs.len(), 2);
                 let saved = &workspace.tabs[0];
+                assert_eq!(saved.title.as_ref().unwrap().as_str(), "Operations");
+                assert!(workspace.tabs[1].title.is_none());
                 let SavedLayout::Split {
                     axis: Axis::Rows,
                     ratio,
@@ -610,6 +624,7 @@ impl TerminalApp {
                 assert_eq!(restored.len(), 2);
                 assert_eq!(restored[1], opened);
                 for id in restored {
+                    assert_eq!(self.tab_label(id), "Operations");
                     let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
                         panic!("expected terminal")
                     };
@@ -652,6 +667,7 @@ mod tests {
             active_tab: 0,
             tabs: vec![
                 WorkspaceTab {
+                    title: Some("Servers".to_owned().try_into().unwrap()),
                     focused: 12,
                     layout: SavedLayout::Split {
                         axis: Axis::Columns,
@@ -666,6 +682,7 @@ mod tests {
                     },
                 },
                 WorkspaceTab {
+                    title: None,
                     focused: 14,
                     layout: demo(14),
                 },
@@ -700,6 +717,10 @@ mod tests {
         let left_bottom = entry(12);
         let right = entry(13);
         assert_eq!(tabs.active_id(), Some(left_bottom));
+        for id in [left_top, left_bottom, right] {
+            assert_eq!(tabs.title_for(id).unwrap().as_str(), "Servers");
+        }
+        assert!(tabs.title_for(existing).is_none());
         assert_eq!(
             tabs.active_layout(),
             Some(&Layout::Split {

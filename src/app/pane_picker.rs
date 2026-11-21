@@ -156,6 +156,7 @@ fn preview_summary(frame: &Snapshot) -> String {
 
 struct Choice {
     pane: u64,
+    tab_title: Option<String>,
     title: String,
     label: String,
     profile: Option<String>,
@@ -172,6 +173,7 @@ impl Choice {
         [&self.title, &self.label, &self.destination]
             .into_iter()
             .chain(self.profile.iter())
+            .chain(self.tab_title.iter())
             .filter_map(|field| {
                 let field = field.to_lowercase();
                 if field == query {
@@ -194,8 +196,9 @@ impl Choice {
         };
         let mut fields = vec![title.as_str()];
         for text in self
-            .profile
+            .tab_title
             .iter()
+            .chain(self.profile.iter())
             .chain(std::iter::once(&self.destination))
         {
             if !text.is_empty() && !fields.contains(&text.as_str()) {
@@ -503,6 +506,7 @@ impl TerminalApp {
                     }) = self.tabs.get(leaf)
                     {
                         choices.push(Choice {
+                            tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
                             pane: live.session.pane_id,
                             label: label.clone(),
                             title: live.session.frames.load().title.clone(),
@@ -830,6 +834,7 @@ mod tests {
     fn row(pane: u64, title: &str, label: &str, destination: &str) -> Choice {
         Choice {
             pane,
+            tab_title: None,
             title: title.into(),
             label: label.into(),
             profile: Some(label.into()),
@@ -857,5 +862,14 @@ mod tests {
         assert_eq!(ids(" üIlD "), [2]);
         assert_eq!(ids("PILOT@game"), [2, 3]);
         assert!(ids("missing").is_empty());
+    }
+
+    #[test]
+    fn named_tab_matches_alongside_the_pane_title_and_profile() {
+        let mut choice = row(7, "shell", "prod", "user@host");
+        choice.tab_title = Some("Incident response".into());
+        assert_eq!(choice.rank("incident response"), Some(0));
+        assert_eq!(choice.rank("shell"), Some(0));
+        assert!(choice.caption().contains("Incident response"));
     }
 }

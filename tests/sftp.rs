@@ -594,6 +594,7 @@ fn registry(session: &Session) -> Registry {
     r.replace([Pane {
         id: 1,
         tab_id: 4,
+        tab_title: None,
         label: "test".into(),
         active: false,
         visible: false,

@@ -55,6 +55,8 @@ Click a pane to focus it, drag a divider to resize, or zoom one pane and restore
 
 To move a running shell beside one in another tab, choose **caret → Panes → Move pane to existing tab…**. Search for the destination by title, profile or SSH address and press Enter or click it. Press an arrow key or choose **Move left**, **Move right**, **Move above** or **Move below**. Escape cancels at either step. The moved pane keeps focus, scrollback and its control ID. SSH channels and local processes keep running. The source tab closes if its last pane moves. You can assign a shortcut in Keyboard settings.
 
+Choose **caret → Rename tab…** to give a group of panes a name such as `Production logs`. The tab strip, window title, tab switcher and pane picker use the name as you move between panes. Saving a workspace keeps the name. Choose **Use default** to return to the focused pane’s label. The control pipe’s `list` reply includes the optional `tab_title` alongside each pane’s own `label` and terminal `title`.
+
 Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
 
 Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.
