@@ -192,6 +192,16 @@ impl Layout {
         panes
     }
 
+    pub(crate) fn replace_leaves(&mut self, replace: &mut impl FnMut(u64) -> u64) {
+        match self {
+            Self::Leaf(id) => *id = replace(*id),
+            Self::Split { first, second, .. } => {
+                first.replace_leaves(replace);
+                second.replace_leaves(replace);
+            }
+        }
+    }
+
     pub fn bounds(&self, target: u64) -> Option<Bounds> {
         let mut found = None;
         self.visit(Bounds::FULL, &mut |id, bounds| {
