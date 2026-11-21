@@ -531,6 +531,7 @@ fn tab_menu_message(label: String) -> Message {
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         "Command palette…" => Message::Shortcut(Shortcut::CommandPalette),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
+        pane_picker::FIND_TEXT_LABEL => Message::Shortcut(Shortcut::FindAllPanes),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
         _ => Message::ControlIdle,
@@ -692,6 +693,7 @@ pub enum Message {
     ToggleInspector,
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
+    PaneText(pane_picker::TextAction),
     PickerHover(u64),
     PickerFrame(u64, u64),
     PickerChoose(u64),
@@ -2705,6 +2707,11 @@ impl TerminalApp {
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.duplicate_tab_item(),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
+            self.binding_menu(
+                "find-all-panes",
+                pane_picker::FIND_TEXT_LABEL,
+                KeyAction::FindAllPanes,
+            ),
             MenuItem::item("inbox", "Attention inbox"),
             command_menu_item("paste", "Paste", can_paste),
             command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
@@ -3595,6 +3602,7 @@ impl Component for TerminalApp {
                     pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
                 )
                 | Message::PickerQuery(..)
+                | Message::PaneText(..)
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
@@ -3694,6 +3702,7 @@ impl Component for TerminalApp {
             Message::History(action) => self.handle_history(action, context),
             Message::PaletteChoose(id) => self.choose_command(id, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
+            Message::PaneText(action) => self.pane_text_action(action, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
@@ -4486,6 +4495,7 @@ impl Component for TerminalApp {
             Message::Shortcut(shortcut) => match shortcut {
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::FindAllPanes => self.open_text_picker(context),
                 Shortcut::MovePaneToExistingTab => self.open_move_picker(context),
                 Shortcut::PickerPlace(side) => {
                     if let Some((source, target)) =
@@ -4504,6 +4514,7 @@ impl Component for TerminalApp {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);
                         self.sync_picker_preview(context);
+                        self.announce_text_selection();
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),

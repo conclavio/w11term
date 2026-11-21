@@ -146,6 +146,24 @@ async fn native_regex_find_in_mixed_panes_keeps_search_input_off_the_wire() {
     run_palette_fixture("regex-find-ui.ps1", b"find-ssh-resumed", Some(&history)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "finds offscreen text across SSH and PowerShell tabs and checks both viewports and local Find state"]
+async fn native_find_in_all_panes_preserves_views_and_reveals_the_chosen_ssh_match() {
+    let mut history = String::new();
+    for row in 0..280 {
+        let content = match row {
+            12 => "ssh-first Fleet.Target north".into(),
+            105 => "ssh-second FLEET.TARGET south".into(),
+            198 => "ssh-prior-anchor".into(),
+            _ => format!("SSH history row {row}"),
+        };
+        history.push_str(&content);
+        history.push_str("\r\n");
+    }
+    history.push_str("ssh-window-search-ready\r\n");
+    run_palette_fixture("find-all-panes-ui.ps1", b"global-ssh-ok", Some(&history)).await;
+}
+
 async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Option<&str>) {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
         unreachable!()

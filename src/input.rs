@@ -174,6 +174,7 @@ pub enum Shortcut {
     FindClose,
     CommandPalette,
     PanePicker,
+    FindAllPanes,
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
@@ -1312,6 +1313,7 @@ impl State {
                         shortcut,
                         Shortcut::CommandPalette
                             | Shortcut::PanePicker
+                            | Shortcut::FindAllPanes
                             | Shortcut::MovePaneToExistingTab
                     ) {
                         self.picker = Some(if shortcut == Shortcut::CommandPalette {
@@ -1604,6 +1606,7 @@ impl From<Action> for Shortcut {
             Action::Workspaces => Self::Workspaces,
             Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
+            Action::FindAllPanes => Self::FindAllPanes,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
             Action::NextTab => Self::NextTab,
