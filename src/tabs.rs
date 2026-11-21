@@ -180,6 +180,64 @@ impl<T> Tabs<T> {
         id
     }
 
+    /// Resolve every leaf before launching anything. A rejected recipe leaves
+    /// all tab state intact, including original focus and header order.
+    pub fn duplicate_active_group<P, E>(
+        &mut self,
+        mut prepare: impl FnMut(&T) -> Result<P, E>,
+        mut create: impl FnMut(P) -> T,
+    ) -> Result<Option<TabId>, E> {
+        fn replace_leaves(layout: &mut Layout, replace: &mut impl FnMut(TabId) -> TabId) {
+            match layout {
+                Layout::Leaf(id) => *id = replace(*id),
+                Layout::Split { first, second, .. } => {
+                    replace_leaves(first, replace);
+                    replace_leaves(second, replace);
+                }
+            }
+        }
+        let Some(index) = self.active_index() else {
+            return Ok(None);
+        };
+        let original = &self.groups[index];
+        let recipes = original
+            .layout
+            .leaves()
+            .into_iter()
+            .map(|id| prepare(self.get(id).expect("layout leaf belongs to the group")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut recipes = recipes.into_iter();
+        let mut layout = original.layout.clone();
+        let mut group = None;
+        let mut focused = None;
+        replace_leaves(&mut layout, &mut |source| {
+            let id = next_id();
+            let group = *group.get_or_insert(id);
+            if original.focused == source {
+                focused = Some(id);
+            }
+            self.entries.push(Tab {
+                id,
+                group,
+                value: create(recipes.next().expect("one recipe per leaf")),
+            });
+            id
+        });
+        let id = group.expect("every tab group has a leaf");
+        self.groups.insert(
+            index + 1,
+            Group {
+                id,
+                title: original.title.clone(),
+                focused: focused.expect("the focused entry belongs to this layout"),
+                layout,
+                zoomed: original.zoomed,
+            },
+        );
+        self.active_group = Some(id);
+        Ok(Some(id))
+    }
+
     fn insert_group(&mut self, id: TabId, entry_id: TabId, value: T) {
         self.entries.push(Tab {
             id: entry_id,
@@ -386,6 +444,68 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_group_preflights_all_leaves_and_preserves_nested_layout_focus_zoom_and_order() {
+        let mut tabs = Tabs::default();
+        let before = tabs.insert(0);
+        let a = tabs.insert(1);
+        let b = tabs.split(a, 2, Axis::Rows).unwrap();
+        let c = tabs.split(b, 3, Axis::Columns).unwrap();
+        let after = tabs.insert(4);
+        tabs.select(b);
+        assert!(tabs.set_ratio(&[], 0.4123));
+        assert!(tabs.set_ratio(&[true], 0.7331));
+        assert!(tabs.toggle_zoom());
+        let title = TabTitle::try_from("Operations".to_owned()).unwrap();
+        tabs.set_group_title(a, Some(title.clone()));
+        let original = tabs.active_layout().unwrap().clone();
+        let rejected = tabs.duplicate_active_group(
+            |value| {
+                if *value == 3 {
+                    Err("unsupported pane")
+                } else {
+                    Ok(*value)
+                }
+            },
+            |_| panic!("no shell may start before preflight succeeds"),
+        );
+        assert_eq!(rejected, Err("unsupported pane"));
+        assert_eq!(tabs.active_id(), Some(b));
+        assert_eq!(tabs.headers().len(), 3);
+        let hd = tabs
+            .duplicate_active_group(|value| Ok::<_, ()>(*value), |value| value + 10)
+            .unwrap()
+            .unwrap();
+        let ids = tabs.active_layout().unwrap().leaves();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| ![a, b, c].contains(id)));
+        assert_eq!(tabs.active_id(), Some(ids[1]));
+        assert_eq!(tabs.title_for(ids[1]), Some(&title));
+        assert!(tabs.zoomed());
+        assert_eq!(
+            tabs.headers()
+                .iter()
+                .map(|tab| tab.group_id())
+                .collect::<Vec<_>>(),
+            [before, a, hd, after]
+        );
+        assert_eq!(
+            ids.iter()
+                .map(|id| *tabs.get(*id).unwrap())
+                .collect::<Vec<_>>(),
+            [11, 12, 13]
+        );
+        for (old, new) in original.leaves().into_iter().zip(&ids) {
+            assert_eq!(
+                tabs.active_layout().unwrap().bounds(*new),
+                original.bounds(old)
+            );
+        }
+        tabs.remove_group(ids[1]);
+        assert_eq!(tabs.layout_for(a), Some(&original));
+        assert_eq!(tabs.get(b), Some(&2));
+    }
 
     #[test]
     fn moving_a_group_between_windows_keeps_its_live_values_and_layout() {

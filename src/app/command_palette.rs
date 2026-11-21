@@ -8,6 +8,7 @@ pub enum CommandId {
     SharedFolders(Option<u64>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
+    DuplicateTabLayout(Option<TabId>),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -190,6 +191,11 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                Shortcut::DuplicateTabLayout => {
+                    // A click queued on this row must keep its original tab even
+                    // when a control client switches tabs before we receive it.
+                    row.id = CommandId::DuplicateTabLayout(self.tabs.active_group_id());
+                }
                 Shortcut::FocusPane(dir) => {
                     row.enabled = self
                         .tabs
@@ -251,6 +257,9 @@ impl TerminalApp {
         let message = match id {
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
+            }
+            CommandId::DuplicateTabLayout(group) => {
+                bind_tab_action(Message::Shortcut(Shortcut::DuplicateTabLayout), group)
             }
             CommandId::SharedFolders(Some(pane)) => {
                 Message::FolderShare(folder_shares::Action::Open(pane))
@@ -445,6 +454,27 @@ mod tests {
             &mut rows,
         );
         assert_eq!(rows[0].id, CommandId::Profile(display));
+    }
+
+    #[test]
+    fn unavailable_tab_duplication_is_searchable_with_its_reason() {
+        let mut rows = Vec::new();
+        menu_rows(
+            vec![MenuItem::disabled(
+                "duplicate_tab_layout",
+                "Duplicate tab layout: Select a terminal tab",
+            )],
+            false,
+            &mut rows,
+        );
+        let found = filter(rows, "duplicate layout");
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].enabled);
+        assert!(found[0].label.contains("Select a terminal tab"));
+        assert_eq!(
+            found[0].id,
+            CommandId::Shortcut(Shortcut::DuplicateTabLayout)
+        );
     }
 
     #[test]

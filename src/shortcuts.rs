@@ -31,6 +31,7 @@ pub enum Action {
     NextTab,
     PreviousTab,
     NewTab,
+    DuplicateTabLayout,
     CloseTab,
     SelectTab(u8),
     Workspaces,
@@ -119,6 +120,13 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(NewTab, "new_tab", "New tab", 0x54, CTRL_SHIFT),
+    Binding::new(
+        DuplicateTabLayout,
+        "duplicate_tab_layout",
+        "Duplicate tab layout",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(CloseTab, "close_tab", "Close tab", 0x57, CTRL_SHIFT),
     Binding::new(SelectTab(1), "select_tab_1", "Select tab 1", 0x31, CTRL_ALT),
     Binding::new(SelectTab(2), "select_tab_2", "Select tab 2", 0x32, CTRL_ALT),
@@ -155,6 +163,7 @@ impl Action {
                 | ClosePane
                 | MovePane
                 | MovePaneToExistingTab
+                | DuplicateTabLayout
                 | KeyboardHints
                 | CopyMode
         )
@@ -391,6 +400,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn duplicate_tab_layout_can_be_bound_without_claiming_keys_in_forms() {
+        let mut shortcuts = Shortcuts::default();
+        assert_eq!(shortcuts.get(DuplicateTabLayout.binding()), None);
+        let chord: Chord = "F8".parse().unwrap();
+        shortcuts.set(DuplicateTabLayout, Some(chord)).unwrap();
+        let saved = serde_json::to_string(&shortcuts).unwrap();
+        let restored: Shortcuts = serde_json::from_str(&saved).unwrap();
+        let map = restored.keymap().unwrap();
+        assert_eq!(
+            map.resolve(chord.key, chord.mods, true, false),
+            Some(DuplicateTabLayout)
+        );
+        assert_eq!(map.resolve(chord.key, chord.mods, false, false), None);
+        assert_eq!(map.resolve(chord.key, chord.mods, true, true), None);
     }
 
     #[test]

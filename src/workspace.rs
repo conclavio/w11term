@@ -242,24 +242,7 @@ impl SavedSource {
             }
             Self::Demo => Source::Demo,
             Self::Local { shell, .. } => {
-                if let Some(cwd) = &shell.cwd {
-                    ensure!(
-                        cwd.is_dir(),
-                        "Workspace local working directory is unavailable: {}",
-                        cwd.display()
-                    );
-                }
-                if shell.executable.is_absolute() {
-                    let executable = &shell.executable;
-                    // CreateProcess also tries .exe on an extensionless program.
-                    ensure!(
-                        executable.is_file()
-                            || (executable.extension().is_none()
-                                && executable.with_extension("exe").is_file()),
-                        "Workspace local executable is unavailable: {}",
-                        executable.display()
-                    );
-                }
+                shell.check_launch_paths()?;
                 Source::Local(shell.clone())
             }
             Self::Replay(path) => {

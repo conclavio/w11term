@@ -485,6 +485,7 @@ fn tab_menu_message(label: String) -> Message {
         "Terminal inspector" => Message::ToggleInspector,
         "Attention inbox" => Message::Attention(attention::Action::Open),
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
+        "Duplicate tab layout" => Message::Shortcut(Shortcut::DuplicateTabLayout),
         "SFTP files" => Message::Files(FileAction::Toggle),
         "Workspace startup…" => {
             Message::Workspace(workspace_view::WorkspaceAction::ConfigureStartup)
@@ -532,6 +533,15 @@ fn tab_menu_message(label: String) -> Message {
     }
 }
 
+fn bind_tab_action(message: Message, group: Option<TabId>) -> Message {
+    match message {
+        Message::Shortcut(Shortcut::DuplicateTabLayout) => {
+            group.map_or(Message::ControlIdle, Message::DuplicateTabLayout)
+        }
+        message => message,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum Field {
     Name,
@@ -552,6 +562,7 @@ enum UiWork {
 struct CaretMenuBinding {
     pane: Option<u64>,
     paste: Option<clipboard_paste::Origin>,
+    group: Option<TabId>,
     exited: Option<ExitedPane>,
     on_click: Callback<String>,
 }
@@ -564,7 +575,7 @@ pub struct TerminalApp {
     show_inspector: bool,
     inspection: Option<inspector::Inspection>,
     accessible: crate::accessibility::Bridge,
-    active_group: Option<TabId>,
+    active_group: Rc<Cell<Option<TabId>>>,
     windows: Rc<RefCell<crate::window_state::Windows>>,
     window_profile: Option<String>,
     window_restored: bool,
@@ -649,6 +660,7 @@ pub enum Message {
     ClosePane,
     MovePaneToTab,
     MoveTabToWindow,
+    DuplicateTabLayout(TabId),
     WindowTick,
     DismissWindowError,
     TransferReady(u64),
@@ -1811,9 +1823,10 @@ impl TerminalApp {
             })
             .map(str::to_owned);
         let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
-        let group_changed = self.active_group != group;
+        let previous_group = self.active_group.replace(group);
+        let group_changed = previous_group != group;
         if group_changed
-            && let Some(previous) = self.active_group
+            && let Some(previous) = previous_group
             && let Some(AppTab {
                 page: Page::NewProfile(draft),
                 ..
@@ -1821,7 +1834,6 @@ impl TerminalApp {
         {
             draft.folder_revoke.cancel_confirmation();
         }
-        self.active_group = group;
         if profile != self.window_profile {
             if let Some(previous) = self.window_profile.take() {
                 let _ = self.windows.borrow_mut().remember(&previous);
@@ -1960,7 +1972,7 @@ impl TerminalApp {
         let Some(group) = self.tabs.group_id(id) else {
             return;
         };
-        let active = self.active_group == Some(group);
+        let active = self.active_group.get() == Some(group);
         if active {
             self.keyboard.set_target(None);
             self.cancel_frame_tasks();
@@ -2443,10 +2455,12 @@ impl TerminalApp {
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let paste = self.paste_origin();
+        let group = self.tabs.active_group_id();
         let mut cached = self.caret_menu_binding.borrow_mut();
         if let Some(binding) = cached.as_ref()
             && binding.pane == pane
             && binding.paste == paste
+            && binding.group == group
             && binding.exited == exited
         {
             return binding.on_click.clone();
@@ -2463,11 +2477,12 @@ impl TerminalApp {
             "Paste raw (no bracketed paste)" => {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
             }
-            _ => tab_menu_message(label),
+            _ => bind_tab_action(tab_menu_message(label), group),
         });
         *cached = Some(CaretMenuBinding {
             pane,
             paste,
+            group,
             exited,
             on_click: on_click.clone(),
         });
@@ -2632,6 +2647,7 @@ impl TerminalApp {
             ),
             self.pane_menu(can_restart),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
+            self.duplicate_tab_item(),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             MenuItem::item("inbox", "Attention inbox"),
             command_menu_item("paste", "Paste", can_paste),
@@ -2712,6 +2728,19 @@ impl TerminalApp {
             .get(action.binding())
             .map_or_else(|| label.to_owned(), |chord| format!("{label}    {chord}"));
         MenuItem::item(key, description)
+    }
+    fn duplicate_tab_item(&self) -> MenuItem {
+        let action = KeyAction::DuplicateTabLayout;
+        let binding = action.binding();
+        match self
+            .tabs
+            .active_group_id()
+            .context("Select a terminal tab")
+            .and_then(|group| self.can_duplicate_tab_layout(group))
+        {
+            Ok(()) => self.binding_menu(binding.id, binding.label, action),
+            Err(reason) => MenuItem::disabled(binding.id, format!("{}: {reason}", binding.label)),
+        }
     }
     fn pane_menu(&self, can_restart: bool) -> MenuItem {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
@@ -3176,6 +3205,8 @@ impl Component for TerminalApp {
         let sender = context.sender();
         let clipboard = clipboard_paste::State::default();
         let paste_origin = clipboard.input_origin.clone();
+        let active_group = Rc::new(Cell::new(None));
+        let shortcut_group = active_group.clone();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(match shortcut {
                 Shortcut::Paste | Shortcut::PasteRaw => {
@@ -3184,7 +3215,7 @@ impl Component for TerminalApp {
                         shortcut == Shortcut::PasteRaw,
                     ))
                 }
-                _ => Message::Shortcut(shortcut),
+                _ => bind_tab_action(Message::Shortcut(shortcut), shortcut_group.get()),
             });
         })
         .expect("installing terminal input adapter");
@@ -3356,7 +3387,7 @@ impl Component for TerminalApp {
             inbox,
             taskbar: RefCell::default(),
             accessible: Default::default(),
-            active_group: None,
+            active_group,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
             window_restored: moving || options.cols.is_some() || options.rows.is_some(),
@@ -3544,6 +3575,12 @@ impl Component for TerminalApp {
             }
             Message::DismissWindowError => self.window_error = None,
             Message::MoveTabToWindow => self.move_tab_window(context),
+            Message::DuplicateTabLayout(group) => {
+                self.window_error = self
+                    .duplicate_tab_layout(group, context)
+                    .err()
+                    .map(|error| format!("Couldn’t duplicate tab layout. {error:#}"));
+            }
             Message::WindowTick => self.window_tick(context),
             Message::TransferReady(id) => self.offer_group(id, context),
             Message::TransferClaim(id) => self.claim_group(id, context),
@@ -4421,6 +4458,11 @@ impl Component for TerminalApp {
                     self.default_profile.clone(),
                     context,
                 ),
+                Shortcut::DuplicateTabLayout => {
+                    if let Some(group) = self.tabs.active_group_id() {
+                        self.update(Message::DuplicateTabLayout(group), context);
+                    }
+                }
                 Shortcut::CloseTab => {
                     if let Some(id) = self.tabs.active_id() {
                         self.close_tab(id, context);
@@ -5849,6 +5891,23 @@ mod find_tests {
 #[cfg(test)]
 mod profile_ui_tests {
     use super::*;
+
+    #[test]
+    fn duplicate_tab_actions_capture_the_group_at_invocation() {
+        for action in [
+            tab_menu_message("Duplicate tab layout    F8".into()),
+            Message::Shortcut(KeyAction::DuplicateTabLayout.into()),
+        ] {
+            assert!(matches!(
+                bind_tab_action(action, Some(42)),
+                Message::DuplicateTabLayout(42)
+            ));
+        }
+        assert!(matches!(
+            bind_tab_action(tab_menu_message("Duplicate tab layout".into()), None),
+            Message::ControlIdle
+        ));
+    }
     #[test]
     fn pane_menu_dispatch_preserves_profile_names_and_ignores_shortcut_labels() {
         for label in [
