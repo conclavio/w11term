@@ -26,7 +26,10 @@ concurrency:
 
 jobs:
   guest:
-    name: Build the Linux SSHFS guest
+    name: Build the Linux SSHFS guest (${{ matrix.suite }})
+    strategy:
+      matrix:
+        suite: [resolute, noble]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -34,10 +37,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Build kernel and initramfs
-        run: sudo bash tests/folder-sharing/guest/build.sh "$RUNNER_TEMP/sshfs-guest"
+        env:
+          GUEST_SUITE: ${{ matrix.suite }}
+        run: sudo bash tests/folder-sharing/guest/build.sh "$RUNNER_TEMP/sshfs-guest" "$GUEST_SUITE"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: sshfs-guest
+          name: sshfs-guest-${{ matrix.suite }}
           path: |
             ${{ runner.temp }}/sshfs-guest/vmlinuz
             ${{ runner.temp }}/sshfs-guest/initramfs.gz
@@ -62,8 +67,8 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: sshfs-guest
-          path: ${{ runner.temp }}/sshfs-guest
+          pattern: sshfs-guest-*
+          path: ${{ runner.temp }}/sshfs-guests
       - name: Install Rust
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
       - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
@@ -94,7 +99,11 @@ jobs:
           qemu=$(command -v qemu-system-x86_64.exe)
           "$qemu" --version
           echo "MOUNT_TEST_QEMU=$(cygpath -w "$qemu")" >> "$GITHUB_ENV"
-      - name: Mount, read, unmount and check the original SSH shell
+      - name: Check early refusal on Ubuntu 24.04 with FUSE 3.14
         run: |
-          ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guest" `
+          ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-noble" `
+            -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE -LegacyFuse
+      - name: Mount, read, unmount and check the original SSH shell on Ubuntu 26.04
+        run: |
+          ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-resolute" `
             -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE

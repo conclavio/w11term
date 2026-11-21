@@ -6,8 +6,23 @@ use w11term::{conpty, options::LocalOptions, ssh::Event, terminal::TransportInpu
 use wezterm_term::TerminalSize;
 
 async fn through(output: &mut mpsc::Receiver<Event>, marker: &str) -> Result<String> {
+    wait_for(output, marker, Duration::from_secs(15)).await
+}
+
+async fn first_prompt(output: &mut mpsc::Receiver<Event>, marker: &str) -> Result<String> {
+    // A hosted runner can still be loading ConsoleHost and PSReadLine after
+    // the pseudoconsole has painted its initial title. Bound cold startup
+    // separately from an already-running shell executing a fixture command.
+    wait_for(output, marker, Duration::from_secs(45)).await
+}
+
+async fn wait_for(
+    output: &mut mpsc::Receiver<Event>,
+    marker: &str,
+    deadline: Duration,
+) -> Result<String> {
     let mut text = String::new();
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(deadline, async {
         while !text.contains(marker) {
             match output.recv().await.context("PowerShell closed")? {
                 Event::Data(bytes) => text.push_str(&String::from_utf8_lossy(&bytes)),
@@ -18,7 +33,7 @@ async fn through(output: &mut mpsc::Receiver<Event>, marker: &str) -> Result<Str
         anyhow::Ok(())
     })
     .await
-    .with_context(|| format!("waiting for {marker:?}; output: {text:?}"))??;
+    .with_context(|| format!("waiting {deadline:?} for {marker:?}; output: {text:?}"))??;
     Ok(text)
 }
 
@@ -77,10 +92,25 @@ async fn exercise(executable: &Path) -> Result<()> {
     let hook = temp.path().join("hook.ps1");
     std::fs::write(&hook, include_bytes!("../src/conpty/shell-integration.ps1"))?;
     let ready = "\x1b]133;B";
-    let mut stock = Shell::start(executable, &hook)?;
-    through(&mut stock.output, ready)
+    // These plain-text sentinels distinguish an interpreter still starting,
+    // a hook that returned without installing, and a missing input marker in a
+    // timeout transcript. They don't create a reader or generate OSC output.
+    let stock_startup = temp.path().join("stock.ps1");
+    let script = include_str!("../src/conpty/shell-integration.ps1");
+    std::fs::write(
+        &stock_startup,
+        format!(
+            "[Console]::WriteLine('[fixture: stock startup entered]')\n{script}\n[Console]::WriteLine('[fixture: stock hook installed=' + [bool]$global:__W11TermSemanticPrompt + ']')\n"
+        ),
+    )?;
+    let mut stock = Shell::start(executable, &stock_startup)?;
+    let initial = first_prompt(&mut stock.output, ready)
         .await
         .context("pristine profile did not emit the input marker")?;
+    ensure!(
+        initial.contains("[fixture: stock hook installed=True]"),
+        "{initial:?}"
+    );
     stock.close().await?;
     // Install a representative user customization and never save fixture input
     // to the machine's real PSReadLine history.
@@ -93,7 +123,7 @@ function global:prompt { "$state-prompt-$?> " }
 "#;
     std::fs::write(&startup, custom_profile)?;
     let mut baseline = Shell::start(executable, &startup)?;
-    through(&mut baseline.output, "fixture-prompt-True>").await?;
+    first_prompt(&mut baseline.output, "fixture-prompt-True>").await?;
     baseline.write("cmd.exe /d /c exit 23\r")?;
     through(&mut baseline.output, "fixture-prompt-False>").await?;
     let inspect = "'next-status-'+$?+'-'+$LASTEXITCODE\r";
@@ -108,7 +138,7 @@ function global:prompt { "$state-prompt-$?> " }
     let load = ". (Join-Path $PSScriptRoot 'hook.ps1')";
     std::fs::write(&startup, format!("{custom_profile}\n{load}\n{load}\n"))?;
     let mut shell = Shell::start(executable, &startup)?;
-    let initial = through(&mut shell.output, ready).await?;
+    let initial = first_prompt(&mut shell.output, ready).await?;
     assert!(initial.contains("\x1b]133;A") && initial.contains("fixture-prompt-True>"));
     shell.write("discardme")?;
     through(&mut shell.output, "discardme").await?;
