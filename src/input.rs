@@ -42,7 +42,7 @@ struct State {
     picker: bool,
     hints: bool,
     hint_held: HashSet<u32>,
-    held_resize: Option<(u32, KeyModifiers, Direction)>,
+    held_resize: Option<HeldResize>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
     zoom_remainder: i32,
@@ -54,6 +54,12 @@ struct State {
 struct Target {
     sender: mpsc::UnboundedSender<Command>,
     frames: FrameStore,
+}
+
+#[derive(Clone, Copy)]
+struct HeldResize {
+    key: u32,
+    repeat: Option<(KeyModifiers, Direction)>,
 }
 
 #[derive(Default)]
@@ -714,7 +720,11 @@ fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
 }
 impl State {
     fn release_keys(&mut self) {
-        self.held_resize = None;
+        // The physical key still belongs to the old shortcut until key-up.
+        // A picker or native text field can receive repeat messages before then.
+        if let Some(held) = &mut self.held_resize {
+            held.repeat = None;
+        }
         if let Some(target) = &self.target {
             for (vk, key) in self.pressed.drain() {
                 emit_key(
@@ -770,15 +780,14 @@ impl State {
         } else {
             raw_vk
         };
-        if self.modal {
-            return false;
-        }
-        if let Some((key, required, direction)) = self.held_resize
-            && key == vk
+        if let Some(held) = self.held_resize
+            && held.key == vk
         {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
-                    if self.target.is_some()
+                    if let Some((required, direction)) = held.repeat
+                        && self.target.is_some()
+                        && !self.modal
                         && !self.hints
                         && !self.picker
                         && !self.switcher
@@ -789,9 +798,17 @@ impl State {
                     }
                     return true;
                 }
-                WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => self.held_resize = None,
+                WM_KEYUP | WM_SYSKEYUP => {
+                    self.held_resize = None;
+                    self.swallowed.remove(&vk);
+                    return true;
+                }
+                WM_KEYDOWN | WM_SYSKEYDOWN => self.held_resize = None,
                 _ => {}
             }
+        }
+        if self.modal {
+            return false;
         }
         if self.hint_held.contains(&vk) {
             match message.message {
@@ -954,7 +971,10 @@ impl State {
                         self.hints = true;
                     }
                     if let Shortcut::ResizePane(direction) = shortcut {
-                        self.held_resize = Some((vk, mods, direction));
+                        self.held_resize = Some(HeldResize {
+                            key: vk,
+                            repeat: Some((mods, direction)),
+                        });
                     }
                     (self.shortcut)(shortcut);
                 }
@@ -1472,6 +1492,30 @@ mod tests {
         );
         state.search = false;
         state.picker = true;
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        state.shortcut = Box::new(move |action| observed.borrow_mut().push(action));
+        let down = |message, repeat| MSG {
+            message,
+            wParam: WPARAM(VK_DOWN.0 as usize),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        // Opening the picker calls release_keys while Alt+Shift+Down is held.
+        state.held_resize = Some(HeldResize {
+            key: VK_DOWN.0 as u32,
+            repeat: Some((KeyModifiers::ALT | KeyModifiers::SHIFT, Direction::Down)),
+        });
+        state.release_keys();
+        assert!(state.handle(&down(WM_KEYDOWN, true)));
+        assert!(state.handle(&down(WM_KEYUP, false)));
+        assert!(
+            actions.borrow().is_empty(),
+            "resize repeat moved the picker"
+        );
+        assert!(state.handle(&down(WM_KEYDOWN, false)));
+        assert!(state.handle(&down(WM_KEYUP, false)));
+        assert_eq!(actions.borrow().as_slice(), &[Shortcut::PickerMove(1)]);
         assert!(!state.handle(&MSG {
             message: WM_CHAR,
             wParam: WPARAM('q' as usize),
