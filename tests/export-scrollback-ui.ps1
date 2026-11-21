@@ -78,12 +78,32 @@ function Click-DialogButton($Dialog, [string]$Id) {
     }
 }
 function Wait-Saved([string]$Path) {
-    $null = Wait-Until "export to $Path" {
-        if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            # The Shell reports the expanded path even when TEMP uses a DOS short name.
-            $destination = [IO.Path]::GetFullPath($Path)
-            Find-Element "Saved scrollback for pane $remote to $destination"
+    $prefix = "Saved scrollback for pane $remote to "
+    $buttons = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $exportEvidence = @{ Status = '(no export status)' }
+    try {
+        $null = Wait-Until "export to $Path" {
+            foreach ($button in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons)) {
+                $name = $button.Current.Name
+                if ($name.StartsWith($prefix)) {
+                    $exportEvidence.Status = $name
+                    # Match the file actually reported. Shell display names can differ
+                    # in casing, DOS aliases, or the spelling of the user's profile path.
+                    return [FixtureDialog]::SameFile($Path, $name.Substring($prefix.Length))
+                }
+                if ($name.StartsWith('Could not save scrollback')) { $exportEvidence.Status = $name }
+            }
         }
+    } catch {
+        $open = foreach ($handle in [FixtureDialog]::Windows($app.Id)) {
+            $candidate = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+            if ($candidate.Current.ClassName -eq '#32770') {
+                "$($candidate.Current.Name) (HWND $handle, owner $([FixtureDialog]::GetWindow($handle,4)))"
+            }
+        }
+        throw "$_ Destination exists: $([IO.File]::Exists($Path)). Status: $($exportEvidence.Status). Open fixture dialogs: [$($open -join ', ')]."
     }
     Wait-Focus $remote
 }
