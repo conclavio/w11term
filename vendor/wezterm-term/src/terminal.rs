@@ -1,6 +1,7 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
 use std::sync::Arc;
+pub use wezterm_escape_parser::osc::FinalTermSemanticPrompt;
 use wezterm_escape_parser::parser::Parser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,13 +33,14 @@ pub trait DeviceControlHandler: Send + Sync {
     fn handle_device_control(&mut self, _control: wezterm_escape_parser::DeviceControlMode);
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum Progress {
     #[default]
     None,
     Percentage(u8),
     Error(u8),
+    Paused(u8),
     Indeterminate,
 }
 
@@ -77,6 +79,10 @@ pub enum Alert {
 
 pub trait AlertHandler: Send + Sync {
     fn alert(&mut self, alert: Alert);
+
+    /// Live primary-screen markers, observed in parser order before history capture.
+    fn semantic_prompt(&mut self, _marker: &FinalTermSemanticPrompt) {}
+    fn terminal_reset(&mut self) {}
 }
 
 pub trait DownloadHandler: Send + Sync {
@@ -182,6 +188,7 @@ impl Terminal {
         mut boundary: impl FnMut(&TerminalState, bool),
     ) {
         self.state.increment_seqno();
+        self.state.swap_parser_writer();
         {
             let bytes = bytes.as_ref();
 
@@ -198,17 +205,20 @@ impl Terminal {
                 }
             });
         }
+        self.state.swap_parser_writer();
         self.trigger_unseen_output_notif();
     }
 
     pub fn perform_actions(&mut self, actions: Vec<wezterm_escape_parser::Action>) {
         self.state.increment_seqno();
+        self.state.swap_parser_writer();
         {
             let mut performer = Performer::new(&mut self.state);
             for action in actions {
                 performer.perform(action);
             }
         }
+        self.state.swap_parser_writer();
         self.trigger_unseen_output_notif();
     }
 }

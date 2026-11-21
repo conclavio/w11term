@@ -3,8 +3,9 @@ use crate::options::{Authentication, JumpHost, MAX_JUMPS, SshOptions};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Read,
+    fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Debug)]
@@ -20,134 +21,97 @@ pub struct ImportedAlias {
     pub warnings: Vec<String>,
 }
 
+mod includes;
+
 pub fn import_file(path: &Path) -> Result<ImportReport> {
-    const LIMIT: u64 = 1024 * 1024;
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(LIMIT + 1)
-        .read_to_string(&mut text)
-        .context("reading UTF-8 SSH config")?;
-    ensure!(text.len() as u64 <= LIMIT, "SSH config exceeds 1 MiB");
     let home = std::env::home_dir().context("cannot determine the Windows home directory")?;
     let user = std::env::var("USERNAME").context("cannot determine the Windows user")?;
-    parse(&text, &home, &user)
+    includes::load(path, &home, &user)
+}
+
+#[derive(Clone)]
+struct Location {
+    path: Arc<Path>,
+    line: usize,
+}
+
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.path.display(), self.line)
+    }
 }
 
 enum Scope {
     Global,
     Hosts(Vec<String>),
-    Conditional(usize),
+    Conditional(Location),
 }
 struct Section {
     scope: Scope,
     directives: Vec<Directive>,
 }
+
+impl Section {
+    fn global() -> Self {
+        Self {
+            scope: Scope::Global,
+            directives: Vec::new(),
+        }
+    }
+}
+
 struct Directive {
-    line: usize,
+    line: Location,
     key: String,
     args: Vec<String>,
 }
 
-fn parse(text: &str, home: &Path, user: &str) -> Result<ImportReport> {
-    let mut sections = vec![Section {
-        scope: Scope::Global,
-        directives: Vec::new(),
-    }];
-    let mut aliases = BTreeSet::new();
-    let mut warnings = BTreeSet::new();
-    for (i, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
-        let line_no = i + 1;
-        ensure!(line_no <= 16_384, "SSH config exceeds 16384 lines");
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+#[derive(Default)]
+struct Parsed {
+    sections: Vec<Section>,
+    aliases: BTreeSet<String>,
+    warnings: BTreeSet<String>,
+}
+impl Parsed {
+    fn section(&mut self, section: Section) {
+        if !section.directives.is_empty() {
+            self.sections.push(section);
         }
-        let split = line
-            .find(|c: char| c.is_whitespace() || c == '=')
-            .unwrap_or(line.len());
-        let key = line[..split].to_ascii_lowercase();
-        let value = line[split..].trim_start();
-        let args = words(value.strip_prefix('=').unwrap_or(value))
-            .with_context(|| format!("line {line_no}"))?;
-        ensure!(
-            !key.is_empty()
-                && key.len() <= 128
-                && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                && !args.is_empty(),
-            "line {line_no}: invalid directive or missing argument"
-        );
-        match key.as_str() {
-            "host" => {
-                for alias in &args {
-                    if !alias.starts_with('!') && !alias.contains(['*', '?']) {
-                        valid_host(alias)
-                            .with_context(|| format!("line {line_no}: invalid Host alias"))?;
-                        aliases.insert(alias.clone());
+    }
+    fn report(mut self, home: &Path, user: &str) -> ImportReport {
+        if self.aliases.is_empty() {
+            self.warnings
+                .insert("No explicit Host aliases were found.".into());
+        }
+        let config = Config {
+            sections: self.sections,
+            home,
+            user,
+        };
+        let aliases = self
+            .aliases
+            .into_iter()
+            .map(|name| {
+                let mut warnings = BTreeSet::new();
+                let options = match config.resolve(&name, &mut warnings) {
+                    Ok(options) => Some(options),
+                    Err(error) => {
+                        warnings.insert(format!("{error:#}"));
+                        None
                     }
+                };
+                ImportedAlias {
+                    name,
+                    options,
+                    warnings: warnings.into_iter().collect(),
                 }
-                sections.push(Section {
-                    scope: Scope::Hosts(args),
-                    directives: vec![],
-                });
-            }
-            "match" => {
-                warnings.insert(format!(
-                    "Line {line_no}: Match conditions are unsupported and were not evaluated."
-                ));
-                sections.push(Section {
-                    scope: Scope::Conditional(line_no),
-                    directives: vec![],
-                });
-            }
-            _ => {
-                if key == "include" {
-                    warnings.insert(format!(
-                        "Line {line_no}: Include is unsupported. Included files were not opened."
-                    ));
-                }
-                sections.last_mut().unwrap().directives.push(Directive {
-                    line: line_no,
-                    key,
-                    args,
-                });
-            }
+            })
+            .collect();
+        ImportReport {
+            aliases,
+            warnings: self.warnings.into_iter().collect(),
         }
     }
-    ensure!(
-        aliases.len() <= 1024,
-        "SSH config exceeds 1024 explicit host aliases"
-    );
-    if aliases.is_empty() {
-        warnings.insert("No explicit Host aliases were found.".into());
-    }
-    let config = Config {
-        sections,
-        home,
-        user,
-    };
-    let aliases = aliases
-        .into_iter()
-        .map(|name| {
-            let mut warnings = BTreeSet::new();
-            let options = match config.resolve(&name, &mut warnings) {
-                Ok(options) => Some(options),
-                Err(error) => {
-                    warnings.insert(format!("{error:#}"));
-                    None
-                }
-            };
-            ImportedAlias {
-                name,
-                options,
-                warnings: warnings.into_iter().collect(),
-            }
-        })
-        .collect();
-    Ok(ImportReport {
-        aliases,
-        warnings: warnings.into_iter().collect(),
-    })
 }
 
 fn words(line: &str) -> Result<Vec<String>> {
@@ -368,11 +332,13 @@ impl Config<'_> {
         let (endpoint, via) = self
             .endpoint(&spec, expand_jump, warnings)
             .with_context(|| format!("Host {}", spec.alias))?;
-        if let Some(via) = via.filter(|s| !s.eq_ignore_ascii_case("none")) {
+        if let Some((via, line)) = via.filter(|(s, _)| !s.eq_ignore_ascii_case("none")) {
             stack.push(spec.alias);
             for (index, hop) in via.split(',').enumerate() {
                 // An explicit preceding -J path on the command line wins over that intermediate alias's own ProxyJump.
-                self.append(EndpointSpec::jump(hop)?, route, stack, index == 0, warnings)?;
+                EndpointSpec::jump(hop)
+                    .and_then(|spec| self.append(spec, route, stack, index == 0, warnings))
+                    .with_context(|| format!("{line}: ProxyJump"))?;
             }
             stack.pop();
         }
@@ -389,7 +355,7 @@ impl Config<'_> {
         spec: &EndpointSpec,
         expand_jump: bool,
         warnings: &mut BTreeSet<String>,
-    ) -> Result<(JumpHost, Option<String>)> {
+    ) -> Result<(JumpHost, Option<(String, Location)>)> {
         let mut scalars = BTreeMap::new();
         let mut identities = Vec::new();
         let mut proxy = None;
@@ -411,7 +377,7 @@ impl Config<'_> {
                             )
                     }) {
                         bail!(
-                            "Line {line}: unsupported Match may change the connection, identity or trust settings"
+                            "{line}: unsupported Match may change the connection, identity or trust settings"
                         );
                     }
                     continue;
@@ -431,12 +397,12 @@ impl Config<'_> {
                         }
                     }
                     key if sensitive(key) => bail!(
-                        "Line {}: unsupported {key} could change routing, authentication or trust",
+                        "{}: unsupported {key} could change routing, authentication or trust",
                         d.line
                     ),
                     key if warnings.len() < 64 => {
                         warnings.insert(format!(
-                            "Host {}, line {}: unsupported {key} was ignored.",
+                            "Host {}, {}: unsupported {key} was ignored.",
                             spec.alias, d.line
                         ));
                     }
@@ -449,23 +415,26 @@ impl Config<'_> {
                 }
             }
         }
-        let scalar =
-            |k: &str| -> Result<Option<&str>> { scalars.get(k).map(|d| argument(d)).transpose() };
         let alias = &spec.alias;
-        let host = expand(scalar("hostname")?.unwrap_or(alias), &[('h', alias)])?;
-        valid_host(&host)?;
-        let user = spec
-            .user
-            .as_deref()
-            .or(scalar("user")?)
-            .unwrap_or(self.user);
-        ensure!(
-            !user.is_empty() && !user.chars().any(|c| c.is_whitespace() || c.is_control()),
-            "invalid SSH username"
-        );
+        let host = configured(scalars.get("hostname").copied(), alias, |name| {
+            let host = expand(name, &[('h', alias)])?;
+            valid_host(&host)?;
+            Ok(host)
+        })?;
+        let user = configured(
+            scalars.get("user").copied().filter(|_| spec.user.is_none()),
+            spec.user.as_deref().unwrap_or(self.user),
+            |user| {
+                ensure!(
+                    !user.is_empty() && !user.chars().any(|c| c.is_whitespace() || c.is_control()),
+                    "invalid SSH username"
+                );
+                Ok(user)
+            },
+        )?;
         let port = match spec.port {
             Some(p) => p,
-            None => scalar("port")?.map(parse_port).transpose()?.unwrap_or(22),
+            None => configured(scalars.get("port").copied(), "22", parse_port)?,
         };
         let port_text = port.to_string();
         let tokens = [
@@ -478,12 +447,16 @@ impl Config<'_> {
             if d.key == "proxycommand" {
                 ensure!(
                     d.args.len() == 1 && d.args[0].eq_ignore_ascii_case("none"),
-                    "Line {}: ProxyCommand is unsupported; this route cannot be imported",
+                    "{}: ProxyCommand is unsupported; this route cannot be imported",
                     d.line
                 );
                 None
             } else {
-                Some(expand(argument(d)?, &tokens)?)
+                Some((
+                    expand(argument(d)?, &tokens)
+                        .with_context(|| format!("{}: ProxyJump", d.line))?,
+                    d.line.clone(),
+                ))
             }
         } else {
             None
@@ -497,42 +470,45 @@ impl Config<'_> {
             let mut tokens = tokens.to_vec();
             let home = self.home.to_str().context("non-Unicode home path")?;
             tokens.extend([('d', home), ('u', self.user)]);
-            let path = expand(value, &tokens)?;
+            let path =
+                expand(value, &tokens).with_context(|| format!("{}: IdentityFile", d.line))?;
             let path =
                 if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
                     self.home.join(rest)
                 } else {
                     ensure!(
                         !path.starts_with('~'),
-                        "unsupported named-user home in IdentityFile"
+                        "{}: unsupported named-user home in IdentityFile",
+                        d.line
                     );
                     PathBuf::from(path)
                 };
             ensure!(
                 path.is_absolute(),
-                "relative IdentityFile is ambiguous; use ~/ or an absolute path"
+                "{}: relative IdentityFile is ambiguous; use ~/ or an absolute path",
+                d.line
             );
             ensure!(
                 identity.as_ref().is_none_or(|first| first == &path),
-                "multiple IdentityFile entries are additive in OpenSSH; select one identity for this profile"
+                "{}: multiple IdentityFile entries are additive in OpenSSH; select one identity for this profile",
+                d.line
             );
             identity = Some(path);
         }
-        let identities_only = scalar("identitiesonly")?.unwrap_or("no");
-        ensure!(
-            identities_only.eq_ignore_ascii_case("yes")
-                || identities_only.eq_ignore_ascii_case("no"),
-            "IdentitiesOnly requires yes or no"
-        );
+        configured(scalars.get("identitiesonly").copied(), "no", |value| {
+            ensure!(
+                value.eq_ignore_ascii_case("yes") || value.eq_ignore_ascii_case("no"),
+                "IdentitiesOnly requires yes or no"
+            );
+            ensure!(
+                identity.is_some() || !value.eq_ignore_ascii_case("yes"),
+                "IdentitiesOnly yes requires an explicit identity file"
+            );
+            Ok(())
+        })?;
         let authentication = match identity {
             Some(identity) => Authentication::Identity { identity },
-            None => {
-                ensure!(
-                    !identities_only.eq_ignore_ascii_case("yes"),
-                    "IdentitiesOnly yes requires an explicit identity file"
-                );
-                Authentication::Agent
-            }
+            None => Authentication::Agent,
         };
         Ok((
             JumpHost {
@@ -547,10 +523,21 @@ impl Config<'_> {
     }
 }
 
+fn configured<'a, T>(
+    directive: Option<&'a Directive>,
+    default: &'a str,
+    parse: impl FnOnce(&'a str) -> Result<T>,
+) -> Result<T> {
+    match directive {
+        Some(d) => parse(argument(d)?).with_context(|| format!("{}: {}", d.line, d.key)),
+        None => parse(default),
+    }
+}
+
 fn argument(directive: &Directive) -> Result<&str> {
     ensure!(
         directive.args.len() == 1,
-        "line {}: {} requires one argument",
+        "{}: {} requires one argument",
         directive.line,
         directive.key
     );
@@ -587,7 +574,7 @@ fn expand(value: &str, tokens: &[(char, &str)]) -> Result<String> {
 mod tests {
     use super::*;
     fn parse_config(text: &str) -> ImportReport {
-        parse(text, Path::new(r"C:\Users\pilot"), "local-pilot").unwrap()
+        includes::parse_test(text, Path::new(r"C:\Users\pilot"), "local-pilot").unwrap()
     }
     fn alias<'a>(report: &'a ImportReport, name: &str) -> &'a ImportedAlias {
         report

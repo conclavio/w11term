@@ -32,12 +32,11 @@ edits. Synchronized-output holds use those committed pixels for both Canvas and
 screenshots while the parser updates its separate working state. Unchanged frozen
 images are shared across snapshots rather than copied again for every cell or paint.
 
-The renderer sorts all visible tiles by z-index inside the below-text and above-text
-layers, including placements anchored in different cells. Stable ties preserve model
-order. This fixes traversal order overriding explicit z-indices. Cell backgrounds
-are painted first, then negative-z images, text, and nonnegative-z images. The full
-kitty negative-z/background interaction and every blend/placement extension have
-not been exhaustively compared against reference terminals.
+The renderer collects visible tiles once per paint. It draws images with
+`z < -1073741824` over the window background, then paints cell backgrounds.
+It draws the remaining negative-z images before glyphs and nonnegative-z images
+after glyphs. Each layer sorts placements by z-index and image ID. An overlap
+at equal z shows the higher numbered kitty image on top. [Kitty placement rules](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout)
 
 The engine's image table now counts replacement of id zero correctly, limits direct
 transmissions to 48 MiB encoded / 32 MiB inflated, limits decoded kitty frames to
@@ -71,8 +70,9 @@ Deleting a parent removes its dependents. Cycles and missing parents return
 `ECYCLE` and `ENOPARENT`. Each terminal accepts up to 1,024 placements, a
 relative ancestry depth of 16, and 65,536 projected visible tiles per snapshot.
 
-`tests/fixtures/kitty/placements.vt` is the exact byte stream consumed by all three
-renderers. `samples.json` gives zero-based cell centers and expected RGB values.
+`tests/fixtures/kitty/placements.vt` and `layers.vt` are the byte streams
+consumed in order by all three renderers. `samples.json` gives zero-based
+cell centers and expected RGB values.
 It includes two differently colored placeholder cells, a blue relative child
 and the yellow second animation frame. Run the Windows Direct2D check with
 `cargo test --bin w11term offscreen_kitty_reference_cell_centers`. The engine
@@ -83,9 +83,18 @@ snapshots, resizing, scrolling, parent deletion and error replies.
 The `Kitty graphics reference` workflow runs two independent Linux jobs under
 Xvfb with Mesa software GL. One captures Ubuntu 24.04's kitty 0.32.2. The
 other captures Ghostty 1.4.0, the release that added animation and relative
-placements. Its container image is pinned by digest and its signed packages
-come from the November 12 Arch Linux Archive. Both jobs run on pull requests
-and feed the merge release check. [Ghostty release notes](https://ghostty.org/docs/install/release-notes/1-4-0) · [Arch Linux package](https://archlinux.org/packages/extra/x86_64/ghostty/)
+placements. Both jobs run on pull requests and feed the merge release check.
+[Ghostty release notes](https://ghostty.org/docs/install/release-notes/1-4-0)
+
+The Ghostty job runs on GitHub’s Ubuntu 26.04 x64 image. It downloads the
+community-built `ghostty_1.4.0-0.ppa2_amd64_26.04.deb` from
+`mkasberg/ghostty-ubuntu` release `1.4.0-0-ppa2`. Before installing, it
+checks SHA-256 `2d70bf419494362dffb6463d8ff3ab76c3fd1b0e247ea9b0b0aeda5c2fa4c681`
+and the Debian package name, version and architecture. Ubuntu supplies the
+capture dependencies, including Mesa, GTK, Xvfb and DejaVu Sans Mono.
+The job checks the running Ghostty version and records the runner image and
+installed package versions alongside the captured PNG and cell samples.
+[Package release](https://github.com/mkasberg/ghostty-ubuntu/releases/tag/1.4.0-0-ppa2) · [Ubuntu 26.04 runner availability](https://github.com/actions/runner-images/issues/14747)
 
 To repeat either capture on Linux, install the corresponding terminal,
 Xvfb, xauth, xdotool, ImageMagick and Python with Pillow. Ghostty also uses
@@ -104,9 +113,29 @@ single center pixel. Ghostty's default 10-pixel-wide cell puts the center
 between two pixels. On the red/green boundary its right-hand pixel already
 contains interpolated green. The Ghostty harness sets `adjust-cell-width=-1`
 for the pinned font and Xvfb display.
-The five colored sample points test placement and selected pixels. GPU interpolation,
+Eight samples in the seventh row exercise a default background, explicit cell
+backgrounds on both sides of the z threshold, negative and zero z across a
+solid glyph, and equal- and different-z image overlaps. The solid image tiles
+contain 8×8 texels so the cell-center sample falls inside an opaque texture
+region on all three renderers. The original five sample
+points exercise placement and selected animation frames. GPU interpolation,
 general deletion selectors, placeholders under every rendition attribute, and every
 possible compositing edge remain outside this fixture.
+
+The equal-z sample transmits image 70 before 71, then places 71 before 70.
+Both reference terminals show 71 on top. Ghostty 1.4.0 and w11term use the
+client's image ID to break ties. Kitty 0.32.2 uses an internal ID assigned at
+transmission, so reversing transmission order can change its result. The
+protocol leaves overlapping placements with identical image ID and z-index
+unspecified. [Protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout) · [Ghostty ID ordering](https://github.com/ghostty-org/ghostty/blob/v1.4.0/src/renderer/image.zig#L535-L553) · [Kitty ID allocation](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L381-L391) · [Kitty sort](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L1090-L1117)
+
+An explicit RGB cell background equal to the terminal default covers a
+below-background image in w11term and Ghostty 1.4.0. Kitty 0.32.2 compares
+resolved RGB values and lets the image show through that cell. The shared
+fixture uses blue against a black default. The w11term-only native test
+`offscreen_explicit_default_rgb_covers_a_below_background_image` checks
+explicit black beside a default cell over the same red image.
+[Ghostty background opacity](https://github.com/ghostty-org/ghostty/blob/v1.4.0/src/renderer/generic.zig#L3203-L3225) · [Kitty color resolution](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/cell_vertex.glsl#L153-L165) · [Kitty background comparison](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/cell_vertex.glsl#L196-L204)
 
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) and
 [kitty 0.32.2 placement implementation](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c)

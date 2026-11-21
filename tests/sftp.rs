@@ -27,7 +27,16 @@ struct Peer {
 }
 impl server::Handler for Peer {
     type Error = anyhow::Error;
-    async fn auth_none(&mut self, _: &str) -> anyhow::Result<server::Auth> {
+    async fn auth_none(&mut self, _user: &str) -> anyhow::Result<server::Auth> {
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("authenticated-users").is_file() {
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.root.join("authenticated-users"))?,
+                "{_user}"
+            )?;
+        }
         Ok(server::Auth::Accept)
     }
     async fn channel_open_session(
@@ -140,6 +149,22 @@ impl server::Handler for Peer {
                     .open(self.root.join("keyboard-input.bin"))?
                     .write_all(data)?;
             }
+            #[cfg(feature = "ui-smoke")]
+            if data == b"\x04" && self.root.join("exit-on-eot").is_file() {
+                s.exit_status_request(c, 23)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
+            }
+            #[cfg(feature = "ui-smoke")]
+            if data == b"\x04" && self.root.join("disconnect-on-eot").is_file() {
+                s.disconnect(
+                    russh::Disconnect::ByApplication,
+                    "test connection loss",
+                    "en",
+                )?;
+                return Ok(());
+            }
             s.data(c, data.to_vec())?;
         }
         Ok(())
@@ -196,6 +221,16 @@ fn io(e: std::io::Error) -> StatusCode {
     } else {
         StatusCode::Failure
     }
+}
+fn entry_attrs(path: &std::path::Path) -> Result<FileAttributes, StatusCode> {
+    let metadata = fs::symlink_metadata(path).map_err(io)?;
+    let mut attrs = FileAttributes::from(&metadata);
+    // russh-sftp's Windows Metadata conversion treats non-directories as regular files.
+    if metadata.file_type().is_symlink() {
+        attrs.permissions =
+            Some((attrs.permissions.unwrap_or_default() & !0o170000) | FileMode::LNK.bits());
+    }
+    Ok(attrs)
 }
 impl Files {
     fn path(&self, path: &str) -> PathBuf {
@@ -323,7 +358,24 @@ impl russh_sftp::server::Handler for Files {
         })
     }
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
-        self.stat(id, path).await
+        if self.root.join("deny-rename-check").exists() {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if self.root.join("disconnect-on-lstat").exists() {
+            let _ = self
+                .ssh
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "fixture interrupted LSTAT".into(),
+                    "en".into(),
+                )
+                .await;
+            return Err(StatusCode::ConnectionLost);
+        }
+        Ok(Attrs {
+            id,
+            attrs: entry_attrs(&self.path(&path))?,
+        })
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
         if self.root.join("no-fstat").exists() {
@@ -365,13 +417,13 @@ impl russh_sftp::server::Handler for Files {
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
             .map(|e| {
-                let e = e.unwrap();
-                russh_sftp::protocol::File::new(
+                let e = e.map_err(io)?;
+                Ok(russh_sftp::protocol::File::new(
                     e.file_name().to_string_lossy(),
-                    (&e.metadata().unwrap()).into(),
-                )
+                    entry_attrs(&e.path())?,
+                ))
             })
-            .collect();
+            .collect::<Result<_, StatusCode>>()?;
         Ok(self.add(id, Opened::Dir(entries)))
     }
     async fn readdir(&mut self, id: u32, h: String) -> Result<Name, StatusCode> {
@@ -390,6 +442,14 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         _: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("mkdir-trace").exists() {
+            let mut trace = fs::OpenOptions::new()
+                .append(true)
+                .open(self.root.join("mkdir-trace"))
+                .map_err(io)?;
+            writeln!(trace, "{path}").map_err(io)?;
+        }
         fs::create_dir(self.path(&path)).map_err(io)?;
         Ok(status(id))
     }
@@ -402,7 +462,43 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn rename(&mut self, id: u32, from: String, to: String) -> Result<Status, StatusCode> {
-        fs::rename(self.path(&from), self.path(&to)).map_err(io)?;
+        let trace = self.root.join("rename-trace.jsonl");
+        if trace.is_file() {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(trace)
+                .map_err(io)?;
+            writeln!(file, "{}", json!([from, to])).map_err(io)?;
+        }
+        let destination = self.path(&to);
+        if self.root.join("race-next-rename").exists() {
+            fs::File::create_new(&destination)
+                .map_err(io)?
+                .write_all(b"racing entry")
+                .map_err(io)?;
+            fs::remove_file(self.root.join("race-next-rename")).map_err(io)?;
+        }
+        // MoveFileW enforces one no-replace operation, including for directories
+        // and reparse points. std::fs::rename would replace a racing entry.
+        use windows::{Win32::Storage::FileSystem::MoveFileW, core::HSTRING};
+        unsafe {
+            MoveFileW(
+                &HSTRING::from(self.path(&from).as_os_str()),
+                &HSTRING::from(destination.as_os_str()),
+            )
+        }
+        .map_err(|_| StatusCode::Failure)?;
+        if self.root.join("disconnect-after-rename").exists() {
+            let _ = self
+                .ssh
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "fixture lost RENAME reply".into(),
+                    "en".into(),
+                )
+                .await;
+            return Err(StatusCode::ConnectionLost);
+        }
         Ok(status(id))
     }
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
@@ -509,8 +605,54 @@ async fn fixture(
 }
 
 #[cfg(feature = "ui-smoke")]
+#[path = "sftp/keypad.rs"]
+mod keypad;
+#[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
+#[path = "sftp/rename.rs"]
+mod rename;
+#[cfg(feature = "ui-smoke")]
+#[path = "sftp/tab_windows.rs"]
+mod tab_windows;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let generation = pane.frames.load().connection_generation;
+    let baseline = opens.load(Ordering::Relaxed);
+    for expected in [generation + 1, generation] {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        pane.input
+            .send(Command::Sftp(w11term::sftp::Job {
+                operation: w11term::sftp::Operation::Mkdir {
+                    path: "/approved".into(),
+                    attrs: Default::default(),
+                },
+                expected_generation: Some(expected),
+                deadline,
+                reply,
+                progress: None,
+            }))
+            .unwrap();
+        let result = tokio::time::timeout_at(deadline, result)
+            .await
+            .unwrap()
+            .unwrap();
+        if expected != generation {
+            assert!(result.unwrap_err().contains("operation was not started"));
+            assert!(!remote.path().join("approved").exists());
+            assert_eq!(opens.load(Ordering::Relaxed), baseline);
+        } else {
+            result.unwrap();
+            assert!(remote.path().join("approved").is_dir());
+            assert_eq!(opens.load(Ordering::Relaxed), baseline + 1);
+        }
+    }
+    drop(pane);
+    server.abort();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_workspace_exec_reply_does_not_dispatch_command_again() {
@@ -598,6 +740,7 @@ fn registry(session: &Session) -> Registry {
         label: "test".into(),
         active: false,
         visible: false,
+        read_only: false,
         input: session.input.clone(),
     }]);
     r
@@ -612,6 +755,7 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         pane.input
             .send(Command::Sftp(Job {
+                expected_generation: None,
                 operation,
                 deadline,
                 reply,
@@ -688,6 +832,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         session
             .input
             .send(Command::Sftp(Job {
+                expected_generation: None,
                 operation,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 reply,
@@ -1082,7 +1227,7 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         let _=fs::remove_file(root.path().join("read-entered"));
         fs::write(root.path().join("pause-reads"),[]).unwrap();
         let (reply,response)=tokio::sync::oneshot::channel();
-        session.input.send(Command::Sftp(w11term::sftp::Job{operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply,progress:None})).unwrap();
+        session.input.send(Command::Sftp(w11term::sftp::Job{expected_generation:None,operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply,progress:None})).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !root.path().join("read-entered").exists() { tokio::task::yield_now().await; }
         }).await.unwrap();

@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use russh::{Channel, client};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use tokio::{runtime, sync::oneshot};
+use tokio::{
+    runtime,
+    sync::{oneshot, watch},
+};
 
 // A socket and its russh driver must outlive whichever terminal opened it.
 // Terminal parsing and presentation continue on each pane's own worker.
@@ -79,6 +82,15 @@ impl ConnectionShare {
     pub(super) fn fingerprint(&self) -> &str {
         &self.0.fingerprint
     }
+    pub(crate) fn verified_endpoint(&self) -> (&str, &str, u16, &str) {
+        let options = &self.0.options;
+        (
+            &options.host,
+            &options.user,
+            options.port,
+            &self.0.fingerprint,
+        )
+    }
     pub(super) async fn open_shell(&self) -> Result<ShellChannel> {
         // russh doesn't close a bare Channel on drop. An opener cancelled
         // during channel confirmation still has to close a later acceptance.
@@ -104,6 +116,9 @@ pub(super) struct ShellChannel {
 }
 
 impl ShellChannel {
+    pub(super) fn into_stream(mut self) -> russh::ChannelStream<client::Msg> {
+        self.channel.take().unwrap().into_stream()
+    }
     pub(super) fn channel(&mut self) -> &mut Channel<client::Msg> {
         self.channel.as_mut().unwrap()
     }
@@ -148,22 +163,61 @@ impl Drop for ShellChannel {
     }
 }
 
+#[derive(Default)]
+struct Publication {
+    generation: u64,
+    current: Weak<ConnectionShare>,
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct ShareSlot(Arc<Mutex<Weak<ConnectionShare>>>);
+pub(crate) struct ShareSlot {
+    publication: Arc<Mutex<Publication>>,
+    changed: watch::Sender<()>,
+}
+
+pub(super) struct PublishedShell {
+    slot: ShareSlot,
+    link: Weak<ConnectionShare>,
+}
+
+impl Drop for PublishedShell {
+    fn drop(&mut self) {
+        let mut state = self.slot.publication.lock().unwrap();
+        if state.current.ptr_eq(&self.link) {
+            state.current = Weak::new();
+            self.slot.changed.send_replace(());
+        }
+    }
+}
 
 impl ShareSlot {
     pub(crate) fn current(&self) -> Option<ConnectionShare> {
-        self.0
-            .lock()
-            .unwrap()
+        self.generation().map(|(_, link)| link)
+    }
+    pub(crate) fn generation(&self) -> Option<(u64, ConnectionShare)> {
+        let state = self.publication.lock().unwrap();
+        state
+            .current
             .upgrade()
             .filter(|share| !share.0.handle.is_closed())
-            .map(|share| (*share).clone())
+            .map(|share| (state.generation, (*share).clone()))
+    }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
+        self.changed.subscribe()
+    }
+    pub(super) fn shell_lifetime(&self, link: &Arc<ConnectionShare>) -> PublishedShell {
+        PublishedShell {
+            slot: self.clone(),
+            link: Arc::downgrade(link),
+        }
     }
     pub(super) fn publish(&self, local: &Arc<ConnectionShare>) {
         // Each pane owns its own outer Arc. Its offer expires on disconnect
         // even when other panes continue to use the underlying Link.
-        *self.0.lock().unwrap() = Arc::downgrade(local);
+        let mut state = self.publication.lock().unwrap();
+        state.generation += 1;
+        state.current = Arc::downgrade(local);
+        self.changed.send_replace(());
     }
 }
 
@@ -173,4 +227,39 @@ pub(crate) struct Sharing {
     pub published: ShareSlot,
     pub offered: Option<ConnectionShare>,
     pub durable: Option<super::durability::Worker>,
+    generations: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Sharing {
+    pub(crate) fn new(
+        published: ShareSlot,
+        offered: Option<ConnectionShare>,
+        durable: Option<super::durability::Worker>,
+        startup: Option<crate::workspace::SshStartup>,
+    ) -> Self {
+        Self {
+            published,
+            offered,
+            durable,
+            startup,
+            ..Default::default()
+        }
+    }
+
+    /// Only the original launch can consume a shared connection or attach worker.
+    pub(crate) fn for_launch(&mut self) -> Self {
+        Self {
+            published: self.published.clone(),
+            offered: self.offered.take(),
+            durable: self.durable.take(),
+            startup: self.startup.clone(),
+            generations: self.generations.clone(),
+        }
+    }
+
+    pub(crate) fn next_generation(&self) -> u64 {
+        self.generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
 }

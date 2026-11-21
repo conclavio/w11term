@@ -217,12 +217,15 @@ impl TerminalApp {
         let window_grid = surface.window_grid.clone();
         let area = surface.area.clone();
         let selection = tab.selection.clone();
+        let read_only = tab.read_only.clone();
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
         let copy_mode = self.copy_mode.clone();
+        let native_window = self.keyboard.scope();
         #[cfg(feature = "ui-smoke")]
         let paint_count = surface.paint_count.clone();
         let canvas: View = Canvas::invalidated(&surface.invalidator, move |ctx| {
+            let _native = native_window.enter();
             #[cfg(feature = "ui-smoke")]
             paint_count.set(paint_count.get() + 1);
             let hints = hints.borrow();
@@ -232,6 +235,7 @@ impl TerminalApp {
             let mode = copy_mode.borrow();
             let mode = mode.as_ref().filter(|m| m.pane == id);
             renderer.copy_cursor = mode.map(|m| m.state.cursor);
+            renderer.read_only = read_only.get();
             let marked = mode.and_then(|m| m.state.selection());
             let measured = renderer.draw(ctx, &frame)?;
             renderer.draw_interaction(
@@ -597,6 +601,36 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_transport_ignores_an_old_drag_until_a_fresh_press() {
+        let event = |kind, button| MouseEvent {
+            kind,
+            button,
+            x: 3,
+            y: 1,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut remote = RemoteMouse::default();
+        let drag = event(MouseEventKind::Move, MouseButton::Left);
+        let release = event(MouseEventKind::Release, MouseButton::None);
+        assert!(remote.event(drag).is_none());
+        assert!(remote.event(release).is_none());
+        assert!(
+            remote
+                .event(event(MouseEventKind::Move, MouseButton::None))
+                .is_some()
+        );
+        assert!(
+            remote
+                .event(event(MouseEventKind::Press, MouseButton::Left))
+                .is_some()
+        );
+        assert!(remote.event(drag).is_some());
+        assert_eq!(remote.event(release).unwrap().button, MouseButton::Left);
+    }
 
     #[test]
     fn dragging_uses_window_coordinates_and_requires_same_view_and_divider() {

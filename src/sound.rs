@@ -17,6 +17,14 @@ pub struct Alerts {
     pub player: Arc<RwLock<PlayerOptions>>,
 }
 impl wezterm_term::AlertHandler for Alerts {
+    fn semantic_prompt(&mut self, marker: &wezterm_term::FinalTermSemanticPrompt) {
+        self.events.semantic_prompt(marker);
+    }
+
+    fn terminal_reset(&mut self) {
+        self.events.reset_command_watch();
+    }
+
     fn alert(&mut self, alert: wezterm_term::Alert) {
         use wezterm_term::Alert;
         match alert {

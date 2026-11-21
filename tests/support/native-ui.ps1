@@ -6,6 +6,22 @@ using System.Runtime.InteropServices;
 public static class FixtureMessages {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(
         IntPtr hwnd, uint msg, UIntPtr key, IntPtr detail);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint MapVirtualKeyW(uint key, uint mapping);
+    public static bool PostKey(IntPtr hwnd, uint msg, uint key) {
+        uint detail = 0;
+        if (msg == 0x100 || msg == 0x101) { // WM_KEYDOWN / WM_KEYUP
+            uint scan = MapVirtualKeyW(key, 4); // MAPVK_VK_TO_VSC_EX, including the E0 prefix
+            detail = 1 | ((scan & 0xff) << 16);
+            // Windows can report the shared keypad scan for arrows/navigation. The
+            // generic fixtures press the dedicated cluster; keypad fixtures encode their own.
+            if ((scan >> 8) == 0xe0 || (key >= 0x21 && key <= 0x28) || key == 0x2d || key == 0x2e)
+                detail |= 1u << 24;
+            // TranslateMessage treats a release with the transition bit clear as another press.
+            if (msg == 0x101) detail |= 0xc0000000u;
+        }
+        return PostMessage(hwnd, msg, new UIntPtr(key), new IntPtr(unchecked((int)detail)));
+    }
 }
 '@
 
@@ -18,6 +34,39 @@ function Wait-Until([string]$Description, [scriptblock]$Probe) {
         Start-Sleep -Milliseconds 80
     } while ([DateTime]::UtcNow -lt $until)
     throw "Timed out waiting for $Description"
+}
+function Find-OwnedDialog([string]$Title) {
+    foreach ($hwnd in [FixtureDialog]::Windows($app.Id)) {
+        if ([FixtureDialog]::GetWindow($hwnd, 4) -ne $window) { continue }
+        $element = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        if ($element.Current.ClassName -eq '#32770' -and $element.Current.Name -eq $Title) { return $hwnd }
+    }
+}
+function Select-DialogItem([IntPtr]$Dialog, [string]$Name) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Dialog)
+    $byName = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+    $selectable = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty, $true)
+    $match = [System.Windows.Automation.AndCondition]::new($byName, $selectable)
+    $null = Wait-Until "native picker selection '$Name'" {
+        $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $match)
+        if ($item) {
+            $selection = $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            if (!$selection.Current.IsSelected) { $selection.Select() }
+            return $selection.Current.IsSelected
+        }
+    }
+}
+function Wait-InputWindow {
+    # The GUI replaces its bootstrap title only after installing the HWND's input route.
+    $prefix = 'w11term ' + [char]0xb7 + ' '
+    return Wait-Until 'the fixture window to bind its keyboard' {
+        $app.Refresh()
+        if ($app.MainWindowHandle -ne [IntPtr]::Zero -and ([string]$app.MainWindowTitle).StartsWith($prefix)) {
+            $app.MainWindowHandle
+        }
+    }
 }
 function Control([string[]]$Command) {
     $reply = & $Cli --pid $app.Id @Command | ConvertFrom-Json
@@ -50,13 +99,33 @@ function Invoke-Button($Element) {
 }
 function Post-Key([uint32]$Message, [uint32]$Key) {
     # Address this process's window. This never types into the foreground application.
-    if (-not [FixtureMessages]::PostMessage($window, $Message, [UIntPtr]::new($Key), [IntPtr]::Zero)) {
+    if (-not [FixtureMessages]::PostKey($window, $Message, $Key)) {
         throw "Could not post key event to the fixture window"
     }
 }
 function Press-Key([uint32]$Key) {
     Post-Key 0x100 $Key
     Post-Key 0x101 $Key
+}
+function Open-Palette([string]$Command) {
+    Press-Key 0x76 # F7 in the fixture's keymap
+    try {
+        return Wait-Until "F7 to focus command search for '$Command'" {
+            $entry = Find-Element 'Search commands' ([System.Windows.Automation.ControlType]::Edit)
+            if ($entry -and $entry.Current.HasKeyboardFocus) { $entry }
+        }
+    } catch {
+        $mounted = $null -ne (Find-Element 'Search commands' ([System.Windows.Automation.ControlType]::Edit))
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        $focus = if ($focused -and $focused.Current.ProcessId -eq $app.Id) { $focused.Current.Name } else { '(outside fixture)' }
+        throw "$_ Search edit mounted: $mounted. Foreground HWND: $([FixtureMessages]::GetForegroundWindow()), fixture HWND: $window. Focus: $focus"
+    }
+}
+function Run-Palette([string]$Command) {
+    $field = Open-Palette $Command
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
+    Invoke-Button (Wait-Until $Command { Find-Element $Command ([System.Windows.Automation.ControlType]::Button) })
+    $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
 }
 function Wait-Focus([int]$Pane) {
     try {

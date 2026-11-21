@@ -1,5 +1,7 @@
 # Local modifications
 
+- Framed terminal viewers can install separate nonblocking writers for user input and parser replies. The default writer remains threaded. The embedding can also detach its clipboard handler when a stream may repaint earlier output.
+
 Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term
 
 - The manifest expands workspace dependencies so this crate can be built outside the WezTerm workspace. Shared crates remain pinned to the same upstream revision.
@@ -45,3 +47,21 @@ The original MIT license is preserved in `LICENSE.md`.
   preserves the distinction between a missing status and exit code zero.
   OSC 7 retains the original URI alongside the parsed URL so the embedding can
   validate the authority before using it for the pane's SFTP drawer.
+
+- The embedding receives primary-screen OSC 133 command markers and terminal
+  reset notifications as the parser processes them. This lets the command
+  completion watch observe a short command even when several complete in one
+  input batch or its output has already left scrollback.
+
+- OSC 9;4 retains the percentage of a paused operation. Error and paused
+  states with an omitted or zero value reuse the previous percentage, including
+  across indeterminate updates. A fresh warning starts at 10%, matching Windows
+  Terminal. RIS and transport reset clear both the state and the stored value.
+
+- `Screen::physical_lines` provides a borrowed, double-ended iterator over
+  retained rows for plain-text exports without cloning scrollback.
+
+- A terminal may replace its input and reply writer after the previous
+  transport has exited. Pending bytes on the old writer keep their original
+  destination while the next shell starts in the same terminal model.
+  The embedding can track window focus locally while the peer is offline.

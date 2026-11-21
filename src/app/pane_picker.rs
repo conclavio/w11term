@@ -155,6 +155,7 @@ fn preview_summary(frame: &Snapshot) -> String {
 }
 
 struct Choice {
+    read_only: bool,
     pane: u64,
     tab_title: Option<String>,
     title: String,
@@ -195,6 +196,9 @@ impl Choice {
             &self.title
         };
         let mut fields = vec![title.as_str()];
+        if self.read_only {
+            fields.push("Read-only");
+        }
         for text in self
             .tab_title
             .iter()
@@ -216,6 +220,7 @@ impl Choice {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
+    Commands,
     Focus,
     Destination { source: TabId },
     Placement { source: TabId, target: TabId },
@@ -227,6 +232,7 @@ pub(super) struct Picker {
     input: ElementRef<TextBox>,
     default_side: ElementRef<Button>,
     matches: Vec<Choice>,
+    commands: Vec<command_palette::Row>,
     selected: usize,
     preview: Option<Preview>,
 }
@@ -253,13 +259,28 @@ impl Picker {
         if self.placement().is_some() {
             return;
         }
+        let count = if self.mode == Mode::Commands {
+            self.commands.len()
+        } else {
+            self.matches.len()
+        };
         self.selected = self
             .selected
             .saturating_add_signed(amount)
-            .min(self.matches.len().saturating_sub(1));
+            .min(count.saturating_sub(1));
     }
 
     pub(super) fn view(&self, app: &TerminalApp, ctx: &ViewContext<TerminalApp>) -> View {
+        if self.mode == Mode::Commands {
+            return command_palette::view(
+                &self.commands,
+                self.selected,
+                &self.query,
+                &self.input,
+                app,
+                ctx,
+            );
+        }
         match self.placement() {
             Some((source, target)) => self.placement_view(source, target, app.width, ctx),
             None => self.search_view(app, ctx),
@@ -452,7 +473,7 @@ impl Picker {
         )
     }
 
-    fn overlay(content: View, width: f64) -> View {
+    pub(super) fn overlay(content: View, width: f64) -> View {
         Border::new()
             .grid_row_span(2)
             .background(Color::argb(112, 0, 0, 0))
@@ -489,6 +510,7 @@ impl TerminalApp {
                     }) = self.tabs.get(leaf)
                     {
                         choices.push(Choice {
+                            read_only: live.read_only.get(),
                             tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
                             pane: live.session.pane_id,
                             label: label.clone(),
@@ -505,6 +527,53 @@ impl TerminalApp {
         choices
     }
 
+    pub(super) fn open_command_palette(&mut self, ctx: &ComponentContext<Self>) {
+        if matches!(self.tabs.active().map(|t| &t.page), Some(Page::Terminal(live)) if live.prompt_id.is_some() || live.session.prompts.current().is_some() || live.device_busy)
+        {
+            if self.picker.is_none() {
+                self.keyboard.set_picker(None);
+            }
+            return;
+        }
+        self.start_picker(Mode::Commands, ctx);
+    }
+
+    pub(super) fn refresh_open_commands(&mut self) {
+        let Some(picker) = self.picker.as_ref().filter(|p| p.mode == Mode::Commands) else {
+            return;
+        };
+        let commands = self.command_rows(&picker.query);
+        let selected = picker
+            .commands
+            .get(picker.selected)
+            .and_then(|previous| commands.iter().position(|row| row.id == previous.id))
+            .unwrap_or_else(|| picker.selected.min(commands.len().saturating_sub(1)));
+        let picker = self.picker.as_mut().unwrap();
+        picker.commands = commands;
+        picker.selected = selected;
+    }
+
+    pub(super) fn choose_command(
+        &mut self,
+        id: command_palette::CommandId,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some(picker) = &self.picker else { return };
+        if picker.mode != Mode::Commands || !picker.commands.iter().any(|r| r.id == id && r.enabled)
+        {
+            return;
+        }
+        // A profile, pane, selection, or remote connection can change while the palette is open.
+        let rows = self.command_rows(&picker.query);
+        if rows.iter().any(|r| r.id == id && r.enabled) {
+            self.close_picker(ctx);
+            self.run_palette_command(id, ctx);
+        } else if let Some(picker) = &mut self.picker {
+            picker.commands = rows;
+            picker.move_by(0);
+        }
+    }
+
     pub(super) fn open_picker(&mut self, ctx: &ComponentContext<Self>) {
         self.start_picker(Mode::Focus, ctx);
     }
@@ -513,7 +582,7 @@ impl TerminalApp {
         if let Some(source) = self.move_source() {
             self.start_picker(Mode::Destination { source }, ctx);
         } else if self.picker.is_none() {
-            self.keyboard.set_picker(false);
+            self.keyboard.set_picker(None);
         }
     }
 
@@ -534,7 +603,11 @@ impl TerminalApp {
         if self.switcher.is_some() {
             self.finish_switcher(false, ctx);
         }
-        let matches = self.picker_choices(mode);
+        let (matches, commands) = if mode == Mode::Commands {
+            (vec![], self.command_rows(""))
+        } else {
+            (self.picker_choices(mode), vec![])
+        };
         let active = self.tabs.active().and_then(AppTab::pane_id);
         let selected = matches
             .iter()
@@ -546,11 +619,16 @@ impl TerminalApp {
             default_side: ElementRef::new(),
             query: String::new(),
             matches,
+            commands,
             selected,
             preview: None,
         });
         self.sync_picker_preview(ctx);
-        self.keyboard.set_picker(true);
+        self.keyboard.set_picker(Some(if mode == Mode::Commands {
+            PickerStage::Commands
+        } else {
+            PickerStage::Search
+        }));
         self.focus_picker_input(0, ctx);
     }
 
@@ -578,6 +656,14 @@ impl TerminalApp {
     pub(super) fn filter_picker(&mut self, query: String, ctx: &ComponentContext<Self>) {
         let Some(picker) = &self.picker else { return };
         if picker.placement().is_some() || picker.query == query {
+            return;
+        }
+        if picker.mode == Mode::Commands {
+            let rows = self.command_rows(&query);
+            let picker = self.picker.as_mut().unwrap();
+            picker.commands = rows;
+            picker.query = query;
+            picker.selected = 0;
             return;
         }
         let matches = Picker::filter(self.picker_choices(picker.mode), &query);
@@ -646,6 +732,14 @@ impl TerminalApp {
     }
 
     pub(super) fn accept_picker(&mut self, ctx: &ComponentContext<Self>) {
+        if let Some(picker) = &self.picker
+            && picker.mode == Mode::Commands
+        {
+            if let Some(row) = picker.commands.get(picker.selected) {
+                self.choose_command(row.id.clone(), ctx);
+            }
+            return;
+        }
         if let Some(pane) = self
             .picker
             .as_ref()
@@ -759,6 +853,7 @@ mod tests {
     }
     fn row(pane: u64, title: &str, label: &str, destination: &str) -> Choice {
         Choice {
+            read_only: false,
             pane,
             tab_title: None,
             title: title.into(),

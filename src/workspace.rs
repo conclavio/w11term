@@ -28,6 +28,7 @@ pub enum SavedSource {
     /// An explicit session browser on a saved SSH account. Reopening an
     /// unselected browser lists sessions again without creating a shell.
     Discovery(String),
+    HerdrDiscovery(String),
     Local {
         name: Option<String>,
         shell: crate::options::LocalOptions,
@@ -69,7 +70,9 @@ impl SavedSource {
 
     pub fn profile_name(&self) -> Option<&str> {
         match self {
-            Self::SavedProfile(name) | Self::Discovery(name) => Some(name),
+            Self::SavedProfile(name) | Self::Discovery(name) | Self::HerdrDiscovery(name) => {
+                Some(name)
+            }
             Self::Local { name, .. } => name.as_deref(),
             Self::Durable { connection, .. } | Self::Startup { connection, .. } => {
                 connection.profile_name()
@@ -77,9 +80,16 @@ impl SavedSource {
             _ => None,
         }
     }
+    pub fn is_herdr_browser(&self) -> bool {
+        match self {
+            Self::HerdrDiscovery(_) => true,
+            Self::Durable { connection, .. } => connection.is_herdr_browser(),
+            _ => false,
+        }
+    }
     pub fn is_discovery(&self) -> bool {
         match self {
-            Self::Discovery(_) => true,
+            Self::Discovery(_) | Self::HerdrDiscovery(_) => true,
             Self::Durable { connection, .. } => connection.is_discovery(),
             _ => false,
         }
@@ -143,14 +153,17 @@ impl SavedSource {
                 ensure!(
                     matches!(
                         connection.as_ref(),
-                        Self::Ssh(_) | Self::SavedProfile(_) | Self::Discovery(_)
+                        Self::Ssh(_)
+                            | Self::SavedProfile(_)
+                            | Self::Discovery(_)
+                            | Self::HerdrDiscovery(_)
                     ),
                     "A durable reference requires an SSH connection"
                 );
                 connection.validate()?;
                 session.validate()?;
             }
-            Self::SavedProfile(name) | Self::Discovery(name) => {
+            Self::SavedProfile(name) | Self::Discovery(name) | Self::HerdrDiscovery(name) => {
                 ensure!(!name.trim().is_empty(), "Missing profile name")
             }
             Self::Demo => {}
@@ -213,12 +226,12 @@ impl SavedSource {
                 );
                 source
             }
-            Self::SavedProfile(name) | Self::Discovery(name) => {
+            Self::SavedProfile(name) | Self::Discovery(name) | Self::HerdrDiscovery(name) => {
                 let mut options = profiles
                     .get(name)
                     .with_context(|| format!("Unknown workspace profile {name}"))?
                     .clone();
-                if matches!(self, Self::Discovery(_)) {
+                if matches!(self, Self::Discovery(_) | Self::HerdrDiscovery(_)) {
                     ensure!(
                         !options.player.rustmush,
                         "Remote shell discovery requires an SSH shell profile"
@@ -712,6 +725,29 @@ mod tests {
     }
 
     #[test]
+    fn saved_herdr_browser_reopens_in_the_same_discovery_scope_with_or_without_a_choice() {
+        let profile = ssh("dev.example");
+        let profiles = BTreeMap::from([("work".into(), profile.clone())]);
+        let mut reference = DurableReference::new(&profile, &format!("SHA256:{}", "A".repeat(43)));
+        reference.backend = crate::durable::Backend::Herdr;
+        reference.name = "t7".into();
+        reference.generation = format!(
+            "{}/123/112/d4156dc9-a3ad-4d94-ad77-0303577e25cc/34",
+            "a".repeat(32)
+        );
+        for session in [None, Some(reference)] {
+            let saved = SavedSource::HerdrDiscovery("work".into())
+                .with_session(session.clone())
+                .unwrap();
+            let saved: SavedSource =
+                serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+            assert!(saved.is_herdr_browser() && saved.is_discovery());
+            assert_eq!(saved.session(), session.as_ref());
+            assert!(saved.resolve(&profiles).is_ok());
+        }
+    }
+
+    #[test]
     fn durable_workspace_checks_the_current_profile_before_reattaching() {
         let mut options = ssh("dev.example");
         options.durable = true;
@@ -772,6 +808,7 @@ mod tests {
             executable: "powershell.exe".into(),
             args: vec!["-NoProfile".into()],
             cwd: Some(dir.path().to_owned()),
+            powershell_integration: true,
         };
         let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
         let mut layout = Layout::Leaf(41);
@@ -801,6 +838,7 @@ mod tests {
             shell: crate::options::LocalOptions {
                 executable: exe.into(),
                 cwd: Some(cwd.into()),
+                powershell_integration: false,
                 args: Vec::new(),
             },
         };
