@@ -71,7 +71,7 @@ Deleting a parent removes its dependents. Cycles and missing parents return
 `ECYCLE` and `ENOPARENT`. Each terminal accepts up to 1,024 placements, a
 relative ancestry depth of 16, and 65,536 projected visible tiles per snapshot.
 
-`tests/fixtures/kitty/placements.vt` is the exact byte stream consumed by both
+`tests/fixtures/kitty/placements.vt` is the exact byte stream consumed by all three
 renderers. `samples.json` gives zero-based cell centers and expected RGB values.
 It includes two differently colored placeholder cells, a blue relative child
 and the yellow second animation frame. Run the Windows Direct2D check with
@@ -80,11 +80,25 @@ fixtures are `cargo test --test kitty_graphics --test image_limits --test synchr
 They also check loading, finite loops, signed gaps, fragmented transfers, old
 snapshots, resizing, scrolling, parent deletion and error replies.
 
-The `Kitty graphics reference` workflow runs Ubuntu 24.04's kitty 0.32.2
-under Xvfb using Mesa software GL. It compares an X11 capture against the
-same cell coordinates and uploads the PNG, measured grid, and package
-versions. On a Linux host with those packages installed, run
-`xvfb-run -a /usr/bin/python3 tests/kitty-reference.py artifacts` from the repo.
+The `Kitty graphics reference` workflow runs two independent Linux jobs under
+Xvfb with Mesa software GL. One captures Ubuntu 24.04's kitty 0.32.2. The
+other captures Ghostty 1.4.0, the release that added animation and relative
+placements. Its container image is pinned by digest and its signed packages
+come from the November 12 Arch Linux Archive. Both jobs run on pull requests
+and feed the merge release check. [Ghostty release notes](https://ghostty.org/docs/install/release-notes/1-4-0) · [Arch Linux package](https://archlinux.org/packages/extra/x86_64/ghostty/)
+
+To repeat either capture on Linux, install the corresponding terminal,
+Xvfb, xauth, xdotool, ImageMagick and Python with Pillow. Ghostty also uses
+a D-Bus session and the DejaVu Sans Mono font. From the repository root run
+
+```sh
+xvfb-run -a /usr/bin/python3 tests/kitty-reference.py artifacts/kitty
+dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/kitty-reference.py artifacts/ghostty --terminal ghostty
+```
+
+Each job uploads its full window PNG, terminal log, package versions, measured
+PTY geometry and a per-cell report with pixel coordinates and expected and
+observed RGB. A mismatch of 32 or more in any channel fails the check.
 The five colored sample points test placement and selected pixels. GPU interpolation,
 general deletion selectors, placeholders under every rendition attribute, and every
 possible compositing edge remain outside this fixture.
