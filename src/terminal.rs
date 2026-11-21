@@ -1988,6 +1988,115 @@ mod tests {
     }
 
     #[test]
+    fn vim_undercurl_probe_reports_the_rendition_at_the_query() {
+        let (mut terminal, mut replies) = engine();
+        // Vim's term.c sends the reset after the query in the same write.
+        terminal.advance_bytes(b"\x1b[0m\x1b[4:3m\x1bP$qm\x1b\\\x1b[0m");
+        let reply = receive(&mut replies);
+        assert!(
+            sgr_parameters(&reply)
+                .split(';')
+                .any(|param| param == "4:3")
+        );
+        assert_eq!(terminal.pen(), CellAttributes::default());
+        terminal.advance_bytes(b"\x1bP$qm\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0m\x1b\\");
+    }
+
+    fn sgr_parameters(reply: &[u8]) -> &str {
+        let response = std::str::from_utf8(reply).unwrap();
+        let params = response
+            .strip_prefix("\x1bP1$r")
+            .and_then(|report| report.strip_suffix("m\x1b\\"))
+            .expect("expected a valid, ST-terminated SGR status string");
+        assert!(
+            params
+                .bytes()
+                .all(|c| c.is_ascii_digit() || matches!(c, b':' | b';'))
+        );
+        params
+    }
+
+    #[test]
+    fn rendition_reports_restore_the_complete_pen_on_another_terminal() {
+        let (mut source, mut replies) = engine();
+        let (mut restored, _) = engine();
+        // Change one pen in sequence, including partial resets and all three
+        // color channels. The report must restore the pen even over prior styles.
+        for settings in [
+            "0",
+            "1;3;4:3;5;7;8;9;53;73;38:2::1:2:3;48:2::4:5:6;58:2::7:8:9",
+            "2;21;6;74;38;5;200;48;5;17;58;5;245",
+            "22;23;28;39;59",
+            "24;25;27;29;49;55;75",
+            "31;104;4;58:5:2",
+            "97;45;4:4",
+            "4:5;38:6::11:12:13:91;48:6::14:15:16:125;58:6::17:18:19:159",
+            "4:0;59;39;49",
+        ] {
+            source.advance_bytes(format!("\x1b[{settings}m"));
+            let expected = source.pen();
+            source.advance_bytes(b"\x1bP$qm\x1b\\");
+            let reply = receive(&mut replies);
+            let params = sgr_parameters(&reply);
+            for starting in ["0", "0;1;3;4:2;6;7;8;9;53;73;92;106;58;5;99"] {
+                restored.advance_bytes(format!("\x1b[{starting}m\x1b[{params}m"));
+                assert_eq!(
+                    restored.pen(),
+                    expected,
+                    "input {settings}, report {params}, starting {starting}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_rendition_query_only_emits_a_reply_and_keeps_local_metadata() {
+        let (writer, mut output) = mpsc::unbounded_channel();
+        let mut terminal = create(TerminalSize::default(), writer.clone());
+        // The framed viewer distinguishes automatic replies from user input.
+        enter_herdr_viewer(&mut terminal, &writer, &crate::events::Events::default());
+        terminal
+            .advance_bytes(b"sample\x1b]133;B\x07\x1b[3m\x1b]8;;https://example.com/private\x1b\\");
+        let original_pen = terminal.pen();
+        assert!(original_pen.hyperlink().is_some());
+        assert_ne!(
+            original_pen.semantic_type(),
+            CellAttributes::default().semantic_type()
+        );
+        let before = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        for &byte in b"\x1bP$qm" {
+            terminal.advance_bytes([byte]);
+            assert!(output.try_recv().is_err(), "query is still incomplete");
+        }
+        terminal.advance_bytes([0x1b]);
+        terminal.advance_bytes([b'\\']);
+        let TransportInput::Automatic(reply) = output.try_recv().unwrap() else {
+            panic!("an SGR report must use the terminal reply transport");
+        };
+        let params = sgr_parameters(&reply);
+        let (mut other, _) = engine();
+        other.advance_bytes(format!("\x1b[{params}m"));
+        let mut expected = CellAttributes::default();
+        expected.set_italic(true);
+        assert_eq!(other.pen(), expected);
+        assert_eq!(terminal.pen(), original_pen);
+        assert!(before.same_presentation(&Snapshot::capture(
+            &terminal,
+            Some(&before),
+            2,
+            0,
+            String::new(),
+            0
+        )));
+        terminal.advance_bytes(b"\x1bP$q!m\x1b\\");
+        assert!(
+            matches!(output.try_recv(), Ok(TransportInput::Automatic(bytes)) if bytes == b"\x1bP0$r\x1b\\")
+        );
+        assert!(output.try_recv().is_err(), "no extra replies or user input");
+    }
+
+    #[test]
     fn parses_fragmented_utf8_and_control_sequences() {
         let (mut t, _rx) = engine();
         for byte in "\x1b[2J\x1b[Hhello 世界\x1b[31m red\x1b[0m".as_bytes() {
