@@ -677,6 +677,8 @@ impl<'a> Performer<'a> {
             // reset graphic rendition, erase all positions, move active position to first
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
+                self.last_command = None;
+                self.current_dir = None;
                 let seqno = self.seqno;
                 self.pen = Default::default();
                 self.cursor = Default::default();
@@ -875,6 +877,9 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. },
             ) => {
+                if self.screen.command_start.is_some() {
+                    self.finish_command_output(None);
+                }
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
             }
@@ -886,6 +891,9 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. },
             ) => {
+                if self.screen.command_start.is_some() {
+                    self.finish_command_output(None);
+                }
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
             }
@@ -903,12 +911,13 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { .. },
             ) => {
+                self.begin_command_output();
                 self.pen.set_semantic_type(SemanticType::Output);
             }
 
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::CommandStatus { .. },
-            ) => {}
+                FinalTermSemanticPrompt::CommandStatus { status, .. },
+            ) => self.finish_command_output(status),
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {
@@ -943,7 +952,7 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
-                self.current_dir = Url::parse(&url).ok();
+                self.current_dir = Url::parse(&url).ok().map(|parsed| (parsed, url.into()));
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::CurrentWorkingDirectoryChanged);
                 }

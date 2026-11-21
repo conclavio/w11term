@@ -741,7 +741,7 @@ pub enum FinalTermSemanticPrompt {
 
     /// Indicates the result of the command
     CommandStatus {
-        status: i32,
+        status: Option<i32>,
         aid: Option<String>,
     },
 }
@@ -793,13 +793,7 @@ impl FinalTermSemanticPrompt {
         }
 
         if param == "D" {
-            let status = match osc.get(2).map(|&p| p) {
-                Some(s) => match str::from_utf8(s) {
-                    Ok(s) => s.parse().unwrap_or(0),
-                    _ => 0,
-                },
-                _ => 0,
-            };
+            let status = osc.get(2).and_then(|s| str::from_utf8(s).ok()?.parse().ok());
 
             return Ok(Self::CommandStatus {
                 status,
@@ -866,14 +860,17 @@ impl Display for FinalTermSemanticPrompt {
                     write!(f, ";aid={}", aid)?;
                 }
             }
-            Self::CommandStatus {
-                status,
-                aid: Some(aid),
-            } => {
-                write!(f, "D;{};err={};aid={}", status, status, aid)?;
-            }
-            Self::CommandStatus { status, aid: None } => {
-                write!(f, "D;{}", status)?;
+            Self::CommandStatus { status, aid } => {
+                write!(f, "D")?;
+                if let Some(status) = status {
+                    write!(f, ";{}", status)?;
+                }
+                if let Some(aid) = aid {
+                    match status {
+                        Some(status) => write!(f, ";err={};aid={}", status, aid)?,
+                        None => write!(f, ";;aid={}", aid)?,
+                    }
+                }
             }
         }
         Ok(())
@@ -1535,7 +1532,7 @@ mod test {
             parse(&["133", "D", "1"], "\x1b]133;D;1\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 1,
+                    status: Some(1),
                     aid: None
                 }
             )
@@ -1545,7 +1542,7 @@ mod test {
             parse(&["133", "D", "0"], "\x1b]133;D;0\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 0,
+                    status: Some(0),
                     aid: None
                 }
             )
@@ -1558,7 +1555,7 @@ mod test {
             ),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 0,
+                    status: Some(0),
                     aid: Some("23".to_owned())
                 }
             )
@@ -1571,7 +1568,7 @@ mod test {
             ),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::CommandStatus {
-                    status: 1,
+                    status: Some(1),
                     aid: Some("23".to_owned())
                 }
             )

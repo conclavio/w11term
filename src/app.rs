@@ -40,6 +40,7 @@ mod durable_view;
 mod ime_smoke;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod pane_picker;
 mod pane_view;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
@@ -50,6 +51,7 @@ use pane_view::PaneSurface;
 struct LiveTab {
     files: Box<FileDrawer>,
     discovery_page: Option<usize>,
+    copy_output_unavailable: Option<&'static str>,
     confirm_end: bool,
     durable_phase: Option<w11term::ssh::DurablePhase>,
     source: Source,
@@ -270,6 +272,8 @@ fn tab_menu_message(label: String) -> Message {
     }
     match label.split(": ").next().unwrap_or(&label) {
         "SFTP files" => Message::Files(FileAction::Toggle),
+        "Open files here" => Message::Files(FileAction::OpenHere),
+        "Copy last command output" => Message::CopyLastCommand,
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
@@ -292,6 +296,7 @@ fn tab_menu_message(label: String) -> Message {
         "Forget this device (revoke game key)" => Message::DeviceAction(true),
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
+        "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         _ => Message::ControlIdle,
     }
 }
@@ -345,9 +350,13 @@ pub struct TerminalApp {
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     mru: Vec<TabId>,
     switcher: Option<TabSwitcher>,
+    picker: Option<pane_picker::Picker>,
 }
 
 pub enum Message {
+    PickerQuery(String),
+    PickerChoose(u64),
+    PickerFocus(u8),
     LocalProfile(local_profile::Action),
     Files(FileAction),
     AccessibleSelection(crate::accessibility::SelectionRequest),
@@ -381,6 +390,7 @@ pub enum Message {
     GenerateKey(TabId),
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
+    CopyLastCommand,
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
     Discovery(session_browser::Action),
@@ -456,6 +466,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
         page: Page::Terminal(LiveTab {
             files: Box::default(),
             discovery_page: None,
+            copy_output_unavailable: Some("waiting for shell markers"),
             source,
             confirm_end: false,
             durable_phase: None,
@@ -533,6 +544,9 @@ impl TerminalApp {
         };
         let frame = tab.session.frames.load();
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
+        if prompt_id.is_some() && self.picker.take().is_some() {
+            self.keyboard.set_picker(false);
+        }
         let changed = prompt_id != tab.prompt_id;
         self.keyboard
             .set_game_mode(tab.session.player.read().unwrap().game_mode);
@@ -1385,6 +1399,9 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        if self.picker.take().is_some() {
+            self.keyboard.set_picker(false);
+        }
         let single = matches!(
             self.tabs.active_layout(),
             Some(w11term::pane_layout::Layout::Leaf(_))
@@ -2056,6 +2073,7 @@ impl TerminalApp {
             .menu(Menu::new(
                 [
                     self.pane_menu(),
+                    MenuItem::item("pane-picker", "Find pane…"),
                     MenuItem::item("paste", "Paste"),
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
@@ -2132,14 +2150,23 @@ impl TerminalApp {
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
             items.push(MenuItem::item("files", "SFTP files"));
+            items.push(MenuItem::item("files-here", "Open files here"));
         }
         if let Some(AppTab {
             page: Page::Terminal(live),
             ..
         }) = self.tabs.active()
-            && let Some(menu) = durable_view::pane_menu(live)
         {
-            items.push(menu);
+            items.push(match live.session.frames.load().copy_output_unavailable() {
+                Some(why) => MenuItem::disabled(
+                    "copy-last-output",
+                    format!("Copy last command output ({why})"),
+                ),
+                None => MenuItem::item("copy-last-output", "Copy last command output"),
+            });
+            if let Some(menu) = durable_view::pane_menu(live) {
+                items.push(menu);
+            }
         }
         if !self.profiles.is_empty() || !self.local_profiles.is_empty() {
             for (key, label) in [
@@ -2638,6 +2665,7 @@ impl Component for TerminalApp {
             measured_layout: None,
             mru: Vec::new(),
             switcher: None,
+            picker: None,
             selection_pending: true,
             selection_epoch: 0,
         };
@@ -2697,6 +2725,8 @@ impl Component for TerminalApp {
             &message,
             Message::FrameReady(..)
                 | Message::Files(..)
+                | Message::PickerQuery(..)
+                | Message::PickerFocus(..)
                 | Message::PaneRatio(..)
                 | Message::DividerPress(..)
                 | Message::DividerEnd(..)
@@ -2710,6 +2740,21 @@ impl Component for TerminalApp {
             self.watch_control(context);
         }
         match message {
+            Message::CopyLastCommand => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active()
+                    && let Some(command) = &tab.session.frames.load().last_command
+                    && let Ok(text) = &command.output
+                    && let Err(error) = w11term::clipboard::write(text)
+                {
+                    log::warn!("Copy last command output: {error:#}");
+                }
+            }
+            Message::PickerQuery(query) => self.filter_picker(query),
+            Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
+            Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::Files(action) => self.file_action(action, context),
             Message::AccessibleSelection(request) => {
                 if let Some(AppTab {
@@ -2720,6 +2765,7 @@ impl Component for TerminalApp {
                     && tab.prompt_id.is_none()
                     && !tab.find.open
                     && self.switcher.is_none()
+                    && self.picker.is_none()
                 {
                     let frame = tab.session.frames.load();
                     if frame.generation == request.generation {
@@ -3272,8 +3318,13 @@ impl Component for TerminalApp {
                     }) = self.tabs.get_mut(id)
                     {
                         tab.error = None;
-                        tab.files
-                            .observe_connection(tab.session.frames.load().connection_generation);
+                        let frame = tab.session.frames.load();
+                        tab.files.observe_connection(frame.connection_generation);
+                        let unavailable = frame.copy_output_unavailable();
+                        if tab.copy_output_unavailable != unavailable {
+                            tab.copy_output_unavailable = unavailable;
+                            self.header.borrow_mut().take();
+                        }
                         let phase = tab.session.durable_state().map(|s| s.phase);
                         if tab.durable_phase != phase {
                             tab.durable_phase = phase;
@@ -3406,6 +3457,14 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::PickerAccept => self.accept_picker(context),
+                Shortcut::PickerCancel => self.close_picker(context),
+                Shortcut::PickerMove(delta) => {
+                    if let Some(picker) = &mut self.picker {
+                        picker.move_by(delta);
+                    }
+                }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
@@ -3795,6 +3854,9 @@ impl Component for TerminalApp {
             }
             Message::FindApply(id, epoch) => self.apply_find(id, epoch),
             Message::FindFocus(id, epoch, attempt) => {
+                if self.picker.is_some() {
+                    return;
+                }
                 let sender = context.sender();
                 if self.tabs.active_id() == Some(id)
                     && let Some(AppTab {
@@ -3838,6 +3900,7 @@ impl Component for TerminalApp {
             && !tab.find.open
             && !tab.browsing_sessions()
             && self.switcher.is_none()
+            && self.picker.is_none()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
             let metrics = tab.surface.metrics.get();
@@ -3964,6 +4027,9 @@ impl Component for TerminalApp {
                             .keyed_children(choices),
                     ),
             ));
+        }
+        if let Some(picker) = &self.picker {
+            views.push(KeyedView::new("pane-picker", picker.view(self, context)));
         }
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {

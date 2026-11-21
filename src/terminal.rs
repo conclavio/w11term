@@ -408,6 +408,8 @@ pub struct Snapshot {
     pub cols: usize,
     pub scroll_offset: usize,
     pub title: String,
+    pub last_command: Option<Arc<wezterm_term::CompletedCommand>>,
+    pub reported_directory: Option<Arc<str>>,
     pub status: String,
     pub bytes_received: u64,
     pub first_stable_row: isize,
@@ -430,6 +432,13 @@ struct FrozenImage {
 }
 
 impl Snapshot {
+    pub fn copy_output_unavailable(&self) -> Option<&'static str> {
+        match &self.last_command {
+            Some(command) => command.output.as_ref().err().copied(),
+            None => Some("waiting for shell markers"),
+        }
+    }
+
     pub fn capture(
         terminal: &wezterm_term::TerminalState,
         previous: Option<&Self>,
@@ -532,6 +541,8 @@ impl Snapshot {
             cols: screen.physical_cols,
             scroll_offset: offset,
             title: terminal.get_title().to_owned(),
+            last_command: terminal.last_command().cloned(),
+            reported_directory: terminal.reported_current_dir().cloned(),
             status,
             bytes_received,
             first_stable_row,
@@ -606,6 +617,12 @@ impl Snapshot {
             )
             && self.palette == old.palette
             && self.title == old.title
+            && match (&self.last_command, &old.last_command) {
+                (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.reported_directory == old.reported_directory
             && self.status == old.status
             && self.bytes_received / 1024 == old.bytes_received / 1024
             && self.connection_generation == old.connection_generation
@@ -690,6 +707,109 @@ pub fn colors(attrs: &CellAttributes, palette: &ColorPalette) -> (Rgba, Rgba) {
 mod tests {
     use super::*;
     use wezterm_term::{KeyCode, KeyModifiers};
+    #[test]
+    fn completed_shell_output_uses_markers_scrollback_and_real_line_breaks() {
+        let (mut term, _) = engine();
+        term.resize(TerminalSize {
+            cols: 6,
+            rows: 2,
+            ..TerminalSize::default()
+        });
+        for byte in b"\x1b]133;A\x07> \x1b]133;B\x07ls\r\n\x1b]133;C\x07\x1b[31m123456789\x1b[0m\r\n\r\nend\x1b]133;D;42\x1b\\" {
+            term.advance_bytes([*byte]);
+        }
+        let first = term.last_command().unwrap().clone();
+        assert_eq!(first.exit_code, Some(42));
+        assert_eq!(first.output.as_deref(), Ok("123456789\r\n\r\nend"));
+        term.advance_bytes(b"\x1b]133;A\x07> \x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(term.last_command().unwrap().output.as_deref(), Ok(""));
+        assert_eq!(term.last_command().unwrap().exit_code, Some(0));
+        assert_eq!(first.output.as_deref(), Ok("123456789\r\n\r\nend"));
+    }
+
+    #[test]
+    fn shell_metadata_follows_primary_pane_and_connection() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]7;file://localhost/old%20dir\x07\x1b]133;C\x07left");
+        term.advance_bytes(
+            b"\x1b[?1049h\x1b]133;C\x07private alternate\x1b]133;D;99\x07\x1b[?1049l",
+        );
+        term.advance_bytes(b" right\x1b]133;D\x07");
+        let command = term.last_command().unwrap();
+        assert_eq!(command.output.as_deref(), Ok("left right"));
+        assert_eq!(command.exit_code, None);
+        assert_eq!(
+            term.reported_current_dir().map(AsRef::as_ref),
+            Some("file://localhost/old%20dir")
+        );
+        let (other, _) = engine();
+        assert!(other.last_command().is_none() && other.reported_current_dir().is_none());
+        term.reset_connection();
+        assert!(term.last_command().is_none() && term.reported_current_dir().is_none());
+        term.advance_bytes(b"\x1b]133;C\x07fresh\x1b]133;A\x07");
+        assert_eq!(term.last_command().unwrap().output.as_deref(), Ok("fresh"));
+        term.advance_bytes(b"\x1b]133;C\x07bad code\x1b]133;D;unknown\x07");
+        assert_eq!(term.last_command().unwrap().exit_code, None);
+    }
+
+    #[test]
+    fn oversized_command_retains_status_and_never_copies_a_truncated_prefix() {
+        let (mut term, _) = engine();
+        term.resize(TerminalSize {
+            cols: 1024,
+            rows: 513,
+            ..TerminalSize::default()
+        });
+        term.advance_bytes(b"\x1b]133;C\x07");
+        let row = Line::from_text(&"é".repeat(1024), &CellAttributes::default(), 1, None);
+        let screen = term.screen_mut();
+        for index in screen.phys_row(0)..screen.phys_row(512) {
+            *screen.line_mut(index) = row.clone();
+        }
+        term.advance_bytes(b"\x1b[513;1H\x1b]133;D;0\x07");
+        let command = term.last_command().unwrap();
+        assert_eq!(command.exit_code, Some(0));
+        assert_eq!(
+            command.output,
+            Err("Command output exceeds the 1 MiB clipboard limit")
+        );
+    }
+
+    #[test]
+    fn partial_command_output_is_unavailable_after_history_is_cleared() {
+        let (mut term, _) = engine();
+        term.resize(TerminalSize {
+            cols: 16,
+            rows: 2,
+            ..TerminalSize::default()
+        });
+        term.advance_bytes(b"\x1b]133;C\x07begin\r\nmiddle\r\nend\x1b[3J\x1b]133;D;7\x07");
+        let command = term.last_command().unwrap();
+        assert_eq!(command.exit_code, Some(7));
+        assert_eq!(command.output, Err("Command output left scrollback"));
+    }
+
+    #[test]
+    fn resizing_a_running_command_maps_the_start_after_a_wide_cell() {
+        let (mut term, _) = engine();
+        term.resize(TerminalSize {
+            cols: 7,
+            rows: 5,
+            ..TerminalSize::default()
+        });
+        term.advance_bytes("hello界\x1b]133;C\x07abc界defg".as_bytes());
+        term.resize(TerminalSize {
+            cols: 5,
+            rows: 5,
+            ..TerminalSize::default()
+        });
+        term.advance_bytes(b"\x1b]133;D;0\x07");
+        assert_eq!(
+            term.last_command().unwrap().output.as_deref(),
+            Ok("abc界defg")
+        );
+    }
+
     #[test]
     fn synchronized_output_queries_and_resets_follow_parser_state() {
         let (mut t, mut rx) = engine();

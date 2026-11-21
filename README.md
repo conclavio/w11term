@@ -41,6 +41,8 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 ## Tabs and profiles
 
+Use **Ctrl+Shift+P** or **caret → Find pane…** to search every terminal pane in the window, including panes in other tabs and hidden splits. Type part of the terminal title, profile name or SSH `user@host`. Use the arrow keys to highlight a match, then press Enter to focus it. Escape returns to the pane you were using.
+
 The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
@@ -52,6 +54,8 @@ Choose **+ → Windows PowerShell · Local** to start a local shell or **caret �
 Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.
 
 On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** or drop local files onto the drawer to upload into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
+
+Choose **caret → Panes → Open files here** to open the drawer at the directory the focused shell last reported with OSC 7. For example, `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s existing SSH connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. An absent, invalid or foreign-host report opens the usual SFTP working directory. The drawer stays where you opened it until you navigate or choose the action again.
 
 **Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.
 
@@ -162,6 +166,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Ctrl+Shift+Home / Ctrl+Shift+End | Oldest retained history / return to the live screen |
 | Ctrl+Shift+Up / Ctrl+Shift+Down | Previous / next OSC 133 prompt |
 | Ctrl+Shift+F | Find in scrollback; case toggle, highlighted matches, and a match counter |
+| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
 | Enter in find / F3; Shift+Enter / Shift+F3 | Next / previous find result, wrapping at either end |
 | Escape in find | Close find and restore terminal keyboard input |
 | Mouse wheel | Scrollback using Windows' wheel-line/page preference, including accumulated fractional deltas; remote wheel events when mouse reporting is enabled |
@@ -175,7 +180,7 @@ Find is local to each tab and searches literal text across retained history and 
 
 The alternate screen has no local scrollback. A TUI receives wheel reports when it enables mouse reporting; otherwise w11term uses the engine's arrow-key fallback so programs such as pagers can navigate their own content. Shift+wheel overrides mouse reporting for local primary-screen history; on the alternate screen that local action is a no-op. Find on the alternate screen searches only its current contents, without mixing in shell history. Returning to the primary screen restores its history position.
 
-**OSC 133 semantic prompts** are inherited from the vendored WezTerm engine: A/B/C mark prompt/input/output regions, including regions retained in scrollback. Ctrl+Shift+Up/Down now navigates prompt starts relative to the top of the viewport. The remote shell must emit these markers through its own shell integration; w11term does not modify remote shell startup files. The engine currently consumes OSC 133 D without retaining its command exit status, so exit-code badges/command-status tracking are not implemented.
+**OSC 133 semantic prompts.** With shell integration enabled in your shell, Ctrl+Shift+Up/Down jumps between prompt starts in scrollback. **Caret → Panes → Copy last command output** copies the focused pane’s most recent completed command as plain text, joining soft wraps and preserving hard newlines. Capture starts at the shell’s C marker and ends at D or the next prompt. An explicit numeric D status appears as **exit 0**, **exit 1**, etc. in the pane footer. Each pane retains one completed output of up to 1 MiB. If its start has left scrollback or the capture exceeds that limit, the menu shows why copying is unavailable. Alternate-screen programs do not replace the shell capture. Reconnecting clears the previous connection’s shell metadata.
 
 The Settings tab exposes auto-copy, block-selection trimming, paste trimming, grid snapping, tab-switcher mode (tab order/MRU/disabled), Ctrl+scroll zoom, URL detection, and remote OSC 52 writes. Auto-copy is enabled as requested; the other listed boolean options default to enabled, and the switcher defaults to tab order. Copies always contain plain text. Normal paste trims whitespace only at the end of the entire payload by default; raw paste preserves it. The resize border snaps to cell boundaries during manual dragging. These behaviors follow the relevant [Windows Terminal interaction settings](https://learn.microsoft.com/en-us/windows/terminal/customize-settings/interaction), with the explicit auto-copy override.
 

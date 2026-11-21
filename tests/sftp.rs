@@ -58,6 +58,20 @@ impl server::Handler for Peer {
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
         s.channel_success(c)?;
         s.data(c, b"ready\r\n".as_slice())?;
+        if self.root.join("shell directory").is_dir() {
+            s.data(
+                c,
+                b"\x1b]133;A\x07$ \x1b]133;B\x07status\r\n\x1b]133;C\x07".as_slice(),
+            )?;
+            s.data(
+                c,
+                b"\x1b[35mfixture status\x1b[0m\r\n\x1b]133;D;7\x07".as_slice(),
+            )?;
+            s.data(
+                c,
+                b"\x1b]7;file://127.0.0.1/shell%20directory\x1b\\".as_slice(),
+            )?;
+        }
         Ok(())
     }
     async fn data(
