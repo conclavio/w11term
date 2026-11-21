@@ -81,6 +81,13 @@ impl server::Handler for Peer {
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
         if self.channels.contains_key(&c) {
+            #[cfg(feature = "ui-smoke")]
+            if self.root.join("keyboard-input.bin").exists() {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.root.join("keyboard-input.bin"))?
+                    .write_all(data)?;
+            }
             s.data(c, data.to_vec())?;
         }
         Ok(())
