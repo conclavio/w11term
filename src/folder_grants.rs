@@ -4,7 +4,8 @@ use crate::{
     options::SshOptions,
     profiles::FolderEpoch,
     ssh::{
-        ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, ShareSlot, valid_mount_name,
+        ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, MountedFolder, ShareSlot,
+        valid_mount_name,
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -47,6 +48,10 @@ pub struct Authority {
     epoch: FolderEpoch,
 }
 impl Authority {
+    pub fn connection_generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn check_profile(&self, options: &SshOptions) -> Result<()> {
         ensure!(
             self.host.eq_ignore_ascii_case(&options.host)
@@ -67,6 +72,7 @@ pub struct FolderRow {
     pub name: String,
     pub path: PathBuf,
     pub status: FolderMountStatus,
+    pub mounted: Option<MountedFolder>,
 }
 
 struct Row {
@@ -185,8 +191,42 @@ impl PaneShares {
                 name: name.clone(),
                 path: row.path.clone(),
                 status: row.status(),
+                mounted: row.mount.as_ref().and_then(FolderMount::mounted_folder),
             })
             .collect())
+    }
+
+    /// Recheck saved consent on a blocking worker, then resolve the exact mount
+    /// the user clicked. A remount may reuse both the Linux and Windows paths.
+    pub fn resolve_mounted(
+        &self,
+        auth: &Authority,
+        name: &str,
+        generation: &str,
+    ) -> impl FnOnce() -> Result<MountedFolder> + Send + 'static + use<> {
+        let core = self.core.clone();
+        let auth = auth.clone();
+        let name = name.to_owned();
+        let generation = generation.to_owned();
+        move || {
+            let grants = core.current_store(&auth)?.read()?;
+            let state = core.check(&auth)?;
+            let row = state
+                .rows
+                .get(&name)
+                .context("This folder is no longer shared")?;
+            ensure!(
+                row.grant
+                    .as_ref()
+                    .is_some_and(|grant| grants.contains(grant)),
+                "Folder permission changed"
+            );
+            row.mount
+                .as_ref()
+                .and_then(FolderMount::mounted_folder)
+                .filter(|mount| mount.generation == generation)
+                .context("This folder mount has ended or changed")
+        }
     }
     pub fn add(&self, auth: &Authority, name: &str, path: PathBuf) -> Result<()> {
         ensure!(

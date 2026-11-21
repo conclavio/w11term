@@ -693,6 +693,8 @@ async fn lost_workspace_exec_reply_does_not_dispatch_command_again() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
+    use w11term::folder_grants::FolderScope;
+    use w11term::sftp::{Job, Operation};
     let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 2).await else {
         unreachable!()
     };
@@ -701,6 +703,13 @@ async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
     fs::write(&trace, []).unwrap();
     fs::write(remote.path().join("drop-before-exec-reply"), []).unwrap();
     let startup = w11term::workspace::SshStartup::new(&ssh, "/work".into(), String::new()).unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let catalog = local.path().join("profiles.json");
+    fs::write(
+        &catalog,
+        serde_json::to_vec(&json!({"profiles":{"guest":ssh}})).unwrap(),
+    )
+    .unwrap();
     let session = Session::start_workspace_ssh(ssh, Default::default(), false, startup);
     tokio::time::timeout(Duration::from_secs(10), async {
         while session.frames.load().connection_generation != 2 {
@@ -714,6 +723,56 @@ async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
         fs::read_to_string(trace).unwrap(),
         r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/work'"#.repeat(2)
     );
+    // The first connection failed before publishing a usable shell. Folder
+    // actions and SFTP must still identify the same second SSH generation.
+    let shares = session.profile_folders(FolderScope::new(
+        catalog,
+        "guest".into(),
+        local.path().into(),
+    ));
+    let authority = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(auth) = shares.authority() {
+                break auth;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(authority.connection_generation(), 2);
+    let mount = remote.path().join("mounted");
+    fs::create_dir(&mount).unwrap();
+    fs::write(mount.join("from-windows"), []).unwrap();
+    for (expected_generation, path, error) in [
+        (Some(1), "/mounted", Some("SSH connection changed")),
+        (None, "/mounted", Some("Missing SSH connection")),
+        (Some(2), ".", Some("different path")),
+        (Some(2), "/mounted", None),
+    ] {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        session
+            .input
+            .send(Command::Sftp(Job {
+                expected_generation,
+                operation: Operation::ListMountedFolder { path: path.into() },
+                deadline,
+                reply,
+                progress: None,
+            }))
+            .unwrap();
+        let result = tokio::time::timeout_at(deadline, response)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(message) = error {
+            assert!(result.unwrap_err().contains(message));
+        } else {
+            assert_eq!(result.unwrap()["entries"][0]["filename"], "from-windows");
+        }
+    }
+    drop(shares);
     drop(session);
     server.abort();
 }

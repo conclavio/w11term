@@ -831,7 +831,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     let sideband = exchange(probe, auth, None);
     tokio::pin!(sideband);
     if managed {
-        shell.published.publish(&shell.link);
+        shell.published.publish(&shell.link, generation);
         program.ready();
         events.push(
             "connected",
@@ -925,7 +925,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             }
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
-                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
+                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link,generation);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),
                 // Exit status is advisory until EOF/close; the peer can still
                 // deliver final terminal bytes after reporting it.
@@ -974,8 +974,8 @@ async fn run_herdr_channel(
             )
             .await?;
     }
-    shell.published.publish(&link);
     let generation = driver.generation;
+    shell.published.publish(&link, generation);
     driver.output.send(Event::HerdrViewer).await?;
     driver.output.send(Event::Connected(generation)).await?;
     driver.events.push(

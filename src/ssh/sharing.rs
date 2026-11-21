@@ -211,11 +211,11 @@ impl ShareSlot {
             link: Arc::downgrade(link),
         }
     }
-    pub(super) fn publish(&self, local: &Arc<ConnectionShare>) {
+    pub(super) fn publish(&self, local: &Arc<ConnectionShare>, generation: u64) {
         // Each pane owns its own outer Arc. Its offer expires on disconnect
         // even when other panes continue to use the underlying Link.
         let mut state = self.publication.lock().unwrap();
-        state.generation += 1;
+        state.generation = generation;
         state.current = Arc::downgrade(local);
         self.changed.send_replace(());
     }

@@ -3,6 +3,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use serde_json::Value;
 use std::{collections::VecDeque, path::PathBuf};
 use tokio::sync::{oneshot, watch};
+use w11term::folder_grants::Authority;
 use w11term::sftp::{DEFAULT_TIMEOUT, Job, Operation, TransferProgress};
 
 const PAGE_SIZE: usize = 32;
@@ -726,7 +727,9 @@ impl FileDrawer {
         session
             .input
             .send(Command::Sftp(Job {
-                expected_generation: matches!(step, Step::Change { .. }).then_some(self.generation),
+                expected_generation: (matches!(step, Step::Change { .. })
+                    || matches!(operation, Operation::ListMountedFolder { .. }))
+                .then_some(self.generation),
                 operation,
                 progress: tx_progress,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
@@ -956,6 +959,62 @@ impl LiveTab {
 }
 
 impl TerminalApp {
+    pub(super) fn browse_mounted_share(
+        &mut self,
+        authority: &Authority,
+        path: &str,
+        context: &ComponentContext<Self>,
+    ) -> Result<()> {
+        let pane = authority.pane;
+        let id = self
+            .tab_for_pane(pane)
+            .context("The original SSH pane is closed")?;
+        ensure!(
+            self.folder_authority(pane).as_ref() == Some(authority),
+            "The SSH connection has changed"
+        );
+        let Some(AppTab {
+            page: super::Page::Terminal(tab),
+            ..
+        }) = self.tabs.get_mut(id)
+        else {
+            bail!("The original SSH pane is closed");
+        };
+        let generation = tab.session.frames.load().connection_generation;
+        ensure!(
+            generation == authority.connection_generation(),
+            "The SSH connection has changed"
+        );
+        let files = &mut tab.files;
+        files.observe_connection(generation);
+        ensure!(
+            !files.busy(),
+            "The SFTP drawer is busy. Try again when the current operation finishes."
+        );
+        files.job(
+            pane,
+            &tab.session,
+            Operation::ListMountedFolder { path: path.into() },
+            Step::Listing(path.into()),
+            context,
+        )?;
+        files.open = true;
+        files.following = false;
+        files.reveal = None;
+        files.directory = None;
+        files.entries.clear();
+        files.selected = None;
+        files.page = 0;
+        files.status = "Reading directory…".into();
+        files.cached.borrow_mut().take();
+        self.tabs.select(id);
+        self.initial_grid.set(None);
+        crate::input::clear_grid();
+        self.sync_selection(context);
+        self.activate(context);
+        Ok(())
+    }
+
     pub(super) fn cancel_inactive_name_editor(&mut self) {
         let inactive = self
             .tabs

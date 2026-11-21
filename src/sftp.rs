@@ -48,6 +48,11 @@ pub enum Operation {
     Ls {
         path: String,
     },
+    /// The absolute path verified by SSHFS can only be opened on the source pane.
+    #[serde(skip)]
+    ListMountedFolder {
+        path: String,
+    },
     Opendir {
         path: String,
     },
@@ -222,7 +227,7 @@ type JobResult = Result<Value, String>;
 
 #[derive(Debug)]
 pub struct Job {
-    /// A UI mutation approved against a particular live SSH connection.
+    /// A UI action approved against a particular live SSH connection.
     /// The worker owns that connection and rejects stale approvals before I/O.
     pub expected_generation: Option<u64>,
     pub operation: Operation,
@@ -297,6 +302,11 @@ pub(crate) async fn run(
             let _ = reply.send(Err(
                 "Missing SSH connection approval; rename was not started".into(),
             ));
+            continue;
+        }
+        if matches!(operation, Operation::ListMountedFolder { .. }) && expected_generation.is_none()
+        {
+            let _ = reply.send(Err("Missing SSH connection for this mounted folder".into()));
             continue;
         }
         if expected_generation.is_some_and(|expected| expected != generation) {
@@ -516,6 +526,7 @@ impl Engine {
     ) -> Result<Value> {
         use Operation::*;
         let ok = json!({});
+        let mounted = matches!(op, ListMountedFolder { .. });
         Ok(match op {
             Info => {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
@@ -555,7 +566,19 @@ impl Engine {
                 Err(e) if eof(&e) => json!({"entries":[],"eof":true}),
                 Err(e) => return Err(e.into()),
             },
-            Ls { path } => {
+            Ls { path } | ListMountedFolder { path } => {
+                if mounted {
+                    let names = self
+                        .raw
+                        .realpath(&path)
+                        .await
+                        .context("SFTP could not resolve this mount path")?
+                        .files;
+                    ensure!(
+                        matches!(names.as_slice(), [entry] if entry.filename == path),
+                        "SFTP resolves this mount to a different path"
+                    );
+                }
                 let h = self.raw.opendir(path).await?.handle;
                 let result = async {
                     let mut entries = Vec::new();
