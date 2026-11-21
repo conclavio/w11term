@@ -530,7 +530,7 @@ mod tests {
         let mut tabs = Tabs::default();
         let existing = tabs.insert(AppTab {
             label: "Settings".into(),
-            page: Page::Settings,
+            page: Page::Settings(None),
         });
         let error = append_workspace(&mut tabs, &workspace, &BTreeMap::new(), false).unwrap_err();
         assert!(error.to_string().contains("missing"));
