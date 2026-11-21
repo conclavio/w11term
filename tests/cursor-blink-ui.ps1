@@ -88,7 +88,7 @@ try {
     $window = Wait-InputWindow
     $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
     $pane = (Control @('list')).sessions[0].id
-    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','BlinkProbe')
+    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
     if ([FixtureMessages]::GetForegroundWindow() -ne $window -and
         ![CursorCellProbe]::SetForegroundWindow($window)) {
         # A caller running in the background can be refused activation. Restore
@@ -100,6 +100,9 @@ try {
     $null = Wait-Until 'the fixture to own foreground before sampling its cursor' {
         [FixtureMessages]::GetForegroundWindow() -eq $window -and ![CursorCellProbe]::IsIconic($window)
     }
+    # Position the cursor after the restore, before measuring the live cell.
+    $esc = [char]27
+    $null = Send-Sequence "[2J$esc[4;4HBlinkProbe$esc[4;4H$esc[6 q$esc[?25l"
     $bounds = Wait-Until 'UI Automation bounds for the marked cursor cell' {
         $doc = Find-Element ('Terminal ' + [char]0xb7 + ' palette-ssh')
         if (!$doc) { return }
@@ -120,6 +123,10 @@ try {
         $sample = Sample-Cell
         if ($sample -ne $hidden) { $sample }
     }
+    $null = Send-Sequence '[?25l'
+    $null = Wait-Until 'the same native cell with its bar hidden again' { (Sample-Cell) -eq $hidden }
+    $null = Send-Sequence '[?25h'
+    $null = Wait-Until 'the original bar pixels restored' { (Sample-Cell) -eq $shown }
 
     $generation = Send-Sequence '[5 q'
     $beforePng = Join-Path $State 'blink-before.png'
@@ -127,7 +134,9 @@ try {
     $null = Control @('screenshot','--pane',"$pane",$beforePng)
     Assert-Blinking
     $null = Control @('screenshot','--pane',"$pane",$afterPng)
-    if ((Read-Generation) -ne $generation -or (Get-FileHash $beforePng).Hash -ne (Get-FileHash $afterPng).Hash) {
+    $samePng = [Collections.StructuralComparisons]::StructuralEqualityComparer.Equals(
+        [IO.File]::ReadAllBytes($beforePng), [IO.File]::ReadAllBytes($afterPng))
+    if ((Read-Generation) -ne $generation -or !$samePng) {
         throw 'Blinking changed the terminal generation or deterministic PNG capture'
     }
 

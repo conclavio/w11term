@@ -42,12 +42,15 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "samples a cursor cell on the focused native SSH canvas"]
 async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
-    run_palette_fixture(
-        "cursor-blink-ui.ps1",
-        b"\x1b[?25h\x1b[5 q\x1b[6 q\x1b[?12h\x1b[?12l",
-        Some("\x1b[2J\x1b[4;4HBlinkProbe\x1b[4;4H\x1b[6 q\x1b[?25l"),
-    )
-    .await;
+    let (Source::Ssh(ssh), _remote, shells, server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    // The input-recording fixture also prints every PTY resize. Keep this SSH
+    // shell quiet so only the requested VT sequences can move the test cursor.
+    drive_mixed_gui("cursor-blink-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 1);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
