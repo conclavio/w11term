@@ -1,6 +1,7 @@
-//! Read-only selected-folder export exercised against the Linux FUSE guest.
+//! Read-only Windows folder mounts carried by a pane's authenticated SSH connection.
 mod filesystem;
+mod mount;
 mod protocol;
 
-pub(super) use filesystem::Root;
-pub(super) use protocol::{Export, valid_read_path_encoding};
+pub use filesystem::Root as FolderRoot;
+pub use mount::{FolderMount, FolderMountStatus, valid_mount_name};

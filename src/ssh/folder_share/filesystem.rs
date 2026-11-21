@@ -13,6 +13,10 @@ use std::{
         io::{AsRawHandle, FromRawHandle},
     },
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use windows::{
     Wdk::{
@@ -45,9 +49,10 @@ const SHARE_ALL: FILE_SHARE_MODE =
     FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
 const SHARE_IN_PLACE: FILE_SHARE_MODE = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0);
 
-pub(in crate::ssh) struct Root {
+pub struct Root {
     directory: File,
     cursor: std::sync::Mutex<()>,
+    pub(super) revoked: Arc<AtomicBool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -344,10 +349,12 @@ fn walk(
     names: &[&str],
     final_rights: FILE_ACCESS_RIGHTS,
     final_share: FILE_SHARE_MODE,
+    revoked: &AtomicBool,
 ) -> io::Result<Opened> {
     let mut parents = Vec::new();
     let (last, ancestors) = names.split_last().ok_or_else(invalid)?;
     for name in ancestors {
+        check_active(revoked)?;
         let child = relative(
             parents.last().unwrap_or(root),
             name,
@@ -357,6 +364,7 @@ fn walk(
         describe(&child, name)?.directory()?;
         parents.push(child);
     }
+    check_active(revoked)?;
     let file = relative(
         parents.last().unwrap_or(root),
         last,
@@ -371,11 +379,21 @@ fn walk(
     })
 }
 
+fn check_active(revoked: &AtomicBool) -> io::Result<()> {
+    if revoked.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            ErrorKind::Interrupted,
+            "folder share revoked",
+        ));
+    }
+    Ok(())
+}
+
 impl Root {
     /// Select an absolute drive-letter directory below the root of local NTFS.
     /// Whole drives, UNC/device paths, and reparse points anywhere in the
     /// selected path are refused.
-    pub(in crate::ssh) fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         let path = path.to_str().ok_or_else(invalid)?;
         let bytes = path.as_bytes();
         if path.len() > MAX_PATH_BYTES
@@ -387,36 +405,73 @@ impl Root {
         let tail = tail.strip_suffix(['\\', '/']).unwrap_or(tail);
         let names = parts(tail.split(['\\', '/']))?;
         let drive = drive_root(bytes[0])?;
+        let revoked = Arc::new(AtomicBool::new(false));
         let selected = walk(
             &drive,
             &names,
             FILE_TRAVERSE | FILE_LIST_DIRECTORY,
             SHARE_ALL,
+            &revoked,
         )?;
         selected.entry.directory()?;
         Ok(Self {
             directory: selected.file,
             cursor: std::sync::Mutex::new(()),
+            revoked,
         })
     }
 
+    /// Identify the selected directory itself across rename or reopen on the same volume.
+    pub fn identity(&self) -> io::Result<String> {
+        let mut id = FILE_ID_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle(&self.directory),
+                FileIdInfo,
+                (&raw mut id).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        }
+        .map_err(win_error)?;
+        Ok(format!(
+            "ntfs-v1:{:016x}:{:032x}",
+            id.VolumeSerialNumber,
+            u128::from_be_bytes(id.FileId.Identifier)
+        ))
+    }
+
     pub(super) fn metadata(&self, path: &str) -> io::Result<Entry> {
+        check_active(&self.revoked)?;
         let names = virtual_path(path)?;
         let root = describe(&self.directory, "/")?;
         root.directory()?;
         if names.is_empty() {
             return Ok(root);
         }
-        Ok(walk(&self.directory, &names, FILE_READ_ATTRIBUTES, SHARE_ALL)?.entry)
+        Ok(walk(
+            &self.directory,
+            &names,
+            FILE_READ_ATTRIBUTES,
+            SHARE_ALL,
+            &self.revoked,
+        )?
+        .entry)
     }
 
     pub(super) fn file(&self, path: &str) -> io::Result<File> {
+        check_active(&self.revoked)?;
         let names = virtual_path(path)?;
         describe(&self.directory, "/")?.directory()?;
         if names.is_empty() {
             return Err(ErrorKind::IsADirectory.into());
         }
-        let opened = walk(&self.directory, &names, FILE_READ_DATA, SHARE_ALL)?;
+        let opened = walk(
+            &self.directory,
+            &names,
+            FILE_READ_DATA,
+            SHARE_ALL,
+            &self.revoked,
+        )?;
         if opened.entry.is_dir {
             return Err(ErrorKind::IsADirectory.into());
         }
@@ -426,6 +481,7 @@ impl Root {
     /// Return only admissible names. A directory exceeding the scan cap or
     /// failing a filesystem query returns an error rather than a partial list.
     pub(super) fn list(&self, path: &str) -> io::Result<Vec<Entry>> {
+        check_active(&self.revoked)?;
         let names = virtual_path(path)?;
         describe(&self.directory, "/")?.directory()?;
         if names.is_empty() {
@@ -434,20 +490,21 @@ impl Root {
                 .cursor
                 .lock()
                 .map_err(|_| io::Error::other("folder listing interrupted"))?;
-            return entries(&self.directory, MAX_ENTRIES);
+            return entries(&self.directory, MAX_ENTRIES, &self.revoked);
         }
         let dir = walk(
             &self.directory,
             &names,
             FILE_LIST_DIRECTORY | FILE_TRAVERSE,
             SHARE_IN_PLACE,
+            &self.revoked,
         )?;
         dir.entry.directory()?;
-        entries(&dir.file, MAX_ENTRIES)
+        entries(&dir.file, MAX_ENTRIES, &self.revoked)
     }
 }
 
-fn entries(directory: &File, limit: usize) -> io::Result<Vec<Entry>> {
+fn entries(directory: &File, limit: usize, revoked: &AtomicBool) -> io::Result<Vec<Entry>> {
     // FILE_NAMES_INFORMATION followed by the full NTFS component. NtQuery returns
     // one record at a time, so neither kernel nor peer offsets become pointers.
     #[repr(C, align(8))]
@@ -470,6 +527,7 @@ fn entries(directory: &File, limit: usize) -> io::Result<Vec<Entry>> {
     let mut scanned = 0;
     let mut first = true;
     loop {
+        check_active(revoked)?;
         let mut ios = IO_STATUS_BLOCK::default();
         let status = unsafe {
             NtQueryDirectoryFile(
@@ -634,7 +692,9 @@ mod tests {
         );
         assert_eq!(root.list(".")?, listing);
         assert_eq!(
-            entries(&root.directory, 1).unwrap_err().kind(),
+            entries(&root.directory, 1, &root.revoked)
+                .unwrap_err()
+                .kind(),
             ErrorKind::Other
         );
         assert_eq!(
@@ -653,8 +713,11 @@ mod tests {
         fs::create_dir(&selected)?;
         fs::write(selected.join("file"), b"selected bytes")?;
         let root = Root::open(&selected)?;
+        let identity = root.identity()?;
         fs::rename(&selected, &original)?;
         fs::create_dir(&selected)?;
+        assert_eq!(Root::open(&original)?.identity()?, identity);
+        assert_ne!(Root::open(&selected)?.identity()?, identity);
         fs::write(selected.join("redirection"), b"other directory")?;
         assert_eq!(root.list("/")?, [root.metadata("/file")?]);
         let mut admitted = root.file("file")?;
