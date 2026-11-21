@@ -367,6 +367,13 @@ impl ProfileStore {
     }
 
     pub(crate) fn lock(&self) -> Result<std::fs::File> {
+        let lock = self.open_catalog_lock()?;
+        lock.try_lock()
+            .context("Another window is updating profiles; try again")?;
+        Ok(lock)
+    }
+
+    fn open_catalog_lock(&self) -> Result<std::fs::File> {
         let parent = self
             .path
             .parent()
@@ -374,15 +381,12 @@ impl ProfileStore {
         std::fs::create_dir_all(parent)?;
         let mut lock_path = self.path.as_os_str().to_owned();
         lock_path.push(".w11term.lock");
-        let lock = std::fs::OpenOptions::new()
+        Ok(std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(lock_path)?;
-        lock.try_lock()
-            .context("Another window is updating profiles; try again")?;
-        Ok(lock)
+            .open(lock_path)?)
     }
 
     fn modify(

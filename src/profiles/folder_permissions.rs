@@ -7,7 +7,6 @@ use std::{
     fs,
     io::{ErrorKind, Read},
     path::Path,
-    time::{Duration, Instant},
 };
 
 fn id<'a>(raw: &'a serde_json::Value, key: &str) -> Result<Option<&'a str>> {
@@ -155,6 +154,7 @@ fn mutation_lock(revision: &Path) -> Result<fs::File> {
 #[cfg(test)]
 #[test]
 fn successful_revocation_waits_for_writes_already_admitted() -> Result<()> {
+    use std::time::{Duration, Instant};
     let temp = tempfile::tempdir()?;
     let data = temp.path().join("data");
     let catalog = temp.path().join("profiles.json");
@@ -342,23 +342,14 @@ impl ProfileStore {
         )
     }
 
+    /// Grant mutations run on a blocking disk worker. Queue behind the current
+    /// catalog writer even when discovery or a disk flush takes a while. The
+    /// kernel releases the lock if the owning process exits.
     pub(crate) fn folder_lock(&self) -> Result<fs::File> {
-        // Independent simultaneous first grants may share one newly issued token.
-        // Wait briefly for the other profile writer, without blocking indefinitely.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match self.lock() {
-                Err(e)
-                    if matches!(
-                        e.downcast_ref::<fs::TryLockError>(),
-                        Some(fs::TryLockError::WouldBlock)
-                    ) && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
-                result => return result,
-            }
-        }
+        let lock = self.open_catalog_lock()?;
+        lock.lock()
+            .context("Waiting to update folder permissions")?;
+        Ok(lock)
     }
 
     pub(crate) fn issue_folder_epoch(

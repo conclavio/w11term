@@ -629,6 +629,43 @@ mod tests {
     }
 
     #[test]
+    fn folder_consent_waits_for_a_slow_catalog_writer_without_blocking_editor_actions() -> Result<()>
+    {
+        use std::{sync::mpsc, time::Duration};
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let catalog = ProfileStore::new(scope.catalog.clone())?;
+        let (expected, _) = Store::inspect(&scope, &auth)?;
+        let writing = catalog.lock()?;
+        let (started, ready) = mpsc::channel();
+        let (result, done) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let _ = result.send(Store::issue(&scope, &auth, &expected).map(|_| ()));
+        });
+        ready.recv_timeout(Duration::from_secs(5))?;
+        // Ordinary profile edits still report contention immediately. Queue
+        // the disk worker past the old one-second timeout, then complete it.
+        let (editor_result, editor_done) = mpsc::channel();
+        let editor = std::thread::spawn(move || {
+            let _ = editor_result.send(catalog.lock().map(drop));
+        });
+        let pending_editor = editor_done.recv_timeout(Duration::from_secs(5));
+        let pending = done.recv_timeout(Duration::from_millis(1250));
+        drop(writing);
+        let busy = pending_editor?.unwrap_err();
+        assert!(matches!(
+            busy.downcast_ref::<std::fs::TryLockError>(),
+            Some(std::fs::TryLockError::WouldBlock)
+        ));
+        assert!(matches!(pending, Err(mpsc::RecvTimeoutError::Timeout)));
+        done.recv_timeout(Duration::from_secs(15))??;
+        editor.join().unwrap();
+        worker.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
     fn concurrent_first_consent_reuses_one_grant_namespace() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let (scope, auth) = fixture(dir.path());
