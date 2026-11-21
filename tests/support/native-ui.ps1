@@ -58,6 +58,16 @@ function Press-Key([uint32]$Key) {
     Post-Key 0x100 $Key
     Post-Key 0x101 $Key
 }
+function Run-Palette([string]$Command) {
+    Press-Key 0x76 # F7 in the fixture's keymap
+    $field = Wait-Until 'command search focus' {
+        $entry = Find-Element 'Search commands'
+        if ($entry -and $entry.Current.HasKeyboardFocus) { $entry }
+    }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
+    Invoke-Button (Wait-Until $Command { Find-Element $Command ([System.Windows.Automation.ControlType]::Button) })
+    $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
+}
 function Wait-Focus([int]$Pane) {
     try {
         $null = Wait-Until "pane $Pane to receive focus" {
