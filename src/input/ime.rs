@@ -40,10 +40,19 @@ struct Composition {
     candidate_mask: u32,
     positioned: Option<RECT>,
 }
-thread_local! {
-    static IME: RefCell<Composition> = RefCell::new(Composition::default());
-    static WINDOWS: RefCell<Vec<HWND>> = const {RefCell::new(Vec::new())};
-    static ASSOCIATION: std::cell::Cell<Option<(HWND,HIMC)>> = const {std::cell::Cell::new(None)};
+#[derive(Default)]
+pub(super) struct WindowIme {
+    composition: RefCell<Composition>,
+    subclasses: RefCell<Vec<HWND>>,
+    association: std::cell::Cell<Option<(HWND, HIMC)>>,
+}
+
+fn with_composition<R>(f: impl FnOnce(&Composition) -> R) -> R {
+    super::window::with_ime(|ime| f(&ime.composition.borrow()))
+}
+
+fn with_composition_mut<R>(f: impl FnOnce(&mut Composition) -> R) -> R {
+    super::window::with_ime(|ime| f(&mut ime.composition.borrow_mut()))
 }
 impl Composition {
     fn clear(&mut self) {
@@ -85,16 +94,16 @@ impl Composition {
 }
 
 pub(crate) fn set_surface(surface: Option<Surface>) {
-    IME.with_borrow_mut(|ime| ime.surface = surface);
+    with_composition_mut(|ime| ime.surface = surface);
 }
 pub(crate) fn preedit(sender: &mpsc::UnboundedSender<Command>) -> Option<Preedit> {
-    IME.with_borrow(|ime| {
+    with_composition(|ime| {
         (ime.owner.is_some() && ime.surface.as_ref()?.sender.same_channel(sender))
             .then(|| ime.preedit.clone())
     })
 }
 pub(crate) fn active() -> bool {
-    IME.with_borrow(|ime| ime.owner.is_some())
+    with_composition(|ime| ime.owner.is_some())
 }
 pub(crate) fn client_height() -> Option<i32> {
     let hwnd = window()?;
@@ -157,7 +166,7 @@ impl Drop for Context {
 }
 
 pub(super) fn cancel() {
-    let owner = IME.with_borrow_mut(|ime| {
+    let owner = with_composition_mut(|ime| {
         let owner = ime.owner?;
         ime.discarded = Some(owner);
         ime.clear();
@@ -173,19 +182,20 @@ pub(super) fn cancel() {
 }
 
 fn eligible() -> bool {
-    INPUT.with(|state| {
-        state.try_borrow().ok().is_some_and(|state| {
-            state.as_ref().is_some_and(|s| {
-                s.target.is_some()
-                    && !s.is_read_only()
-                    && !s.search
-                    && !s.modal
-                    && !s.switcher
-                    && s.picker.is_none()
-                    && s.local_mode.is_none()
+    super::window::active()
+        && with_input(|state| {
+            state.try_borrow().ok().is_some_and(|state| {
+                state.as_ref().is_some_and(|s| {
+                    s.target.is_some()
+                        && !s.is_read_only()
+                        && !s.search
+                        && !s.modal
+                        && !s.switcher
+                        && s.picker.is_none()
+                        && s.local_mode.is_none()
+                })
             })
         })
-    })
 }
 
 // Some non-editing island windows have no input context. Temporarily attach
@@ -193,7 +203,7 @@ fn eligible() -> bool {
 pub(super) fn sync_context() {
     let hwnd = unsafe { GetFocus() };
     let wanted = (!hwnd.is_invalid() && eligible() && is_terminal(hwnd)).then_some(hwnd);
-    let current = ASSOCIATION.get();
+    let current = super::window::with_ime(|ime| ime.association.get());
     if current.is_some_and(|(old, _)| Some(old) == wanted) {
         return;
     }
@@ -203,12 +213,12 @@ pub(super) fn sync_context() {
         && unsafe { ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT) }.as_bool()
         && let Some(context) = Context::get(hwnd)
     {
-        ASSOCIATION.set(Some((hwnd, context.1)));
+        super::window::with_ime(|ime| ime.association.set(Some((hwnd, context.1))));
     }
 }
 
 fn restore_context() {
-    if let Some((hwnd, bound)) = ASSOCIATION.take()
+    if let Some((hwnd, bound)) = super::window::with_ime(|ime| ime.association.take())
         && Context::get(hwnd).is_some_and(|context| context.1 == bound)
     {
         unsafe {
@@ -217,11 +227,11 @@ fn restore_context() {
     }
 }
 pub(crate) fn position_after_draw(offset: f32, scale: f32) {
-    IME.with_borrow_mut(|ime| ime.offset = (offset * scale).round() as i32);
+    with_composition_mut(|ime| ime.offset = (offset * scale).round() as i32);
     position(false);
 }
 fn position(force: bool) {
-    let update = IME.with_borrow_mut(|ime| {
+    let update = with_composition_mut(|ime| {
         let hwnd = ime.owner?;
         let mut rect = (ime.surface.as_ref()?.caret)()?;
         rect.left += ime.offset;
@@ -281,7 +291,8 @@ pub(super) fn observe(hwnd: HWND, msg: u32) {
     {
         return;
     }
-    WINDOWS.with_borrow_mut(|hooks| {
+    super::window::with_ime(|ime| {
+        let mut hooks = ime.subclasses.borrow_mut();
         if !hooks.contains(&hwnd) && unsafe { SetWindowSubclass(hwnd, Some(proc), 2, 0) }.as_bool()
         {
             hooks.push(hwnd);
@@ -291,14 +302,15 @@ pub(super) fn observe(hwnd: HWND, msg: u32) {
 pub(super) fn uninstall() {
     cancel();
     restore_context();
-    WINDOWS.with_borrow_mut(|hooks| {
-        for hwnd in hooks.drain(..) {
+    super::window::with_ime(|ime| {
+        let mut hooks = ime.subclasses.borrow_mut();
+        for hwnd in hooks.drain(..).filter(|hwnd| is_terminal(*hwnd)) {
             unsafe {
                 let _ = RemoveWindowSubclass(hwnd, Some(proc), 2);
             }
         }
     });
-    IME.with_borrow_mut(|ime| *ime = Composition::default());
+    with_composition_mut(|ime| *ime = Composition::default());
 }
 unsafe extern "system" fn proc(
     hwnd: HWND,
@@ -308,6 +320,10 @@ unsafe extern "system" fn proc(
     _: usize,
     _: usize,
 ) -> LRESULT {
+    let Some(scope) = WindowScope::for_window(hwnd) else {
+        return unsafe { DefSubclassProc(hwnd, msg, w, l) };
+    };
+    let _guard = scope.enter();
     let handled =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(hwnd, msg, w, l)))
             .ok()
@@ -320,17 +336,18 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         sync_context();
     }
     if matches!(msg, WM_KILLFOCUS | WM_INPUTLANGCHANGE | WM_NCDESTROY)
-        && IME.with_borrow(|i| i.owner == Some(hwnd))
+        && with_composition(|i| i.owner == Some(hwnd))
     {
         cancel();
     }
     if matches!(msg, WM_KILLFOCUS | WM_NCDESTROY)
-        && ASSOCIATION.get().is_some_and(|(owner, _)| owner == hwnd)
+        && super::window::with_ime(|ime| ime.association.get())
+            .is_some_and(|(owner, _)| owner == hwnd)
     {
         restore_context();
     }
     if msg == WM_NCDESTROY {
-        WINDOWS.with_borrow_mut(|hooks| hooks.retain(|h| *h != hwnd));
+        super::window::with_ime(|ime| ime.subclasses.borrow_mut().retain(|h| *h != hwnd));
         unsafe {
             let _ = RemoveWindowSubclass(hwnd, Some(proc), 2);
         }
@@ -348,15 +365,15 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         return None;
     }
     if msg == WM_IME_STARTCOMPOSITION {
-        IME.with_borrow_mut(|i| i.discarded = None);
+        with_composition_mut(|i| i.discarded = None);
         if !eligible() {
             return None;
         }
-        IME.with_borrow_mut(|i| {
+        with_composition_mut(|i| {
             i.clear();
             i.owner = Some(hwnd);
         });
-        INPUT.with(|state| {
+        with_input(|state| {
             if let Ok(state) = state.try_borrow()
                 && let Some(target) = state.as_ref().and_then(|s| s.target.as_ref())
                 && target.frames.load().scroll_offset > 0
@@ -367,7 +384,7 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         position(true);
         return zero;
     }
-    if msg == WM_IME_COMPOSITION && IME.with_borrow(|i| i.discarded == Some(hwnd)) {
+    if msg == WM_IME_COMPOSITION && with_composition(|i| i.discarded == Some(hwnd)) {
         return zero;
     }
     if msg == WM_IME_SETCONTEXT && w.0 != 0 && eligible() {
@@ -380,7 +397,7 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
             )
         });
     }
-    if !IME.with_borrow(|i| i.owner == Some(hwnd)) {
+    if !with_composition(|i| i.owner == Some(hwnd)) {
         return None;
     }
     match msg {
@@ -388,7 +405,7 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
             let flags = l.0 as u32;
             #[cfg(feature = "ui-smoke")]
             if let Some((result, text, cursor)) = smoke::READ.with_borrow_mut(Option::take) {
-                IME.with_borrow_mut(|i| i.update(hwnd, result, text, cursor));
+                with_composition_mut(|i| i.update(hwnd, result, text, cursor));
                 return zero;
             }
             let context = Context::get(hwnd)?;
@@ -406,17 +423,17 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
             let cursor = has(GCS_CURSORPOS).then(|| {
                 unsafe { ImmGetCompositionStringW(context.1, GCS_CURSORPOS, None, 0) }.max(0) as u32
             });
-            IME.with_borrow_mut(|i| i.update(hwnd, result, text, cursor));
+            with_composition_mut(|i| i.update(hwnd, result, text, cursor));
             // Owning the result prevents the default procedure from generating
             // a second WM_IME_CHAR / WM_CHAR for these same UTF-16 units.
             zero
         }
         WM_IME_ENDCOMPOSITION => {
-            IME.with_borrow_mut(|i| i.clear());
+            with_composition_mut(|i| i.clear());
             zero
         }
         WM_IME_NOTIFY if matches!(w.0 as u32, IMN_OPENCANDIDATE | IMN_CHANGECANDIDATE) => {
-            IME.with_borrow_mut(|i| i.candidate_mask = (l.0 as u32 & 15).max(1));
+            with_composition_mut(|i| i.candidate_mask = (l.0 as u32 & 15).max(1));
             position(true);
             None
         }
@@ -426,7 +443,7 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
             if query.dwSize < (std::mem::size_of::<IMECHARPOSITION>() as u32) {
                 return None;
             }
-            let (rect, offset, cursor) = IME.with_borrow(|i| {
+            let (rect, offset, cursor) = with_composition(|i| {
                 Some(((i.surface.as_ref()?.caret)()?, i.offset, i.preedit.cursor))
             })?;
             if query.dwCharPos != 0 && query.dwCharPos != cursor {

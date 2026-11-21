@@ -22,7 +22,9 @@ use windows::Win32::{
     },
 };
 
-thread_local! { static INPUT: RefCell<Option<State>> = const { RefCell::new(None) }; }
+mod window;
+pub(crate) use window::{WindowScope, window};
+use window::{with_input, with_input_mut};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LocalMode {
@@ -51,7 +53,6 @@ struct State {
     selection: bool,
     switcher: bool,
     grid: Option<Grid>,
-    window: Option<HWND>,
     search: bool,
     picker: Option<PickerStage>,
     local_mode: Option<LocalMode>,
@@ -158,6 +159,12 @@ pub enum Shortcut {
 }
 
 pub struct KeyboardBridge {
+    scope: WindowScope,
+    bootstrap: String,
+    _hooks: std::rc::Rc<ThreadHooks>,
+}
+
+struct ThreadHooks {
     messages: HHOOK,
     focus: HHOOK,
     mouse: HHOOK,
@@ -168,12 +175,8 @@ type PaneTarget = (
     std::rc::Rc<std::cell::Cell<bool>>,
 );
 
-pub fn window() -> Option<HWND> {
-    INPUT.with(|s| s.borrow().as_ref().and_then(|s| s.window))
-}
-
-impl KeyboardBridge {
-    pub fn install(shortcut: impl Fn(Shortcut) + 'static) -> windows::core::Result<Self> {
+impl ThreadHooks {
+    fn install() -> windows::core::Result<Self> {
         // SAFETY: callback lives for the program's lifetime; hook is limited to the current thread.
         let hook =
             unsafe { SetWindowsHookExW(WH_GETMESSAGE, Some(hook), None, GetCurrentThreadId())? };
@@ -200,16 +203,39 @@ impl KeyboardBridge {
                 return Err(error);
             }
         };
-        INPUT.with(|input| *input.borrow_mut() = Some(State::new(shortcut)));
         Ok(Self {
             messages: hook,
             focus,
             mouse,
         })
     }
+}
+
+impl Drop for ThreadHooks {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.messages);
+            let _ = UnhookWindowsHookEx(self.focus);
+            let _ = UnhookWindowsHookEx(self.mouse);
+        }
+    }
+}
+
+impl KeyboardBridge {
+    pub fn install(shortcut: impl Fn(Shortcut) + 'static) -> windows::core::Result<Self> {
+        let scope = WindowScope::default();
+        let _guard = scope.enter();
+        with_input_mut(|input| *input = Some(State::new(shortcut)));
+        Ok(Self {
+            scope,
+            bootstrap: format!("w11term-window-{:032x}", rand::random::<u128>()),
+            _hooks: window::install_hooks()?,
+        })
+    }
 
     pub fn set_target(&self, target: Option<PaneTarget>) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut() {
                 state.read_only = target.as_ref().map(|(_, _, locked)| locked.clone());
                 state.retarget(target.map(|(sender, frames, _)| Target { sender, frames }));
@@ -227,7 +253,7 @@ impl KeyboardBridge {
             return;
         }
         let cancel_composition = enabled
-            && INPUT.with_borrow_mut(|input| {
+            && with_input_mut(|input| {
                 if let Some(state) = input.as_mut()
                     && state
                         .target
@@ -254,14 +280,16 @@ impl KeyboardBridge {
         &self,
         panes: impl IntoIterator<Item = (u64, mpsc::UnboundedSender<Command>, FrameStore)>,
     ) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut() {
                 state.wheel_panes.replace(panes);
             }
         });
     }
     pub fn hover_pane(&self, id: u64) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut()
                 && state.wheel_panes.visible.contains_key(&id)
             {
@@ -270,7 +298,8 @@ impl KeyboardBridge {
         });
     }
     pub fn leave_pane(&self, id: u64) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut()
                 && state.wheel_panes.hovered == Some(id)
             {
@@ -279,28 +308,32 @@ impl KeyboardBridge {
         });
     }
     pub fn set_preferences(&self, preferences: Interaction) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.preferences = preferences;
             }
         });
     }
     pub fn set_shortcuts(&self, keymap: KeyMap) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.keymap = keymap;
             }
         });
     }
     pub fn set_selection(&self, selected: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.selection = selected;
             }
         });
     }
     pub fn set_switcher(&self, visible: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.switcher = visible;
                 if visible {
@@ -312,7 +345,8 @@ impl KeyboardBridge {
         ime::sync_context();
     }
     pub fn set_search(&self, visible: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 if visible {
                     ime::cancel();
@@ -320,17 +354,14 @@ impl KeyboardBridge {
                     s.wheel_panes.hovered = None;
                 }
                 s.search = visible;
-                if let Some(target) = &s.target {
-                    let _ = target.sender.send(Command::Focus(
-                        !visible && s.picker.is_none() && s.local_mode.is_none(),
-                    ));
-                }
+                s.report_focus();
             }
         });
         ime::sync_context();
     }
     pub fn set_picker(&self, stage: Option<PickerStage>) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(s) = input.borrow_mut().as_mut() {
                 s.picker = stage;
                 if stage.is_some() {
@@ -347,7 +378,8 @@ impl KeyboardBridge {
         ime::sync_context();
     }
     pub fn set_picker_placement(&self) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(s) = input.borrow_mut().as_mut()
                 && s.picker.is_some()
             {
@@ -362,7 +394,8 @@ impl KeyboardBridge {
         self.set_local_mode(visible.then_some(LocalMode::Copy));
     }
     fn set_local_mode(&self, mode: Option<LocalMode>) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(s) = input.borrow_mut().as_mut() {
                 s.local_mode = mode;
                 if mode.is_some() {
@@ -374,17 +407,14 @@ impl KeyboardBridge {
                     s.release_keys();
                     s.wheel_panes.hovered = None;
                 }
-                if let Some(target) = &s.target {
-                    let _ = target.sender.send(Command::Focus(
-                        mode.is_none() && !s.search && s.picker.is_none() && !s.modal,
-                    ));
-                }
+                s.report_focus();
             }
         });
         ime::sync_context();
     }
     pub fn set_modal(&self, visible: bool) {
-        let changed = INPUT.with(|i| {
+        let _native = self.scope.enter();
+        let changed = with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 if s.modal == visible {
                     return false;
@@ -404,14 +434,16 @@ impl KeyboardBridge {
         }
     }
     pub fn on_close(&self, handler: impl Fn() + 'static) {
-        INPUT.with(|state| {
+        let _native = self.scope.enter();
+        with_input(|state| {
             if let Some(state) = state.borrow_mut().as_mut() {
                 state.close_handler = Some(Box::new(handler));
             }
         });
     }
     pub fn reset_keys(&self) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.pressed.clear();
                 s.details.clear();
@@ -420,7 +452,8 @@ impl KeyboardBridge {
         });
     }
     pub fn set_game_mode(&self, game: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.game_mode = game;
             }
@@ -429,9 +462,7 @@ impl KeyboardBridge {
 
     #[cfg(feature = "ui-smoke")]
     pub fn smoke_wheel(&self, delta: i16) -> bool {
-        let hwnd = INPUT
-            .with(|i| i.borrow().as_ref().and_then(|s| s.window))
-            .expect("terminal HWND");
+        let hwnd = self.hwnd().expect("terminal HWND");
         let data = MOUSEHOOKSTRUCTEX {
             Base: MOUSEHOOKSTRUCT {
                 hwnd,
@@ -449,7 +480,8 @@ impl KeyboardBridge {
     }
     #[cfg(feature = "ui-smoke")]
     pub fn has_target(&self) -> bool {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             input
                 .borrow()
                 .as_ref()
@@ -460,22 +492,12 @@ impl KeyboardBridge {
 
 impl Drop for KeyboardBridge {
     fn drop(&mut self) {
+        let _guard = self.scope.enter();
         ime::uninstall();
-        // SAFETY: this object owns the hook, and is destroyed on its installing thread.
-        unsafe {
-            let _ = UnhookWindowsHookEx(self.messages);
-            let _ = UnhookWindowsHookEx(self.focus);
-            let _ = UnhookWindowsHookEx(self.mouse);
+        if let Some(mut state) = with_input_mut(Option::take) {
+            state.release_keys();
         }
-        INPUT.with(|input| {
-            if let Some(state) = input.borrow_mut().take()
-                && let Some(hwnd) = state.window
-            {
-                unsafe {
-                    let _ = RemoveWindowSubclass(hwnd, Some(window_proc), 1);
-                }
-            }
-        });
+        self.scope.remove();
     }
 }
 
@@ -483,9 +505,10 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code == HC_ACTION as i32 && wparam.0 as u32 == WM_MOUSEWHEEL {
         // Thread-local WH_MOUSE sees real wheel input before WinUI translates it.
         let mouse = unsafe { &*(lparam.0 as *const MOUSEHOOKSTRUCTEX) };
-        if is_terminal(mouse.Base.hwnd) {
+        if let Some(scope) = WindowScope::for_window(mouse.Base.hwnd) {
+            let _guard = scope.enter();
             let consumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                INPUT.with(|i| {
+                with_input(|i| {
                     i.try_borrow_mut()
                         .ok()
                         .and_then(|mut i| {
@@ -509,31 +532,13 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code >= 0 {
         // SAFETY: WH_CALLWNDPROC supplies a CWPSTRUCT valid for this callback.
         let message = unsafe { &*(lparam.0 as *const CWPSTRUCT) };
-        ime::observe(message.hwnd, message.message);
-        if message.message == WM_ACTIVATEAPP && is_terminal(message.hwnd) {
-            INPUT.with(|input| {
-                if let Ok(mut input) = input.try_borrow_mut()
-                    && let Some(state) = input.as_mut()
-                {
-                    let focused = message.wParam.0 != 0;
-                    if !focused {
-                        ime::cancel();
-                        state.release_keys();
-                        if state.switcher {
-                            state.switcher = false;
-                            (state.shortcut)(Shortcut::CancelTab);
-                        }
-                    }
-                    if let Some(target) = &state.target {
-                        let _ = target.sender.send(Command::Focus(
-                            focused
-                                && !state.search
-                                && state.picker.is_none()
-                                && state.local_mode.is_none(),
-                        ));
-                    }
-                }
-            });
+        if matches!(
+            message.message,
+            WM_SETFOCUS | WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_SETCONTEXT
+        ) && let Some(scope) = WindowScope::for_window(message.hwnd)
+        {
+            let _guard = scope.enter();
+            ime::observe(message.hwnd, message.message);
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -544,10 +549,26 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         // SAFETY: WH_GETMESSAGE provides a valid MSG for this callback invocation.
         let message = unsafe { &mut *(lparam.0 as *mut MSG) };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if !is_terminal(message.hwnd) {
+            if !matches!(
+                message.message,
+                WM_KEYDOWN
+                    | WM_KEYUP
+                    | WM_SYSKEYDOWN
+                    | WM_SYSKEYUP
+                    | WM_CHAR
+                    | WM_SYSCHAR
+                    | WM_DEADCHAR
+                    | WM_SYSDEADCHAR
+                    | WM_MOUSEWHEEL
+                    | WM_POINTERWHEEL
+            ) {
                 return;
             }
-            INPUT.with(|input| {
+            let Some(scope) = WindowScope::for_window(message.hwnd) else {
+                return;
+            };
+            let _guard = scope.enter();
+            with_input(|input| {
                 if let Ok(mut input) = input.try_borrow_mut()
                     && let Some(state) = input.as_mut()
                     && state.handle(message)
@@ -562,13 +583,7 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
 }
 
 fn is_terminal(hwnd: HWND) -> bool {
-    // Popup menus and dialogs have their own root window; never consume their keyboard input.
-    unsafe {
-        let root = GetAncestor(hwnd, GA_ROOT);
-        let mut title = [0u16; 256];
-        let len = GetWindowTextW(root, &mut title);
-        len > 0 && String::from_utf16_lossy(&title[..len as usize]).starts_with("w11term")
-    }
+    window().is_some_and(|root| unsafe { GetAncestor(hwnd, GA_ROOT) } == root)
 }
 
 #[derive(Clone, Copy)]
@@ -580,7 +595,7 @@ struct Grid {
     scale: f32,
 }
 pub fn clear_grid() {
-    INPUT.with(|i| {
+    with_input(|i| {
         if let Ok(mut state) = i.try_borrow_mut()
             && let Some(state) = state.as_mut()
         {
@@ -589,7 +604,7 @@ pub fn clear_grid() {
     });
 }
 pub fn set_grid(cw: f32, ch: f32, width: f32, height: f32, scale: f32) {
-    INPUT.with(|i| {
+    with_input(|i| {
         if let Ok(mut state) = i.try_borrow_mut()
             && let Some(state) = state.as_mut()
         {
@@ -618,10 +633,23 @@ unsafe extern "system" fn window_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if !matches!(
+        message,
+        WM_ACTIVATE | WM_CLOSE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_SIZING | WM_NCDESTROY
+    ) {
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
+    let Some(scope) = WindowScope::for_window(hwnd) else {
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    };
+    let _guard = scope.enter();
+    if message == WM_ACTIVATE {
+        window::activated((wparam.0 & 0xffff) != WA_INACTIVE as usize);
+    }
     // Persist before native destruction; a queued component message can be
     // retired with the window before it gets a chance to inspect its HWND.
     if message == WM_CLOSE {
-        INPUT.with(|state| {
+        with_input(|state| {
             if let Ok(state) = state.try_borrow()
                 && let Some(state) = state.as_ref()
                 && let Some(handler) = &state.close_handler
@@ -631,7 +659,7 @@ unsafe extern "system" fn window_proc(
         });
     }
     if message == WM_ENTERSIZEMOVE {
-        INPUT.with(|s| {
+        with_input(|s| {
             if let Ok(s) = s.try_borrow()
                 && let Some(s) = s.as_ref()
             {
@@ -641,7 +669,7 @@ unsafe extern "system" fn window_proc(
     }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     if matches!(message, WM_EXITSIZEMOVE | WM_CLOSE) {
-        INPUT.with(|s| {
+        with_input(|s| {
             if let Ok(s) = s.try_borrow()
                 && let Some(s) = s.as_ref()
             {
@@ -650,7 +678,7 @@ unsafe extern "system" fn window_proc(
         });
     }
     if message == WM_SIZING && lparam.0 != 0 {
-        INPUT.with(|i| {
+        with_input(|i| {
             if let Ok(state) = i.try_borrow()
                 && let Some(state) = state.as_ref()
                 && state.preferences.snap_to_grid_on_resize
@@ -686,16 +714,7 @@ unsafe extern "system" fn window_proc(
         return LRESULT(1);
     }
     if message == WM_NCDESTROY {
-        unsafe {
-            let _ = RemoveWindowSubclass(hwnd, Some(window_proc), 1);
-        }
-        INPUT.with(|i| {
-            if let Ok(mut s) = i.try_borrow_mut()
-                && let Some(s) = s.as_mut()
-            {
-                s.window = None;
-            }
-        });
+        scope.remove();
     }
     result
 }
@@ -791,7 +810,6 @@ impl State {
             selection: false,
             switcher: false,
             grid: None,
-            window: None,
             search: false,
             picker: None,
             local_mode: None,
@@ -846,18 +864,23 @@ impl State {
         self.target = target;
         self.wheel_remainder = 0;
         self.zoom_remainder = 0;
+        self.report_focus();
+    }
+
+    fn report_focus(&self) {
         if let Some(target) = &self.target {
-            let _ = target.sender.send(Command::Focus(true));
+            let _ = target.sender.send(Command::Focus(
+                window::active()
+                    && !self.search
+                    && !self.modal
+                    && !self.switcher
+                    && self.picker.is_none()
+                    && self.local_mode.is_none(),
+            ));
         }
     }
 
     fn handle(&mut self, message: &MSG) -> bool {
-        if self.window.is_none() && message.hwnd != HWND::default() {
-            let root = unsafe { GetAncestor(message.hwnd, GA_ROOT) };
-            if unsafe { SetWindowSubclass(root, Some(window_proc), 1, 0) }.as_bool() {
-                self.window = Some(root);
-            }
-        }
         let raw_vk = message.wParam.0 as u32;
         let vk = if matches!(
             message.message,
@@ -1723,7 +1746,7 @@ mod tests {
         let lab = Session::start(Source::Demo);
         let (sender, mut pending) = mpsc::unbounded_channel();
         let locked = std::rc::Rc::new(std::cell::Cell::new(false));
-        INPUT.with_borrow_mut(|slot| {
+        with_input_mut(|slot| {
             *slot = Some(State {
                 target: Some(Target {
                     sender: sender.clone(),
@@ -1761,7 +1784,7 @@ mod tests {
             pending.try_recv().unwrap(),
             Command::SetReadOnly(false)
         ));
-        INPUT.with_borrow_mut(|slot| {
+        with_input_mut(|slot| {
             let mut state = slot.take().unwrap();
             assert!(state.surrogate.is_none());
             assert!(state.handle(&MSG {
@@ -1787,6 +1810,8 @@ mod tests {
 
     #[test]
     fn switching_tabs_releases_held_keys_to_the_old_session_and_forms_receive_native_input() {
+        let _guard = WindowScope::default().enter();
+        window::activated(true);
         let lab = Session::start(Source::Demo);
         let (old, mut old_input) = mpsc::unbounded_channel();
         let (new, mut new_input) = mpsc::unbounded_channel();
