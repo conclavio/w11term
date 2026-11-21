@@ -1,6 +1,8 @@
 //! The loopback peer implements zmx and tmux CLI responses. Each attach
 //! and control command still runs on a real authenticated SSH channel.
 use anyhow::{Result, bail};
+#[path = "support/herdr_peer.rs"]
+mod herdr;
 use russh::{
     Channel, ChannelId,
     keys::{Algorithm, HashAlg, PrivateKey},
@@ -74,12 +76,14 @@ struct Backend {
     replace_on_resume: bool,
     tmux_name: Option<String>,
     tmux_available: bool,
+    herdr: herdr::Records,
 }
 #[derive(Clone, Default)]
 struct Peer {
     backend: Arc<Mutex<Backend>>,
     checking: Arc<Notify>,
     release: Arc<Notify>,
+    hc: std::collections::HashMap<ChannelId, herdr::Wire>,
 }
 impl server::Handler for Peer {
     type Error = anyhow::Error;
@@ -141,6 +145,9 @@ impl server::Handler for Peer {
         Ok(())
     }
     async fn data(&mut self, c: ChannelId, data: &[u8], s: &mut server::Session) -> Result<()> {
+        if let Some(wire) = self.hc.get_mut(&c) {
+            return wire.feed(&mut self.backend.lock().unwrap().herdr, c, data, s);
+        }
         if data == b"lose transport" {
             bail!("injected SSH loss")
         }
@@ -160,7 +167,16 @@ impl server::Handler for Peer {
         let (status, text, hold) = {
             let mut b = self.backend.lock().unwrap();
             b.commands.push(command.into());
+            if command == "hc connect" {
+                self.hc.insert(c, herdr::Wire::default());
+                return Ok(());
+            }
             match args.as_slice() {
+                ["sh", "-c", ..] if command.contains("/proc/sys/kernel/random/boot_id") => (
+                    0,
+                    format!("{}\n112 {}\n", herdr::BOOT, b.herdr.ticks),
+                    false,
+                ),
                 [
                     "env",
                     "LC_ALL=C",

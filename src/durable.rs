@@ -3,6 +3,7 @@ use crate::options::SshOptions;
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use serde::{Deserialize, Serialize};
+pub mod herdr;
 pub(crate) mod tmux;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +12,7 @@ pub enum Backend {
     #[default]
     Zmx,
     Tmux,
+    Herdr,
 }
 impl Backend {
     fn is_zmx(&self) -> bool {
@@ -48,6 +50,7 @@ impl DurableReference {
         ensure!(
             match self.backend {
                 Backend::Zmx => valid_identity(&self.name, &self.generation),
+                Backend::Herdr => herdr::Target::parse(&self.name, &self.generation).is_some(),
                 Backend::Tmux => tmux::Target::parse(&self.name, &self.generation).is_some(),
             },
             "Invalid durable session name or generation"

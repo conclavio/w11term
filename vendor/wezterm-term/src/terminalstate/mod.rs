@@ -388,7 +388,8 @@ pub struct TerminalState {
     term_program: String,
     term_version: String,
 
-    writer: BufWriter<ThreadedWriter>,
+    writer: BufWriter<Box<dyn std::io::Write + Send>>,
+    parser_reply_writer: Option<BufWriter<Box<dyn std::io::Write + Send>>>,
 
     image_cache: lru::LruCache<[u8; 32], Arc<ImageData>>,
     sixel_scrolls_right: bool,
@@ -571,7 +572,7 @@ impl TerminalState {
         term_version: &str,
         writer: Box<dyn std::io::Write + Send>,
     ) -> TerminalState {
-        let writer = BufWriter::new(ThreadedWriter::new(writer));
+        let writer: Box<dyn std::io::Write + Send> = Box::new(ThreadedWriter::new(writer));
         let seqno = 1;
         let screen = ScreenOrAlt::new(size, &config, seqno, config.bidi_mode());
 
@@ -636,7 +637,8 @@ impl TerminalState {
             command_label: None,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
-            writer,
+            writer: BufWriter::new(writer),
+            parser_reply_writer: None,
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
@@ -688,6 +690,27 @@ impl TerminalState {
 
     pub fn set_clipboard(&mut self, clipboard: &Arc<dyn Clipboard>) {
         self.clipboard.replace(Arc::clone(clipboard));
+    }
+
+    pub fn clear_clipboard(&mut self) {
+        self.clipboard = None;
+    }
+
+    /// Install separate, nonblocking input and reply sinks for a framed viewer.
+    /// Both sinks run on the parser thread to preserve order between writes.
+    pub fn set_nonblocking_viewer_writers(
+        &mut self,
+        input: Box<dyn std::io::Write + Send>,
+        reply: Box<dyn std::io::Write + Send>,
+    ) {
+        self.writer = BufWriter::new(input);
+        self.parser_reply_writer = Some(BufWriter::new(reply));
+    }
+
+    pub(crate) fn swap_parser_writer(&mut self) {
+        if let Some(reply) = &mut self.parser_reply_writer {
+            std::mem::swap(&mut self.writer, reply);
+        }
     }
 
     pub fn set_device_control_handler(&mut self, handler: Box<dyn DeviceControlHandler>) {

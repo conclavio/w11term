@@ -301,8 +301,17 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(name) = label.strip_prefix("Browse Herdr terminals on ") {
+        return Message::Discovery(session_browser::Action::Discover {
+            name: name.into(),
+            herdr: true,
+        });
+    }
     if let Some(name) = label.strip_prefix("Find sessions on ") {
-        return Message::Discovery(session_browser::Action::Discover(name.into()));
+        return Message::Discovery(session_browser::Action::Discover {
+            name: name.into(),
+            herdr: false,
+        });
     }
     if let Some(action) = durable_view::menu_action(&label) {
         return Message::Durability(action);
