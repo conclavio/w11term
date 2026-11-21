@@ -116,6 +116,10 @@ pub(super) fn keyboard_view(
     if let Some((action, input)) = &page.draft {
         let action = *action;
         let label = action.binding().label;
+        let current = shortcuts
+            .get(action.binding())
+            .map_or_else(String::new, String::from);
+        let changed = !input.trim().is_empty() && !input.trim().eq_ignore_ascii_case(&current);
         rows.extend([
             KeyedView::new("action", TextBlock::new().text(label).font_size(20.0)),
             KeyedView::new(
@@ -141,6 +145,7 @@ pub(super) fn keyboard_view(
                     .spacing(8.0)
                     .children((
                         Button::new()
+                            .is_enabled(changed)
                             .on_click(ctx.callback(move |_| Message::Keyboard(Edit::Save(action))))
                             .content("Save shortcut"),
                         Button::new()
