@@ -52,6 +52,16 @@ async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "keeps an open native tab menu actionable through SSH progress repaints"]
+async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
+    let mut expected = Vec::new();
+    for percent in [20, 40, 60, 80] {
+        expected.extend(format!("\x1b]9;4;1;{percent}\x07").bytes());
+    }
+    run_palette_fixture("caret-repaint-ui.ps1", &expected, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
 async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
     run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
