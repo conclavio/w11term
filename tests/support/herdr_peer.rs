@@ -9,6 +9,8 @@ pub(super) struct Records {
     inputs: Vec<Vec<u8>>,
     grids: Vec<Vec<u8>>,
     attaches: usize,
+    viewer: Option<(server::Handle, ChannelId)>,
+    automatic: Vec<u8>,
 }
 #[derive(Default, Clone)]
 pub(super) struct Wire {
@@ -70,6 +72,7 @@ impl Wire {
                         "terminal.attach" => {
                             assert_eq!(req["params"]["terminal"], "t7");
                             records.attaches += 1;
+                            records.viewer = Some((s.handle(), c));
                             painted = true;
                             json!({"channel":19,"terminal":live(),"automatic_input":true})
                         }
@@ -95,7 +98,8 @@ impl Wire {
                     s.data(c, frame(19, 0, data))?;
                 }
                 (19, 3) => records.grids.push(data.to_vec()),
-                (19, 1 | 2 | 6) => {}
+                (19, 6) => records.automatic.extend_from_slice(data),
+                (19, 1 | 2) => {}
                 other => panic!("unexpected Herdr viewer frame {other:?}"),
             }
         }
@@ -119,6 +123,42 @@ async fn native_ssh_herdr_checks_identity_before_input_and_preserves_the_remote_
         .durable_action(DurableAction::Choose(selected.clone()))
         .unwrap();
     phase(&session, DurablePhase::Attached).await;
+    session.input.send(Command::SetReadOnly(true)).unwrap();
+    assert!(
+        raw(&session, "locked")
+            .await
+            .unwrap_err()
+            .contains("read-only")
+    );
+    let (peer, channel) = fixture
+        .peer
+        .backend
+        .lock()
+        .unwrap()
+        .herdr
+        .viewer
+        .clone()
+        .unwrap();
+    peer.data(channel, frame(19, 0, b"\x1b[c")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if fixture
+                .peer
+                .backend
+                .lock()
+                .unwrap()
+                .herdr
+                .automatic
+                .ends_with(b"c")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("locked Herdr pane must still send automatic device attributes");
+    session.input.send(Command::SetReadOnly(false)).unwrap();
     raw(&session, "live-typed").await.unwrap();
     session
         .input
