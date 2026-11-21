@@ -71,7 +71,9 @@ def launch_command(terminal, title):
         f"--title={title}", "--window-decoration=none", "--window-show-tab-bar=never",
         "--window-width=40", "--window-height=12", "--window-padding-x=0",
         "--window-padding-y=0", "--window-padding-balance=false", "--background=000000",
-        "--font-family=DejaVu Sans Mono", "--shell-integration=none", "-e",
+        # At this Xvfb DPI, DejaVu Sans Mono normally yields 10px cells.
+        # A 9px cell has one central pixel, like the kitty reference grid.
+        "--font-family=DejaVu Sans Mono", "--adjust-cell-width=-1", "--shell-integration=none", "-e",
     ]
 
 
