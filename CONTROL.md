@@ -93,6 +93,51 @@ Direct protocol screenshot paths must be absolute. The CLI resolves relative pat
 
 Each entry also has a `label` and `status`. Available sessions report `title`, `cols`, `rows`, `connection_generation`, and `prompt`. An unavailable session retains its IDs and flags and reports an `error`. Prompts expose public challenge metadata only. The connection generation increases after each new SSH login. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels.
 
+## Completed shell commands
+
+`list-commands --pane ID` reads the pane’s OSC 133 command history. It returns
+`pane`, `connection_generation`, and a `commands` array, newest first. Each entry
+contains `id`, `command`, `exit_code`, and `output_available`. The array is empty
+until the shell marks a completed command. A missing command line or exit status
+is JSON `null`. Listing transfers only this metadata and preserves keyboard focus
+and the scroll position.
+
+To get the latest command’s output, pass its ID and the generation from the same
+listing. A generation of zero is valid.
+
+```powershell
+$historyReply = & $ctl --pid 12345 list-commands --pane $pane | ConvertFrom-Json
+if (!$historyReply.ok) { throw $historyReply.error }
+$history = $historyReply.result
+if ($history.commands.Count -gt 0) {
+    $id = $history.commands[0].id
+    $reply = & $ctl --pid 12345 get-command --pane $pane --id $id --connection-generation $history.connection_generation | ConvertFrom-Json
+    if (!$reply.ok) { throw $reply.error }
+    if ($null -ne $reply.result.output_error) { throw $reply.result.output_error }
+    $reply.result.output
+}
+```
+
+Direct pipe clients use these JSON requests.
+
+```json
+{"verb":"list-commands","pane":2}
+{"verb":"get-command","pane":2,"id":5,"connection_generation":1}
+```
+
+`get-command` returns `pane`, `connection_generation`, `id`, `command`,
+`exit_code`, `output`, and `output_error`. Output preserves Unicode text,
+joins soft wraps, and uses CRLF between hard lines. A successful capture sets
+`output_error` to `null`. A silent command can have an empty output string and
+`output_available: true` in the listing. If capture failed, the command still
+has a record with `output: null` and an explanation in `output_error`.
+
+Each pane retains up to 64 completed commands within a 4 MiB text budget.
+Capture limits are 4,096 UTF-8 bytes per command line and 1 MiB per command’s
+output. Keep the pane ID, command ID and connection generation together. A lookup
+fails if its record has been evicted or its connection generation has changed.
+After a reconnect, list again to see the new session’s history.
+
 ## Waiting, geometry, tabs, and events
 
 `find-text` searches each selected pane’s retained scrollback and visible screen once. Use `--pane ID` for one pane or `--all-panes` for every pane in the process, across all its windows. Matching uses a case-insensitive Unicode literal, joins soft wraps, and stops at hard line breaks. Text can be up to 4,096 UTF-8 bytes. Use `--` before a pattern beginning with two hyphens. An alternate-screen pane searches its current screen.
