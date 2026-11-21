@@ -54,7 +54,9 @@ fn write_input(
 ) -> Result<()> {
     while let Some(message) = rx.blocking_recv() {
         match message {
-            TransportInput::Data(bytes) => pipe.write_all(&bytes).context("write local input")?,
+            TransportInput::Data(bytes) | TransportInput::Automatic(bytes) => {
+                pipe.write_all(&bytes).context("write local input")?
+            }
             TransportInput::Raw(bytes, reply) => {
                 let result = pipe.write_all(&bytes);
                 let _ = reply.send(
