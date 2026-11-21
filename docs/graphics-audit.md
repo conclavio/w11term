@@ -106,7 +106,9 @@ contains interpolated green. The Ghostty harness sets `adjust-cell-width=-1`
 for the pinned font and Xvfb display.
 Eight samples in the seventh row exercise a default background, explicit cell
 backgrounds on both sides of the z threshold, negative and zero z across a
-solid glyph, and equal- and different-z image overlaps. The original five sample
+solid glyph, and equal- and different-z image overlaps. The solid image tiles
+contain 8×8 texels so the cell-center sample falls inside an opaque texture
+region on all three renderers. The original five sample
 points exercise placement and selected animation frames. GPU interpolation,
 general deletion selectors, placeholders under every rendition attribute, and every
 possible compositing edge remain outside this fixture.
