@@ -4,6 +4,32 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manages a verified profile's read-only folder consent with the native Windows folder picker"]
+async fn native_shared_folders_keep_consent_bound_to_the_verified_ssh_profile() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let selected = state.path().join("Selected folder");
+    fs::create_dir(&selected).unwrap();
+    fs::write(selected.join("sample.txt"), b"unchanged").unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    drive_mixed_gui("folder-share-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        fs::read(trace).unwrap(),
+        b"share-shell-before-restartshare-shell-after-restart\x04"
+    );
+    assert_eq!(fs::read(selected.join("sample.txt")).unwrap(), b"unchanged");
+    assert!(
+        opens.load(Ordering::Relaxed) >= 4,
+        "two live shells and two refused mount attempts"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives the command palette across a loopback SSH session and a PowerShell tab"]
 async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
     run_palette_fixture("command-palette-ui.ps1", b"after", None).await;
