@@ -71,9 +71,16 @@ impl TerminalApp {
                         .get()
                         .is_some_and(|s| s.cols == frame.cols && s.rows == frame.rows.len())
                     {
+                        let links = concat!(
+                            "\r\n\x1b]8;;https://osc.example/test\x1b\\",
+                            "labelled\x1b]8;;\x1b\\",
+                            "\r\nhttps://text.example/path "
+                        );
                         tab.session
                             .input
-                            .send(Command::Paste(format!("\x1b[2J\x1b[H{marker} Aאב12ג")))
+                            .send(Command::Paste(format!(
+                                "\x1b[2J\x1b[H{marker} Aאב12ג{links}"
+                            )))
                             .unwrap();
                     }
                     step
@@ -82,6 +89,44 @@ impl TerminalApp {
             2 if state.join("switch").exists() => {
                 self.update(Message::PaneNeighbor(Direction::Left), context);
                 3
+            }
+            2 if state.join("pointer").exists() => {
+                // A pointer event addressed to this fixture only, through the same
+                // update path as Reactor's native pane-local pointer callback.
+                let path = state.join("pointer");
+                let request = std::fs::read_to_string(&path).unwrap();
+                std::fs::remove_file(path).unwrap();
+                if !self.show_inspector {
+                    self.update(Message::ToggleInspector, context);
+                }
+                let focused = self.tabs.active_id().unwrap();
+                let (id, row) = match request.as_str() {
+                    "plain" => (focused, 0),
+                    "osc" => (focused, 1),
+                    "detected" => (focused, 2),
+                    "neighbor" => (
+                        self.tabs
+                            .entries()
+                            .iter()
+                            .find(|t| t.id != focused)
+                            .unwrap()
+                            .id,
+                        0,
+                    ),
+                    _ => panic!("unexpected pointer probe"),
+                };
+                let Page::Terminal(live) = &self.tabs.get(id).unwrap().page else {
+                    panic!("missing fixture pane")
+                };
+                let metrics = live.surface.metrics.get();
+                let pointer = PointerEventInfo {
+                    x: (PADDING + 0.5 * metrics.cell_width) as f64,
+                    y: (PADDING + (row as f32 + 0.5) * metrics.cell_height) as f64,
+                    ..Default::default()
+                };
+                self.update(Message::Pointer(id, pointer, MouseEventKind::Move), context);
+                assert_eq!(self.tabs.active_id(), Some(focused));
+                2
             }
             2 if state.join("append").exists() => {
                 std::fs::remove_file(state.join("append")).unwrap();

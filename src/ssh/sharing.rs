@@ -169,6 +169,7 @@ impl ShareSlot {
 
 #[derive(Default)]
 pub(crate) struct Sharing {
+    pub startup: Option<crate::workspace::SshStartup>,
     pub published: ShareSlot,
     pub offered: Option<ConnectionShare>,
     pub durable: Option<super::durability::Worker>,

@@ -31,6 +31,34 @@ impl Default for Metrics {
     }
 }
 
+/// Renderer coordinates and Reactor pointer events are both expressed in pane-local DIPs.
+pub struct CellHit {
+    pub col: usize,
+    pub row: usize,
+    pub inside: bool,
+}
+impl Metrics {
+    pub fn hit(self, x: f64, y: f64) -> CellHit {
+        let col = ((x as f32 - PADDING) / self.cell_width).floor();
+        let row = ((y as f32 - PADDING) / self.cell_height).floor();
+        CellHit {
+            col: (col as usize).min(self.cols.saturating_sub(1)),
+            row: (row as usize).min(self.rows.saturating_sub(1)),
+            inside: col >= 0.0 && row >= 0.0 && col < self.cols as f32 && row < self.rows as f32,
+        }
+    }
+}
+impl CellHit {
+    pub fn point(&self, frame: &Snapshot) -> w11term::interaction::Point {
+        w11term::interaction::Point {
+            row: frame.first_stable_row + self.row as isize,
+            col: frame
+                .cell_map(self.row)
+                .map_or(self.col, |map| map.logical(self.col)),
+        }
+    }
+}
+
 /// First renderer: cached DirectWrite layouts + GPU-resident Direct2D images.
 /// The engine/transport boundary allows an atlas renderer to replace this independently.
 pub struct Renderer {
@@ -300,6 +328,38 @@ impl Renderer {
         frame: &Snapshot,
     ) -> windows_canvas::Result<Metrics> {
         self.draw_surface(ctx, ctx.width, ctx.height, ctx.device_changed(), frame)
+    }
+
+    /// Draw the committed grid at its original geometry, then fit it into the thumbnail.
+    /// Preview dimensions must never become a resize request for the PTY.
+    pub fn draw_preview(
+        &mut self,
+        ctx: &DrawingSession<'_>,
+        width: f32,
+        height: f32,
+        device_changed: bool,
+        frame: &Snapshot,
+    ) -> windows_canvas::Result<()> {
+        if width <= 0.0 || height <= 0.0 {
+            return Ok(());
+        }
+        let dpi = (NativeDrawing::new(ctx)?.dpi() / 96.0).max(0.5);
+        let grid = self.measure(width, height, dpi);
+        let source_w = PADDING * 2.0 + frame.cols as f32 * grid.cell_width;
+        let source_h = PADDING * 2.0 + STATUS_HEIGHT + frame.rows.len() as f32 * grid.cell_height;
+        let fit = (width / source_w).min(height / source_h).min(1.0);
+        let previous = ctx.transform();
+        let transform = windows_canvas::Matrix3x2 {
+            m11: fit,
+            m22: fit,
+            m31: (width - source_w * fit) / 2.0,
+            m32: (height - source_h * fit) / 2.0,
+            ..Default::default()
+        };
+        ctx.set_transform(&(transform * previous));
+        let result = self.draw_surface(ctx, source_w, source_h, device_changed, frame);
+        ctx.set_transform(&previous);
+        result.map(|_| ())
     }
 
     pub fn draw_hint_labels<'a>(
@@ -1316,6 +1376,54 @@ mod tests {
         assert!(renderer.images.is_empty());
         assert_eq!(renderer.tile_bytes, 0);
     }
+    #[test]
+    fn preview_fits_the_entire_grid_and_renders_kitty_placements() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::new().unwrap();
+        let metrics = renderer.measure(800.0, 600.0, 1.0);
+        let size = wezterm_term::TerminalSize {
+            cols: 32,
+            rows: 12,
+            dpi: 96,
+            pixel_width: 32 * metrics.cell_width as usize,
+            pixel_height: 12 * metrics.cell_height as usize,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = w11term::terminal::create(size, tx);
+        term.advance_bytes(include_bytes!("../tests/fixtures/kitty/placements.vt"));
+        term.advance_bytes(b"\x1b[?25l\x1b[12;32H\x1b[48;2;255;0;255m ");
+        let snapshot = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        for (width, height) in [(160, 220), (320, 80)] {
+            let target = device.create_render_target(width, height).unwrap();
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(96.0);
+                    renderer.draw_preview(ctx, width as f32, height as f32, true, &snapshot)
+                })
+                .unwrap();
+            let pixels = target.read_pixels().unwrap();
+            let source_w = PADDING * 2.0 + size.pixel_width as f32;
+            let source_h = PADDING * 2.0 + STATUS_HEIGHT + size.pixel_height as f32;
+            let fit = (width as f32 / source_w).min(height as f32 / source_h);
+            let sample = |col: f32, row: f32| {
+                let x = (width as f32 - source_w * fit) / 2.0
+                    + (PADDING + col * metrics.cell_width) * fit;
+                let y = (height as f32 - source_h * fit) / 2.0
+                    + (PADDING + row * metrics.cell_height) * fit;
+                let i = (y as usize * width as usize + x as usize) * 4;
+                [pixels[i + 2], pixels[i + 1], pixels[i]]
+            };
+            // At thumbnail scale Direct2D interpolates the adjacent colored tiles.
+            let [red, green, blue] = sample(2.5, 2.5);
+            assert!(
+                red > 220 && green < 35 && blue < 35,
+                "kitty placement {red}/{green}/{blue}"
+            );
+            assert_eq!(sample(31.5, 11.5), [255, 0, 255], "last cell");
+        }
+    }
+
     #[test]
     fn offscreen_kitty_reference_cell_centers() {
         #[derive(serde::Deserialize)]

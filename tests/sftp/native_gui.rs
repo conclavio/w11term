@@ -4,6 +4,52 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "saves a startup command in the native workspace editor and reopens it over SSH"]
+async fn native_workspace_startup_is_sent_only_by_the_reopened_pane() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("workspace-exec.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":{"fixture":ssh}})).unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-STA", "-File"])
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/workspace-startup-ui.ps1"),
+        )
+        .args([
+            "-Gui",
+            env!("CARGO_BIN_EXE_w11term"),
+            "-Cli",
+            env!("CARGO_BIN_EXE_w11term-cli"),
+        ])
+        .arg("-State")
+        .arg(state.path())
+        .arg("-Trace")
+        .arg(&trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        fs::read_to_string(trace).unwrap(),
+        r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -c "$2"' w11term '/srv/crew'\''s project' 'tail -f build.log'"#
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits keyboard settings and restarts a native SSH and Windows PowerShell workspace"]
 async fn native_shortcut_rebind_releases_previous_key_and_persists_after_restart() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 2).await else {

@@ -35,6 +35,7 @@ mod config_import;
 mod file_drawer;
 mod keyboard_settings;
 mod local_profile;
+mod pattern_settings;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
@@ -54,6 +55,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
     files: Box<FileDrawer>,
     discovery_page: Option<usize>,
@@ -124,13 +126,17 @@ pub enum InteractionField {
     DetectUrls,
     Osc52,
 }
+enum SettingsEditor {
+    Keyboard(keyboard_settings::KeyboardPage),
+    Patterns(pattern_settings::PatternPage),
+}
 enum Page {
     Attention,
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
     Workspaces(workspace_view::WorkspacePage),
-    Settings(Option<keyboard_settings::KeyboardPage>),
+    Settings(Option<SettingsEditor>),
     NewProfile(ProfileDraft),
 }
 struct AppTab {
@@ -285,6 +291,9 @@ fn tab_menu_message(label: String) -> Message {
         "Terminal inspector" => Message::ToggleInspector,
         "Attention inbox" => Message::Attention(attention::Action::Open),
         "SFTP files" => Message::Files(FileAction::Toggle),
+        "Workspace startup…" => {
+            Message::Workspace(workspace_view::WorkspaceAction::ConfigureStartup)
+        }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
         "Split right" => Message::SplitPane(Axis::Columns, None),
@@ -381,6 +390,8 @@ pub enum Message {
     AttentionChanged,
     ToggleInspector,
     PickerQuery(String),
+    PickerHover(u64),
+    PickerFrame(u64, u64),
     PickerChoose(u64),
     PickerFocus(u8),
     LocalProfile(local_profile::Action),
@@ -430,6 +441,7 @@ pub enum Message {
     ProfileMenu(String),
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
+    Patterns(pattern_settings::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
     Font(Option<usize>),
@@ -491,6 +503,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            startup: None,
             observed_frame: 0,
             files: Box::default(),
             discovery_page: None,
@@ -960,15 +973,17 @@ impl TerminalApp {
         };
         let metrics = tab.surface.metrics.get();
         let frame = tab.session.frames.load();
-        let x = (((pointer.x as f32 - PADDING).max(0.0) / metrics.cell_width).floor() as usize)
-            .min(metrics.cols.saturating_sub(1));
-        let y = (((pointer.y as f32 - PADDING).max(0.0) / metrics.cell_height).floor() as usize)
-            .min(metrics.rows.saturating_sub(1));
-        let point = Point {
-            row: frame.first_stable_row + y as isize,
-            col: frame.cell_map(y).map_or(x, |map| map.logical(x)),
-        };
+        let hit = metrics.hit(pointer.x, pointer.y);
+        let (x, y) = (hit.col, hit.row);
+        let point = hit.point(&frame);
         let link = link_at(&frame, point, preferences.detect_urls);
+        if let Some(inspector) = &mut self.inspection {
+            if inspector.pane == tab.session.pane_id {
+                inspector.observe_pointer((pointer.x, pointer.y), &hit, &frame, link.as_ref());
+            } else {
+                inspector.clear_pointer();
+            }
+        }
         if *tab.hover.borrow() != link {
             *tab.hover.borrow_mut() = link.clone();
             tab.surface.invalidator.invalidate();
@@ -1284,6 +1299,12 @@ impl TerminalApp {
                 .content("Import OpenSSH config…"),
         );
         children.splice(1..1, profiles);
+        children.insert(
+            1,
+            Button::new()
+                .on_click(context.callback(|_| Message::Patterns(pattern_settings::Edit::Show)))
+                .content("Hint patterns"),
+        );
         children.insert(
             1,
             Button::new()
@@ -2130,6 +2151,12 @@ impl TerminalApp {
                 self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
             })
         });
+        let workspace_startup = match self.tabs.active().map(|tab| &tab.page) {
+            Some(Page::Terminal(live)) if matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush) => {
+                MenuItem::item("workspace-startup", "Workspace startup…")
+            }
+            _ => MenuItem::disabled("workspace-startup", "Workspace startup…"),
+        };
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2146,6 +2173,7 @@ impl TerminalApp {
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
                     self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
+                    workspace_startup,
                     self.discovery_menu(),
                     state_menu_item(
                         "inspector",
@@ -2831,7 +2859,12 @@ impl Component for TerminalApp {
             Message::FrameReady(..)
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
+                | Message::Patterns(
+                    pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
+                )
                 | Message::PickerQuery(..)
+                | Message::PickerHover(..)
+                | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
                 | Message::PaneRatio(..)
                 | Message::DividerPress(..)
@@ -2867,7 +2900,9 @@ impl Component for TerminalApp {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
-            Message::PickerQuery(query) => self.filter_picker(query),
+            Message::PickerQuery(query) => self.filter_picker(query, context),
+            Message::PickerHover(pane) => self.hover_picker(pane, context),
+            Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::Files(action) => self.file_action(action, context),
@@ -3120,10 +3155,12 @@ impl Component for TerminalApp {
                 self.frame_tasks
                     .retain(|_, task| task.status() != ComponentTaskStatus::Rejected);
                 self.watch_frames(context);
-                if self
-                    .control_task
-                    .as_ref()
-                    .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
+                let preview_ready = self.watch_picker_preview(context);
+                if preview_ready
+                    && self
+                        .control_task
+                        .as_ref()
+                        .is_some_and(|task| task.status() != ComponentTaskStatus::Rejected)
                     && self
                         .frame_tasks
                         .values()
@@ -3444,6 +3481,15 @@ impl Component for TerminalApp {
                             return;
                         }
                         tab.observed_frame = frame.generation;
+                        if let Some(inspector) = &mut self.inspection
+                            && inspector.pane == tab.session.pane_id
+                        {
+                            inspector.refresh_pointer(
+                                tab.surface.metrics.get(),
+                                &frame,
+                                self.appearance.read().unwrap().interaction.detect_urls,
+                            );
+                        }
                         tab.error = None;
                         tab.files.observe_connection(frame.connection_generation);
                         let unavailable = frame.copy_output_unavailable();
@@ -3593,6 +3639,7 @@ impl Component for TerminalApp {
                 Shortcut::PickerMove(delta) => {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);
+                        self.sync_picker_preview(context);
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
@@ -3725,6 +3772,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
+            Message::Patterns(edit) => self.edit_patterns(edit),
             Message::SettingsMenu => self.utility(true, context),
             Message::LocalProfile(action) => self.local_profile_action(action, context),
             Message::Workspace(action) => self.workspace_action(action, context),
@@ -3811,7 +3859,14 @@ impl Component for TerminalApp {
                     self.divider_drag.borrow_mut().take();
                 }
             }
-            Message::HoverPane(id) => self.keyboard.hover_pane(id),
+            Message::HoverPane(id) => {
+                self.keyboard.hover_pane(id);
+                if self.tabs.active_id() != Some(id)
+                    && let Some(inspector) = &mut self.inspection
+                {
+                    inspector.clear_pointer();
+                }
+            }
             Message::PointerExit(id) => {
                 self.keyboard.leave_pane(id);
                 if let Some(AppTab {
@@ -3819,6 +3874,11 @@ impl Component for TerminalApp {
                     ..
                 }) = self.tabs.get(id)
                 {
+                    if let Some(inspector) = &mut self.inspection
+                        && inspector.pane == tab.session.pane_id
+                    {
+                        inspector.clear_pointer();
+                    }
                     tab.hover.borrow_mut().take();
                     tab.surface.invalidator.invalidate();
                 }
@@ -4096,9 +4156,16 @@ impl Component for TerminalApp {
                 },
                 Page::Settings(None) => self.settings_view(context),
                 Page::Attention => self.attention_view(context),
-                Page::Settings(Some(page)) => keyboard_settings::keyboard_view(
+                Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
+                    keyboard_settings::keyboard_view(
+                        page,
+                        &self.appearance.read().unwrap().shortcuts,
+                        context,
+                    )
+                }
+                Page::Settings(Some(SettingsEditor::Patterns(page))) => pattern_settings::view(
                     page,
-                    &self.appearance.read().unwrap().shortcuts,
+                    &self.appearance.read().unwrap().hint_patterns,
                     context,
                 ),
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),

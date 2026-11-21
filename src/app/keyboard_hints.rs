@@ -57,10 +57,10 @@ impl Hints {
     }
 
     fn reveal(&self) -> Option<(String, Option<String>)> {
-        match self.selected()? {
-            Target::Path(path) if self.ssh => reveal_path(path, self.directory.as_deref()),
-            _ => None,
+        if !self.ssh {
+            return None;
         }
+        reveal_path(self.selected()?.file_path()?, self.directory.as_deref())
     }
 
     pub fn instructions(&self) -> String {
@@ -73,9 +73,17 @@ impl Hints {
                 format!("Enter copy · R reveal in SFTP · Esc cancel   {path}")
             }
             Some(Target::Path(path)) => format!("Enter copy · Esc cancel   {path}"),
-            None if self.entries.is_empty() => {
-                "No URL or path hints in this pane · Esc close".into()
+            Some(target @ Target::Pattern { name, text }) => {
+                let action = if target.pattern_url().is_some() {
+                    " · O open URL"
+                } else if self.reveal().is_some() {
+                    " · R reveal in SFTP"
+                } else {
+                    ""
+                };
+                format!("{name} · Enter copy{action} · Esc cancel   {text}")
             }
+            None if self.entries.is_empty() => "No matching hints in this pane · Esc close".into(),
             None => format!("Type a hint label · Esc cancel   {}", self.prefix),
         }
     }
@@ -106,8 +114,14 @@ impl TerminalApp {
             return;
         }
         let frame = tab.session.frames.load();
-        let detect = self.appearance.read().unwrap().interaction.detect_urls;
-        let entries = hints::viewport(&frame, detect);
+        let entries = {
+            let settings = self.appearance.read().unwrap();
+            hints::viewport_with_patterns(
+                &frame,
+                settings.interaction.detect_urls,
+                &settings.hint_patterns,
+            )
+        };
         let (ssh, directory) = match &tab.source {
             Source::Ssh(ssh) => (
                 true,
@@ -125,6 +139,9 @@ impl TerminalApp {
             directory,
             message: None,
         });
+        if let Some(inspector) = &mut self.inspection {
+            inspector.clear_pointer();
+        }
         self.keyboard.set_hints(true);
         tab.surface.invalidator.invalidate();
     }
@@ -185,13 +202,19 @@ impl TerminalApp {
         let mut reveal = None;
         match (vk, target) {
             (0x0d, Target::Url(uri)) => Self::open_link(uri),
+            (0x4f, Target::Pattern { .. }) => {
+                let Some(uri) = target.pattern_url() else {
+                    return;
+                };
+                Self::open_link(&uri);
+            }
             (0x0d | 0x43, _) => {
                 if let Err(error) = w11term::clipboard::write(target.text()) {
                     h.message = Some(format!("Copy failed: {error} · Esc close"));
                     return;
                 }
             }
-            (0x52, Target::Path(_)) => {
+            (0x52, _) => {
                 let Some((dir, name)) = h.reveal() else {
                     return;
                 };

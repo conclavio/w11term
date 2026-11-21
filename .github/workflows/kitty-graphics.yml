@@ -24,3 +24,35 @@ jobs:
         with:
           name: kitty-reference
           path: artifacts
+
+  ghostty-reference:
+    name: Ghostty 1.4 graphics reference
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: archlinux:base@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
+    steps:
+      - name: Install the archived Ghostty build and its X11 environment
+        run: |
+          cat > /etc/pacman.d/mirrorlist <<'MIRROR'
+          Server = https://archive.archlinux.org/repos/2026/11/12/$repo/os/$arch
+          MIRROR
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm --needed 'ghostty=1.4.0-1' git dbus ttf-dejavu mesa xorg-server-xvfb xorg-xauth xdotool imagemagick python-pillow
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Capture Ghostty and compare the shared cell samples
+        run: |
+          mkdir -p artifacts
+          pacman -Q ghostty gtk4 mesa xorg-server-xvfb imagemagick python-pillow > artifacts/versions.txt
+          ghostty --version >> artifacts/versions.txt
+          XDG_RUNTIME_DIR=$(mktemp -d)
+          export XDG_RUNTIME_DIR
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' python tests/kitty-reference.py artifacts --terminal ghostty
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: ghostty-reference
+          path: artifacts

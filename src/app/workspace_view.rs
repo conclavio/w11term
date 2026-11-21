@@ -1,15 +1,63 @@
 use super::*;
-use w11term::workspace::{SavedLayout, SavedSource, Workspace, WorkspaceStore};
+use w11term::workspace::{SavedLayout, SavedSource, SshStartup, Workspace, WorkspaceStore};
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {
     name: String,
     names: Vec<String>,
     status: String,
+    startup: Option<StartupEditor>,
+}
+
+struct StartupEditor {
+    pane: TabId,
+    destination: String,
+    fields: Rc<RefCell<StartupFields>>,
+    directory_changed: Callback<String>,
+    command_changed: Callback<String>,
+    apply: Callback<()>,
+}
+
+#[derive(Default)]
+struct StartupFields {
+    directory: String,
+    command: String,
+}
+
+impl StartupFields {
+    fn description(&self) -> String {
+        match (self.directory.is_empty(), self.command.is_empty()) {
+            (true, true) => "Open the profile’s default shell".into(),
+            (false, true) => format!("Open an interactive shell in {}", self.directory),
+            (true, false) => format!("Run {}", self.command),
+            (false, false) => format!("Run {} in {}", self.command, self.directory),
+        }
+    }
+}
+
+impl StartupEditor {
+    fn new(pane: TabId, destination: String, fields: StartupFields, apply: Callback<()>) -> Self {
+        let fields = Rc::new(RefCell::new(fields));
+        let directory = Rc::clone(&fields);
+        let command = Rc::clone(&fields);
+        // Keep both subscriptions alive throughout the edit. Rebuilding them after
+        // one change can retire the adjacent field's queued native TextChanged.
+        Self {
+            pane,
+            destination,
+            directory_changed: Callback::new(move |value| directory.borrow_mut().directory = value),
+            command_changed: Callback::new(move |value| command.borrow_mut().command = value),
+            fields,
+            apply,
+        }
+    }
 }
 
 pub enum WorkspaceAction {
     Show,
+    ConfigureStartup,
+    ApplyStartup(TabId),
+    CancelStartup(TabId),
     Name(TabId, String),
     Save(TabId),
     Open(TabId, String),
@@ -22,6 +70,89 @@ impl TerminalApp {
         context: &ComponentContext<Self>,
     ) {
         match action {
+            WorkspaceAction::ConfigureStartup => {
+                let Some(pane) = self.tabs.active_id() else {
+                    return;
+                };
+                let Some(AppTab {
+                    page: Page::Terminal(live),
+                    ..
+                }) = self.tabs.get(pane)
+                else {
+                    return;
+                };
+                if !matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush)
+                {
+                    return;
+                }
+                let destination = source_label(&live.source);
+                let fields = live
+                    .startup
+                    .as_ref()
+                    .map(|s| StartupFields {
+                        directory: s.directory.clone(),
+                        command: s.command.clone(),
+                    })
+                    .unwrap_or_default();
+                self.workspace_action(WorkspaceAction::Show, context);
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(page) = self.workspace_page_mut(id)
+                {
+                    let apply = context
+                        .sender()
+                        .callback(move |_| Message::Workspace(WorkspaceAction::ApplyStartup(id)));
+                    page.status.clear();
+                    page.startup = Some(StartupEditor::new(pane, destination, fields, apply));
+                }
+            }
+            WorkspaceAction::CancelStartup(id) => {
+                if let Some(page) = self.workspace_page_mut(id) {
+                    page.startup = None;
+                    page.status.clear();
+                }
+            }
+            WorkspaceAction::ApplyStartup(id) => {
+                let Some(draft) = self.workspace_page_mut(id).and_then(|p| p.startup.take()) else {
+                    return;
+                };
+                let result = (|| -> anyhow::Result<()> {
+                    let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.get_mut(draft.pane)
+                    else {
+                        anyhow::bail!("The SSH pane was closed")
+                    };
+                    let Source::Ssh(ssh) = &live.source else {
+                        anyhow::bail!("The pane requires SSH")
+                    };
+                    let fields = draft.fields.borrow();
+                    live.startup = if fields.directory.is_empty() && fields.command.is_empty() {
+                        None
+                    } else {
+                        Some(Box::new(SshStartup::new(
+                            ssh,
+                            fields.directory.clone(),
+                            fields.command.clone(),
+                        )?))
+                    };
+                    Ok(())
+                })();
+                if let Some(page) = self.workspace_page_mut(id) {
+                    match result {
+                        Ok(()) => {
+                            page.status = format!(
+                                "On reopen · {}. Save or update the workspace to keep this setting.",
+                                draft.fields.borrow().description()
+                            );
+                        }
+                        Err(error) => {
+                            page.status = error.to_string();
+                            page.startup = Some(draft);
+                        }
+                    }
+                }
+            }
             WorkspaceAction::Show => {
                 let page = self
                     .tabs
@@ -41,6 +172,7 @@ impl TerminalApp {
                     id
                 };
                 if let Some(page) = self.workspace_page_mut(id) {
+                    page.startup = None;
                     match WorkspaceStore::open().and_then(|store| store.load()) {
                         Ok(catalog) => page.names = catalog.into_keys().collect(),
                         Err(error) => page.status = format!("{error:#}"),
@@ -147,6 +279,12 @@ impl TerminalApp {
             } else {
                 SavedSource::capture(&live.source, live.profile_name.as_deref())?
             };
+            if let Some(launch) = live.startup.as_deref() {
+                return Ok(SavedSource::Startup {
+                    connection: Box::new(source),
+                    launch: launch.clone(),
+                });
+            }
             source.with_session(
                 live.session
                     .durable_state()
@@ -161,6 +299,57 @@ impl TerminalApp {
         page: &WorkspacePage,
         context: &ViewContext<Self>,
     ) -> View {
+        if let Some(editor) = &page.startup {
+            let fields = editor.fields.borrow();
+            let directory = TextBox::new()
+                .automation_name("Remote starting directory")
+                .text(&fields.directory)
+                .placeholder_text("/home/me/project")
+                .on_text_changed(editor.directory_changed.clone());
+            let command = TextBox::new()
+                .automation_name("Remote startup command")
+                .text(&fields.command)
+                .placeholder_text("tail -f build.log")
+                .on_text_changed(editor.command_changed.clone());
+            let buttons = StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    Button::new()
+                        .on_click(editor.apply.clone())
+                        .content("Apply to pane"),
+                    Button::new()
+                        .on_click(context.callback(move |_| {
+                            Message::Workspace(WorkspaceAction::CancelStartup(id))
+                        }))
+                        .content("Cancel"),
+                ));
+            let instructions = "These values apply when you next open this pane from a saved workspace. Leave both empty for the default shell.";
+            let panel = StackPanel::new()
+                .margin(32.0)
+                .spacing(10.0)
+                .max_width(600.0)
+                .children((
+                    TextBlock::new()
+                        .text(format!("Workspace startup · {}", editor.destination))
+                        .font_size(22.0),
+                    TextBlock::new()
+                        .text(instructions)
+                        .text_wrapping(TextWrapping::Wrap),
+                    TextBlock::new().text("Remote starting directory"),
+                    directory,
+                    TextBlock::new().text("Remote command"),
+                    command,
+                    TextBlock::new()
+                        .text(format!("On reopen · {}", fields.description()))
+                        .text_wrapping(TextWrapping::Wrap),
+                    buttons,
+                    TextBlock::new()
+                        .text(&page.status)
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            return ScrollViewer::new().content(panel);
+        }
         let name = page.name.trim();
         let save_label = if page.names.iter().any(|entry| entry == name) {
             "Update saved workspace"
@@ -264,6 +453,19 @@ pub(super) fn append_resolved_workspace(
                 osc52,
                 saved.session().cloned(),
             );
+        }
+        if let (SavedSource::Startup { launch, .. }, Source::Ssh(options)) = (saved, &source) {
+            let session = Session::start_workspace_ssh(
+                options.clone(),
+                TerminalSize::default(),
+                osc52,
+                launch.clone(),
+            );
+            let mut tab = live_tab_for_session(label, source, session).with_profile(profile_name);
+            if let Page::Terminal(live) = &mut tab.page {
+                live.startup = Some(Box::new(launch.clone()));
+            }
+            return tab;
         }
         live_tab_sized(
             label,
