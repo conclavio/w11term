@@ -7,6 +7,7 @@ use std::{
         ffi::OsStrExt,
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
+    path::Path,
 };
 use wezterm_term::TerminalSize;
 use windows::{
@@ -106,6 +107,47 @@ fn argument(line: &mut Vec<u16>, arg: &OsStr) {
     line.extend(std::iter::repeat_n(slash, slashes * 2));
     line.push(quote);
 }
+
+fn command_line(options: &LocalOptions, host_exe: Option<&Path>) -> Result<Vec<u16>> {
+    let mut cmd = Vec::new();
+    argument(&mut cmd, options.executable.as_os_str());
+    let mut append = |arg: &OsStr| {
+        cmd.push(u16::from(b' '));
+        argument(&mut cmd, arg);
+    };
+    for arg in &options.args {
+        append(OsStr::new(arg));
+    }
+    if options.powershell_integration
+        && LocalOptions::supports_powershell_integration(&options.executable, &options.args)
+    {
+        let script = host_exe.map(|exe| exe.with_file_name("shell-integration.ps1"));
+        if let Some(script) = script.filter(|path| path.is_absolute() && path.is_file()) {
+            if !options
+                .args
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("-NoExit"))
+            {
+                append(OsStr::new("-NoExit"));
+            }
+            // A literal file argument leaves signing and zone checks to PowerShell
+            // and never interprets characters in the install path as commands.
+            append(OsStr::new("-File"));
+            append(script.as_os_str());
+        } else {
+            log::warn!(
+                "PowerShell integration script missing beside w11term; starting the ordinary shell"
+            );
+        }
+    }
+    cmd.push(0);
+    ensure!(
+        cmd.len() <= 32767,
+        "local command line exceeds the Windows limit"
+    );
+    Ok(cmd)
+}
+
 pub(super) struct Launch {
     // If an aborted startup future drops Launch before the reader starts, the
     // output pipe and private job must close before ClosePseudoConsole.
@@ -126,17 +168,7 @@ impl Launch {
                 .any(|c| c == u16::from(b'"')),
             "invalid quote in local executable path"
         );
-        let mut cmd = Vec::new();
-        argument(&mut cmd, options.executable.as_os_str());
-        for arg in &options.args {
-            cmd.push(u16::from(b' '));
-            argument(&mut cmd, OsStr::new(arg));
-        }
-        cmd.push(0);
-        ensure!(
-            cmd.len() <= 32767,
-            "local command line exceeds the Windows limit"
-        );
+        let mut cmd = command_line(options, std::env::current_exe().ok().as_deref())?;
         let cwd = options
             .cwd
             .as_ref()
@@ -218,5 +250,52 @@ impl Launch {
                 process: OwnedHandle::from_raw_handle(child.hProcess.0),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn powershell_startup_preserves_argv_and_uses_only_the_installed_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let install = temp.path().join("w11term's $dir [x] & tools");
+        std::fs::create_dir(&install).unwrap();
+        let exe = install.join("w11term.exe");
+        let script = install.join("shell-integration.ps1");
+        let mut shell = LocalOptions {
+            executable: "pwsh.exe".into(),
+            args: vec!["-nOlOgO".into()],
+            cwd: None,
+            powershell_integration: true,
+        };
+        let line = |shell: &LocalOptions, exe: Option<&Path>| {
+            let utf16 = command_line(shell, exe).unwrap();
+            String::from_utf16(utf16.strip_suffix(&[0]).unwrap()).unwrap()
+        };
+        let baseline = r#""pwsh.exe" "-nOlOgO""#;
+        assert_eq!(line(&shell, None), baseline);
+        assert_eq!(line(&shell, Some(&exe)), baseline);
+
+        std::fs::write(&script, "# fixture").unwrap();
+        let suffix = format!(r#""-File" "{}""#, script.display());
+        assert_eq!(
+            line(&shell, Some(&exe)),
+            format!(r#"{baseline} "-NoExit" {suffix}"#)
+        );
+        shell.args.push("-nOExIt".into());
+        assert_eq!(
+            line(&shell, Some(&exe)),
+            format!(r#"{baseline} "-nOExIt" {suffix}"#)
+        );
+        shell.powershell_integration = false;
+        assert_eq!(line(&shell, Some(&exe)), format!(r#"{baseline} "-nOExIt""#));
+        shell.powershell_integration = true;
+        shell.args.extend(["-Command".into(), "exit 5".into()]);
+        assert_eq!(
+            line(&shell, Some(&exe)),
+            format!(r#"{baseline} "-nOExIt" "-Command" "exit 5""#)
+        );
     }
 }

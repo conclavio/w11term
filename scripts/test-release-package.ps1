@@ -20,6 +20,9 @@ $pane = $null
 try {
     [void][IO.Directory]::CreateDirectory($state)
     [IO.Compression.ZipFile]::ExtractToDirectory($zip, $app)
+    $hook = Get-FileHash -LiteralPath (Join-Path $app 'shell-integration.ps1') -Algorithm SHA256
+    $expectedHook = Get-FileHash -LiteralPath (Join-Path $PSScriptRoot '../src/conpty/shell-integration.ps1') -Algorithm SHA256
+    if ($hook.Hash -ne $expectedHook.Hash) { throw 'The packaged PowerShell integration script differs from this release.' }
     $env:LOCALAPPDATA = $state
     $env:W11TERM_DATA_DIR = Join-Path $state 'app'
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'

@@ -52,6 +52,21 @@ async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "enables PowerShell shell integration in Settings and observes a real command beside SSH"]
+async fn native_powershell_shell_integration_records_history_and_completion() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("powershell-integration-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(trace).unwrap(), b"neighbor-ok");
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "keeps an open native tab menu actionable through SSH progress repaints"]
 async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
     let mut expected = Vec::new();

@@ -808,6 +808,7 @@ mod tests {
             executable: "powershell.exe".into(),
             args: vec!["-NoProfile".into()],
             cwd: Some(dir.path().to_owned()),
+            powershell_integration: true,
         };
         let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
         let mut layout = Layout::Leaf(41);
@@ -837,6 +838,7 @@ mod tests {
             shell: crate::options::LocalOptions {
                 executable: exe.into(),
                 cwd: Some(cwd.into()),
+                powershell_integration: false,
                 args: Vec::new(),
             },
         };

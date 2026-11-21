@@ -121,6 +121,7 @@ impl Fixture {
             executable: std::env::current_exe()?,
             args: child_args("native_child"),
             cwd: Some(cwd.path().into()),
+            powershell_integration: false,
         };
         let (input, rx) = mpsc::unbounded_channel();
         let (tx, output) = mpsc::channel(3);
@@ -249,6 +250,7 @@ async fn missing_executable_returns_a_launch_error_and_releases_endpoints() -> R
         executable: dir.path().join("missing-w11term-fixture.exe"),
         args: vec![],
         cwd: None,
+        powershell_integration: false,
     };
     let (_input, rx) = mpsc::unbounded_channel();
     let (tx, mut output) = mpsc::channel(1);
@@ -266,6 +268,7 @@ async fn failed_local_launch_offers_one_fresh_restart_per_termination() -> Resul
         executable: dir.path().join("missing-w11term-fixture.exe"),
         args: vec![],
         cwd: None,
+        powershell_integration: false,
     };
     let pane = crate::session::Session::start(crate::options::Source::Local(options));
     let mut cursor = 0;

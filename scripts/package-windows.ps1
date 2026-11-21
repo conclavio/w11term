@@ -34,7 +34,7 @@ function Add-File([string] $path, [string] $name) {
 try {
     $archive = [IO.Compression.ZipFile]::Open($partial, 'Create')
     try {
-        foreach ($name in 'w11term.exe', 'w11term-cli.exe', 'Microsoft.Web.WebView2.Core.dll') {
+        foreach ($name in 'w11term.exe', 'w11term-cli.exe', 'Microsoft.Web.WebView2.Core.dll', 'shell-integration.ps1') {
             Add-File (Join-Path $binaries $name) $name
         }
         $runtime = [IO.Compression.ZipFile]::OpenRead($msix)

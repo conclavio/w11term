@@ -871,6 +871,7 @@ mod failure_tests {
                 executable: "pwsh".into(),
                 args: Vec::new(),
                 cwd: None,
+                powershell_integration: false,
             }
         )));
         assert!(!can_watch_commands(&Source::Demo));
