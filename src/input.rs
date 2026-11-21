@@ -98,6 +98,18 @@ struct WheelPanes {
 }
 
 impl WheelPanes {
+    fn swapped(&mut self, [first, second]: [u64; 2]) {
+        let replacement = match self.hovered {
+            Some(id) if id == first => second,
+            Some(id) if id == second => first,
+            _ => return,
+        };
+        self.hovered = self
+            .visible
+            .contains_key(&replacement)
+            .then_some(replacement);
+    }
+
     fn replace(
         &mut self,
         panes: impl IntoIterator<Item = (u64, mpsc::UnboundedSender<Command>, FrameStore)>,
@@ -134,6 +146,7 @@ pub enum Shortcut {
     RememberWindow,
     BeginResize,
     TaskbarCreated,
+    CaretPresentationChanged,
     NextTab,
     PreviousTab,
     NewTab,
@@ -143,6 +156,7 @@ pub enum Shortcut {
     SplitBelow,
     FocusPane(Direction),
     ResizePane(Direction),
+    SwapPane(Direction),
     ZoomPane,
     ClosePane,
     Select(usize),
@@ -160,6 +174,7 @@ pub enum Shortcut {
     FindClose,
     CommandPalette,
     PanePicker,
+    FindAllPanes,
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
@@ -237,6 +252,19 @@ impl Drop for ThreadHooks {
 }
 
 impl KeyboardBridge {
+    pub fn terminal_focused(&self, sender: &mpsc::UnboundedSender<Command>) -> bool {
+        let _native = self.scope.enter();
+        with_input(|input| {
+            input.borrow().as_ref().is_some_and(|state| {
+                window::visible()
+                    && state.terminal_focused()
+                    && state
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.sender.same_channel(sender))
+            })
+        })
+    }
     pub fn install(shortcut: impl Fn(Shortcut) + 'static) -> windows::core::Result<Self> {
         let scope = WindowScope::default();
         let _guard = scope.enter();
@@ -309,6 +337,14 @@ impl KeyboardBridge {
                 && state.wheel_panes.visible.contains_key(&id)
             {
                 state.wheel_panes.hovered = Some(id);
+            }
+        });
+    }
+    pub fn panes_swapped(&self, pair: [u64; 2]) {
+        let _native = self.scope.enter();
+        with_input_mut(|input| {
+            if let Some(state) = input.as_mut() {
+                state.wheel_panes.swapped(pair);
             }
         });
     }
@@ -662,7 +698,15 @@ unsafe extern "system" fn window_proc(
     let taskbar_created = message != 0 && message == *TASKBAR_CREATED;
     if !matches!(
         message,
-        WM_ACTIVATE | WM_CLOSE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_SIZING | WM_NCDESTROY
+        WM_ACTIVATE
+            | WM_SETTINGCHANGE
+            | WM_SIZE
+            | WM_WINDOWPOSCHANGED
+            | WM_CLOSE
+            | WM_ENTERSIZEMOVE
+            | WM_EXITSIZEMOVE
+            | WM_SIZING
+            | WM_NCDESTROY
     ) && !taskbar_created
     {
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
@@ -671,15 +715,6 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     };
     let _guard = scope.enter();
-    if taskbar_created {
-        with_input(|s| {
-            if let Ok(s) = s.try_borrow()
-                && let Some(s) = s.as_ref()
-            {
-                (s.shortcut)(Shortcut::TaskbarCreated);
-            }
-        });
-    }
     if message == WM_ACTIVATE {
         window::activated((wparam.0 & 0xffff) != WA_INACTIVE as usize);
     }
@@ -705,6 +740,21 @@ unsafe extern "system" fn window_proc(
         });
     }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    let visibility_changed =
+        matches!(message, WM_SIZE | WM_WINDOWPOSCHANGED) && scope.refresh_visibility(hwnd);
+    if taskbar_created || message == WM_SETTINGCHANGE || visibility_changed {
+        with_input(|s| {
+            if let Ok(s) = s.try_borrow()
+                && let Some(s) = s.as_ref()
+            {
+                (s.shortcut)(if taskbar_created {
+                    Shortcut::TaskbarCreated
+                } else {
+                    Shortcut::CaretPresentationChanged
+                });
+            }
+        });
+    }
     if matches!(message, WM_EXITSIZEMOVE | WM_CLOSE) {
         with_input(|s| {
             if let Ok(s) = s.try_borrow()
@@ -983,16 +1033,17 @@ impl State {
         self.report_focus();
     }
 
+    fn terminal_focused(&self) -> bool {
+        window::active()
+            && !self.search
+            && !self.modal
+            && !self.switcher
+            && self.picker.is_none()
+            && self.local_mode.is_none()
+    }
     fn report_focus(&self) {
         if let Some(target) = &self.target {
-            let _ = target.sender.send(Command::Focus(
-                window::active()
-                    && !self.search
-                    && !self.modal
-                    && !self.switcher
-                    && self.picker.is_none()
-                    && self.local_mode.is_none(),
-            ));
+            let _ = target.sender.send(Command::Focus(self.terminal_focused()));
         }
     }
 
@@ -1262,6 +1313,7 @@ impl State {
                         shortcut,
                         Shortcut::CommandPalette
                             | Shortcut::PanePicker
+                            | Shortcut::FindAllPanes
                             | Shortcut::MovePaneToExistingTab
                     ) {
                         self.picker = Some(if shortcut == Shortcut::CommandPalette {
@@ -1541,6 +1593,10 @@ impl From<Action> for Shortcut {
             Action::ResizeRight => Self::ResizePane(Direction::Right),
             Action::ResizeUp => Self::ResizePane(Direction::Up),
             Action::ResizeDown => Self::ResizePane(Direction::Down),
+            Action::SwapPaneLeft => Self::SwapPane(Direction::Left),
+            Action::SwapPaneRight => Self::SwapPane(Direction::Right),
+            Action::SwapPaneUp => Self::SwapPane(Direction::Up),
+            Action::SwapPaneDown => Self::SwapPane(Direction::Down),
             Action::SplitRight => Self::SplitRight,
             Action::SplitBelow => Self::SplitBelow,
             Action::ZoomPane => Self::ZoomPane,
@@ -1550,6 +1606,7 @@ impl From<Action> for Shortcut {
             Action::Workspaces => Self::Workspaces,
             Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
+            Action::FindAllPanes => Self::FindAllPanes,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
             Action::NextTab => Self::NextTab,
@@ -1968,6 +2025,15 @@ mod tests {
         assert_eq!(wheel_steps(panes.target().unwrap().1, 60), 1);
         panes.hovered = Some(6);
         assert_eq!(wheel_steps(panes.target().unwrap().1, 60), 1);
+
+        // Swapping exchanges the panes under a stationary pointer. Fractional
+        // deltas stay with their sessions; swapping elsewhere leaves hover alone.
+        panes.swapped([5, 6]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&left));
+        panes.swapped([6, 7]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&left));
+        panes.swapped([6, 5]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&right));
 
         panes.replace([(5, left.clone(), lab.frames.clone())]);
         assert_eq!(panes.hovered, None);

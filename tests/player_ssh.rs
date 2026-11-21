@@ -690,7 +690,15 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
         .input
         .send(TransportInput::Raw(b"MUST_NOT_REPLAY".to_vec(), reply))
         .unwrap();
-    assert!(response.await.unwrap().unwrap_err().contains("not queued"));
+    let (reply, clipboard_response) = oneshot::channel();
+    client
+        .input
+        .send(TransportInput::Clipboard {
+            connection: 1,
+            bytes: b"OFFLINE_PASTE".to_vec(),
+            reply,
+        })
+        .unwrap();
     client
         .input
         .send(TransportInput::Resize(wezterm_term::TerminalSize {
@@ -699,12 +707,41 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
             ..Default::default()
         }))
         .unwrap();
+    assert!(response.await.unwrap().unwrap_err().contains("not queued"));
+    assert!(clipboard_response.await.unwrap().is_err());
     connected(&mut client, 2).await;
     assert!(prompts.current().is_none());
-    let mut observations = Vec::new();
-    while let Ok(event) = seen.try_recv() {
-        observations.push(event);
+    // The terminal actor may have approved the paste before the reconnect,
+    // but its queued transport message now reaches the replacement shell.
+    for (generation, paste, accepted) in [(1, "STALE_PASTE", false), (2, "CURRENT_PASTE", true)] {
+        let (reply, response) = oneshot::channel();
+        client
+            .input
+            .send(TransportInput::Clipboard {
+                connection: generation,
+                bytes: paste.as_bytes().into(),
+                reply,
+            })
+            .unwrap();
+        assert_eq!(response.await.unwrap().is_ok(), accepted);
     }
+    client
+        .input
+        .send(TransportInput::Data(b"quit".to_vec()))
+        .unwrap();
+    let mut observations = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = seen.recv().await {
+            let arrived = event == Seen::Data(b"quit".to_vec());
+            observations.push(event);
+            if arrived {
+                return;
+            }
+        }
+        panic!("SSH fixture ended before the last input arrived");
+    })
+    .await
+    .unwrap();
     assert_eq!(
         observations
             .iter()
@@ -721,10 +758,10 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
         2
     );
     assert!(!observations.contains(&Seen::Data(b"MUST_NOT_REPLAY".to_vec())));
-    client
-        .input
-        .send(TransportInput::Data(b"quit".to_vec()))
-        .unwrap();
+    assert!(!observations.contains(&Seen::Data(b"OFFLINE_PASTE".to_vec())));
+    assert!(!observations.contains(&Seen::Data(b"STALE_PASTE".to_vec())));
+    let paste = Seen::Data(b"CURRENT_PASTE".to_vec());
+    assert_eq!(observations.iter().filter(|e| **e == paste).count(), 1);
     assert!(
         tokio::time::timeout(Duration::from_secs(3), client.task)
             .await
