@@ -26,6 +26,7 @@ pub enum Command {
     Authenticate(crate::options::Authentication),
     Events(tokio::sync::oneshot::Sender<crate::events::Events>),
     Frames(tokio::sync::oneshot::Sender<FrameStore>),
+    Inspect(bool),
     Sftp(crate::sftp::Job),
     Key {
         key: KeyCode,
@@ -389,6 +390,7 @@ async fn run(
     let mut search_refresh = tokio::time::Instant::now();
     let mut connection_generation = 0;
     let mut recorder: Option<crate::recorder::Recorder> = None;
+    let mut inspecting = false;
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
         if let Some(version) = pending_pack.next(
@@ -433,6 +435,9 @@ async fn run(
                 connection: connection_generation,
             },
         );
+        if inspecting {
+            frames.set_inspection(Some(terminal::TerminalModes::read(&terminal)));
+        }
         let animation_deadline = presentation.animation_deadline(&terminal);
         tokio::select! {
             _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if animation_deadline.is_some() => {
@@ -466,6 +471,11 @@ async fn run(
                     Some(Command::Authenticate(auth))=>{let _=writer.send(TransportInput::Authenticate(auth));Ok(())},
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
+                    Some(Command::Inspect(enabled))=>{
+                        inspecting=enabled;
+                        if !enabled { frames.set_inspection(None); }
+                        Ok(())
+                    },
                     Some(Command::Sftp(job)) => {
                         if is_ssh {
                             if let Err(error) = writer.send(TransportInput::Sftp(job))

@@ -121,6 +121,61 @@ async fn no_op_input_and_control_queries_do_not_publish_frames() {
 }
 
 #[tokio::test]
+async fn inspector_reports_parser_modes_while_rendered_output_is_held() {
+    use termwiz::input::KeyboardEncoding;
+    use wezterm_input_types::KittyKeyboardFlags;
+    let session = Session::start(Source::Demo);
+    let old = feed(&session, "committed").await;
+    session.input.send(Command::Inspect(true)).unwrap();
+    capture(&session).await;
+    let initial = session.frames.inspection().unwrap();
+    assert_eq!((initial.cols, initial.rows), (old.size.cols, old.size.rows));
+    assert!(!initial.alternate && !initial.synchronized && !initial.bracketed_paste);
+    assert_eq!(initial.keyboard, KeyboardEncoding::Xterm);
+
+    let pending = feed(
+        &session,
+        "\x1b[?2026h\x1b[?1049h\x1b[?1002;1006;2004h\x1b[>3uprivate update",
+    )
+    .await;
+    assert_eq!(pending.generation, old.generation);
+    let active = session.frames.inspection().unwrap();
+    assert!(active.synchronized && active.alternate && active.bracketed_paste && active.mouse_drag);
+    assert!(!active.mouse_click && !active.mouse_motion);
+    assert_eq!(active.mouse_encoding, wezterm_term::MouseEncoding::SGR);
+    assert_eq!(
+        active.keyboard,
+        KeyboardEncoding::Kitty(KittyKeyboardFlags::from_bits_truncate(3))
+    );
+    assert_eq!(text(&session.frames.load()), text(&old));
+
+    // Let the engine's existing synchronized-output watchdog release the batch.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    session
+        .frames
+        .wait_for_view(old.generation, Some(Some(active)), || {
+            std::time::Instant::now() >= deadline
+        });
+    capture(&session).await;
+    assert!(!session.frames.inspection().unwrap().synchronized);
+    assert!(text(&session.frames.load()).contains("private update"));
+    feed(&session, "\x1b[?1049l\x1b[?1002;1006;2004l").await;
+    assert_eq!(session.frames.inspection().unwrap(), initial);
+    let resized = TerminalSize {
+        cols: 99,
+        rows: 36,
+        ..old.size
+    };
+    session.input.send(Command::Resize(resized)).unwrap();
+    capture(&session).await;
+    let modes = session.frames.inspection().unwrap();
+    assert_eq!((modes.cols, modes.rows), (99, 36));
+    session.input.send(Command::Inspect(false)).unwrap();
+    feed(&session, "\x1b[?2004h").await;
+    assert!(session.frames.inspection().is_none());
+}
+
+#[tokio::test]
 async fn same_read_boundaries_preserve_completed_frames_and_pending_prefix() {
     let session = Session::start(Source::Demo);
     feed(&session, "old").await;

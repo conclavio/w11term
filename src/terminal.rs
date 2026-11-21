@@ -643,22 +643,34 @@ impl Snapshot {
 }
 
 /// Only an immutable frame crosses onto the UI thread. Output is never queued as frames.
+mod modes;
+pub use modes::TerminalModes;
+
 #[derive(Clone, Debug)]
-pub struct FrameStore(Arc<(Mutex<Arc<Snapshot>>, Condvar, tokio::sync::Notify)>);
+pub struct FrameStore(Arc<(Mutex<ViewState>, Condvar, tokio::sync::Notify)>);
+
+#[derive(Debug)]
+struct ViewState {
+    frame: Arc<Snapshot>,
+    inspection: Option<TerminalModes>,
+}
 
 impl FrameStore {
     pub fn new(frame: Snapshot) -> Self {
         Self(Arc::new((
-            Mutex::new(Arc::new(frame)),
+            Mutex::new(ViewState {
+                frame: Arc::new(frame),
+                inspection: None,
+            }),
             Condvar::new(),
             tokio::sync::Notify::new(),
         )))
     }
     pub fn load(&self) -> Arc<Snapshot> {
-        Arc::clone(&self.0.0.lock().unwrap())
+        self.0.0.lock().unwrap().frame.clone()
     }
     pub fn publish(&self, frame: Snapshot) {
-        *self.0.0.lock().unwrap() = Arc::new(frame);
+        self.0.0.lock().unwrap().frame = Arc::new(frame);
         self.0.1.notify_all();
         self.0.2.notify_waiters();
     }
@@ -671,13 +683,37 @@ impl FrameStore {
         }
         tokio::time::timeout_at(deadline, changed).await.is_ok()
     }
+    pub fn inspection(&self) -> Option<TerminalModes> {
+        self.0.0.lock().unwrap().inspection
+    }
+    pub(crate) fn set_inspection(&self, modes: Option<TerminalModes>) {
+        let mut state = self.0.0.lock().unwrap();
+        if state.inspection != modes {
+            state.inspection = modes;
+            // Wake the native watcher only. Control consumers await committed frames.
+            self.0.1.notify_all();
+        }
+    }
     pub fn wait_for_change(&self, generation: u64, cancelled: impl Fn() -> bool) {
-        let mut frame = self.0.0.lock().unwrap();
-        while frame.generation == generation && !cancelled() {
-            frame = self
+        self.wait_for_view(generation, None, cancelled);
+    }
+    /// Wait on the frame and optionally also the last observed inspector value.
+    /// An open inspector may still be waiting for its initial mode report.
+    pub fn wait_for_view(
+        &self,
+        generation: u64,
+        inspected: Option<Option<TerminalModes>>,
+        cancelled: impl Fn() -> bool,
+    ) {
+        let mut state = self.0.0.lock().unwrap();
+        while state.frame.generation == generation
+            && inspected.is_none_or(|previous| previous == state.inspection)
+            && !cancelled()
+        {
+            state = self
                 .0
                 .1
-                .wait_timeout(frame, Duration::from_millis(250))
+                .wait_timeout(state, Duration::from_millis(250))
                 .unwrap()
                 .0;
         }

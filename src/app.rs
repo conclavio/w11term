@@ -38,6 +38,7 @@ mod accessibility_smoke;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
+mod inspector;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
 mod pane_picker;
@@ -49,6 +50,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    observed_frame: u64,
     files: Box<FileDrawer>,
     discovery_page: Option<usize>,
     copy_output_unavailable: Option<&'static str>,
@@ -271,6 +273,7 @@ fn tab_menu_message(label: String) -> Message {
         }
     }
     match label.split(": ").next().unwrap_or(&label) {
+        "Terminal inspector" => Message::ToggleInspector,
         "SFTP files" => Message::Files(FileAction::Toggle),
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
@@ -312,6 +315,8 @@ pub enum Field {
 }
 
 pub struct TerminalApp {
+    show_inspector: bool,
+    inspection: Option<inspector::Inspection>,
     accessible: crate::accessibility::Bridge,
     active_group: Option<TabId>,
     windows: Rc<RefCell<crate::window_state::Windows>>,
@@ -354,6 +359,7 @@ pub struct TerminalApp {
 }
 
 pub enum Message {
+    ToggleInspector,
     PickerQuery(String),
     PickerChoose(u64),
     PickerFocus(u8),
@@ -464,6 +470,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            observed_frame: 0,
             files: Box::default(),
             discovery_page: None,
             copy_output_unavailable: Some("waiting for shell markers"),
@@ -1383,13 +1390,18 @@ impl TerminalApp {
                 continue;
             };
             let frames = tab.session.frames.clone();
-            let generation = frames.load().generation;
+            let generation = tab.observed_frame;
+            let inspected = self
+                .inspection
+                .as_ref()
+                .filter(|inspector| inspector.pane == tab.session.pane_id)
+                .map(|inspector| inspector.modes);
             let epoch = self.watch_epoch;
             self.frame_tasks.insert(
                 id,
                 context.spawn_background_with_rejection(
                     move |cancel| {
-                        frames.wait_for_change(generation, || cancel.is_cancelled());
+                        frames.wait_for_view(generation, inspected, || cancel.is_cancelled());
                         Message::FrameReady(id, epoch)
                     },
                     Message::WatchRejected,
@@ -1399,6 +1411,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.sync_inspector();
         if self.picker.take().is_some() {
             self.keyboard.set_picker(false);
         }
@@ -2081,6 +2094,14 @@ impl TerminalApp {
                     MenuItem::item("workspaces", "Workspaces…"),
                     self.discovery_menu(),
                     state_menu_item(
+                        "inspector",
+                        "Terminal inspector",
+                        self.tabs
+                            .active()
+                            .and_then(AppTab::pane_id)
+                            .map(|_| self.show_inspector),
+                    ),
+                    state_menu_item(
                         "fullscreen",
                         "Fullscreen (F11)",
                         Some(self.windows.borrow().fullscreen()),
@@ -2645,6 +2666,8 @@ impl Component for TerminalApp {
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
             frame_tasks: BTreeMap::new(),
+            show_inspector: false,
+            inspection: None,
             watcher_retry: None,
             watch_epoch: 0,
             default_source: options.source.clone(),
@@ -2740,6 +2763,12 @@ impl Component for TerminalApp {
             self.watch_control(context);
         }
         match message {
+            Message::ToggleInspector => {
+                self.show_inspector = !self.show_inspector;
+                self.sync_inspector();
+                self.cancel_frame_tasks();
+                self.watch_frames(context);
+            }
             Message::CopyLastCommand => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -3317,8 +3346,18 @@ impl Component for TerminalApp {
                         ..
                     }) = self.tabs.get_mut(id)
                     {
-                        tab.error = None;
+                        if let Some(inspector) = &mut self.inspection
+                            && inspector.pane == tab.session.pane_id
+                        {
+                            inspector.refresh(tab.session.frames.inspection());
+                        }
                         let frame = tab.session.frames.load();
+                        if frame.generation == tab.observed_frame {
+                            self.watch_frames(context);
+                            return;
+                        }
+                        tab.observed_frame = frame.generation;
+                        tab.error = None;
                         tab.files.observe_connection(frame.connection_generation);
                         let unavailable = frame.copy_output_unavailable();
                         if tab.copy_output_unavailable != unavailable {
@@ -3976,6 +4015,12 @@ impl Component for TerminalApp {
             ),
             KeyedView::new("content", Border::new().grid_row(1).content(content)),
         ];
+        if let Some(inspection) = &self.inspection {
+            views.push(KeyedView::new(
+                "terminal-inspector",
+                inspection.view(context),
+            ));
+        }
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {
                 page: Page::Terminal(tab),
