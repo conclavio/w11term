@@ -12,6 +12,25 @@ pub(super) struct Grant {
     pub name: String,
     pub path: PathBuf,
     pub identity: String,
+    #[serde(default = "mount_by_default", skip_serializing_if = "is_enabled")]
+    pub auto_mount: bool,
+}
+
+fn mount_by_default() -> bool {
+    true
+}
+fn is_enabled(value: &bool) -> bool {
+    *value
+}
+
+impl Grant {
+    /// A mount-policy change preserves the original consent and live mount.
+    pub fn same_selection(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.path == other.path
+            && self.identity == other.identity
+    }
 }
 
 pub(super) struct Store {
@@ -168,10 +187,21 @@ impl Store {
             ensure!(
                 !grants
                     .iter()
-                    .any(|g| g.name == grant.name && g.id != grant.id),
+                    .any(|g| (g.name == grant.name || g.id == grant.id) && !g.same_selection(grant)),
                 "This shared folder has changed. Reopen Shared folders"
             );
-            grants.retain(|g| g.id != grant.id);
+            grants.retain(|g| !g.same_selection(grant));
+            Ok(())
+        })
+    }
+
+    pub fn set_auto_mount(&self, grant: &Grant, enabled: bool) -> Result<()> {
+        self.edit(|grants| {
+            let saved = grants
+                .iter_mut()
+                .find(|saved| saved.same_selection(grant))
+                .context("This shared folder has changed. Reopen Shared folders")?;
+            saved.auto_mount = enabled;
             Ok(())
         })
     }
@@ -204,8 +234,84 @@ mod tests {
             name: "sprites".into(),
             id: format!("{id:032x}"),
             identity: "ntfs-v1:volume:directory".into(),
+            auto_mount: true,
             path,
         }
+    }
+
+    #[test]
+    fn legacy_grants_mount_by_default_and_the_policy_survives_another_writer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let store = Store::for_profile(&scope, &auth, true)?.unwrap();
+        let first = grant(dir.path().join("first"), 1);
+        std::fs::create_dir_all(store.path.parent().unwrap())?;
+        std::fs::write(
+            &store.path,
+            serde_json::to_vec(&[serde_json::json!({
+                "id": first.id, "name": first.name, "path": first.path, "identity": first.identity
+            })])?,
+        )?;
+        assert_eq!(store.read()?, [first.clone()]);
+        store.set_auto_mount(&first, false)?;
+        let other_writer = Store::inspect(&scope, &auth)?.1.unwrap();
+        let mut second = grant(dir.path().join("second"), 2);
+        second.name = "music".into();
+        other_writer.add(second.clone())?;
+        let grants = store.read()?;
+        assert!(!grants[0].auto_mount && grants[0].same_selection(&first));
+        assert_eq!(grants[1], second);
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&store.path)?)?;
+        assert_eq!(json[0]["auto_mount"], false);
+        assert!(json[1].get("auto_mount").is_none());
+        store.set_auto_mount(&grants[0], true)?;
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&store.path)?)?;
+        assert!(json[0].get("auto_mount").is_none());
+        assert_eq!(other_writer.read()?, [first, second.clone()]);
+        // The captured selection still refers to the same consent after an
+        // independent policy edit; Forget must still remove that selection.
+        other_writer.remove(&grants[0])?;
+        assert_eq!(store.read()?, [second]);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_mount_policy_edits_cannot_change_a_replacement_or_retired_grant() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let store = Store::for_profile(&scope, &auth, true)?.unwrap();
+        let first = grant(dir.path().join("first"), 1);
+        store.add(first.clone())?;
+        for stale in [
+            Grant {
+                name: "different".into(),
+                ..first.clone()
+            },
+            Grant {
+                path: dir.path().join("different"),
+                ..first.clone()
+            },
+            Grant {
+                identity: "ntfs-v1:replacement".into(),
+                ..first.clone()
+            },
+        ] {
+            assert!(store.set_auto_mount(&stale, false).is_err());
+            assert!(store.remove(&stale).is_err());
+        }
+        store.remove(&first)?;
+        let replacement = Grant {
+            id: format!("{:032x}", 2),
+            ..first.clone()
+        };
+        store.add(replacement.clone())?;
+        assert!(store.set_auto_mount(&first, false).is_err());
+        assert_eq!(store.read()?, [replacement.clone()]);
+        let catalog = ProfileStore::new(scope.catalog.clone())?;
+        let (_, profile) = catalog.inspect_catalog(&scope.profile)?;
+        catalog.revoke_folder_permissions(&profile, &scope.store_dir)?;
+        assert!(store.set_auto_mount(&replacement, false).is_err());
+        Ok(())
     }
 
     #[test]
