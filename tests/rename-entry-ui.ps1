@@ -59,7 +59,10 @@ try {
     Click 'Cancel'
     $null = Wait-Until 'cancel kept the originating file' { !(Name-Field) -and (Button 'before.bin') }
 
-    $replace = Find-Element 'Replace existing files' ([System.Windows.Automation.ControlType]::CheckBox)
+    $replace = Wait-Until 'transfer checkbox to re-enable after cancel' {
+        $box = Find-Element 'Replace existing files' ([System.Windows.Automation.ControlType]::CheckBox)
+        if ($box -and $box.Current.IsEnabled) { $box }
+    }
     $replace.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
     $null = Wait-Until 'replace transfers enabled' {
         (Find-Element 'Replace existing files').GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState -eq 'On'
