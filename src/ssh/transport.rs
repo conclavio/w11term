@@ -25,6 +25,8 @@ pub enum Event {
     Status(String),
     SessionListUpdated(String),
     Connected(u64),
+    /// Ordered after the last bytes from this generation and before any retry.
+    Disconnected,
 }
 #[derive(Debug)]
 struct Permanent(String);
@@ -668,6 +670,7 @@ impl Driver {
                     self.generation += 1;
                     let started = tokio::time::Instant::now();
                     let result = run_channel(session, self, program).await;
+                    self.output.send(Event::Disconnected).await?;
                     if let Some(game) = &mut self.game {
                         game.disconnected();
                     }

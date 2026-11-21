@@ -677,6 +677,9 @@ impl<'a> Performer<'a> {
             // reset graphic rendition, erase all positions, move active position to first
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
+                if let Some(handler) = self.alert_handler.as_mut() {
+                    handler.terminal_reset();
+                }
                 self.command_history = Default::default();
                 self.capturing_shell_input = false;
                 self.command_label = None;
@@ -746,6 +749,13 @@ impl<'a> Performer<'a> {
     fn osc_dispatch(&mut self, osc: OperatingSystemCommand) {
         self.pop_tmux_title_state();
         self.flush_print();
+        if let OperatingSystemCommand::FinalTermSemanticPrompt(ref marker) = osc {
+            if !self.is_alt_screen_active() {
+                if let Some(handler) = self.alert_handler.as_mut() {
+                    handler.semantic_prompt(marker);
+                }
+            }
+        }
         match osc {
             OperatingSystemCommand::SetIconNameSun(title)
             | OperatingSystemCommand::SetIconName(title) => {

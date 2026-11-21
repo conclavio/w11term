@@ -461,7 +461,18 @@ async fn split_reconnects_using_its_own_authentication_after_link_loss() {
         Some(connection(&original).await),
     );
     drop(connection(&child).await);
+    send(&child, "\x1b]133;C\x07").await;
+    expect_echo(&child, "old-command-running").await;
+    assert!(child.events.set_command_watch(true));
     send(&child, "drop").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while child.events.command_watch().is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a disconnected pane should cancel its command watch");
+    assert!(!child.events.set_command_watch(true));
     enter_password(&child).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while [&original, &child]
@@ -474,7 +485,17 @@ async fn split_reconnects_using_its_own_authentication_after_link_loss() {
     .await
     .expect("both panes should independently reconnect");
     assert!(original.prompts.current().is_none());
+    assert_eq!(child.events.command_watch(), Some(false));
+    send(&child, "\x1b]133;D;23\x07").await;
     expect_echo(&child, "ready-again").await;
+    assert!(
+        !child
+            .events
+            .since(0)
+            .events
+            .iter()
+            .any(|e| e.kind == "command-finished")
+    );
     drop((child, original));
     server.abort();
 }
