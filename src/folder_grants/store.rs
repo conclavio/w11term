@@ -1,4 +1,5 @@
 use super::*;
+use crate::profiles::{FolderEpoch, FolderGrantGate, ProfileStore};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,41 +14,83 @@ pub(super) struct Grant {
     pub identity: String,
 }
 
-#[derive(Clone)]
-pub(super) struct Store(PathBuf);
+pub(super) struct Store {
+    path: PathBuf,
+    gate: FolderGrantGate,
+    scope: FolderScope,
+    auth: Authority,
+    epoch: FolderEpoch,
+    token: String,
+}
 
 impl Store {
-    pub fn for_profile(scope: &FolderScope, auth: &Authority, issue: bool) -> Result<Option<Self>> {
+    fn catalog(scope: &FolderScope, auth: &Authority) -> Result<ProfileStore> {
         ensure!(
             scope.profile == auth.profile,
             "The profile for this permission changed"
         );
-        let catalog = crate::profiles::ProfileStore::new(scope.catalog.clone())?;
-        let Some(token) = catalog.folder_token(auth, issue)? else {
-            return Ok(None);
-        };
-        let catalog_path =
-            std::fs::canonicalize(catalog.path()).context("Locating the saved profile catalog")?;
+        ProfileStore::new(scope.catalog.clone())
+    }
+    pub fn inspect(scope: &FolderScope, auth: &Authority) -> Result<(FolderEpoch, Option<Self>)> {
+        let catalog = Self::catalog(scope, auth)?;
+        let (epoch, token) = catalog.folder_binding(auth, &scope.store_dir)?;
+        let store = token
+            .map(|token| Self::bound(scope, auth, &epoch, token))
+            .transpose()?;
+        Ok((epoch, store))
+    }
+    pub fn issue(scope: &FolderScope, auth: &Authority, expected: &FolderEpoch) -> Result<Self> {
+        let catalog = Self::catalog(scope, auth)?;
+        let token = catalog.issue_folder_epoch(auth, &scope.store_dir, expected)?;
+        Self::bound(scope, auth, expected, token)
+    }
+    fn bound(
+        scope: &FolderScope,
+        auth: &Authority,
+        epoch: &FolderEpoch,
+        token: String,
+    ) -> Result<Self> {
         let binding = serde_json::to_vec(&(
-            catalog_path,
+            epoch.catalog(),
             &auth.profile,
             &auth.host,
             &auth.user,
             auth.port,
             &auth.fingerprint,
-            token,
+            &token,
         ))?;
         let hash = bytes::Bytes::copy_from_slice(&Sha256::digest(binding));
-        Ok(Some(Self(
-            scope
+        Ok(Self {
+            path: scope
                 .store_dir
                 .join("folder-shares")
                 .join(format!("{hash:x}.json")),
-        )))
+            gate: epoch.gate(&scope.store_dir, &token)?,
+            scope: scope.clone(),
+            auth: auth.clone(),
+            epoch: epoch.clone(),
+            token,
+        })
+    }
+
+    pub fn revocation_gate(&self) -> FolderGrantGate {
+        self.gate.clone()
+    }
+
+    #[cfg(test)]
+    fn for_profile(scope: &FolderScope, auth: &Authority, issue: bool) -> Result<Option<Self>> {
+        let (epoch, store) = Self::inspect(scope, auth)?;
+        if issue && store.is_none() {
+            return Self::issue(scope, auth, &epoch).map(Some);
+        }
+        Ok(store)
     }
 
     pub fn read(&self) -> Result<Vec<Grant>> {
-        let file = match std::fs::File::open(&self.0) {
+        if self.gate.revoked()? {
+            return Ok(Vec::new());
+        }
+        let file = match std::fs::File::open(&self.path) {
             Ok(file) => file,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e).context("Opening saved folder permissions"),
@@ -75,14 +118,23 @@ impl Store {
     }
 
     fn edit(&self, change: impl FnOnce(&mut Vec<Grant>) -> Result<()>) -> Result<()> {
-        let parent = self.0.parent().context("Missing permission directory")?;
+        // Serialize grant writes with offline revocation and token issuance.
+        // Retain the existing peer-specific lock for older profile writers.
+        let catalog = Self::catalog(&self.scope, &self.auth)?;
+        let _catalog_lock = catalog.folder_lock()?;
+        let (epoch, token) = catalog.folder_binding(&self.auth, &self.scope.store_dir)?;
+        ensure!(
+            epoch == self.epoch && token.as_ref() == Some(&self.token),
+            "Folder permissions changed; reopen Shared folders"
+        );
+        let parent = self.path.parent().context("Missing permission directory")?;
         std::fs::create_dir_all(parent)?;
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.0.with_extension("lock"))?;
+            .open(self.path.with_extension("lock"))?;
         lock.try_lock()
             .context("Another window is changing shared folders. Try again")?;
         let mut grants = self.read()?;
@@ -91,7 +143,8 @@ impl Store {
         serde_json::to_writer_pretty(&mut file, &grants)?;
         file.write_all(b"\n")?;
         file.as_file().sync_all()?;
-        file.persist(&self.0).context("Saving folder permission")?;
+        file.persist(&self.path)
+            .context("Saving folder permission")?;
         Ok(())
     }
 
@@ -142,6 +195,7 @@ mod tests {
                 fingerprint: "SHA256:test".into(),
                 pane: 5,
                 generation: 3,
+                epoch: Default::default(),
             },
         )
     }
@@ -265,10 +319,172 @@ mod tests {
         store.add(new.clone())?;
         assert!(store.remove(&old).is_err());
         assert_eq!(store.read()?, vec![new]);
-        std::fs::write(&store.0, b"{")?;
+        std::fs::write(&store.path, b"{")?;
         assert!(store.read().is_err());
         assert!(store.add(old).is_err());
-        assert_eq!(std::fs::read(&store.0)?, b"{");
+        assert_eq!(std::fs::read(&store.path)?, b"{");
+        Ok(())
+    }
+
+    #[test]
+    fn offline_revocation_invalidates_pickers_mounts_and_historical_catalogs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let profiles = ProfileStore::new(scope.catalog.clone())?;
+        let pristine = std::fs::read(&scope.catalog)?;
+        let (before_first, _) = Store::inspect(&scope, &auth)?;
+        // A pre-feature config has an active random token but no consent epoch.
+        let mut legacy: serde_json::Value = serde_json::from_slice(&pristine)?;
+        legacy["profiles"]["test"]["folder_share_id"] = format!("{:032x}", 42).into();
+        let backup_a = serde_json::to_vec(&legacy)?;
+        std::fs::write(&scope.catalog, &backup_a)?;
+        let (epoch_a, a) = Store::inspect(&scope, &auth)?;
+        let a = a.unwrap();
+        a.add(grant(dir.path().join("one"), 1))?;
+        let (_, original) = profiles.inspect_catalog("test")?;
+        let mut changed = original.options.clone();
+        changed.user = "second-account".into();
+        profiles.edit("test", "test", &changed, &original.options)?;
+        let second = Authority {
+            user: changed.user,
+            ..auth.clone()
+        };
+        let epoch_b = Store::inspect(&scope, &second)?.0;
+        let b = Store::issue(&scope, &second, &epoch_b)?;
+        b.add(grant(dir.path().join("two"), 2))?;
+        assert!(
+            profiles
+                .revoke_folder_permissions(&original, &scope.store_dir)
+                .is_err()
+        );
+        assert!(!a.gate.revoked()? && !b.gate.revoked()?);
+        let backup_b = std::fs::read(&scope.catalog)?;
+        let (_, before_revoke) = profiles.inspect_catalog("test")?;
+        let snapshot = profiles.revoke_folder_permissions(&before_revoke, &scope.store_dir)?;
+        assert!(!profiles.has_folder_permissions(&snapshot)?);
+        assert!(a.gate.revoked()? && b.gate.revoked()?);
+        assert!(a.read()?.is_empty() && b.read()?.is_empty());
+        assert!(b.add(grant(dir.path().join("delayed"), 3)).is_err());
+        for (backup, peer, stale) in [
+            (&backup_b, &second, &epoch_b),
+            (&backup_a, &auth, &epoch_a),
+            (&pristine, &auth, &before_first),
+        ] {
+            std::fs::write(&scope.catalog, backup)?;
+            assert!(Store::inspect(&scope, peer)?.1.is_none());
+            assert!(Store::issue(&scope, peer, stale).is_err());
+        }
+        let fresh = Store::inspect(&scope, &auth)?.0;
+        let renewed = Store::issue(&scope, &auth, &fresh)?;
+        assert!(!renewed.gate.revoked()? && renewed.read()?.is_empty());
+        renewed.add(grant(dir.path().join("chosen-again"), 4))?;
+        let (issued, saved) = Store::inspect(&scope, &auth)?;
+        assert_eq!(issued, fresh);
+        assert_eq!(saved.unwrap().read()?[0].id, format!("{:032x}", 4));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_first_consent_reuses_one_grant_namespace() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let (expected, no_store) = Store::inspect(&scope, &auth)?;
+        assert!(no_store.is_none());
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|s| -> Result<()> {
+            let handles = ["game", "admin"].map(|name| {
+                s.spawn({
+                    let (barrier, scope, auth, expected, dir) =
+                        (&barrier, &scope, &auth, &expected, dir.path());
+                    move || -> Result<()> {
+                        barrier.wait();
+                        let store = Store::issue(scope, auth, expected)?;
+                        let mut g = grant(dir.join(name), name.len() as u128);
+                        g.name = name.into();
+                        store.add(g)
+                    }
+                })
+            });
+            for handle in handles {
+                handle.join().unwrap()?;
+            }
+            Ok(())
+        })?;
+        let (epoch, store) = Store::inspect(&scope, &auth)?;
+        assert_eq!(epoch, expected);
+        assert_eq!(store.unwrap().read()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_and_retirement_are_isolated_by_catalog_and_profile() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let first = Store::for_profile(&scope, &auth, true)?.unwrap();
+        let original = ProfileStore::new(scope.catalog.clone())?;
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&scope.catalog)?)?;
+        document["profiles"]["sibling"] = document["profiles"]["test"].clone();
+        std::fs::write(&scope.catalog, serde_json::to_vec(&document)?)?;
+        let copy = FolderScope {
+            catalog: dir.path().join("copy.json"),
+            ..scope.clone()
+        };
+        std::fs::copy(&scope.catalog, &copy.catalog)?;
+        let sibling = Store::for_profile(
+            &FolderScope {
+                profile: "sibling".into(),
+                ..scope.clone()
+            },
+            &Authority {
+                profile: "sibling".into(),
+                ..auth.clone()
+            },
+            true,
+        )?
+        .unwrap();
+        let other = Store::for_profile(&copy, &auth, true)?.unwrap();
+        for store in [&first, &sibling, &other] {
+            store.add(grant(dir.path().join("ok"), 5))?;
+        }
+        let (_, base) = original.inspect_catalog("test")?;
+        assert!(
+            ProfileStore::new(copy.catalog)?
+                .revoke_folder_permissions(&base, &scope.store_dir)
+                .is_err()
+        );
+        document["profiles"]["test"]["extra"] = true.into();
+        std::fs::write(&scope.catalog, serde_json::to_vec(&document)?)?;
+        assert!(
+            original
+                .revoke_folder_permissions(&base, &scope.store_dir)
+                .is_err()
+        );
+        let (_, current) = original.inspect_catalog("test")?;
+        original.revoke_folder_permissions(&current, &scope.store_dir)?;
+        assert!(first.gate.revoked()? && first.read()?.is_empty());
+        for unaffected in [&sibling, &other] {
+            assert!(!unaffected.gate.revoked()? && unaffected.read()?.len() == 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_an_unshared_profile_invalidates_its_pending_picker() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let catalog = ProfileStore::new(scope.catalog.clone())?;
+        let (_, legacy) = catalog.inspect_catalog("test")?;
+        catalog.delete(&legacy)?;
+        catalog.add("test", &legacy.options)?;
+        let (pending, _) = Store::inspect(&scope, &auth)?;
+        let (_, first) = catalog.inspect_catalog("test")?;
+        catalog.delete(&first)?;
+        catalog.add("test", &first.options)?;
+        assert!(Store::issue(&scope, &auth, &pending).is_err());
+        let (current, store) = Store::inspect(&scope, &auth)?;
+        assert!(store.is_none());
+        assert_ne!(pending, current);
         Ok(())
     }
 }

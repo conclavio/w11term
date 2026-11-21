@@ -3,11 +3,15 @@ use crate::options::{Profiles, SshOptions, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
+mod folder_permissions;
+pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileSnapshot {
     pub name: String,
     pub options: SshOptions,
     raw: serde_json::Value,
+    catalog_path: PathBuf,
 }
 
 pub struct ProfileStore {
@@ -15,17 +19,7 @@ pub struct ProfileStore {
 }
 
 const SHARE_TOKEN: &str = "folder_share_id";
-
-fn share_token(entry: &serde_json::Value) -> Result<Option<String>> {
-    let Some(value) = entry.get(SHARE_TOKEN) else {
-        return Ok(None);
-    };
-    let token = value
-        .as_str()
-        .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-        .context("Invalid folder-sharing profile identifier")?;
-    Ok(Some(token.to_owned()))
-}
+const SHARE_EPOCH: &str = "folder_share_epoch";
 
 #[derive(Clone)]
 pub struct LocalProfileSnapshot {
@@ -60,38 +54,6 @@ fn order_after_edit(
 impl ProfileStore {
     pub fn path(&self) -> &std::path::Path {
         &self.path
-    }
-
-    /// The portable profile contains an opaque identifier. Folder paths and
-    /// permissions live in a separate Windows-user store bound to the SSH peer.
-    pub(crate) fn folder_token(
-        &self,
-        authority: &crate::folder_grants::Authority,
-        issue: bool,
-    ) -> Result<Option<String>> {
-        let (_, snapshot) = self.inspect_catalog(&authority.profile)?;
-        authority.check_profile(&snapshot.options)?;
-        let current = share_token(&snapshot.raw)?;
-        if current.is_some() || !issue {
-            return Ok(current);
-        }
-        let mut token = None;
-        self.modify(|profiles, catalog| {
-            let options = catalog
-                .profiles
-                .get(&authority.profile)
-                .context("SSH profile was removed")?;
-            authority.check_profile(options)?;
-            let profile = profiles
-                .get_mut(&authority.profile)
-                .context("SSH profile was removed")?;
-            let key =
-                share_token(profile)?.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>()));
-            profile[SHARE_TOKEN] = key.clone().into();
-            token = Some(key);
-            Ok(None)
-        })?;
-        Ok(token)
     }
 
     pub fn new(path: PathBuf) -> Result<Self> {
@@ -244,6 +206,7 @@ impl ProfileStore {
             name: name.into(),
             options,
             raw: raw["profiles"][name].clone(),
+            catalog_path: std::fs::canonicalize(&self.path)?,
         };
         Ok((catalog, snapshot))
     }
@@ -351,6 +314,12 @@ impl ProfileStore {
                     })
             {
                 object.remove(SHARE_TOKEN);
+                // Distinguish a recreated profile even when its visible options
+                // match a still-open folder picker from the old incarnation.
+                object.insert(
+                    SHARE_EPOCH.into(),
+                    format!("{:032x}", rand::random::<u128>()).into(),
+                );
             }
             let keep_identity = expected
                 .is_some_and(|previous| previous.authentication == options.authentication)
@@ -397,13 +366,7 @@ impl ProfileStore {
         .map(|_| ())
     }
 
-    fn modify(
-        &self,
-        change: impl FnOnce(
-            &mut serde_json::Map<String, serde_json::Value>,
-            &Profiles,
-        ) -> Result<Option<Vec<String>>>,
-    ) -> Result<Profiles> {
+    pub(crate) fn lock(&self) -> Result<std::fs::File> {
         let parent = self
             .path
             .parent()
@@ -419,6 +382,31 @@ impl ProfileStore {
             .open(lock_path)?;
         lock.try_lock()
             .context("Another window is updating profiles; try again")?;
+        Ok(lock)
+    }
+
+    fn modify(
+        &self,
+        change: impl FnOnce(
+            &mut serde_json::Map<String, serde_json::Value>,
+            &Profiles,
+        ) -> Result<Option<Vec<String>>>,
+    ) -> Result<Profiles> {
+        let _lock = self.lock()?;
+        self.modify_locked(change)
+    }
+
+    fn modify_locked(
+        &self,
+        change: impl FnOnce(
+            &mut serde_json::Map<String, serde_json::Value>,
+            &Profiles,
+        ) -> Result<Option<Vec<String>>>,
+    ) -> Result<Profiles> {
+        let parent = self
+            .path
+            .parent()
+            .context("Configuration has no parent directory")?;
         let before = match std::fs::read(&self.path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
