@@ -301,6 +301,21 @@ impl<'a> Performer<'a> {
                         // inverted; there's a note about this in the xterm
                         // ctlseqs docs.
                         match s.data.as_slice() {
+                            b" q" => {
+                                // DECSCUSR: the selector can be sent back to restore this style.
+                                use wezterm_surface::CursorShape::*;
+                                let style = match self.cursor.shape {
+                                    Default => 0,
+                                    BlinkingBlock => 1,
+                                    SteadyBlock => 2,
+                                    BlinkingUnderline => 3,
+                                    SteadyUnderline => 4,
+                                    BlinkingBar => 5,
+                                    SteadyBar => 6,
+                                };
+                                write!(self.writer, "{DCS}1$r{style} q{ST}").ok();
+                                self.writer.flush().ok();
+                            }
                             &[b'"', b'p'] => {
                                 // DECSCL - select conformance level
                                 write!(self.writer, "{}1$r65;1\"p{}", DCS, ST).ok();

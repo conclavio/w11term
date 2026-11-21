@@ -1958,6 +1958,36 @@ mod tests {
     }
 
     #[test]
+    fn cursor_style_status_string_round_trips_every_shape_and_tracks_mode_12() {
+        let (mut terminal, mut replies) = engine();
+        let query = b"\x1bP$q q\x1b\\";
+        terminal.advance_bytes(query);
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0 q\x1b\\");
+        for selector in 0..=6 {
+            terminal.advance_bytes(format!("\x1b[{selector} q"));
+            for &byte in query {
+                terminal.advance_bytes([byte]);
+            }
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1bP1$r{selector} q\x1b\\").as_bytes()
+            );
+        }
+        for (mode, expected) in [("h", 5), ("l", 6)] {
+            terminal.advance_bytes(format!("\x1b[?12{mode}"));
+            terminal.advance_bytes(query);
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1bP1$r{expected} q\x1b\\").as_bytes()
+            );
+        }
+        terminal.advance_bytes(b"\x1bP$q\"p\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r65;1\"p\x1b\\");
+        terminal.advance_bytes(b"\x1bP$qunknown\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
     fn parses_fragmented_utf8_and_control_sequences() {
         let (mut t, _rx) = engine();
         for byte in "\x1b[2J\x1b[Hhello 世界\x1b[31m red\x1b[0m".as_bytes() {
