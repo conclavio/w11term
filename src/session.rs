@@ -78,6 +78,7 @@ fn contain_worker_failure(
 ) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         events.command_stream(false);
+        events.set_progress(wezterm_term::Progress::None);
         // Never resume a possibly inconsistent terminal engine after unwinding.
         let mut frame = (*frames.load()).clone();
         frame.generation += 1;
@@ -350,6 +351,7 @@ async fn run(
     // A durable backend may reconstruct an old screen at any time. Its OSC
     // 133 bytes cannot be used to announce a newly completed command.
     let live_commands = sharing.durable.is_none() && can_watch_commands(&source);
+    let mut show_progress = interactive;
     let endpoint = match &source {
         Source::Ssh(options) => format!("{}@{}:{}", options.user, options.host, options.port),
         _ => String::new(),
@@ -662,16 +664,26 @@ async fn run(
                 for event in std::iter::once(event).chain(ready).take(8) {
                     match event {
                         ssh::Event::HerdrViewer => {
+                            show_progress = false;
+                            events.set_progress(wezterm_term::Progress::None);
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
-                        ssh::Event::Disconnected => events.command_stream(false),
+                        ssh::Event::Disconnected => {
+                            events.command_stream(false);
+                            events.set_progress(wezterm_term::Progress::None);
+                            show_progress = interactive;
+                        }
                         ssh::Event::Data(bytes) => {
                             if observed.receiver_count() > 0 {
                                 let _ = observed.send(bytes.clone());
                             }
                             record_output(&mut recorder, &bytes, &events);
                             total_bytes += bytes.len() as u64;
+                            let before = terminal.get_progress();
                             presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                            if show_progress && before != terminal.get_progress() {
+                                events.set_progress(terminal.get_progress());
+                            }
                         }
                         ssh::Event::Status(message) => {
                             log::info!("{message}");
@@ -684,6 +696,7 @@ async fn run(
                         ssh::Event::Connected(generation) => {
                             if generation > 1 {
                                 terminal.reset_connection();
+                                events.set_progress(wezterm_term::Progress::None);
                                 scroll_offset = 0;
                             }
                             presentation.dirty = true;

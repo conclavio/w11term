@@ -56,6 +56,7 @@ mod session_browser;
 mod split_smoke;
 mod tab_title;
 mod tab_windows;
+mod taskbar;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
 use pane_view::PaneSurface;
@@ -516,6 +517,7 @@ enum UiWork {
 }
 
 pub struct TerminalApp {
+    taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
     show_inspector: bool,
     inspection: Option<inspector::Inspection>,
@@ -2361,6 +2363,23 @@ impl TerminalApp {
     }
 
     fn header_view(&self, context: &ViewContext<Self>) -> View {
+        let mut progress = BTreeMap::new();
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(pane) = &entry.value.page {
+                let next = pane.session.events.progress();
+                if next != wezterm_term::Progress::None {
+                    let group = progress.entry(entry.group_id()).or_default();
+                    *group = taskbar::most_important(*group, next);
+                }
+            }
+        }
+        if let Some(hwnd) = self.keyboard.hwnd() {
+            let state = progress
+                .values()
+                .copied()
+                .fold(wezterm_term::Progress::None, taskbar::most_important);
+            self.taskbar.borrow_mut().show(hwnd, state);
+        }
         let tab_strip = TabView::new()
             .height(44.0)
             .width(
@@ -2390,7 +2409,10 @@ impl TerminalApp {
                     KeyedView::new(
                         self.tabs.group_id(tab.id).unwrap().to_string(),
                         TabViewItem::new()
-                            .header(self.tab_label(tab.id))
+                            .header(taskbar::tab_header(
+                                self.tab_label(tab.id),
+                                progress.get(&tab.group_id()).copied().unwrap_or_default(),
+                            ))
                             .tag(tab.id.to_string())
                             .is_closable(true),
                     )
@@ -3178,6 +3200,7 @@ impl Component for TerminalApp {
         });
         let mut app = Self {
             inbox,
+            taskbar: RefCell::default(),
             accessible: Default::default(),
             active_group: None,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
@@ -4158,6 +4181,9 @@ impl Component for TerminalApp {
                 }
                 Shortcut::BeginResize => {
                     self.initial_grid.set(None);
+                }
+                Shortcut::TaskbarCreated => {
+                    self.taskbar.borrow_mut().shell_restarted();
                 }
                 Shortcut::RememberWindow => {
                     if let Some(name) = &self.window_profile {

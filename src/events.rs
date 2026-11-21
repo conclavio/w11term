@@ -29,6 +29,7 @@ pub struct Batch {
 struct State {
     next: u64,
     events: VecDeque<Event>,
+    progress: wezterm_term::Progress,
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
 }
@@ -153,6 +154,21 @@ impl Events {
         }
     }
 
+    /// Progress is current pane state. Frequent updates must not evict journal entries.
+    pub fn progress(&self) -> wezterm_term::Progress {
+        self.state.lock().unwrap().progress
+    }
+
+    pub(crate) fn set_progress(&self, progress: wezterm_term::Progress) {
+        let mut state = self.state.lock().unwrap();
+        if state.progress != progress {
+            state.progress = progress;
+            if let Some((_, _, inbox)) = &state.inbox {
+                inbox.refresh();
+            }
+        }
+    }
+
     /// Attach a pane to its owning window, preserving acknowledgements when it moves.
     pub fn connect_inbox(&self, pane: u64, label: &str, inbox: &Inbox) {
         let mut state = self.state.lock().unwrap();
@@ -242,6 +258,31 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_progress_coalesces_wakes_without_creating_notifications_or_journal_rows() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wezterm_term::Progress;
+        let calls = Arc::new(AtomicUsize::default());
+        let counter = calls.clone();
+        let inbox = Inbox::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let pane = Events::default();
+        pane.connect_inbox(11, "Loopback", &inbox);
+        for value in 1..=100 {
+            pane.set_progress(Progress::Percentage(value));
+        }
+        assert_eq!(pane.progress(), Progress::Percentage(100));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inbox.unread_count(), 0);
+        assert!(pane.since(0).events.is_empty());
+        inbox.acknowledge_wake();
+        pane.set_progress(Progress::Percentage(100));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        pane.set_progress(Progress::None);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
     #[tokio::test]
     async fn cursors_detect_loss_and_wait_without_polling() {
         let e = Events::default();

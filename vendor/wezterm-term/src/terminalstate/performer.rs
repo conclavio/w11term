@@ -728,6 +728,7 @@ impl<'a> Performer<'a> {
                 self.accumulating_title.take();
                 self.end_synchronized_output();
                 self.progress = Progress::default();
+                self.progress_value = 0;
 
                 self.screen.full_reset();
                 self.screen.activate_alt_screen(seqno);
@@ -1105,15 +1106,27 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
                 use wezterm_escape_parser::osc::Progress as TProg;
+                let retained = if self.progress_value == 0 {
+                    10
+                } else {
+                    self.progress_value
+                };
                 let prog = match prog {
                     TProg::None => Progress::None,
                     TProg::SetPercentage(p) => Progress::Percentage(p),
+                    TProg::SetError(0) => Progress::Error(retained),
                     TProg::SetError(p) => Progress::Error(p),
                     TProg::SetIndeterminate => Progress::Indeterminate,
-                    TProg::Paused => Progress::None,
+                    TProg::Paused(0) => Progress::Paused(retained),
+                    TProg::Paused(p) => Progress::Paused(p),
+                };
+                self.progress_value = match prog {
+                    Progress::None => 0,
+                    Progress::Percentage(p) | Progress::Error(p) | Progress::Paused(p) => p,
+                    Progress::Indeterminate => self.progress_value,
                 };
                 if prog != self.progress {
-                    self.progress = prog.clone();
+                    self.progress = prog;
                     if let Some(handler) = self.alert_handler.as_mut() {
                         handler.alert(Alert::Progress(prog));
                     }

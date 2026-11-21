@@ -43,6 +43,12 @@ pub struct Tab<T> {
     group: TabId,
 }
 
+impl<T> Tab<T> {
+    pub fn group_id(&self) -> TabId {
+        self.group
+    }
+}
+
 struct Group {
     id: TabId,
     title: Option<TabTitle>,
