@@ -62,6 +62,7 @@ impl CellHit {
 /// First renderer: cached DirectWrite layouts + GPU-resident Direct2D images.
 /// The engine/transport boundary allows an atlas renderer to replace this independently.
 pub struct Renderer {
+    pub read_only: bool,
     pub copy_cursor: Option<w11term::interaction::Point>,
     normal: TextFormat,
     bold: TextFormat,
@@ -259,6 +260,7 @@ impl Renderer {
         };
         Ok(Self {
             copy_cursor: None,
+            read_only: false,
             normal,
             bold,
             small: TextFormat::new("Segoe UI", 11.0)?.with_word_wrapping(WordWrapping::NoWrap),
@@ -746,7 +748,12 @@ impl Renderer {
         );
         brush.set_color(ColorF::new(0.59, 0.64, 0.71, 1.0));
         let mut label = format!(
-            "{}   ·   {} × {}   ·   {} KiB{}",
+            "{}{}   ·   {} × {}   ·   {} KiB{}",
+            if self.read_only {
+                "Read-only   ·   "
+            } else {
+                ""
+            },
             frame.status,
             self.metrics.cols,
             self.metrics.rows,

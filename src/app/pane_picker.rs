@@ -155,6 +155,7 @@ fn preview_summary(frame: &Snapshot) -> String {
 }
 
 struct Choice {
+    read_only: bool,
     pane: u64,
     tab_title: Option<String>,
     title: String,
@@ -195,6 +196,9 @@ impl Choice {
             &self.title
         };
         let mut fields = vec![title.as_str()];
+        if self.read_only {
+            fields.push("Read-only");
+        }
         for text in self
             .tab_title
             .iter()
@@ -506,6 +510,7 @@ impl TerminalApp {
                     }) = self.tabs.get(leaf)
                     {
                         choices.push(Choice {
+                            read_only: live.read_only.get(),
                             tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
                             pane: live.session.pane_id,
                             label: label.clone(),
@@ -833,6 +838,7 @@ mod tests {
     }
     fn row(pane: u64, title: &str, label: &str, destination: &str) -> Choice {
         Choice {
+            read_only: false,
             pane,
             tab_title: None,
             title: title.into(),

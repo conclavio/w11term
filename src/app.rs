@@ -61,6 +61,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    read_only: Rc<Cell<bool>>,
     startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
     files: Box<FileDrawer>,
@@ -343,6 +344,8 @@ fn tab_menu_message(label: String) -> Message {
         "Resize down" => Message::Shortcut(Shortcut::ResizePane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
+        "Enable read-only pane input" => Message::SetPaneReadOnly(true),
+        "Disable read-only pane input" => Message::SetPaneReadOnly(false),
         "Move pane to new tab" => Message::MovePaneToTab,
         "Move pane to existing tab…" => Message::Shortcut(Shortcut::MovePaneToExistingTab),
         "Paste" => Message::Paste,
@@ -451,6 +454,7 @@ pub enum Message {
     ClosePane,
     MovePaneToTab,
     PaneFocus(TabId),
+    SetPaneReadOnly(bool),
     PaneRatio(u64, Vec<bool>, f64),
     HoverPane(TabId),
     DividerPress(u64, Vec<bool>, f64),
@@ -565,6 +569,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             profile_name: None,
             surface: PaneSurface::default(),
             device_busy: false,
+            read_only: Rc::default(),
             device_message: None,
             session,
             last_size: Rc::new(Cell::new(None)),
@@ -677,7 +682,11 @@ impl TerminalApp {
         if changed {
             self.keyboard
                 .set_target(if prompt_id.is_none() && !tab.device_busy && !choosing {
-                    Some((tab.session.input.clone(), tab.session.frames.clone()))
+                    Some((
+                        tab.session.input.clone(),
+                        tab.session.frames.clone(),
+                        tab.read_only.clone(),
+                    ))
                 } else {
                     None
                 });
@@ -923,6 +932,9 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if tab.read_only.get() {
+                return;
+            }
             match w11term::clipboard::read() {
                 Ok(text) => {
                     if raw {
@@ -1062,6 +1074,7 @@ impl TerminalApp {
         let local_drag = tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
             || tab.clicked_link.is_some();
         if frame.mouse_grabbed
+            && !tab.read_only.get()
             && !local_drag
             && !modifiers.contains(KeyModifiers::SHIFT)
             && !(modifiers.contains(KeyModifiers::CTRL) && link.is_some())
@@ -1488,6 +1501,7 @@ impl TerminalApp {
                         .title_for(entry.id)
                         .map(|title| title.as_str().to_owned()),
                     visible: self.tabs.visible(entry.id),
+                    read_only: tab.read_only.get(),
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
@@ -1627,7 +1641,11 @@ impl TerminalApp {
             Some(AppTab {
                 page: Page::Terminal(tab),
                 ..
-            }) => Some((tab.session.input.clone(), tab.session.frames.clone())),
+            }) => Some((
+                tab.session.input.clone(),
+                tab.session.frames.clone(),
+                tab.read_only.clone(),
+            )),
             _ => None,
         };
         self.keyboard.set_target(target);
@@ -2261,6 +2279,7 @@ impl TerminalApp {
     }
 
     fn caret_items(&self) -> Vec<MenuItem> {
+        let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
             _ => None,
@@ -2291,12 +2310,8 @@ impl TerminalApp {
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             MenuItem::item("inbox", "Attention inbox"),
-            command_menu_item("paste", "Paste", player.is_some()),
-            command_menu_item(
-                "paste-raw",
-                "Paste raw (no bracketed paste)",
-                player.is_some(),
-            ),
+            command_menu_item("paste", "Paste", can_paste),
+            command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
             MenuItem::separator("paste-end"),
             MenuItem::item("settings", "Settings"),
             self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
@@ -2398,6 +2413,16 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if matches!(live.source, Source::Ssh(_) | Source::Local(_)) {
+                items.push(MenuItem::item(
+                    "pane-read-only",
+                    if live.read_only.get() {
+                        "Disable read-only pane input"
+                    } else {
+                        "Enable read-only pane input"
+                    },
+                ));
+            }
             items.push(match live.session.frames.load().copy_output_unavailable() {
                 Some(why) => MenuItem::disabled(
                     "copy-last-output",
@@ -3248,6 +3273,7 @@ impl Component for TerminalApp {
                         self.keyboard.set_target(Some((
                             tab.session.input.clone(),
                             tab.session.frames.clone(),
+                            tab.read_only.clone(),
                         )));
                     }
                 }
@@ -3738,6 +3764,20 @@ impl Component for TerminalApp {
                 let _ = context.window().request_close();
             }
             Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::SetPaneReadOnly(enabled) => {
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    && matches!(live.source, Source::Ssh(_) | Source::Local(_))
+                {
+                    KeyboardBridge::set_read_only(&live.session.input, &live.read_only, enabled);
+                    live.remote_button = MouseButton::None;
+                    live.surface.invalidator.invalidate();
+                    self.publish_panes();
+                }
+            }
             Message::PaneRatio(epoch, path, ratio) => {
                 if epoch == self.watch_epoch && self.dragging_divider(epoch, &path) {
                     self.tabs.set_ratio(&path, ratio);
