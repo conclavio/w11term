@@ -47,7 +47,8 @@ struct State {
     search: bool,
     picker: bool,
     local_mode: Option<LocalMode>,
-    local_held: HashSet<u32>,
+    // A true entry may repeat a movement first pressed in this copy-mode session.
+    local_held: HashMap<u32, bool>,
     held_resize: Option<(u32, KeyModifiers, Direction)>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
@@ -197,7 +198,7 @@ impl KeyboardBridge {
                 search: false,
                 picker: false,
                 local_mode: None,
-                local_held: HashSet::new(),
+                local_held: HashMap::new(),
                 held_resize: None,
                 wheel_panes: WheelPanes::default(),
                 wheel_remainder: 0,
@@ -329,7 +330,10 @@ impl KeyboardBridge {
                 s.local_mode = mode;
                 if mode.is_some() {
                     ime::cancel();
-                    s.local_held.extend(s.pressed.keys().copied());
+                    for owned in s.local_held.values_mut() {
+                        *owned = false;
+                    }
+                    s.local_held.extend(s.pressed.keys().map(|&vk| (vk, false)));
                     s.release_keys();
                     s.wheel_panes.hovered = None;
                 }
@@ -807,7 +811,7 @@ impl State {
                 _ => {}
             }
         }
-        if self.local_held.contains(&vk) {
+        if let Some(&repeat_owned) = self.local_held.get(&vk) {
             match message.message {
                 WM_KEYUP | WM_SYSKEYUP => {
                     self.local_held.remove(&vk);
@@ -815,7 +819,7 @@ impl State {
                     return true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
-                    if self.local_mode != Some(LocalMode::Copy) {
+                    if self.local_mode != Some(LocalMode::Copy) || !repeat_owned {
                         return true;
                     }
                 }
@@ -831,14 +835,18 @@ impl State {
                     if vk == VK_F4.0 as u32 && modifiers().contains(KeyModifiers::ALT) {
                         return false;
                     }
-                    self.local_held.insert(vk);
+                    let repeat = message.lParam.0 & (1 << 30) != 0;
+                    if repeat && !self.local_held.contains_key(&vk) {
+                        return true;
+                    }
+                    self.local_held.insert(vk, mode == LocalMode::Copy);
                     if mode == LocalMode::Copy {
                         if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, modifiers())
-                            && (message.lParam.0 & (1 << 30) == 0 || key.repeats())
+                            && (!repeat || key.repeats())
                         {
                             (self.shortcut)(Shortcut::CopyKey(key));
                         }
-                    } else if message.lParam.0 & (1 << 30) == 0
+                    } else if !repeat
                         && matches!(vk, 0x41..=0x5a | 0x08 | 0x1b | 0x0d)
                         && !modifiers().intersects(KeyModifiers::CTRL | KeyModifiers::ALT)
                     {
@@ -1450,7 +1458,7 @@ mod tests {
             search: false,
             picker: false,
             local_mode: None,
-            local_held: HashSet::new(),
+            local_held: HashMap::new(),
             held_resize: None,
             wheel_panes: WheelPanes::default(),
             wheel_remainder: 0,
@@ -1544,7 +1552,13 @@ mod tests {
             lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
             ..Default::default()
         };
+        // Held in the shell when the user entered copy mode. Neither a known
+        // inherited key nor an orphan repeat can start a movement here.
+        state.local_held.insert(0x26, false);
         for event in [
+            key(WM_KEYDOWN, 0x26, true),
+            key(WM_KEYUP, 0x26, false),
+            key(WM_KEYDOWN, 0x26, true),
             key(WM_KEYDOWN, 0x26, false),
             key(WM_KEYDOWN, 0x26, true),
             key(WM_KEYUP, 0x26, false),
