@@ -23,8 +23,16 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
         read_only: true,
         input,
     };
-    registry.replace([pane(1, stalled), pane(7, closed)]);
-    second_window.replace([pane(4, ready)]);
+    // Occupy every scan slot. Their timeouts must leave room for the
+    // healthy pane in the second window before the overall deadline.
+    registry.replace([
+        pane(1, stalled.clone()),
+        pane(2, stalled.clone()),
+        pane(3, stalled.clone()),
+        pane(4, stalled),
+        pane(7, closed),
+    ]);
+    second_window.replace([pane(5, ready)]);
     let worker = tokio::spawn(async move {
         let Some(Command::SearchPreview { query, reply }) = requests.recv().await else {
             panic!("expected a read-only search")
@@ -45,7 +53,7 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
         .unwrap();
     worker.await.unwrap();
     let rows = result["panes"].as_array().unwrap();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 6);
     assert_eq!(rows[0]["pane"], 1);
     assert_eq!(rows[0]["window_id"], 10);
     assert!(rows[0]["error"].as_str().unwrap().contains("timed out"));
@@ -55,11 +63,11 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
     };
     assert!(reply.is_closed(), "timed out scan must see cancellation");
     assert_eq!(
-        rows[1],
-        serde_json::json!({"pane":4,"tab_id":104,"window_id":20,"count":0,"truncated":false,"first":null})
+        rows[4],
+        serde_json::json!({"pane":5,"tab_id":105,"window_id":20,"count":0,"truncated":false,"first":null})
     );
-    assert_eq!(rows[2]["pane"], 7);
-    assert!(rows[2]["error"].as_str().unwrap().contains("closed"));
+    assert_eq!(rows[5]["pane"], 7);
+    assert!(rows[5]["error"].as_str().unwrap().contains("closed"));
     for (filter, all, expected) in [
         (Some(7), false, "closed"),
         (Some(99), false, "unknown pane"),

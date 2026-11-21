@@ -1,6 +1,9 @@
 use super::*;
 use tokio::{task::JoinSet, time::Instant};
 
+const PARALLEL_PANES: usize = 4;
+const PANE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Registry {
     pub(super) async fn find_text(
         &self,
@@ -32,10 +35,15 @@ impl Registry {
         loop {
             // Long-running panes may complete in any order. Limit concurrent
             // scans while allowing ready siblings to make progress.
-            for (window_id, target) in targets.by_ref().take(4 - workers.len()) {
+            for (window_id, target) in targets.by_ref().take(PARALLEL_PANES - workers.len()) {
                 let query = pattern.clone();
+                let pane_deadline = if all_panes {
+                    deadline.min(Instant::now() + PANE_TIMEOUT)
+                } else {
+                    deadline
+                };
                 workers.spawn(async move {
-                    let result = search_pane(&target, query, deadline).await;
+                    let result = search_pane(&target, query, pane_deadline).await;
                     (window_id, target, result)
                 });
             }

@@ -41,7 +41,7 @@ if ($screen.result.text -notmatch 'fps=') { throw 'HUD missing' }
 
 & $ctl --pid 12345 find-text --pane $pane 'connection reset'
 $found = & $ctl --pid 12345 find-text --all-panes 'connection reset' | ConvertFrom-Json
-$found.result.panes | Where-Object { $_.count -gt 0 }
+$found.result.panes | Where-Object { !$_.error -and $_.count -gt 0 }
 
 & $ctl --pid 12345 screenshot --pane $pane .\frame.png
 & $ctl --pid 12345 save-text --pane $pane .\shell-transcript.txt
