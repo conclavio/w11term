@@ -408,7 +408,7 @@ pub struct Snapshot {
     pub cols: usize,
     pub scroll_offset: usize,
     pub title: String,
-    pub last_command: Option<Arc<wezterm_term::CompletedCommand>>,
+    pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
     pub reported_directory: Option<Arc<str>>,
     pub status: String,
     pub bytes_received: u64,
@@ -434,7 +434,7 @@ struct FrozenImage {
 
 impl Snapshot {
     pub fn copy_output_unavailable(&self) -> Option<&'static str> {
-        match &self.last_command {
+        match self.command_history.back() {
             Some(command) => command.output.as_ref().err().copied(),
             None => Some("waiting for shell markers"),
         }
@@ -542,7 +542,7 @@ impl Snapshot {
             cols: screen.physical_cols,
             scroll_offset: offset,
             title: terminal.get_title().to_owned(),
-            last_command: terminal.last_command().cloned(),
+            command_history: terminal.command_history().clone(),
             reported_directory: terminal.reported_current_dir().cloned(),
             status,
             bytes_received,
@@ -620,11 +620,7 @@ impl Snapshot {
             )
             && self.palette == old.palette
             && self.title == old.title
-            && match (&self.last_command, &old.last_command) {
-                (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
-                (None, None) => true,
-                _ => false,
-            }
+            && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.reported_directory == old.reported_directory
             && self.status == old.status
             && self.bytes_received / 1024 == old.bytes_received / 1024
@@ -758,12 +754,57 @@ mod tests {
             term.advance_bytes([*byte]);
         }
         let first = term.last_command().unwrap().clone();
+        assert_eq!(first.command.as_deref(), Some("ls"));
         assert_eq!(first.exit_code, Some(42));
         assert_eq!(first.output.as_deref(), Ok("123456789\r\n\r\nend"));
         term.advance_bytes(b"\x1b]133;A\x07> \x1b]133;C\x07\x1b]133;D;0\x07");
         assert_eq!(term.last_command().unwrap().output.as_deref(), Ok(""));
         assert_eq!(term.last_command().unwrap().exit_code, Some(0));
+        assert!(term.last_command().unwrap().command.is_none());
+        assert!(Arc::ptr_eq(term.command_history().front().unwrap(), &first));
         assert_eq!(first.output.as_deref(), Ok("123456789\r\n\r\nend"));
+    }
+
+    #[test]
+    fn command_history_is_bounded_and_frozen_across_eviction_and_reset() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]133;B\x07cancelled\x1b]133;A\x07");
+        assert!(term.command_history().is_empty());
+        term.advance_bytes(b"\x1b]133;B\x07echo first\r\n\x1b]133;C\x07first\x1b]133;D;0\x07");
+        let frozen = term.command_history().clone();
+        for _ in 0..64 {
+            term.advance_bytes(b"\x1b]133;C\x07ok\x1b]133;D;1\x07");
+        }
+        assert_eq!(term.command_history().len(), 64);
+        assert_eq!(term.command_history().front().unwrap().id, 2);
+        assert_eq!(frozen[0].command.as_deref(), Some("echo first"));
+        assert_eq!(frozen[0].output.as_deref(), Ok("first"));
+        term.reset_connection();
+        assert!(term.command_history().is_empty());
+        term.advance_bytes(b"\x1b]133;C\x07new\x1b]133;D\x07");
+        assert_eq!(term.command_history()[0].id, 66);
+    }
+
+    #[test]
+    fn command_history_evicts_old_outputs_at_the_byte_limit() {
+        let (mut term, _) = engine();
+        term.resize(TerminalSize {
+            cols: 1024,
+            rows: 513,
+            ..TerminalSize::default()
+        });
+        let row = Line::from_text(&"x".repeat(1024), &CellAttributes::default(), 1, None);
+        for _ in 0..8 {
+            term.advance_bytes(b"\x1b[1;1H\x1b]133;C\x07");
+            let screen = term.screen_mut();
+            for index in screen.phys_row(0)..screen.phys_row(512) {
+                *screen.line_mut(index) = row.clone();
+            }
+            term.advance_bytes(b"\x1b[513;1H\x1b]133;D;0\x07");
+        }
+        assert_eq!(term.command_history().len(), 7);
+        assert_eq!(term.command_history().front().unwrap().id, 2);
+        assert!(term.last_command().unwrap().output.as_ref().unwrap().len() > 512 * 1024);
     }
 
     #[test]

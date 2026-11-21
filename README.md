@@ -47,7 +47,7 @@ The native WinUI tab strip sits in the title bar. Click **+** to open a profile 
 
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
 
-Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
+Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.
 
 Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
 
@@ -79,6 +79,7 @@ Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the pane pic
 | --- | --- |
 | Split right or below | Ctrl+Alt+Shift+Right or Down |
 | Focus a neighbor | Ctrl+Alt+Arrow |
+| Resize the focused split | Alt+Shift+Arrow |
 | Zoom pane or restore layout | Ctrl+Alt+Shift+Z |
 | Close focused pane | Ctrl+Alt+Shift+W |
 
@@ -202,7 +203,9 @@ Find is local to each tab and searches literal text across retained history and 
 
 The alternate screen has no local scrollback. A TUI receives wheel reports when it enables mouse reporting. For other TUIs, **Alternate-screen wheel keys** enables the arrow-key fallback used by pagers. It defaults to on for standard profiles and off in game mode. Shift+wheel scrolls local primary-screen history and has no effect on the alternate screen. Find on the alternate screen searches its current contents. Returning to the primary screen restores its history position.
 
-**OSC 133 semantic prompts.** With shell integration enabled in your shell, Ctrl+Shift+Up/Down jumps between prompt starts in scrollback. **Caret → Panes → Copy last command output** copies the focused pane’s most recent completed command as plain text, joining soft wraps and preserving hard newlines. Capture starts at the shell’s C marker and ends at D or the next prompt. An explicit numeric D status appears as **exit 0**, **exit 1**, etc. in the pane footer. Each pane retains one completed output of up to 1 MiB. If its start has left scrollback or the capture exceeds that limit, the menu shows why copying is unavailable. Alternate-screen programs do not replace the shell capture. Reconnecting clears the previous connection’s shell metadata.
+**OSC 133 semantic prompts.** With shell integration enabled, Ctrl+Shift+Up/Down jumps between prompt starts. **Caret → Panes → Command history** opens the focused pane’s completed commands, newest first. Select a command to preview its output and exit status. **Copy output** copies its full plain text, joining soft wraps and preserving hard newlines. **Refresh history** selects the latest command, and **Return to pane** takes you back to the originating shell. **Copy last command output** remains available directly in the Panes menu.
+
+History uses visible command text between the shell’s B and C markers when available. Output runs from C to D or the next prompt. The pane footer shows an explicit numeric exit status. Each pane retains up to 64 commands and 4 MiB of captured text in memory. A command whose output exceeded 1 MiB or left scrollback before completion shows the reason in its preview. Alternate-screen applications leave shell history intact. A terminal reset or reconnect clears it.
 
 The Settings tab exposes auto-copy, block-selection trimming, paste trimming, grid snapping, tab-switcher mode (tab order/MRU/disabled), Ctrl+scroll zoom, URL detection, and remote OSC 52 writes. Auto-copy is enabled as requested; the other listed boolean options default to enabled, and the switcher defaults to tab order. Copies always contain plain text. Normal paste trims whitespace only at the end of the entire payload by default; raw paste preserves it. The resize border snaps to cell boundaries during manual dragging. These behaviors follow the relevant [Windows Terminal interaction settings](https://learn.microsoft.com/en-us/windows/terminal/customize-settings/interaction), with the explicit auto-copy override.
 

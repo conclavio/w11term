@@ -109,6 +109,11 @@ async fn native_shortcut_rebind_releases_previous_key_and_persists_after_restart
     let state = tempfile::tempdir().unwrap();
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
+    fs::write(
+        state.path().join("appearance.json"),
+        br#"{"shortcuts":{"resize_right":"F9","resize_left":"F10"}}"#,
+    )
+    .unwrap();
     let data = state.path().join("data");
     fs::create_dir(&data).unwrap();
     fs::write(
@@ -149,8 +154,8 @@ async fn native_shortcut_rebind_releases_previous_key_and_persists_after_restart
         String::from_utf8_lossy(&output.stderr),
         fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
     );
-    // Only the released F7 reached SSH on each launch. F8 and subsequent
-    // text were consumed locally or directed to the neighboring PowerShell.
+    // Only the released F7 reached SSH on each launch. Resize and focus
+    // chords were consumed locally, and the text went to PowerShell.
     assert_eq!(fs::read(trace).unwrap(), b"\x1b[18~\x1b[18~");
     assert_eq!(opens.load(Ordering::Relaxed), 2);
     server.abort();

@@ -757,7 +757,7 @@ impl Renderer {
                 ""
             }
         );
-        if let Some(code) = frame.last_command.as_ref().and_then(|c| c.exit_code) {
+        if let Some(code) = frame.command_history.back().and_then(|c| c.exit_code) {
             use std::fmt::Write as _;
             let _ = write!(label, "   ·   exit {code}");
         }

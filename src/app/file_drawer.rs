@@ -890,10 +890,21 @@ impl TerminalApp {
             0 if tab.session.frames.load().reported_directory.is_none() => 0,
             0 => {
                 let frame = tab.session.frames.load();
-                let command = frame.last_command.as_ref().expect("fixture shell status");
+                let command = frame.command_history.back().expect("fixture shell status");
                 assert_eq!(command.output.as_deref(), Ok("fixture status\r\n"));
                 assert_eq!(command.exit_code, Some(7));
                 assert_eq!(frame.copy_output_unavailable(), None);
+                self.update(super::tab_menu_message("Command history".into()), context);
+                self.history_smoke_select_older(context);
+                8
+            }
+            8 => {
+                self.history_smoke_verify_older();
+                self.update(
+                    Message::History(super::command_history::Action::Return),
+                    context,
+                );
+                assert_eq!(self.tabs.active_id(), Some(id));
                 self.file_action(FileAction::Toggle, context);
                 1
             }

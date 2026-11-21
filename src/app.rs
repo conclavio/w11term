@@ -31,6 +31,7 @@ const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
 mod attention;
+mod command_history;
 mod config_import;
 mod file_drawer;
 mod keyboard_settings;
@@ -133,6 +134,7 @@ enum SettingsEditor {
 }
 enum Page {
     Attention,
+    CommandHistory(command_history::HistoryPage),
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
@@ -297,12 +299,17 @@ fn tab_menu_message(label: String) -> Message {
         }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
+        "Command history" => Message::History(command_history::Action::Open),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
         "Focus below" => Message::PaneNeighbor(Direction::Down),
+        "Resize left" => Message::Shortcut(Shortcut::ResizePane(Direction::Left)),
+        "Resize right" => Message::Shortcut(Shortcut::ResizePane(Direction::Right)),
+        "Resize up" => Message::Shortcut(Shortcut::ResizePane(Direction::Up)),
+        "Resize down" => Message::Shortcut(Shortcut::ResizePane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
         "Move pane to new tab" => Message::MovePaneToTab,
@@ -431,6 +438,7 @@ pub enum Message {
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
     CopyLastCommand,
+    History(command_history::Action),
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
     Discovery(session_browser::Action),
@@ -2295,6 +2303,7 @@ impl TerminalApp {
                 ),
                 None => MenuItem::item("copy-last-output", "Copy last command output"),
             });
+            items.push(MenuItem::item("command-history", "Command history"));
             if let Some(menu) = durable_view::pane_menu(live) {
                 items.push(menu);
             }
@@ -2327,6 +2336,25 @@ impl TerminalApp {
                 ("down", KeyAction::FocusDown),
             ] {
                 items.push(self.binding_menu(key, action.binding().label, action));
+            }
+            if !self.tabs.zoomed()
+                && let Some(id) = self.tabs.active_id()
+                && let Some(layout) = self.tabs.active_layout()
+            {
+                for (axis, actions) in [
+                    (
+                        Axis::Columns,
+                        [KeyAction::ResizeLeft, KeyAction::ResizeRight],
+                    ),
+                    (Axis::Rows, [KeyAction::ResizeUp, KeyAction::ResizeDown]),
+                ] {
+                    if layout.divider_for(id, axis).is_some() {
+                        for action in actions {
+                            let binding = action.binding();
+                            items.push(self.binding_menu(binding.id, binding.label, action));
+                        }
+                    }
+                }
             }
             items.push(self.binding_menu(
                 "zoom-pane",
@@ -2907,13 +2935,14 @@ impl Component for TerminalApp {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.active()
-                    && let Some(command) = &tab.session.frames.load().last_command
+                    && let Some(command) = tab.session.frames.load().command_history.back()
                     && let Ok(text) = &command.output
                     && let Err(error) = w11term::clipboard::write(text)
                 {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
+            Message::History(action) => self.handle_history(action, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
@@ -3661,6 +3690,7 @@ impl Component for TerminalApp {
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
+                Shortcut::ResizePane(direction) => self.keyboard_resize(direction),
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)
@@ -4182,6 +4212,7 @@ impl Component for TerminalApp {
                 },
                 Page::Settings(None) => self.settings_view(context),
                 Page::Attention => self.attention_view(context),
+                Page::CommandHistory(page) => self.history_view(page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,
