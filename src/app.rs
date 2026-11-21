@@ -518,6 +518,11 @@ enum UiWork {
     AttentionChanged,
 }
 
+struct CaretMenuBinding {
+    pane: Option<u64>,
+    on_click: Callback<String>,
+}
+
 pub struct TerminalApp {
     taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
@@ -546,6 +551,7 @@ pub struct TerminalApp {
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
+    caret_menu_binding: RefCell<Option<CaretMenuBinding>>,
     frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
@@ -2366,6 +2372,30 @@ impl TerminalApp {
         }
     }
 
+    fn caret_menu_callback(&self, context: &ViewContext<Self>) -> Callback<String> {
+        let pane = self.tabs.active().and_then(AppTab::pane_id);
+        let mut cached = self.caret_menu_binding.borrow_mut();
+        if let Some(binding) = cached.as_ref()
+            && binding.pane == pane
+        {
+            return binding.on_click.clone();
+        }
+        // Reactor replaces a flyout when its callback changes. Keep the same
+        // callback while repainting the title bar for the same action target.
+        let on_click = context.callback(move |label| {
+            if label == scrollback_export::LABEL {
+                Message::Export(scrollback_export::Action::Start(pane))
+            } else {
+                tab_menu_message(label)
+            }
+        });
+        *cached = Some(CaretMenuBinding {
+            pane,
+            on_click: on_click.clone(),
+        });
+        on_click
+    }
+
     fn header_view(&self, context: &ViewContext<Self>) -> View {
         let mut progress = BTreeMap::new();
         for entry in self.tabs.entries() {
@@ -2433,7 +2463,6 @@ impl TerminalApp {
                 self.profile_items(),
                 context.callback(Message::ProfileMenu),
             ));
-        let pane = self.tabs.active().and_then(AppTab::pane_id);
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2442,13 +2471,7 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
                 self.caret_items(),
-                context.callback(move |label| {
-                    if label == scrollback_export::LABEL {
-                        Message::Export(scrollback_export::Action::Start(pane))
-                    } else {
-                        tab_menu_message(label)
-                    }
-                }),
+                self.caret_menu_callback(context),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -3239,6 +3262,7 @@ impl Component for TerminalApp {
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
+            caret_menu_binding: RefCell::new(None),
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
             inspection: None,
