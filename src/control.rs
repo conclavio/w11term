@@ -86,6 +86,12 @@ pub enum Request {
     GetText {
         pane: u64,
     },
+    SaveText {
+        pane: u64,
+        path: PathBuf,
+        #[serde(default)]
+        overwrite: bool,
+    },
     Screenshot {
         pane: u64,
         path: PathBuf,
@@ -404,6 +410,30 @@ impl Registry {
                 Ok(
                     json!({"pane":pane,"generation":frame.generation,"cols":size.cols,"rows":size.rows,"lines":lines,"text":lines.join("\n"),"title":frame.title,"status":frame.status,"alternate_screen":frame.alternate}),
                 )
+            }
+            Request::SaveText {
+                pane,
+                path,
+                overwrite,
+            } => {
+                ensure!(path.is_absolute(), "save-text path must be absolute");
+                let (reply, snapshot) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::ExportText(reply))
+                    .context("pane is closed")?;
+                let text = tokio::time::timeout(TIMEOUT, snapshot)
+                    .await
+                    .context("scrollback capture timed out")?
+                    .context("pane closed before capture")?
+                    .map_err(anyhow::Error::msg)?;
+                let bytes = text.len();
+                let saved_path = tokio::task::spawn_blocking(move || {
+                    crate::transcript::save(&path, &text, overwrite)?;
+                    anyhow::Ok(path)
+                })
+                .await??;
+                Ok(json!({"pane":pane,"path":saved_path,"bytes":bytes}))
             }
             Request::Screenshot { pane, path } => {
                 ensure!(path.is_absolute(), "screenshot path must be absolute");

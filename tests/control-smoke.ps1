@@ -74,6 +74,18 @@ try {
         Start-Sleep -Milliseconds 20
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $text.text.Contains('BOARD')) { throw 'Inactive pane did not receive input' }
+    $transcript = Join-Path $state 'shell transcript.txt'
+    [IO.File]::WriteAllText($transcript, 'keep this file')
+    $collision = & $ctl --pid $terminal.Id save-text --pane 1 $transcript | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $collision.ok -or [IO.File]::ReadAllText($transcript) -ne 'keep this file') {
+        throw 'save-text replaced an existing file without --overwrite'
+    }
+    $saved = Invoke-Control @('save-text', '--pane', '1', $transcript, '--overwrite')
+    $savedText = [IO.File]::ReadAllText($transcript, [Text.UTF8Encoding]::new($false, $true))
+    if ($saved.pane -ne 1 -or $saved.path -ne $transcript -or $saved.bytes -ne (Get-Item -LiteralPath $transcript).Length -or !$savedText.Contains('BOARD')) {
+        throw 'save-text did not export the addressed pane'
+    }
+    if ((Invoke-Control @('list')).sessions[0].active) { throw 'Saving scrollback changed the focused pane' }
     $image = Invoke-Control @('screenshot', '--pane', '1', (Join-Path $state 'inactive.png'))
     $png = [System.IO.File]::ReadAllBytes($image.path)
     if ([Convert]::ToHexString($png[0..7]) -ne '89504E470D0A1A0A' -or $image.width -le 0 -or $image.height -le 0) { throw 'Invalid PNG capture' }
