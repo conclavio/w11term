@@ -1,5 +1,5 @@
 use crate::{
-    input::{KeyboardBridge, Shortcut},
+    input::{KeyboardBridge, PickerStage, Shortcut},
     renderer::{Metrics, PADDING, Renderer, STATUS_HEIGHT},
 };
 use anyhow::Context as _;
@@ -42,6 +42,7 @@ mod pattern_settings;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
+mod command_palette;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
@@ -284,6 +285,13 @@ impl ProfileDraft {
         }
     }
 }
+fn command_menu_item(key: &str, label: &str, enabled: bool) -> MenuItem {
+    if enabled {
+        MenuItem::item(key, label)
+    } else {
+        MenuItem::disabled(key, label)
+    }
+}
 fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     match state {
         Some(state) => MenuItem::item(
@@ -350,6 +358,7 @@ fn tab_menu_message(label: String) -> Message {
         "Forget this device (revoke game key)" => Message::DeviceAction(true),
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
+        "Command palette…" => Message::Shortcut(Shortcut::CommandPalette),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
@@ -426,6 +435,7 @@ pub enum Message {
     Attention(attention::Action),
     AttentionChanged,
     ToggleInspector,
+    PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
     PickerHover(u64),
     PickerFrame(u64, u64),
@@ -639,7 +649,7 @@ impl TerminalApp {
             tab.surface.invalidator.invalidate();
         }
         if prompt_id.is_some() && self.picker.take().is_some() {
-            self.keyboard.set_picker(false);
+            self.keyboard.set_picker(None);
         }
         let changed = prompt_id != tab.prompt_id;
         self.keyboard
@@ -1547,7 +1557,7 @@ impl TerminalApp {
         self.close_hints();
         self.sync_inspector();
         if self.picker.take().is_some() {
-            self.keyboard.set_picker(false);
+            self.keyboard.set_picker(None);
         }
         let single = matches!(
             self.tabs.active_layout(),
@@ -2181,24 +2191,6 @@ impl TerminalApp {
                     )
                 }),
             );
-        let mut menu: Vec<_> = self
-            .profiles
-            .iter()
-            .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
-            .collect();
-        menu.extend(
-            self.local_profiles
-                .keys()
-                .map(|name| MenuItem::item(format!("local:{name}"), format!("{name} · Local"))),
-        );
-        if self.profile_error.is_some() {
-            menu.push(MenuItem::disabled("error", "Could not load profiles"));
-        }
-        menu.extend([
-            MenuItem::separator("profiles-end"),
-            MenuItem::item("new-profile", NEW_PROFILE),
-            MenuItem::item("lab", LAB),
-        ]);
         let plus = Button::new()
             .style(ButtonStyle::Subtle)
             .width(40.0)
@@ -2206,22 +2198,10 @@ impl TerminalApp {
             .automation_name("New tab")
             .content(TextBlock::new().text("+").font_size(22.0))
             // Reactor 0.100 cannot currently nest a Menu owner under a Tooltip wrapper.
-            .menu(Menu::new(menu, context.callback(Message::ProfileMenu)));
-        let player = self.tabs.active().and_then(|tab| match &tab.page {
-            Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
-            _ => None,
-        });
-        let can_edit = self.tabs.active().is_some_and(|tab| {
-            tab.profile_name().is_some_and(|name| {
-                self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
-            })
-        });
-        let workspace_startup = match self.tabs.active().map(|tab| &tab.page) {
-            Some(Page::Terminal(live)) if matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush) => {
-                MenuItem::item("workspace-startup", "Workspace startup…")
-            }
-            _ => MenuItem::disabled("workspace-startup", "Workspace startup…"),
-        };
+            .menu(Menu::new(
+                self.profile_items(),
+                context.callback(Message::ProfileMenu),
+            ));
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2229,65 +2209,7 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                [
-                    self.pane_menu(),
-                    if self.tabs.active().and_then(AppTab::pane_id).is_some() {
-                        MenuItem::item("rename-tab", "Rename tab…")
-                    } else {
-                        MenuItem::disabled("rename-tab", "Rename tab…")
-                    },
-                    self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
-                    MenuItem::item("inbox", "Attention inbox"),
-                    MenuItem::item("paste", "Paste"),
-                    MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
-                    MenuItem::separator("paste-end"),
-                    MenuItem::item("settings", "Settings"),
-                    self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
-                    workspace_startup,
-                    self.discovery_menu(),
-                    state_menu_item(
-                        "inspector",
-                        "Terminal inspector",
-                        self.tabs
-                            .active()
-                            .and_then(AppTab::pane_id)
-                            .map(|_| self.show_inspector),
-                    ),
-                    state_menu_item(
-                        "fullscreen",
-                        "Fullscreen (F11)",
-                        Some(self.windows.borrow().fullscreen()),
-                    ),
-                    state_menu_item("mute", "Mute", player.as_ref().map(|p| p.mute)),
-                    state_menu_item(
-                        "game-mode",
-                        "Game mode (suppress key repeat)",
-                        player.as_ref().map(|p| p.game_mode),
-                    ),
-                    state_menu_item(
-                        "alternate-scroll",
-                        "Alternate-screen wheel keys",
-                        player.as_ref().map(|p| p.alternate_scroll_enabled()),
-                    ),
-                    state_menu_item(
-                        "remote-sounds",
-                        "Remote named sounds",
-                        player.as_ref().map(|p| p.remote_sounds_enabled()),
-                    ),
-                    state_menu_item(
-                        "sync-assets",
-                        "Remote asset synchronization",
-                        player.as_ref().map(|p| p.sync_assets_enabled()),
-                    ),
-                    MenuItem::separator("profile-actions"),
-                    if can_edit {
-                        MenuItem::item("edit-profile", "Edit current profile…")
-                    } else {
-                        MenuItem::disabled("edit-profile", "Edit current profile…")
-                    },
-                    MenuItem::item("enroll", "Enroll this device (at game prompt)"),
-                    MenuItem::item("forget-device", "Forget this device (revoke game key)"),
-                ],
+                self.caret_items(),
                 context.callback(tab_menu_message),
             ));
         TitleBar::new()
@@ -2314,6 +2236,123 @@ impl TerminalApp {
                             .content(self.inbox_button(context)),
                     )),
             )
+    }
+
+    fn profile_items(&self) -> Vec<MenuItem> {
+        let mut menu: Vec<_> = self
+            .profiles
+            .iter()
+            .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
+            .collect();
+        menu.extend(
+            self.local_profiles
+                .keys()
+                .map(|name| MenuItem::item(format!("local:{name}"), format!("{name} · Local"))),
+        );
+        if self.profile_error.is_some() {
+            menu.push(MenuItem::disabled("error", "Could not load profiles"));
+        }
+        menu.extend([
+            MenuItem::separator("profiles-end"),
+            MenuItem::item("new-profile", NEW_PROFILE),
+            MenuItem::item("lab", LAB),
+        ]);
+        menu
+    }
+
+    fn caret_items(&self) -> Vec<MenuItem> {
+        let player = self.tabs.active().and_then(|tab| match &tab.page {
+            Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
+            _ => None,
+        });
+        let can_edit = self.tabs.active().is_some_and(|tab| {
+            tab.profile_name().is_some_and(|name| {
+                self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
+            })
+        });
+        let device_ready = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
+            if !live.device_busy && live.session.prompts.current().is_none()
+            && live.session.frames.load().connection_generation > 0
+            && live.profile_name.as_ref().and_then(|name| self.profiles.get(name))
+                .is_some_and(|profile| profile.player.rustmush && profile.player.device_key.is_some()));
+        let workspace_startup = match self.tabs.active().map(|tab| &tab.page) {
+            Some(Page::Terminal(live)) if matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush) => {
+                MenuItem::item("workspace-startup", "Workspace startup…")
+            }
+            _ => MenuItem::disabled("workspace-startup", "Workspace startup…"),
+        };
+        vec![
+            self.binding_menu(
+                "command-palette",
+                "Command palette…",
+                KeyAction::CommandPalette,
+            ),
+            self.pane_menu(),
+            command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
+            self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
+            MenuItem::item("inbox", "Attention inbox"),
+            command_menu_item("paste", "Paste", player.is_some()),
+            command_menu_item(
+                "paste-raw",
+                "Paste raw (no bracketed paste)",
+                player.is_some(),
+            ),
+            MenuItem::separator("paste-end"),
+            MenuItem::item("settings", "Settings"),
+            self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
+            workspace_startup,
+            self.discovery_menu(),
+            state_menu_item(
+                "inspector",
+                "Terminal inspector",
+                self.tabs
+                    .active()
+                    .and_then(AppTab::pane_id)
+                    .map(|_| self.show_inspector),
+            ),
+            state_menu_item(
+                "fullscreen",
+                "Fullscreen (F11)",
+                Some(self.windows.borrow().fullscreen()),
+            ),
+            state_menu_item("mute", "Mute", player.as_ref().map(|p| p.mute)),
+            state_menu_item(
+                "game-mode",
+                "Game mode (suppress key repeat)",
+                player.as_ref().map(|p| p.game_mode),
+            ),
+            state_menu_item(
+                "alternate-scroll",
+                "Alternate-screen wheel keys",
+                player.as_ref().map(|p| p.alternate_scroll_enabled()),
+            ),
+            state_menu_item(
+                "remote-sounds",
+                "Remote named sounds",
+                player.as_ref().map(|p| p.remote_sounds_enabled()),
+            ),
+            state_menu_item(
+                "sync-assets",
+                "Remote asset synchronization",
+                player.as_ref().map(|p| p.sync_assets_enabled()),
+            ),
+            MenuItem::separator("profile-actions"),
+            if can_edit {
+                MenuItem::item("edit-profile", "Edit current profile…")
+            } else {
+                MenuItem::disabled("edit-profile", "Edit current profile…")
+            },
+            command_menu_item(
+                "enroll",
+                "Enroll this device (at game prompt)",
+                device_ready,
+            ),
+            command_menu_item(
+                "forget-device",
+                "Forget this device (revoke game key)",
+                device_ready,
+            ),
+        ]
     }
 
     fn binding_menu(&self, key: &str, label: &str, action: KeyAction) -> MenuItem {
@@ -3038,6 +3077,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::History(action) => self.handle_history(action, context),
+            Message::PaletteChoose(id) => self.choose_command(id, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
@@ -3774,6 +3814,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
                 Shortcut::MovePaneToExistingTab => self.open_move_picker(context),
                 Shortcut::PickerPlace(side) => {
