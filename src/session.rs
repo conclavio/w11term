@@ -47,6 +47,12 @@ pub enum Command {
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
     Resize(TerminalSize),
     Scroll(isize),
+    ScrollTo(isize),
+    CopyRange(
+        crate::copy_mode::ScreenId,
+        crate::interaction::Selection,
+        tokio::sync::oneshot::Sender<Result<String, &'static str>>,
+    ),
     ScrollEdge(bool),
     Prompt(isize),
     Search {
@@ -564,6 +570,17 @@ async fn run(
                     }
                     Some(Command::Scroll(lines)) => {
                         if !terminal.is_alt_screen_active() { scroll_offset = scroll_offset.saturating_add_signed(lines).min(crate::search::max_offset(&terminal)); }
+                        Ok(())
+                    }
+                    Some(Command::CopyRange(id, selection, reply)) => {
+                        let _ = reply.send(crate::copy_mode::selected_text(&terminal, connection_generation, id, selection));
+                        Ok(())
+                    }
+                    Some(Command::ScrollTo(top)) => {
+                        if !terminal.is_alt_screen_active() {
+                            scroll_offset = terminal.screen().visible_row_to_stable_row(0).saturating_sub(top).max(0) as usize;
+                            scroll_offset = scroll_offset.min(crate::search::max_offset(&terminal));
+                        }
                         Ok(())
                     }
                     Some(Command::ScrollEdge(oldest)) => { if !terminal.is_alt_screen_active() {scroll_offset = if oldest {crate::search::max_offset(&terminal)}else{0};} Ok(()) }

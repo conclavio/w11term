@@ -87,6 +87,10 @@ impl server::Handler for Peer {
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
         s.channel_success(c)?;
         s.data(c, b"ready\r\n".as_slice())?;
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("copy-history.vt").is_file() {
+            s.data(c, fs::read(self.root.join("copy-history.vt"))?)?;
+        }
         if self.root.join("shell directory").is_dir() {
             s.data(
                 c,

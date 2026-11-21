@@ -413,6 +413,7 @@ pub struct Snapshot {
     pub status: String,
     pub bytes_received: u64,
     pub first_stable_row: isize,
+    pub oldest_stable_row: isize,
     pub alternate: bool,
     pub mouse_grabbed: bool,
     pub search: Option<crate::search::SearchSnapshot>,
@@ -546,6 +547,7 @@ impl Snapshot {
             status,
             bytes_received,
             first_stable_row,
+            oldest_stable_row: screen.phys_to_stable_row_index(0),
             alternate,
             mouse_grabbed: terminal.is_mouse_grabbed(),
             search: None,
@@ -600,6 +602,7 @@ impl Snapshot {
     pub fn same_presentation(&self, old: &Self) -> bool {
         self.size == old.size
             && self.first_stable_row == old.first_stable_row
+            && self.oldest_stable_row == old.oldest_stable_row
             && self.scroll_offset == old.scroll_offset
             && self.alternate == old.alternate
             && self.cursor_visible == old.cursor_visible

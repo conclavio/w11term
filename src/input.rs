@@ -24,6 +24,12 @@ use windows::Win32::{
 
 thread_local! { static INPUT: RefCell<Option<State>> = const { RefCell::new(None) }; }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalMode {
+    Hints,
+    Copy,
+}
+
 struct State {
     target: Option<Target>,
     shortcut: Box<dyn Fn(Shortcut)>,
@@ -40,8 +46,8 @@ struct State {
     window: Option<HWND>,
     search: bool,
     picker: bool,
-    hints: bool,
-    hint_held: HashSet<u32>,
+    local_mode: Option<LocalMode>,
+    local_held: HashSet<u32>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
     zoom_remainder: i32,
@@ -125,6 +131,8 @@ pub enum Shortcut {
     PickerCancel,
     KeyboardHints,
     HintKey(u32),
+    CopyMode,
+    CopyKey(w11term::copy_mode::CopyKey),
     MovePane,
     Workspaces,
 }
@@ -186,8 +194,8 @@ impl KeyboardBridge {
                 window: None,
                 search: false,
                 picker: false,
-                hints: false,
-                hint_held: HashSet::new(),
+                local_mode: None,
+                local_held: HashSet::new(),
                 wheel_panes: WheelPanes::default(),
                 wheel_remainder: 0,
                 zoom_remainder: 0,
@@ -282,9 +290,9 @@ impl KeyboardBridge {
                 }
                 s.search = visible;
                 if let Some(target) = &s.target {
-                    let _ = target
-                        .sender
-                        .send(Command::Focus(!visible && !s.picker && !s.hints));
+                    let _ = target.sender.send(Command::Focus(
+                        !visible && !s.picker && s.local_mode.is_none(),
+                    ));
                 }
             }
         });
@@ -307,18 +315,24 @@ impl KeyboardBridge {
         ime::sync_context();
     }
     pub fn set_hints(&self, visible: bool) {
+        self.set_local_mode(visible.then_some(LocalMode::Hints));
+    }
+    pub fn set_copy_mode(&self, visible: bool) {
+        self.set_local_mode(visible.then_some(LocalMode::Copy));
+    }
+    fn set_local_mode(&self, mode: Option<LocalMode>) {
         INPUT.with(|input| {
             if let Some(s) = input.borrow_mut().as_mut() {
-                s.hints = visible;
-                if visible {
+                s.local_mode = mode;
+                if mode.is_some() {
                     ime::cancel();
-                    s.hint_held.extend(s.pressed.keys().copied());
+                    s.local_held.extend(s.pressed.keys().copied());
                     s.release_keys();
                     s.wheel_panes.hovered = None;
                 }
                 if let Some(target) = &s.target {
                     let _ = target.sender.send(Command::Focus(
-                        !visible && !s.search && !s.picker && !s.modal,
+                        mode.is_none() && !s.search && !s.picker && !s.modal,
                     ));
                 }
             }
@@ -468,7 +482,7 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     }
                     if let Some(target) = &state.target {
                         let _ = target.sender.send(Command::Focus(
-                            focused && !state.search && !state.picker && !state.hints,
+                            focused && !state.search && !state.picker && state.local_mode.is_none(),
                         ));
                     }
                 }
@@ -769,28 +783,38 @@ impl State {
         if self.modal {
             return false;
         }
-        if self.hint_held.contains(&vk) {
+        if self.local_held.contains(&vk) {
             match message.message {
                 WM_KEYUP | WM_SYSKEYUP => {
-                    self.hint_held.remove(&vk);
+                    self.local_held.remove(&vk);
                     self.swallowed.remove(&vk);
                     return true;
                 }
-                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => return true,
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
+                    if self.local_mode != Some(LocalMode::Copy) {
+                        return true;
+                    }
+                }
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    self.hint_held.remove(&vk);
+                    self.local_held.remove(&vk);
                 }
                 _ => {}
             }
         }
-        if self.hints {
+        if let Some(mode) = self.local_mode {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     if vk == VK_F4.0 as u32 && modifiers().contains(KeyModifiers::ALT) {
                         return false;
                     }
-                    self.hint_held.insert(vk);
-                    if message.lParam.0 & (1 << 30) == 0
+                    self.local_held.insert(vk);
+                    if mode == LocalMode::Copy {
+                        if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, modifiers())
+                            && (message.lParam.0 & (1 << 30) == 0 || key.repeats())
+                        {
+                            (self.shortcut)(Shortcut::CopyKey(key));
+                        }
+                    } else if message.lParam.0 & (1 << 30) == 0
                         && matches!(vk, 0x41..=0x5a | 0x08 | 0x1b | 0x0d)
                         && !modifiers().intersects(KeyModifiers::CTRL | KeyModifiers::ALT)
                     {
@@ -927,7 +951,9 @@ impl State {
                         self.picker = true;
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
-                        self.hints = true;
+                        self.local_mode = Some(LocalMode::Hints);
+                    } else if matches!(shortcut, Shortcut::CopyMode) {
+                        self.local_mode = Some(LocalMode::Copy);
                     }
                     (self.shortcut)(shortcut);
                 }
@@ -1110,7 +1136,7 @@ impl State {
         }
     }
     fn wheel(&mut self, delta: i16, mods: KeyModifiers) -> bool {
-        if self.modal || self.switcher || self.picker || self.hints {
+        if self.modal || self.switcher || self.picker || self.local_mode.is_some() {
             return false;
         }
         let Some(target) = &self.target else {
@@ -1171,6 +1197,7 @@ impl From<Action> for Shortcut {
             Action::Workspaces => Self::Workspaces,
             Action::PanePicker => Self::PanePicker,
             Action::KeyboardHints => Self::KeyboardHints,
+            Action::CopyMode => Self::CopyMode,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
             Action::NewTab => Self::NewTab,
@@ -1391,8 +1418,8 @@ mod tests {
             window: None,
             search: false,
             picker: false,
-            hints: false,
-            hint_held: HashSet::new(),
+            local_mode: None,
+            local_held: HashSet::new(),
             wheel_panes: WheelPanes::default(),
             wheel_remainder: 0,
             zoom_remainder: 0,
@@ -1459,7 +1486,7 @@ mod tests {
             new_input.try_recv().is_err(),
             "picker input reached the shell"
         );
-        state.hints = true;
+        state.local_mode = Some(LocalMode::Hints);
         let hint = |msg, repeat| MSG {
             message: msg,
             wParam: WPARAM(b'C' as usize),
@@ -1468,12 +1495,47 @@ mod tests {
         };
         assert!(state.handle(&hint(WM_KEYDOWN, false)));
         assert!(state.handle(&hint(WM_CHAR, false)));
-        state.hints = false;
+        state.local_mode = None;
         assert!(state.handle(&hint(WM_KEYDOWN, true)));
         assert!(state.handle(&hint(WM_KEYUP, false)));
         assert!(
             new_input.try_recv().is_err(),
             "a hint key reached the terminal after dismissal"
+        );
+        state.local_mode = Some(LocalMode::Copy);
+        let moves = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let got = moves.clone();
+        state.shortcut = Box::new(move |event| got.borrow_mut().push(event));
+        let key = |msg, vk, repeat| MSG {
+            message: msg,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        for event in [
+            key(WM_KEYDOWN, 0x26, false),
+            key(WM_KEYDOWN, 0x26, true),
+            key(WM_KEYUP, 0x26, false),
+            key(WM_CHAR, 0x71, false),
+            key(WM_KEYDOWN, 0x1b, false),
+        ] {
+            assert!(state.handle(&event));
+        }
+        state.local_mode = None;
+        assert!(state.handle(&key(WM_KEYDOWN, 0x1b, true)));
+        assert!(state.handle(&key(WM_KEYUP, 0x1b, false)));
+        use w11term::copy_mode::CopyKey;
+        assert_eq!(
+            *moves.borrow(),
+            [
+                Shortcut::CopyKey(CopyKey::Up),
+                Shortcut::CopyKey(CopyKey::Up),
+                Shortcut::CopyKey(CopyKey::Cancel)
+            ]
+        );
+        assert!(
+            new_input.try_recv().is_err(),
+            "copy mode or its closing key release reached the shell"
         );
         state.game_mode = true;
         let key_message = |message, repeat| MSG {

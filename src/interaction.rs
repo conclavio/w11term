@@ -128,15 +128,29 @@ impl Selection {
         if self.alternate != frame.alternate || self.cols != frame.cols || !self.active {
             return String::new();
         }
-        let mut output = String::new();
-        let mut previous_wrapped = false;
-        let mut first = true;
         let mut lines = self.lines.clone();
         for (i, line) in frame.rows.iter().enumerate() {
             lines.insert(frame.first_stable_row + i as isize, line.clone());
         }
-        for (row, line) in &lines {
-            let Some(range) = self.span(*row, frame.cols) else {
+        self.text_from_rows(
+            lines.iter().map(|(row, line)| (*row, &**line)),
+            trim_block,
+            usize::MAX,
+        )
+        .expect("unlimited selection")
+    }
+
+    pub(crate) fn text_from_rows<'a>(
+        &self,
+        lines: impl Iterator<Item = (isize, &'a wezterm_term::Line)>,
+        trim_block: bool,
+        limit: usize,
+    ) -> Result<String, &'static str> {
+        let mut output = String::new();
+        let mut previous_wrapped = false;
+        let mut first = true;
+        for (row, line) in lines {
+            let Some(range) = self.span(row, self.cols) else {
                 continue;
             };
             if !first && (self.block || !previous_wrapped) {
@@ -165,13 +179,16 @@ impl Selection {
                     column += 1;
                 }
             }
-            previous_wrapped = line.last_cell_was_wrapped() && range.end == frame.cols;
+            previous_wrapped = line.last_cell_was_wrapped() && range.end == self.cols;
             if (self.block && trim_block) || (!self.block && !previous_wrapped) {
                 text.truncate(text.trim_end().len());
             }
+            if output.len().saturating_add(text.len()) > limit {
+                return Err("Selection exceeds the clipboard size limit");
+            }
             output.push_str(&text);
         }
-        output
+        Ok(output)
     }
 }
 
