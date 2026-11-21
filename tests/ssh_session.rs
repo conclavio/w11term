@@ -105,14 +105,20 @@ impl server::Handler for Peer {
     }
     async fn window_change_request(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         cols: u32,
         rows: u32,
         _width: u32,
         _height: u32,
-        _session: &mut server::Session,
+        session: &mut server::Session,
     ) -> Result<(), Self::Error> {
         self.events.send(Observed::Resize(cols, rows)).unwrap();
+        if (cols, rows) == (113, 37) {
+            session.data(
+                channel,
+                b"\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[>0q".as_slice(),
+            )?;
+        }
         Ok(())
     }
     async fn data(
@@ -291,6 +297,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                 label: "loopback".into(),
                 active: false,
                 visible: false,
+                read_only: false,
                 input: session.input.clone(),
             }]);
             let discovery = tempfile::tempdir().unwrap();
@@ -352,6 +359,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
             .await
             .unwrap();
             assert!(!reply.ok);
+            verify_read_only(&session, &mut observed, pid).await;
             // Discovery is removed, the socket disappears, and no fallback server is started.
             drop(server);
             assert!(control::call(pid, &Request::List).await.is_err());
@@ -393,6 +401,99 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
     })
     .await
     .expect("loopback SSH session timed out");
+}
+
+async fn verify_read_only(
+    session: &Session,
+    observed: &mut mpsc::UnboundedReceiver<Observed>,
+    pid: Option<u32>,
+) {
+    use wezterm_term::{MouseButton, MouseEvent, MouseEventKind};
+    let modes = b"\0sync:\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[?2004h";
+    let (reply, result) = tokio::sync::oneshot::channel();
+    session
+        .input
+        .send(Command::Raw(modes.to_vec(), reply))
+        .unwrap();
+    result.await.unwrap().unwrap();
+    assert_eq!(
+        next(observed, session).await,
+        Observed::Data(modes.to_vec())
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let f = session.frames.load();
+        if f.alternate && f.mouse_grabbed {
+            break;
+        }
+        assert!(session.frames.changed(f.generation, deadline).await);
+    }
+    session.input.send(Command::SetReadOnly(true)).unwrap();
+    for input in [
+        Command::Key {
+            key: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            down: true,
+            repeat: false,
+        },
+        Command::DetailedKey {
+            key: KeyCode::Char('a'),
+            details: Default::default(),
+            modifiers: KeyModifiers::NONE,
+            down: true,
+            repeat: false,
+        },
+        Command::Text("text".into()),
+        Command::Composed("変換".into()),
+        Command::Paste("bracketed".into()),
+        Command::Mouse(MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            x: 1,
+            y: 1,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        }),
+        Command::Wheel(-1, KeyModifiers::NONE),
+    ] {
+        session.input.send(input).unwrap();
+    }
+    let reply = control::call(
+        pid,
+        &Request::SendText {
+            pane: 7,
+            data_base64: "eA==".into(),
+            no_paste: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!reply.ok && reply.error.unwrap().contains("read-only"));
+    session
+        .input
+        .send(Command::Resize(TerminalSize {
+            cols: 113,
+            rows: 37,
+            ..Default::default()
+        }))
+        .unwrap();
+    // Every blocked command preceded this resize; the server asks for a
+    // terminal version after observing it, while the pane is still locked.
+    assert_eq!(next(observed, session).await, Observed::Resize(113, 37));
+    assert_eq!(
+        next(observed, session).await,
+        Observed::Data(format!("\x1bP>|w11term {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes())
+    );
+    session.input.send(Command::SetReadOnly(false)).unwrap();
+    session
+        .input
+        .send(Command::Composed("ready".into()))
+        .unwrap();
+    assert_eq!(
+        next(observed, session).await,
+        Observed::Data(b"ready".to_vec())
+    );
 }
 
 async fn next(observed: &mut mpsc::UnboundedReceiver<Observed>, session: &Session) -> Observed {

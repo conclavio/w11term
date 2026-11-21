@@ -16,6 +16,8 @@ use presentation::Presentation;
 
 #[derive(Debug)]
 pub enum Command {
+    /// Ordered with both native input and control-pipe writes on this pane.
+    SetReadOnly(bool),
     /// Input method committed text has no corresponding physical key presses.
     Composed(String),
     Observe(tokio::sync::oneshot::Sender<tokio::sync::broadcast::Receiver<Vec<u8>>>),
@@ -353,6 +355,7 @@ async fn run(
     let mut status;
     let mut total_bytes = 0u64;
     let mut scroll_offset = 0usize;
+    let mut read_only = false;
     let mut last_mouse = MouseEvent {
         kind: wezterm_term::MouseEventKind::Move,
         x: 0,
@@ -499,11 +502,32 @@ async fn run(
                 presentation.dirty=true;
             }
             command = commands.recv() => {
+                let command = if read_only {
+                    match command {
+                        Some(Command::Raw(_, reply)) => {
+                            let _ = reply.send(Err("Pane input is read-only".into()));
+                            continue;
+                        }
+                        Some(Command::Key { .. } | Command::DetailedKey { .. } | Command::Mouse(_)
+                            | Command::Text(_) | Command::Paste(_) | Command::Composed(_)) => continue,
+                        Some(Command::Wheel(lines, _)) => Some(Command::Scroll(lines)),
+                        other => other,
+                    }
+                } else { command };
                 let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
                     Some(Command::Shutdown) | None => break,
+                    Some(Command::SetReadOnly(enabled)) => {
+                        read_only = enabled;
+                        if enabled && matches!(last_mouse.button, wezterm_term::MouseButton::Left | wezterm_term::MouseButton::Middle | wezterm_term::MouseButton::Right)
+                            && last_mouse.kind != wezterm_term::MouseEventKind::Release {
+                            let release = MouseEvent { kind: wezterm_term::MouseEventKind::Release, ..last_mouse };
+                            last_mouse.button = wezterm_term::MouseButton::None;
+                            terminal.mouse_event(release)
+                        } else { Ok(()) }
+                    }
                     Some(Command::Observe(reply))=>{let _=reply.send(observed.subscribe());Ok(())},
                     Some(Command::Record{path,reply})=>{
                         let result=(||->anyhow::Result<serde_json::Value>{

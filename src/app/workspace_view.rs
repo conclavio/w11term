@@ -4,6 +4,8 @@ use w11term::workspace::{SavedLayout, SavedSource, SshStartup, Workspace, Worksp
 #[derive(Default)]
 pub(super) struct WorkspacePage {
     name: String,
+    query: String,
+    switching: bool,
     names: Vec<String>,
     status: String,
     startup: Option<StartupEditor>,
@@ -59,6 +61,9 @@ pub enum WorkspaceAction {
     ApplyStartup(TabId),
     CancelStartup(TabId),
     Name(TabId, String),
+    Search(TabId, String),
+    Switch(TabId, String),
+    Switched(TabId, Result<(), String>),
     Save(TabId),
     Open(TabId, String),
 }
@@ -185,14 +190,52 @@ impl TerminalApp {
                     page.name = value;
                 }
             }
+            WorkspaceAction::Search(id, query) => {
+                if let Some(page) = self.workspace_page_mut(id) {
+                    page.query = query;
+                }
+            }
+            WorkspaceAction::Switch(id, name) => {
+                let Some(page) = self.workspace_page_mut(id) else {
+                    return;
+                };
+                if page.switching {
+                    return;
+                }
+                page.switching = true;
+                page.status = format!("Switching to {name}…");
+                let profiles = self.store.path().to_owned();
+                context.spawn_background(move |_| {
+                    let result = crate::workspace_window::switch(&name, &profiles)
+                        .map_err(|error| format!("{error:#}"));
+                    Message::Workspace(WorkspaceAction::Switched(id, result))
+                });
+            }
+            WorkspaceAction::Switched(id, result) => {
+                let Some(page) = self.workspace_page_mut(id) else {
+                    return;
+                };
+                page.switching = false;
+                page.status.clear();
+                match result {
+                    Ok(_) if self.tabs.headers().len() > 1 => self.close_tab(id, context),
+                    Ok(_) => {}
+                    Err(error) => self.workspace_page_mut(id).unwrap().status = error,
+                }
+            }
             WorkspaceAction::Save(id) => {
                 let Some(page) = self.workspace_page_mut(id) else {
                     return;
                 };
                 let name = page.name.trim().to_owned();
-                let result = self
-                    .capture_workspace()
-                    .and_then(|workspace| WorkspaceStore::open()?.save(&name, &workspace));
+                let result = self.capture_workspace().and_then(|workspace| {
+                    crate::workspace_window::save(
+                        &name,
+                        self.store.path(),
+                        &workspace,
+                        &self._control,
+                    )
+                });
                 if let Some(page) = self.workspace_page_mut(id) {
                     page.status = match result {
                         Ok(()) => {
@@ -407,19 +450,49 @@ impl TerminalApp {
         if !page.names.is_empty() {
             children.push(KeyedView::new(
                 "list",
-                TextBlock::new().text("Open in new tabs").font_size(18.0),
+                TextBlock::new().text("Switch workspace").font_size(18.0),
+            ));
+            children.push(KeyedView::new(
+                "filter",
+                TextBox::new()
+                    .automation_name("Find workspace")
+                    .placeholder_text("Find workspace")
+                    .text(&page.query)
+                    .on_text_changed(context.callback(move |query| {
+                        Message::Workspace(WorkspaceAction::Search(id, query))
+                    })),
             ));
         }
-        for name in &page.names {
+        let mut matches = matching_names(&page.names, &page.query).peekable();
+        if !page.names.is_empty() && matches.peek().is_none() {
+            children.push(KeyedView::new(
+                "no-matches",
+                TextBlock::new().text("No matching workspaces"),
+            ));
+        }
+        for name in matches {
+            let switch = name.clone();
             let saved = name.clone();
             children.push(KeyedView::new(
                 format!("workspace-{name}"),
-                Button::new()
-                    .automation_name(format!("Open workspace {name} in new tabs"))
-                    .on_click(context.callback(move |_| {
-                        Message::Workspace(WorkspaceAction::Open(id, saved.clone()))
-                    }))
-                    .content(name.as_str()),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .is_enabled(!page.switching)
+                            .automation_name(format!("Switch to workspace {name}"))
+                            .on_click(context.callback(move |_| {
+                                Message::Workspace(WorkspaceAction::Switch(id, switch.clone()))
+                            }))
+                            .content(name.as_str()),
+                        Button::new()
+                            .automation_name(format!("Open workspace {name} in new tabs"))
+                            .on_click(context.callback(move |_| {
+                                Message::Workspace(WorkspaceAction::Open(id, saved.clone()))
+                            }))
+                            .content("Append in this window"),
+                    )),
             ));
         }
         ScrollViewer::new().content(
@@ -431,6 +504,13 @@ impl TerminalApp {
                 .keyed_children(children),
         )
     }
+}
+
+fn matching_names<'a>(names: &'a [String], query: &str) -> impl Iterator<Item = &'a String> {
+    let query = query.trim().to_lowercase();
+    names
+        .iter()
+        .filter(move |name| name.to_lowercase().contains(&query))
 }
 
 /// Resolve every source before starting connections, including when opening a workspace at launch.
@@ -663,6 +743,17 @@ mod tests {
     use super::*;
     use w11term::pane_layout::{Axis, Layout};
     use w11term::workspace::WorkspaceTab;
+
+    #[test]
+    fn workspace_search_preserves_names_and_matches_case_insensitive_substrings() {
+        let names = vec![String::from("Admin console"), String::from("Test rig")];
+        assert_eq!(
+            matching_names(&names, "  CoNs  ").collect::<Vec<_>>(),
+            [&names[0]]
+        );
+        assert_eq!(matching_names(&names, "").count(), 2);
+        assert_eq!(matching_names(&names, "absent").count(), 0);
+    }
 
     fn demo(slot: u64) -> SavedLayout {
         SavedLayout::Leaf {

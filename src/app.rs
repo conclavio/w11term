@@ -16,9 +16,7 @@ use w11term::{
     interaction::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
-    options::{
-        Authentication, LocalOptions, Options, Source, SshOptions, TerminalType, profile_source,
-    },
+    options::{Authentication, LocalOptions, Source, SshOptions, TerminalType, profile_source},
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
@@ -61,6 +59,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    read_only: Rc<Cell<bool>>,
     startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
     files: Box<FileDrawer>,
@@ -352,6 +351,8 @@ fn tab_menu_message(label: String) -> Message {
         "Resize down" => Message::Shortcut(Shortcut::ResizePane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
+        "Enable read-only pane input" => Message::SetPaneReadOnly(true),
+        "Disable read-only pane input" => Message::SetPaneReadOnly(false),
         "Move pane to new tab" => Message::MovePaneToTab,
         "Move pane to existing tab…" => Message::Shortcut(Shortcut::MovePaneToExistingTab),
         "Paste" => Message::Paste,
@@ -460,6 +461,7 @@ pub enum Message {
     ClosePane,
     MovePaneToTab,
     PaneFocus(TabId),
+    SetPaneReadOnly(bool),
     PaneRatio(u64, Vec<bool>, f64),
     HoverPane(TabId),
     DividerPress(u64, Vec<bool>, f64),
@@ -574,6 +576,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             profile_name: None,
             surface: PaneSurface::default(),
             device_busy: false,
+            read_only: Rc::default(),
             device_message: None,
             session,
             last_size: Rc::new(Cell::new(None)),
@@ -686,7 +689,11 @@ impl TerminalApp {
         if changed {
             self.keyboard
                 .set_target(if prompt_id.is_none() && !tab.device_busy && !choosing {
-                    Some((tab.session.input.clone(), tab.session.frames.clone()))
+                    Some((
+                        tab.session.input.clone(),
+                        tab.session.frames.clone(),
+                        tab.read_only.clone(),
+                    ))
                 } else {
                     None
                 });
@@ -932,6 +939,9 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if tab.read_only.get() {
+                return;
+            }
             match w11term::clipboard::read() {
                 Ok(text) => {
                     if raw {
@@ -1071,6 +1081,7 @@ impl TerminalApp {
         let local_drag = tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
             || tab.clicked_link.is_some();
         if frame.mouse_grabbed
+            && !tab.read_only.get()
             && !local_drag
             && !modifiers.contains(KeyModifiers::SHIFT)
             && !(modifiers.contains(KeyModifiers::CTRL) && link.is_some())
@@ -1497,6 +1508,7 @@ impl TerminalApp {
                         .title_for(entry.id)
                         .map(|title| title.as_str().to_owned()),
                     visible: self.tabs.visible(entry.id),
+                    read_only: tab.read_only.get(),
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
@@ -1636,7 +1648,11 @@ impl TerminalApp {
             Some(AppTab {
                 page: Page::Terminal(tab),
                 ..
-            }) => Some((tab.session.input.clone(), tab.session.frames.clone())),
+            }) => Some((
+                tab.session.input.clone(),
+                tab.session.frames.clone(),
+                tab.read_only.clone(),
+            )),
             _ => None,
         };
         self.keyboard.set_target(target);
@@ -1656,6 +1672,13 @@ impl TerminalApp {
             }));
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
+            if let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+            {
+                tab.follow_shell_directory(&tab.session.frames.load(), context);
+            }
         }
         self.keyboard.set_search(
             matches!(self.tabs.active(),Some(AppTab{page:Page::Terminal(tab),..}) if tab.find.open && tab.prompt_id.is_none()),
@@ -2270,6 +2293,7 @@ impl TerminalApp {
     }
 
     fn caret_items(&self) -> Vec<MenuItem> {
+        let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
             _ => None,
@@ -2300,12 +2324,8 @@ impl TerminalApp {
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             MenuItem::item("inbox", "Attention inbox"),
-            command_menu_item("paste", "Paste", player.is_some()),
-            command_menu_item(
-                "paste-raw",
-                "Paste raw (no bracketed paste)",
-                player.is_some(),
-            ),
+            command_menu_item("paste", "Paste", can_paste),
+            command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
             MenuItem::separator("paste-end"),
             MenuItem::item("settings", "Settings"),
             self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
@@ -2407,6 +2427,16 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if matches!(live.source, Source::Ssh(_) | Source::Local(_)) {
+                items.push(MenuItem::item(
+                    "pane-read-only",
+                    if live.read_only.get() {
+                        "Disable read-only pane input"
+                    } else {
+                        "Enable read-only pane input"
+                    },
+                ));
+            }
             items.push(match live.session.frames.load().copy_output_unavailable() {
                 Some(why) => MenuItem::disabled(
                     "copy-last-output",
@@ -2790,10 +2820,10 @@ impl TerminalApp {
 }
 
 impl Component for TerminalApp {
-    type Input = Options;
+    type Input = crate::workspace_window::Launch;
     type Message = Message;
 
-    fn create(options: &Options, context: &ComponentContext<Self>) -> Self {
+    fn create((options, opening): &Self::Input, context: &ComponentContext<Self>) -> Self {
         let sender = context.sender();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(Message::Shortcut(shortcut));
@@ -2881,7 +2911,7 @@ impl Component for TerminalApp {
             })
             .unwrap_or((1120.0, 760.0));
         let osc52 = appearance.read().unwrap().interaction.osc52;
-        if let Some(workspace) = &options.workspace {
+        if let Some(workspace) = opening.as_ref().map(|window| &window.layout) {
             workspace_view::append_resolved_workspace(
                 &mut tabs,
                 &workspace.layout,
@@ -2917,7 +2947,7 @@ impl Component for TerminalApp {
                 Some(w11term::pane_layout::Layout::Leaf(_))
             )
         });
-        let registry = Registry::default();
+        let registry = Registry::for_workspace(opening.as_ref().map(|window| window.key.clone()));
         let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
         let inbox = w11term::events::Inbox::new(move || {
@@ -2939,6 +2969,9 @@ impl Component for TerminalApp {
             crate::renderer::screenshot_with_font(frame, size, path, &appearance)
         })
         .expect("starting local control pipe");
+        if let Some(window) = opening {
+            window.published();
+        }
         let mut app = Self {
             inbox,
             accessible: Default::default(),
@@ -3257,6 +3290,7 @@ impl Component for TerminalApp {
                         self.keyboard.set_target(Some((
                             tab.session.input.clone(),
                             tab.session.frames.clone(),
+                            tab.read_only.clone(),
                         )));
                     }
                 }
@@ -3656,6 +3690,7 @@ impl Component for TerminalApp {
             Message::FrameReady(id, epoch) => {
                 if self.tabs.visible(id) && self.watch_epoch == epoch {
                     self.frame_tasks.remove(&id);
+                    let active = self.tabs.active_id() == Some(id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -3683,6 +3718,9 @@ impl Component for TerminalApp {
                         }
                         tab.error = None;
                         tab.files.observe_connection(frame.connection_generation);
+                        if active {
+                            tab.follow_shell_directory(&frame, context);
+                        }
                         let unavailable = frame.copy_output_unavailable();
                         if tab.copy_output_unavailable != unavailable {
                             tab.copy_output_unavailable = unavailable;
@@ -3695,7 +3733,7 @@ impl Component for TerminalApp {
                             self.header.borrow_mut().take();
                         }
                     }
-                    if self.tabs.active_id() == Some(id) {
+                    if active {
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
@@ -3747,6 +3785,20 @@ impl Component for TerminalApp {
                 let _ = context.window().request_close();
             }
             Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::SetPaneReadOnly(enabled) => {
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    && matches!(live.source, Source::Ssh(_) | Source::Local(_))
+                {
+                    KeyboardBridge::set_read_only(&live.session.input, &live.read_only, enabled);
+                    live.remote_button = MouseButton::None;
+                    live.surface.invalidator.invalidate();
+                    self.publish_panes();
+                }
+            }
             Message::PaneRatio(epoch, path, ratio) => {
                 if epoch == self.watch_epoch && self.dragging_divider(epoch, &path) {
                     self.tabs.set_ratio(&path, ratio);
@@ -4308,7 +4360,7 @@ impl Component for TerminalApp {
         }
     }
 
-    fn view(&self, _options: &Options, context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         if let Some(AppTab {
             label,
             page: Page::Terminal(tab),
