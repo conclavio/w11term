@@ -65,7 +65,9 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 The **Inbox** button beside the tab menu shows how many bells and terminal notifications are unread across this window. The inbox keeps the newest 128 alerts, including alerts from background tabs and splits. Select a message to mark it read and focus its source pane. **Mark all read** acknowledges the remaining messages, and **Clear inbox** empties the list. Both leave the per-pane control event journals available to scripts.
 
-Choose **caret → Panes → Open files here** to open the drawer at the directory the focused shell last reported with OSC 7. For example, `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s existing SSH connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. An absent, invalid or foreign-host report opens the usual SFTP working directory. The drawer stays where you opened it until you navigate or choose the action again.
+Choose **caret → Panes → Open files here** to open the drawer at the directory the focused shell last reported with OSC 7. For example, `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s existing SSH connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. An absent, invalid or foreign-host report opens the usual SFTP working directory.
+
+Check **Follow shell directory** in the drawer to track later directory changes from that shell. The drawer waits for active transfers and file pickers to finish, then reads the latest reported directory when visible. It ignores invalid and foreign-host reports. Opening a folder manually or revealing a file turns following off for that pane.
 
 **Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.
 

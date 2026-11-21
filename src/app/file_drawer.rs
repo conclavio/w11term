@@ -11,13 +11,14 @@ const PAGE_SIZE: usize = 32;
 pub enum FileAction {
     Toggle,
     OpenHere,
+    Follow(u64, u64, bool),
     Reveal(u64, u64, String, Option<String>),
     Close(u64),
     Browse(u64, u64, String),
     Choose(u64, String),
     Page(u64, usize),
     Replace(u64, u64, bool),
-    Pick(u64, u64, Option<String>),
+    Pick(u64, u64, String, Option<String>),
     Picked(u64, u64, Option<String>, Result<Option<PathBuf>, String>),
     Drop(u64, u64, String, Vec<PathBuf>),
     Listed(u64, u64, String, Result<Vec<Entry>, String>),
@@ -29,6 +30,8 @@ pub(super) struct FileDrawer {
     pub(super) open: bool,
     generation: u64,
     directory: Option<String>,
+    following: bool,
+    last_report: Option<Arc<str>>,
     entries: Vec<Entry>,
     page: usize,
     selected: Option<String>,
@@ -256,10 +259,22 @@ impl FileDrawer {
         };
         *self = Self {
             open: self.open,
+            following: self.following,
             generation,
             status: status.into(),
             ..Self::default()
         };
+    }
+
+    /// Sample only when ready to browse. A burst during a transfer or listing is
+    /// coalesced into the latest report, without changing any transfer destination.
+    fn follow_target(&mut self, report: &Option<Arc<str>>, host: &str) -> Option<String> {
+        if !self.open || !self.following || self.busy() || self.last_report == *report {
+            return None;
+        }
+        self.last_report.clone_from(report);
+        shell_directory(report.as_deref(), host)
+            .filter(|path| Some(path) != self.directory.as_ref())
     }
 
     fn panel(&self, pane: u64, ssh: &SshOptions, context: &ViewContext<TerminalApp>) -> View {
@@ -311,7 +326,11 @@ impl FileDrawer {
                         ),
                     ),
                     button("Refresh", ready, Browse(pane, generation, folder.into())),
-                    button("Upload…", writable, Pick(pane, generation, None)),
+                    button(
+                        "Upload…",
+                        writable,
+                        Pick(pane, generation, folder.into(), None),
+                    ),
                 )),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
@@ -325,9 +344,15 @@ impl FileDrawer {
                     button(
                         "Download…",
                         ready && selected.is_some_and(|e| e.directory != Some(true)),
-                        Pick(pane, generation, path),
+                        Pick(pane, generation, folder.into(), path),
                     ),
                 )),
+            CheckBox::new()
+                .is_checked(self.following)
+                .on_is_checked_changed(
+                    context.callback(move |v| Message::Files(Follow(pane, generation, v))),
+                )
+                .content(TextBlock::new().text("Follow shell directory")),
             CheckBox::new()
                 .is_enabled(ready)
                 .is_checked(self.replace)
@@ -643,6 +668,34 @@ impl FileDrawer {
     }
 }
 
+impl LiveTab {
+    pub(super) fn follow_shell_directory(
+        &mut self,
+        frame: &w11term::terminal::Snapshot,
+        context: &ComponentContext<TerminalApp>,
+    ) {
+        if !self.files.following || !self.files.open {
+            return;
+        }
+        let Source::Ssh(ssh) = &self.source else {
+            return;
+        };
+        self.files.observe_connection(frame.connection_generation);
+        if let Some(path) = self
+            .files
+            .follow_target(&frame.reported_directory, &ssh.host)
+        {
+            self.files.cached.borrow_mut().take();
+            if let Err(error) =
+                self.files
+                    .browse(self.session.pane_id, &self.session, path, context)
+            {
+                self.files.status = format!("{error:#}");
+            }
+        }
+    }
+}
+
 impl TerminalApp {
     pub(super) fn with_file_drawer(&self, content: View, context: &ViewContext<Self>) -> View {
         let Some(AppTab {
@@ -682,6 +735,7 @@ impl TerminalApp {
                 None => return,
             },
             Close(id)
+            | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
             | Choose(id, _)
@@ -714,7 +768,7 @@ impl TerminalApp {
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
+        if matches!(&action, Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
         {
             return;
         }
@@ -744,9 +798,16 @@ impl TerminalApp {
                 Close(_) => {
                     files.open = false;
                 }
+                Follow(_, _, enabled) => {
+                    if files.open && files.following != enabled {
+                        files.following = enabled;
+                        files.last_report = None;
+                    }
+                }
                 Reveal(_, _, directory, name) => {
                     if !files.busy() {
                         files.open = true;
+                        files.following = false;
                         self.initial_grid.set(None);
                         crate::input::clear_grid();
                         files.browse(pane, session, directory, context)?;
@@ -797,7 +858,12 @@ impl TerminalApp {
                     }
                 }
                 _ if files.busy() || !files.open => {}
-                Browse(_, _, path) => files.browse(pane, session, path, context)?,
+                Browse(_, _, path) => {
+                    if files.directory.as_ref() != Some(&path) {
+                        files.following = false;
+                    }
+                    files.browse(pane, session, path, context)?;
+                }
                 Choose(_, name) => files.selected = Some(name),
                 Page(_, page) => {
                     files.page = page.min(files.entries.len().saturating_sub(1) / PAGE_SIZE);
@@ -817,7 +883,11 @@ impl TerminalApp {
                     files.uploads.extend(paths);
                     files.upload_next(pane, session, context)?;
                 }
-                Pick(_, _, remote) => {
+                Pick(_, _, directory, remote) => {
+                    ensure!(
+                        files.directory.as_ref() == Some(&directory),
+                        "The directory changed. Select the file operation again."
+                    );
                     let owner = crate::input::window().context("Window is not ready")?.0 as usize;
                     files.picking = true;
                     let generation = files.generation;
@@ -851,6 +921,9 @@ impl TerminalApp {
             files.uploads.clear();
             files.status = format!("{error:#}");
             files.cached.borrow_mut().take();
+        }
+        if visible {
+            tab.follow_shell_directory(&frame, context);
         }
     }
 }
@@ -1005,6 +1078,55 @@ impl TerminalApp {
             7 => {
                 assert_eq!(files.selected.as_deref(), Some("trace.rs"));
                 assert!(self.hints.borrow().is_none());
+                self.file_action(FileAction::Follow(pane, files.generation, true), context);
+                9
+            }
+            9 => {
+                assert_eq!(
+                    files.directory.as_deref(),
+                    Some("/shell directory"),
+                    "{status}"
+                );
+                // The loopback shell echoes terminal output over the established SSH channel.
+                let (ack, _) = oneshot::channel();
+                tab.session
+                    .input
+                    .send(Command::Raw(
+                        b"\x1b]7;file://127.0.0.1/shell%20directory/src\x07".to_vec(),
+                        ack,
+                    ))
+                    .unwrap();
+                10
+            }
+            10 if files.directory.as_deref() != Some("/shell directory/src") => 10,
+            10 => {
+                assert!(files.entries.iter().any(|entry| entry.name == "trace.rs"));
+                self.file_action(
+                    FileAction::Browse(pane, files.generation, "/".into()),
+                    context,
+                );
+                11
+            }
+            11 => {
+                assert_eq!(files.directory.as_deref(), Some("/"), "{status}");
+                assert!(!files.following);
+                let (ack, _) = oneshot::channel();
+                tab.session
+                    .input
+                    .send(Command::Raw(
+                        b"\x1b]7;file://127.0.0.1/shell%20directory\x07".to_vec(),
+                        ack,
+                    ))
+                    .unwrap();
+                12
+            }
+            12 if tab.session.frames.load().reported_directory.as_deref()
+                != Some("file://127.0.0.1/shell%20directory") =>
+            {
+                12
+            }
+            12 => {
+                assert_eq!(files.directory.as_deref(), Some("/"));
                 let groups: Vec<_> = self.tabs.headers().into_iter().map(|h| h.id).collect();
                 for group in groups {
                     self.close_tab(group, context);
@@ -1025,6 +1147,47 @@ impl TerminalApp {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn follow_coalesces_reports_while_busy_and_ignores_stale_or_foreign_reports() {
+        let mut drawer = FileDrawer {
+            following: true,
+            open: true,
+            directory: Some("/a".into()),
+            ..Default::default()
+        };
+        let report = |s: &str| Some(Arc::<str>::from(s));
+        assert!(
+            drawer
+                .follow_target(&report("file://peer/a"), "peer")
+                .is_none()
+        );
+        drawer.picking = true;
+        assert!(
+            drawer
+                .follow_target(&report("file://peer/b"), "peer")
+                .is_none()
+        );
+        drawer.picking = false;
+        let latest = report("file://peer/c");
+        assert_eq!(drawer.follow_target(&latest, "peer").as_deref(), Some("/c"));
+        assert!(drawer.follow_target(&latest, "peer").is_none());
+        assert!(
+            drawer
+                .follow_target(&report("file://other/d"), "peer")
+                .is_none()
+        );
+        drawer.open = false;
+        assert!(
+            drawer
+                .follow_target(&report("file://peer/z"), "peer")
+                .is_none()
+        );
+        drawer.open = true;
+        drawer.observe_connection(2);
+        assert!(drawer.following);
+        assert_eq!(drawer.follow_target(&latest, "peer").as_deref(), Some("/c"));
+    }
 
     #[test]
     fn shell_directory_uses_only_an_absolute_path_on_this_ssh_host() {
