@@ -83,9 +83,18 @@ snapshots, resizing, scrolling, parent deletion and error replies.
 The `Kitty graphics reference` workflow runs two independent Linux jobs under
 Xvfb with Mesa software GL. One captures Ubuntu 24.04's kitty 0.32.2. The
 other captures Ghostty 1.4.0, the release that added animation and relative
-placements. Its container image is pinned by digest and its signed packages
-come from the November 12 Arch Linux Archive. Both jobs run on pull requests
-and feed the merge release check. [Ghostty release notes](https://ghostty.org/docs/install/release-notes/1-4-0) · [Arch Linux package](https://archlinux.org/packages/extra/x86_64/ghostty/)
+placements. Both jobs run on pull requests and feed the merge release check.
+[Ghostty release notes](https://ghostty.org/docs/install/release-notes/1-4-0)
+
+The Ghostty job runs on GitHub’s Ubuntu 26.04 x64 image. It downloads the
+community-built `ghostty_1.4.0-0.ppa2_amd64_26.04.deb` from
+`mkasberg/ghostty-ubuntu` release `1.4.0-0-ppa2`. Before installing, it
+checks SHA-256 `2d70bf419494362dffb6463d8ff3ab76c3fd1b0e247ea9b0b0aeda5c2fa4c681`
+and the Debian package name, version and architecture. Ubuntu supplies the
+capture dependencies, including Mesa, GTK, Xvfb and DejaVu Sans Mono.
+The job checks the running Ghostty version and records the runner image and
+installed package versions alongside the captured PNG and cell samples.
+[Package release](https://github.com/mkasberg/ghostty-ubuntu/releases/tag/1.4.0-0-ppa2) · [Ubuntu 26.04 runner availability](https://github.com/actions/runner-images/issues/14747)
 
 To repeat either capture on Linux, install the corresponding terminal,
 Xvfb, xauth, xdotool, ImageMagick and Python with Pillow. Ghostty also uses
