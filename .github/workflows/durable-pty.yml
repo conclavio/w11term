@@ -16,3 +16,8 @@ jobs:
           persist-credentials: false
       - name: Check the editor, image and input after losing the PTY client
         run: sh tests/durable/run-linux.sh
+      - name: Discover and attach to an existing stock tmux session
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends tmux
+          python3 tests/durable/tmux_existing.py
