@@ -148,6 +148,7 @@ impl Reply {
 
 #[derive(Clone)]
 pub struct Pane {
+    pub read_only: bool,
     pub id: u64,
     pub tab_id: u64,
     pub tab_title: Option<String>,
@@ -383,6 +384,7 @@ impl Registry {
                     }
                     session["label"] = pane.label.into();
                     session["active"] = pane.active.into();
+                    session["read_only"] = pane.read_only.into();
                     session["visible"] = pane.visible.into();
                     sessions.push(session);
                 }

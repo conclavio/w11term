@@ -598,6 +598,7 @@ fn registry(session: &Session) -> Registry {
         label: "test".into(),
         active: false,
         visible: false,
+        read_only: false,
         input: session.input.clone(),
     }]);
     r

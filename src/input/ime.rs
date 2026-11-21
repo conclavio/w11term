@@ -177,6 +177,7 @@ fn eligible() -> bool {
         state.try_borrow().ok().is_some_and(|state| {
             state.as_ref().is_some_and(|s| {
                 s.target.is_some()
+                    && !s.is_read_only()
                     && !s.search
                     && !s.modal
                     && !s.switcher

@@ -217,6 +217,7 @@ impl TerminalApp {
         let window_grid = surface.window_grid.clone();
         let area = surface.area.clone();
         let selection = tab.selection.clone();
+        let read_only = tab.read_only.clone();
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
         let copy_mode = self.copy_mode.clone();
@@ -232,6 +233,7 @@ impl TerminalApp {
             let mode = copy_mode.borrow();
             let mode = mode.as_ref().filter(|m| m.pane == id);
             renderer.copy_cursor = mode.map(|m| m.state.cursor);
+            renderer.read_only = read_only.get();
             let marked = mode.and_then(|m| m.state.selection());
             let measured = renderer.draw(ctx, &frame)?;
             renderer.draw_interaction(
