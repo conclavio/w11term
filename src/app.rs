@@ -953,17 +953,17 @@ impl TerminalApp {
         }
         if prompt_id.is_some() {
             self.title_editor = None;
-            tab.files.cancel_name_edit();
+            tab.files.cancel_entry_dialog();
         }
         self.clipboard.connection_changed(
             tab.session.pane_id,
             frame.connection_generation,
-            prompt_id.is_some() || tab.read_only.get() || tab.files.editing_name(),
+            prompt_id.is_some() || tab.read_only.get() || tab.files.entry_dialog_open(),
         );
         self.keyboard.set_modal(
             prompt_id.is_some()
                 || self.title_editor.is_some()
-                || tab.files.editing_name()
+                || tab.files.entry_dialog_open()
                 || self.clipboard.is_open(),
         );
         let choosing = tab.browsing_sessions();
@@ -1850,7 +1850,7 @@ impl TerminalApp {
         self.bind_folder_shares();
         self.activate_folder_panel(context);
         self.title_editor = None;
-        self.cancel_inactive_name_editor();
+        self.cancel_inactive_entry_dialog();
         self.close_copy_mode();
         self.close_hints();
         self.sync_inspector();
@@ -5257,7 +5257,8 @@ impl Component for TerminalApp {
         }) = self.tabs.active()
             && self.title_editor.is_none()
             && tab.session.frames.load().prompt.is_none()
-            && let Some(dialog) = tab.files.name_dialog(tab.session.pane_id, context)
+            && let Source::Ssh(ssh) = &tab.source
+            && let Some(dialog) = tab.files.entry_dialog(tab.session.pane_id, ssh, context)
         {
             views.push(KeyedView::new("sftp-name-editor", dialog));
         }

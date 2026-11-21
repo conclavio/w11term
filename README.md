@@ -91,6 +91,10 @@ Select a file or directory and choose **Rename…** to change its name in the cu
 
 SFTP v3 requires the server to reject an existing destination. If another process creates the name between the check and the rename, enforcement depends on the server and filesystem. [SFTP v3 rename semantics](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5) · [OpenSSH implementation](https://github.com/openssh/openssh-portable/blob/V_10_2_P1/sftp-server.c#L1187-L1249)
 
+To remove a remote file, symbolic link or empty directory, select it in the SFTP drawer and choose **Delete…**. The confirmation shows the SSH destination, entry type and full remote path. Deleting a link leaves its target intact. A nonempty directory stays in place with its contents. After confirmation, w11term checks the entry type again on the same SSH connection. If the connection drops before the server acknowledges deletion, refresh the parent directory to check the outcome.
+
+SFTP v3 addresses entries by path. Another process can replace an entry between the final type check and the delete request. [SFTP file removal](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5) · [Directory removal](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6)
+
 ### Share a Windows folder with Linux
 
 Connect to a saved SSH profile, open **caret → Shared folders… → Add folder…**, and choose a local NTFS directory. Check the displayed SSH account, host and fingerprint. Enter a mount name and select **Save folder**. For example, sharing `C:\Projects\sprites` as `sprites` makes its files available at `~/windows/sprites` on Linux. New and existing folders default to **Read-only**.
