@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 
-from linux_pty import Client
+from linux_pty import Client, eventually
 
 
 INITIAL = (30, 100)
@@ -163,11 +163,29 @@ def run(args, root, name, mux, term):
                 assert b"\x1bPq" not in frame and not graphics, "unexpected default Sixel passthrough"
         print(f"{name}: input and resize {initial} -> {resized}", flush=True)
     finally:
+        primary_error = sys.exception()
         (args.out / f"{name}-full.vt").write_bytes(client.output)
         try:
-            subprocess.run(stop, env={**env, "TERM": term}, capture_output=True, timeout=8)
-        finally:
-            client.close()
+            try:
+                stopped = subprocess.run(stop, env={**env, "TERM": term},
+                                         capture_output=True, timeout=8)
+                if report.exists():
+                    stopped.check_returncode()
+            finally:
+                client.close()
+            if mux == "venti":
+                # 'venti kill' acknowledges the command before its daemon
+                # saves the session. The server removes its socket only after
+                # persisting the layout and joining its accept loop.
+                sock = runtime / "venti" / str(os.getuid()) / f"{name}.sock"
+                eventually(lambda: not sock.exists(), f"{name} did not finish shutting down")
+                if primary_error is None:
+                    snapshot = directory / ".local/state/venti/sessions" / f"{name}.toml"
+                    assert snapshot.is_file(), f"{name} session snapshot missing at shutdown"
+        except Exception as shutdown_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f"{name} shutdown also failed: {shutdown_error}")
 
 
 if __name__ == "__main__":
