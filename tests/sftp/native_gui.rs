@@ -189,6 +189,44 @@ fn drive_mixed_gui(script: &str, ssh: &SshOptions, state: &std::path::Path) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "verifies normal and raw clipboard paste decisions through WinUI and a reconnecting loopback peer"]
+async fn native_clipboard_paste_confirms_original_bytes_for_the_original_pane() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 3, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    fs::write(
+        state.path().join("peer-trace-path.txt"),
+        trace.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("clipboard-paste-ui.ps1", &ssh, state.path());
+    let wire = fs::read_to_string(trace).unwrap();
+    assert!(wire.ends_with("ssh-still-live/"));
+    assert!(wire.contains("\x1b[200~wrapped 雪\r\n\x1b[201~"));
+    assert!(wire.contains("raw 雪\r\n\t \r\n"));
+    assert!(!wire.contains("discard-"));
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "original and reconnected SSH transports"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one shell on each transport"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives OSC progress across a real SSH split, a reconnect and a PowerShell tab"]
 async fn native_terminal_progress_updates_background_tab_and_resets_on_reconnect() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 3).await else {
