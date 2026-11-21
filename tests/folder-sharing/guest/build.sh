@@ -24,8 +24,8 @@ apt-get -qq install -y --no-install-recommends mmdebstrap ubuntu-keyring kmod cp
 
 # Install SSH and FUSE only in the guest. mmdebstrap runs maintainer scripts
 # inside its private root and suppresses service startup during the bootstrap.
+# Noble's base-files owns the /usr symlinks and provides usr-is-merged.
 mmdebstrap --mode=root --variant=minbase --architectures=amd64 \
-    --hook-dir=/usr/share/mmdebstrap/hooks/merged-usr \
     --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
     --include=openssh-server,sshfs,fuse3,busybox-static,iproute2,util-linux,mount \
     --dpkgopt='path-exclude=/usr/share/doc/*' \
