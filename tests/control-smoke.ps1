@@ -102,6 +102,20 @@ try {
     $null = Invoke-Control @('wait-for-text', '--pane', [string]$opened.pane, '--timeout', '5', 'Loopback SSH echo')
     $listing = Invoke-Control @('list')
     if ($listing.sessions.Count -ne 3 -or -not $listing.sessions[1].active) { throw 'open changed active tab' }
+    $history = "search-archive this SSH line`r" + ("filler`r" * 45) + 'search-fixture-finished'
+    $null = Invoke-Control @('send-text', '--pane', '1', '--no-paste', '--base64', [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($history)))
+    $liveSearch = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '5', 'search-fixture-finished')
+    if ($liveSearch.text.Contains('search-archive')) { throw 'Scrollback search fixture still fits on screen' }
+    $all = Invoke-Control @('find-text', '--all-panes', 'SEARCH-ARCHIVE')
+    $found = @($all.panes | Where-Object { $_.count -gt 0 })
+    if ($all.panes.Count -ne 3 -or $found.Count -ne 1 -or $found[0].pane -ne 1 -or $found[0].count -ne 1 -or
+        $found[0].first.excerpt -cnotmatch 'search-archive this SSH line' -or $found[0].truncated) {
+        throw "find-text did not locate the offscreen SSH line in its original pane: $($all | ConvertTo-Json -Depth 5)"
+    }
+    $one = Invoke-Control @('find-text', '--pane', '1', 'search-archive')
+    if ($one.panes.Count -ne 1 -or $one.panes[0].first.row -ne $found[0].first.row -or
+        (Invoke-Control @('get-text', '--pane', '1')).text -cne $liveSearch.text -or
+        -not (Invoke-Control @('list')).sessions[1].active) { throw 'find-text changed the live screen or active pane' }
     $null = Invoke-Control @('resize', '--pane', '2', '--cols', '72', '--rows', '21')
     $capture = Join-Path $state 'recording.vt'
     $null = Invoke-Control @('record', '--pane', '1', $capture)

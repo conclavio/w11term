@@ -48,7 +48,7 @@ impl SshStartup {
         Ok(())
     }
 
-    pub(crate) fn check_target(&self, options: &SshOptions) -> Result<()> {
+    pub fn check_target(&self, options: &SshOptions) -> Result<()> {
         self.validate()?;
         ensure!(
             self.host.eq_ignore_ascii_case(&options.host)

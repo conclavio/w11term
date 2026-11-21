@@ -84,6 +84,8 @@ jobs:
       - name: Check the native fixtures' keyboard messages
         run: ./tests/fixture-keyboard-messages.ps1
       - name: Verify native SSH and ConPTY workflows, command notifications, durable panes and accessibility
+        env:
+          W11TERM_VERIFY_HOSTED_PASTE: '1'
         run: cargo test --locked --features ui-smoke --test accessibility --test durable_ssh --test sftp -- --ignored --test-threads=1
       - name: Copy Unicode text through the real OSC 52 clipboard path
         run: |

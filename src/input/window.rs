@@ -14,6 +14,7 @@ struct WindowData {
     ime: ime::WindowIme,
     hwnd: Cell<Option<HWND>>,
     active: Cell<bool>,
+    visible: Cell<bool>,
     on_activation: RefCell<Option<Activation>>,
 }
 
@@ -43,6 +44,11 @@ impl WindowScope {
 
     pub(crate) fn hwnd(&self) -> Option<HWND> {
         self.0.hwnd.get()
+    }
+
+    pub(super) fn refresh_visibility(&self, hwnd: HWND) -> bool {
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() };
+        self.0.visible.replace(visible) != visible
     }
 
     pub(crate) fn enter(&self) -> WindowGuard {
@@ -100,6 +106,10 @@ pub(crate) fn window() -> Option<HWND> {
 
 pub(super) fn active() -> bool {
     CURRENT.with_borrow(|scope| scope.0.active.get())
+}
+
+pub(super) fn visible() -> bool {
+    CURRENT.with_borrow(|scope| scope.0.visible.get())
 }
 
 pub(super) fn activated(focused: bool) {
@@ -203,6 +213,7 @@ impl KeyboardBridge {
             return None;
         }
         self.scope.0.hwnd.set(Some(hwnd));
+        self.scope.refresh_visibility(hwnd);
         ROOTS.with_borrow_mut(|roots| {
             roots.insert(hwnd.0 as usize, Rc::downgrade(&self.scope.0));
         });
@@ -272,6 +283,58 @@ mod tests {
             assert!(PeekMessageW(&mut msg, Some(hwnd), WM_CHAR, WM_CHAR, PM_REMOVE).as_bool());
             msg.message
         }
+    }
+
+    #[test]
+    fn hidden_minimized_and_restored_windows_update_cursor_eligibility_without_activation() {
+        let changes = Rc::new(Cell::new(0));
+        let observed = changes.clone();
+        let bridge = KeyboardBridge::install(move |event| {
+            if event == Shortcut::CaretPresentationChanged {
+                observed.set(observed.get() + 1);
+            }
+        })
+        .unwrap();
+        let window = HiddenWindow(unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                &HSTRING::from(bridge.bootstrap_title()),
+                WS_OVERLAPPEDWINDOW,
+                GetSystemMetrics(SM_XVIRTUALSCREEN) - 1024,
+                GetSystemMetrics(SM_YVIRTUALSCREEN) - 1024,
+                100,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        });
+        assert_eq!(bridge.try_bind(), Some(window.0));
+        let scope = bridge.scope();
+        let _scope = scope.enter();
+        assert!(!visible());
+        unsafe {
+            let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+        }
+        assert!(visible());
+        let shown = changes.get();
+        unsafe {
+            let _ = ShowWindow(window.0, SW_SHOWMINNOACTIVE);
+        }
+        assert!(unsafe { IsIconic(window.0) }.as_bool());
+        assert!(!visible());
+        assert!(changes.get() > shown);
+        unsafe {
+            let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+        }
+        assert!(visible());
+        unsafe {
+            let _ = ShowWindow(window.0, SW_HIDE);
+        }
+        assert!(!visible());
     }
 
     #[test]
