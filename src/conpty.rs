@@ -51,13 +51,19 @@ fn write_input(
     mut pipe: File,
     console: Arc<Mutex<Option<Console>>>,
     mut rx: mpsc::Receiver<TransportInput>,
+    generation: u64,
 ) -> Result<()> {
     while let Some(message) = rx.blocking_recv() {
         match message {
             TransportInput::Data(bytes) | TransportInput::Automatic(bytes) => {
                 pipe.write_all(&bytes).context("write local input")?
             }
-            TransportInput::Raw(bytes, reply) => {
+            TransportInput::Clipboard {
+                connection, reply, ..
+            } if connection != generation => {
+                let _ = reply.send(Err(crate::terminal::STALE_PASTE.into()));
+            }
+            TransportInput::Raw(bytes, reply) | TransportInput::Clipboard { bytes, reply, .. } => {
                 let result = pipe.write_all(&bytes);
                 let _ = reply.send(
                     result
@@ -113,7 +119,7 @@ pub(crate) async fn run_generation(
     let (read_tx, mut read_rx) = mpsc::channel(4);
     let (write_tx, write_rx) = mpsc::channel(1);
     let _reader = spawn_blocking(move || read_output(read, read_tx));
-    let mut writer = spawn_blocking(move || write_input(write, console, write_rx));
+    let mut writer = spawn_blocking(move || write_input(write, console, write_rx, generation));
     let monitor = spawn_blocking(move || -> Result<Option<u32>> {
         let wait = unsafe {
             WaitForMultipleObjects(

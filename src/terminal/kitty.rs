@@ -1,5 +1,4 @@
-//! Kitty gives keypad functions distinct identities even when Windows supplies
-//! the same logical key (Enter, Left, Delete, etc.) as the main keyboard.
+//! Kitty identities that cannot be recovered from the translated character alone.
 use std::fmt::Write;
 use wezterm_input_types::{KeyboardLedStatus, KittyKeyboardFlags as Flags};
 use wezterm_term::{KeyCode, KeyModifiers as Mods};
@@ -38,9 +37,32 @@ pub enum KeypadKey {
     Begin,
 }
 
-impl KeypadKey {
-    /// None delegates to the regular logical-key encoder when keypad
-    /// disambiguation is off. An empty result suppresses an unrequested release.
+pub(super) enum NativeKey {
+    Keypad(KeypadKey),
+    Printable { base: char, physical: char },
+}
+
+impl NativeKey {
+    pub(super) fn from_event(
+        flags: Flags,
+        logical: KeyCode,
+        details: &super::KeyDetails,
+    ) -> Option<Self> {
+        if let Some(keypad) = details.keypad {
+            return (flags.intersects(
+                Flags::DISAMBIGUATE_ESCAPE_CODES | Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ) || keypad == KeypadKey::Begin)
+                .then_some(Self::Keypad(keypad));
+        }
+        let KeyCode::Char(character) = logical else {
+            return None;
+        };
+        let physical = details.physical?;
+        let base = details.base.unwrap_or(character);
+        (flags.contains(Flags::REPORT_ALTERNATE_KEYS) && !base.is_control() && physical != base)
+            .then_some(Self::Printable { base, physical })
+    }
+
     pub(super) fn encode(
         self,
         flags: Flags,
@@ -49,22 +71,17 @@ impl KeypadKey {
         details: &super::KeyDetails,
         down: bool,
         repeat: bool,
-    ) -> Option<String> {
-        if !flags
-            .intersects(Flags::DISAMBIGUATE_ESCAPE_CODES | Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
-            && self != Self::Begin
-        {
-            return None;
-        }
+    ) -> String {
         let events = flags.contains(Flags::REPORT_EVENT_TYPES);
         if !down && !events {
-            return Some(String::new());
+            return String::new();
         }
         let mut character = [0; 4];
         let text = if down && !modifiers.intersects(Mods::CTRL | Mods::ALT | Mods::SUPER) {
             details
-                .text
+                .repeat_text
                 .as_deref()
+                .or(details.text.as_deref())
                 .or_else(|| match logical {
                     KeyCode::Char(c) if !c.is_control() => Some(&*c.encode_utf8(&mut character)),
                     _ => None,
@@ -75,7 +92,7 @@ impl KeypadKey {
         };
         let all = flags.contains(Flags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
         if !all && let Some(text) = text {
-            return Some(text.to_owned());
+            return text.to_owned();
         }
         let modifier = 1
             + u8::from(modifiers.contains(Mods::SHIFT))
@@ -93,11 +110,29 @@ impl KeypadKey {
         };
         let associated = text.filter(|_| all && flags.contains(Flags::REPORT_ASSOCIATED_TEXT));
         let mut wire = String::from("\x1b[");
-        if self != Self::Begin {
-            write!(wire, "{}", self as u16).unwrap();
-        } else if modifier != 1 || !event.is_empty() {
-            wire.push('1');
-        }
+        let trailer = match self {
+            Self::Keypad(KeypadKey::Begin) => {
+                if modifier != 1 || !event.is_empty() {
+                    wire.push('1');
+                }
+                'E'
+            }
+            Self::Keypad(keypad) => {
+                write!(wire, "{}", keypad as u16).unwrap();
+                'u'
+            }
+            Self::Printable { base, physical } => {
+                write!(wire, "{}:", base as u32).unwrap();
+                if modifiers.contains(Mods::SHIFT)
+                    && let Some(shifted) = details.shifted
+                    && shifted != base
+                {
+                    write!(wire, "{}", shifted as u32).unwrap();
+                }
+                write!(wire, ":{}", physical as u32).unwrap();
+                'u'
+            }
+        };
         if modifier != 1 || !event.is_empty() {
             write!(wire, ";{modifier}{event}").unwrap();
         } else if associated.is_some() {
@@ -109,7 +144,7 @@ impl KeypadKey {
                 write!(wire, "{}", c as u32).unwrap();
             }
         }
-        wire.push(if self == Self::Begin { 'E' } else { 'u' });
-        Some(wire)
+        wire.push(trailer);
+        wire
     }
 }

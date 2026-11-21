@@ -42,8 +42,15 @@ pub enum PickerStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum KeySlot {
     Virtual(u32),
+    PrintableScan(char),
     KeypadScan { scan: u32, extended: bool },
     KeypadVirtual(u32),
+}
+
+struct HeldKey {
+    vk: u32,
+    key: KeyCode,
+    details: Option<KeyDetails>,
 }
 
 struct State {
@@ -51,8 +58,7 @@ struct State {
     target: Option<Target>,
     shortcut: Box<dyn Fn(Shortcut)>,
     swallowed: HashSet<KeySlot>,
-    pressed: HashMap<KeySlot, KeyCode>,
-    details: HashMap<KeySlot, KeyDetails>,
+    pressed: HashMap<KeySlot, HeldKey>,
     surrogate: Option<u16>,
     preferences: Interaction,
     keymap: KeyMap,
@@ -92,6 +98,18 @@ struct WheelPanes {
 }
 
 impl WheelPanes {
+    fn swapped(&mut self, [first, second]: [u64; 2]) {
+        let replacement = match self.hovered {
+            Some(id) if id == first => second,
+            Some(id) if id == second => first,
+            _ => return,
+        };
+        self.hovered = self
+            .visible
+            .contains_key(&replacement)
+            .then_some(replacement);
+    }
+
     fn replace(
         &mut self,
         panes: impl IntoIterator<Item = (u64, mpsc::UnboundedSender<Command>, FrameStore)>,
@@ -128,14 +146,17 @@ pub enum Shortcut {
     RememberWindow,
     BeginResize,
     TaskbarCreated,
+    CaretPresentationChanged,
     NextTab,
     PreviousTab,
     NewTab,
+    DuplicateTabLayout,
     CloseTab,
     SplitRight,
     SplitBelow,
     FocusPane(Direction),
     ResizePane(Direction),
+    SwapPane(Direction),
     ZoomPane,
     ClosePane,
     Select(usize),
@@ -153,6 +174,7 @@ pub enum Shortcut {
     FindClose,
     CommandPalette,
     PanePicker,
+    FindAllPanes,
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
@@ -230,6 +252,19 @@ impl Drop for ThreadHooks {
 }
 
 impl KeyboardBridge {
+    pub fn terminal_focused(&self, sender: &mpsc::UnboundedSender<Command>) -> bool {
+        let _native = self.scope.enter();
+        with_input(|input| {
+            input.borrow().as_ref().is_some_and(|state| {
+                window::visible()
+                    && state.terminal_focused()
+                    && state
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.sender.same_channel(sender))
+            })
+        })
+    }
     pub fn install(shortcut: impl Fn(Shortcut) + 'static) -> windows::core::Result<Self> {
         let scope = WindowScope::default();
         let _guard = scope.enter();
@@ -302,6 +337,14 @@ impl KeyboardBridge {
                 && state.wheel_panes.visible.contains_key(&id)
             {
                 state.wheel_panes.hovered = Some(id);
+            }
+        });
+    }
+    pub fn panes_swapped(&self, pair: [u64; 2]) {
+        let _native = self.scope.enter();
+        with_input_mut(|input| {
+            if let Some(state) = input.as_mut() {
+                state.wheel_panes.swapped(pair);
             }
         });
     }
@@ -458,7 +501,6 @@ impl KeyboardBridge {
                     .is_some_and(|target| target.sender.same_channel(sender))
             {
                 s.pressed.clear();
-                s.details.clear();
                 s.surrogate = None;
                 return true;
             }
@@ -656,7 +698,15 @@ unsafe extern "system" fn window_proc(
     let taskbar_created = message != 0 && message == *TASKBAR_CREATED;
     if !matches!(
         message,
-        WM_ACTIVATE | WM_CLOSE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_SIZING | WM_NCDESTROY
+        WM_ACTIVATE
+            | WM_SETTINGCHANGE
+            | WM_SIZE
+            | WM_WINDOWPOSCHANGED
+            | WM_CLOSE
+            | WM_ENTERSIZEMOVE
+            | WM_EXITSIZEMOVE
+            | WM_SIZING
+            | WM_NCDESTROY
     ) && !taskbar_created
     {
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
@@ -665,15 +715,6 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     };
     let _guard = scope.enter();
-    if taskbar_created {
-        with_input(|s| {
-            if let Ok(s) = s.try_borrow()
-                && let Some(s) = s.as_ref()
-            {
-                (s.shortcut)(Shortcut::TaskbarCreated);
-            }
-        });
-    }
     if message == WM_ACTIVATE {
         window::activated((wparam.0 & 0xffff) != WA_INACTIVE as usize);
     }
@@ -699,6 +740,21 @@ unsafe extern "system" fn window_proc(
         });
     }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    let visibility_changed =
+        matches!(message, WM_SIZE | WM_WINDOWPOSCHANGED) && scope.refresh_visibility(hwnd);
+    if taskbar_created || message == WM_SETTINGCHANGE || visibility_changed {
+        with_input(|s| {
+            if let Ok(s) = s.try_borrow()
+                && let Some(s) = s.as_ref()
+            {
+                (s.shortcut)(if taskbar_created {
+                    Shortcut::TaskbarCreated
+                } else {
+                    Shortcut::CaretPresentationChanged
+                });
+            }
+        });
+    }
     if matches!(message, WM_EXITSIZEMOVE | WM_CLOSE) {
         with_input(|s| {
             if let Ok(s) = s.try_borrow()
@@ -774,13 +830,20 @@ fn emit_key(
     sender: &mpsc::UnboundedSender<Command>,
     key: KeyCode,
     details: Option<&KeyDetails>,
-    modifiers: KeyModifiers,
+    mut modifiers: KeyModifiers,
     down: bool,
-    repeat: bool,
+    repeat_scan: Option<(u32, u32)>,
 ) {
+    let repeat = repeat_scan.is_some();
     let command = if let Some(details) = details {
         let mut details = details.clone();
-        if details.keypad.is_some() {
+        if details.altgr
+            && modifiers.contains(KeyModifiers::CTRL | KeyModifiers::ALT)
+            && unsafe { GetKeyState(VK_RMENU.0.into()) < 0 }
+        {
+            modifiers.remove(KeyModifiers::CTRL | KeyModifiers::ALT);
+        }
+        if details.keypad.is_some() || details.physical.is_some() {
             // Lock modifiers describe this event, including repeats and releases
             // after the lock changed while the physical key was held.
             use wezterm_input_types::KeyboardLedStatus as Leds;
@@ -791,6 +854,20 @@ fn emit_key(
                 details
                     .leds
                     .set(Leds::CAPS_LOCK, GetKeyState(VK_CAPITAL.0.into()) & 1 != 0);
+            }
+        }
+        if let Some((vk, scan)) = repeat_scan
+            && details.physical.is_some()
+            && details.text.is_none()
+        {
+            // The physical identity still belongs to the initial press, but typing
+            // Shift/Caps Lock while holding it can change subsequent associated text.
+            let mut state = [0; 256];
+            if unsafe { GetKeyboardState(&mut state) }.is_ok() {
+                if !details.altgr {
+                    clear_command_modifiers(&mut state);
+                }
+                details.repeat_text = layout_text(vk, scan, &state);
             }
         }
         Command::DetailedKey {
@@ -810,17 +887,27 @@ fn emit_key(
     };
     let _ = sender.send(command);
 }
-fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
-    for modifier in [VK_SHIFT, VK_LSHIFT, VK_RSHIFT] {
+fn clear_command_modifiers(keyboard: &mut [u8; 256]) {
+    for modifier in [
+        VK_CONTROL,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_MENU,
+        VK_LMENU,
+        VK_RMENU,
+    ] {
         keyboard[modifier.0 as usize] = 0;
     }
-    keyboard[VK_CAPITAL.0 as usize] = 0;
+}
+
+// Flag 4 asks Windows to translate without consuming its pending dead key.
+fn layout_text(vk: u32, scan: u32, keyboard: &[u8; 256]) -> Option<String> {
     let mut result = [0u16; 8];
     let count = unsafe {
         ToUnicodeEx(
             vk,
             scan,
-            &keyboard,
+            keyboard,
             &mut result,
             4,
             Some(GetKeyboardLayout(0)),
@@ -829,11 +916,47 @@ fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
     if count <= 0 {
         return None;
     }
-    let text = String::from_utf16_lossy(&result[..count as usize]);
+    Some(String::from_utf16_lossy(&result[..count as usize]))
+}
+
+fn layout_level(vk: u32, scan: u32, mut keyboard: [u8; 256], shift: bool) -> Option<char> {
+    keyboard[VK_RSHIFT.0 as usize] = 0;
+    let state = if shift { 0x80 } else { 0 };
+    keyboard[VK_SHIFT.0 as usize] = state;
+    keyboard[VK_LSHIFT.0 as usize] = state;
+    keyboard[VK_CAPITAL.0 as usize] = 0;
+    let text = layout_text(vk, scan, &keyboard)?;
     let mut chars = text.chars();
     let first = chars.next()?;
     (chars.next().is_none() && !first.is_control()).then_some(first)
 }
+
+fn translated_key(
+    count: i32,
+    translated: &[u16],
+    base: Option<char>,
+    position: Option<char>,
+    altgr: bool,
+) -> Option<(KeyCode, KeyDetails)> {
+    // A negative ToUnicodeEx result is a pending dead key. Its spacing
+    // character in the output buffer is not committed text or a key event.
+    let units = translated.get(..usize::try_from(count).ok()?)?;
+    let text = String::from_utf16_lossy(units);
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    let composed = chars.next().is_some();
+    Some((
+        KeyCode::Char(first),
+        KeyDetails {
+            base,
+            physical: position.filter(|&p| p != base.unwrap_or(first)),
+            altgr,
+            text: composed.then_some(text),
+            ..KeyDetails::default()
+        },
+    ))
+}
+
 impl State {
     fn is_read_only(&self) -> bool {
         self.read_only.as_ref().is_some_and(|locked| locked.get())
@@ -845,7 +968,6 @@ impl State {
             swallowed: HashSet::new(),
             read_only: None,
             pressed: HashMap::new(),
-            details: HashMap::new(),
             surrogate: None,
             preferences: Interaction::default(),
             keymap: Shortcuts::default()
@@ -876,20 +998,19 @@ impl State {
             held.repeat = None;
         }
         if let Some(target) = &self.target {
-            for (vk, key) in self.pressed.drain() {
+            for (_, held) in self.pressed.drain() {
                 emit_key(
                     &target.sender,
-                    key,
-                    self.details.get(&vk),
+                    held.key,
+                    held.details.as_ref(),
                     KeyModifiers::NONE,
                     false,
-                    false,
+                    None,
                 );
             }
         } else {
             self.pressed.clear();
         }
-        self.details.clear();
         self.surrogate = None;
     }
 
@@ -912,16 +1033,17 @@ impl State {
         self.report_focus();
     }
 
+    fn terminal_focused(&self) -> bool {
+        window::active()
+            && !self.search
+            && !self.modal
+            && !self.switcher
+            && self.picker.is_none()
+            && self.local_mode.is_none()
+    }
     fn report_focus(&self) {
         if let Some(target) = &self.target {
-            let _ = target.sender.send(Command::Focus(
-                window::active()
-                    && !self.search
-                    && !self.modal
-                    && !self.switcher
-                    && self.picker.is_none()
-                    && self.local_mode.is_none(),
-            ));
+            let _ = target.sender.send(Command::Focus(self.terminal_focused()));
         }
     }
 
@@ -942,12 +1064,14 @@ impl State {
             WM_CHAR | WM_SYSCHAR if vk == 0x0d && extended => Some(KeypadKey::Enter),
             _ => None,
         };
+        let physical = pc101_printable(scan, extended);
         // Shortcut lookup uses the logical VK. Ownership follows the physical
         // position, including when Windows changes VK on a Num Lock transition.
-        let slot = match (keypad, scan) {
-            (None, _) => KeySlot::Virtual(vk),
-            (Some(_), 0) => KeySlot::KeypadVirtual(vk),
-            (Some(_), scan) => KeySlot::KeypadScan { scan, extended },
+        let slot = match (keypad, physical) {
+            (Some(_), _) if scan == 0 => KeySlot::KeypadVirtual(vk),
+            (Some(_), _) => KeySlot::KeypadScan { scan, extended },
+            (None, Some(position)) => KeySlot::PrintableScan(position),
+            (None, None) => KeySlot::Virtual(vk),
         };
         if let Some(held) = self.held_resize
             && held.key == slot
@@ -1113,7 +1237,7 @@ impl State {
             self.swallowed.insert(slot);
             return true;
         }
-        let mut mods = modifiers();
+        let mods = modifiers();
         if self.switcher {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP)
                 && self.switcher_trigger.released(slot, mods)
@@ -1189,6 +1313,7 @@ impl State {
                         shortcut,
                         Shortcut::CommandPalette
                             | Shortcut::PanePicker
+                            | Shortcut::FindAllPanes
                             | Shortcut::MovePaneToExistingTab
                     ) {
                         self.picker = Some(if shortcut == Shortcut::CommandPalette {
@@ -1291,17 +1416,23 @@ impl State {
                     self.local_held.insert(slot, false);
                     return true;
                 }
-                if let Some(key) = self.pressed.get(&slot) {
+                if let Some(held) = self.pressed.get(&slot) {
                     if !self.game_mode {
-                        emit_key(sender, *key, self.details.get(&slot), mods, true, true);
+                        emit_key(
+                            sender,
+                            held.key,
+                            held.details.as_ref(),
+                            mods,
+                            true,
+                            Some((vk, scan)),
+                        );
                     }
                     return true;
                 }
                 if message.lParam.0 & (1 << 30) != 0 {
-                    // A shared VK (e.g. Enter) can already be down on the
-                    // other cluster. Otherwise this press began in another pane.
-                    let sibling_down = special_key(vk)
-                        .is_some_and(|key| self.pressed.values().any(|held| *held == key));
+                    // Windows tracks the preceding down by VK. A different
+                    // physical key mapped to the same VK can be a fresh press.
+                    let sibling_down = self.pressed.values().any(|held| held.vk == vk);
                     if !sibling_down {
                         return true;
                     }
@@ -1314,21 +1445,19 @@ impl State {
                     }
                     let altgr = keyboard[VK_RMENU.0 as usize] & 0x80 != 0
                         && mods.contains(KeyModifiers::CTRL);
-                    if altgr {
-                        mods.remove(KeyModifiers::CTRL | KeyModifiers::ALT);
-                    } else {
-                        for index in [
-                            VK_CONTROL,
-                            VK_LCONTROL,
-                            VK_RCONTROL,
-                            VK_MENU,
-                            VK_LMENU,
-                            VK_RMENU,
-                        ] {
-                            keyboard[index.0 as usize] = 0;
-                        }
+                    if !altgr {
+                        clear_command_modifiers(&mut keyboard);
                     }
-                    let base = (!altgr).then(|| unshifted(vk, scan, keyboard)).flatten();
+                    let base = (!altgr)
+                        .then(|| layout_level(vk, scan, keyboard, false))
+                        .flatten();
+                    // Shift may change while held. Query its layout level before the
+                    // stateful translation consumes any pending dead-key composition.
+                    let shifted =
+                        base.filter(|&b| physical.is_some_and(|p| p != b))
+                            .and_then(|base| {
+                                layout_level(vk, scan, keyboard, true).filter(|&s| s != base)
+                            });
                     let mut translated = [0u16; 8];
                     // This adapter consumes the keydown, so it owns dead-key translation.
                     let count = unsafe {
@@ -1341,19 +1470,11 @@ impl State {
                             Some(GetKeyboardLayout(0)),
                         )
                     };
-                    if count <= 0 {
-                        return None;
-                    }
-                    let text = String::from_utf16_lossy(&translated[..count as usize]);
-                    let mut chars = text.chars();
-                    let first = chars.next()?;
-                    let composed = chars.next().is_some();
-                    details = Some(KeyDetails {
-                        base,
-                        text: composed.then_some(text),
-                        ..KeyDetails::default()
-                    });
-                    Some(KeyCode::Char(first))
+                    let (key, mut translated) =
+                        translated_key(count, &translated, base, physical, altgr)?;
+                    translated.shifted = shifted;
+                    details = Some(translated);
+                    Some(key)
                 });
                 // A keypad function can have a protocol identity even when the
                 // active layout produced no text. Clear has no legacy encoding.
@@ -1361,13 +1482,20 @@ impl State {
                 if let Some(key) = key {
                     if let Some(keypad) = keypad {
                         details.get_or_insert_with(KeyDetails::default).keypad = Some(keypad);
+                    } else if key == KeyCode::Char(' ')
+                        && let Some(position) = physical.filter(|&p| p != ' ')
+                        && details.is_none()
+                    {
+                        // Space normally takes the special-key path (including Ctrl+Space).
+                        details = Some(KeyDetails {
+                            base: Some(' '),
+                            physical: Some(position),
+                            ..Default::default()
+                        });
                     }
                     (self.shortcut)(Shortcut::ClearSelection);
-                    self.pressed.insert(slot, key);
-                    if let Some(details) = details {
-                        self.details.insert(slot, details);
-                    }
-                    emit_key(sender, key, self.details.get(&slot), mods, true, false);
+                    emit_key(sender, key, details.as_ref(), mods, true, None);
+                    self.pressed.insert(slot, HeldKey { vk, key, details });
                     true
                 } else {
                     // Modifiers/dead keys must not trigger WinUI keyboard navigation.
@@ -1375,9 +1503,8 @@ impl State {
                 }
             }
             WM_KEYUP | WM_SYSKEYUP => {
-                if let Some(key) = self.pressed.remove(&slot) {
-                    let details = self.details.remove(&slot);
-                    emit_key(sender, key, details.as_ref(), mods, false, false);
+                if let Some(held) = self.pressed.remove(&slot) {
+                    emit_key(sender, held.key, held.details.as_ref(), mods, false, None);
                     return true;
                 }
                 false
@@ -1466,6 +1593,10 @@ impl From<Action> for Shortcut {
             Action::ResizeRight => Self::ResizePane(Direction::Right),
             Action::ResizeUp => Self::ResizePane(Direction::Up),
             Action::ResizeDown => Self::ResizePane(Direction::Down),
+            Action::SwapPaneLeft => Self::SwapPane(Direction::Left),
+            Action::SwapPaneRight => Self::SwapPane(Direction::Right),
+            Action::SwapPaneUp => Self::SwapPane(Direction::Up),
+            Action::SwapPaneDown => Self::SwapPane(Direction::Down),
             Action::SplitRight => Self::SplitRight,
             Action::SplitBelow => Self::SplitBelow,
             Action::ZoomPane => Self::ZoomPane,
@@ -1475,11 +1606,13 @@ impl From<Action> for Shortcut {
             Action::Workspaces => Self::Workspaces,
             Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
+            Action::FindAllPanes => Self::FindAllPanes,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
             Action::NewTab => Self::NewTab,
+            Action::DuplicateTabLayout => Self::DuplicateTabLayout,
             Action::CloseTab => Self::CloseTab,
             Action::SelectTab(number) => Self::Select(usize::from(number - 1)),
         }
@@ -1548,6 +1681,24 @@ fn key_identity(vk: u32, data: isize) -> u32 {
         _ => vk,
     }
 }
+
+/// Set-1 make codes for the printable positions of a standard US PC-101.
+/// Extended, keypad, ISO-only and unmapped keys have no printable alternate.
+fn pc101_printable(scan: u32, extended: bool) -> Option<char> {
+    if extended {
+        return None;
+    }
+    let byte = match scan {
+        0x02..=0x0d => b"1234567890-="[(scan - 0x02) as usize],
+        0x10..=0x1b => b"qwertyuiop[]"[(scan - 0x10) as usize],
+        0x1e..=0x29 => b"asdfghjkl;'`"[(scan - 0x1e) as usize],
+        0x2b..=0x35 => b"\\zxcvbnm,./"[(scan - 0x2b) as usize],
+        0x39 => b' ',
+        _ => return None,
+    };
+    Some(char::from(byte))
+}
+
 fn keypad_key(vk: u32, scan: u32, extended: bool) -> Option<KeypadKey> {
     use KeypadKey::*;
     Some(match vk {
@@ -1621,6 +1772,54 @@ fn special_key(vk: u32) -> Option<KeyCode> {
 mod tests {
     use super::*;
     use w11term::{options::Source, session::Session};
+
+    #[test]
+    fn physical_printable_positions_use_the_pc101_make_code() {
+        let mut keys = (0..=255)
+            .filter_map(|scan| pc101_printable(scan, false))
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 47 + 1); // number row, QWERTY rows, and Space
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 48);
+        for (scan, expected) in [
+            (0x02, '1'),
+            (0x0d, '='),
+            (0x10, 'q'),
+            (0x15, 'y'),
+            (0x1b, ']'),
+            (0x1e, 'a'),
+            (0x28, '\''),
+            (0x2b, '\\'),
+            (0x2e, 'c'),
+            (0x35, '/'),
+            (0x39, ' '),
+        ] {
+            assert_eq!(pc101_printable(scan, false), Some(expected));
+            assert_eq!(pc101_printable(scan, true), None);
+        }
+        for scan in [0, 0x0e, 0x1c, 0x36, 0x37, 0x4b, 0x56, 0x7e] {
+            assert_eq!(pc101_printable(scan, false), None);
+        }
+    }
+
+    #[test]
+    fn physical_identity_preserves_altgr_and_the_dead_key_translation_result() {
+        let position = Some('q');
+        assert!(translated_key(-1, &[0xb4], None, position, false).is_none());
+        assert!(translated_key(0, &[0xb4], None, position, false).is_none());
+        let (key, details) = translated_key(1, &[64], None, position, true).unwrap();
+        assert_eq!(key, KeyCode::Char('@'));
+        assert!(details.altgr);
+        assert_eq!(details.physical, position);
+        let (_, details) = translated_key(2, &[0xb4, 113], None, position, false).unwrap();
+        assert_eq!(details.text.as_deref(), Some("´q"));
+        let (_, details) = translated_key(1, &[90], Some('z'), Some('z'), false).unwrap();
+        assert!(
+            details.physical.is_none(),
+            "Shift does not change the PC-101 identity"
+        );
+    }
 
     #[test]
     fn tab_switcher_commits_when_the_remapped_trigger_is_released() {
@@ -1827,6 +2026,15 @@ mod tests {
         panes.hovered = Some(6);
         assert_eq!(wheel_steps(panes.target().unwrap().1, 60), 1);
 
+        // Swapping exchanges the panes under a stationary pointer. Fractional
+        // deltas stay with their sessions; swapping elsewhere leaves hover alone.
+        panes.swapped([5, 6]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&left));
+        panes.swapped([6, 7]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&left));
+        panes.swapped([6, 5]);
+        assert!(panes.target().unwrap().0.sender.same_channel(&right));
+
         panes.replace([(5, left.clone(), lab.frames.clone())]);
         assert_eq!(panes.hovered, None);
         assert!(panes.target().unwrap().0.sender.same_channel(&left));
@@ -1996,12 +2204,15 @@ mod tests {
                     frames: lab.frames.clone(),
                 }),
                 read_only: Some(locked.clone()),
-                pressed: HashMap::from([(KeySlot::Virtual(0x58), KeyCode::Char('x'))]),
-                details: HashMap::from([(
+                pressed: HashMap::from([(
                     KeySlot::Virtual(0x58),
-                    KeyDetails {
-                        base: Some('x'),
-                        ..KeyDetails::default()
+                    HeldKey {
+                        vk: 0x58,
+                        key: KeyCode::Char('x'),
+                        details: Some(KeyDetails {
+                            base: Some('x'),
+                            ..KeyDetails::default()
+                        }),
                     },
                 )]),
                 surrogate: Some(0xd800),
@@ -2063,7 +2274,14 @@ mod tests {
                 sender: old,
                 frames: lab.frames.clone(),
             }),
-            pressed: HashMap::from([(KeySlot::Virtual(0x58), KeyCode::Char('x'))]),
+            pressed: HashMap::from([(
+                KeySlot::Virtual(0x58),
+                HeldKey {
+                    vk: 0x58,
+                    key: KeyCode::Char('x'),
+                    details: None,
+                },
+            )]),
             surrogate: Some(0xd800),
             ..State::new(|_| {})
         };

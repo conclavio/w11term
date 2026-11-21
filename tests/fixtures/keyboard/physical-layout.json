@@ -1,0 +1,15 @@
+[
+  {"logical":"с","shifted":"С","physical":"c","mods":["CTRL"],"flags":15,"action":"press","wire":"\u001b[1089::99;5u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":[],"flags":15,"action":"press","text":"z","wire":"\u001b[122::121u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":[],"flags":15,"action":"repeat","text":"z","wire":"\u001b[122::121;1:2u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":[],"flags":15,"action":"release","wire":"\u001b[122::121;1:3u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":["SHIFT"],"flags":31,"action":"press","text":"Z","wire":"\u001b[122:90:121;2;90u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":["SHIFT"],"flags":31,"action":"release","wire":"\u001b[122:90:121;2:3u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":[],"flags":31,"action":"press","text":"z","wire":"\u001b[122::121;;122u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":["NUM_LOCK"],"flags":31,"action":"repeat","text":"z","wire":"\u001b[122::121;129:2;122u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":["CAPS_LOCK"],"flags":15,"action":"press","text":"Z","wire":"\u001b[122::121;65u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":[],"flags":7,"action":"press","text":"z","wire":"z"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":["CTRL"],"flags":11,"action":"press","wire":"\u001b[122;5u"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":[],"flags":0,"action":"press","text":"z","wire":"z"},
+  {"logical":"z","shifted":"Z","physical":"y","mods":[],"flags":0,"action":"release","wire":""}
+]

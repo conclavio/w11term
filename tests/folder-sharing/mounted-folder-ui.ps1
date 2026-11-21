@@ -64,6 +64,8 @@ try {
     $edit = Wait-Until 'mount name' { Find-Element 'Mount name' ([System.Windows.Automation.ControlType]::Edit) }
     $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($name)
     $null = Wait-Until 'share confirmation for the edited mount name' { Find-Element "Remember this folder and mount it read-only at ~/windows/$name" }
+    (Wait-CheckBox 'Allow write access' Off).Toggle()
+    $null = Wait-Until 'explicit writable consent' { Find-Element "Remember this folder and mount it read/write at ~/windows/$name" }
     Click 'Save folder'
     $copy = "Copy Linux path for $name"
     $open = "Open $name in SFTP drawer"
@@ -77,6 +79,12 @@ try {
             throw "SSHFS mount actions did not become available. Panel text: $($status -join ', ')"
         }
         Start-Sleep -Milliseconds 100
+    }
+    $null = Wait-Until 'saved write access' { Find-Element 'Read/write' }
+    (Wait-CheckBox "Mount on connect for $name" On).Toggle()
+    $null = Wait-CheckBox "Mount on connect for $name" Off
+    if (!(Find-Element $expected) -or !(Enabled $open) -or !(Enabled $copy)) {
+        throw 'Disabling mount on connect changed the live share or its actions'
     }
     if ($CheckClipboard) {
         . (Join-Path $PSScriptRoot '../support/clipboard.ps1')
@@ -101,7 +109,14 @@ try {
     if (![Collections.StructuralComparisons]::StructuralEqualityComparer.Equals([IO.File]::ReadAllBytes($download), $bytes)) {
         throw 'SFTP did not read the Windows fixture through the Linux mount'
     }
-    Write-Output "Native UI opened $expected in its originating SSH pane and read $witness"
+    $upload = Join-Path $State 'upload.bin'
+    $payload = [byte[]](240,159,146,190,0,255,10)
+    [IO.File]::WriteAllBytes($upload, $payload)
+    $null = Control @('sftp','--pane',"$pane",'put',$upload,"$expected/from-linux.bin")
+    if (![Collections.StructuralComparisons]::StructuralEqualityComparer.Equals([IO.File]::ReadAllBytes((Join-Path $local 'from-linux.bin')), $payload)) {
+        throw 'An upload through the Linux mount did not reach the selected Windows directory'
+    }
+    Write-Output "Native UI opened $expected in its originating SSH pane and verified a binary round trip"
 } catch {
     $tail = Get-Content -LiteralPath $log -Tail 20 -ErrorAction SilentlyContinue
     throw "$_ at $($_.ScriptStackTrace). GUI log: $tail"

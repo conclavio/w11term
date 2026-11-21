@@ -249,6 +249,49 @@ impl Files {
             _ => Err(StatusCode::Failure),
         }
     }
+
+    async fn remove_entry(
+        &self,
+        id: u32,
+        path: String,
+        directory: bool,
+    ) -> Result<Status, StatusCode> {
+        let trace = self.root.join("delete-trace.jsonl");
+        if trace.is_file() {
+            let mut log = fs::OpenOptions::new()
+                .append(true)
+                .open(trace)
+                .map_err(io)?;
+            let opcode = if directory { "RMDIR" } else { "REMOVE" };
+            writeln!(log, "{}", json!([opcode, path])).map_err(io)?;
+        }
+        let path = self.path(&path);
+        let kind = fs::symlink_metadata(&path).map_err(io)?.file_type();
+        if directory {
+            if !kind.is_dir() {
+                return Err(StatusCode::Failure);
+            }
+            fs::remove_dir(path).map_err(io)?;
+        } else if std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind) {
+            // Windows unlinks a directory junction using RemoveDirectory. Its
+            // SFTP representation is a symlink and requires SSH_FXP_REMOVE.
+            fs::remove_dir(path).map_err(io)?;
+        } else {
+            fs::remove_file(path).map_err(io)?;
+        }
+        if self.root.join("disconnect-after-delete").is_file() {
+            let _ = self
+                .ssh
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "fixture lost delete acknowledgement".into(),
+                    "en".into(),
+                )
+                .await;
+            return Err(StatusCode::ConnectionLost);
+        }
+        Ok(status(id))
+    }
 }
 impl russh_sftp::server::Handler for Files {
     type Error = StatusCode;
@@ -372,10 +415,11 @@ impl russh_sftp::server::Handler for Files {
                 .await;
             return Err(StatusCode::ConnectionLost);
         }
-        Ok(Attrs {
-            id,
-            attrs: entry_attrs(&self.path(&path))?,
-        })
+        let mut attrs = entry_attrs(&self.path(&path))?;
+        if self.root.join("omit-lstat-permissions").is_file() {
+            attrs.permissions = None;
+        }
+        Ok(Attrs { id, attrs })
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
         if self.root.join("no-fstat").exists() {
@@ -414,14 +458,18 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
+        let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
             .map(|e| {
                 let e = e.map_err(io)?;
-                Ok(russh_sftp::protocol::File::new(
-                    e.file_name().to_string_lossy(),
-                    entry_attrs(&e.path())?,
-                ))
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                let mut attrs = entry_attrs(&e.path())?;
+                if Some(name.as_ref()) == omit_mode.as_deref() {
+                    attrs.permissions = None;
+                }
+                Ok(russh_sftp::protocol::File::new(name, attrs))
             })
             .collect::<Result<_, StatusCode>>()?;
         Ok(self.add(id, Opened::Dir(entries)))
@@ -454,12 +502,10 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, StatusCode> {
-        fs::remove_dir(self.path(&path)).map_err(io)?;
-        Ok(status(id))
+        self.remove_entry(id, path, true).await
     }
     async fn remove(&mut self, id: u32, path: String) -> Result<Status, StatusCode> {
-        fs::remove_file(self.path(&path)).map_err(io)?;
-        Ok(status(id))
+        self.remove_entry(id, path, false).await
     }
     async fn rename(&mut self, id: u32, from: String, to: String) -> Result<Status, StatusCode> {
         let trace = self.root.join("rename-trace.jsonl");
@@ -604,12 +650,64 @@ async fn fixture(
     (session, source, root, opens, server)
 }
 
+fn directory_junction(root: &std::path::Path, name: &str, target: &str) {
+    // A directory junction is a link on NTFS and needs no symbolic-link privilege.
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/j", name, target])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(root.join(name))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+fn mutation_trace(root: &std::path::Path, log: &str) -> Vec<[String; 2]> {
+    fs::read_to_string(root.join(log))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+async fn guarded_job(
+    pane: &Session,
+    generation: Option<u64>,
+    operation: w11term::sftp::Operation,
+) -> Result<Value, String> {
+    let (reply, response) = tokio::sync::oneshot::channel();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    pane.input
+        .send(Command::Sftp(w11term::sftp::Job {
+            expected_generation: generation,
+            operation,
+            deadline,
+            reply,
+            progress: None,
+        }))
+        .unwrap();
+    tokio::time::timeout_at(deadline + Duration::from_secs(1), response)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
+#[path = "sftp/remove.rs"]
+mod remove;
 #[path = "sftp/rename.rs"]
 mod rename;
 #[cfg(feature = "ui-smoke")]
