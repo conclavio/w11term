@@ -90,6 +90,9 @@ impl<T> Tabs<T> {
             .find(|tab| tab.id == entry)
             .map(|tab| tab.group)
     }
+    pub fn active_group_id(&self) -> Option<TabId> {
+        self.active_group
+    }
     pub fn active_id(&self) -> Option<TabId> {
         Some(self.groups.get(self.active_index()?)?.focused)
     }
