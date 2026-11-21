@@ -99,6 +99,12 @@ pub enum Operation {
         from: String,
         to: String,
     },
+    /// Interactive drawer approval, bound to the inspected connection.
+    #[serde(skip)]
+    RenameEntry {
+        from: String,
+        to: String,
+    },
     RemoveFile {
         path: String,
     },
@@ -229,7 +235,27 @@ pub struct Job {
 // Preserve the uncertain outcome of an admitted request across that teardown.
 struct PendingReply {
     sender: Option<oneshot::Sender<JobResult>>,
-    uploading: bool,
+    stage: JobStage,
+}
+
+enum JobStage {
+    Ordinary,
+    Upload,
+    CheckingDestination,
+    Renaming,
+}
+
+impl JobStage {
+    fn interrupted(&self) -> &'static str {
+        match self {
+            Self::Ordinary => "SFTP operation interrupted; outcome may be unknown",
+            Self::Upload => {
+                "SFTP upload interrupted; remote destination may contain a partial file"
+            }
+            Self::CheckingDestination => "Rename was not started",
+            Self::Renaming => "Rename outcome unknown; refresh to check",
+        }
+    }
 }
 
 impl PendingReply {
@@ -241,12 +267,7 @@ impl PendingReply {
 impl Drop for PendingReply {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
-            let message = if self.uploading {
-                "SFTP upload interrupted; remote destination may contain a partial file"
-            } else {
-                "SFTP operation interrupted; outcome may be unknown"
-            };
-            let _ = sender.send(Err(message.into()));
+            let _ = sender.send(Err(self.stage.interrupted().into()));
         }
     }
 }
@@ -272,6 +293,12 @@ pub(crate) async fn run(
             reply,
             progress,
         } = job;
+        if matches!(operation, Operation::RenameEntry { .. }) && expected_generation.is_none() {
+            let _ = reply.send(Err(
+                "Missing SSH connection approval; rename was not started".into(),
+            ));
+            continue;
+        }
         if expected_generation.is_some_and(|expected| expected != generation) {
             let _ = reply.send(Err(
                 "SSH connection changed; operation was not started".into()
@@ -297,9 +324,13 @@ pub(crate) async fn run(
             operation,
             Operation::Open { .. } | Operation::Opendir { .. }
         );
-        let reply = PendingReply {
+        let mut reply = PendingReply {
             sender: Some(reply),
-            uploading: matches!(operation, Operation::Put { .. }),
+            stage: match operation {
+                Operation::Put { .. } => JobStage::Upload,
+                Operation::RenameEntry { .. } => JobStage::CheckingDestination,
+                _ => JobStage::Ordinary,
+            },
         };
         // Finish an admitted request even if its caller disappears. Cancelling a
         // read must not reset the shared SFTP channel and invalidate CLI handles.
@@ -310,19 +341,25 @@ pub(crate) async fn run(
             engine
                 .as_mut()
                 .unwrap()
-                .execute(operation, progress.as_ref())
+                .execute(operation, progress.as_ref(), &mut reply.stage)
                 .await
         })
         .await
         {
             Ok(result) => {
-                if result
+                let lost = result
                     .as_ref()
                     .err()
                     .and_then(|e| e.downcast_ref::<Error>())
-                    .is_some_and(transport_error)
-                {
+                    .is_some_and(transport_error);
+                if lost {
                     engine = None;
+                }
+                if matches!(reply.stage, JobStage::CheckingDestination)
+                    || (lost && matches!(reply.stage, JobStage::Renaming))
+                {
+                    result.context(reply.stage.interrupted())
+                } else if lost {
                     result.context("SFTP channel failed; outcome may be unknown; handles invalidated, do not blindly retry")
                 } else {
                     result
@@ -330,9 +367,19 @@ pub(crate) async fn run(
             }
             Err(_) => {
                 engine = None;
-                Err(anyhow::anyhow!(
-                    "SFTP timed out; partial uploads may remain and the operation may have completed; handles invalidated, do not blindly retry"
-                ))
+                if matches!(
+                    reply.stage,
+                    JobStage::CheckingDestination | JobStage::Renaming
+                ) {
+                    Err(anyhow::anyhow!(
+                        "SFTP timed out; {}; handles invalidated",
+                        reply.stage.interrupted()
+                    ))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "SFTP timed out; partial uploads may remain and the operation may have completed; handles invalidated, do not blindly retry"
+                    ))
+                }
             }
         };
         if let Err(Ok(value)) = reply.finish(result.map_err(|e| format!("SFTP: {e:#}")))
@@ -340,11 +387,8 @@ pub(crate) async fn run(
             && let Some(handle) = value["handle"].as_u64()
             && let Some(active) = engine.as_mut()
         {
-            let closed = tokio::time::timeout(
-                Duration::from_secs(5),
-                active.execute(Operation::Close { handle }, None),
-            )
-            .await;
+            let closed =
+                tokio::time::timeout(Duration::from_secs(5), active.close_handle(handle)).await;
             if !matches!(closed, Ok(Ok(_))) {
                 engine = None;
             }
@@ -458,10 +502,17 @@ impl Engine {
         self.handles.insert(id, Handle { remote, directory });
         Ok(json!({"handle":id,"directory":directory}))
     }
+    async fn close_handle(&mut self, handle: u64) -> Result<()> {
+        self.raw.close(self.handle(handle, None)?).await?;
+        self.handles.remove(&handle);
+        Ok(())
+    }
+
     async fn execute(
         &mut self,
         op: Operation,
         progress: Option<&watch::Sender<TransferProgress>>,
+        stage: &mut JobStage,
     ) -> Result<Value> {
         use Operation::*;
         let ok = json!({});
@@ -496,9 +547,7 @@ impl Engine {
                 self.remember(h, false).await?
             }
             Close { handle } => {
-                let h = self.handle(handle, None)?;
-                self.raw.close(h).await?;
-                self.handles.remove(&handle);
+                self.close_handle(handle).await?;
                 ok
             }
             Readdir { handle } => match self.raw.readdir(self.handle(handle, Some(true))?).await {
@@ -609,6 +658,21 @@ impl Engine {
                 ok
             }
             Rename { from, to } => {
+                self.raw.rename(from, to).await?;
+                ok
+            }
+            RenameEntry { from, to } => {
+                // LSTAT sees the directory entry even if it is a dangling link.
+                // A concurrent creator after this check is the v3 server's responsibility.
+                match self.raw.lstat(&to).await {
+                    Ok(_) => bail!("An entry with that name already exists"),
+                    Err(Error::Status(status)) if status.status_code == StatusCode::NoSuchFile => {}
+                    Err(error) => {
+                        return Err(anyhow::Error::from(error)
+                            .context("Could not check the destination name"));
+                    }
+                }
+                *stage = JobStage::Renaming;
                 self.raw.rename(from, to).await?;
                 ok
             }

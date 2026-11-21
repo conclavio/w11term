@@ -222,6 +222,16 @@ fn io(e: std::io::Error) -> StatusCode {
         StatusCode::Failure
     }
 }
+fn entry_attrs(path: &std::path::Path) -> Result<FileAttributes, StatusCode> {
+    let metadata = fs::symlink_metadata(path).map_err(io)?;
+    let mut attrs = FileAttributes::from(&metadata);
+    // russh-sftp's Windows Metadata conversion treats non-directories as regular files.
+    if metadata.file_type().is_symlink() {
+        attrs.permissions =
+            Some((attrs.permissions.unwrap_or_default() & !0o170000) | FileMode::LNK.bits());
+    }
+    Ok(attrs)
+}
 impl Files {
     fn path(&self, path: &str) -> PathBuf {
         assert!(!path.contains("..") && !path.contains(':'));
@@ -348,7 +358,24 @@ impl russh_sftp::server::Handler for Files {
         })
     }
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
-        self.stat(id, path).await
+        if self.root.join("deny-rename-check").exists() {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if self.root.join("disconnect-on-lstat").exists() {
+            let _ = self
+                .ssh
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "fixture interrupted LSTAT".into(),
+                    "en".into(),
+                )
+                .await;
+            return Err(StatusCode::ConnectionLost);
+        }
+        Ok(Attrs {
+            id,
+            attrs: entry_attrs(&self.path(&path))?,
+        })
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
         if self.root.join("no-fstat").exists() {
@@ -390,13 +417,13 @@ impl russh_sftp::server::Handler for Files {
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
             .map(|e| {
-                let e = e.unwrap();
-                russh_sftp::protocol::File::new(
+                let e = e.map_err(io)?;
+                Ok(russh_sftp::protocol::File::new(
                     e.file_name().to_string_lossy(),
-                    (&e.metadata().unwrap()).into(),
-                )
+                    entry_attrs(&e.path())?,
+                ))
             })
-            .collect();
+            .collect::<Result<_, StatusCode>>()?;
         Ok(self.add(id, Opened::Dir(entries)))
     }
     async fn readdir(&mut self, id: u32, h: String) -> Result<Name, StatusCode> {
@@ -435,7 +462,43 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn rename(&mut self, id: u32, from: String, to: String) -> Result<Status, StatusCode> {
-        fs::rename(self.path(&from), self.path(&to)).map_err(io)?;
+        let trace = self.root.join("rename-trace.jsonl");
+        if trace.is_file() {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(trace)
+                .map_err(io)?;
+            writeln!(file, "{}", json!([from, to])).map_err(io)?;
+        }
+        let destination = self.path(&to);
+        if self.root.join("race-next-rename").exists() {
+            fs::File::create_new(&destination)
+                .map_err(io)?
+                .write_all(b"racing entry")
+                .map_err(io)?;
+            fs::remove_file(self.root.join("race-next-rename")).map_err(io)?;
+        }
+        // MoveFileW enforces one no-replace operation, including for directories
+        // and reparse points. std::fs::rename would replace a racing entry.
+        use windows::{Win32::Storage::FileSystem::MoveFileW, core::HSTRING};
+        unsafe {
+            MoveFileW(
+                &HSTRING::from(self.path(&from).as_os_str()),
+                &HSTRING::from(destination.as_os_str()),
+            )
+        }
+        .map_err(|_| StatusCode::Failure)?;
+        if self.root.join("disconnect-after-rename").exists() {
+            let _ = self
+                .ssh
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "fixture lost RENAME reply".into(),
+                    "en".into(),
+                )
+                .await;
+            return Err(StatusCode::ConnectionLost);
+        }
         Ok(status(id))
     }
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
@@ -547,6 +610,8 @@ mod keypad;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
+#[path = "sftp/rename.rs"]
+mod rename;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/tab_windows.rs"]
 mod tab_windows;
