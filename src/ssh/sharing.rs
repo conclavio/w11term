@@ -163,17 +163,29 @@ impl Drop for ShellChannel {
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ShareSlot(Arc<Mutex<(u64, Weak<ConnectionShare>)>>, watch::Sender<()>);
+#[derive(Default)]
+struct Publication {
+    generation: u64,
+    current: Weak<ConnectionShare>,
+}
 
-pub(super) struct PublishedShell(ShareSlot, Weak<ConnectionShare>);
+#[derive(Clone, Default)]
+pub(crate) struct ShareSlot {
+    publication: Arc<Mutex<Publication>>,
+    changed: watch::Sender<()>,
+}
+
+pub(super) struct PublishedShell {
+    slot: ShareSlot,
+    link: Weak<ConnectionShare>,
+}
 
 impl Drop for PublishedShell {
     fn drop(&mut self) {
-        let mut state = self.0.0.lock().unwrap();
-        if state.1.ptr_eq(&self.1) {
-            state.1 = Weak::new();
-            self.0.1.send_replace(());
+        let mut state = self.slot.publication.lock().unwrap();
+        if state.current.ptr_eq(&self.link) {
+            state.current = Weak::new();
+            self.slot.changed.send_replace(());
         }
     }
 }
@@ -183,26 +195,29 @@ impl ShareSlot {
         self.generation().map(|(_, link)| link)
     }
     pub(crate) fn generation(&self) -> Option<(u64, ConnectionShare)> {
-        let state = self.0.lock().unwrap();
+        let state = self.publication.lock().unwrap();
         state
-            .1
+            .current
             .upgrade()
             .filter(|share| !share.0.handle.is_closed())
-            .map(|share| (state.0, (*share).clone()))
+            .map(|share| (state.generation, (*share).clone()))
     }
     pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
-        self.1.subscribe()
+        self.changed.subscribe()
     }
     pub(super) fn shell_lifetime(&self, link: &Arc<ConnectionShare>) -> PublishedShell {
-        PublishedShell(self.clone(), Arc::downgrade(link))
+        PublishedShell {
+            slot: self.clone(),
+            link: Arc::downgrade(link),
+        }
     }
     pub(super) fn publish(&self, local: &Arc<ConnectionShare>) {
         // Each pane owns its own outer Arc. Its offer expires on disconnect
         // even when other panes continue to use the underlying Link.
-        let mut state = self.0.lock().unwrap();
-        state.0 += 1;
-        state.1 = Arc::downgrade(local);
-        self.1.send_replace(());
+        let mut state = self.publication.lock().unwrap();
+        state.generation += 1;
+        state.current = Arc::downgrade(local);
+        self.changed.send_replace(());
     }
 }
 
