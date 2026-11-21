@@ -125,7 +125,7 @@ try {
     [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"keyboard_hints":"F8"}}')
     for ($launch = 1; $launch -le 2; $launch++) {
         $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--replay', ('"' + $replay + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $state "run-$launch.log")
-        $window = Wait-Until 'window handle' { $app.Refresh(); if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } }
+        $window = Wait-InputWindow
         $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
         $pane = (Control @('list')).sessions[0].id
         $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','OPS-104 BUG-203')

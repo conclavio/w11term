@@ -52,6 +52,16 @@ async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "keeps an open native tab menu actionable through SSH progress repaints"]
+async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
+    let mut expected = Vec::new();
+    for percent in [20, 40, 60, 80] {
+        expected.extend(format!("\x1b]9;4;1;{percent}\x07").bytes());
+    }
+    run_palette_fixture("caret-repaint-ui.ps1", &expected, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
 async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
     run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
@@ -155,6 +165,43 @@ async fn native_terminal_progress_updates_background_tab_and_resets_on_reconnect
         3,
         "two shells, one reconnect"
     );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "exports a live SSH pane through the native Save dialog beside a PowerShell split"]
+async fn native_scrollback_export_saves_the_selected_pane_and_respects_cancel_and_replace() {
+    let (Source::Ssh(ssh), _remote, opens, server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let directory = state.path();
+    let plain_header = "archived 雪 café 🚀";
+    let mut expected = format!(
+        "{plain_header}\r\n\r\nwrapped-start:{}:wrapped-end\r\n",
+        "abcdef".repeat(85)
+    );
+    for row in 0..160 {
+        expected.push_str(&format!("history row {row:03}\r\n"));
+    }
+    expected.push_str("snapshot-end\r\n");
+    let formatted = expected.replacen(plain_header, &format!("\x1b[35m{plain_header}\x1b[0m"), 1);
+    fs::write(
+        directory.join("history.vt"),
+        format!("\x1b[2J\x1b[3J\x1b[H{formatted}"),
+    )
+    .unwrap();
+    let sentinel = b"original\x00\xffcontents";
+    for filename in ["cancel.txt", "replace.txt"] {
+        fs::write(directory.join(filename), sentinel).unwrap();
+    }
+    drive_mixed_gui("export-scrollback-ui.ps1", &ssh, directory);
+    let saved = fs::read_to_string(directory.join("new.txt")).unwrap();
+    assert_eq!(saved, expected, "exact UTF-8 transcript at invocation");
+    assert_eq!(fs::read(directory.join("cancel.txt")).unwrap(), sentinel);
+    let replaced = fs::read_to_string(directory.join("replace.txt")).unwrap();
+    assert_eq!(replaced, format!("{expected}arrived-after-picker"));
+    assert_eq!(opens.load(Ordering::Relaxed), 1, "one live SSH shell");
     server.abort();
 }
 

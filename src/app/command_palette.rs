@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandId {
     Menu(String),
+    SaveScrollback(Option<u64>),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -43,7 +44,9 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                 label,
                 enabled,
             } => {
-                if !enabled && key == "panes".into() {
+                if (!enabled && key == "panes".into())
+                    || (!profiles && key == "save-scrollback".into())
+                {
                     continue;
                 }
                 let id = if profiles {
@@ -120,6 +123,13 @@ impl TerminalApp {
             _ => None,
         });
         let tab_count = self.tabs.headers().len();
+        let pane = live.map(|tab| tab.session.pane_id);
+        rows.push(Row {
+            id: CommandId::SaveScrollback(pane),
+            label: scrollback_export::LABEL.into(),
+            chord: String::new(),
+            enabled: pane.is_some() && self.export.pending.is_none(),
+        });
         let selection = self.active_selection();
         let appearance = self.appearance.read().unwrap();
         for binding in BINDINGS
@@ -214,6 +224,9 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::SaveScrollback(pane) => {
+                Message::Export(scrollback_export::Action::Start(pane))
+            }
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),
             CommandId::Shortcut(shortcut) => Message::Shortcut(shortcut),

@@ -26,5 +26,6 @@ pub mod ssh_config;
 pub mod tabs;
 pub mod terminal;
 pub mod text_layout;
+pub mod transcript;
 pub mod wav;
 pub mod workspace;
