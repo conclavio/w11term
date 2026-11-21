@@ -67,7 +67,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
-    folder_sharing: Option<Box<w11term::folder_grants::PaneShares>>,
+    folder_sharing: Option<w11term::folder_grants::PaneShares>,
     read_only: Rc<Cell<bool>>,
     startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
@@ -81,7 +81,7 @@ struct LiveTab {
     surface: PaneSurface,
     device_busy: bool,
     device_message: Option<String>,
-    session: Session,
+    session: Box<Session>,
     last_size: Rc<Cell<Option<TerminalSize>>>,
     error: Option<String>,
     selection: Rc<RefCell<Option<Selection>>>,
@@ -767,7 +767,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             device_busy: false,
             read_only: Rc::default(),
             device_message: None,
-            session,
+            session: Box::new(session),
             last_size: Rc::new(Cell::new(None)),
             error: None,
             selection: Rc::new(RefCell::new(None)),
