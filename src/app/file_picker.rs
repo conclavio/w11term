@@ -105,6 +105,16 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
                 None
             }
             Purpose::Scrollback => {
+                #[cfg(feature = "ui-smoke")]
+                if let Some(folder) = std::env::var_os("W11TERM_EXPORT_SMOKE_DIR") {
+                    use std::os::windows::ffi::OsStrExt;
+                    // Isolate the real Shell picker, including its suggested file.
+                    let path: Vec<_> = folder.encode_wide().chain(Some(0)).collect();
+                    let item: IShellItem =
+                        SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None)?;
+                    dialog.SetFolder(&item)?;
+                    options |= FOS_DONTADDTORECENT;
+                }
                 dialog.SetTitle(w!("Save scrollback as text"))?;
                 dialog.SetFileName(w!("terminal.txt"))?;
                 dialog.SetDefaultExtension(w!("txt"))?;

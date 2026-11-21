@@ -18,7 +18,7 @@ public static class FixtureDialog {
     [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr size, StringBuilder text, uint flags, uint timeout, out IntPtr result);
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr size, string text, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint command);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
@@ -55,16 +55,32 @@ public static class FixtureDialog {
         return IsWindowVisible(hwnd) && IsWindowEnabled(hwnd) && name.ToString() == type;
     }
 
+    private static string EditText(IntPtr hwnd) {
+        var text = new StringBuilder(32768);
+        IntPtr result;
+        if (SendMessageTimeout(hwnd, 0x000D, (IntPtr)text.Capacity, text, 2, 1000, out result) == IntPtr.Zero)
+            throw new IOException("Cannot read the file name");
+        return text.ToString();
+    }
+
     public static bool SetFilename(IntPtr dialog, string path) {
         bool changed = false;
         EnumChildWindows(dialog, (hwnd, _) => {
-            if (!IsControl(hwnd, "Edit")) return true;
-            var text = new StringBuilder(256);
+            if (!IsControl(hwnd, "Edit") || !IsControl(GetParent(hwnd), "ComboBox")) return true;
+            // Only the File name combo contains the suggestion we supplied to
+            // IFileSaveDialog. Never type into the path bar or folder search.
+            string suggested = EditText(hwnd);
+            if (suggested != "terminal.txt" && suggested != "terminal") return true;
             IntPtr result;
-            SendMessageTimeout(hwnd, 0x000D, (IntPtr)text.Capacity, text, 2, 1000, out result); // WM_GETTEXT
-            if (text.ToString() != "terminal.txt" && text.ToString() != "terminal") return true;
-            changed = SendMessageTimeout(hwnd, 0x000C, IntPtr.Zero, path, 2, 1000, out result) != IntPtr.Zero
-                && result != IntPtr.Zero; // WM_SETTEXT
+            SendMessageTimeout(dialog, 0x0028, hwnd, (IntPtr)1, 2, 1000, out result); // WM_NEXTDLGCTL
+            SendMessageTimeout(hwnd, 0x00B1, IntPtr.Zero, (IntPtr)(-1), 2, 1000, out result); // EM_SETSEL
+            // WM_SETTEXT can change the edit's display while leaving the Shell's
+            // selected file at terminal.txt. Typing also notifies the containing combo.
+            foreach (char ch in path) {
+                if (SendMessageTimeout(hwnd, 0x0102, (IntPtr)(int)ch, (IntPtr)1, 2, 1000, out result) == IntPtr.Zero)
+                    return false;
+            }
+            changed = EditText(hwnd) == path;
             return !changed;
         }, IntPtr.Zero);
         return changed;
