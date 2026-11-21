@@ -21,6 +21,8 @@ pub struct Appearance {
     pub font_size: f32,
     pub interaction: crate::interaction::Interaction,
     pub shortcuts: crate::shortcuts::Shortcuts,
+    #[serde(skip_serializing_if = "crate::hints::Patterns::is_empty")]
+    pub hint_patterns: crate::hints::Patterns,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_json::Value>,
 }
@@ -32,6 +34,7 @@ impl Default for Appearance {
             font_size: 16.0,
             interaction: crate::interaction::Interaction::default(),
             shortcuts: Default::default(),
+            hint_patterns: Default::default(),
             extra: BTreeMap::new(),
         }
     }

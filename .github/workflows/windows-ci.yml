@@ -101,6 +101,8 @@ jobs:
         run: ./tests/profile-ui-smoke.ps1
       - name: Import OpenSSH profiles through the GUI
         run: ./tests/openssh-import-ui-smoke.ps1
+      - name: Edit and select named keyboard hints through the GUI
+        run: powershell.exe -NoProfile -NonInteractive -STA -File ./tests/hint-patterns-ui.ps1 -VerifyClipboard
       - name: Compose and commit text through the native IME interface
         run: ./tests/ime-ui-smoke.ps1
       - name: Save failing GUI logs
