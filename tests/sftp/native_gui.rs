@@ -127,6 +127,22 @@ async fn native_profile_order_survives_restart_and_launches_the_selected_backend
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "verifies per-profile scrollback retention across a live SSH tab and two PowerShell processes"]
+async fn native_profile_scrollback_limits_apply_to_new_panes_and_preserve_live_history() {
+    let mut history = String::new();
+    for row in 0..180 {
+        history.push_str(&format!("ssh-row-{row:03}\r\n"));
+    }
+    history.push_str("ssh-history-ready\r\n");
+    run_palette_fixture(
+        "profile-scrollback-ui.ps1",
+        b"history-focus-ok",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "locks and unlocks input in a live SSH and PowerShell split through the native UI"]
 async fn native_read_only_input_is_per_pane_in_a_mixed_split() {
     run_palette_fixture("read-only-pane-ui.ps1", b"resumed", None).await;

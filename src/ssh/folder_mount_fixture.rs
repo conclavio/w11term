@@ -197,6 +197,7 @@ fn options() -> Result<SshOptions> {
         },
         host_key: Some(fingerprint),
         proxy_jump: vec![],
+        scrollback_lines: Default::default(),
         terminal_type: Default::default(),
         durable: false,
         player: crate::options::PlayerOptions {

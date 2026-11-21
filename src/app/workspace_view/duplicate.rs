@@ -180,6 +180,7 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             cwd: None,
             powershell_integration: false,
+            scrollback_lines: Default::default(),
         })
     }
 

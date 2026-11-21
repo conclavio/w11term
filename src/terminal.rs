@@ -1,4 +1,5 @@
 //! The terminal engine is independent of Reactor, rendering, and SSH.
+use crate::options::ScrollbackLines;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -13,6 +14,8 @@ use wezterm_term::{
 
 mod export;
 mod kitty;
+#[cfg(test)]
+mod scrollback_tests;
 pub(crate) use export::export_text;
 pub use kitty::KeypadKey;
 
@@ -53,7 +56,9 @@ pub fn scroll_wheel(
 }
 
 #[derive(Debug)]
-struct Config;
+struct Config {
+    scrollback_lines: ScrollbackLines,
+}
 
 impl TerminalConfiguration for Config {
     fn bidi_mode(&self) -> wezterm_term::config::BidiMode {
@@ -73,7 +78,7 @@ impl TerminalConfiguration for Config {
     }
 
     fn scrollback_size(&self) -> usize {
-        10_000
+        self.scrollback_lines.get()
     }
     fn enable_kitty_graphics(&self) -> bool {
         true
@@ -128,9 +133,17 @@ impl Write for ReplyWriter {
 }
 
 pub fn create(size: TerminalSize, writer: mpsc::UnboundedSender<TransportInput>) -> Terminal {
+    create_with_scrollback(size, writer, ScrollbackLines::default())
+}
+
+pub(crate) fn create_with_scrollback(
+    size: TerminalSize,
+    writer: mpsc::UnboundedSender<TransportInput>,
+    scrollback_lines: ScrollbackLines,
+) -> Terminal {
     Terminal::new(
         size,
-        Arc::new(Config),
+        Arc::new(Config { scrollback_lines }),
         "w11term",
         env!("CARGO_PKG_VERSION"),
         Box::new(ReplyWriter {

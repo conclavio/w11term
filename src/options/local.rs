@@ -1,3 +1,4 @@
+use super::ScrollbackLines;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -14,6 +15,8 @@ pub struct LocalOptions {
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub powershell_integration: bool,
+    #[serde(default, skip_serializing_if = "ScrollbackLines::is_default")]
+    pub scrollback_lines: ScrollbackLines,
 }
 
 impl LocalOptions {
@@ -117,6 +120,7 @@ impl LocalOptions {
                     executable: path,
                     args: vec![],
                     cwd: None,
+                    scrollback_lines: Default::default(),
                     powershell_integration: false,
                 });
             }
@@ -245,6 +249,7 @@ mod tests {
             executable: r"bin\tool.exe".into(),
             args: vec!["".into(), "windows path with spaces".into()],
             cwd: Some("working".into()),
+            scrollback_lines: Default::default(),
             powershell_integration: false,
         };
         assert!(store.save_local(None, "ssh", &shell).is_err());

@@ -61,6 +61,11 @@ The original MIT license is preserved in `LICENSE.md`.
 - `Screen::physical_lines` provides a borrowed, double-ended iterator over
   retained rows for plain-text exports without cloning scrollback.
 
+- Screen storage grows as output arrives. Resizing and rewrapping enforce
+  the physical row limit supplied by the profile, including a limit of zero.
+  Dropping primary rows advances their stable row indices so Find and export
+  continue to address retained text. The alternate buffer keeps one viewport.
+
 - A terminal may replace its input and reply writer after the previous
   transport has exited. Pending bytes on the old writer keep their original
   destination while the next shell starts in the same terminal model.
