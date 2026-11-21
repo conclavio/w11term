@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 pub enum Event {
     Data(Vec<u8>),
     Status(String),
+    SessionListUpdated(String),
     Connected(u64),
 }
 #[derive(Debug)]
@@ -547,6 +548,41 @@ pub(super) struct Driver {
 }
 
 impl Driver {
+    /// Authenticate without opening a PTY or starting a shell. Keep this
+    /// connection available for a subsequent attach from the same chooser.
+    pub(super) async fn discover_sessions(
+        &mut self,
+    ) -> Result<Vec<crate::durable::DiscoveredSession>> {
+        let options = self.options.clone();
+        let offered = self
+            .sharing
+            .offered
+            .take()
+            .filter(|link| link.matches(&options, self.prompts.as_ref()));
+        let scan = async {
+            let link = match offered {
+                Some(link) => link,
+                None => connect(&options, self.prompts.as_ref(), &mut self.passwords, None).await?,
+            };
+            let entries = super::durability::discover(&link, &options).await?;
+            Ok::<_, anyhow::Error>((link, entries))
+        };
+        tokio::pin!(scan);
+        loop {
+            tokio::select! {
+                message = self.input.recv() => match message {
+                    Some(message) => offline(message, &mut self.size, &mut self.options),
+                    None => anyhow::bail!("Session discovery closed"),
+                },
+                result = &mut scan => {
+                    let (link, entries) = result?;
+                    self.sharing.offered = Some(link);
+                    return Ok(entries);
+                }
+            }
+        }
+    }
+
     pub(super) fn discard_input(&mut self, message: TransportInput) {
         match message {
             TransportInput::Raw(_, reply) => {

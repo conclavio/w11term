@@ -105,7 +105,7 @@ def run(binary, vim, directory):
     directory = Path(directory)
     report = directory / "report.json"
     source = directory / "unsaved.txt"
-    session = "w11-" + uuid.uuid4().hex
+    session = "w11term-" + uuid.uuid4().hex
     generation = uuid.uuid4().hex
     env = {**os.environ, "ZMX_DIR": str(directory / "sockets"), "HOME": str(directory),
            "TERM": "xterm-256color", "SHELL": "/bin/sh", "W11_REPORT": str(report)}
@@ -122,12 +122,18 @@ def run(binary, vim, directory):
         result = command("get", session, "w11term_generation", check=False)
         return result.returncode == 0 and result.stdout.strip() == generation.encode()
 
-    def daemon_info():
+    def sessions():
         for line in command("list").stdout.decode().splitlines():
-            fields = dict(item.split("=", 1) for item in line.strip().split("\t") if "=" in item)
-            if fields.get("name") == session:
-                return fields
-        return {}
+            yield dict(item.split("=", 1) for item in line.strip().split("\t") if "=" in item)
+
+    def daemon_info():
+        return next((row for row in sessions() if row.get("name") == session), {})
+
+    def discover():
+        return [(row["name"], row["w11term_generation"]) for row in sessions()
+                if re.fullmatch(r"w11term-[0-9a-f]{32}", row.get("name", ""))
+                and re.fullmatch(r"[0-9a-f]{32}", row.get("w11term_generation", ""))
+                and "ended" not in row and "err" not in row]
 
     def report_data():
         return json.loads(report.read_text()) if report.exists() else {}
@@ -168,7 +174,13 @@ def run(binary, vim, directory):
         assert Path(f"/proc/{pid}").is_dir(), "editor exited with its SSH-facing client"
         # Existing sessions ignore the command. A disappearance between the label
         # probe and attach can spawn only /bin/false, never a replacement login shell.
-        client = Client([binary, "attach", session, "/bin/false"], env, new_size)
+        # A fresh local workspace has neither the name nor the generation.
+        # Obtain both from the stock listing and verify the selected live PTY.
+        [discovered] = discover()
+        assert discovered == (session, generation), discovered
+        name, label = discovered
+        assert command("get", name, "w11term_generation").stdout.strip() == label.encode()
+        client = Client([binary, "attach", name, "/bin/false"], env, new_size)
         eventually(lambda: marker in client.read(), "alternate-screen editor was not restored before input")
         assert same_generation() and daemon_info()["pid"] == daemon
         restored = bytes(client.output)
@@ -197,6 +209,7 @@ def run(binary, vim, directory):
         command("kill", session)
         eventually(lambda: not same_generation() and not daemon_info(),
                    "an ended session still claims its prior identity")
+        assert discover() == [], "expired PTY was offered for discovery"
         # Exercise the stock attach-on-missing behavior with a harmless, observable
         # fallback command; a predecessor's successful probe cannot promise an attach.
         expired_marker = directory / "expired-fallback"

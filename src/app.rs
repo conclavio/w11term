@@ -42,6 +42,7 @@ mod ime_smoke;
 mod local_smoke;
 mod pane_picker;
 mod pane_view;
+mod session_browser;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
 mod workspace_view;
@@ -49,6 +50,8 @@ use pane_view::PaneSurface;
 
 struct LiveTab {
     files: Box<FileDrawer>,
+    discovery_page: Option<usize>,
+    copy_output_unavailable: Option<&'static str>,
     confirm_end: bool,
     durable_phase: Option<w11term::ssh::DurablePhase>,
     source: Source,
@@ -79,6 +82,15 @@ struct Find {
     epoch: u64,
     input: ElementRef<TextBox>,
     focused: bool,
+}
+impl LiveTab {
+    fn browsing_sessions(&self) -> bool {
+        self.discovery_page.is_some()
+            && self
+                .session
+                .durable_state()
+                .is_some_and(|state| state.phase.is_browser())
+    }
 }
 impl Default for Find {
     fn default() -> Self {
@@ -244,6 +256,9 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(name) = label.strip_prefix("Find sessions on ") {
+        return Message::Discovery(session_browser::Action::Discover(name.into()));
+    }
     if let Some(action) = durable_view::menu_action(&label) {
         return Message::Durability(action);
     }
@@ -257,6 +272,8 @@ fn tab_menu_message(label: String) -> Message {
     }
     match label.split(": ").next().unwrap_or(&label) {
         "SFTP files" => Message::Files(FileAction::Toggle),
+        "Open files here" => Message::Files(FileAction::OpenHere),
+        "Copy last command output" => Message::CopyLastCommand,
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
@@ -373,8 +390,10 @@ pub enum Message {
     GenerateKey(TabId),
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
+    CopyLastCommand,
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
+    Discovery(session_browser::Action),
     FrameReady(TabId, u64),
     CloseWindow,
     Select(Option<usize>, u64, bool),
@@ -438,10 +457,16 @@ fn live_tab_sized(
     } else {
         Session::start_configured_with_connection(source.clone(), size, osc52, connection)
     };
+    live_tab_for_session(label, source, session)
+}
+
+fn live_tab_for_session(label: String, source: Source, session: Session) -> AppTab {
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
             files: Box::default(),
+            discovery_page: None,
+            copy_output_unavailable: Some("waiting for shell markers"),
             source,
             confirm_end: false,
             durable_phase: None,
@@ -540,16 +565,17 @@ impl TerminalApp {
             self.keyboard.reset_keys();
         }
         self.keyboard.set_modal(prompt_id.is_some());
+        let choosing = tab.browsing_sessions();
         if changed {
             self.keyboard
-                .set_target(if prompt_id.is_none() && !tab.device_busy {
+                .set_target(if prompt_id.is_none() && !tab.device_busy && !choosing {
                     Some((tab.session.input.clone(), tab.session.frames.clone()))
                 } else {
                     None
                 });
             self.keyboard
                 .set_search(prompt_id.is_none() && tab.find.open);
-        } else if prompt_id.is_some() || tab.device_busy {
+        } else if prompt_id.is_some() || tab.device_busy || choosing {
             self.keyboard.set_target(None);
         }
     }
@@ -1454,7 +1480,7 @@ impl TerminalApp {
                 let Page::Terminal(tab) = &entry.value.page else {
                     return None;
                 };
-                self.tabs.visible(entry.id).then(|| {
+                (self.tabs.visible(entry.id) && !tab.browsing_sessions()).then(|| {
                     (
                         entry.id,
                         tab.session.input.clone(),
@@ -2053,6 +2079,7 @@ impl TerminalApp {
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
                     MenuItem::item("workspaces", "Workspaces…"),
+                    self.discovery_menu(),
                     state_menu_item(
                         "fullscreen",
                         "Fullscreen (F11)",
@@ -2123,14 +2150,23 @@ impl TerminalApp {
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
             items.push(MenuItem::item("files", "SFTP files"));
+            items.push(MenuItem::item("files-here", "Open files here"));
         }
         if let Some(AppTab {
             page: Page::Terminal(live),
             ..
         }) = self.tabs.active()
-            && let Some(menu) = durable_view::pane_menu(live)
         {
-            items.push(menu);
+            items.push(match live.session.frames.load().copy_output_unavailable() {
+                Some(why) => MenuItem::disabled(
+                    "copy-last-output",
+                    format!("Copy last command output ({why})"),
+                ),
+                None => MenuItem::item("copy-last-output", "Copy last command output"),
+            });
+            if let Some(menu) = durable_view::pane_menu(live) {
+                items.push(menu);
+            }
         }
         if !self.profiles.is_empty() || !self.local_profiles.is_empty() {
             for (key, label) in [
@@ -2652,6 +2688,7 @@ impl Component for TerminalApp {
                          || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
                          || std::env::var_os("W11TERM_FILE_SMOKE").is_some()))
                      || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())
+                     || (ssh.user == "pilot" && std::env::var_os("W11TERM_DISCOVERY_SMOKE").is_some())
                      || (ssh.user == "bench" && std::env::var_os("W11TERM_PROFILE_SMOKE").is_some())));
             assert!(
                 (matches!(options.source, Source::Demo) || loopback)
@@ -2703,6 +2740,18 @@ impl Component for TerminalApp {
             self.watch_control(context);
         }
         match message {
+            Message::CopyLastCommand => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active()
+                    && let Some(command) = &tab.session.frames.load().last_command
+                    && let Ok(text) = &command.output
+                    && let Err(error) = w11term::clipboard::write(text)
+                {
+                    log::warn!("Copy last command output: {error:#}");
+                }
+            }
             Message::PickerQuery(query) => self.filter_picker(query),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
@@ -3257,6 +3306,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::Durability(action) => self.durability_action(action),
+            Message::Discovery(action) => self.discovery_action(action, context),
             #[cfg(feature = "ui-smoke")]
             Message::Smoke(step) => self.smoke_step(step, context),
             Message::FrameReady(id, epoch) => {
@@ -3268,8 +3318,13 @@ impl Component for TerminalApp {
                     }) = self.tabs.get_mut(id)
                     {
                         tab.error = None;
-                        tab.files
-                            .observe_connection(tab.session.frames.load().connection_generation);
+                        let frame = tab.session.frames.load();
+                        tab.files.observe_connection(frame.connection_generation);
+                        let unavailable = frame.copy_output_unavailable();
+                        if tab.copy_output_unavailable != unavailable {
+                            tab.copy_output_unavailable = unavailable;
+                            self.header.borrow_mut().take();
+                        }
                         let phase = tab.session.durable_state().map(|s| s.phase);
                         if tab.durable_phase != phase {
                             tab.durable_phase = phase;
@@ -3843,6 +3898,7 @@ impl Component for TerminalApp {
         }) = self.tabs.active()
             && tab.prompt_id.is_none()
             && !tab.find.open
+            && !tab.browsing_sessions()
             && self.switcher.is_none()
             && self.picker.is_none()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
@@ -4017,6 +4073,10 @@ impl Component for TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     fn smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        if std::env::var_os("W11TERM_DISCOVERY_SMOKE").is_some() {
+            self.discovery_smoke_step(step, context);
+            return;
+        }
         if std::env::var_os("W11TERM_DURABLE_SMOKE").is_some() {
             self.durable_smoke_step(step, context);
             return;

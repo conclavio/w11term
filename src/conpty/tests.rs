@@ -142,6 +142,9 @@ impl Fixture {
                     }
                     Some(Event::Status(status)) => self.screen.push_str(&format!("\n[{status}]\n")),
                     Some(Event::Connected(_)) => {}
+                    Some(Event::SessionListUpdated(_)) => {
+                        panic!("ConPTY supplied an SSH session list")
+                    }
                     None => anyhow::bail!("ConPTY ended before {value}, output {:?}", self.screen),
                 }
             }

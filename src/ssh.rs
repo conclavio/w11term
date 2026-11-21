@@ -5,6 +5,7 @@ mod known_hosts;
 mod sharing;
 mod transport;
 pub(crate) use durability::DurableControl;
+pub(crate) use durability::Start as DurableStart;
 pub use durability::{DurableAction, DurablePhase, DurableState};
 pub use sharing::ConnectionShare;
 pub(crate) use sharing::{NETWORK, ShareSlot, Sharing};

@@ -62,6 +62,7 @@ async fn native_durable_workspace() {
 
 #[derive(Default)]
 struct Backend {
+    authenticated: usize,
     shell: Option<(String, String)>,
     commands: Vec<String>,
     input: Vec<Vec<u8>>,
@@ -80,6 +81,7 @@ impl server::Handler for Peer {
     type Error = anyhow::Error;
     async fn auth_none(&mut self, user: &str) -> Result<server::Auth> {
         Ok(if user == "pilot" {
+            self.backend.lock().unwrap().authenticated += 1;
             server::Auth::Accept
         } else {
             server::Auth::reject()
@@ -141,6 +143,13 @@ impl server::Handler for Peer {
             match args.as_slice() {
                 ["zmx", "version"] if b.missing_program => (127, String::new(), false),
                 ["zmx", "version"] => (0, "zmx\t\t1.0.1\nghostty_vt\tfixture\n".into(), false),
+                ["zmx", "list"] => {
+                    let mut rows = "name=unmanaged\tpid=40\tclients=0\n".to_owned();
+                    if let Some((name, generation)) = &b.shell {
+                        rows.push_str(&format!("name={name}\tpid=41\tclients=2\tcreated=123\tcwd=/home/pilot\tcmd=vim\tw11term_generation={generation}\n"));
+                    }
+                    (0, rows, false)
+                }
                 ["zmx", "get", name, "w11term_generation"] => {
                     let label = b
                         .shell
@@ -267,6 +276,160 @@ async fn raw(session: &Session, text: &str) -> Result<(), String> {
         .await
         .unwrap()
         .unwrap()
+}
+
+fn existing_session(fixture: &Fixture) -> DurableReference {
+    let reference = DurableReference::new(
+        &fixture.options,
+        fixture.options.host_key.as_deref().unwrap(),
+    );
+    fixture.peer.backend.lock().unwrap().shell =
+        Some((reference.name.clone(), reference.generation.clone()));
+    reference
+}
+
+#[cfg(feature = "ui-smoke")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens an isolated native WinUI window"]
+async fn native_find_session_on_plain_ssh_profile() {
+    let fixture = Fixture::new().await;
+    let reference = existing_session(&fixture);
+    let dir = tempfile::tempdir().unwrap();
+    gui::run_gui(
+        &Source::Ssh(fixture.options.clone()),
+        dir.path(),
+        &[("W11TERM_DISCOVERY_SMOKE", "1")],
+        "Host discovery smoke passed",
+    )
+    .await;
+    let b = fixture.peer.backend.lock().unwrap();
+    assert!(b.commands.contains(&"zmx list".into()));
+    assert!(
+        b.commands
+            .contains(&format!("zmx attach {} /bin/false", reference.name))
+    );
+    assert!(
+        !b.commands
+            .iter()
+            .any(|c| c.starts_with("zmx attach --labels"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_client_discovers_an_existing_pty_then_attaches_on_its_verified_connection() {
+    let fixture = Fixture::new().await;
+    let ref1 = existing_session(&fixture);
+    let browser = Session::discover_durable(fixture.options.clone(), Default::default(), false);
+    phase(&browser, DurablePhase::Choosing).await;
+    let state = browser.durable_state().unwrap();
+    let [entry] = &*state.candidates else {
+        panic!("{state:?}")
+    };
+    assert_eq!(entry.reference, ref1);
+    assert_eq!(
+        (&*entry.directory, &*entry.command, entry.clients),
+        ("/home/pilot", "vim", 2)
+    );
+    assert!(state.reference.is_none());
+    assert!(raw(&browser, "before selection").await.is_err());
+    let mut other = ref1.clone();
+    other.user.push('x');
+    assert!(
+        browser
+            .durable_action(DurableAction::Choose(other))
+            .is_err()
+    );
+    {
+        let b = fixture.peer.backend.lock().unwrap();
+        assert_eq!(b.commands, ["zmx version", "zmx list"]);
+        assert!(b.grids.is_empty());
+        assert!(b.input.is_empty());
+    }
+    browser
+        .durable_action(DurableAction::Choose(ref1.clone()))
+        .unwrap();
+    phase(&browser, DurablePhase::Attached).await;
+    assert_eq!(
+        browser.durable_state().unwrap().reference,
+        Some(ref1.clone())
+    );
+    raw(&browser, "after selection").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !screen(&browser, "after selection") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the selected PTY echoes the input");
+    let b = fixture.peer.backend.lock().unwrap();
+    assert_eq!(b.authenticated, 1);
+    assert_eq!(b.input, [b"after selection".to_vec()]);
+    let probe = format!("zmx get {} w11term_generation", ref1.name);
+    assert_eq!(
+        &b.commands[2..],
+        [
+            "zmx version",
+            &probe,
+            &format!("zmx attach {} /bin/false", ref1.name),
+            &probe
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_count_refresh_wakes_the_view_for_new_entries() {
+    let fixture = Fixture::new().await;
+    let old = existing_session(&fixture);
+    let browser = Session::discover_durable(fixture.options.clone(), Default::default(), false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let presented = loop {
+        let frame = browser.frames.load();
+        if frame.status == "1 remote session" {
+            break frame;
+        }
+        assert!(browser.frames.changed(frame.generation, deadline).await);
+    };
+    let new = existing_session(&fixture);
+    browser.durable_action(DurableAction::Refresh).unwrap();
+    assert!(browser.frames.changed(presented.generation, deadline).await);
+    assert_eq!(browser.frames.load().status, presented.status);
+    let state = browser.durable_state().unwrap();
+    assert_eq!(state.candidates[0].reference, new);
+    assert!(!state.permits(DurableAction::Choose(old)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_refresh_drops_stale_choices_and_expired_pty_never_becomes_a_new_shell() {
+    let fixture = Fixture::new().await;
+    let reference = existing_session(&fixture);
+    let browser = Session::discover_durable(fixture.options.clone(), Default::default(), false);
+    phase(&browser, DurablePhase::Choosing).await;
+    fixture.peer.backend.lock().unwrap().missing_program = true;
+    browser.durable_action(DurableAction::Refresh).unwrap();
+    phase(&browser, DurablePhase::Choosing).await;
+    let failed = browser.durable_state().unwrap();
+    assert!(failed.candidates.is_empty() && failed.detail.contains("Unable to run zmx"));
+    assert!(
+        browser
+            .durable_action(DurableAction::Choose(reference.clone()))
+            .is_err()
+    );
+    fixture.peer.backend.lock().unwrap().missing_program = false;
+    browser.durable_action(DurableAction::Refresh).unwrap();
+    phase(&browser, DurablePhase::Choosing).await;
+    fixture.peer.backend.lock().unwrap().shell = None;
+    browser
+        .durable_action(DurableAction::Choose(reference))
+        .unwrap();
+    phase(&browser, DurablePhase::Missing).await;
+    assert!(raw(&browser, "expired").await.is_err());
+    let b = fixture.peer.backend.lock().unwrap();
+    assert!(b.grids.is_empty() && b.input.is_empty());
+    assert!(
+        !b.commands
+            .iter()
+            .any(|cmd| cmd.starts_with("zmx attach") || cmd == "<direct shell>")
+    );
 }
 fn screen(session: &Session, text: &str) -> bool {
     session

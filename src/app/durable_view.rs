@@ -60,7 +60,7 @@ pub(super) fn pane_menu(live: &LiveTab) -> Option<MenuItem> {
             actions.push(MenuItem::item("end", "End remote session…"));
         }
     }
-    Some(MenuItem::submenu("durability", "Remote session", actions))
+    (!actions.is_empty()).then(|| MenuItem::submenu("durability", "Remote session", actions))
 }
 
 impl TerminalApp {

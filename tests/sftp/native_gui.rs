@@ -89,6 +89,8 @@ async fn native_ssh_split() {
 #[ignore = "opens an isolated native WinUI window"]
 async fn native_file_drawer() {
     let (source, remote, opens, server) = fixture_server(false).await;
+    let shell_dir = remote.path().join("shell directory");
+    fs::create_dir(&shell_dir).unwrap();
     let state = tempfile::tempdir().unwrap();
     let bytes: Vec<_> = (0..(3 * w11term::sftp::CHUNK + 7))
         .map(|i| (i % 251) as u8)
@@ -101,7 +103,8 @@ async fn native_file_drawer() {
         "File drawer smoke passed",
     )
     .await;
-    assert_eq!(fs::read(remote.path().join("upload.bin")).unwrap(), bytes);
+    assert_eq!(fs::read(shell_dir.join("upload.bin")).unwrap(), bytes);
+    assert!(!remote.path().join("upload.bin").exists());
     assert_eq!(fs::read(state.path().join("download.bin")).unwrap(), bytes);
     assert_eq!(
         opens.load(Ordering::Relaxed),

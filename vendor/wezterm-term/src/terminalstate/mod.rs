@@ -251,6 +251,13 @@ impl ScreenOrAlt {
     }
 }
 
+/// Frozen plain text and optional exit status of the most recently completed command.
+#[derive(Debug)]
+pub struct CompletedCommand {
+    pub exit_code: Option<i32>,
+    pub output: Result<String, &'static str>,
+}
+
 /// Manages the state for the terminal
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
@@ -362,7 +369,10 @@ pub struct TerminalState {
     alert_handler: Option<Box<dyn AlertHandler>>,
     download_handler: Option<Arc<dyn DownloadHandler>>,
 
-    current_dir: Option<Url>,
+    // Keep the wire authority, since URL normalization maps file://localhost
+    // to an empty host. The SSH client must validate the reported destination.
+    current_dir: Option<(Url, Arc<str>)>,
+    last_command: Option<Arc<CompletedCommand>>,
 
     term_program: String,
     term_version: String,
@@ -609,6 +619,7 @@ impl TerminalState {
             alert_handler: None,
             download_handler: None,
             current_dir: None,
+            last_command: None,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
             writer,
@@ -706,7 +717,40 @@ impl TerminalState {
     /// terminal session.  The working directory can be changed by
     /// the applicaiton using the OSC 7 escape sequence.
     pub fn get_current_dir(&self) -> Option<&Url> {
-        self.current_dir.as_ref()
+        self.current_dir.as_ref().map(|(url, _)| url)
+    }
+
+    pub fn reported_current_dir(&self) -> Option<&Arc<str>> {
+        self.current_dir.as_ref().map(|(_, raw)| raw)
+    }
+
+    pub fn last_command(&self) -> Option<&Arc<CompletedCommand>> {
+        self.last_command.as_ref()
+    }
+
+    fn shell_column(&self) -> usize {
+        if self.wrap_next {
+            self.screen().physical_cols
+        } else {
+            self.cursor.x
+        }
+    }
+
+    fn begin_command_output(&mut self) {
+        if !self.is_alt_screen_active() {
+            self.screen.command_start = Some((
+                self.screen.visible_row_to_stable_row(self.cursor.y),
+                self.shell_column(),
+            ));
+        }
+    }
+
+    fn finish_command_output(&mut self, exit_code: Option<i32>) {
+        if !self.is_alt_screen_active() {
+            let col = self.shell_column();
+            let output = self.screen.finish_command_output(self.cursor.y, col);
+            self.last_command = Some(Arc::new(CompletedCommand { exit_code, output }));
+        }
     }
 
     /// Returns a copy of the palette.
