@@ -144,6 +144,7 @@ impl Reply {
 pub struct Pane {
     pub id: u64,
     pub tab_id: u64,
+    pub tab_title: Option<String>,
     pub label: String,
     pub active: bool,
     pub visible: bool,
@@ -361,6 +362,9 @@ impl Registry {
                     };
                     session["id"] = pane.id.into();
                     session["tab_id"] = pane.tab_id.into();
+                    if let Some(title) = pane.tab_title {
+                        session["tab_title"] = title.into();
+                    }
                     session["label"] = pane.label.into();
                     session["active"] = pane.active.into();
                     session["visible"] = pane.visible.into();
