@@ -176,7 +176,12 @@ fn eligible() -> bool {
     INPUT.with(|state| {
         state.try_borrow().ok().is_some_and(|state| {
             state.as_ref().is_some_and(|s| {
-                s.target.is_some() && !s.search && !s.modal && !s.switcher && !s.picker && !s.hints
+                s.target.is_some()
+                    && !s.search
+                    && !s.modal
+                    && !s.switcher
+                    && !s.picker
+                    && s.local_mode.is_none()
             })
         })
     })

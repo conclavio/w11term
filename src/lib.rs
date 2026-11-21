@@ -3,6 +3,7 @@ pub mod assets;
 pub mod clipboard;
 pub mod conpty;
 pub mod control;
+pub mod copy_mode;
 pub mod demo;
 pub mod durable;
 pub mod enroll;

@@ -25,6 +25,7 @@ pub enum Action {
     MovePane,
     PanePicker,
     KeyboardHints,
+    CopyMode,
     NextTab,
     PreviousTab,
     NewTab,
@@ -85,6 +86,13 @@ pub const BINDINGS: &[Binding] = &[
         0x48,
         CTRL_SHIFT,
     ),
+    Binding::new(
+        CopyMode,
+        "copy_mode",
+        "Keyboard copy mode",
+        0x58,
+        CTRL_SHIFT,
+    ),
     Binding::new(Workspaces, "workspaces", "Workspaces", 0, Mods::NONE),
     Binding::new(NextTab, "next_tab", "Next tab", 0x09, Mods::CTRL),
     Binding::new(
@@ -131,6 +139,7 @@ impl Action {
                 | ClosePane
                 | MovePane
                 | KeyboardHints
+                | CopyMode
         )
     }
 }
