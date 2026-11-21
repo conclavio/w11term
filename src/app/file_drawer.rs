@@ -866,7 +866,6 @@ impl FileDrawer {
                 } else {
                     format!("Filter: {}", self.filter)
                 }))
-                .into()
         };
         controls.push(
             Grid::new()
