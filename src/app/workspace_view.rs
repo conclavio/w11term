@@ -12,15 +12,50 @@ pub(super) struct WorkspacePage {
 struct StartupEditor {
     pane: TabId,
     destination: String,
+    fields: Rc<RefCell<StartupFields>>,
+    directory_changed: Callback<String>,
+    command_changed: Callback<String>,
+    apply: Callback<()>,
+}
+
+#[derive(Default)]
+struct StartupFields {
     directory: String,
     command: String,
+}
+
+impl StartupFields {
+    fn description(&self) -> String {
+        match (self.directory.is_empty(), self.command.is_empty()) {
+            (true, true) => "Open the profile’s default shell".into(),
+            (false, true) => format!("Open an interactive shell in {}", self.directory),
+            (true, false) => format!("Run {}", self.command),
+            (false, false) => format!("Run {} in {}", self.command, self.directory),
+        }
+    }
+}
+
+impl StartupEditor {
+    fn new(pane: TabId, destination: String, fields: StartupFields, apply: Callback<()>) -> Self {
+        let fields = Rc::new(RefCell::new(fields));
+        let directory = Rc::clone(&fields);
+        let command = Rc::clone(&fields);
+        // Keep both subscriptions alive throughout the edit. Rebuilding them after
+        // one change can retire the adjacent field's queued native TextChanged.
+        Self {
+            pane,
+            destination,
+            directory_changed: Callback::new(move |value| directory.borrow_mut().directory = value),
+            command_changed: Callback::new(move |value| command.borrow_mut().command = value),
+            fields,
+            apply,
+        }
+    }
 }
 
 pub enum WorkspaceAction {
     Show,
     ConfigureStartup,
-    StartupDirectory(TabId, String),
-    StartupCommand(TabId, String),
     ApplyStartup(TabId),
     CancelStartup(TabId),
     Name(TabId, String),
@@ -50,38 +85,24 @@ impl TerminalApp {
                 {
                     return;
                 }
-                let draft = StartupEditor {
-                    pane,
-                    destination: source_label(&live.source),
-                    directory: live
-                        .startup
-                        .as_ref()
-                        .map(|s| s.directory.clone())
-                        .unwrap_or_default(),
-                    command: live
-                        .startup
-                        .as_ref()
-                        .map(|s| s.command.clone())
-                        .unwrap_or_default(),
-                };
+                let destination = source_label(&live.source);
+                let fields = live
+                    .startup
+                    .as_ref()
+                    .map(|s| StartupFields {
+                        directory: s.directory.clone(),
+                        command: s.command.clone(),
+                    })
+                    .unwrap_or_default();
                 self.workspace_action(WorkspaceAction::Show, context);
-                if let Some(page) = self
-                    .tabs
-                    .active_id()
-                    .and_then(|id| self.workspace_page_mut(id))
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(page) = self.workspace_page_mut(id)
                 {
+                    let apply = context
+                        .sender()
+                        .callback(move |_| Message::Workspace(WorkspaceAction::ApplyStartup(id)));
                     page.status.clear();
-                    page.startup = Some(draft);
-                }
-            }
-            WorkspaceAction::StartupDirectory(id, value) => {
-                if let Some(draft) = self.workspace_page_mut(id).and_then(|p| p.startup.as_mut()) {
-                    draft.directory = value;
-                }
-            }
-            WorkspaceAction::StartupCommand(id, value) => {
-                if let Some(draft) = self.workspace_page_mut(id).and_then(|p| p.startup.as_mut()) {
-                    draft.command = value;
+                    page.startup = Some(StartupEditor::new(pane, destination, fields, apply));
                 }
             }
             WorkspaceAction::CancelStartup(id) => {
@@ -105,13 +126,14 @@ impl TerminalApp {
                     let Source::Ssh(ssh) = &live.source else {
                         anyhow::bail!("The pane requires SSH")
                     };
-                    live.startup = if draft.directory.is_empty() && draft.command.is_empty() {
+                    let fields = draft.fields.borrow();
+                    live.startup = if fields.directory.is_empty() && fields.command.is_empty() {
                         None
                     } else {
                         Some(Box::new(SshStartup::new(
                             ssh,
-                            draft.directory.clone(),
-                            draft.command.clone(),
+                            fields.directory.clone(),
+                            fields.command.clone(),
                         )?))
                     };
                     Ok(())
@@ -119,8 +141,10 @@ impl TerminalApp {
                 if let Some(page) = self.workspace_page_mut(id) {
                     match result {
                         Ok(()) => {
-                            page.status =
-                                "Save or update the workspace to keep these settings.".into();
+                            page.status = format!(
+                                "On reopen · {}. Save or update the workspace to keep this setting.",
+                                draft.fields.borrow().description()
+                            );
                         }
                         Err(error) => {
                             page.status = error.to_string();
@@ -276,28 +300,23 @@ impl TerminalApp {
         context: &ViewContext<Self>,
     ) -> View {
         if let Some(editor) = &page.startup {
+            let fields = editor.fields.borrow();
             let directory = TextBox::new()
                 .automation_name("Remote starting directory")
-                .text(&editor.directory)
+                .text(&fields.directory)
                 .placeholder_text("/home/me/project")
-                .on_text_changed(context.callback(move |value| {
-                    Message::Workspace(WorkspaceAction::StartupDirectory(id, value))
-                }));
+                .on_text_changed(editor.directory_changed.clone());
             let command = TextBox::new()
                 .automation_name("Remote startup command")
-                .text(&editor.command)
+                .text(&fields.command)
                 .placeholder_text("tail -f build.log")
-                .on_text_changed(context.callback(move |value| {
-                    Message::Workspace(WorkspaceAction::StartupCommand(id, value))
-                }));
+                .on_text_changed(editor.command_changed.clone());
             let buttons = StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)
                 .children((
                     Button::new()
-                        .on_click(context.callback(move |_| {
-                            Message::Workspace(WorkspaceAction::ApplyStartup(id))
-                        }))
+                        .on_click(editor.apply.clone())
                         .content("Apply to pane"),
                     Button::new()
                         .on_click(context.callback(move |_| {
@@ -321,6 +340,9 @@ impl TerminalApp {
                     directory,
                     TextBlock::new().text("Remote command"),
                     command,
+                    TextBlock::new()
+                        .text(format!("On reopen · {}", fields.description()))
+                        .text_wrapping(TextWrapping::Wrap),
                     buttons,
                     TextBlock::new()
                         .text(&page.status)
