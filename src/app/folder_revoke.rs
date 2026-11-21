@@ -60,18 +60,15 @@ impl TerminalApp {
                 .automation_name("Confirm revoke all shared folders")
                 .on_click(ctx.callback(move |_| Message::FolderRevoke(id, ticket, Action::Revoke)))
                 .content("Revoke all shared folders");
-            return StackPanel::new()
-                .spacing(5.0)
-                .children((
-                    TextBlock::new()
-                        .text(question)
-                        .text_wrapping(TextWrapping::Wrap),
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(8.0)
-                        .children((cancel, confirm)),
-                ))
-                .into();
+            return StackPanel::new().spacing(5.0).children((
+                TextBlock::new()
+                    .text(question)
+                    .text_wrapping(TextWrapping::Wrap),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((cancel, confirm)),
+            ));
         }
         let available = self.store.has_folder_permissions(base);
         let feedback = match &available {
@@ -87,15 +84,12 @@ impl TerminalApp {
         if feedback.is_empty() {
             button
         } else {
-            StackPanel::new()
-                .spacing(5.0)
-                .children((
-                    button,
-                    TextBlock::new()
-                        .text(feedback)
-                        .text_wrapping(TextWrapping::Wrap),
-                ))
-                .into()
+            StackPanel::new().spacing(5.0).children((
+                button,
+                TextBlock::new()
+                    .text(feedback)
+                    .text_wrapping(TextWrapping::Wrap),
+            ))
         }
     }
 
