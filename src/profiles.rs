@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
 mod folder_permissions;
-pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate};
+pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileSnapshot {

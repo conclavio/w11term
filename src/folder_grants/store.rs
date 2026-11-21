@@ -95,8 +95,16 @@ impl Store {
         })
     }
 
-    pub fn revocation_gate(&self) -> FolderGrantGate {
-        self.gate.clone()
+    pub fn revocation_gate(&self, grant: &Grant) -> Result<FolderGrantGate> {
+        // The filename already binds the catalog, profile, SSH endpoint, host
+        // key and token. The random selection ID distinguishes a replacement
+        // even if it has the same local path and Linux mount name.
+        ensure!(
+            grant.id.len() == 32 && grant.id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Invalid saved folder identifier"
+        );
+        let marker = self.path.with_extension(format!("{}.forgotten", grant.id));
+        Ok(self.gate.for_selection(marker))
     }
 
     #[cfg(test)]
@@ -126,17 +134,24 @@ impl Store {
         let grants: Vec<Grant> =
             serde_json::from_slice(&buf).context("Reading saved folder permissions")?;
         let mut names = std::collections::BTreeSet::new();
+        let mut ids = std::collections::BTreeSet::new();
         ensure!(
             grants.len() <= MAX_FOLDERS
                 && grants.iter().all(|g| valid_mount_name(&g.name)
                     && names.insert(&g.name)
-                    && g.id.len() == 32
-                    && g.id.bytes().all(|b| b.is_ascii_hexdigit())
+                    && ids.insert(g.id.to_ascii_lowercase())
                     && !g.identity.is_empty()
                     && g.path.is_absolute()),
             "Invalid saved folder permissions"
         );
-        Ok(grants)
+        // A backup of the grant list cannot reactivate a forgotten selection.
+        let mut active = Vec::new();
+        for grant in grants {
+            if !self.revocation_gate(&grant)?.selection_retired()? {
+                active.push(grant);
+            }
+        }
+        Ok(active)
     }
 
     fn edit(&self, change: impl FnOnce(&mut Vec<Grant>) -> Result<()>) -> Result<()> {
@@ -177,8 +192,14 @@ impl Store {
                 "A profile can share up to {MAX_FOLDERS} folders"
             );
             ensure!(
-                !grants.iter().any(|g| g.name == grant.name),
-                "This Linux mount name is already saved"
+                !grants
+                    .iter()
+                    .any(|g| g.name == grant.name || g.id.eq_ignore_ascii_case(&grant.id)),
+                "This Linux mount name or folder permission is already saved"
+            );
+            ensure!(
+                !self.revocation_gate(&grant)?.selection_retired()?,
+                "This folder permission was forgotten"
             );
             grants.push(grant);
             Ok(())
@@ -188,11 +209,12 @@ impl Store {
     pub fn remove(&self, grant: &Grant) -> Result<()> {
         self.edit(|grants| {
             ensure!(
-                !grants
-                    .iter()
-                    .any(|g| (g.name == grant.name || g.id == grant.id) && !g.same_selection(grant)),
+                !grants.iter().any(|g| (g.name == grant.name
+                    || g.id.eq_ignore_ascii_case(&grant.id))
+                    && !g.same_selection(grant)),
                 "This shared folder has changed. Reopen Shared folders"
             );
+            self.revocation_gate(grant)?.forget_selection()?;
             grants.retain(|g| !g.same_selection(grant));
             Ok(())
         })
@@ -218,8 +240,12 @@ mod tests {
     fn fixture(dir: &std::path::Path) -> (FolderScope, Authority) {
         let catalog = dir.join("profiles.json");
         std::fs::write(&catalog, br#"{"profiles":{"test":{"host":"example.test","user":"pilot","auth":"none","custom":3}}}"#).unwrap();
+        fixture_binding(catalog, dir.join("data"))
+    }
+
+    fn fixture_binding(catalog: PathBuf, data: PathBuf) -> (FolderScope, Authority) {
         (
-            FolderScope::new(catalog, "test".into(), dir.join("data")),
+            FolderScope::new(catalog, "test".into(), data),
             Authority {
                 profile: "test".into(),
                 host: "example.test".into(),
@@ -241,6 +267,107 @@ mod tests {
             writable: false,
             path,
         }
+    }
+
+    #[test]
+    fn forgetting_one_folder_drains_its_other_process_and_survives_backup_restore() -> Result<()> {
+        use std::{
+            fs,
+            process::Command,
+            thread,
+            time::{Duration, Instant},
+        };
+        const CHILD: &str = "W11TERM_TEST_FORGET_ACTIVE_FOLDER";
+        const TIMEOUT: Duration = Duration::from_secs(15);
+        fn wait_for(mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
+            let deadline = Instant::now() + TIMEOUT;
+            while !ready()? {
+                ensure!(
+                    Instant::now() < deadline,
+                    "Timed out waiting for the other folder permission process"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        }
+
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(dir);
+            let (scope, auth) = fixture_binding(dir.join("profiles.json"), dir.join("data"));
+            let store = Store::for_profile(&scope, &auth, false)?.unwrap();
+            let grants = store.read()?;
+            let target = store.revocation_gate(&grants[0])?;
+            let sibling = store.revocation_gate(&grants[1])?;
+            let admitted = target.lock_mutation()?;
+            let sibling_admitted = sibling.lock_mutation()?;
+            fs::write(dir.join("admitted"), [])?;
+            wait_for(|| target.revoked())?;
+            assert!(!sibling.revoked()?);
+            fs::write(dir.join("saw-retirement"), [])?;
+            wait_for(|| Ok(dir.join("release-target").try_exists()?))?;
+            drop(admitted);
+            wait_for(|| Ok(dir.join("forget-returned").try_exists()?))?;
+            assert!(target.lock_mutation().is_err());
+            drop(sibling_admitted);
+            sibling.lock_mutation()?;
+            return Ok(());
+        }
+
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path();
+        let (scope, auth) = fixture(dir);
+        let store = Store::for_profile(&scope, &auth, true)?.unwrap();
+        let target = Grant {
+            writable: true,
+            ..grant(dir.join("one"), 1)
+        };
+        let sibling = Grant {
+            name: "audio".into(),
+            writable: true,
+            ..grant(dir.join("two"), 2)
+        };
+        store.add(target.clone())?;
+        store.add(sibling.clone())?;
+        let backup = fs::read(&store.path)?;
+        let test_name = std::thread::current()
+            .name()
+            .context("Test name required for subprocess")?
+            .to_owned();
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD, dir)
+            .spawn()?;
+        wait_for(|| Ok(dir.join("admitted").try_exists()?))?;
+        let reopener = Store::for_profile(&scope, &auth, false)?.unwrap();
+        let captured = target.clone();
+        let (sent, done) = std::sync::mpsc::channel();
+        let remover = thread::spawn(move || {
+            let _ = sent.send(reopener.remove(&captured));
+        });
+        wait_for(|| Ok(dir.join("saw-retirement").try_exists()?))?;
+        assert!(matches!(
+            done.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        fs::write(dir.join("release-target"), [])?;
+        done.recv_timeout(TIMEOUT)??;
+        fs::write(dir.join("forget-returned"), [])?;
+        remover.join().unwrap();
+        assert!(child.wait()?.success());
+
+        fs::write(&store.path, backup)?;
+        assert_eq!(store.read()?, [sibling.clone()]);
+        assert!(store.add(target.clone()).is_err());
+        let replacement = Grant {
+            id: format!("{:032x}", 3),
+            ..target.clone()
+        };
+        store.add(replacement.clone())?;
+        assert!(store.remove(&target).is_err());
+        assert_eq!(store.read()?, [sibling, replacement]);
+        Ok(())
     }
 
     #[test]

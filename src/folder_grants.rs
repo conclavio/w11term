@@ -665,7 +665,7 @@ impl Core {
                 .context("Pinning the saved writable folder")?;
             protected_paths::check(&root, &self.scope)?;
         }
-        let root = root.with_profile_permission(store.revocation_gate());
+        let root = root.with_profile_permission(store.revocation_gate(grant)?);
         let mut state = self.check(auth)?;
         let row = state
             .rows

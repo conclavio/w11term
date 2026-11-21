@@ -54,6 +54,15 @@ pub(crate) struct FolderGrantGate {
     marker: PathBuf,
     revision_path: PathBuf,
     expected_revision: Option<String>,
+    selection: Option<PathBuf>,
+}
+
+/// The OS releases both shared locks when this disk operation completes or
+/// its process exits. The profile editor and single-folder Forget drain the
+/// corresponding exclusive lock before confirming revocation.
+pub(crate) struct FolderMutationPermit {
+    _profile: fs::File,
+    _selection: Option<fs::File>,
 }
 impl FolderGrantGate {
     pub(crate) fn new(
@@ -65,20 +74,68 @@ impl FolderGrantGate {
             marker,
             revision_path,
             expected_revision,
+            selection: None,
         }
     }
+    pub(crate) fn for_selection(&self, marker: PathBuf) -> Self {
+        Self {
+            selection: Some(marker),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn selection_retired(&self) -> Result<bool> {
+        match &self.selection {
+            Some(marker) => retired(marker),
+            None => Ok(false),
+        }
+    }
+
+    pub(crate) fn forget_selection(&self) -> Result<()> {
+        let marker = self
+            .selection
+            .as_deref()
+            .context("Missing saved folder identifier")?;
+        record_revocation(marker)?;
+        // A sibling can keep writing throughout. Only requests that passed
+        // this exact selection's check before the marker appeared can remain.
+        let writes = mutation_lock(marker)?;
+        writes.lock()?;
+        Ok(())
+    }
     pub(crate) fn revoked(&self) -> Result<bool> {
-        Ok(retired(&self.marker)? || revision(&self.revision_path)? != self.expected_revision)
+        Ok(retired(&self.marker)?
+            || self.selection_retired()?
+            || revision(&self.revision_path)? != self.expected_revision)
     }
     /// Keep a single admitted filesystem mutation inside the lifetime of this
     /// profile's consent. The editor waits for these handles before reporting
     /// successful revocation, including when it runs in another process.
-    pub(crate) fn lock_mutation(&self) -> Result<fs::File> {
-        let lock = mutation_lock(&self.revision_path)?;
-        lock.lock_shared()?;
+    pub(crate) fn lock_mutation(&self) -> Result<FolderMutationPermit> {
+        let profile = mutation_lock(&self.revision_path)?;
+        profile.lock_shared()?;
+        let selection = self.selection.as_deref().map(mutation_lock).transpose()?;
+        if let Some(lock) = &selection {
+            lock.lock_shared()?;
+        }
         ensure!(!self.revoked()?, "Folder sharing permission was revoked");
-        Ok(lock)
+        Ok(FolderMutationPermit {
+            _profile: profile,
+            _selection: selection,
+        })
     }
+}
+
+fn record_revocation(marker: &Path) -> Result<()> {
+    fs::create_dir_all(marker.parent().context("Missing permission directory")?)
+        .context("Creating folder revocation directory")?;
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(marker)
+        .and_then(|file| file.sync_all())
+        .context("Recording folder permission revocation")
 }
 
 fn mutation_lock(revision: &Path) -> Result<fs::File> {
@@ -247,17 +304,9 @@ impl ProfileStore {
             );
             let token = id(&base.raw, SHARE_TOKEN)?.context("Profile has no folder permissions")?;
             let marker = marker_path(data_dir, &base.catalog_path, &base.name, token)?;
-            let parent = marker.parent().context("Missing permission directory")?;
-            fs::create_dir_all(parent).context("Creating folder revocation directory")?;
             // Existence alone revokes the grant even if the following profile
             // save fails. Repeating the operation from that snapshot is safe.
-            fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&marker)
-                .and_then(|file| file.sync_all())
-                .context("Recording folder permission revocation")?;
+            record_revocation(&marker)?;
             let new = format!("{:032x}", rand::random::<u128>());
             let revision = revision_path(data_dir, &base.catalog_path, &base.name)?;
             save_revision(&revision, &new)?;
