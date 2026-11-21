@@ -318,6 +318,7 @@ impl Registry {
                 self.pane(pane)?
                     .input
                     .send(Command::Sftp(crate::sftp::Job {
+                        expected_generation: None,
                         operation,
                         deadline,
                         reply,
