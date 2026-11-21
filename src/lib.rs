@@ -17,6 +17,7 @@ pub mod recorder;
 pub mod search;
 pub mod session;
 pub mod sftp;
+pub mod shortcuts;
 pub mod sound;
 pub mod ssh;
 pub mod ssh_config;

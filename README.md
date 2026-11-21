@@ -67,7 +67,9 @@ Each restored pane receives a new process-local control ID. SSH panes normally s
 
 Imported `ProxyJump` routes use SSH `direct-tcpip` channels. Each jump host and the final destination have their own authentication and host-key checks. The resulting SSH shell and its SFTP drawer use the destination connection. For a manually configured profile, `proxy_jump` is an ordered array of objects with `host`, `user`, optional `port`, `auth` and optional `host_key`. Each hop supports the same authentication choices as the destination.
 
-| Pane action | Shortcut |
+Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the pane picker and workspaces. Select **Edit…**, enter a chord such as `Ctrl+Alt+Right` or `F8`, and choose **Save shortcut**. **Clear shortcut** releases its key for the terminal. **Restore default** restores that action’s original binding. The editor identifies conflicts, and pane menus show the current bindings. Changes apply immediately and persist in the per-user settings file.
+
+| Pane action | Default shortcut |
 | --- | --- |
 | Split right or below | Ctrl+Alt+Shift+Right or Down |
 | Focus a neighbor | Ctrl+Alt+Arrow |

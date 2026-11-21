@@ -20,6 +20,7 @@ pub struct Appearance {
     pub ligatures: bool,
     pub font_size: f32,
     pub interaction: crate::interaction::Interaction,
+    pub shortcuts: crate::shortcuts::Shortcuts,
     #[serde(flatten)]
     extra: BTreeMap<String, serde_json::Value>,
 }
@@ -30,6 +31,7 @@ impl Default for Appearance {
             ligatures: true,
             font_size: 16.0,
             interaction: crate::interaction::Interaction::default(),
+            shortcuts: Default::default(),
             extra: BTreeMap::new(),
         }
     }
@@ -47,7 +49,15 @@ impl Appearance {
     }
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).context("Reading appearance settings"),
+            Ok(bytes) => {
+                let settings: Self =
+                    serde_json::from_slice(&bytes).context("Reading appearance settings")?;
+                settings
+                    .shortcuts
+                    .keymap()
+                    .context("Checking keyboard shortcuts")?;
+                Ok(settings)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
