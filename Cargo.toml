@@ -44,6 +44,7 @@ rand = "0.10"
 
 [dev-dependencies]
 bytes = "1"
+windows = { version = "0.62", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_IO"] }
 
 [build-dependencies]
 windows-reactor-setup = "=0.100.0"
