@@ -82,8 +82,8 @@ function Confirm-SshBanner([int]$Port) {
     } finally { $client.Dispose() }
 }
 
-$qemu = (Get-Command -Name $QemuExecutable -CommandType Application -ErrorAction Stop).Source
-$keygen = (Get-Command ssh-keygen.exe -CommandType Application -ErrorAction Stop).Source
+$qemu = (Get-Command -Name $QemuExecutable -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
+$keygen = (Get-Command ssh-keygen.exe -CommandType Application -TotalCount 1 -ErrorAction Stop).Source
 $test = (Get-Item -LiteralPath $TestExecutable).FullName
 $kernel = (Get-Item -LiteralPath (Join-Path $GuestDirectory 'vmlinuz')).FullName
 $initramfs = (Get-Item -LiteralPath (Join-Path $GuestDirectory 'initramfs.gz')).FullName
