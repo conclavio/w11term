@@ -418,7 +418,7 @@ fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOpti
         TransportInput::Resize(new) => *size = new,
         TransportInput::Authenticate(auth) => options.authentication = auth,
         TransportInput::Data(_) | TransportInput::Automatic(_) => {}
-        TransportInput::Raw(_, reply) => {
+        TransportInput::Raw(_, reply) | TransportInput::Clipboard { reply, .. } => {
             let _ = reply.send(Err(
                 "SSH is reconnecting; input was not queued or sent".into()
             ));
@@ -624,7 +624,7 @@ impl Driver {
 
     pub(super) fn discard_input(&mut self, message: TransportInput) {
         match message {
-            TransportInput::Raw(_, reply) => {
+            TransportInput::Raw(_, reply) | TransportInput::Clipboard { reply, .. } => {
                 let _ = reply.send(Err(
                     "No SSH shell is attached; input was not queued or sent".into(),
                 ));
@@ -831,7 +831,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     let sideband = exchange(probe, auth, None);
     tokio::pin!(sideband);
     if managed {
-        shell.published.publish(&shell.link);
+        shell.published.publish(&shell.link, generation);
         program.ready();
         events.push(
             "connected",
@@ -889,7 +889,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             message = input.recv() => {
                 if process_exited {
                     match message {
-                        Some(TransportInput::Raw(_, reply)) => { let _ = reply.send(Err("Remote process exited; input was not sent".into())); }
+                        Some(TransportInput::Raw(_, reply) | TransportInput::Clipboard { reply, .. }) => { let _ = reply.send(Err("Remote process exited; input was not sent".into())); }
                         Some(TransportInput::Sftp(job)) => { let _ = job.reply.send(Err("Remote process exited; SFTP operation was not started".into())); }
                         Some(_) => {}
                         None => return Ok(()),
@@ -906,11 +906,14 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                         forward_sftp(&sftp_tx,&cleanup_tx,job);
                     }
                     Some(TransportInput::Data(_) | TransportInput::Automatic(_)) if discard_input => {}
-                    Some(TransportInput::Raw(_, reply)) if discard_input => {
+                    Some(TransportInput::Raw(_, reply) | TransportInput::Clipboard { reply, .. }) if discard_input => {
                         let _ = reply.send(Err("RustMUSH resume is pending; input was not queued or sent".into()));
                     }
                     Some(TransportInput::Data(bytes) | TransportInput::Automatic(bytes)) => channel.data(bytes.as_slice()).await?,
-                    Some(TransportInput::Raw(bytes, reply)) => {
+                    Some(TransportInput::Clipboard { connection, reply, .. }) if connection != generation || pending != 0 => {
+                        let _ = reply.send(Err(crate::terminal::STALE_PASTE.into()));
+                    }
+                    Some(TransportInput::Raw(bytes, reply) | TransportInput::Clipboard { bytes, reply, .. }) => {
                         let result = channel.data(bytes.as_slice()).await;
                         let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
                         result?;
@@ -925,7 +928,7 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             }
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
-                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
+                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link,generation);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),
                 // Exit status is advisory until EOF/close; the peer can still
                 // deliver final terminal bytes after reporting it.
@@ -974,8 +977,8 @@ async fn run_herdr_channel(
             )
             .await?;
     }
-    shell.published.publish(&link);
     let generation = driver.generation;
+    shell.published.publish(&link, generation);
     driver.output.send(Event::HerdrViewer).await?;
     driver.output.send(Event::Connected(generation)).await?;
     driver.events.push(
@@ -997,7 +1000,10 @@ async fn run_herdr_channel(
             message=driver.input.recv()=>match message {
                 Some(TransportInput::Data(data))=>viewer.input(&data).await?,
                 Some(TransportInput::Automatic(data))=>viewer.automatic_input(&data).await?,
-                Some(TransportInput::Raw(data,reply))=>{
+                Some(TransportInput::Clipboard {connection,reply,..}) if connection != generation => {
+                    let _=reply.send(Err(crate::terminal::STALE_PASTE.into()));
+                }
+                Some(TransportInput::Raw(data,reply) | TransportInput::Clipboard {bytes:data,reply,..})=>{
                     let result=viewer.input(&data).await;
                     let _=reply.send(result.as_ref().map(|_|()).map_err(|e|e.to_string()));
                     result?;

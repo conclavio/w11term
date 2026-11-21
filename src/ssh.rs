@@ -11,7 +11,9 @@ mod transport;
 pub(crate) use durability::DurableControl;
 pub(crate) use durability::Start as DurableStart;
 pub use durability::{DurableAction, DurablePhase, DurableState};
-pub use folder_share::{FolderMount, FolderMountStatus, FolderRoot, valid_mount_name};
+pub use folder_share::{
+    FolderMount, FolderMountStatus, FolderRoot, MountedFolder, valid_mount_name,
+};
 pub use sharing::ConnectionShare;
 pub(crate) use sharing::{NETWORK, ShareSlot, Sharing};
 pub use transport::{Event, run, run_configured};

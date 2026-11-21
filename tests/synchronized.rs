@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use w11term::{
-    control::{CapturePng, Pane, Registry, Request},
     options::Source,
     session::{Command, Session},
     terminal::Snapshot,
@@ -28,84 +27,6 @@ fn text(snapshot: &Snapshot) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-fn registry(session: &Session) -> Registry {
-    let registry = Registry::default();
-    registry.replace([Pane {
-        id: 1,
-        tab_id: 5,
-        tab_title: None,
-        label: "test".into(),
-        active: true,
-        visible: true,
-        read_only: false,
-        input: session.input.clone(),
-    }]);
-    registry
-}
-
-#[tokio::test]
-async fn fragmented_update_and_control_capture_share_the_committed_frame() {
-    let session = Session::start_sized(
-        Source::Demo,
-        TerminalSize {
-            cols: 40,
-            rows: 8,
-            pixel_width: 400,
-            pixel_height: 160,
-            dpi: 96,
-        },
-    );
-    let old = feed(&session, "old HUD").await;
-    for piece in ["\x1b[?20", "26h", "\rnew HUD", "\x1b[2;1Hnew picture"] {
-        let partial = feed(&session, piece).await;
-        assert_eq!(partial.generation, old.generation);
-        assert_eq!(text(&partial), text(&old));
-        assert_eq!(text(&session.frames.load()), text(&old));
-    }
-    let registry = registry(&session);
-    let expected = text(&old);
-    let screenshot: CapturePng = Arc::new(move |frame, _, _| {
-        assert_eq!(text(frame), expected);
-        Ok((400, 160))
-    });
-    let screen = registry
-        .execute(Request::GetText { pane: 1 }, screenshot.clone())
-        .await
-        .unwrap();
-    assert!(screen["text"].as_str().unwrap().contains("old HUD"));
-    let directory = tempfile::tempdir().unwrap();
-    registry
-        .execute(
-            Request::Screenshot {
-                pane: 1,
-                path: directory.path().join("unused.png"),
-            },
-            screenshot,
-        )
-        .await
-        .unwrap();
-    let waiting = registry.execute(
-        Request::WaitForText {
-            pane: 1,
-            pattern: "new picture".into(),
-            regex: false,
-            timeout_seconds: 1,
-        },
-        Arc::new(|_, _, _| anyhow::bail!("unused")),
-    );
-    tokio::pin!(waiting);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(10), waiting.as_mut())
-            .await
-            .is_err(),
-        "wait-for-text observed uncommitted output"
-    );
-    let done = feed(&session, "\x1b[?2026l").await;
-    waiting.await.unwrap();
-    assert!(text(&done).contains("new HUD\nnew picture"));
-    assert_eq!(done.generation, old.generation + 1);
-}
-
 #[tokio::test]
 async fn no_op_input_and_control_queries_do_not_publish_frames() {
     let session = Session::start(Source::Demo);

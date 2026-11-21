@@ -1,8 +1,11 @@
 //! Literal and regular expression scrollback search with stable cell coordinates, including soft wraps.
 use crate::interaction::Point;
 use regex::{Regex, RegexBuilder};
-use std::collections::VecDeque;
 use wezterm_term::{SemanticType, Terminal};
+
+mod literal;
+mod panes;
+pub use panes::{PaneSearchAnchor, PaneSearchPreview};
 
 const LIMIT: usize = 10_000;
 pub const MAX_QUERY_BYTES: usize = 4096;
@@ -138,85 +141,18 @@ impl Search {
             .or_else(|| self.matches.len().checked_sub(1));
     }
     fn search_literal(&mut self, terminal: &Terminal) {
-        let query = if self.sensitive {
-            self.query.clone()
-        } else {
-            self.query.chars().flat_map(char::to_lowercase).collect()
-        };
-        let screen = terminal.screen();
-        // Stream a KMP matcher across cells. Keep only the query-sized coordinate
-        // window, so even one logical line spanning all history stays bounded.
-        let query = query.as_bytes();
-        let mut prefix = vec![0; query.len()];
-        for i in 1..query.len() {
-            let mut j = prefix[i - 1];
-            while j > 0 && query[i] != query[j] {
-                j = prefix[j - 1];
+        self.collect_literal(terminal, || false);
+    }
+
+    fn collect_literal(&mut self, terminal: &Terminal, cancelled: impl Fn() -> bool) {
+        self.truncated = literal::scan(terminal, &self.query, self.sensitive, cancelled, |cells| {
+            if self.matches.len() == LIMIT {
+                return false;
             }
-            if query[i] == query[j] {
-                j += 1;
+            if let Some(hit) = Match::from_cells(cells.iter()) {
+                self.matches.push(hit);
             }
-            prefix[i] = j;
-        }
-        let mut cells: VecDeque<Cell> = VecDeque::new();
-        let mut position = 0usize;
-        let mut matched = 0usize;
-        screen.for_each_phys_line(|row, line| {
-            if self.truncated {
-                return;
-            }
-            for cell in line.visible_cells() {
-                let lower;
-                let text = if self.sensitive {
-                    cell.str()
-                } else {
-                    lower = cell
-                        .str()
-                        .chars()
-                        .flat_map(char::to_lowercase)
-                        .collect::<String>();
-                    &lower
-                };
-                cells.push_back(Cell {
-                    start: position,
-                    end: position + text.len(),
-                    point: Point {
-                        row: screen.phys_to_stable_row_index(row),
-                        col: cell.cell_index(),
-                    },
-                    width: cell.width(),
-                });
-                for byte in text.bytes() {
-                    position += 1;
-                    while matched > 0 && byte != query[matched] {
-                        matched = prefix[matched - 1];
-                    }
-                    if byte == query[matched] {
-                        matched += 1;
-                    }
-                    let start = position.saturating_sub(query.len());
-                    while cells.front().is_some_and(|c| c.end <= start) {
-                        cells.pop_front();
-                    }
-                    if matched == query.len() {
-                        if self.matches.len() == LIMIT {
-                            self.truncated = true;
-                            return;
-                        }
-                        if let Some(hit) = Match::from_cells(
-                            cells.iter().filter(|c| c.start < position && c.end > start),
-                        ) {
-                            self.matches.push(hit);
-                        }
-                        matched = 0;
-                    }
-                }
-            }
-            if !line.last_cell_was_wrapped() {
-                matched = 0;
-                position = 0;
-                cells.clear();
-            }
+            true
         });
     }
 

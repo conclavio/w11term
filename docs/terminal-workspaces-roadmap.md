@@ -16,7 +16,7 @@ A Windows user should be able to put a remote editor beside a build log, open a 
 
 RustMUSH cockpit reattachment follows the general-purpose roadmap. A Windows machine and an ordinary Linux SSH host suffice to exercise all five releases.
 
-The general-purpose backlog also includes [mounting selected Windows folders on a Linux SSH host](#mount-selected-windows-folders-on-a-linux-ssh-host).
+The [Windows folder sharing roadmap](#mount-selected-windows-folders-on-a-linux-ssh-host) covers read-only mounts and per-folder write access.
 
 ## Current capabilities
 
@@ -93,6 +93,8 @@ Choose the backend when opening the pane. An SSH pane exchanges terminal bytes d
 **Acceptance.** Split a live SSH tab and select **Local PowerShell**. Verify that typing, Ctrl+C, resize and exit reach the intended pane, and that closing the local shell cleans up its child and pipe handles while the SSH session continues. Drive the remote pane through the CLI during local output and compare its received bytes and captured image with the direct-SSH fixture. Restore the layout and verify the local pane opens in its configured directory.
 
 ## Mount selected Windows folders on a Linux SSH host
+
+A saved SSH profile can mount selected NTFS directories through stock Linux SSHFS. Read-only is the default. Each writable folder requires an explicit choice in the Windows picker. Linux can create and edit files, rename entries, and remove files or empty directories. A real Linux guest exercises both access modes and holds a descriptor across transport loss and reconnection. [Folder sharing](../README.md#share-a-windows-folder-with-linux)
 
 Let an SSH profile share one or more folders chosen with the Windows folder picker. For example, the profile could mount `C:\Projects\sprites` at `~/windows/sprites` when it connects. A Linux editor or build can then use ordinary filesystem paths. Show each share’s host, mount point, access mode and mount status in w11term, with an **Unmount** action. Sharing starts disabled. Each folder defaults to read-only, with write access granted separately per folder.
 

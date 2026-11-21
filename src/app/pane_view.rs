@@ -93,6 +93,7 @@ pub(super) struct PaneSurface {
     pub(super) paint_count: Rc<Cell<u64>>,
     pub(super) metrics: Rc<Cell<Metrics>>,
     pub(super) invalidator: Invalidator,
+    cursor_blink: Rc<RefCell<crate::cursor_blink::CursorBlink>>,
     pub(super) area: Rc<Cell<Option<(f32, f32, f32)>>>,
     window_grid: Rc<Cell<WindowGrid>>,
     window_size: Rc<Cell<(f64, f64)>>,
@@ -106,7 +107,14 @@ impl PaneSurface {
     }
 
     pub(super) fn release(&self) {
+        self.pause_cursor();
         self.canvas.borrow_mut().take();
+    }
+
+    pub(super) fn pause_cursor(&self) {
+        self.cursor_blink
+            .borrow_mut()
+            .set_interval(None, &self.invalidator);
     }
 
     pub(super) fn remeasure(&self, renderer: &mut Renderer) -> Option<TerminalSize> {
@@ -200,11 +208,13 @@ impl TerminalApp {
             return Ok(canvas.clone());
         }
         let appearance = self.appearance.read().unwrap();
-        let renderer = RefCell::new(Renderer::with_size(
+        let mut renderer = Renderer::with_size(
             &appearance.font_family,
             appearance.ligatures,
             appearance.font_size,
-        )?);
+        )?;
+        renderer.live_cursor = Some(surface.cursor_blink.clone());
+        let renderer = RefCell::new(renderer);
         let frames = tab.session.frames.clone();
         let metrics = surface.metrics.clone();
         let sender = tab.session.input.clone();
@@ -305,6 +315,13 @@ impl TerminalApp {
         decorate: bool,
         context: &ViewContext<Self>,
     ) -> View {
+        let interval = self
+            .caret_interval
+            .filter(|_| tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input));
+        tab.surface
+            .cursor_blink
+            .borrow_mut()
+            .set_interval(interval, &tab.surface.invalidator);
         tab.surface
             .window_grid
             .set(match self.tabs.active_layout() {

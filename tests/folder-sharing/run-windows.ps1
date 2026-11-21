@@ -4,9 +4,15 @@ param(
     [Parameter(Mandatory)][string]$GuestDirectory,
     [Parameter(Mandatory)][string]$TestExecutable,
     [string]$QemuExecutable = 'qemu-system-x86_64.exe',
-    [switch]$LegacyFuse
+    [switch]$LegacyFuse,
+    [string]$GuiExecutable,
+    [string]$CliExecutable,
+    [switch]$CheckClipboard
 )
 $ErrorActionPreference = 'Stop'
+if ([bool]$GuiExecutable -ne [bool]$CliExecutable -or ($LegacyFuse -and $GuiExecutable) -or ($CheckClipboard -and !$GuiExecutable)) {
+    throw 'Pass both GUI and CLI paths to run the mounted-folder UI on a modern guest'
+}
 
 function Start-FixtureProcess([string]$Program, [string[]]$Arguments, [hashtable]$Environment = @{}) {
     $start = [Diagnostics.ProcessStartInfo]::new($Program)
@@ -114,14 +120,36 @@ try {
     $port = $listeners[0].LocalPort
     Confirm-SshBanner $port
     Write-Host "Guest SSH is ready on 127.0.0.1:$port"
-    $case = if ($LegacyFuse) { 'old_fusermount_refuses_before_export' } else { 'native_windows_passive_sshfs' }
-    $output = Invoke-FixtureProcess $test @('--ignored','--exact',"ssh::folder_mount_fixture::$case",'--nocapture') 180000 @{
-        W11TERM_MOUNT_TEST_PORT = [string]$port
-        W11TERM_MOUNT_TEST_IDENTITY = $identity
-        W11TERM_MOUNT_TEST_HOST_KEY = $hostKey
+    $cases = if ($LegacyFuse) { 'old_fusermount_refuses_before_export' } else { 'native_windows_passive_sshfs','native_windows_writable_sshfs' }
+    foreach ($case in $cases) {
+        $output = Invoke-FixtureProcess $test @('--ignored','--exact',"ssh::folder_mount_fixture::$case",'--nocapture') 180000 @{
+            W11TERM_MOUNT_TEST_PORT = [string]$port
+            W11TERM_MOUNT_TEST_IDENTITY = $identity
+            W11TERM_MOUNT_TEST_HOST_KEY = $hostKey
+        }
+        if ($output -cnotmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
+            throw "$case did not report exactly one pass"
+        }
     }
-    if ($output -cnotmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
-        throw 'The ignored native mount test did not report exactly one pass'
+    if ($GuiExecutable) {
+        $gui = (Get-Item -LiteralPath $GuiExecutable).FullName
+        $cli = (Get-Item -LiteralPath $CliExecutable).FullName
+        $ui = [IO.Directory]::CreateDirectory((Join-Path $scratch.FullName 'native-ui'))
+        try {
+            $blob = [Convert]::FromBase64String($hostKey.Split(' ')[1])
+            $fingerprint = 'SHA256:' + [Convert]::ToBase64String([Security.Cryptography.SHA256]::HashData($blob)).TrimEnd('=')
+            $uiArgs = @('-NoProfile','-NonInteractive','-STA','-File',(Join-Path $PSScriptRoot 'mounted-folder-ui.ps1'),
+                '-Gui',$gui,'-Cli',$cli,'-State',$ui.FullName,'-Port',"$port",'-Identity',$identity,'-Fingerprint',$fingerprint)
+            if ($CheckClipboard) { $uiArgs += '-CheckClipboard' }
+            $null = Invoke-FixtureProcess 'powershell.exe' $uiArgs 180000
+        } finally {
+            $target = (Resolve-Path -LiteralPath $ui.FullName).ProviderPath
+            if ([IO.Path]::GetDirectoryName($target) -ne $scratch.FullName -or [IO.Path]::GetFileName($target) -ne 'native-ui' -or
+                ((Get-Item -LiteralPath $target).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'Unexpected fixture cleanup directory'
+            }
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
     }
 } catch {
     Write-Host 'Guest serial console (last 60 lines)'

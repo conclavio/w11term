@@ -27,6 +27,25 @@ pub const CHUNK: usize = 32 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
+/// Directory entry types the drawer can delete with the SFTP v3 primitives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl EntryKind {
+    pub fn from_permissions(permissions: Option<u32>) -> Option<Self> {
+        match permissions? & 0o170000 {
+            0o100000 => Some(Self::File),
+            0o040000 => Some(Self::Directory),
+            0o120000 => Some(Self::Symlink),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
@@ -46,6 +65,11 @@ pub enum Operation {
         overwrite: bool,
     },
     Ls {
+        path: String,
+    },
+    /// The absolute path verified by SSHFS can only be opened on the source pane.
+    #[serde(skip)]
+    ListMountedFolder {
         path: String,
     },
     Opendir {
@@ -104,6 +128,12 @@ pub enum Operation {
     RenameEntry {
         from: String,
         to: String,
+    },
+    /// Delete the selected entry with the type and SSH connection the user approved.
+    #[serde(skip)]
+    RemoveEntry {
+        path: String,
+        kind: EntryKind,
     },
     RemoveFile {
         path: String,
@@ -222,7 +252,7 @@ type JobResult = Result<Value, String>;
 
 #[derive(Debug)]
 pub struct Job {
-    /// A UI mutation approved against a particular live SSH connection.
+    /// A UI action approved against a particular live SSH connection.
     /// The worker owns that connection and rejects stale approvals before I/O.
     pub expected_generation: Option<u64>,
     pub operation: Operation,
@@ -241,8 +271,8 @@ struct PendingReply {
 enum JobStage {
     Ordinary,
     Upload,
-    CheckingDestination,
-    Renaming,
+    Checking(&'static str),
+    AwaitingStatus(&'static str),
 }
 
 impl JobStage {
@@ -252,8 +282,7 @@ impl JobStage {
             Self::Upload => {
                 "SFTP upload interrupted; remote destination may contain a partial file"
             }
-            Self::CheckingDestination => "Rename was not started",
-            Self::Renaming => "Rename outcome unknown; refresh to check",
+            Self::Checking(message) | Self::AwaitingStatus(message) => message,
         }
     }
 }
@@ -293,11 +322,23 @@ pub(crate) async fn run(
             reply,
             progress,
         } = job;
-        if matches!(operation, Operation::RenameEntry { .. }) && expected_generation.is_none() {
-            let _ = reply.send(Err(
-                "Missing SSH connection approval; rename was not started".into(),
-            ));
-            continue;
+        if expected_generation.is_none() {
+            let missing = match operation {
+                Operation::RenameEntry { .. } => {
+                    Some("Missing SSH connection approval; rename was not started")
+                }
+                Operation::RemoveEntry { .. } => {
+                    Some("Missing SSH connection approval; delete was not started")
+                }
+                Operation::ListMountedFolder { .. } => {
+                    Some("Missing SSH connection for this mounted folder")
+                }
+                _ => None,
+            };
+            if let Some(message) = missing {
+                let _ = reply.send(Err(message.into()));
+                continue;
+            }
         }
         if expected_generation.is_some_and(|expected| expected != generation) {
             let _ = reply.send(Err(
@@ -328,7 +369,8 @@ pub(crate) async fn run(
             sender: Some(reply),
             stage: match operation {
                 Operation::Put { .. } => JobStage::Upload,
-                Operation::RenameEntry { .. } => JobStage::CheckingDestination,
+                Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
+                Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
             },
         };
@@ -355,8 +397,8 @@ pub(crate) async fn run(
                 if lost {
                     engine = None;
                 }
-                if matches!(reply.stage, JobStage::CheckingDestination)
-                    || (lost && matches!(reply.stage, JobStage::Renaming))
+                if matches!(reply.stage, JobStage::Checking(_))
+                    || (lost && matches!(reply.stage, JobStage::AwaitingStatus(_)))
                 {
                     result.context(reply.stage.interrupted())
                 } else if lost {
@@ -369,7 +411,7 @@ pub(crate) async fn run(
                 engine = None;
                 if matches!(
                     reply.stage,
-                    JobStage::CheckingDestination | JobStage::Renaming
+                    JobStage::Checking(_) | JobStage::AwaitingStatus(_)
                 ) {
                     Err(anyhow::anyhow!(
                         "SFTP timed out; {}; handles invalidated",
@@ -516,6 +558,7 @@ impl Engine {
     ) -> Result<Value> {
         use Operation::*;
         let ok = json!({});
+        let mounted = matches!(op, ListMountedFolder { .. });
         Ok(match op {
             Info => {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
@@ -555,7 +598,19 @@ impl Engine {
                 Err(e) if eof(&e) => json!({"entries":[],"eof":true}),
                 Err(e) => return Err(e.into()),
             },
-            Ls { path } => {
+            Ls { path } | ListMountedFolder { path } => {
+                if mounted {
+                    let names = self
+                        .raw
+                        .realpath(&path)
+                        .await
+                        .context("SFTP could not resolve this mount path")?
+                        .files;
+                    ensure!(
+                        matches!(names.as_slice(), [entry] if entry.filename == path),
+                        "SFTP resolves this mount to a different path"
+                    );
+                }
                 let h = self.raw.opendir(path).await?.handle;
                 let result = async {
                     let mut entries = Vec::new();
@@ -672,8 +727,39 @@ impl Engine {
                             .context("Could not check the destination name"));
                     }
                 }
-                *stage = JobStage::Renaming;
+                *stage = JobStage::AwaitingStatus("Rename outcome unknown; refresh to check");
                 self.raw.rename(from, to).await?;
+                ok
+            }
+            RemoveEntry { path, kind } => {
+                // A trailing slash can make even LSTAT dereference a directory link;
+                // Windows SFTP servers can also interpret backslashes in a leaf.
+                let name = path.rsplit('/').next().unwrap_or("");
+                ensure!(
+                    !matches!(name, "" | "." | "..")
+                        && !name.contains('\\')
+                        && !path.contains('\0'),
+                    "Expected a remote directory entry name"
+                );
+                let attrs = self
+                    .raw
+                    .lstat(&path)
+                    .await
+                    .context("Could not check the selected entry")?
+                    .attrs;
+                let actual = EntryKind::from_permissions(attrs.permissions)
+                    .context("The server reported an unsupported type for this entry")?;
+                ensure!(
+                    actual == kind,
+                    "The selected entry type changed; refresh to check"
+                );
+                // v3 has no conditional unlink. Use exactly one request against
+                // this name; the server enforces directory emptiness for RMDIR.
+                *stage = JobStage::AwaitingStatus("Delete outcome unknown; refresh to check");
+                match kind {
+                    EntryKind::File | EntryKind::Symlink => self.raw.remove(path).await?,
+                    EntryKind::Directory => self.raw.rmdir(path).await?,
+                };
                 ok
             }
             RemoveFile { path } => {
@@ -868,4 +954,30 @@ fn transport_error(error: &Error) -> bool {
         error,
         Error::Timeout | Error::IO(_) | Error::UnexpectedPacket | Error::UnexpectedBehavior(_)
     ) || matches!(error,Error::Status(s) if matches!(s.status_code,StatusCode::ConnectionLost|StatusCode::NoConnection))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntryKind;
+
+    #[test]
+    fn drawer_deletion_requires_explicit_regular_directory_or_link_type_bits() {
+        for (mode, kind) in [
+            (0o100000, EntryKind::File),
+            (0o040000, EntryKind::Directory),
+            (0o120000, EntryKind::Symlink),
+        ] {
+            assert_eq!(EntryKind::from_permissions(Some(mode | 0o7755)), Some(kind));
+        }
+        for mode in [
+            None,
+            Some(0o755),
+            Some(0o010644),
+            Some(0o020640),
+            Some(0o060660),
+            Some(0o140777),
+        ] {
+            assert_eq!(EntryKind::from_permissions(mode), None);
+        }
+    }
 }
