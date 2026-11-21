@@ -6,7 +6,12 @@ $ErrorActionPreference = 'Stop'
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
-$env:W11TERM_FOLDER_SHARE_SMOKE_DIR = Join-Path $State 'Selected folder'
+$env:W11TERM_FOLDER_SHARE_SMOKE_DIR = $State
+$leaf = 'Selected folder'
+$selectedDir = Join-Path $State $leaf
+# Compare the full directory Windows resolved. Explorer may expand an 8.3 TEMP
+# path (e.g. RUNNER~1) before returning SIGDN_FILESYSPATH.
+$canonicalDir = [FixtureDialog]::DirectoryPath($selectedDir)
 $profiles = Join-Path $State 'profiles.json'
 $savedProfile = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'
 $identityLabel = 'palette-ssh ' + [char]0xb7 + " $($savedProfile.user)@$($savedProfile.host):$($savedProfile.port) " + [char]0xb7 + ' Read-only'
@@ -37,9 +42,48 @@ function Folder-Dialog {
         if ($element.Current.ClassName -eq '#32770' -and $element.Current.Name -eq 'Choose a folder to share') { return $hwnd }
     }
 }
+function Select-FixtureFolder([IntPtr]$Dialog) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($Dialog)
+    $byName = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, $leaf)
+    $selectable = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty, $true)
+    $match = [System.Windows.Automation.AndCondition]::new($byName, $selectable)
+    $null = Wait-Until "native picker to select the fixture child '$leaf'" {
+        $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $match)
+        if ($item) {
+            $selection = $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            if (!$selection.Current.IsSelected) { $selection.Select() }
+            return $selection.Current.IsSelected
+        }
+    }
+}
+function Same-SelectedFolder([string]$Path) {
+    # Only consider absolute paths on the disposable fixture's local drive.
+    if ($Path -notmatch '^[A-Za-z]:[\\/]' -or $Path[0] -ine $selectedDir[0]) { return $false }
+    if (![IO.Directory]::Exists($Path)) { return $false }
+    return [FixtureDialog]::DirectoryPath($Path) -ieq $canonicalDir
+}
+function Wait-SelectedPath {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    $evidence = @{ paths = @(); draft = $false }
+    try {
+        $null = Wait-Until 'the full canonical selected directory in the shared folders panel' {
+            $evidence.draft = $null -ne (Find-Element 'Mount name' ([System.Windows.Automation.ControlType]::Edit))
+            $evidence.paths = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
+                ForEach-Object { $_.Current.Name } | Where-Object { $_ -match '^[A-Za-z]:[\\/]' })
+            foreach ($path in $evidence.paths) { if (Same-SelectedFolder $path) { return $true } }
+        }
+    } catch {
+        throw "$_ Expected '$selectedDir' ($canonicalDir). Reported paths: [$($evidence.paths -join ', ')]. Draft visible: $($evidence.draft). Picker open: $([bool](Folder-Dialog))."
+    }
+}
 function Pick-Folder([int]$ButtonId) {
     Click $add
     $dialog = Wait-Until 'owned native folder picker' { Folder-Dialog }
+    if ($ButtonId -eq 1) { Select-FixtureFolder $dialog }
     $null = Wait-Until "folder picker button $ButtonId" { [FixtureDialog]::ClickButton($dialog, $ButtonId) }
     $null = Wait-Until 'folder picker dismissed' { !(Folder-Dialog) }
 }
@@ -80,8 +124,8 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Pick-Folder 2 # Cancel
             $null = Wait-Until 'canceled picker restored Add' { $b = Find-Element $add $button; $b -and $b.Current.IsEnabled }
             if (Find-Element 'Mount name') { throw 'Cancel left behind a share draft' }
-            Pick-Folder 1 # Select the current, fixture-owned directory
-            $null = Wait-Until 'the exact disposable selected directory' { Find-Element $env:W11TERM_FOLDER_SHARE_SMOKE_DIR }
+            Pick-Folder 1
+            Wait-SelectedPath
             $field = Wait-Until 'editable remote mount name' { Find-Element 'Mount name' ([System.Windows.Automation.ControlType]::Edit) }
             $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
             $value.SetValue('../invalid')
@@ -95,7 +139,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
             if ($grantFiles.Length -ne 1) { throw 'Expected exactly one isolated local consent file' }
             $consentFile = $grantFiles[0].FullName
             $consent = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
-            if ($consent.Length -ne 1 -or $consent[0].path -ne $env:W11TERM_FOLDER_SHARE_SMOKE_DIR -or $consent[0].name -ne 'smoke-share') {
+            if ($consent.Length -ne 1 -or !(Same-SelectedFolder $consent[0].path) -or $consent[0].name -ne 'smoke-share') {
                 throw 'Persisted consent did not match the selected test directory and mount name'
             }
             Send-ToShell 'share-shell-before-restart'
@@ -107,7 +151,8 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Wait-Focus $local
             if ((Share-Menu).Current.IsEnabled) { throw 'Local PowerShell offered folder sharing' }
         } else {
-            $null = Wait-Until 'persisted share in restarted process' { (Find-Element '~/windows/smoke-share') -and (Find-Element $env:W11TERM_FOLDER_SHARE_SMOKE_DIR) }
+            $null = Wait-Until 'persisted share in restarted process' { Find-Element '~/windows/smoke-share' }
+            Wait-SelectedPath
             Wait-FailedMount
             Click 'Forget smoke-share'
             $null = Wait-Until 'forgotten share removed' { (Find-Element 'Requested removal of smoke-share') -and !(Find-Element '~/windows/smoke-share') }
@@ -116,6 +161,7 @@ for ($launch = 1; $launch -le 2; $launch++) {
             $null = Wait-Until 'palette opens verified panel' { Find-Element $identityLabel }
             Click $add
             $dialog = Wait-Until 'owned picker before disconnect' { Folder-Dialog }
+            Select-FixtureFolder $dialog
             $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64','BA==')
             $stale = 'The verified SSH connection has changed or closed. Reopen Shared folders from a connected SSH pane.'
             $null = Wait-Until 'verified connection revoked with the picker open' { Find-Element $stale }
