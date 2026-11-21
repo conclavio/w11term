@@ -127,6 +127,7 @@ pub enum Shortcut {
     Fullscreen,
     RememberWindow,
     BeginResize,
+    TaskbarCreated,
     NextTab,
     PreviousTab,
     NewTab,
@@ -640,16 +641,30 @@ unsafe extern "system" fn window_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    static TASKBAR_CREATED: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| unsafe {
+        RegisterWindowMessageW(windows::core::w!("TaskbarButtonCreated"))
+    });
+    let taskbar_created = message != 0 && message == *TASKBAR_CREATED;
     if !matches!(
         message,
         WM_ACTIVATE | WM_CLOSE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_SIZING | WM_NCDESTROY
-    ) {
+    ) && !taskbar_created
+    {
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     }
     let Some(scope) = WindowScope::for_window(hwnd) else {
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     };
     let _guard = scope.enter();
+    if taskbar_created {
+        with_input(|s| {
+            if let Ok(s) = s.try_borrow()
+                && let Some(s) = s.as_ref()
+            {
+                (s.shortcut)(Shortcut::TaskbarCreated);
+            }
+        });
+    }
     if message == WM_ACTIVATE {
         window::activated((wparam.0 & 0xffff) != WA_INACTIVE as usize);
     }

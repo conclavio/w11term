@@ -889,6 +889,36 @@ mod tests {
     }
 
     #[test]
+    fn osc9_progress_retains_values_across_warnings_and_clears_on_reset() {
+        use wezterm_term::Progress::*;
+        let (mut term, _) = engine();
+        for (sequence, expected) in [
+            ("9;4;2", Error(10)),
+            ("9;4;1;0", Percentage(0)),
+            ("9;4;1;27", Percentage(27)),
+            ("9;4;3", Indeterminate),
+            ("9;4;4", Paused(27)),
+            ("9;4;2;0", Error(27)),
+            ("9;4;4;63", Paused(63)),
+            ("9;4;1;bogus", Paused(63)),
+            ("9;4;1;900000000000000000000", Percentage(100)),
+            ("9;4;0", None),
+            ("9;4;4", Paused(10)),
+        ] {
+            for byte in format!("\x1b]{sequence}\x1b\\").bytes() {
+                term.advance_bytes([byte]);
+            }
+            assert_eq!(term.get_progress(), expected, "{sequence}");
+        }
+        term.reset_connection();
+        assert_eq!(term.get_progress(), None);
+        term.advance_bytes(b"\x1b]9;4;2\x07");
+        assert_eq!(term.get_progress(), Error(10));
+        term.advance_bytes(b"\x1bc");
+        assert_eq!(term.get_progress(), None);
+    }
+
+    #[test]
     fn completed_shell_output_uses_markers_scrollback_and_real_line_breaks() {
         let (mut term, _) = engine();
         term.resize(TerminalSize {
