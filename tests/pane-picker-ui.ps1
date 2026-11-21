@@ -19,6 +19,19 @@ function Assert-Input([int]$Pane, [string]$Marker, [int[]]$OtherPanes) {
     }
 }
 
+function Wait-Preview([string]$Profile, [string]$Text) {
+    $null = Wait-Until "preview of $Profile containing '$Text'" {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $textNodes = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Text)
+        foreach ($node in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textNodes)) {
+            $name = $node.Current.Name
+            if ($name.StartsWith('Preview of ') -and $name.Contains($Profile) -and $name.Contains($Text)) { return $true }
+        }
+    }
+}
+
 try {
     $window = Wait-Until 'the fixture window' { $app.Refresh(); if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } }
     $manifest = Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json"
@@ -53,6 +66,26 @@ try {
     Press-Key 27
     $null = Wait-Until 'inspector to return on Escape' { (Find-Element 'Close terminal inspector') -and (Find-Element 'Screen   Alternate') }
     Wait-Focus $left
+
+    $null = Control @('send-text','--pane',"$left",'--no-paste','source-marker')
+    $null = Control @('send-text','--pane',"$right",'--no-paste','hidden-marker')
+    $original = Control @('get-text','--pane',"$right")
+    Picker-Query 'DEV2'
+    Wait-Preview 'dev2' 'hidden-marker'
+    Wait-Focus $left
+    $null = Control @('send-text','--pane',"$right",'--no-paste','-live')
+    Wait-Preview 'dev2' 'hidden-marker-live'
+    $grid = Control @('get-text','--pane',"$right")
+    if ($grid.cols -ne $original.cols -or $grid.rows -ne $original.rows) { throw 'Preview resized the hidden pane' }
+    $field = Find-Element 'Find pane'
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('dev')
+    Wait-Preview 'dev1' 'source-marker'
+    Press-Key 40
+    Wait-Preview 'dev2' 'hidden-marker-live'
+    Press-Key 27
+    $null = Wait-Until 'preview dismissal' { -not (Find-Element 'Find pane') }
+    Wait-Focus $left
+    Assert-Input $left 'after-preview' @($right,$local)
 
     Picker-Query 'DEV2'
     Press-Key 13
