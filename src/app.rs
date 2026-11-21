@@ -31,6 +31,7 @@ const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 
 mod attention;
+mod command_history;
 mod config_import;
 mod file_drawer;
 mod keyboard_settings;
@@ -132,6 +133,7 @@ enum SettingsEditor {
 }
 enum Page {
     Attention,
+    CommandHistory(command_history::HistoryPage),
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
@@ -296,6 +298,7 @@ fn tab_menu_message(label: String) -> Message {
         }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
+        "Command history" => Message::History(command_history::Action::Open),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
@@ -428,6 +431,7 @@ pub enum Message {
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
     CopyLastCommand,
+    History(command_history::Action),
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
     Discovery(session_browser::Action),
@@ -2282,6 +2286,7 @@ impl TerminalApp {
                 ),
                 None => MenuItem::item("copy-last-output", "Copy last command output"),
             });
+            items.push(MenuItem::item("command-history", "Command history"));
             if let Some(menu) = durable_view::pane_menu(live) {
                 items.push(menu);
             }
@@ -2893,13 +2898,14 @@ impl Component for TerminalApp {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.active()
-                    && let Some(command) = &tab.session.frames.load().last_command
+                    && let Some(command) = tab.session.frames.load().command_history.back()
                     && let Ok(text) = &command.output
                     && let Err(error) = w11term::clipboard::write(text)
                 {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
+            Message::History(action) => self.handle_history(action, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
@@ -4156,6 +4162,7 @@ impl Component for TerminalApp {
                 },
                 Page::Settings(None) => self.settings_view(context),
                 Page::Attention => self.attention_view(context),
+                Page::CommandHistory(page) => self.history_view(page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,
