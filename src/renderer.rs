@@ -1,5 +1,9 @@
-use crate::native_drawing::{GpuImage, NativeDrawing, Typography};
+use crate::{
+    cursor_blink::{CursorBlink, CursorCell},
+    native_drawing::{GpuImage, NativeDrawing, Typography},
+};
 use std::collections::{HashMap, HashSet};
+use std::{cell::RefCell, rc::Rc, time::Instant};
 use w11term::terminal::{Snapshot, colors, rgba};
 use wezterm_term::{
     Intensity, Underline,
@@ -65,6 +69,7 @@ impl CellHit {
 /// First renderer: cached DirectWrite layouts + GPU-resident Direct2D images.
 /// The engine/transport boundary allows an atlas renderer to replace this independently.
 pub struct Renderer {
+    pub live_cursor: Option<Rc<RefCell<CursorBlink>>>,
     pub read_only: bool,
     pub copy_cursor: Option<w11term::interaction::Point>,
     normal: TextFormat,
@@ -262,6 +267,7 @@ impl Renderer {
             ..Metrics::default()
         };
         Ok(Self {
+            live_cursor: None,
             copy_cursor: None,
             read_only: false,
             normal,
@@ -732,20 +738,33 @@ impl Renderer {
                 (row, col, true)
             },
         );
-        if visible
-            && let Ok(row) = usize::try_from(row)
-            && row < self.metrics.rows
-            && col < self.metrics.cols
+        let row = usize::try_from(row)
+            .ok()
+            .filter(|&r| visible && r < self.metrics.rows && col < self.metrics.cols);
+        use termwiz::surface::CursorShape;
+        let shape = if self.copy_cursor.is_some() {
+            CursorShape::SteadyBlock
+        } else {
+            frame.cursor.shape
+        };
+        let show_cursor = self.live_cursor.as_ref().is_none_or(|blink| {
+            let cell = row.filter(|_| shape.is_blinking()).map(|row| CursorCell {
+                col,
+                row,
+                shape,
+                stable_row: frame.first_stable_row.saturating_add(row as isize),
+                alternate: frame.alternate,
+                connection: frame.connection_generation,
+            });
+            blink.borrow_mut().visible(cell, Instant::now())
+        });
+        if let Some(row) = row
+            && show_cursor
         {
             let x = PADDING + col as f32 * cw;
             let y = PADDING + row as f32 * ch;
             brush.set_color(color(rgba(frame.palette.cursor_bg)));
-            use termwiz::surface::CursorShape;
-            match if self.copy_cursor.is_some() {
-                CursorShape::SteadyBlock
-            } else {
-                frame.cursor.shape
-            } {
+            match shape {
                 CursorShape::SteadyBar | CursorShape::BlinkingBar => {
                     ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, ch), &brush)
                 }
@@ -1057,6 +1076,44 @@ mod tests {
             unsafe {
                 windows::Win32::System::Com::CoUninitialize();
             }
+        }
+    }
+
+    #[test]
+    fn cursor_timer_only_runs_for_a_blinking_application_caret_in_the_painted_grid() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::new().unwrap();
+        let blink = Rc::new(RefCell::new(CursorBlink::default()));
+        blink
+            .borrow_mut()
+            .set_interval(Some(200), &windows_canvas::Invalidator::new());
+        renderer.live_cursor = Some(blink.clone());
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(260, 180).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(wezterm_term::TerminalSize::default(), tx);
+        for (request, copy_mode, running) in [
+            ("\x1b[5 q", false, true),
+            ("\x1b[?25l", false, false),
+            ("\x1b[?25h", false, true),
+            ("\x1b[24;80H", false, false),
+            ("\x1b[H", true, false),
+            ("", false, true),
+            ("\x1b[6 q", false, false),
+        ] {
+            terminal.advance_bytes(request.as_bytes());
+            let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+            renderer.copy_cursor = copy_mode.then_some(w11term::interaction::Point {
+                row: frame.first_stable_row,
+                col: 1,
+            });
+            target
+                .draw(|ctx| {
+                    renderer.draw_surface(ctx, 260.0, 180.0, false, &frame)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(blink.borrow().is_running(), running, "{request:?}");
         }
     }
 

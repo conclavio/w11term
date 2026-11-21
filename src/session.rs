@@ -11,7 +11,11 @@ use std::{
 };
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
+mod clipboard;
 mod launch;
+pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
+#[cfg(test)]
+mod pane_search_tests;
 mod presentation;
 #[cfg(test)]
 mod synchronized_capture;
@@ -53,6 +57,7 @@ pub enum Command {
         repeat: bool,
     },
     Paste(String),
+    ClipboardPaste(ClipboardPaste, ClipboardReply),
     Text(String),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
@@ -75,6 +80,15 @@ pub enum Command {
     },
     SearchNavigate(isize),
     SearchClose,
+    SearchPreview {
+        query: String,
+        reply: tokio::sync::oneshot::Sender<crate::search::PaneSearchPreview>,
+    },
+    SearchReveal {
+        query: String,
+        anchor: crate::search::PaneSearchAnchor,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
     Wheel(isize, KeyModifiers),
     Mouse(MouseEvent),
     Focus(bool),
@@ -433,11 +447,13 @@ async fn run(
         presentation.advance(&mut terminal, bytes, 0, &status, total_bytes);
     }
     let mut search = crate::search::Search::default();
+    let mut search_origin = Arc::new(());
     let mut search_dirty = false;
     let mut search_refresh = tokio::time::Instant::now();
     let mut connection_generation = 0;
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let mut inspecting = false;
+    let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
         if let Some(version) = pending_pack.next(
@@ -513,6 +529,7 @@ async fn run(
                 queued_before_connection = queued_before_connection.saturating_sub(1);
                 let command = if phase != Phase::Running || queued_offline {
                     match command {
+                        Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("No active terminal connection; clipboard text was not sent".into())); continue; }
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
@@ -523,6 +540,7 @@ async fn run(
                 } else { command };
                 let command = if read_only {
                     match command {
+                        Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("Pane input is read-only".into())); continue; }
                         Some(Command::Raw(_, reply)) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
@@ -533,14 +551,43 @@ async fn run(
                         other => other,
                     }
                 } else { command };
-                let changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
+                let mut changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
+                    Some(Command::ClipboardPaste(request, reply)) => {
+                        use clipboard::Decision;
+                        if interactive && connection_generation == 0 {
+                            let _ = reply.send(Err("The terminal is still connecting. Paste again when it is ready.".into()));
+                            continue;
+                        }
+                        let action = request.evaluate(&clipboard_origin, connection_generation, terminal.bracketed_paste_enabled());
+                        match action {
+                            Err(error) => { let _ = reply.send(Err(error)); }
+                            Ok(Decision::Confirm(pending)) => { let _ = reply.send(Ok(Some(pending))); }
+                            Ok(Decision::Send { text, .. }) if text.is_empty() => { let _ = reply.send(Ok(None)); }
+                            Ok(Decision::Send { text, raw }) if interactive => {
+                                let bytes = if raw { text.into_bytes() } else {
+                                    scroll_offset = 0;
+                                    terminal.encode_paste(&text).into_bytes()
+                                };
+                                clipboard::write(&writer, connection_generation, bytes, reply);
+                            }
+                            Ok(Decision::Send { text, raw: false }) if is_demo => {
+                                changes_screen = true;
+                                scroll_offset = 0;
+                                presentation.advance(&mut terminal, text.replace('\n', "\r\n"), 0, &status, total_bytes);
+                                let _ = reply.send(Ok(None));
+                            }
+                            Ok(Decision::Send { .. }) => { let _ = reply.send(Err("Clipboard input requires an interactive terminal".into())); }
+                        }
+                        Ok(())
+                    }
                     Some(Command::RestartExited(ClaimedRestart(token))) => {
                         if phase == Phase::Exited && restartable && token == launch_id {
                             launch_id += 1;
                             phase = Phase::Restarting { reset: true };
+                            search_origin = Arc::new(());
                             terminal.reset_connection();
                             scroll_offset = 0;
                             last_mouse.button = wezterm_term::MouseButton::None;
@@ -679,6 +726,25 @@ async fn run(
                         scroll_offset=search.navigate(direction,&terminal,scroll_offset);Ok(())
                     }
                     Some(Command::SearchClose) => {search.open=false;Ok(())}
+                    Some(Command::SearchPreview { query, reply }) => {
+                        let preview = crate::search::PaneSearchPreview::scan(&terminal, &search_origin, query, || reply.is_closed());
+                        let _ = reply.send(preview);
+                        Ok(())
+                    }
+                    Some(Command::SearchReveal { query, anchor, reply }) => {
+                        let prepared = anchor.prepare_reveal(&terminal, &search_origin, query, scroll_offset, || reply.is_closed());
+                        if let Some((next, offset)) = prepared {
+                            if reply.send(true).is_ok() {
+                                search = next;
+                                search_dirty = false;
+                                scroll_offset = offset;
+                                presentation.dirty = true;
+                            }
+                        } else {
+                            let _ = reply.send(false);
+                        }
+                        Ok(())
+                    }
                     Some(Command::Wheel(lines, modifiers)) => {
                         terminal::scroll_wheel(&mut terminal,&mut scroll_offset,last_mouse,lines,modifiers,player.read().unwrap().alternate_scroll_enabled())
                     }
@@ -753,6 +819,7 @@ async fn run(
                             presentation.refresh_view = true;
                         }
                         ssh::Event::Connected(generation) => {
+                            search_origin = Arc::new(());
                             if matches!(phase, Phase::Restarting { .. }) {
                                 // Anything already waiting in this FIFO predates the ready frame.
                                 // Apply local configuration, but never deliver its queued user input.

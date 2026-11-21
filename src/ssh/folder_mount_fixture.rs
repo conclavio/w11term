@@ -440,6 +440,148 @@ async fn native_windows_passive_sshfs() -> Result<()> {
         .context("profile-wide folder permissions")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the disposable Linux FUSE guest and pinned loopback SSH supplied by the mount runner"]
+async fn native_windows_writable_sshfs() -> Result<()> {
+    let options = &options()?;
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path();
+    let catalog = dir.join("profiles.json");
+    fs::write(
+        &catalog,
+        serde_json::to_vec(&serde_json::json!({"profiles":{"linux":options}}))?,
+    )?;
+    let scope = || FolderScope::new(catalog.clone(), "linux".into(), dir.join("permissions"));
+    let (writer, witness) = ("write-fixture", "read-fixture");
+    let writable = dir.join(writer);
+    let readonly = dir.join(witness);
+    fs::create_dir(&writable)?;
+    fs::create_dir(&readonly)?;
+    fs::write(readonly.join("untouched"), b"outside")?;
+    fs::hard_link(readonly.join("untouched"), writable.join("linked"))?;
+    let mount = format!("{HOME}/windows/{writer}");
+    let ro = format!("{HOME}/windows/{witness}");
+    let (observer, observer_link) = login(options).await?;
+    let observer_pid = shell_pid(&observer, "WRITER_PID").await?;
+    let (pane, link) = login(options).await?;
+    let manager = pane.profile_folders(scope());
+    let auth = ready_authority(&manager).await?;
+    manager.add_with_access(&auth, writer, writable.clone(), true, true)?;
+    wait_profile(&manager, &auth, writer, Some(FolderMountStatus::Mounted)).await?;
+    manager.add(&auth, witness, readonly.clone())?;
+    wait_profile(&manager, &auth, witness, Some(FolderMountStatus::Mounted)).await?;
+    let first = mount_record(&link, &mount).await?;
+    ensure!(!first.is_empty(), "missing writable mount");
+    checked(
+        &link,
+        &format!("dd if=/dev/zero of='{mount}/large.bin' bs=98321 count=1 status=none"),
+    )
+    .await?;
+    ensure!(fs::read(writable.join("large.bin"))? == vec![0u8; 98321]);
+    checked(&link, &format!("cd '{mount}' && mkdir nested && printf abcdefgh >draft && printf XY | dd of=draft bs=1 seek=2 conv=notrunc status=none && mv draft nested/edited")).await?;
+    ensure!(fs::read(writable.join("nested/edited"))? == b"abXYefgh");
+    checked(
+        &link,
+        &format!("cd '{mount}' && printf short >nested/edited && mv nested renamed"),
+    )
+    .await?;
+    ensure!(fs::read(writable.join("renamed/edited"))? == b"short");
+    checked(
+        &link,
+        &format!("cd '{mount}' && rm renamed/edited && rmdir renamed"),
+    )
+    .await?;
+    ensure!(!writable.join("renamed").try_exists()?);
+    for path in [format!("{mount}/linked"), format!("{ro}/untouched")] {
+        let attempt = bounded_command(&link, &format!("printf changed >'{path}'"), 1024).await?;
+        ensure!(attempt.status != 0, "Linux modified a protected file");
+    }
+    ensure!(fs::read(readonly.join("untouched"))? == b"outside");
+
+    // Hold the fd from a second SSH shell so its process survives the first
+    // connection dropping. The Windows check happens before close or fsync.
+    let open = format!("exec 7>>'{mount}/journal' && printf ack >&7; w11result=$?");
+    ensure!(shell_probe(&observer, "WRITE_ACK", &open).await? == 0);
+    ensure!(fs::read(writable.join("journal"))? == b"ack");
+    close_transport(&link).await?;
+    wait_detached(&observer_link, &mount).await?;
+    wait_detached(&observer_link, &ro).await?;
+    drop(manager);
+    drop(pane);
+
+    let (next, next_link) = login(options).await?;
+    let manager = next.profile_folders(scope());
+    let auth = ready_authority(&manager).await?;
+    wait_profile(&manager, &auth, writer, Some(FolderMountStatus::Mounted)).await?;
+    ensure!(mount_record(&next_link, &mount).await? != first);
+    ensure!(
+        shell_probe(
+            &observer,
+            "STALE_FD",
+            "printf stale >&7; w11result=$?; exec 7>&-"
+        )
+        .await?
+            != 0,
+        "a descriptor from before disconnect wrote into the remount"
+    );
+    let append = format!("exec 8>>'{mount}/journal' && printf fresh >&8; w11result=$?");
+    ensure!(shell_probe(&observer, "FRESH_FD", &append).await? == 0);
+    ensure!(fs::read(writable.join("journal"))? == b"ackfresh");
+    // A second manager for the same profile can forget one folder while the
+    // first manager is serving it. Keep its other mounts in their original pane.
+    for name in [writer, witness] {
+        let id = saved_preference(&manager, &auth, name, true).await?;
+        manager.set_auto_mount(&auth, name, &id, false)?;
+        saved_preference(&manager, &auth, name, false).await?;
+    }
+    let once = "forget-writer";
+    let disposable = dir.join(once);
+    fs::create_dir(&disposable)?;
+    manager.add_with_access(&auth, once, disposable.clone(), false, true)?;
+    wait_profile(&manager, &auth, once, Some(FolderMountStatus::Mounted)).await?;
+    let open = format!("exec 9>>'{HOME}/windows/{once}/note' && printf initial >&9; w11result=$?");
+    ensure!(shell_probe(&observer, "FORGET_OPEN", &open).await? == 0);
+    let editor = observer.profile_folders(scope());
+    let editor_auth = ready_authority(&editor).await?;
+    wait_profile(
+        &editor,
+        &editor_auth,
+        once,
+        Some(FolderMountStatus::Stopped),
+    )
+    .await?;
+    editor.forget(&editor_auth, once)?;
+    wait_profile(&editor, &editor_auth, once, None).await?;
+    ensure!(
+        shell_probe(
+            &observer,
+            "FORGOTTEN_FD",
+            "printf later >&9; w11result=$?; exec 9>&-"
+        )
+        .await?
+            != 0
+    );
+    ensure!(fs::read(disposable.join("note"))? == b"initial");
+    ensure!(shell_probe(&observer, "SIBLING_FD", "printf sibling >&8; w11result=$?").await? == 0);
+    ensure!(fs::read(writable.join("journal"))? == b"ackfreshsibling");
+    revoke_in_other_process(dir, "linux")?;
+    ensure!(
+        shell_probe(
+            &observer,
+            "REVOKED_WRITER",
+            "printf revoked >&8; w11result=$?; exec 8>&-"
+        )
+        .await?
+            != 0
+    );
+    ensure!(fs::read(writable.join("journal"))? == b"ackfreshsibling");
+    wait_detached(&observer_link, &mount).await?;
+    ensure!(shell_pid(&observer, "WRITER_STILL_HERE").await? == observer_pid);
+    close_transport(&next_link).await?;
+    close_transport(&observer_link).await?;
+    Ok(())
+}
+
 async fn individual_grants(options: &SshOptions) -> Result<()> {
     let (pane, link) = login(options).await?;
     let before = shell_pid(&pane, "BEFORE_MOUNT").await?;

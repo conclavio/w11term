@@ -1,4 +1,5 @@
-//! Windows-user permissions for read-only exports from a named SSH pane.
+//! Windows-user permissions for selected folders exported from a named SSH pane.
+mod protected_paths;
 mod store;
 use crate::{
     options::SshOptions,
@@ -71,6 +72,7 @@ impl Authority {
 pub struct FolderRow {
     pub name: String,
     pub path: PathBuf,
+    pub writable: bool,
     pub status: FolderMountStatus,
     pub mounted: Option<MountedFolder>,
     pub mount_on_connect: Option<MountPreference>,
@@ -86,6 +88,7 @@ pub struct MountPreference {
 
 struct Row {
     path: PathBuf,
+    writable: bool,
     grant: Option<Grant>,
     mount: Option<FolderMount>,
     status: FolderMountStatus,
@@ -118,7 +121,7 @@ struct Core {
 
 enum Action {
     Refresh,
-    Add(Authority, String, PathBuf, bool),
+    Add(Authority, String, PathBuf, bool, bool),
     Mount(Authority, Grant),
     SetAutoMount(Authority, Grant, bool),
     Forget(Authority, String, Option<String>),
@@ -202,6 +205,7 @@ impl PaneShares {
             .map(|(name, row)| FolderRow {
                 name: name.clone(),
                 path: row.path.clone(),
+                writable: row.writable,
                 status: row.status(),
                 mounted: row.mount.as_ref().and_then(FolderMount::mounted_folder),
                 mount_on_connect: row.grant.as_ref().map(|grant| MountPreference {
@@ -256,6 +260,17 @@ impl PaneShares {
         path: PathBuf,
         auto_mount: bool,
     ) -> Result<()> {
+        self.add_with_access(auth, name, path, auto_mount, false)
+    }
+
+    pub fn add_with_access(
+        &self,
+        auth: &Authority,
+        name: &str,
+        path: PathBuf,
+        auto_mount: bool,
+        writable: bool,
+    ) -> Result<()> {
         ensure!(
             valid_mount_name(name),
             "Use a Linux mount name of 1–64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit"
@@ -277,11 +292,13 @@ impl PaneShares {
             name.into(),
             path.clone(),
             auto_mount,
+            writable,
         ))?;
         state.rows.insert(
             name.into(),
             Row {
                 path,
+                writable,
                 grant: None,
                 mount: None,
                 status: FolderMountStatus::Starting,
@@ -292,6 +309,27 @@ impl PaneShares {
         Ok(())
     }
     pub fn mount(&self, auth: &Authority, name: &str) -> Result<()> {
+        self.mount_if_current(auth, name, None)
+    }
+
+    /// A button drawn for a read-only share must not start a later writable
+    /// grant that happens to use the same name and local folder.
+    pub fn mount_selected(
+        &self,
+        auth: &Authority,
+        name: &str,
+        grant_id: &str,
+        writable: bool,
+    ) -> Result<()> {
+        self.mount_if_current(auth, name, Some((grant_id, writable)))
+    }
+
+    fn mount_if_current(
+        &self,
+        auth: &Authority,
+        name: &str,
+        expected: Option<(&str, bool)>,
+    ) -> Result<()> {
         let mut state = self.core.check(auth)?;
         let row = state
             .rows
@@ -301,6 +339,10 @@ impl PaneShares {
             .grant
             .as_ref()
             .context("This permission was not saved; forget the row and add the folder again")?;
+        ensure!(
+            expected.is_none_or(|(id, writable)| grant.id == id && grant.writable == writable),
+            "This shared folder has changed. Review the current list."
+        );
         ensure!(
             matches!(
                 row.status(),
@@ -426,8 +468,8 @@ impl Core {
                     wake();
                 }
             }
-            Action::Add(auth, name, path, auto_mount) => {
-                if let Err(e) = self.add(&auth, &name, path, auto_mount) {
+            Action::Add(auth, name, path, auto_mount, writable) => {
+                if let Err(e) = self.add(&auth, &name, path, auto_mount, writable) {
                     self.failed(&auth, &name, e);
                 }
             }
@@ -534,6 +576,7 @@ impl Core {
                         grant.name.clone(),
                         Row {
                             path: grant.path.clone(),
+                            writable: grant.writable,
                             grant: Some(grant.clone()),
                             mount: None,
                             status: if grant.auto_mount {
@@ -564,15 +607,30 @@ impl Core {
         ensure!(epoch == auth.epoch, "This shared-folder view has expired");
         store.context("Profile has no folder permissions")
     }
-    fn add(&self, auth: &Authority, name: &str, path: PathBuf, auto_mount: bool) -> Result<()> {
+    fn add(
+        &self,
+        auth: &Authority,
+        name: &str,
+        path: PathBuf,
+        auto_mount: bool,
+        writable: bool,
+    ) -> Result<()> {
         drop(self.check(auth)?);
-        let root = FolderRoot::open(&path).context("Opening the selected local NTFS directory")?;
+        let mut root = FolderRoot::open(&path)
+            .context("Opening the selected local NTFS directory")?
+            .with_write_access(writable);
+        if writable {
+            root.pin_write_location()
+                .context("Pinning the selected writable folder")?;
+            protected_paths::check(&root, &self.scope)?;
+        }
         let grant = Grant {
             id: format!("{:032x}", rand::random::<u128>()),
             name: name.into(),
             identity: root.identity()?,
             path,
             auto_mount,
+            writable,
         };
         let store = Store::issue(&self.scope, auth, &auth.epoch)?;
         drop(self.check(auth)?);
@@ -601,7 +659,13 @@ impl Core {
             store.read()?.iter().any(|g| g.same_selection(grant)),
             "Folder permission changed"
         );
-        let root = root.with_profile_permission(store.revocation_gate());
+        let mut root = root.with_write_access(grant.writable);
+        if grant.writable {
+            root.pin_write_location()
+                .context("Pinning the saved writable folder")?;
+            protected_paths::check(&root, &self.scope)?;
+        }
+        let root = root.with_profile_permission(store.revocation_gate(grant)?);
         let mut state = self.check(auth)?;
         let row = state
             .rows
