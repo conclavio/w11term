@@ -78,7 +78,13 @@ function Click-DialogButton($Dialog, [string]$Id) {
     }
 }
 function Wait-Saved([string]$Path) {
-    $null = Wait-Until "export to $Path" { Find-Element "Saved scrollback for pane $remote to $Path" }
+    $null = Wait-Until "export to $Path" {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            # The Shell reports the expanded path even when TEMP uses a DOS short name.
+            $destination = [IO.Path]::GetFullPath($Path)
+            Find-Element "Saved scrollback for pane $remote to $destination"
+        }
+    }
     Wait-Focus $remote
 }
 function Shell-Pid([string]$Tag) {
@@ -110,7 +116,7 @@ try {
     $frame = Control @('wait-for-text','--pane',"$remote",'--timeout','15','snapshot-end')
     if ($frame.text.Contains('archived') -or $frame.cols -ge 510) { throw 'Fixture needs offscreen and soft-wrapped content' }
 
-    $new = Join-Path $State 'new.txt'
+    $new = Join-Path $State '.\new.txt'
     $dialog = Open-Export -Menu
     Set-Filename $dialog $new
     # Output that arrives while the user chooses the file belongs to the next capture.
