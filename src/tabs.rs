@@ -5,6 +5,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type TabId = u64;
 
+/// A directional swap offered for a specific pair of visible panes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaneSwap {
+    group: TabId,
+    source: TabId,
+    neighbor: TabId,
+    direction: Direction,
+}
+
+impl PaneSwap {
+    pub fn panes(self) -> [TabId; 2] {
+        [self.source, self.neighbor]
+    }
+}
+
 // A pane can change windows without changing its tab or layout IDs.
 fn next_id() -> TabId {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -144,6 +159,36 @@ impl<T> Tabs<T> {
         group.focused = next;
         true
     }
+
+    pub fn pane_swap(&self, direction: Direction) -> Option<PaneSwap> {
+        let group = self.groups.get(self.active_index()?)?;
+        if group.zoomed {
+            return None;
+        }
+        Some(PaneSwap {
+            group: group.id,
+            source: group.focused,
+            neighbor: group.layout.neighbor(group.focused, direction)?,
+            direction,
+        })
+    }
+
+    pub fn swap_panes(&mut self, target: PaneSwap) -> bool {
+        if self.pane_swap(target.direction) != Some(target) {
+            return false;
+        }
+        let index = self.active_index().expect("validated tab is active");
+        self.groups[index].layout.replace_leaves(&mut |id| {
+            if id == target.source {
+                target.neighbor
+            } else if id == target.neighbor {
+                target.source
+            } else {
+                id
+            }
+        });
+        true
+    }
     pub fn toggle_zoom(&mut self) -> bool {
         let Some(index) = self.active_index() else {
             return false;
@@ -178,6 +223,55 @@ impl<T> Tabs<T> {
         let id = next_id();
         self.insert_group(id, id, value);
         id
+    }
+
+    /// Resolve every leaf before launching anything. A rejected recipe leaves
+    /// all tab state intact, including original focus and header order.
+    pub fn duplicate_active_group<P, E>(
+        &mut self,
+        mut prepare: impl FnMut(&T) -> Result<P, E>,
+        mut create: impl FnMut(P) -> T,
+    ) -> Result<Option<TabId>, E> {
+        let Some(index) = self.active_index() else {
+            return Ok(None);
+        };
+        let original = &self.groups[index];
+        let recipes = original
+            .layout
+            .leaves()
+            .into_iter()
+            .map(|id| prepare(self.get(id).expect("layout leaf belongs to the group")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut recipes = recipes.into_iter();
+        let mut layout = original.layout.clone();
+        let mut group = None;
+        let mut focused = None;
+        layout.replace_leaves(&mut |source| {
+            let id = next_id();
+            let group = *group.get_or_insert(id);
+            if original.focused == source {
+                focused = Some(id);
+            }
+            self.entries.push(Tab {
+                id,
+                group,
+                value: create(recipes.next().expect("one recipe per leaf")),
+            });
+            id
+        });
+        let id = group.expect("every tab group has a leaf");
+        self.groups.insert(
+            index + 1,
+            Group {
+                id,
+                title: original.title.clone(),
+                focused: focused.expect("the focused entry belongs to this layout"),
+                layout,
+                zoomed: original.zoomed,
+            },
+        );
+        self.active_group = Some(id);
+        Ok(Some(id))
     }
 
     fn insert_group(&mut self, id: TabId, entry_id: TabId, value: T) {
@@ -386,6 +480,130 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_exchanges_only_neighboring_rectangles_and_keeps_the_focused_session() {
+        let mut tabs = Tabs::default();
+        let ssh = tabs.insert("SSH");
+        let logs = tabs.split(ssh, "logs", Axis::Columns).unwrap();
+        let shell = tabs.split(logs, "PowerShell", Axis::Rows).unwrap();
+        tabs.set_ratio(&[], 0.62);
+        tabs.set_ratio(&[true], 0.3);
+        tabs.select(ssh);
+        let before = tabs.active_layout().unwrap().clone();
+        let target = tabs.pane_swap(Direction::Right).unwrap();
+        assert_eq!(target.neighbor, shell); // The lower pane has the longer shared edge.
+        assert!(tabs.swap_panes(target));
+        let after = tabs.active_layout().unwrap();
+        assert_eq!(after.bounds(ssh), before.bounds(shell));
+        assert_eq!(after.bounds(shell), before.bounds(ssh));
+        assert_eq!(after.bounds(logs), before.bounds(logs));
+        assert_eq!(after.leaves(), [shell, logs, ssh]);
+        assert_eq!(tabs.active(), Some(&"SSH"));
+        assert_eq!(tabs.active_id(), Some(ssh));
+        assert_eq!(tabs.get(shell), Some(&"PowerShell"));
+        assert!(!tabs.swap_panes(target));
+        let reverse = tabs.pane_swap(Direction::Left).unwrap();
+        assert!(tabs.swap_panes(reverse));
+        assert_eq!(tabs.active_layout(), Some(&before));
+    }
+
+    #[test]
+    fn swap_requires_the_same_visible_source_and_neighbor_at_dispatch() {
+        let mut tabs = Tabs::default();
+        let a = tabs.insert("a");
+        assert!(tabs.pane_swap(Direction::Right).is_none());
+        let b = tabs.split(a, "b", Axis::Columns).unwrap();
+        let target = tabs.pane_swap(Direction::Left).unwrap();
+        let before = tabs.active_layout().unwrap().clone();
+        assert!(tabs.pane_swap(Direction::Right).is_none());
+
+        tabs.select(a);
+        assert!(!tabs.swap_panes(target));
+        tabs.select(b);
+        assert!(tabs.toggle_zoom());
+        assert!(tabs.pane_swap(Direction::Left).is_none());
+        assert!(!tabs.swap_panes(target));
+        assert!(tabs.toggle_zoom());
+        let elsewhere = tabs.insert("another tab");
+        assert!(!tabs.swap_panes(target));
+        assert_eq!(tabs.active_id(), Some(elsewhere));
+        tabs.select(b);
+        assert_eq!(tabs.active_layout(), Some(&before));
+
+        // The same source can acquire a different neighbor while a flyout is open.
+        let replacement = tabs.split(a, "new neighbor", Axis::Columns).unwrap();
+        tabs.select(b);
+        assert_eq!(
+            tabs.pane_swap(Direction::Left).unwrap().neighbor,
+            replacement
+        );
+        let changed = tabs.active_layout().unwrap().clone();
+        assert!(!tabs.swap_panes(target));
+        assert_eq!(tabs.active_layout(), Some(&changed));
+    }
+
+    #[test]
+    fn duplicate_group_preflights_all_leaves_and_preserves_nested_layout_focus_zoom_and_order() {
+        let mut tabs = Tabs::default();
+        let before = tabs.insert(0);
+        let a = tabs.insert(1);
+        let b = tabs.split(a, 2, Axis::Rows).unwrap();
+        let c = tabs.split(b, 3, Axis::Columns).unwrap();
+        let after = tabs.insert(4);
+        tabs.select(b);
+        assert!(tabs.set_ratio(&[], 0.4123));
+        assert!(tabs.set_ratio(&[true], 0.7331));
+        assert!(tabs.toggle_zoom());
+        let title = TabTitle::try_from("Operations".to_owned()).unwrap();
+        tabs.set_group_title(a, Some(title.clone()));
+        let original = tabs.active_layout().unwrap().clone();
+        let rejected = tabs.duplicate_active_group(
+            |value| {
+                if *value == 3 {
+                    Err("unsupported pane")
+                } else {
+                    Ok(*value)
+                }
+            },
+            |_| panic!("no shell may start before preflight succeeds"),
+        );
+        assert_eq!(rejected, Err("unsupported pane"));
+        assert_eq!(tabs.active_id(), Some(b));
+        assert_eq!(tabs.headers().len(), 3);
+        let hd = tabs
+            .duplicate_active_group(|value| Ok::<_, ()>(*value), |value| value + 10)
+            .unwrap()
+            .unwrap();
+        let ids = tabs.active_layout().unwrap().leaves();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| ![a, b, c].contains(id)));
+        assert_eq!(tabs.active_id(), Some(ids[1]));
+        assert_eq!(tabs.title_for(ids[1]), Some(&title));
+        assert!(tabs.zoomed());
+        assert_eq!(
+            tabs.headers()
+                .iter()
+                .map(|tab| tab.group_id())
+                .collect::<Vec<_>>(),
+            [before, a, hd, after]
+        );
+        assert_eq!(
+            ids.iter()
+                .map(|id| *tabs.get(*id).unwrap())
+                .collect::<Vec<_>>(),
+            [11, 12, 13]
+        );
+        for (old, new) in original.leaves().into_iter().zip(&ids) {
+            assert_eq!(
+                tabs.active_layout().unwrap().bounds(*new),
+                original.bounds(old)
+            );
+        }
+        tabs.remove_group(ids[1]);
+        assert_eq!(tabs.layout_for(a), Some(&original));
+        assert_eq!(tabs.get(b), Some(&2));
+    }
 
     #[test]
     fn moving_a_group_between_windows_keeps_its_live_values_and_layout() {

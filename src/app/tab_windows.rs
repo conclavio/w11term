@@ -33,7 +33,7 @@ impl PartialEq for WindowLaunch {
 pub(super) struct Transfer {
     pub(super) registry: Registry,
     pub(super) server: Arc<Server>,
-    group: TabId,
+    pub(super) group: TabId,
     panes: Vec<u64>,
     source: LocalSender<Message>,
     pub(super) target: RefCell<Option<LocalSender<Message>>>,

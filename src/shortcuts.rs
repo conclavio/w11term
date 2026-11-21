@@ -18,6 +18,10 @@ pub enum Action {
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    SwapPaneLeft,
+    SwapPaneRight,
+    SwapPaneUp,
+    SwapPaneDown,
     SplitRight,
     SplitBelow,
     ZoomPane,
@@ -26,11 +30,13 @@ pub enum Action {
     MovePaneToExistingTab,
     CommandPalette,
     PanePicker,
+    FindAllPanes,
     KeyboardHints,
     CopyMode,
     NextTab,
     PreviousTab,
     NewTab,
+    DuplicateTabLayout,
     CloseTab,
     SelectTab(u8),
     Workspaces,
@@ -75,6 +81,28 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(ResizeRight, "resize_right", "Resize right", 0x27, ALT_SHIFT),
     Binding::new(ResizeUp, "resize_up", "Resize up", 0x26, ALT_SHIFT),
     Binding::new(ResizeDown, "resize_down", "Resize down", 0x28, ALT_SHIFT),
+    Binding::new(
+        SwapPaneLeft,
+        "swap_pane_left",
+        "Swap pane left",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(
+        SwapPaneRight,
+        "swap_pane_right",
+        "Swap pane right",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(SwapPaneUp, "swap_pane_up", "Swap pane up", 0, Mods::NONE),
+    Binding::new(
+        SwapPaneDown,
+        "swap_pane_down",
+        "Swap pane down",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(SplitRight, "split_right", "Split right", 0x27, PANE),
     Binding::new(SplitBelow, "split_below", "Split below", 0x28, PANE),
     Binding::new(ZoomPane, "zoom_pane", "Zoom pane", 0x5a, PANE),
@@ -95,6 +123,13 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
+    Binding::new(
+        FindAllPanes,
+        "find_all_panes",
+        "Find in all panes",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(
         KeyboardHints,
         "keyboard_hints",
@@ -119,6 +154,13 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(NewTab, "new_tab", "New tab", 0x54, CTRL_SHIFT),
+    Binding::new(
+        DuplicateTabLayout,
+        "duplicate_tab_layout",
+        "Duplicate tab layout",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(CloseTab, "close_tab", "Close tab", 0x57, CTRL_SHIFT),
     Binding::new(SelectTab(1), "select_tab_1", "Select tab 1", 0x31, CTRL_ALT),
     Binding::new(SelectTab(2), "select_tab_2", "Select tab 2", 0x32, CTRL_ALT),
@@ -149,12 +191,17 @@ impl Action {
                 | ResizeRight
                 | ResizeUp
                 | ResizeDown
+                | SwapPaneLeft
+                | SwapPaneRight
+                | SwapPaneUp
+                | SwapPaneDown
                 | SplitRight
                 | SplitBelow
                 | ZoomPane
                 | ClosePane
                 | MovePane
                 | MovePaneToExistingTab
+                | DuplicateTabLayout
                 | KeyboardHints
                 | CopyMode
         )
@@ -390,6 +437,63 @@ mod tests {
                     binding.action.requires_terminal()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn find_all_panes_can_be_bound_from_a_terminal_or_a_utility_tab() {
+        let mut shortcuts = Shortcuts::default();
+        assert_eq!(shortcuts.get(FindAllPanes.binding()), None);
+        let chord: Chord = "F8".parse().unwrap();
+        shortcuts.set(FindAllPanes, Some(chord)).unwrap();
+        let json = serde_json::to_string(&shortcuts).unwrap();
+        assert_eq!(json, r#"{"find_all_panes":"F8"}"#);
+        let restored: Shortcuts = serde_json::from_str(&json).unwrap();
+        let map = restored.keymap().unwrap();
+        for in_terminal in [false, true] {
+            assert_eq!(
+                map.resolve(chord.key, chord.mods, in_terminal, false),
+                Some(FindAllPanes)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_tab_layout_can_be_bound_without_claiming_keys_in_forms() {
+        let mut shortcuts = Shortcuts::default();
+        assert_eq!(shortcuts.get(DuplicateTabLayout.binding()), None);
+        let chord: Chord = "F8".parse().unwrap();
+        shortcuts.set(DuplicateTabLayout, Some(chord)).unwrap();
+        let saved = serde_json::to_string(&shortcuts).unwrap();
+        let restored: Shortcuts = serde_json::from_str(&saved).unwrap();
+        let map = restored.keymap().unwrap();
+        assert_eq!(
+            map.resolve(chord.key, chord.mods, true, false),
+            Some(DuplicateTabLayout)
+        );
+        assert_eq!(map.resolve(chord.key, chord.mods, false, false), None);
+        assert_eq!(map.resolve(chord.key, chord.mods, true, true), None);
+    }
+
+    #[test]
+    fn pane_swaps_are_individually_remappable_and_require_a_terminal() {
+        let actions = [SwapPaneLeft, SwapPaneRight, SwapPaneUp, SwapPaneDown];
+        let mut shortcuts = Shortcuts::default();
+        let chord: Chord = "F8".parse().unwrap();
+        for action in actions {
+            assert_eq!(shortcuts.get(action.binding()), None);
+            shortcuts.set(action, Some(chord)).unwrap();
+            let saved = serde_json::to_string(&shortcuts).unwrap();
+            assert!(saved.contains(action.binding().id));
+            let restored: Shortcuts = serde_json::from_str(&saved).unwrap();
+            let map = restored.keymap().unwrap();
+            assert_eq!(
+                map.resolve(chord.key, chord.mods, true, false),
+                Some(action)
+            );
+            assert_eq!(map.resolve(chord.key, chord.mods, false, false), None);
+            assert_eq!(map.resolve(chord.key, chord.mods, true, true), None);
+            shortcuts.restore(action).unwrap();
         }
     }
 

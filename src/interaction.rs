@@ -13,12 +13,48 @@ pub enum TabSwitcherMode {
     Mru,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MultiLinePasteWarning {
+    #[default]
+    Automatic,
+    Always,
+    Never,
+}
+
+// Windows Terminal also accepts true for automatic and false for never.
+fn multiline_setting<'de, D: serde::Deserializer<'de>>(
+    input: D,
+) -> Result<MultiLinePasteWarning, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Setting {
+        Mode(MultiLinePasteWarning),
+        Enabled(bool),
+    }
+    Ok(match Setting::deserialize(input)? {
+        Setting::Mode(mode) => mode,
+        Setting::Enabled(true) => MultiLinePasteWarning::Automatic,
+        Setting::Enabled(false) => MultiLinePasteWarning::Never,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteWarning {
+    MultiLine,
+    Large,
+    LargeMultiLine,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Interaction {
     pub copy_on_select: bool,
     pub trim_block_selection: bool,
     pub trim_paste: bool,
+    #[serde(deserialize_with = "multiline_setting")]
+    pub multi_line_paste_warning: MultiLinePasteWarning,
+    pub large_paste_warning: bool,
     pub snap_to_grid_on_resize: bool,
     pub tab_switcher_mode: TabSwitcherMode,
     pub scroll_to_zoom: bool,
@@ -32,6 +68,8 @@ impl Default for Interaction {
             copy_on_select: true,
             trim_block_selection: true,
             trim_paste: true,
+            multi_line_paste_warning: MultiLinePasteWarning::Automatic,
+            large_paste_warning: true,
             snap_to_grid_on_resize: true,
             tab_switcher_mode: TabSwitcherMode::InOrder,
             scroll_to_zoom: true,
@@ -43,6 +81,35 @@ impl Default for Interaction {
 }
 pub fn paste_text(text: &str, trim: bool) -> &str {
     if trim { text.trim_end() } else { text }
+}
+
+impl Interaction {
+    /// Use the actual clipboard payload, after any trimming, for both the
+    /// prompt decision and delivery. Raw paste never has bracket protection.
+    pub fn clipboard_paste<'a>(
+        &self,
+        text: &'a str,
+        raw: bool,
+        bracketed: bool,
+    ) -> (&'a str, Option<PasteWarning>) {
+        let bracketed = !raw && bracketed;
+        let text = paste_text(text, self.trim_paste && !raw && !bracketed);
+        let warn_multiline = match self.multi_line_paste_warning {
+            MultiLinePasteWarning::Automatic => !bracketed,
+            MultiLinePasteWarning::Always => true,
+            MultiLinePasteWarning::Never => false,
+        };
+        // Windows measures the clipboard's UTF-16 units. Count only far
+        // enough to distinguish the last unprompted unit from the first over.
+        let large = self.large_paste_warning && text.encode_utf16().nth(5 * 1024).is_some();
+        let warning = match (warn_multiline && text.contains(['\r', '\n']), large) {
+            (true, true) => Some(PasteWarning::LargeMultiLine),
+            (true, false) => Some(PasteWarning::MultiLine),
+            (false, true) => Some(PasteWarning::Large),
+            (false, false) => None,
+        };
+        (text, warning)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -494,6 +561,91 @@ mod tests {
         assert_eq!(range, 6..11);
         assert_eq!(paste_text("one  \r\n  two \r\n\t ", true), "one  \r\n  two");
         assert_eq!(paste_text("x \r\n", false), "x \r\n");
+    }
+
+    #[test]
+    fn clipboard_paste_warns_for_the_bytes_that_will_be_sent() {
+        let mut settings = Interaction::default();
+        let text = "one\r\ntwo \r\n";
+        assert_eq!(
+            settings.clipboard_paste(text, false, false),
+            ("one\r\ntwo", Some(PasteWarning::MultiLine))
+        );
+        assert_eq!(settings.clipboard_paste(text, false, true), (text, None));
+        assert_eq!(
+            settings.clipboard_paste(text, true, true),
+            (text, Some(PasteWarning::MultiLine))
+        );
+        assert_eq!(
+            settings.clipboard_paste("one\r\n", false, false),
+            ("one", None)
+        );
+        assert_eq!(settings.clipboard_paste("", true, false), ("", None));
+        settings.multi_line_paste_warning = MultiLinePasteWarning::Always;
+        assert_eq!(
+            settings.clipboard_paste(text, false, true).1,
+            Some(PasteWarning::MultiLine)
+        );
+        settings.multi_line_paste_warning = MultiLinePasteWarning::Never;
+        settings.trim_paste = false;
+        assert_eq!(settings.clipboard_paste(text, false, false), (text, None));
+    }
+
+    #[test]
+    fn large_paste_counts_windows_clipboard_units_and_combines_warnings() {
+        let mut settings = Interaction::default();
+        let at_limit = "😀".repeat(2560);
+        assert!(
+            settings
+                .clipboard_paste(&at_limit, false, false)
+                .1
+                .is_none()
+        );
+        let over = format!("{at_limit}\n");
+        assert_eq!(
+            settings.clipboard_paste(&over, false, false),
+            (at_limit.as_str(), None)
+        );
+        assert_eq!(
+            settings.clipboard_paste(&over, false, true).1,
+            Some(PasteWarning::Large)
+        );
+        assert_eq!(
+            settings.clipboard_paste(&over, true, false).1,
+            Some(PasteWarning::LargeMultiLine)
+        );
+        settings.large_paste_warning = false;
+        assert_eq!(
+            settings.clipboard_paste(&over, true, false).1,
+            Some(PasteWarning::MultiLine)
+        );
+    }
+
+    #[test]
+    fn paste_preferences_accept_legacy_booleans_and_round_trip() {
+        for (value, mode) in [
+            (serde_json::json!(true), MultiLinePasteWarning::Automatic),
+            (serde_json::json!(false), MultiLinePasteWarning::Never),
+            (serde_json::json!("always"), MultiLinePasteWarning::Always),
+        ] {
+            let settings: Interaction = serde_json::from_value(
+                serde_json::json!({"multiLinePasteWarning":value, "largePasteWarning":false}),
+            )
+            .unwrap();
+            assert_eq!(settings.multi_line_paste_warning, mode);
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                saved["multiLinePasteWarning"],
+                serde_json::to_value(mode).unwrap()
+            );
+            assert_eq!(saved["largePasteWarning"], false);
+        }
+        let old: Interaction = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            old.multi_line_paste_warning,
+            MultiLinePasteWarning::Automatic
+        );
+        assert!(old.large_paste_warning);
     }
     #[test]
     fn urls_cover_wrapped_lines_explicit_links_and_safe_schemes() {

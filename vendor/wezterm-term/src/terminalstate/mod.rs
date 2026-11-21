@@ -1136,12 +1136,12 @@ impl TerminalState {
         }
     }
 
-    /// Send text to the terminal that is the result of pasting.
+    /// Encode text to send to the terminal as a paste.
     /// If bracketed paste mode is enabled, the paste is enclosed
     /// in the bracketing, otherwise it is fed to the writer as-is.
     /// De-fang the text by removing any embedded bracketed paste
     /// sequence that may be present.
-    pub fn send_paste(&mut self, text: &str) -> Result<(), Error> {
+    pub fn encode_paste(&self, text: &str) -> String {
         let mut buf = String::new();
         if self.bracketed_paste {
             buf.push_str("\x1b[200~");
@@ -1161,6 +1161,11 @@ impl TerminalState {
             buf.push_str("\x1b[201~");
         }
 
+        buf
+    }
+
+    pub fn send_paste(&mut self, text: &str) -> Result<(), Error> {
+        let buf = self.encode_paste(text);
         self.writer.write_all(buf.as_bytes())?;
         self.writer.flush()?;
         Ok(())
@@ -1761,11 +1766,23 @@ impl TerminalState {
             ))
             | Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::StartBlinkingCursor,
-            )) => {}
+            )) => {
+                use CursorShape::*;
+                let blinking = matches!(mode, Mode::SetDecPrivateMode(_));
+                self.cursor.shape = match (self.cursor.shape, blinking) {
+                    (BlinkingBar | SteadyBar, true) => BlinkingBar,
+                    (BlinkingBar | SteadyBar, false) => SteadyBar,
+                    (BlinkingUnderline | SteadyUnderline, true) => BlinkingUnderline,
+                    (BlinkingUnderline | SteadyUnderline, false) => SteadyUnderline,
+                    (Default | BlinkingBlock | SteadyBlock, true) => BlinkingBlock,
+                    (BlinkingBlock | SteadyBlock, false) => SteadyBlock,
+                    (Default, false) => Default,
+                };
+            }
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::StartBlinkingCursor,
             )) => {
-                self.decqrm_response(mode, true, false);
+                self.decqrm_response(mode, true, self.cursor.shape.is_blinking());
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AutoRepeat))

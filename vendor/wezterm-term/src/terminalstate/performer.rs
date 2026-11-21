@@ -28,6 +28,54 @@ use wezterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
 };
 
+/// Build a restorable SGR parameter list from the pen at the instant of the query.
+/// Only attributes set by SGR belong here; the pen can also carry links and semantic marks.
+fn sgr_parameters(pen: &CellAttributes) -> String {
+    use wezterm_cell::color::{ColorAttribute, ColorSpec};
+    use wezterm_escape_parser::csi::{Blink, Intensity, Sgr, Underline, VerticalAlign};
+
+    fn color(value: ColorAttribute) -> Option<ColorSpec> {
+        match value {
+            ColorAttribute::Default => None,
+            ColorAttribute::PaletteIndex(index) => Some(ColorSpec::PaletteIndex(index)),
+            ColorAttribute::TrueColorWithDefaultFallback(rgb)
+            | ColorAttribute::TrueColorWithPaletteFallback(rgb, _) => {
+                Some(ColorSpec::TrueColor(rgb))
+            }
+        }
+    }
+
+    let mut params = String::from("0");
+    let intensity = pen.intensity();
+    let underline = pen.underline();
+    let blink = pen.blink();
+    let align = pen.vertical_align();
+    for setting in [
+        (intensity != Intensity::Normal).then_some(Sgr::Intensity(intensity)),
+        pen.italic().then_some(Sgr::Italic(true)),
+        (underline != Underline::None).then_some(Sgr::Underline(underline)),
+        (blink != Blink::None).then_some(Sgr::Blink(blink)),
+        pen.reverse().then_some(Sgr::Inverse(true)),
+        pen.invisible().then_some(Sgr::Invisible(true)),
+        pen.strikethrough().then_some(Sgr::StrikeThrough(true)),
+        pen.overline().then_some(Sgr::Overline(true)),
+        (align != VerticalAlign::BaseLine).then_some(Sgr::VerticalAlign(align)),
+        color(pen.foreground()).map(Sgr::Foreground),
+        color(pen.background()).map(Sgr::Background),
+        color(pen.underline_color()).map(Sgr::UnderlineColor),
+    ]
+    .iter()
+    .flatten()
+    {
+        // Sgr's formatter includes the final 'm' for each standalone setting.
+        // The combined status string has one final 'm' after all parameters.
+        write!(params, ";{setting}").expect("writing to a String is infallible");
+        let final_byte = params.pop();
+        debug_assert_eq!(final_byte, Some('m'));
+    }
+    params
+}
+
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
 /// the terminal state and the embedding/host terminal interface
 pub(crate) struct Performer<'a> {
@@ -301,6 +349,26 @@ impl<'a> Performer<'a> {
                         // inverted; there's a note about this in the xterm
                         // ctlseqs docs.
                         match s.data.as_slice() {
+                            b"m" => {
+                                let params = sgr_parameters(&self.pen);
+                                write!(self.writer, "{DCS}1$r{params}m{ST}").ok();
+                                self.writer.flush().ok();
+                            }
+                            b" q" => {
+                                // DECSCUSR: the selector can be sent back to restore this style.
+                                use wezterm_surface::CursorShape::*;
+                                let style = match self.cursor.shape {
+                                    Default => 0,
+                                    BlinkingBlock => 1,
+                                    SteadyBlock => 2,
+                                    BlinkingUnderline => 3,
+                                    SteadyUnderline => 4,
+                                    BlinkingBar => 5,
+                                    SteadyBar => 6,
+                                };
+                                write!(self.writer, "{DCS}1$r{style} q{ST}").ok();
+                                self.writer.flush().ok();
+                            }
                             &[b'"', b'p'] => {
                                 // DECSCL - select conformance level
                                 write!(self.writer, "{}1$r65;1\"p{}", DCS, ST).ok();
