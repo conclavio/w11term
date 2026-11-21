@@ -11,6 +11,11 @@ use wezterm_term::{
     CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
 };
 
+mod export;
+mod keypad;
+pub(crate) use export::export_text;
+pub use keypad::KeypadKey;
+
 pub type Rgba = [f32; 4];
 
 pub fn scroll_wheel(
@@ -89,16 +94,21 @@ pub enum TransportInput {
     Authenticate(crate::options::Authentication),
     Sftp(crate::sftp::Job),
     Data(Vec<u8>),
+    /// Parser-generated reply on a viewer transport that distinguishes it from user input.
+    Automatic(Vec<u8>),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
     Resize(TerminalSize),
 }
 
-struct ReplyWriter(mpsc::UnboundedSender<TransportInput>);
+struct ReplyWriter {
+    sender: mpsc::UnboundedSender<TransportInput>,
+    message: fn(Vec<u8>) -> TransportInput,
+}
 
 impl Write for ReplyWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0
-            .send(TransportInput::Data(bytes.to_vec()))
+        self.sender
+            .send((self.message)(bytes.to_vec()))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))?;
         Ok(bytes.len())
     }
@@ -113,8 +123,51 @@ pub fn create(size: TerminalSize, writer: mpsc::UnboundedSender<TransportInput>)
         Arc::new(Config),
         "w11term",
         env!("CARGO_PKG_VERSION"),
-        Box::new(ReplyWriter(writer)),
+        Box::new(ReplyWriter {
+            sender: writer,
+            message: TransportInput::Data,
+        }),
     )
+}
+
+pub(crate) fn replace_transport(
+    terminal: &mut Terminal,
+    writer: mpsc::UnboundedSender<TransportInput>,
+) {
+    terminal.replace_writer(Box::new(ReplyWriter {
+        sender: writer,
+        message: TransportInput::Data,
+    }));
+}
+
+/// Herdr can send a screen reconstruction on attach or while a viewer falls behind.
+/// Screen paint and subsequent live bytes share the same stream.
+pub(crate) fn enter_herdr_viewer(
+    terminal: &mut Terminal,
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    events: &crate::events::Events,
+) {
+    struct ViewerAlerts(crate::events::Events);
+    impl wezterm_term::AlertHandler for ViewerAlerts {
+        fn alert(&mut self, alert: wezterm_term::Alert) {
+            if let wezterm_term::Alert::WindowTitleChanged(title) = alert {
+                self.0.push("title", serde_json::json!({"title": title}));
+            }
+        }
+    }
+    events.command_stream(false);
+    terminal.clear_clipboard();
+    terminal.set_notification_handler(Box::new(ViewerAlerts(events.clone())));
+    terminal.set_nonblocking_viewer_writers(
+        Box::new(ReplyWriter {
+            sender: writer.clone(),
+            message: TransportInput::Data,
+        }),
+        Box::new(ReplyWriter {
+            sender: writer.clone(),
+            message: TransportInput::Automatic,
+        }),
+    );
 }
 
 /// WezTerm's kitty encoder lives in its input-types crate, outside Terminal::key_down.
@@ -149,6 +202,8 @@ pub fn send_key_event(
 pub struct KeyDetails {
     pub base: Option<char>,
     pub text: Option<String>,
+    pub keypad: Option<KeypadKey>,
+    pub leds: wezterm_input_types::KeyboardLedStatus,
 }
 pub fn send_key_event_detailed(
     terminal: &mut Terminal,
@@ -165,6 +220,14 @@ pub fn send_key_event_detailed(
         let all = flags
             .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
         let reports = flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
+        if let Some(keypad) = details.keypad
+            && let Some(wire) = keypad.encode(flags, key, modifiers, details, down, repeat)
+        {
+            if !wire.is_empty() {
+                writer.send(TransportInput::Data(wire.into_bytes()))?;
+            }
+            return Ok(());
+        }
         let safety_key = matches!(
             key,
             L::Enter | L::Tab | L::Backspace | L::Char('\r' | '\t' | '\x08')
@@ -742,6 +805,131 @@ pub fn colors(attrs: &CellAttributes, palette: &ColorPalette) -> (Rgba, Rgba) {
 mod tests {
     use super::*;
     use wezterm_term::{KeyCode, KeyModifiers};
+
+    fn watched_terminal() -> (Terminal, crate::events::Events) {
+        let (mut term, _) = engine();
+        let events = crate::events::Events::default();
+        term.set_notification_handler(Box::new(crate::sound::Alerts {
+            events: events.clone(),
+            notices: mpsc::channel(1).0,
+            player: Default::default(),
+        }));
+        (term, events)
+    }
+
+    fn completions(events: &crate::events::Events) -> Vec<serde_json::Value> {
+        events
+            .since(0)
+            .events
+            .into_iter()
+            .filter(|e| e.kind == "command-finished")
+            .map(|e| e.data)
+            .collect()
+    }
+
+    #[test]
+    fn command_watch_fires_once_for_the_first_paired_primary_command_in_a_batch() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(true);
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;B\x07cancelled\x1b]133;A\x07\x1b]133;D;1\x07\x1b[?1049h\x1b]133;C\x07\x1b]133;D;2\x07\x1b[?1049l");
+        assert_eq!(events.command_watch(), Some(true));
+        term.advance_bytes(b"\x1b[?2026h\x1b]133;C\x07secret\x1b]133;D;42\x07\x1b]133;D;3\x07\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b[?2026l");
+        assert_eq!(completions(&events), [serde_json::json!({"exit_code":42})]);
+        assert_eq!(events.command_watch(), Some(false));
+        // A late arm after the batch must not fire on the last stored result.
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;D;0\x07");
+        assert_eq!(completions(&events).len(), 1);
+    }
+
+    #[test]
+    fn command_watch_tracks_current_command_across_capture_loss_and_nested_markers() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(true);
+        term.advance_bytes(b"\x1b]133;C;aid=shell\x07private output\x1b[3J");
+        assert!(events.set_command_watch(true));
+        for b in b"\x1b]133;C;aid=shell\x07\x1b]133;C;aid=nested\x07\x1b]133;D;5;aid=nested\x1b\\\x1b]133;A;aid=nested\x07\x1b[?1049h\x1b]133;D;9;aid=shell\x07\x1b[?1049l\x1b]133;N;aid=shell\x1b\\\x1b]133;D;8;aid=shell\x07" {
+            term.advance_bytes([*b]);
+        }
+        assert_eq!(
+            completions(&events),
+            [serde_json::json!({"exit_code":null})]
+        );
+        for end in [b"\x1b]133;A\x07".as_slice(), b"\x1b]133;D\x07"] {
+            assert!(events.set_command_watch(true));
+            term.advance_bytes(b"\x1b]133;C\x07");
+            term.advance_bytes(end);
+        }
+        assert_eq!(
+            completions(&events),
+            vec![serde_json::json!({"exit_code":null}); 3]
+        );
+    }
+
+    #[test]
+    fn command_watch_cancels_on_reset_disconnect_and_viewer_transition() {
+        let (mut term, events) = watched_terminal();
+        assert!(!events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;C\x07historical output");
+        events.command_stream(true);
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;D;11\x07");
+        assert_eq!(events.command_watch(), Some(true));
+        for reset in [b"\x1bc".as_slice(), b"\x1b[!p", b"\x1b]133;B\x07"] {
+            events.set_command_watch(true);
+            term.advance_bytes(b"\x1b]133;C\x07");
+            term.advance_bytes(reset);
+            assert_eq!(events.command_watch(), Some(false));
+            term.advance_bytes(b"\x1b]133;D;42\x07");
+        }
+        events.set_command_watch(true);
+        term.advance_bytes(b"\x1b]133;C\x07");
+        events.command_stream(false);
+        assert_eq!(events.command_watch(), None);
+        term.reset_connection();
+        events.command_stream(true);
+        term.advance_bytes(b"\x1b]133;D;2\x07\x1b]133;C\x07");
+        assert!(events.set_command_watch(true));
+        assert!(events.set_command_watch(false));
+        term.advance_bytes(b"\x1b]133;D;4\x07");
+        assert!(events.set_command_watch(true));
+        enter_herdr_viewer(&mut term, &mpsc::unbounded_channel().0, &events);
+        assert!(!events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;C\x07old bytes\x1b]133;D;99\x07");
+        assert!(completions(&events).is_empty());
+    }
+
+    #[test]
+    fn osc9_progress_retains_values_across_warnings_and_clears_on_reset() {
+        use wezterm_term::Progress::*;
+        let (mut term, _) = engine();
+        for (sequence, expected) in [
+            ("9;4;2", Error(10)),
+            ("9;4;1;0", Percentage(0)),
+            ("9;4;1;27", Percentage(27)),
+            ("9;4;3", Indeterminate),
+            ("9;4;4", Paused(27)),
+            ("9;4;2;0", Error(27)),
+            ("9;4;4;63", Paused(63)),
+            ("9;4;1;bogus", Paused(63)),
+            ("9;4;1;900000000000000000000", Percentage(100)),
+            ("9;4;0", None),
+            ("9;4;4", Paused(10)),
+        ] {
+            for byte in format!("\x1b]{sequence}\x1b\\").bytes() {
+                term.advance_bytes([byte]);
+            }
+            assert_eq!(term.get_progress(), expected, "{sequence}");
+        }
+        term.reset_connection();
+        assert_eq!(term.get_progress(), None);
+        term.advance_bytes(b"\x1b]9;4;2\x07");
+        assert_eq!(term.get_progress(), Error(10));
+        term.advance_bytes(b"\x1bc");
+        assert_eq!(term.get_progress(), None);
+    }
+
     #[test]
     fn completed_shell_output_uses_markers_scrollback_and_real_line_breaks() {
         let (mut term, _) = engine();
@@ -857,16 +1045,20 @@ mod tests {
 
     #[test]
     fn partial_command_output_is_unavailable_after_history_is_cleared() {
-        let (mut term, _) = engine();
+        let (mut term, events) = watched_terminal();
+        events.command_stream(true);
         term.resize(TerminalSize {
             cols: 16,
             rows: 2,
             ..TerminalSize::default()
         });
-        term.advance_bytes(b"\x1b]133;C\x07begin\r\nmiddle\r\nend\x1b[3J\x1b]133;D;7\x07");
+        term.advance_bytes(b"\x1b]133;C\x07begin\r\nmiddle\r\nend\x1b[3J");
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;D;7\x07");
         let command = term.last_command().unwrap();
         assert_eq!(command.exit_code, Some(7));
         assert_eq!(command.output, Err("Command output left scrollback"));
+        assert_eq!(completions(&events), [serde_json::json!({"exit_code":7})]);
     }
 
     #[test]
@@ -1212,6 +1404,195 @@ mod tests {
     }
 
     #[test]
+    fn keypad_matches_stock_kitty_wire_fixture() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Case {
+            key: String,
+            flags: u8,
+            action: String,
+            text: Option<String>,
+            #[serde(default)]
+            num_lock: bool,
+            wire: String,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/keyboard/keypad.json")).unwrap();
+        for case in cases {
+            let (key, keypad) = match case.key.as_str() {
+                "ENTER" => (KeyCode::Char('\r'), None),
+                "LEFT" => (KeyCode::LeftArrow, None),
+                "KP_ENTER" => (KeyCode::Char('\r'), Some(KeypadKey::Enter)),
+                "KP_LEFT" => (KeyCode::LeftArrow, Some(KeypadKey::Left)),
+                "KP_DELETE" => (KeyCode::Delete, Some(KeypadKey::Delete)),
+                "KP_BEGIN" => (KeyCode::Clear, Some(KeypadKey::Begin)),
+                "KP_4" => (KeyCode::Char('4'), Some(KeypadKey::Digit4)),
+                "KP_DECIMAL" => (KeyCode::Char(','), Some(KeypadKey::Decimal)),
+                "KP_ADD" => (KeyCode::Char('+'), Some(KeypadKey::Add)),
+                _ => panic!("unhandled fixture {case:?}"),
+            };
+            let (writer, mut wire) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            if case.flags != 0 {
+                terminal.advance_bytes(format!("\x1b[>{}u", case.flags));
+            }
+            let mut details = KeyDetails {
+                keypad,
+                ..Default::default()
+            };
+            details.leds.set(
+                wezterm_input_types::KeyboardLedStatus::NUM_LOCK,
+                case.num_lock,
+            );
+            if case.text.as_deref().is_some_and(|t| t.chars().count() > 1) {
+                details.text = case.text.clone();
+            }
+            let (down, repeat) = match case.action.as_str() {
+                "press" => (true, false),
+                "repeat" => (true, true),
+                "release" => (false, false),
+                _ => panic!("unknown action {case:?}"),
+            };
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                key,
+                KeyModifiers::NONE,
+                down,
+                repeat,
+                &details,
+            )
+            .unwrap();
+            if case.wire.is_empty() {
+                assert!(wire.try_recv().is_err(), "{case:?}");
+            } else {
+                assert_eq!(receive(&mut wire), case.wire.as_bytes(), "{case:?}");
+                assert!(wire.try_recv().is_err(), "{case:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn keypad_text_uses_the_active_layout_and_only_requested_press_events() {
+        let details = KeyDetails {
+            keypad: Some(KeypadKey::Decimal),
+            text: Some("٫ ".into()),
+            leds: wezterm_input_types::KeyboardLedStatus::NUM_LOCK
+                | wezterm_input_types::KeyboardLedStatus::CAPS_LOCK,
+            ..Default::default()
+        };
+        for (flags, modifiers, down, repeat, expected) in [
+            (1, KeyModifiers::NONE, true, false, "٫ "),
+            (3, KeyModifiers::NONE, true, true, "٫ "),
+            (8, KeyModifiers::NONE, true, false, "\x1b[57409;193u"),
+            (
+                27,
+                KeyModifiers::SHIFT,
+                true,
+                false,
+                "\x1b[57409;194;1643:32u",
+            ),
+            (27, KeyModifiers::CTRL, true, true, "\x1b[57409;197:2u"),
+            (27, KeyModifiers::NONE, false, false, "\x1b[57409;193:3u"),
+            (3, KeyModifiers::NONE, false, false, "\x1b[57409;193:3u"),
+        ] {
+            let (writer, mut wire) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            terminal.advance_bytes(format!("\x1b[>{flags}u"));
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char('٫'),
+                modifiers,
+                down,
+                repeat,
+                &details,
+            )
+            .unwrap();
+            assert_eq!(receive(&mut wire), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn herdr_repaints_preserve_text_title_and_distinguish_replies_from_real_input() {
+        #[derive(Default)]
+        struct Clipboard(Mutex<Vec<Option<String>>>);
+        impl wezterm_term::Clipboard for Clipboard {
+            fn set_contents(
+                &self,
+                _: wezterm_term::ClipboardSelection,
+                value: Option<String>,
+            ) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(value);
+                Ok(())
+            }
+        }
+        let (writer, mut received) = mpsc::unbounded_channel();
+        let mut term = create(Default::default(), writer.clone());
+        let sink = Arc::new(Clipboard::default());
+        let clipboard: Arc<dyn wezterm_term::Clipboard> = sink.clone();
+        term.set_clipboard(&clipboard);
+        let events = crate::events::Events::default();
+        let (notices, mut pending) = mpsc::channel(16);
+        let player = crate::options::PlayerOptions {
+            remote_sounds: Some(true),
+            sync_assets: Some(true),
+            ..Default::default()
+        };
+        term.set_notification_handler(Box::new(crate::sound::Alerts {
+            events: events.clone(),
+            notices,
+            player: Arc::new(std::sync::RwLock::new(player)),
+        }));
+        let effects = b"\x07\x1b]52;c;eA==\x07\x1b]440;1;play;shot\x07\x1b]440;1;pack;v1\x07\x1b]777;notify;title;test\x07";
+        term.advance_bytes(effects);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(
+            events
+                .since(0)
+                .events
+                .iter()
+                .any(|e| e.kind == "notification")
+        );
+        assert!(matches!(
+            pending.try_recv(),
+            Ok(crate::sound::Notice::Play(_))
+        ));
+        assert!(matches!(
+            pending.try_recv(),
+            Ok(crate::sound::Notice::Play(_))
+        ));
+        assert!(matches!(
+            pending.try_recv(),
+            Ok(crate::sound::Notice::Pack(_))
+        ));
+        let cursor = events.since(0).next;
+
+        enter_herdr_viewer(&mut term, &writer, &events);
+        term.reset_connection();
+        for _ in 0..2 {
+            // Reproduce both a whole repaint and OSCs split across DATA frames.
+            for byte in effects {
+                term.advance_bytes([*byte]);
+            }
+            term.advance_bytes(b"\x1b]52;c;?\x07");
+        }
+        term.advance_bytes(b"visible\x1b]2;viewer title\x07\x1b[5n");
+        term.send_paste("typed").unwrap();
+        term.advance_bytes(b"\x1b[5n");
+        assert!(text(&term).contains("visible"));
+        assert_eq!(term.get_title(), "viewer title");
+        let updates = events.since(cursor).events;
+        assert!(updates.iter().any(|event| event.kind == "title"));
+        assert!(updates.iter().all(|event| event.kind == "title"));
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(pending.try_recv().is_err());
+        assert!(matches!(received.try_recv(), Ok(TransportInput::Automatic(v)) if v == b"\x1b[0n"));
+        assert!(matches!(received.try_recv(), Ok(TransportInput::Data(v)) if v == b"typed"));
+        assert!(matches!(received.try_recv(), Ok(TransportInput::Automatic(v)) if v == b"\x1b[0n"));
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
     fn kitty_modifiers_safety_keys_shifted_identity_and_composed_text() {
         for flags in [1, 3, 8, 11, 15, 31] {
             let (mut terminal, _) = engine();
@@ -1265,7 +1646,7 @@ mod tests {
                 repeat,
                 &KeyDetails {
                     base: Some('1'),
-                    text: None,
+                    ..KeyDetails::default()
                 },
             )
             .unwrap();
@@ -1286,6 +1667,7 @@ mod tests {
                 &KeyDetails {
                     base: Some('e'),
                     text: Some("e\u{301}".into()),
+                    ..KeyDetails::default()
                 },
             )
             .unwrap();

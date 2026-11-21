@@ -1078,6 +1078,11 @@ impl Screen {
         }
     }
 
+    /// Borrow retained rows in chronological order without copying the screen.
+    pub fn physical_lines(&self) -> impl DoubleEndedIterator<Item = &Line> + ExactSizeIterator {
+        self.lines.iter()
+    }
+
     pub fn for_each_phys_line_mut<F>(&mut self, mut f: F)
     where
         F: FnMut(usize, &mut Line),

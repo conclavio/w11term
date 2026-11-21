@@ -29,7 +29,42 @@ pub struct Batch {
 struct State {
     next: u64,
     events: VecDeque<Event>,
+    progress: wezterm_term::Progress,
     inbox: Option<(u64, Arc<str>, Inbox)>,
+    command_watch: Option<CommandWatch>,
+    restart_token: Option<u64>,
+    restart_closed: bool,
+}
+
+#[derive(Debug, Default)]
+struct CommandWatch {
+    armed: bool,
+    running: Option<RunningCommand>,
+}
+
+#[derive(Debug)]
+struct RunningCommand {
+    /// Keep a fixed-size identity even if the shell supplies a large OSC 133 aid.
+    aid: Option<[u8; 32]>,
+}
+
+fn application_id(aid: Option<&str>) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    aid.map(|id| Sha256::digest(id.as_bytes()).into())
+}
+
+impl State {
+    fn watch_state(&self) -> Option<bool> {
+        self.command_watch.as_ref().map(|watch| watch.armed)
+    }
+
+    fn refresh_watch(&self, previous: Option<bool>) {
+        if previous != self.watch_state()
+            && let Some((_, _, inbox)) = &self.inbox
+        {
+            inbox.refresh();
+        }
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub struct Events {
@@ -37,13 +72,169 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
-    /// Attach once, forwarding any alerts that arrived during pane startup.
+    pub fn restart_token(&self) -> Option<u64> {
+        self.state.lock().unwrap().restart_token
+    }
+
+    pub(crate) fn restart_exited(
+        &self,
+        input: &tokio::sync::mpsc::UnboundedSender<crate::session::Command>,
+        token: u64,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        anyhow::ensure!(
+            state.restart_token == Some(token),
+            "Pane is running, unavailable, or the exit token has expired"
+        );
+        state.restart_token = None;
+        if let Some((_, _, inbox)) = &state.inbox {
+            inbox.refresh();
+        }
+        input
+            .send(crate::session::Command::RestartExited(
+                crate::session::ClaimedRestart(token),
+            ))
+            .map_err(|_| anyhow::anyhow!("The terminal pane has closed"))
+    }
+
+    pub(crate) fn pane_exited(&self, token: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.restart_closed {
+            return;
+        }
+        state.restart_token = Some(token);
+        if let Some((_, _, inbox)) = &state.inbox {
+            inbox.refresh();
+        }
+        self.append(
+            state,
+            "pane-exited",
+            serde_json::json!({"exit_token":token}),
+        );
+    }
+
+    pub(crate) fn close_restart(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.restart_closed = true;
+        if state.restart_token.take().is_some()
+            && let Some((_, _, inbox)) = &state.inbox
+        {
+            inbox.refresh();
+        }
+    }
+
+    /// None while disconnected or on streams that may repaint historical bytes.
+    pub fn command_watch(&self) -> Option<bool> {
+        self.state.lock().unwrap().watch_state()
+    }
+
+    pub fn set_command_watch(&self, armed: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        let Some(watch) = &mut state.command_watch else {
+            return false;
+        };
+        watch.armed = armed;
+        state.refresh_watch(previous);
+        true
+    }
+
+    pub(crate) fn command_stream(&self, live: bool) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        state.command_watch = live.then(CommandWatch::default);
+        state.refresh_watch(previous);
+    }
+
+    pub(crate) fn reset_command_watch(&self) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        if let Some(watch) = &mut state.command_watch {
+            *watch = CommandWatch::default();
+        }
+        state.refresh_watch(previous);
+    }
+
+    pub(crate) fn semantic_prompt(&self, marker: &wezterm_term::FinalTermSemanticPrompt) {
+        use wezterm_term::FinalTermSemanticPrompt::*;
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        let Some(watch) = &mut state.command_watch else {
+            return;
+        };
+        let (aid, exit_code) = match marker {
+            MarkEndOfInputAndStartOfOutput { aid } => {
+                // A repeated start or a nested shell cannot steal the original watch.
+                watch.running.get_or_insert_with(|| RunningCommand {
+                    aid: application_id(aid.as_deref()),
+                });
+                return;
+            }
+            CommandStatus { status, aid } => (aid, *status),
+            FreshLineAndStartPrompt { aid, .. } | MarkEndOfCommandWithFreshLine { aid, .. } => {
+                (aid, None)
+            }
+            // Without an end marker or a fresh prompt, a new input phase
+            // abandons the previous unqualified command. It cannot prove success.
+            MarkEndOfPromptAndStartOfInputUntilNextMarker
+            | MarkEndOfPromptAndStartOfInputUntilEndOfLine => {
+                if watch
+                    .running
+                    .as_ref()
+                    .is_some_and(|command| command.aid.is_none())
+                {
+                    *watch = CommandWatch::default();
+                    state.refresh_watch(previous);
+                }
+                return;
+            }
+            StartPrompt(_) | FreshLine => return,
+        };
+        if !watch
+            .running
+            .as_ref()
+            .is_some_and(|command| command.aid == application_id(aid.as_deref()))
+        {
+            return;
+        }
+        watch.running = None;
+        if std::mem::take(&mut watch.armed) {
+            self.append(
+                state,
+                "command-finished",
+                serde_json::json!({"exit_code":exit_code}),
+            );
+        }
+    }
+
+    /// Progress is current pane state. Frequent updates must not evict journal entries.
+    pub fn progress(&self) -> wezterm_term::Progress {
+        self.state.lock().unwrap().progress
+    }
+
+    pub(crate) fn set_progress(&self, progress: wezterm_term::Progress) {
+        let mut state = self.state.lock().unwrap();
+        if state.progress != progress {
+            state.progress = progress;
+            if let Some((_, _, inbox)) = &state.inbox {
+                inbox.refresh();
+            }
+        }
+    }
+
+    /// Attach a pane to its owning window, preserving acknowledgements when it moves.
     pub fn connect_inbox(&self, pane: u64, label: &str, inbox: &Inbox) {
         let mut state = self.state.lock().unwrap();
-        if state.inbox.is_none() {
+        if let Some((_, _, old)) = &state.inbox {
+            if old.same_window(inbox) {
+                return;
+            }
+            old.move_pane_to(pane, inbox);
+            state.inbox = Some((pane, Arc::from(label), inbox.clone()));
+        } else {
             let label = Arc::from(label);
             for event in &state.events {
-                inbox.receive(pane, &label, event);
+                inbox.receive(pane, &label, event, false);
             }
             state.inbox = Some((pane, label, inbox.clone()));
         }
@@ -60,7 +251,10 @@ impl Events {
         } else {
             data
         };
-        let mut state = self.state.lock().unwrap();
+        self.append(self.state.lock().unwrap(), kind, data);
+    }
+
+    fn append(&self, mut state: std::sync::MutexGuard<'_, State>, kind: &str, data: Value) {
         state.next += 1;
         let sequence = state.next;
         let timestamp_ms = SystemTime::now()
@@ -74,7 +268,7 @@ impl Events {
             data,
         };
         if let Some((pane, label, inbox)) = &state.inbox {
-            inbox.receive(*pane, label, &event);
+            inbox.receive(*pane, label, &event, true);
         }
         state.events.push_back(event);
         if state.events.len() > CAPACITY {
@@ -117,6 +311,31 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_progress_coalesces_wakes_without_creating_notifications_or_journal_rows() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wezterm_term::Progress;
+        let calls = Arc::new(AtomicUsize::default());
+        let counter = calls.clone();
+        let inbox = Inbox::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let pane = Events::default();
+        pane.connect_inbox(11, "Loopback", &inbox);
+        for value in 1..=100 {
+            pane.set_progress(Progress::Percentage(value));
+        }
+        assert_eq!(pane.progress(), Progress::Percentage(100));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inbox.unread_count(), 0);
+        assert!(pane.since(0).events.is_empty());
+        inbox.acknowledge_wake();
+        pane.set_progress(Progress::Percentage(100));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        pane.set_progress(Progress::None);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
     #[tokio::test]
     async fn cursors_detect_loss_and_wait_without_polling() {
         let e = Events::default();

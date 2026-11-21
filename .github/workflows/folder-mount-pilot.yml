@@ -1,0 +1,109 @@
+name: Windows folder mount pilot
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/folder-mount-pilot.yml
+      - tests/folder-sharing/**
+      - src/ssh.rs
+      - src/ssh/**
+      - src/folder_grants.rs
+      - src/folder_grants/**
+      - src/session.rs
+      - src/profiles.rs
+      - src/app/folder_sharing_state.rs
+      - src/app/folder_shares.rs
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+concurrency:
+  group: folder-mount-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  guest:
+    name: Build the Linux SSHFS guest (${{ matrix.suite }})
+    strategy:
+      matrix:
+        suite: [resolute, noble]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build kernel and initramfs
+        env:
+          GUEST_SUITE: ${{ matrix.suite }}
+        run: sudo bash tests/folder-sharing/guest/build.sh "$RUNNER_TEMP/sshfs-guest" "$GUEST_SUITE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sshfs-guest-${{ matrix.suite }}
+          path: |
+            ${{ runner.temp }}/sshfs-guest/vmlinuz
+            ${{ runner.temp }}/sshfs-guest/initramfs.gz
+            ${{ runner.temp }}/sshfs-guest/manifest.txt
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  mount:
+    name: Read a Windows fixture through a real Linux FUSE mount
+    needs: guest
+    runs-on: windows-2025
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.0
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: sshfs-guest-*
+          path: ${{ runner.temp }}/sshfs-guests
+      - name: Install Rust
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          key: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/git/db
+      - name: Build the native SSH fixture
+        run: |
+          $messages = cargo test --locked --lib --no-run --message-format=json-render-diagnostics
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $binary = @($messages | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.profile.test -and
+            $_.target.name -eq 'w11term' -and $_.executable
+          })
+          if ($binary.Count -ne 1) { throw 'Expected one w11term library test executable' }
+          "MOUNT_TEST_EXE=$($binary[0].executable)" >> $env:GITHUB_ENV
+      - name: Install QEMU for the disposable runner
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-qemu
+      - name: Locate the native QEMU executable
+        shell: msys2 {0}
+        run: |
+          qemu=$(command -v qemu-system-x86_64.exe)
+          "$qemu" --version
+          echo "MOUNT_TEST_QEMU=$(cygpath -w "$qemu")" >> "$GITHUB_ENV"
+      - name: Check early refusal on Ubuntu 24.04 with FUSE 3.14
+        run: |
+          ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-noble" `
+            -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE -LegacyFuse
+      - name: Mount, read, unmount and check the original SSH shell on Ubuntu 26.04
+        run: |
+          ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-resolute" `
+            -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE

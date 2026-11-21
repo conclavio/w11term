@@ -365,6 +365,8 @@ pub struct TerminalState {
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     progress: Progress,
+    // OSC 9;4 preserves the previous value while the bar is indeterminate.
+    progress_value: u8,
 
     palette: Option<ColorPalette>,
 
@@ -388,7 +390,8 @@ pub struct TerminalState {
     term_program: String,
     term_version: String,
 
-    writer: BufWriter<ThreadedWriter>,
+    writer: BufWriter<Box<dyn std::io::Write + Send>>,
+    parser_reply_writer: Option<BufWriter<Box<dyn std::io::Write + Send>>>,
 
     image_cache: lru::LruCache<[u8; 32], Arc<ImageData>>,
     sixel_scrolls_right: bool,
@@ -571,7 +574,7 @@ impl TerminalState {
         term_version: &str,
         writer: Box<dyn std::io::Write + Send>,
     ) -> TerminalState {
-        let writer = BufWriter::new(ThreadedWriter::new(writer));
+        let writer: Box<dyn std::io::Write + Send> = Box::new(ThreadedWriter::new(writer));
         let seqno = 1;
         let screen = ScreenOrAlt::new(size, &config, seqno, config.bidi_mode());
 
@@ -636,7 +639,8 @@ impl TerminalState {
             command_label: None,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
-            writer,
+            writer: BufWriter::new(writer),
+            parser_reply_writer: None,
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
@@ -653,6 +657,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            progress_value: 0,
         }
     }
 
@@ -690,12 +695,40 @@ impl TerminalState {
         self.clipboard.replace(Arc::clone(clipboard));
     }
 
+    pub fn clear_clipboard(&mut self) {
+        self.clipboard = None;
+    }
+
+    /// Install separate, nonblocking input and reply sinks for a framed viewer.
+    /// Both sinks run on the parser thread to preserve order between writes.
+    pub fn set_nonblocking_viewer_writers(
+        &mut self,
+        input: Box<dyn std::io::Write + Send>,
+        reply: Box<dyn std::io::Write + Send>,
+    ) {
+        self.writer = BufWriter::new(input);
+        self.parser_reply_writer = Some(BufWriter::new(reply));
+    }
+
+    pub(crate) fn swap_parser_writer(&mut self) {
+        if let Some(reply) = &mut self.parser_reply_writer {
+            std::mem::swap(&mut self.writer, reply);
+        }
+    }
+
     pub fn set_device_control_handler(&mut self, handler: Box<dyn DeviceControlHandler>) {
         self.device_control_handler.replace(handler);
     }
 
     pub fn set_notification_handler(&mut self, handler: Box<dyn AlertHandler>) {
         self.alert_handler.replace(handler);
+    }
+
+    /// Replace the input/reply sink when the host launches a new transport.
+    /// Bytes still queued on the old writer remain bound to the old sink.
+    pub fn replace_writer(&mut self, writer: Box<dyn std::io::Write + Send>) {
+        self.writer = BufWriter::new(Box::new(ThreadedWriter::new(writer)));
+        self.parser_reply_writer = None;
     }
 
     pub fn set_download_handler(&mut self, handler: &Arc<dyn DownloadHandler>) {
@@ -724,7 +757,7 @@ impl TerminalState {
     }
 
     pub fn get_progress(&self) -> Progress {
-        self.progress.clone()
+        self.progress
     }
 
     /// Returns the current working directory associated with the
@@ -1067,6 +1100,14 @@ impl TerminalState {
         if self.focus_tracking {
             write!(self.writer, "{}{}", CSI, if focused { "I" } else { "O" }).ok();
             self.writer.flush().ok();
+        }
+        self.set_focus_without_reporting(focused);
+    }
+
+    /// Keep local focus current while no interactive peer can receive events.
+    pub fn set_focus_without_reporting(&mut self, focused: bool) {
+        if focused == self.focused {
+            return;
         }
         self.focused = focused;
         if !focused {
@@ -1537,6 +1578,9 @@ impl TerminalState {
                 }
             }
             Device::SoftReset => {
+                if let Some(handler) = self.alert_handler.as_mut() {
+                    handler.terminal_reset();
+                }
                 // TODO: see https://vt100.net/docs/vt510-rm/DECSTR.html
                 self.pen = CellAttributes::default();
                 self.insert = false;

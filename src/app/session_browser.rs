@@ -1,9 +1,9 @@
 use super::*;
-use w11term::durable::DurableReference;
+use w11term::durable::{Backend, DurableReference};
 use w11term::ssh::{DurableAction, DurablePhase};
 
 pub enum Action {
-    Discover(String),
+    Discover { name: String, herdr: bool },
     Page(TabId, usize),
     Pick(TabId, DurableAction),
 }
@@ -13,6 +13,7 @@ pub(super) fn discovery_tab(
     mut options: SshOptions,
     osc52: bool,
     saved: Option<DurableReference>,
+    herdr: bool,
 ) -> AppTab {
     options.durable = true;
     let size = TerminalSize::default();
@@ -21,6 +22,7 @@ pub(super) fn discovery_tab(
         Some(reference) => {
             Session::start_durable(source.clone(), size, osc52, None, Some(reference))
         }
+        None if herdr => Session::discover_herdr(options, size, osc52),
         None => Session::discover_durable(options, size, osc52),
     };
     let mut tab = live_tab_for_session(name.clone(), source, session).with_profile(Some(name));
@@ -43,9 +45,15 @@ pub(super) fn discovery_view(
     let mut rows = vec![
         KeyedView::new(
             "heading",
-            TextBlock::new()
-                .font_size(24.0)
-                .text(format!("Remote sessions on {}", source_label(&tab.source))),
+            TextBlock::new().font_size(24.0).text(format!(
+                "{} on {}",
+                if state.herdr_browser {
+                    "Herdr terminals"
+                } else {
+                    "Remote sessions"
+                },
+                source_label(&tab.source)
+            )),
         ),
         KeyedView::new(
             "status",
@@ -90,20 +98,40 @@ pub(super) fn discovery_view(
     }
     for entry in state.candidates.iter().skip(page * PER_PAGE).take(PER_PAGE) {
         let reference = entry.reference.clone();
-        let name = &reference.name;
         let count = entry.clients;
         let clients = if count == 1 {
             "1 client".into()
         } else {
             format!("{count} clients")
         };
-        let label = [name.as_str(), &entry.command, &entry.directory, &clients]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
+        let backend = match reference.backend {
+            Backend::Zmx => "zmx",
+            Backend::Tmux => "tmux",
+            Backend::Herdr => "Herdr",
+        };
+        let windows = match entry.windows {
+            Some(1) => "1 window".into(),
+            Some(n) => format!("{n} windows"),
+            None => String::new(),
+        };
+        let label = [
+            entry.display_name.as_str(),
+            backend,
+            &entry.command,
+            &entry.directory,
+            &windows,
+            if reference.backend == Backend::Herdr {
+                ""
+            } else {
+                &clients
+            },
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
         rows.push(KeyedView::new(
-            name.clone(),
+            format!("{backend}-{}", reference.name),
             Button::new()
                 .automation_name(format!("Attach to {label}"))
                 .on_click(context.callback(move |_| {
@@ -136,7 +164,13 @@ impl TerminalApp {
         let state = tab.session.durable_state();
         let next = match (step, state.as_ref().map(|s| s.phase)) {
             (0, None) => {
-                self.update(tab_menu_message("Find sessions on fixture".into()), context);
+                let command = if std::env::var("W11TERM_DISCOVERY_SMOKE").as_deref() == Ok("herdr")
+                {
+                    "Browse Herdr terminals on fixture"
+                } else {
+                    "Find sessions on fixture"
+                };
+                self.update(tab_menu_message(command.into()), context);
                 assert_ne!(self.tabs.active_id(), Some(id));
                 1
             }
@@ -183,14 +217,26 @@ impl TerminalApp {
     }
     pub(super) fn discovery_menu(&self) -> MenuItem {
         let hosts: Vec<_> = self
-            .profiles
+            .catalog
+            .profile_order
             .iter()
-            .filter(|(_, options)| !options.player.rustmush)
-            .map(|(name, _)| {
-                MenuItem::item(
-                    format!("discover-{name}"),
-                    format!("Find sessions on {name}"),
-                )
+            .filter(|name| {
+                self.catalog
+                    .profiles
+                    .get(*name)
+                    .is_some_and(|options| !options.player.rustmush)
+            })
+            .flat_map(|name| {
+                [
+                    MenuItem::item(
+                        format!("discover-{name}"),
+                        format!("Find sessions on {name}"),
+                    ),
+                    MenuItem::item(
+                        format!("herdr-{name}"),
+                        format!("Browse Herdr terminals on {name}"),
+                    ),
+                ]
             })
             .collect();
         if hosts.is_empty() {
@@ -211,15 +257,16 @@ impl TerminalApp {
                     *current = page;
                 }
             }
-            Action::Discover(name) => {
+            Action::Discover { name, herdr } => {
                 if let Some(options) = self
+                    .catalog
                     .profiles
                     .get(&name)
                     .filter(|options| !options.player.rustmush)
                 {
                     let osc52 = self.appearance.read().unwrap().interaction.osc52;
                     self.tabs
-                        .insert(discovery_tab(name, options.clone(), osc52, None));
+                        .insert(discovery_tab(name, options.clone(), osc52, None, herdr));
                     self.sync_selection(context);
                     self.activate(context);
                 }

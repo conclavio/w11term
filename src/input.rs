@@ -8,7 +8,7 @@ use w11term::{
     pane_layout::Direction,
     session::Command,
     shortcuts::{Action, KeyMap, Shortcuts},
-    terminal::FrameStore,
+    terminal::{FrameStore, KeyDetails, KeypadKey},
 };
 use wezterm_term::{KeyCode, KeyModifiers};
 pub(crate) mod ime;
@@ -22,7 +22,9 @@ use windows::Win32::{
     },
 };
 
-thread_local! { static INPUT: RefCell<Option<State>> = const { RefCell::new(None) }; }
+mod window;
+pub(crate) use window::{WindowScope, window};
+use window::{with_input, with_input_mut};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LocalMode {
@@ -31,17 +33,26 @@ enum LocalMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PickerStage {
+pub enum PickerStage {
     Search,
+    Commands,
     Placement,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum KeySlot {
+    Virtual(u32),
+    KeypadScan { scan: u32, extended: bool },
+    KeypadVirtual(u32),
+}
+
 struct State {
+    read_only: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     target: Option<Target>,
     shortcut: Box<dyn Fn(Shortcut)>,
-    swallowed: HashSet<u32>,
-    pressed: HashMap<u32, KeyCode>,
-    details: HashMap<u32, w11term::terminal::KeyDetails>,
+    swallowed: HashSet<KeySlot>,
+    pressed: HashMap<KeySlot, KeyCode>,
+    details: HashMap<KeySlot, KeyDetails>,
     surrogate: Option<u16>,
     preferences: Interaction,
     keymap: KeyMap,
@@ -49,12 +60,11 @@ struct State {
     selection: bool,
     switcher: bool,
     grid: Option<Grid>,
-    window: Option<HWND>,
     search: bool,
     picker: Option<PickerStage>,
     local_mode: Option<LocalMode>,
     // A true entry may repeat a movement first pressed in this copy-mode session.
-    local_held: HashMap<u32, bool>,
+    local_held: HashMap<KeySlot, bool>,
     held_resize: Option<HeldResize>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
@@ -71,7 +81,7 @@ struct Target {
 
 #[derive(Clone, Copy)]
 struct HeldResize {
-    key: u32,
+    key: KeySlot,
     repeat: Option<(KeyModifiers, Direction)>,
 }
 
@@ -117,6 +127,7 @@ pub enum Shortcut {
     Fullscreen,
     RememberWindow,
     BeginResize,
+    TaskbarCreated,
     NextTab,
     PreviousTab,
     NewTab,
@@ -140,6 +151,7 @@ pub enum Shortcut {
     FindNext,
     FindPrevious,
     FindClose,
+    CommandPalette,
     PanePicker,
     PickerMove(isize),
     PickerAccept,
@@ -155,17 +167,24 @@ pub enum Shortcut {
 }
 
 pub struct KeyboardBridge {
+    scope: WindowScope,
+    bootstrap: String,
+    _hooks: std::rc::Rc<ThreadHooks>,
+}
+
+struct ThreadHooks {
     messages: HHOOK,
     focus: HHOOK,
     mouse: HHOOK,
 }
+type PaneTarget = (
+    mpsc::UnboundedSender<Command>,
+    FrameStore,
+    std::rc::Rc<std::cell::Cell<bool>>,
+);
 
-pub fn window() -> Option<HWND> {
-    INPUT.with(|s| s.borrow().as_ref().and_then(|s| s.window))
-}
-
-impl KeyboardBridge {
-    pub fn install(shortcut: impl Fn(Shortcut) + 'static) -> windows::core::Result<Self> {
+impl ThreadHooks {
+    fn install() -> windows::core::Result<Self> {
         // SAFETY: callback lives for the program's lifetime; hook is limited to the current thread.
         let hook =
             unsafe { SetWindowsHookExW(WH_GETMESSAGE, Some(hook), None, GetCurrentThreadId())? };
@@ -192,34 +211,93 @@ impl KeyboardBridge {
                 return Err(error);
             }
         };
-        INPUT.with(|input| *input.borrow_mut() = Some(State::new(shortcut)));
         Ok(Self {
             messages: hook,
             focus,
             mouse,
         })
     }
+}
 
-    pub fn set_target(&self, target: Option<(mpsc::UnboundedSender<Command>, FrameStore)>) {
-        INPUT.with(|input| {
+impl Drop for ThreadHooks {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.messages);
+            let _ = UnhookWindowsHookEx(self.focus);
+            let _ = UnhookWindowsHookEx(self.mouse);
+        }
+    }
+}
+
+impl KeyboardBridge {
+    pub fn install(shortcut: impl Fn(Shortcut) + 'static) -> windows::core::Result<Self> {
+        let scope = WindowScope::default();
+        let _guard = scope.enter();
+        with_input_mut(|input| *input = Some(State::new(shortcut)));
+        Ok(Self {
+            scope,
+            bootstrap: format!("w11term-window-{:032x}", rand::random::<u128>()),
+            _hooks: window::install_hooks()?,
+        })
+    }
+
+    pub fn set_target(&self, target: Option<PaneTarget>) {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut() {
-                state.retarget(target.map(|(sender, frames)| Target { sender, frames }));
+                state.read_only = target.as_ref().map(|(_, _, locked)| locked.clone());
+                state.retarget(target.map(|(sender, frames, _)| Target { sender, frames }));
             }
         });
+        ime::sync_context();
+    }
+
+    pub fn set_read_only(
+        sender: &mpsc::UnboundedSender<Command>,
+        flag: &std::cell::Cell<bool>,
+        enabled: bool,
+    ) {
+        if flag.get() == enabled {
+            return;
+        }
+        let cancel_composition = enabled
+            && with_input_mut(|input| {
+                if let Some(state) = input.as_mut()
+                    && state
+                        .target
+                        .as_ref()
+                        .is_some_and(|t| t.sender.same_channel(sender))
+                {
+                    state
+                        .local_held
+                        .extend(state.pressed.keys().map(|vk| (*vk, false)));
+                    state.release_keys();
+                    return true;
+                }
+                false
+            });
+        if cancel_composition {
+            ime::cancel();
+        }
+        if sender.send(Command::SetReadOnly(enabled)).is_ok() {
+            flag.set(enabled);
+        }
         ime::sync_context();
     }
     pub fn set_wheel_panes(
         &self,
         panes: impl IntoIterator<Item = (u64, mpsc::UnboundedSender<Command>, FrameStore)>,
     ) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut() {
                 state.wheel_panes.replace(panes);
             }
         });
     }
     pub fn hover_pane(&self, id: u64) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut()
                 && state.wheel_panes.visible.contains_key(&id)
             {
@@ -228,7 +306,8 @@ impl KeyboardBridge {
         });
     }
     pub fn leave_pane(&self, id: u64) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(state) = input.borrow_mut().as_mut()
                 && state.wheel_panes.hovered == Some(id)
             {
@@ -237,28 +316,32 @@ impl KeyboardBridge {
         });
     }
     pub fn set_preferences(&self, preferences: Interaction) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.preferences = preferences;
             }
         });
     }
     pub fn set_shortcuts(&self, keymap: KeyMap) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.keymap = keymap;
             }
         });
     }
     pub fn set_selection(&self, selected: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.selection = selected;
             }
         });
     }
     pub fn set_switcher(&self, visible: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.switcher = visible;
                 if visible {
@@ -270,7 +353,8 @@ impl KeyboardBridge {
         ime::sync_context();
     }
     pub fn set_search(&self, visible: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 if visible {
                     ime::cancel();
@@ -278,20 +362,17 @@ impl KeyboardBridge {
                     s.wheel_panes.hovered = None;
                 }
                 s.search = visible;
-                if let Some(target) = &s.target {
-                    let _ = target.sender.send(Command::Focus(
-                        !visible && s.picker.is_none() && s.local_mode.is_none(),
-                    ));
-                }
+                s.report_focus();
             }
         });
         ime::sync_context();
     }
-    pub fn set_picker(&self, visible: bool) {
-        INPUT.with(|input| {
+    pub fn set_picker(&self, stage: Option<PickerStage>) {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(s) = input.borrow_mut().as_mut() {
-                s.picker = visible.then_some(PickerStage::Search);
-                if visible {
+                s.picker = stage;
+                if stage.is_some() {
                     ime::cancel();
                     s.local_held.extend(s.pressed.keys().map(|&vk| (vk, false)));
                     s.release_keys();
@@ -305,7 +386,8 @@ impl KeyboardBridge {
         ime::sync_context();
     }
     pub fn set_picker_placement(&self) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(s) = input.borrow_mut().as_mut()
                 && s.picker.is_some()
             {
@@ -320,7 +402,8 @@ impl KeyboardBridge {
         self.set_local_mode(visible.then_some(LocalMode::Copy));
     }
     fn set_local_mode(&self, mode: Option<LocalMode>) {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             if let Some(s) = input.borrow_mut().as_mut() {
                 s.local_mode = mode;
                 if mode.is_some() {
@@ -332,17 +415,14 @@ impl KeyboardBridge {
                     s.release_keys();
                     s.wheel_panes.hovered = None;
                 }
-                if let Some(target) = &s.target {
-                    let _ = target.sender.send(Command::Focus(
-                        mode.is_none() && !s.search && s.picker.is_none() && !s.modal,
-                    ));
-                }
+                s.report_focus();
             }
         });
         ime::sync_context();
     }
     pub fn set_modal(&self, visible: bool) {
-        let changed = INPUT.with(|i| {
+        let _native = self.scope.enter();
+        let changed = with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 if s.modal == visible {
                     return false;
@@ -362,23 +442,35 @@ impl KeyboardBridge {
         }
     }
     pub fn on_close(&self, handler: impl Fn() + 'static) {
-        INPUT.with(|state| {
+        let _native = self.scope.enter();
+        with_input(|state| {
             if let Some(state) = state.borrow_mut().as_mut() {
                 state.close_handler = Some(Box::new(handler));
             }
         });
     }
-    pub fn reset_keys(&self) {
-        INPUT.with(|i| {
-            if let Some(s) = i.borrow_mut().as_mut() {
+    pub fn reset_keys(&self, sender: &mpsc::UnboundedSender<Command>) {
+        let _native = self.scope.enter();
+        let owns_input = with_input_mut(|input| {
+            if let Some(s) = input
+                && s.target
+                    .as_ref()
+                    .is_some_and(|target| target.sender.same_channel(sender))
+            {
                 s.pressed.clear();
                 s.details.clear();
                 s.surrogate = None;
+                return true;
             }
+            false
         });
+        if owns_input {
+            ime::cancel();
+        }
     }
     pub fn set_game_mode(&self, game: bool) {
-        INPUT.with(|i| {
+        let _native = self.scope.enter();
+        with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
                 s.game_mode = game;
             }
@@ -387,9 +479,7 @@ impl KeyboardBridge {
 
     #[cfg(feature = "ui-smoke")]
     pub fn smoke_wheel(&self, delta: i16) -> bool {
-        let hwnd = INPUT
-            .with(|i| i.borrow().as_ref().and_then(|s| s.window))
-            .expect("terminal HWND");
+        let hwnd = self.hwnd().expect("terminal HWND");
         let data = MOUSEHOOKSTRUCTEX {
             Base: MOUSEHOOKSTRUCT {
                 hwnd,
@@ -407,7 +497,8 @@ impl KeyboardBridge {
     }
     #[cfg(feature = "ui-smoke")]
     pub fn has_target(&self) -> bool {
-        INPUT.with(|input| {
+        let _native = self.scope.enter();
+        with_input(|input| {
             input
                 .borrow()
                 .as_ref()
@@ -418,22 +509,12 @@ impl KeyboardBridge {
 
 impl Drop for KeyboardBridge {
     fn drop(&mut self) {
+        let _guard = self.scope.enter();
         ime::uninstall();
-        // SAFETY: this object owns the hook, and is destroyed on its installing thread.
-        unsafe {
-            let _ = UnhookWindowsHookEx(self.messages);
-            let _ = UnhookWindowsHookEx(self.focus);
-            let _ = UnhookWindowsHookEx(self.mouse);
+        if let Some(mut state) = with_input_mut(Option::take) {
+            state.release_keys();
         }
-        INPUT.with(|input| {
-            if let Some(state) = input.borrow_mut().take()
-                && let Some(hwnd) = state.window
-            {
-                unsafe {
-                    let _ = RemoveWindowSubclass(hwnd, Some(window_proc), 1);
-                }
-            }
-        });
+        self.scope.remove();
     }
 }
 
@@ -441,9 +522,10 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code == HC_ACTION as i32 && wparam.0 as u32 == WM_MOUSEWHEEL {
         // Thread-local WH_MOUSE sees real wheel input before WinUI translates it.
         let mouse = unsafe { &*(lparam.0 as *const MOUSEHOOKSTRUCTEX) };
-        if is_terminal(mouse.Base.hwnd) {
+        if let Some(scope) = WindowScope::for_window(mouse.Base.hwnd) {
+            let _guard = scope.enter();
             let consumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                INPUT.with(|i| {
+                with_input(|i| {
                     i.try_borrow_mut()
                         .ok()
                         .and_then(|mut i| {
@@ -467,31 +549,13 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code >= 0 {
         // SAFETY: WH_CALLWNDPROC supplies a CWPSTRUCT valid for this callback.
         let message = unsafe { &*(lparam.0 as *const CWPSTRUCT) };
-        ime::observe(message.hwnd, message.message);
-        if message.message == WM_ACTIVATEAPP && is_terminal(message.hwnd) {
-            INPUT.with(|input| {
-                if let Ok(mut input) = input.try_borrow_mut()
-                    && let Some(state) = input.as_mut()
-                {
-                    let focused = message.wParam.0 != 0;
-                    if !focused {
-                        ime::cancel();
-                        state.release_keys();
-                        if state.switcher {
-                            state.switcher = false;
-                            (state.shortcut)(Shortcut::CancelTab);
-                        }
-                    }
-                    if let Some(target) = &state.target {
-                        let _ = target.sender.send(Command::Focus(
-                            focused
-                                && !state.search
-                                && state.picker.is_none()
-                                && state.local_mode.is_none(),
-                        ));
-                    }
-                }
-            });
+        if matches!(
+            message.message,
+            WM_SETFOCUS | WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_SETCONTEXT
+        ) && let Some(scope) = WindowScope::for_window(message.hwnd)
+        {
+            let _guard = scope.enter();
+            ime::observe(message.hwnd, message.message);
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -502,10 +566,26 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
         // SAFETY: WH_GETMESSAGE provides a valid MSG for this callback invocation.
         let message = unsafe { &mut *(lparam.0 as *mut MSG) };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if !is_terminal(message.hwnd) {
+            if !matches!(
+                message.message,
+                WM_KEYDOWN
+                    | WM_KEYUP
+                    | WM_SYSKEYDOWN
+                    | WM_SYSKEYUP
+                    | WM_CHAR
+                    | WM_SYSCHAR
+                    | WM_DEADCHAR
+                    | WM_SYSDEADCHAR
+                    | WM_MOUSEWHEEL
+                    | WM_POINTERWHEEL
+            ) {
                 return;
             }
-            INPUT.with(|input| {
+            let Some(scope) = WindowScope::for_window(message.hwnd) else {
+                return;
+            };
+            let _guard = scope.enter();
+            with_input(|input| {
                 if let Ok(mut input) = input.try_borrow_mut()
                     && let Some(state) = input.as_mut()
                     && state.handle(message)
@@ -520,13 +600,7 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
 }
 
 fn is_terminal(hwnd: HWND) -> bool {
-    // Popup menus and dialogs have their own root window; never consume their keyboard input.
-    unsafe {
-        let root = GetAncestor(hwnd, GA_ROOT);
-        let mut title = [0u16; 256];
-        let len = GetWindowTextW(root, &mut title);
-        len > 0 && String::from_utf16_lossy(&title[..len as usize]).starts_with("w11term")
-    }
+    window().is_some_and(|root| unsafe { GetAncestor(hwnd, GA_ROOT) } == root)
 }
 
 #[derive(Clone, Copy)]
@@ -538,7 +612,7 @@ struct Grid {
     scale: f32,
 }
 pub fn clear_grid() {
-    INPUT.with(|i| {
+    with_input(|i| {
         if let Ok(mut state) = i.try_borrow_mut()
             && let Some(state) = state.as_mut()
         {
@@ -547,7 +621,7 @@ pub fn clear_grid() {
     });
 }
 pub fn set_grid(cw: f32, ch: f32, width: f32, height: f32, scale: f32) {
-    INPUT.with(|i| {
+    with_input(|i| {
         if let Ok(mut state) = i.try_borrow_mut()
             && let Some(state) = state.as_mut()
         {
@@ -576,10 +650,37 @@ unsafe extern "system" fn window_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    static TASKBAR_CREATED: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| unsafe {
+        RegisterWindowMessageW(windows::core::w!("TaskbarButtonCreated"))
+    });
+    let taskbar_created = message != 0 && message == *TASKBAR_CREATED;
+    if !matches!(
+        message,
+        WM_ACTIVATE | WM_CLOSE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_SIZING | WM_NCDESTROY
+    ) && !taskbar_created
+    {
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    }
+    let Some(scope) = WindowScope::for_window(hwnd) else {
+        return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    };
+    let _guard = scope.enter();
+    if taskbar_created {
+        with_input(|s| {
+            if let Ok(s) = s.try_borrow()
+                && let Some(s) = s.as_ref()
+            {
+                (s.shortcut)(Shortcut::TaskbarCreated);
+            }
+        });
+    }
+    if message == WM_ACTIVATE {
+        window::activated((wparam.0 & 0xffff) != WA_INACTIVE as usize);
+    }
     // Persist before native destruction; a queued component message can be
     // retired with the window before it gets a chance to inspect its HWND.
     if message == WM_CLOSE {
-        INPUT.with(|state| {
+        with_input(|state| {
             if let Ok(state) = state.try_borrow()
                 && let Some(state) = state.as_ref()
                 && let Some(handler) = &state.close_handler
@@ -589,7 +690,7 @@ unsafe extern "system" fn window_proc(
         });
     }
     if message == WM_ENTERSIZEMOVE {
-        INPUT.with(|s| {
+        with_input(|s| {
             if let Ok(s) = s.try_borrow()
                 && let Some(s) = s.as_ref()
             {
@@ -599,7 +700,7 @@ unsafe extern "system" fn window_proc(
     }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     if matches!(message, WM_EXITSIZEMOVE | WM_CLOSE) {
-        INPUT.with(|s| {
+        with_input(|s| {
             if let Ok(s) = s.try_borrow()
                 && let Some(s) = s.as_ref()
             {
@@ -608,7 +709,7 @@ unsafe extern "system" fn window_proc(
         });
     }
     if message == WM_SIZING && lparam.0 != 0 {
-        INPUT.with(|i| {
+        with_input(|i| {
             if let Ok(state) = i.try_borrow()
                 && let Some(state) = state.as_ref()
                 && state.preferences.snap_to_grid_on_resize
@@ -644,16 +745,7 @@ unsafe extern "system" fn window_proc(
         return LRESULT(1);
     }
     if message == WM_NCDESTROY {
-        unsafe {
-            let _ = RemoveWindowSubclass(hwnd, Some(window_proc), 1);
-        }
-        INPUT.with(|i| {
-            if let Ok(mut s) = i.try_borrow_mut()
-                && let Some(s) = s.as_mut()
-            {
-                s.window = None;
-            }
-        });
+        scope.remove();
     }
     result
 }
@@ -681,15 +773,29 @@ pub fn modifiers() -> KeyModifiers {
 fn emit_key(
     sender: &mpsc::UnboundedSender<Command>,
     key: KeyCode,
-    details: Option<&w11term::terminal::KeyDetails>,
+    details: Option<&KeyDetails>,
     modifiers: KeyModifiers,
     down: bool,
     repeat: bool,
 ) {
     let command = if let Some(details) = details {
+        let mut details = details.clone();
+        if details.keypad.is_some() {
+            // Lock modifiers describe this event, including repeats and releases
+            // after the lock changed while the physical key was held.
+            use wezterm_input_types::KeyboardLedStatus as Leds;
+            unsafe {
+                details
+                    .leds
+                    .set(Leds::NUM_LOCK, GetKeyState(VK_NUMLOCK.0.into()) & 1 != 0);
+                details
+                    .leds
+                    .set(Leds::CAPS_LOCK, GetKeyState(VK_CAPITAL.0.into()) & 1 != 0);
+            }
+        }
         Command::DetailedKey {
             key,
-            details: details.clone(),
+            details,
             modifiers,
             down,
             repeat,
@@ -729,11 +835,15 @@ fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
     (chars.next().is_none() && !first.is_control()).then_some(first)
 }
 impl State {
+    fn is_read_only(&self) -> bool {
+        self.read_only.as_ref().is_some_and(|locked| locked.get())
+    }
     fn new(shortcut: impl Fn(Shortcut) + 'static) -> Self {
         Self {
             target: None,
             shortcut: Box::new(shortcut),
             swallowed: HashSet::new(),
+            read_only: None,
             pressed: HashMap::new(),
             details: HashMap::new(),
             surrogate: None,
@@ -745,7 +855,6 @@ impl State {
             selection: false,
             switcher: false,
             grid: None,
-            window: None,
             search: false,
             picker: None,
             local_mode: None,
@@ -800,18 +909,23 @@ impl State {
         self.target = target;
         self.wheel_remainder = 0;
         self.zoom_remainder = 0;
+        self.report_focus();
+    }
+
+    fn report_focus(&self) {
         if let Some(target) = &self.target {
-            let _ = target.sender.send(Command::Focus(true));
+            let _ = target.sender.send(Command::Focus(
+                window::active()
+                    && !self.search
+                    && !self.modal
+                    && !self.switcher
+                    && self.picker.is_none()
+                    && self.local_mode.is_none(),
+            ));
         }
     }
 
     fn handle(&mut self, message: &MSG) -> bool {
-        if self.window.is_none() && message.hwnd != HWND::default() {
-            let root = unsafe { GetAncestor(message.hwnd, GA_ROOT) };
-            if unsafe { SetWindowSubclass(root, Some(window_proc), 1, 0) }.as_bool() {
-                self.window = Some(root);
-            }
-        }
         let raw_vk = message.wParam.0 as u32;
         let vk = if matches!(
             message.message,
@@ -821,8 +935,22 @@ impl State {
         } else {
             raw_vk
         };
+        let scan = ((message.lParam.0 >> 16) & 0xff) as u32;
+        let extended = message.lParam.0 & (1 << 24) != 0;
+        let keypad = match message.message {
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => keypad_key(vk, scan, extended),
+            WM_CHAR | WM_SYSCHAR if vk == 0x0d && extended => Some(KeypadKey::Enter),
+            _ => None,
+        };
+        // Shortcut lookup uses the logical VK. Ownership follows the physical
+        // position, including when Windows changes VK on a Num Lock transition.
+        let slot = match (keypad, scan) {
+            (None, _) => KeySlot::Virtual(vk),
+            (Some(_), 0) => KeySlot::KeypadVirtual(vk),
+            (Some(_), scan) => KeySlot::KeypadScan { scan, extended },
+        };
         if let Some(held) = self.held_resize
-            && held.key == vk
+            && held.key == slot
         {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
@@ -841,7 +969,7 @@ impl State {
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
                     self.held_resize = None;
-                    self.swallowed.remove(&vk);
+                    self.swallowed.remove(&slot);
                     return true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN => self.held_resize = None,
@@ -851,11 +979,13 @@ impl State {
         if self.modal {
             return false;
         }
-        if let Some(&repeat_owned) = self.local_held.get(&vk) {
+        if let Some(&repeat_owned) = self.local_held.get(&slot) {
             match message.message {
+                // A translated control character can arrive after Enter or Escape closed the overlay.
+                WM_CHAR | WM_SYSCHAR if matches!(vk, 0x0d | 0x1b) => return true,
                 WM_KEYUP | WM_SYSKEYUP => {
-                    self.local_held.remove(&vk);
-                    self.swallowed.remove(&vk);
+                    self.local_held.remove(&slot);
+                    self.swallowed.remove(&slot);
                     return true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
@@ -864,7 +994,7 @@ impl State {
                     }
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    self.local_held.remove(&vk);
+                    self.local_held.remove(&slot);
                 }
                 _ => {}
             }
@@ -876,14 +1006,19 @@ impl State {
                         return false;
                     }
                     let repeat = message.lParam.0 & (1 << 30) != 0;
-                    if repeat && !self.local_held.contains_key(&vk) {
+                    if repeat && !self.local_held.contains_key(&slot) {
                         return true;
                     }
-                    self.local_held.insert(vk, mode == LocalMode::Copy);
+                    self.local_held.insert(slot, mode == LocalMode::Copy);
                     if mode == LocalMode::Copy {
                         if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, modifiers())
                             && (!repeat || key.repeats())
                         {
+                            if key == w11term::copy_mode::CopyKey::Cancel {
+                                // The UI dismisses the overlay asynchronously. Keep Escape's
+                                // release local, but let the next key use the terminal shortcuts.
+                                self.local_mode = None;
+                            }
                             (self.shortcut)(Shortcut::CopyKey(key));
                         }
                     } else if !repeat
@@ -895,7 +1030,7 @@ impl State {
                     return true;
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
-                    self.swallowed.remove(&vk);
+                    self.swallowed.remove(&slot);
                     return true;
                 }
                 WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => return true,
@@ -903,7 +1038,7 @@ impl State {
             }
         }
         if let Some(stage) = self.picker {
-            if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
+            if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&slot) {
                 // Fresh Enter and Space belong to the focused placement button
                 // while it is mounted. Space activates native buttons on release.
                 return stage != PickerStage::Placement || !matches!(vk, 0x0d | 0x20);
@@ -912,31 +1047,38 @@ impl State {
                 let repeat = message.lParam.0 & (1 << 30) != 0;
                 let action = match (stage, vk) {
                     (_, 0x1b) => Shortcut::PickerCancel,
-                    (PickerStage::Search, 0x0d) => Shortcut::PickerAccept,
-                    (PickerStage::Search, 0x26) => Shortcut::PickerMove(-1),
-                    (PickerStage::Search, 0x28) => Shortcut::PickerMove(1),
+                    (PickerStage::Commands, 0x09) => {
+                        Shortcut::PickerMove(if modifiers().contains(KeyModifiers::SHIFT) {
+                            -1
+                        } else {
+                            1
+                        })
+                    }
+                    (PickerStage::Search | PickerStage::Commands, 0x0d) => Shortcut::PickerAccept,
+                    (PickerStage::Search | PickerStage::Commands, 0x26) => Shortcut::PickerMove(-1),
+                    (PickerStage::Search | PickerStage::Commands, 0x28) => Shortcut::PickerMove(1),
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),
                     (PickerStage::Placement, 0x27) => Shortcut::PickerPlace(Direction::Right),
                     (PickerStage::Placement, 0x28) => Shortcut::PickerPlace(Direction::Down),
                     (PickerStage::Placement, 0x0d | 0x20) => {
-                        if repeat && !self.swallowed.contains(&vk) {
+                        if repeat && !self.swallowed.contains(&slot) {
                             // Held in the search field before the buttons appeared.
-                            self.local_held.insert(vk, false);
+                            self.local_held.insert(slot, false);
                         } else {
-                            self.swallowed.insert(vk);
+                            self.swallowed.insert(slot);
                         }
                         return repeat;
                     }
                     _ => return false,
                 };
                 if matches!(action, Shortcut::PickerMove(_)) {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     (self.shortcut)(action);
                 } else {
                     // A selection, placement or cancel key stays local until its
                     // release, even when its action changes the active stage/pane.
-                    self.local_held.insert(vk, false);
+                    self.local_held.insert(slot, false);
                     if !repeat {
                         (self.shortcut)(action);
                     }
@@ -946,13 +1088,13 @@ impl State {
             // Native text editing owns printable keys, composition and clipboard shortcuts.
             return false;
         }
-        if matches!(vk, 0x0d | 0x20 | 0x26 | 0x28) && self.swallowed.contains(&vk) {
+        if matches!(vk, 0x09 | 0x0d | 0x20 | 0x26 | 0x28) && self.swallowed.contains(&slot) {
             // The button or row that owned the key may have closed the picker.
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => return true,
-                WM_CHAR | WM_SYSCHAR if matches!(vk, 0x0d | 0x20) => return true,
+                WM_CHAR | WM_SYSCHAR if matches!(vk, 0x09 | 0x0d | 0x20) => return true,
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    self.swallowed.remove(&vk);
+                    self.swallowed.remove(&slot);
                 }
                 _ => {}
             }
@@ -968,15 +1110,15 @@ impl State {
             if message.lParam.0 & (1 << 30) == 0 {
                 (self.shortcut)(Shortcut::Fullscreen);
             }
-            self.swallowed.insert(vk);
+            self.swallowed.insert(slot);
             return true;
         }
         let mut mods = modifiers();
         if self.switcher {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP)
-                && self.switcher_trigger.released(vk, mods)
+                && self.switcher_trigger.released(slot, mods)
             {
-                self.swallowed.remove(&vk);
+                self.swallowed.remove(&slot);
                 self.switcher = false;
                 (self.shortcut)(Shortcut::CommitTab);
                 return true;
@@ -993,7 +1135,7 @@ impl State {
                     _ => None,
                 };
                 if let Some(shortcut) = shortcut {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     if matches!(shortcut, Shortcut::CancelTab | Shortcut::CommitTab) {
                         self.switcher = false;
                     }
@@ -1004,7 +1146,7 @@ impl State {
                 return true;
             }
         }
-        if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
+        if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&slot) {
             return true;
         }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
@@ -1024,7 +1166,7 @@ impl State {
                     None
                 };
                 if let Some(shortcut) = find {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     (self.shortcut)(shortcut);
                     return true;
                 }
@@ -1038,17 +1180,23 @@ impl State {
                 if matches!(shortcut, Shortcut::NextTab | Shortcut::PreviousTab)
                     && self.preferences.tab_switcher_mode != TabSwitcherMode::Disabled
                 {
-                    self.switcher_trigger = SwitchTrigger::new(vk, mods);
+                    self.switcher_trigger = SwitchTrigger::new(slot, mods);
                     self.switcher = true;
                 }
-                self.swallowed.insert(vk);
+                self.swallowed.insert(slot);
                 if message.lParam.0 & (1 << 30) == 0 {
                     if matches!(
                         shortcut,
-                        Shortcut::PanePicker | Shortcut::MovePaneToExistingTab
+                        Shortcut::CommandPalette
+                            | Shortcut::PanePicker
+                            | Shortcut::MovePaneToExistingTab
                     ) {
-                        self.picker = Some(PickerStage::Search);
-                        self.local_held.insert(vk, false);
+                        self.picker = Some(if shortcut == Shortcut::CommandPalette {
+                            PickerStage::Commands
+                        } else {
+                            PickerStage::Search
+                        });
+                        self.local_held.insert(slot, false);
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
                         self.local_mode = Some(LocalMode::Hints);
@@ -1057,7 +1205,7 @@ impl State {
                     }
                     if let Shortcut::ResizePane(direction) = shortcut {
                         self.held_resize = Some(HeldResize {
-                            key: vk,
+                            key: slot,
                             repeat: Some((mods, direction)),
                         });
                     }
@@ -1107,31 +1255,31 @@ impl State {
                     None
                 };
                 if let Some(shortcut) = local {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     (self.shortcut)(shortcut);
                     return true;
                 }
                 if mods.contains(KeyModifiers::SHIFT) && vk == VK_PRIOR.0 as u32 {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::Scroll(
                         frames.load().rows.len().saturating_sub(1).max(1) as isize,
                     ));
                     return true;
                 }
                 if mods.contains(KeyModifiers::SHIFT) && vk == VK_NEXT.0 as u32 {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::Scroll(
                         -(frames.load().rows.len().saturating_sub(1).max(1) as isize),
                     ));
                     return true;
                 }
                 if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && matches!(vk, 0x26 | 0x28) {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::Prompt(if vk == 0x26 { -1 } else { 1 }));
                     return true;
                 }
                 if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && matches!(vk, 0x24 | 0x23) {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::ScrollEdge(vk == 0x24));
                     return true;
                 }
@@ -1139,14 +1287,24 @@ impl State {
                     let _ = sender.send(Command::ReloadDemo);
                     return true;
                 }
-                let repeat = self.pressed.contains_key(&vk) || message.lParam.0 & (1 << 30) != 0;
-                if repeat {
-                    if let Some(key) = self.pressed.get(&vk)
-                        && !self.game_mode
-                    {
-                        emit_key(sender, *key, self.details.get(&vk), mods, true, true);
+                if self.is_read_only() {
+                    self.local_held.insert(slot, false);
+                    return true;
+                }
+                if let Some(key) = self.pressed.get(&slot) {
+                    if !self.game_mode {
+                        emit_key(sender, *key, self.details.get(&slot), mods, true, true);
                     }
                     return true;
+                }
+                if message.lParam.0 & (1 << 30) != 0 {
+                    // A shared VK (e.g. Enter) can already be down on the
+                    // other cluster. Otherwise this press began in another pane.
+                    let sibling_down = special_key(vk)
+                        .is_some_and(|key| self.pressed.values().any(|held| *held == key));
+                    if !sibling_down {
+                        return true;
+                    }
                 }
                 let mut details = None;
                 let key = special_key(vk).or_else(|| {
@@ -1170,14 +1328,13 @@ impl State {
                             keyboard[index.0 as usize] = 0;
                         }
                     }
-                    let scan = ((message.lParam.0 >> 16) & 0xff) as u32;
                     let base = (!altgr).then(|| unshifted(vk, scan, keyboard)).flatten();
                     let mut translated = [0u16; 8];
                     // This adapter consumes the keydown, so it owns dead-key translation.
                     let count = unsafe {
                         ToUnicodeEx(
                             vk,
-                            ((message.lParam.0 >> 16) & 0xff) as u32,
+                            scan,
                             &keyboard,
                             &mut translated,
                             0,
@@ -1191,19 +1348,26 @@ impl State {
                     let mut chars = text.chars();
                     let first = chars.next()?;
                     let composed = chars.next().is_some();
-                    details = Some(w11term::terminal::KeyDetails {
+                    details = Some(KeyDetails {
                         base,
                         text: composed.then_some(text),
+                        ..KeyDetails::default()
                     });
                     Some(KeyCode::Char(first))
                 });
+                // A keypad function can have a protocol identity even when the
+                // active layout produced no text. Clear has no legacy encoding.
+                let key = key.or_else(|| keypad.map(|_| KeyCode::Clear));
                 if let Some(key) = key {
-                    (self.shortcut)(Shortcut::ClearSelection);
-                    self.pressed.insert(vk, key);
-                    if let Some(details) = details {
-                        self.details.insert(vk, details);
+                    if let Some(keypad) = keypad {
+                        details.get_or_insert_with(KeyDetails::default).keypad = Some(keypad);
                     }
-                    emit_key(sender, key, self.details.get(&vk), mods, true, false);
+                    (self.shortcut)(Shortcut::ClearSelection);
+                    self.pressed.insert(slot, key);
+                    if let Some(details) = details {
+                        self.details.insert(slot, details);
+                    }
+                    emit_key(sender, key, self.details.get(&slot), mods, true, false);
                     true
                 } else {
                     // Modifiers/dead keys must not trigger WinUI keyboard navigation.
@@ -1211,14 +1375,17 @@ impl State {
                 }
             }
             WM_KEYUP | WM_SYSKEYUP => {
-                if let Some(key) = self.pressed.remove(&vk) {
-                    let details = self.details.remove(&vk);
+                if let Some(key) = self.pressed.remove(&slot) {
+                    let details = self.details.remove(&slot);
                     emit_key(sender, key, details.as_ref(), mods, false, false);
                     return true;
                 }
                 false
             }
             WM_CHAR => {
+                if self.is_read_only() {
+                    return true;
+                }
                 (self.shortcut)(Shortcut::ClearSelection);
                 let unit = vk as u16;
                 if (0xd800..=0xdbff).contains(&unit) {
@@ -1306,6 +1473,7 @@ impl From<Action> for Shortcut {
             Action::MovePane => Self::MovePane,
             Action::MovePaneToExistingTab => Self::MovePaneToExistingTab,
             Action::Workspaces => Self::Workspaces,
+            Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
@@ -1321,24 +1489,24 @@ impl From<Action> for Shortcut {
 #[derive(Clone, Copy)]
 enum SwitchTrigger {
     Modifier(KeyModifiers),
-    Key(u32),
+    Key(KeySlot),
 }
 impl SwitchTrigger {
-    fn new(vk: u32, mods: KeyModifiers) -> Self {
+    fn new(slot: KeySlot, mods: KeyModifiers) -> Self {
         [KeyModifiers::CTRL, KeyModifiers::ALT, KeyModifiers::SHIFT]
             .into_iter()
             .find(|flag| mods.contains(*flag))
-            .map_or(Self::Key(vk), Self::Modifier)
+            .map_or(Self::Key(slot), Self::Modifier)
     }
-    fn released(self, vk: u32, mods: KeyModifiers) -> bool {
+    fn released(self, slot: KeySlot, mods: KeyModifiers) -> bool {
         match self {
-            Self::Key(key) => key == vk,
+            Self::Key(key) => key == slot,
             Self::Modifier(flag) => {
                 !mods.contains(flag)
                     && match flag {
-                        KeyModifiers::CTRL => matches!(vk, 0x11 | 0xa2 | 0xa3),
-                        KeyModifiers::ALT => matches!(vk, 0x12 | 0xa4 | 0xa5),
-                        _ => matches!(vk, 0x10 | 0xa0 | 0xa1),
+                        KeyModifiers::CTRL => matches!(slot, KeySlot::Virtual(0x11 | 0xa2 | 0xa3)),
+                        KeyModifiers::ALT => matches!(slot, KeySlot::Virtual(0x12 | 0xa4 | 0xa5)),
+                        _ => matches!(slot, KeySlot::Virtual(0x10 | 0xa0 | 0xa1)),
                     }
             }
         }
@@ -1380,6 +1548,43 @@ fn key_identity(vk: u32, data: isize) -> u32 {
         _ => vk,
     }
 }
+fn keypad_key(vk: u32, scan: u32, extended: bool) -> Option<KeypadKey> {
+    use KeypadKey::*;
+    Some(match vk {
+        0x60..=0x69 => [
+            Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
+        ][(vk - 0x60) as usize],
+        0x6a => Multiply,
+        0x6b => Add,
+        0x6c => Separator,
+        // HID Keypad Comma can reach Windows through a layout-specific VK.
+        0xbc | 0xc2 if scan == 0x7e => Separator,
+        0x6d => Subtract,
+        0x6e => Decimal,
+        0x6f => Divide,
+        0x0d if extended => Enter,
+        // 0x92 is shared with the Japanese dictionary key. 0x59 is keypad '='.
+        0x92 | 0xbb if scan == 0x59 => Equal,
+        // The dedicated navigation cluster uses the same scans with E0 set.
+        // No scan in an injected VK event gives us no keypad evidence.
+        _ if !extended => match (vk, scan) {
+            (0x24, 0x47) => Home,
+            (0x26, 0x48) => Up,
+            (0x21, 0x49) => PageUp,
+            (0x25, 0x4b) => Left,
+            (0x0c, 0x4c) => Begin,
+            (0x27, 0x4d) => Right,
+            (0x23, 0x4f) => End,
+            (0x28, 0x50) => Down,
+            (0x22, 0x51) => PageDown,
+            (0x2d, 0x52) => Insert,
+            (0x2e, 0x53) => Delete,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 fn special_key(vk: u32) -> Option<KeyCode> {
     Some(match vk {
         0x08 => KeyCode::Char('\u{8}'),
@@ -1419,13 +1624,16 @@ mod tests {
 
     #[test]
     fn tab_switcher_commits_when_the_remapped_trigger_is_released() {
-        let trigger = SwitchTrigger::new(0x75, KeyModifiers::ALT | KeyModifiers::SHIFT);
-        assert!(!trigger.released(0xa0, KeyModifiers::ALT));
-        assert!(!trigger.released(0xa4, KeyModifiers::ALT));
-        assert!(trigger.released(0xa4, KeyModifiers::NONE));
-        let single = SwitchTrigger::new(0x77, KeyModifiers::NONE);
-        assert!(!single.released(0xa2, KeyModifiers::NONE));
-        assert!(single.released(0x77, KeyModifiers::NONE));
+        let trigger = SwitchTrigger::new(
+            KeySlot::Virtual(0x75),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert!(!trigger.released(KeySlot::Virtual(0xa0), KeyModifiers::ALT));
+        assert!(!trigger.released(KeySlot::Virtual(0xa4), KeyModifiers::ALT));
+        assert!(trigger.released(KeySlot::Virtual(0xa4), KeyModifiers::NONE));
+        let single = SwitchTrigger::new(KeySlot::Virtual(0x77), KeyModifiers::NONE);
+        assert!(!single.released(KeySlot::Virtual(0xa2), KeyModifiers::NONE));
+        assert!(single.released(KeySlot::Virtual(0x77), KeyModifiers::NONE));
     }
     #[test]
     fn simultaneous_left_and_right_modifiers_have_distinct_press_identities() {
@@ -1440,6 +1648,133 @@ mod tests {
             Some(KeyCode::RightShift)
         );
     }
+    #[test]
+    fn windows_keypad_scans_distinguish_both_clusters_and_all_operators() {
+        use KeypadKey::*;
+        for (vk, scan, key) in [
+            (0x24, 0x47, Home),
+            (0x26, 0x48, Up),
+            (0x21, 0x49, PageUp),
+            (0x25, 0x4b, Left),
+            (0x0c, 0x4c, Begin),
+            (0x27, 0x4d, Right),
+            (0x23, 0x4f, End),
+            (0x28, 0x50, Down),
+            (0x22, 0x51, PageDown),
+            (0x2d, 0x52, Insert),
+            (0x2e, 0x53, Delete),
+        ] {
+            assert_eq!(keypad_key(vk, scan, false), Some(key));
+            assert_eq!(keypad_key(vk, scan, true), None);
+            assert_eq!(keypad_key(vk, 0, false), None);
+        }
+        for (index, key) in [
+            Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(keypad_key(0x60 + index as u32, 0, false), Some(key));
+        }
+        for (vk, scan, extended, key) in [
+            (0x0d, 0x1c, true, Enter),
+            (0x6a, 0x37, false, Multiply),
+            (0x6b, 0x4e, false, Add),
+            (0x6c, 0x7e, false, Separator),
+            (0xc2, 0x7e, false, Separator),
+            (0x6d, 0x4a, false, Subtract),
+            (0x6e, 0x53, false, Decimal),
+            (0x6f, 0x35, true, Divide),
+            (0x92, 0x59, false, Equal),
+        ] {
+            assert_eq!(keypad_key(vk, scan, extended), Some(key));
+        }
+        assert_eq!(keypad_key(0x0d, 0x1c, false), None);
+        assert_eq!(keypad_key(0xbb, 0x0d, false), None); // main '='
+        assert_eq!(keypad_key(0x92, 0, false), None); // Fujitsu dictionary
+    }
+
+    #[test]
+    fn simultaneous_enters_keep_distinct_presses_repeats_and_releases() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut pending) = mpsc::unbounded_channel();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            ..State::new(|_| {})
+        };
+        for (msg, keypad, previous, down, repeat) in [
+            (WM_KEYDOWN, false, false, true, false),
+            (WM_KEYDOWN, true, true, true, false),
+            (WM_KEYDOWN, true, true, true, true),
+            (WM_KEYUP, false, true, false, false),
+            (WM_KEYUP, true, true, false, false),
+        ] {
+            assert!(state.handle(&MSG {
+                message: msg,
+                wParam: WPARAM(0x0d),
+                lParam: LPARAM(
+                    (0x1c << 16) | ((keypad as isize) << 24) | ((previous as isize) << 30)
+                ),
+                ..Default::default()
+            }));
+            let actual = match pending.try_recv().unwrap() {
+                Command::DetailedKey {
+                    key: KeyCode::Char('\r'),
+                    details,
+                    down,
+                    repeat,
+                    ..
+                } => (details.keypad, down, repeat),
+                Command::Key {
+                    key: KeyCode::Char('\r'),
+                    down,
+                    repeat,
+                    ..
+                } => (None, down, repeat),
+                _ => panic!("Expected Enter"),
+            };
+            assert_eq!(actual, (keypad.then_some(KeypadKey::Enter), down, repeat));
+        }
+        assert!(state.pressed.is_empty());
+        assert!(pending.try_recv().is_err());
+    }
+    #[test]
+    fn keypad_game_mode_releases_press_identity_when_num_lock_changes() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut pending) = mpsc::unbounded_channel();
+        let mut state = State {
+            game_mode: true,
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            ..State::new(|_| {})
+        };
+        for (msg, vk, previous) in [
+            (WM_KEYDOWN, VK_LEFT, false),
+            (WM_KEYDOWN, VK_LEFT, true),
+            (WM_KEYUP, VK_NUMPAD4, true),
+        ] {
+            assert!(state.handle(&MSG {
+                message: msg,
+                wParam: WPARAM(vk.0.into()),
+                lParam: LPARAM((0x4b << 16) | ((previous as isize) << 30)),
+                ..Default::default()
+            }));
+        }
+        for expected in [true, false] {
+            assert!(matches!(pending.try_recv(), Ok(Command::DetailedKey {
+                key: KeyCode::LeftArrow, details: KeyDetails {keypad: Some(KeypadKey::Left), ..},
+                down, repeat: false, ..
+            }) if down == expected));
+        }
+        assert!(pending.try_recv().is_err());
+        assert!(state.pressed.is_empty());
+    }
+
     #[test]
     fn sgr_pixel_offsets_use_physical_pixels_at_non_default_dpi() {
         assert_eq!(cell_pixel_offset(13.0, 10.0, 1.0), 3);
@@ -1503,6 +1838,51 @@ mod tests {
         assert_eq!(snap_extent(1238, 24, 10), 1234);
         assert_eq!(snap_extent(980, 98, 20), 978);
         assert_eq!(snap_extent(0, 24, 10), 34);
+    }
+
+    #[test]
+    fn remapped_palette_owns_navigation_before_the_overlay_mounts_and_after_accept() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::CommandPalette, Some("F7".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        let key = |message, vk| MSG {
+            message,
+            wParam: WPARAM(vk),
+            ..Default::default()
+        };
+        for vk in [0x76, 0x09, 0x28, 0x26] {
+            assert!(state.handle(&key(WM_KEYDOWN, vk)));
+            assert!(state.handle(&key(WM_KEYUP, vk)));
+        }
+        assert!(!state.handle(&key(WM_CHAR, 'k' as usize)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d)));
+        state.picker = None;
+        assert!(state.handle(&key(WM_CHAR, 0x0d)));
+        assert!(state.handle(&key(WM_KEYUP, 0x0d)));
+        assert_eq!(
+            *actions.borrow(),
+            [
+                Shortcut::CommandPalette,
+                Shortcut::PickerMove(1),
+                Shortcut::PickerMove(1),
+                Shortcut::PickerMove(-1),
+                Shortcut::PickerAccept
+            ]
+        );
+        assert!(input.try_recv().is_err());
     }
 
     #[test]
@@ -1605,7 +1985,76 @@ mod tests {
     }
 
     #[test]
+    fn locking_a_pane_releases_the_held_key_before_lock_and_swallows_its_remaining_repeats() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut pending) = mpsc::unbounded_channel();
+        let locked = std::rc::Rc::new(std::cell::Cell::new(false));
+        with_input_mut(|slot| {
+            *slot = Some(State {
+                target: Some(Target {
+                    sender: sender.clone(),
+                    frames: lab.frames.clone(),
+                }),
+                read_only: Some(locked.clone()),
+                pressed: HashMap::from([(KeySlot::Virtual(0x58), KeyCode::Char('x'))]),
+                details: HashMap::from([(
+                    KeySlot::Virtual(0x58),
+                    KeyDetails {
+                        base: Some('x'),
+                        ..KeyDetails::default()
+                    },
+                )]),
+                surrogate: Some(0xd800),
+                ..State::new(|_| {})
+            })
+        });
+        KeyboardBridge::set_read_only(&sender, &locked, true);
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::DetailedKey {
+                key: KeyCode::Char('x'),
+                down: false,
+                repeat: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::SetReadOnly(true)
+        ));
+        KeyboardBridge::set_read_only(&sender, &locked, false);
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::SetReadOnly(false)
+        ));
+        with_input_mut(|slot| {
+            let mut state = slot.take().unwrap();
+            assert!(state.surrogate.is_none());
+            assert!(state.handle(&MSG {
+                message: WM_KEYDOWN,
+                wParam: WPARAM(0x58),
+                lParam: LPARAM(1 << 30),
+                ..Default::default()
+            }));
+            assert!(state.handle(&MSG {
+                message: WM_KEYUP,
+                wParam: WPARAM(0x58),
+                ..Default::default()
+            }));
+            assert!(pending.try_recv().is_err());
+            assert!(state.handle(&MSG {
+                message: WM_CHAR,
+                wParam: WPARAM('x' as usize),
+                ..Default::default()
+            }));
+            assert!(matches!(pending.try_recv().unwrap(), Command::Text(s) if s == "x"));
+        });
+    }
+
+    #[test]
     fn switching_tabs_releases_held_keys_to_the_old_session_and_forms_receive_native_input() {
+        let _guard = WindowScope::default().enter();
+        window::activated(true);
         let lab = Session::start(Source::Demo);
         let (old, mut old_input) = mpsc::unbounded_channel();
         let (new, mut new_input) = mpsc::unbounded_channel();
@@ -1614,7 +2063,7 @@ mod tests {
                 sender: old,
                 frames: lab.frames.clone(),
             }),
-            pressed: HashMap::from([(0x58, KeyCode::Char('x'))]),
+            pressed: HashMap::from([(KeySlot::Virtual(0x58), KeyCode::Char('x'))]),
             surrogate: Some(0xd800),
             ..State::new(|_| {})
         };
@@ -1669,7 +2118,7 @@ mod tests {
         };
         // Opening the picker calls release_keys while Alt+Shift+Down is held.
         state.held_resize = Some(HeldResize {
-            key: VK_DOWN.0 as u32,
+            key: KeySlot::Virtual(VK_DOWN.0.into()),
             repeat: Some((KeyModifiers::ALT | KeyModifiers::SHIFT, Direction::Down)),
         });
         state.release_keys();
@@ -1729,7 +2178,7 @@ mod tests {
         };
         // Held in the shell when the user entered copy mode. Neither a known
         // inherited key nor an orphan repeat can start a movement here.
-        state.local_held.insert(0x26, false);
+        state.local_held.insert(KeySlot::Virtual(0x26), false);
         for event in [
             key(WM_KEYDOWN, 0x26, true),
             key(WM_KEYUP, 0x26, false),
@@ -1742,22 +2191,33 @@ mod tests {
         ] {
             assert!(state.handle(&event));
         }
-        state.local_mode = None;
+        // Escape and a new shortcut may already be in the Windows message queue
+        // before the component has processed the copy-mode dismissal.
+        let mut shortcuts = Shortcuts::default();
+        shortcuts
+            .set(Action::CommandPalette, Some("F7".parse().unwrap()))
+            .unwrap();
+        state.keymap = shortcuts.keymap().unwrap();
         assert!(state.handle(&key(WM_KEYDOWN, 0x1b, true)));
+        assert!(state.handle(&key(WM_CHAR, 0x1b, false)));
         assert!(state.handle(&key(WM_KEYUP, 0x1b, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x76, false)));
+        assert!(state.handle(&key(WM_KEYUP, 0x76, false)));
         use w11term::copy_mode::CopyKey;
         assert_eq!(
             *moves.borrow(),
             [
                 Shortcut::CopyKey(CopyKey::Up),
                 Shortcut::CopyKey(CopyKey::Up),
-                Shortcut::CopyKey(CopyKey::Cancel)
+                Shortcut::CopyKey(CopyKey::Cancel),
+                Shortcut::CommandPalette,
             ]
         );
         assert!(
             new_input.try_recv().is_err(),
             "copy mode or its closing key release reached the shell"
         );
+        state.picker = None;
         state.game_mode = true;
         let key_message = |message, repeat| MSG {
             message,

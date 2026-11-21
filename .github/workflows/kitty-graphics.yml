@@ -14,6 +14,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends 'kitty=0.32.2-*' xvfb xauth xdotool imagemagick python3-pil libgl1-mesa-dri
+      - name: Compare keypad wire vectors with the stock encoder
+        run: kitty +runpy "import runpy; runpy.run_path('tests/kitty-keypad-reference.py', run_name='__main__')"
       - name: Capture the reference and compare cell colors
         run: |
           mkdir -p artifacts
@@ -27,30 +29,43 @@ jobs:
 
   ghostty-reference:
     name: Ghostty 1.4 graphics reference
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
-    container:
-      image: archlinux:base@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
+    env:
+      GHOSTTY_DEB: ghostty_1.4.0-0.ppa2_amd64_26.04.deb
+      GHOSTTY_SHA256: 2d70bf419494362dffb6463d8ff3ab76c3fd1b0e247ea9b0b0aeda5c2fa4c681
     steps:
-      - name: Install the archived Ghostty build and its X11 environment
-        run: |
-          cat > /etc/pacman.d/mirrorlist <<'MIRROR'
-          Server = https://archive.archlinux.org/repos/2026/11/12/$repo/os/$arch
-          MIRROR
-          pacman-key --init
-          pacman-key --populate archlinux
-          pacman -Syu --noconfirm --needed 'ghostty=1.4.0-1' git dbus ttf-dejavu mesa xorg-server-xvfb xorg-xauth xdotool imagemagick python-pillow
       - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
           persist-credentials: false
+      - name: Verify Ghostty 1.4.0 and install its X11 capture environment
+        run: |
+          deb="$RUNNER_TEMP/$GHOSTTY_DEB"
+          curl --fail --silent --show-error --location --retry 4 --retry-all-errors --max-time 90 \
+            --output "$deb" "https://github.com/mkasberg/ghostty-ubuntu/releases/download/1.4.0-0-ppa2/$GHOSTTY_DEB"
+          printf '%s  %s\n' "$GHOSTTY_SHA256" "$deb" | sha256sum --check --strict
+          test "$(dpkg-deb -f "$deb" Package)" = ghostty
+          test "$(dpkg-deb -f "$deb" Version)" = '1.4.0-0~ppa2'
+          test "$(dpkg-deb -f "$deb" Architecture)" = amd64
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends "$deb" \
+            dbus-daemon xvfb xauth xdotool imagemagick python3-pil fonts-dejavu-mono \
+            libegl-mesa0 libglx-mesa0 libgl1-mesa-dri
+          test "$(dpkg-query -W -f='${Version}' ghostty)" = '1.4.0-0~ppa2'
       - name: Capture Ghostty and compare the shared cell samples
         run: |
           mkdir -p artifacts
-          pacman -Q ghostty gtk4 mesa xorg-server-xvfb imagemagick python-pillow > artifacts/versions.txt
-          ghostty --version >> artifacts/versions.txt
+          export PATH="/usr/bin:/bin:$PATH"
+          /usr/bin/ghostty --version > artifacts/versions.txt
+          grep -Eq '^Ghostty 1\.4\.0(\+[^[:space:]]+)?$' artifacts/versions.txt
+          {
+            printf 'Runner image: %s %s\nPackage SHA256: %s\n' "$ImageOS" "$ImageVersion" "$GHOSTTY_SHA256"
+            dpkg-query -W ghostty libgtk-4-1 libgl1-mesa-dri fonts-dejavu-mono dbus-daemon xvfb imagemagick python3-pil
+            import -version
+          } >> artifacts/versions.txt
           XDG_RUNTIME_DIR=$(mktemp -d)
           export XDG_RUNTIME_DIR
-          dbus-run-session -- xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' python tests/kitty-reference.py artifacts --terminal ghostty
+          dbus-run-session -- xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts --terminal ghostty
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

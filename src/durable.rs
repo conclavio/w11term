@@ -3,10 +3,28 @@ use crate::options::SshOptions;
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use serde::{Deserialize, Serialize};
+pub mod herdr;
+pub(crate) mod tmux;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    #[default]
+    Zmx,
+    Tmux,
+    Herdr,
+}
+impl Backend {
+    fn is_zmx(&self) -> bool {
+        *self == Self::Zmx
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableReference {
+    #[serde(default, skip_serializing_if = "Backend::is_zmx")]
+    pub backend: Backend,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -18,6 +36,7 @@ pub struct DurableReference {
 impl DurableReference {
     pub fn new(options: &SshOptions, host_key: &str) -> Self {
         Self {
+            backend: Backend::Zmx,
             host: options.host.clone(),
             port: options.port,
             user: options.user.clone(),
@@ -29,7 +48,11 @@ impl DurableReference {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            valid_identity(&self.name, &self.generation),
+            match self.backend {
+                Backend::Zmx => valid_identity(&self.name, &self.generation),
+                Backend::Herdr => herdr::Target::parse(&self.name, &self.generation).is_some(),
+                Backend::Tmux => tmux::Target::parse(&self.name, &self.generation).is_some(),
+            },
             "Invalid durable session name or generation"
         );
         ensure!(
@@ -70,6 +93,8 @@ fn valid_identity(name: &str, generation: &str) -> bool {
 #[derive(Clone, Debug)]
 pub struct DiscoveredSession {
     pub reference: DurableReference,
+    pub display_name: String,
+    pub windows: Option<u32>,
     pub clients: u32,
     pub directory: String,
     pub command: String,
@@ -131,7 +156,10 @@ pub(crate) fn parse_listing(
                 .collect()
         };
         let entry = DiscoveredSession {
+            display_name: name.into(),
+            windows: None,
             reference: DurableReference {
+                backend: Backend::Zmx,
                 host: options.host.clone(),
                 port: options.port,
                 user: options.user.clone(),

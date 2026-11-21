@@ -146,50 +146,126 @@ impl Selection {
         trim_block: bool,
         limit: usize,
     ) -> Result<String, &'static str> {
-        let mut output = String::new();
-        let mut previous_wrapped = false;
-        let mut first = true;
-        for (row, line) in lines {
-            let Some(range) = self.span(row, self.cols) else {
-                continue;
-            };
-            if !first && (self.block || !previous_wrapped) {
-                output.push_str("\r\n");
-            }
-            first = false;
-            let mut text = String::new();
-            let mut column = range.start;
-            for cell in line.visible_cells() {
-                if cell.cell_index() >= range.end {
-                    break;
-                }
-                if cell.cell_index() + cell.width() <= range.start {
-                    continue;
-                }
-                while column < cell.cell_index() {
-                    text.push(' ');
-                    column += 1;
-                }
-                text.push_str(cell.str());
-                column = cell.cell_index() + cell.width();
-            }
-            if self.block && !trim_block {
-                while column < range.end {
-                    text.push(' ');
-                    column += 1;
-                }
-            }
-            previous_wrapped = line.last_cell_was_wrapped() && range.end == self.cols;
-            if (self.block && trim_block) || (!self.block && !previous_wrapped) {
-                text.truncate(text.trim_end().len());
-            }
-            if output.len().saturating_add(text.len()) > limit {
-                return Err("Selection exceeds the clipboard size limit");
-            }
-            output.push_str(&text);
-        }
-        Ok(output)
+        let shape = match (self.block, trim_block) {
+            (false, _) => TextShape::Linear,
+            (true, true) => TextShape::TrimmedBlock,
+            (true, false) => TextShape::PaddedBlock,
+        };
+        plain_text(
+            lines.filter_map(|(row, line)| Some((line, self.span(row, self.cols)?))),
+            self.cols,
+            shape,
+            limit,
+            "Selection exceeds the clipboard size limit",
+        )
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextShape {
+    Linear,
+    TrimmedBlock,
+    PaddedBlock,
+}
+
+/// Copy and export use the same grapheme, wrap and whitespace rules. Check the
+/// actual UTF-8 byte count before appending, including column gaps and CRLF.
+pub(crate) fn plain_text<'a>(
+    rows: impl Iterator<Item = (&'a wezterm_term::Line, Range<usize>)>,
+    cols: usize,
+    shape: TextShape,
+    limit: usize,
+    limit_error: &'static str,
+) -> Result<String, &'static str> {
+    let mut output = String::new();
+    let mut hard_break = false;
+    for (line, range) in rows {
+        if hard_break {
+            append_text(&mut output, 0, "\r\n", limit, limit_error)?;
+        }
+        hard_break =
+            shape != TextShape::Linear || range.end != cols || !line.last_cell_was_wrapped();
+        let trim = hard_break && shape != TextShape::PaddedBlock;
+        let last_text = if trim {
+            // Locate the last non-whitespace cell before allocating. A large
+            // blank or padded row can legitimately serialize to zero bytes.
+            let last = line
+                .visible_cells()
+                .take_while(|c| c.cell_index() < range.end)
+                .filter(|c| {
+                    c.cell_index() + c.width() > range.start && !c.str().trim_end().is_empty()
+                })
+                .last();
+            let Some(cell) = last else { continue };
+            Some(cell.cell_index())
+        } else {
+            None
+        };
+        let mut column = range.start;
+        for cell in line
+            .visible_cells()
+            .take_while(|c| c.cell_index() < range.end)
+        {
+            let start = cell.cell_index();
+            if start + cell.width() <= range.start {
+                continue;
+            }
+            let last = Some(start) == last_text;
+            let text = if last {
+                cell.str().trim_end()
+            } else {
+                cell.str()
+            };
+            append_text(
+                &mut output,
+                start.saturating_sub(column),
+                text,
+                limit,
+                limit_error,
+            )?;
+            column = start + cell.width();
+            if last {
+                break;
+            }
+        }
+        if shape == TextShape::PaddedBlock {
+            append_text(
+                &mut output,
+                range.end.saturating_sub(column),
+                "",
+                limit,
+                limit_error,
+            )?;
+        }
+    }
+    Ok(output)
+}
+
+fn append_text(
+    output: &mut String,
+    spaces: usize,
+    text: &str,
+    limit: usize,
+    limit_error: &'static str,
+) -> Result<(), &'static str> {
+    let size = output
+        .len()
+        .checked_add(spaces)
+        .and_then(|size| size.checked_add(text.len()))
+        .filter(|&size| size <= limit)
+        .ok_or(limit_error)?;
+    if size > output.capacity() {
+        let capacity = size
+            .max(output.capacity().saturating_mul(2))
+            .max(64)
+            .min(limit);
+        output
+            .try_reserve_exact(capacity - output.len())
+            .map_err(|_| "Not enough memory to capture terminal text")?;
+    }
+    output.extend(std::iter::repeat_n(' ', spaces));
+    output.push_str(text);
+    Ok(())
 }
 
 pub fn word_range(frame: &Snapshot, point: Point, delimiters: &str) -> Range<usize> {

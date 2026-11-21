@@ -228,6 +228,7 @@ impl ITextProvider2_Impl for Provider_Impl {
 
 struct Host {
     hwnd: HWND,
+    parent: HWND,
     source: Arc<Source>,
     provider: IRawElementProviderSimple,
     last_frame: Option<Arc<Snapshot>>,
@@ -236,6 +237,7 @@ struct Host {
 const APPLY_SELECTION: u32 = WM_APP + 17;
 struct Site {
     provider: IRawElementProviderSimple,
+    source: Arc<Source>,
     select: Box<dyn Fn()>,
 }
 thread_local! { static PROVIDERS: RefCell<std::collections::HashMap<isize, Site>> = RefCell::default(); }
@@ -276,7 +278,11 @@ unsafe extern "system" fn subclass(
             LRESULT(0)
         }
         WM_NCDESTROY => {
-            PROVIDERS.with(|entries| entries.borrow_mut().remove(&(hwnd.0 as isize)));
+            if let Some(site) =
+                PROVIDERS.with(|entries| entries.borrow_mut().remove(&(hwnd.0 as isize)))
+            {
+                site.source.alive.store(false, Ordering::Release);
+            }
             unsafe {
                 UiaReturnRawElementProvider(hwnd, WPARAM(0), LPARAM(0), None);
                 let _ = RemoveWindowSubclass(hwnd, Some(subclass), 1);
@@ -288,9 +294,12 @@ unsafe extern "system" fn subclass(
 }
 impl Drop for Host {
     fn drop(&mut self) {
-        self.source.alive.store(false, Ordering::Release);
-        unsafe {
-            let _ = DestroyWindow(self.hwnd);
+        // Closing the parent can already have destroyed its children. A
+        // recycled HWND must never tear down another window's provider.
+        if self.source.alive.swap(false, Ordering::AcqRel) {
+            unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            }
         }
     }
 }
@@ -322,7 +331,9 @@ impl Bridge {
             block: s.block,
         });
         let mut slot = self.host.borrow_mut();
-        let changed_pane = slot.as_ref().is_none_or(|h| h.source.id != pane);
+        let changed_pane = slot.as_ref().is_none_or(|h| {
+            h.source.id != pane || h.parent != parent || !h.source.alive.load(Ordering::Acquire)
+        });
         if changed_pane {
             slot.take();
             let created = unsafe {
@@ -371,6 +382,7 @@ impl Bridge {
                     hwnd.0 as isize,
                     Site {
                         provider: provider.clone(),
+                        source: source.clone(),
                         select: Box::new(move || {
                             if let Ok(mut state) = live.state.lock()
                                 && let Some(request) = state.requested.take()
@@ -383,6 +395,7 @@ impl Bridge {
             });
             *slot = Some(Host {
                 hwnd,
+                parent,
                 source,
                 provider,
                 last_frame: None,

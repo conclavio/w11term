@@ -1,5 +1,5 @@
 use crate::{
-    input::{KeyboardBridge, Shortcut},
+    input::{KeyboardBridge, PickerStage, Shortcut},
     renderer::{Metrics, PADDING, Renderer, STATUS_HEIGHT},
 };
 use anyhow::Context as _;
@@ -16,9 +16,7 @@ use w11term::{
     interaction::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
-    options::{
-        Authentication, LocalOptions, Options, Source, SshOptions, TerminalType, profile_source,
-    },
+    options::{Authentication, LocalOptions, Profiles, Source, SshOptions, TerminalType},
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
@@ -31,17 +29,22 @@ use windows_reactor::*;
 
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
+const RESTART_EXITED_PANE: &str = "Restart exited pane";
 
 mod attention;
 mod command_history;
 mod config_import;
 mod file_drawer;
+mod file_picker;
+mod folder_shares;
+mod folder_sharing_state;
 mod keyboard_settings;
 mod local_profile;
 mod pattern_settings;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
+mod command_palette;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
@@ -52,14 +55,20 @@ mod keyboard_hints;
 mod local_smoke;
 mod pane_picker;
 mod pane_view;
+mod scrollback_export;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
 mod tab_title;
+mod tab_windows;
+mod taskbar;
+pub use tab_windows::WindowLaunch;
 mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    folder_sharing: Option<w11term::folder_grants::PaneShares>,
+    read_only: Rc<Cell<bool>>,
     startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
     files: Box<FileDrawer>,
@@ -72,12 +81,12 @@ struct LiveTab {
     surface: PaneSurface,
     device_busy: bool,
     device_message: Option<String>,
-    session: Session,
+    session: Box<Session>,
     last_size: Rc<Cell<Option<TerminalSize>>>,
     error: Option<String>,
     selection: Rc<RefCell<Option<Selection>>>,
     hover: Rc<RefCell<Option<Link>>>,
-    remote_button: MouseButton,
+    remote_mouse: RemoteMouse,
     clicked_link: Option<String>,
     last_click: Option<(Instant, Point, u8)>,
     scroll_direction: isize,
@@ -92,11 +101,37 @@ struct Find {
     open: bool,
     query: String,
     sensitive: bool,
+    regex: bool,
+    pending: bool,
     epoch: u64,
     input: ElementRef<TextBox>,
     focused: bool,
 }
+#[derive(Clone, Copy)]
+pub enum FindOption {
+    Case,
+    Regex,
+}
 impl LiveTab {
+    fn reset_transport_input(&mut self, keyboard: &KeyboardBridge) {
+        self.remote_mouse = RemoteMouse::default();
+        self.end_pointer_gesture();
+        keyboard.reset_keys(&self.session.input);
+    }
+
+    fn end_pointer_gesture(&mut self) {
+        if let Some(release) = self.remote_mouse.release() {
+            let _ = self.session.input.send(Command::Mouse(release));
+        }
+        if let Some(selection) = self.selection.borrow_mut().as_mut() {
+            selection.dragging = false;
+        }
+        self.clicked_link = None;
+        self.scroll_direction = 0;
+        self.scroll_tick = false;
+        self.gesture += 1;
+    }
+
     fn browsing_sessions(&self) -> bool {
         self.discovery_page.is_some()
             && self
@@ -105,16 +140,117 @@ impl LiveTab {
                 .is_some_and(|state| state.phase.is_browser())
     }
 }
+
+// The window that received a press also owns its release, even if capture is
+// interrupted or the pane's live session moves to another window.
+#[derive(Default)]
+struct RemoteMouse {
+    held: Option<MouseEvent>,
+}
+
+impl RemoteMouse {
+    fn event(&mut self, mut event: MouseEvent) -> Option<MouseEvent> {
+        match event.kind {
+            MouseEventKind::Press if event.button == MouseButton::None => return None,
+            MouseEventKind::Press => self.held = Some(event),
+            MouseEventKind::Release => event.button = self.held.take()?.button,
+            MouseEventKind::Move => {
+                if let Some(held) = &mut self.held {
+                    *held = MouseEvent {
+                        button: held.button,
+                        ..event
+                    };
+                } else if event.button != MouseButton::None {
+                    // A drag that began in another pane or transport is not this stream's input.
+                    return None;
+                }
+            }
+        }
+        Some(event)
+    }
+
+    fn release(&mut self) -> Option<MouseEvent> {
+        self.held.take().map(|event| MouseEvent {
+            kind: MouseEventKind::Release,
+            ..event
+        })
+    }
+}
+
 impl Default for Find {
     fn default() -> Self {
         Self {
             open: false,
             query: String::new(),
             sensitive: false,
+            regex: false,
+            pending: false,
             epoch: 0,
             input: ElementRef::new(),
             focused: false,
         }
+    }
+}
+impl Find {
+    fn matches(&self, result: &w11term::search::SearchSnapshot) -> bool {
+        result.query == self.query
+            && result.sensitive == self.sensitive
+            && result.regex == self.regex
+    }
+
+    fn apply(&mut self, session: &Session) {
+        self.pending = session
+            .input
+            .send(Command::Search {
+                query: self.query.clone(),
+                sensitive: self.sensitive,
+                regex: self.regex,
+            })
+            .is_err();
+    }
+
+    fn limit_query(text: &mut String, regex: bool) {
+        let limit = w11term::search::MAX_QUERY_BYTES;
+        if text.len() > limit {
+            // Keep one overflowing scalar in regex mode so an oversized paste
+            // stays invalid until corrected. Literal Find retains its old cap.
+            let end = if regex {
+                text.ceil_char_boundary(limit + 1)
+            } else {
+                text.floor_char_boundary(limit)
+            };
+            text.truncate(end);
+        }
+    }
+
+    fn status(&self, result: Option<&w11term::search::SearchSnapshot>) -> String {
+        if self.query.is_empty() {
+            return "Find in scrollback".into();
+        }
+        let Some(result) = result.filter(|result| self.matches(result)) else {
+            return "Searching…".into();
+        };
+        if let Some(error) = &result.error {
+            return if self.regex {
+                format!("Invalid regex — {error}. Edit the pattern or turn off Regex.")
+            } else {
+                error.clone()
+            };
+        }
+        let mut count = if result.total == 0 {
+            "No matches".into()
+        } else {
+            format!(
+                "{} / {}{}",
+                result.selected.map_or(0, |i| i + 1),
+                result.total,
+                if result.truncated { "+" } else { "" }
+            )
+        };
+        if result.incomplete {
+            count.push_str(" · Some long lines were skipped");
+        }
+        count
     }
 }
 struct TabSwitcher {
@@ -136,6 +272,7 @@ enum SettingsEditor {
     Patterns(pattern_settings::PatternPage),
 }
 enum Page {
+    SharedFolders(folder_shares::Panel),
     Attention,
     CommandHistory(command_history::HistoryPage),
     Terminal(LiveTab),
@@ -151,6 +288,16 @@ struct AppTab {
 }
 
 impl AppTab {
+    fn exited_pane(&self) -> Option<ExitedPane> {
+        let Page::Terminal(live) = &self.page else {
+            return None;
+        };
+        Some(ExitedPane {
+            pane: live.session.pane_id,
+            token: live.session.events.restart_token()?,
+        })
+    }
+
     fn profile_name(&self) -> Option<&str> {
         match &self.page {
             Page::Terminal(live) => live.profile_name.as_deref(),
@@ -284,6 +431,13 @@ impl ProfileDraft {
         }
     }
 }
+fn command_menu_item(key: &str, label: &str, enabled: bool) -> MenuItem {
+    if enabled {
+        MenuItem::item(key, label)
+    } else {
+        MenuItem::disabled(key, label)
+    }
+}
 fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     match state {
         Some(state) => MenuItem::item(
@@ -294,8 +448,17 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(name) = label.strip_prefix("Browse Herdr terminals on ") {
+        return Message::Discovery(session_browser::Action::Discover {
+            name: name.into(),
+            herdr: true,
+        });
+    }
     if let Some(name) = label.strip_prefix("Find sessions on ") {
-        return Message::Discovery(session_browser::Action::Discover(name.into()));
+        return Message::Discovery(session_browser::Action::Discover {
+            name: name.into(),
+            herdr: false,
+        });
     }
     if let Some(action) = durable_view::menu_action(&label) {
         return Message::Durability(action);
@@ -323,6 +486,8 @@ fn tab_menu_message(label: String) -> Message {
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
         "Command history" => Message::History(command_history::Action::Open),
+        "Notify when command finishes" => Message::Attention(attention::Action::WatchCommand(true)),
+        "Cancel command notification" => Message::Attention(attention::Action::WatchCommand(false)),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
@@ -335,7 +500,10 @@ fn tab_menu_message(label: String) -> Message {
         "Resize down" => Message::Shortcut(Shortcut::ResizePane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
+        "Enable read-only pane input" => Message::SetPaneReadOnly(true),
+        "Disable read-only pane input" => Message::SetPaneReadOnly(false),
         "Move pane to new tab" => Message::MovePaneToTab,
+        "Move tab to new window" => Message::MoveTabToWindow,
         "Move pane to existing tab…" => Message::Shortcut(Shortcut::MovePaneToExistingTab),
         "Paste" => Message::Paste,
         "Paste raw (no bracketed paste)" => Message::PasteRaw,
@@ -350,6 +518,7 @@ fn tab_menu_message(label: String) -> Message {
         "Forget this device (revoke game key)" => Message::DeviceAction(true),
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
+        "Command palette…" => Message::Shortcut(Shortcut::CommandPalette),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
@@ -369,11 +538,21 @@ pub enum Field {
 }
 
 enum UiWork {
+    FolderAuthority,
     Control(w11term::control::UiRequest),
     AttentionChanged,
 }
 
+struct CaretMenuBinding {
+    pane: Option<u64>,
+    exited: Option<ExitedPane>,
+    on_click: Callback<String>,
+}
+
 pub struct TerminalApp {
+    folder_wake: Arc<dyn Fn() + Send + Sync>,
+    folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
+    taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
     show_inspector: bool,
     inspection: Option<inspector::Inspection>,
@@ -384,7 +563,15 @@ pub struct TerminalApp {
     window_restored: bool,
     // Unhook before dropping tabs and shutting down their independent sessions.
     keyboard: KeyboardBridge,
-    _control: Server,
+    _control: Arc<Server>,
+    window_launch: w11term::options::Options,
+    opening: Option<Rc<crate::workspace_window::Opening>>,
+    incoming: Option<Rc<tab_windows::Transfer>>,
+    outgoing: Option<Rc<tab_windows::Transfer>>,
+    window_timer: Option<crate::ui_timer::RetryTimer>,
+    native_bound: bool,
+    window_error: Option<String>,
+    export: scrollback_export::Export,
     registry: Registry,
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiWork>>>,
     control_task: Option<ComponentTask>,
@@ -392,16 +579,17 @@ pub struct TerminalApp {
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
+    caret_menu_binding: RefCell<Option<CaretMenuBinding>>,
     frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
     default_source: Source,
     default_label: String,
     default_profile: Option<String>,
-    profiles: BTreeMap<String, SshOptions>,
-    local_profiles: BTreeMap<String, LocalOptions>,
+    catalog: Profiles,
     store: ProfileStore,
     profile_error: Option<String>,
+    profile_move_error: Option<String>,
     width: f64,
     selection_pending: bool,
     selection_epoch: u64,
@@ -421,11 +609,22 @@ pub struct TerminalApp {
     copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExitedPane {
+    pane: u64,
+    token: u64,
+}
+
 pub enum Message {
+    FolderAuthority,
+    FolderShare(folder_shares::Action),
+    RestartExited(ExitedPane),
+    Export(scrollback_export::Action),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
     ToggleInspector,
+    PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
     PickerHover(u64),
     PickerFrame(u64, u64),
@@ -440,7 +639,15 @@ pub enum Message {
     ZoomPane,
     ClosePane,
     MovePaneToTab,
+    MoveTabToWindow,
+    WindowTick,
+    DismissWindowError,
+    TransferReady(u64),
+    TransferClaim(u64),
+    TransferDone(u64),
+    TransferCanceled(u64),
     PaneFocus(TabId),
+    SetPaneReadOnly(bool),
     PaneRatio(u64, Vec<bool>, f64),
     HoverPane(TabId),
     DividerPress(u64, Vec<bool>, f64),
@@ -478,6 +685,8 @@ pub enum Message {
     SyncSelection(u64),
     Shortcut(Shortcut),
     ProfileMenu(String),
+    MoveProfile(String, isize, Arc<[String]>),
+    RefreshProfiles,
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
@@ -513,7 +722,7 @@ pub enum Message {
     Geometry(f64, f64, u64, bool),
     GridFallback(u64),
     FindEdit(TabId, String),
-    FindCase(TabId, bool),
+    FindOption(TabId, FindOption, bool),
     FindApply(TabId, u64),
     FindFocus(TabId, u64, u8),
     FindFocusResult(TabId, u64, bool),
@@ -544,6 +753,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            folder_sharing: None,
             startup: None,
             observed_frame: 0,
             files: Box::default(),
@@ -555,13 +765,14 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             profile_name: None,
             surface: PaneSurface::default(),
             device_busy: false,
+            read_only: Rc::default(),
             device_message: None,
-            session,
+            session: Box::new(session),
             last_size: Rc::new(Cell::new(None)),
             error: None,
             selection: Rc::new(RefCell::new(None)),
             hover: Rc::new(RefCell::new(None)),
-            remote_button: MouseButton::None,
+            remote_mouse: Default::default(),
             clicked_link: None,
             last_click: None,
             scroll_direction: 0,
@@ -609,6 +820,7 @@ impl TerminalApp {
                     {
                         Ok(UiWork::Control(request)) => return Message::Control(request),
                         Ok(UiWork::AttentionChanged) => return Message::AttentionChanged,
+                        Ok(UiWork::FolderAuthority) => return Message::FolderAuthority,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(_) => return Message::ControlIdle,
                     }
@@ -626,6 +838,7 @@ impl TerminalApp {
             return;
         };
         let frame = tab.session.frames.load();
+        tab.files.observe_connection(frame.connection_generation);
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
         if self.hints.borrow().as_ref().is_some_and(|h| {
             h.pane == id
@@ -639,7 +852,7 @@ impl TerminalApp {
             tab.surface.invalidator.invalidate();
         }
         if prompt_id.is_some() && self.picker.take().is_some() {
-            self.keyboard.set_picker(false);
+            self.keyboard.set_picker(None);
         }
         let changed = prompt_id != tab.prompt_id;
         self.keyboard
@@ -655,19 +868,26 @@ impl TerminalApp {
             tab.prompt_id = prompt_id;
         }
         if tab.connection_generation != frame.connection_generation {
+            self.header.borrow_mut().take();
             tab.connection_generation = frame.connection_generation;
-            self.keyboard.reset_keys();
+            tab.reset_transport_input(&self.keyboard);
         }
         if prompt_id.is_some() {
             self.title_editor = None;
+            tab.files.cancel_name_edit();
         }
-        self.keyboard
-            .set_modal(prompt_id.is_some() || self.title_editor.is_some());
+        self.keyboard.set_modal(
+            prompt_id.is_some() || self.title_editor.is_some() || tab.files.editing_name(),
+        );
         let choosing = tab.browsing_sessions();
         if changed {
             self.keyboard
                 .set_target(if prompt_id.is_none() && !tab.device_busy && !choosing {
-                    Some((tab.session.input.clone(), tab.session.frames.clone()))
+                    Some((
+                        tab.session.input.clone(),
+                        tab.session.frames.clone(),
+                        tab.read_only.clone(),
+                    ))
                 } else {
                     None
                 });
@@ -737,13 +957,14 @@ impl TerminalApp {
             return;
         };
         let configure = !tab.find.open
+            || tab.find.pending
             || tab
                 .session
                 .frames
                 .load()
                 .search
                 .as_ref()
-                .is_none_or(|s| s.query != tab.find.query || s.sensitive != tab.find.sensitive);
+                .is_none_or(|s| !tab.find.matches(s));
         tab.find.open = !close;
         if close {
             tab.find.focused = false;
@@ -754,10 +975,7 @@ impl TerminalApp {
             let _ = tab.session.input.send(Command::SearchClose);
         } else {
             if configure {
-                let _ = tab.session.input.send(Command::Search {
-                    query: tab.find.query.clone(),
-                    sensitive: tab.find.sensitive,
-                });
+                tab.find.apply(&tab.session);
             }
             if let Some(direction) = direction {
                 let _ = tab.session.input.send(Command::SearchNavigate(direction));
@@ -770,42 +988,20 @@ impl TerminalApp {
         }
         self.invalidator.invalidate();
     }
-    fn apply_find(&self, id: TabId, epoch: u64) {
+    fn apply_find(&mut self, id: TabId, epoch: u64) {
         if let Some(AppTab {
             page: Page::Terminal(tab),
             ..
-        }) = self.tabs.get(id)
+        }) = self.tabs.get_mut(id)
             && tab.find.open
             && tab.find.epoch == epoch
         {
-            let _ = tab.session.input.send(Command::Search {
-                query: tab.find.query.clone(),
-                sensitive: tab.find.sensitive,
-            });
+            tab.find.apply(&tab.session);
         }
     }
     fn find_view(&self, id: TabId, tab: &LiveTab, context: &ViewContext<Self>) -> View {
         let frame = tab.session.frames.load();
-        let count = if tab.find.query.is_empty() {
-            "Find in scrollback".to_string()
-        } else if let Some(search) = frame
-            .search
-            .as_ref()
-            .filter(|s| s.query == tab.find.query && s.sensitive == tab.find.sensitive)
-        {
-            if search.total == 0 {
-                "No matches".into()
-            } else {
-                format!(
-                    "{} / {}{}",
-                    search.selected.map_or(0, |i| i + 1),
-                    search.total,
-                    if search.truncated { "+" } else { "" }
-                )
-            }
-        } else {
-            "Searching…".into()
-        };
+        let status = tab.find.status(frame.search.as_ref());
         Border::new()
             .grid_row(1)
             .horizontal_alignment(HorizontalAlignment::Right)
@@ -817,10 +1013,10 @@ impl TerminalApp {
             .width((self.width - 16.0).clamp(300.0, 600.0))
             .content(
                 Grid::new()
+                    .rows([GridLength::Auto, GridLength::Auto])
+                    .row_spacing(4.0)
                     .columns([
                         GridLength::STAR,
-                        GridLength::Auto,
-                        GridLength::Auto,
                         GridLength::Auto,
                         GridLength::Auto,
                         GridLength::Auto,
@@ -834,21 +1030,8 @@ impl TerminalApp {
                             .on_text_changed(
                                 context.callback(move |text| Message::FindEdit(id, text)),
                             ),
-                        Border::new()
-                            .grid_column(1)
-                            .padding(6.0)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(TextBlock::new().text(count)),
-                        CheckBox::new()
-                            .grid_column(2)
-                            .automation_name("Match case")
-                            .is_checked(tab.find.sensitive)
-                            .on_is_checked_changed(
-                                context.callback(move |v| Message::FindCase(id, v)),
-                            )
-                            .content(TextBlock::new().text("Aa")),
                         Button::new()
-                            .grid_column(3)
+                            .grid_column(1)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Previous match (Shift+Enter)")
                             .on_click(
@@ -856,17 +1039,47 @@ impl TerminalApp {
                             )
                             .content(TextBlock::new().text("↑")),
                         Button::new()
-                            .grid_column(4)
+                            .grid_column(2)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Next match (Enter)")
                             .on_click(context.callback(|_| Message::Shortcut(Shortcut::FindNext)))
                             .content(TextBlock::new().text("↓")),
                         Button::new()
-                            .grid_column(5)
+                            .grid_column(3)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Close find (Escape)")
                             .on_click(context.callback(|_| Message::Shortcut(Shortcut::FindClose)))
                             .content(TextBlock::new().text("×")),
+                        Grid::new()
+                            .grid_row(1)
+                            .grid_column_span(4)
+                            .columns([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+                            .column_spacing(12.0)
+                            .children((
+                                CheckBox::new()
+                                    .min_width(0.0)
+                                    .automation_name("Match case")
+                                    .is_checked(tab.find.sensitive)
+                                    .on_is_checked_changed(context.callback(move |v| {
+                                        Message::FindOption(id, FindOption::Case, v)
+                                    }))
+                                    .content("Match case"),
+                                CheckBox::new()
+                                    .grid_column(1)
+                                    .min_width(0.0)
+                                    .automation_name("Regular expression")
+                                    .is_checked(tab.find.regex)
+                                    .on_is_checked_changed(context.callback(move |v| {
+                                        Message::FindOption(id, FindOption::Regex, v)
+                                    }))
+                                    .content("Regex"),
+                                TextBlock::new()
+                                    .grid_column(2)
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .automation_id("find-status")
+                                    .text(status)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )),
                     )),
             )
     }
@@ -913,6 +1126,9 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if tab.read_only.get() {
+                return;
+            }
             match w11term::clipboard::read() {
                 Ok(text) => {
                     if raw {
@@ -1049,22 +1265,18 @@ impl TerminalApp {
         } else {
             MouseButton::None
         };
+        if kind == MouseEventKind::Press {
+            tab.gesture += 1;
+        }
         let local_drag = tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
             || tab.clicked_link.is_some();
         if frame.mouse_grabbed
+            && !tab.read_only.get()
             && !local_drag
             && !modifiers.contains(KeyModifiers::SHIFT)
             && !(modifiers.contains(KeyModifiers::CTRL) && link.is_some())
         {
-            let button = if kind == MouseEventKind::Release {
-                std::mem::replace(&mut tab.remote_button, MouseButton::None)
-            } else {
-                if kind == MouseEventKind::Press {
-                    tab.remote_button = button;
-                }
-                button
-            };
-            let _ = tab.session.input.send(Command::Mouse(MouseEvent {
+            if let Some(event) = tab.remote_mouse.event(MouseEvent {
                 kind,
                 x,
                 y: y as i64,
@@ -1080,7 +1292,9 @@ impl TerminalApp {
                 ),
                 button,
                 modifiers,
-            }));
+            }) {
+                let _ = tab.session.input.send(Command::Mouse(event));
+            }
             return;
         }
         let mut should_copy = false;
@@ -1089,7 +1303,6 @@ impl TerminalApp {
         match kind {
             MouseEventKind::Press if button == MouseButton::Middle => {}
             MouseEventKind::Press if button == MouseButton::Right => {
-                tab.gesture += 1;
                 if !preferences.copy_on_select
                     && tab.selection.borrow().as_ref().is_some_and(|s| s.active)
                 {
@@ -1099,7 +1312,6 @@ impl TerminalApp {
                 }
             }
             MouseEventKind::Press if button == MouseButton::Left => {
-                tab.gesture += 1;
                 if modifiers.contains(KeyModifiers::CTRL)
                     && let Some(link) = link
                 {
@@ -1289,40 +1501,61 @@ impl TerminalApp {
         ];
         let mut profiles: Vec<View> =
             vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
-        for (name, ssh) in &self.profiles {
-            let display = profile_label(name, ssh);
-            let name = name.clone();
-            profiles.push(
+        let order: Arc<[String]> = self.catalog.profile_order.as_slice().into();
+        let mut rows = Vec::with_capacity(order.len());
+        for (index, name) in order.iter().enumerate() {
+            let edit_name = name.clone();
+            let (label, edit) = if let Some(ssh) = self.catalog.profiles.get(name) {
+                (
+                    profile_label(name, ssh),
+                    Button::new()
+                        .automation_name(format!("Edit profile {name}"))
+                        .on_click(
+                            context.callback(move |_| Message::EditProfile(edit_name.clone())),
+                        ),
+                )
+            } else {
+                (
+                    format!("{name} · Local"),
+                    Button::new()
+                        .automation_name(format!("Edit local profile {name}"))
+                        .on_click(context.callback(move |_| {
+                            Message::LocalProfile(local_profile::Action::Open(Some(
+                                edit_name.clone(),
+                            )))
+                        })),
+                )
+            };
+            let movement = |direction, delta, enabled| {
+                let order = order.clone();
+                let name = name.clone();
+                Button::new()
+                    .automation_name(format!("Move {name} {direction}"))
+                    .is_enabled(enabled)
+                    .on_click(context.callback(move |_| {
+                        Message::MoveProfile(name.clone(), delta, order.clone())
+                    }))
+                    .content(format!("Move {direction}"))
+            };
+            rows.push(KeyedView::new(
+                name.clone(),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(12.0)
+                    .spacing(8.0)
                     .children((
-                        Button::new()
-                            .automation_name(format!("Edit profile {name}"))
-                            .on_click(context.callback(move |_| Message::EditProfile(name.clone())))
-                            .content("Edit…"),
+                        edit.content("Edit…"),
+                        movement("up", -1, index > 0),
+                        movement("down", 1, index + 1 < order.len()),
                         TextBlock::new()
-                            .text(display)
+                            .text(label)
                             .vertical_alignment(VerticalAlignment::Center),
                     )),
-            );
+            ));
         }
-        if self.profiles.is_empty() {
+        if rows.is_empty() {
             profiles.push(TextBlock::new().text("No saved profiles yet.").into());
-        }
-        for name in self.local_profiles.keys() {
-            let name = name.clone();
-            profiles.push(
-                Button::new()
-                    .automation_name(format!("Edit local profile {name}"))
-                    .on_click(context.callback({
-                        let name = name.clone();
-                        move |_| {
-                            Message::LocalProfile(local_profile::Action::Open(Some(name.clone())))
-                        }
-                    }))
-                    .content(format!("Edit {name} · Local…")),
-            );
+        } else {
+            profiles.push(StackPanel::new().spacing(8.0).keyed_children(rows));
         }
         profiles.push(
             Button::new()
@@ -1331,7 +1564,7 @@ impl TerminalApp {
                 )
                 .content("New local shell profile…"),
         );
-        if let Some(error) = &self.profile_error {
+        for error in self.profile_error.iter().chain(&self.profile_move_error) {
             profiles.push(
                 TextBlock::new()
                     .text(error)
@@ -1478,6 +1711,7 @@ impl TerminalApp {
                         .title_for(entry.id)
                         .map(|title| title.as_str().to_owned()),
                     visible: self.tabs.visible(entry.id),
+                    read_only: tab.read_only.get(),
                     label: entry.value.label.clone(),
                     active: self.tabs.active_id() == Some(entry.id),
                     input: tab.session.input.clone(),
@@ -1540,14 +1774,15 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
-        if self.title_editor.take().is_some() {
-            self.keyboard.set_modal(false);
-        }
+        self.bind_folder_shares();
+        self.activate_folder_panel(context);
+        self.title_editor = None;
+        self.cancel_inactive_name_editor();
         self.close_copy_mode();
         self.close_hints();
         self.sync_inspector();
         if self.picker.take().is_some() {
-            self.keyboard.set_picker(false);
+            self.keyboard.set_picker(None);
         }
         let single = matches!(
             self.tabs.active_layout(),
@@ -1559,8 +1794,8 @@ impl TerminalApp {
             .and_then(AppTab::profile_name)
             .filter(|name| {
                 single
-                    && (self.profiles.contains_key(*name)
-                        || self.local_profiles.contains_key(*name))
+                    && (self.catalog.profiles.contains_key(*name)
+                        || self.catalog.local.contains_key(*name))
             })
             .map(str::to_owned);
         let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
@@ -1617,9 +1852,16 @@ impl TerminalApp {
             Some(AppTab {
                 page: Page::Terminal(tab),
                 ..
-            }) => Some((tab.session.input.clone(), tab.session.frames.clone())),
+            }) => Some((
+                tab.session.input.clone(),
+                tab.session.frames.clone(),
+                tab.read_only.clone(),
+            )),
             _ => None,
         };
+        if target.is_none() {
+            self.keyboard.set_modal(false);
+        }
         self.keyboard.set_target(target);
         self.sync_ime_surface();
         self.keyboard
@@ -1637,6 +1879,13 @@ impl TerminalApp {
             }));
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
+            if let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+            {
+                tab.follow_shell_directory(&tab.session.frames.load(), context);
+            }
         }
         self.keyboard.set_search(
             matches!(self.tabs.active(),Some(AppTab{page:Page::Terminal(tab),..}) if tab.find.open && tab.prompt_id.is_none()),
@@ -1648,6 +1897,9 @@ impl TerminalApp {
             }) = self.tabs.get_mut(id)
             && tab.find.open
         {
+            if tab.find.pending {
+                tab.find.apply(&tab.session);
+            }
             tab.find.focused = false;
             let epoch = tab.find.epoch;
             context.spawn_background(move |_| {
@@ -1664,7 +1916,7 @@ impl TerminalApp {
     }
 
     fn restore_window(&self) {
-        if self.initial_grid.get().is_some() {
+        if self.incoming.is_some() || !self.native_bound || self.initial_grid.get().is_some() {
             return;
         }
         if let Some(name) = &self.window_profile {
@@ -1755,7 +2007,7 @@ impl TerminalApp {
         let profile_name = profile.or_else(|| tab.profile_name.clone());
         let (label, source) = match &profile_name {
             Some(name) => {
-                let source = match profile_source(&self.profiles, &self.local_profiles, name) {
+                let source = match self.catalog.source(name) {
                     Some(source) => source,
                     None if !explicit_profile => tab.source.clone(),
                     None => return,
@@ -1851,6 +2103,26 @@ impl TerminalApp {
         Ok(())
     }
 
+    fn refresh_profiles(&mut self) {
+        match self.store.catalog() {
+            Ok(catalog) => {
+                if self.catalog != catalog || self.profile_error.is_some() {
+                    self.catalog = catalog;
+                    self.profile_error = None;
+                    self.header.borrow_mut().take();
+                    self.bind_folder_shares();
+                }
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                if self.profile_error.as_ref() != Some(&error) {
+                    self.profile_error = Some(error);
+                    self.header.borrow_mut().take();
+                }
+            }
+        }
+    }
+
     fn utility(&mut self, settings: bool, context: &ComponentContext<Self>) {
         let existing = self
             .tabs
@@ -1901,8 +2173,7 @@ impl TerminalApp {
         }
         match self.store.inspect_catalog(&name) {
             Ok((catalog, base)) => {
-                self.profiles = catalog.profiles;
-                self.local_profiles = catalog.local;
+                self.catalog = catalog;
                 self.profile_error = None;
                 self.tabs.insert(AppTab {
                     label: format!("Edit {name}"),
@@ -1933,7 +2204,7 @@ impl TerminalApp {
         };
         let mut name = format!("{} copy", base.name);
         let mut index = 2;
-        while self.profiles.contains_key(&name) || self.local_profiles.contains_key(&name) {
+        while self.catalog.profiles.contains_key(&name) || self.catalog.local.contains_key(&name) {
             name = format!("{} copy {index}", base.name);
             index += 1;
         }
@@ -1976,8 +2247,7 @@ impl TerminalApp {
             }
         };
         let name = base.name.clone();
-        self.profiles = catalog.profiles;
-        self.local_profiles = catalog.local;
+        self.catalog = catalog;
         let linked: Vec<_> = self
             .tabs
             .entries()
@@ -2072,8 +2342,7 @@ impl TerminalApp {
                 DraftOrigin::Copy(base) => self.store.duplicate(base, name, &options)?,
             }
             let (catalog, saved) = self.store.inspect_catalog(name)?;
-            self.profiles = catalog.profiles;
-            self.local_profiles = catalog.local;
+            self.catalog = catalog;
             self.profile_error = None;
             Ok(saved)
         })();
@@ -2145,7 +2414,55 @@ impl TerminalApp {
         }
     }
 
+    fn caret_menu_callback(
+        &self,
+        context: &ViewContext<Self>,
+        exited: Option<ExitedPane>,
+    ) -> Callback<String> {
+        let pane = self.tabs.active().and_then(AppTab::pane_id);
+        let mut cached = self.caret_menu_binding.borrow_mut();
+        if let Some(binding) = cached.as_ref()
+            && binding.pane == pane
+            && binding.exited == exited
+        {
+            return binding.on_click.clone();
+        }
+        // Reactor replaces a flyout when its callback changes. Keep the same
+        // callback while repainting the title bar for the same action target.
+        let on_click = context.callback(move |label: String| match label.as_str() {
+            folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
+                Message::FolderShare(folder_shares::Action::Open(id))
+            }),
+            scrollback_export::LABEL => Message::Export(scrollback_export::Action::Start(pane)),
+            RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
+            _ => tab_menu_message(label),
+        });
+        *cached = Some(CaretMenuBinding {
+            pane,
+            exited,
+            on_click: on_click.clone(),
+        });
+        on_click
+    }
+
     fn header_view(&self, context: &ViewContext<Self>) -> View {
+        let mut progress = BTreeMap::new();
+        for entry in self.tabs.entries() {
+            if let Page::Terminal(pane) = &entry.value.page {
+                let next = pane.session.events.progress();
+                if next != wezterm_term::Progress::None {
+                    let group = progress.entry(entry.group_id()).or_default();
+                    *group = taskbar::most_important(*group, next);
+                }
+            }
+        }
+        if let Some(hwnd) = self.keyboard.hwnd() {
+            let state = progress
+                .values()
+                .copied()
+                .fold(wezterm_term::Progress::None, taskbar::most_important);
+            self.taskbar.borrow_mut().show(hwnd, state);
+        }
         let tab_strip = TabView::new()
             .height(44.0)
             .width(
@@ -2175,30 +2492,15 @@ impl TerminalApp {
                     KeyedView::new(
                         self.tabs.group_id(tab.id).unwrap().to_string(),
                         TabViewItem::new()
-                            .header(self.tab_label(tab.id))
+                            .header(taskbar::tab_header(
+                                self.tab_label(tab.id),
+                                progress.get(&tab.group_id()).copied().unwrap_or_default(),
+                            ))
                             .tag(tab.id.to_string())
                             .is_closable(true),
                     )
                 }),
             );
-        let mut menu: Vec<_> = self
-            .profiles
-            .iter()
-            .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
-            .collect();
-        menu.extend(
-            self.local_profiles
-                .keys()
-                .map(|name| MenuItem::item(format!("local:{name}"), format!("{name} · Local"))),
-        );
-        if self.profile_error.is_some() {
-            menu.push(MenuItem::disabled("error", "Could not load profiles"));
-        }
-        menu.extend([
-            MenuItem::separator("profiles-end"),
-            MenuItem::item("new-profile", NEW_PROFILE),
-            MenuItem::item("lab", LAB),
-        ]);
         let plus = Button::new()
             .style(ButtonStyle::Subtle)
             .width(40.0)
@@ -2206,22 +2508,11 @@ impl TerminalApp {
             .automation_name("New tab")
             .content(TextBlock::new().text("+").font_size(22.0))
             // Reactor 0.100 cannot currently nest a Menu owner under a Tooltip wrapper.
-            .menu(Menu::new(menu, context.callback(Message::ProfileMenu)));
-        let player = self.tabs.active().and_then(|tab| match &tab.page {
-            Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
-            _ => None,
-        });
-        let can_edit = self.tabs.active().is_some_and(|tab| {
-            tab.profile_name().is_some_and(|name| {
-                self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
-            })
-        });
-        let workspace_startup = match self.tabs.active().map(|tab| &tab.page) {
-            Some(Page::Terminal(live)) if matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush) => {
-                MenuItem::item("workspace-startup", "Workspace startup…")
-            }
-            _ => MenuItem::disabled("workspace-startup", "Workspace startup…"),
-        };
+            .menu(Menu::new(
+                self.profile_items(),
+                context.callback(Message::ProfileMenu),
+            ));
+        let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2229,66 +2520,8 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                [
-                    self.pane_menu(),
-                    if self.tabs.active().and_then(AppTab::pane_id).is_some() {
-                        MenuItem::item("rename-tab", "Rename tab…")
-                    } else {
-                        MenuItem::disabled("rename-tab", "Rename tab…")
-                    },
-                    self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
-                    MenuItem::item("inbox", "Attention inbox"),
-                    MenuItem::item("paste", "Paste"),
-                    MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
-                    MenuItem::separator("paste-end"),
-                    MenuItem::item("settings", "Settings"),
-                    self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
-                    workspace_startup,
-                    self.discovery_menu(),
-                    state_menu_item(
-                        "inspector",
-                        "Terminal inspector",
-                        self.tabs
-                            .active()
-                            .and_then(AppTab::pane_id)
-                            .map(|_| self.show_inspector),
-                    ),
-                    state_menu_item(
-                        "fullscreen",
-                        "Fullscreen (F11)",
-                        Some(self.windows.borrow().fullscreen()),
-                    ),
-                    state_menu_item("mute", "Mute", player.as_ref().map(|p| p.mute)),
-                    state_menu_item(
-                        "game-mode",
-                        "Game mode (suppress key repeat)",
-                        player.as_ref().map(|p| p.game_mode),
-                    ),
-                    state_menu_item(
-                        "alternate-scroll",
-                        "Alternate-screen wheel keys",
-                        player.as_ref().map(|p| p.alternate_scroll_enabled()),
-                    ),
-                    state_menu_item(
-                        "remote-sounds",
-                        "Remote named sounds",
-                        player.as_ref().map(|p| p.remote_sounds_enabled()),
-                    ),
-                    state_menu_item(
-                        "sync-assets",
-                        "Remote asset synchronization",
-                        player.as_ref().map(|p| p.sync_assets_enabled()),
-                    ),
-                    MenuItem::separator("profile-actions"),
-                    if can_edit {
-                        MenuItem::item("edit-profile", "Edit current profile…")
-                    } else {
-                        MenuItem::disabled("edit-profile", "Edit current profile…")
-                    },
-                    MenuItem::item("enroll", "Enroll this device (at game prompt)"),
-                    MenuItem::item("forget-device", "Forget this device (revoke game key)"),
-                ],
-                context.callback(tab_menu_message),
+                self.caret_items(exited.is_some()),
+                self.caret_menu_callback(context, exited),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2316,6 +2549,131 @@ impl TerminalApp {
             )
     }
 
+    fn profile_items(&self) -> Vec<MenuItem> {
+        let mut menu: Vec<_> = self
+            .catalog
+            .profile_order
+            .iter()
+            .map(|name| {
+                if let Some(ssh) = self.catalog.profiles.get(name) {
+                    MenuItem::item(format!("profile:{name}"), profile_label(name, ssh))
+                } else {
+                    MenuItem::item(format!("local:{name}"), format!("{name} · Local"))
+                }
+            })
+            .collect();
+        if self.profile_error.is_some() {
+            menu.push(MenuItem::disabled("error", "Could not load profiles"));
+        }
+        menu.extend([
+            MenuItem::separator("profiles-end"),
+            MenuItem::item("new-profile", NEW_PROFILE),
+            MenuItem::item("lab", LAB),
+        ]);
+        menu
+    }
+
+    fn caret_items(&self, can_restart: bool) -> Vec<MenuItem> {
+        let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
+        let player = self.tabs.active().and_then(|tab| match &tab.page {
+            Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
+            _ => None,
+        });
+        let can_edit = self.tabs.active().is_some_and(|tab| {
+            tab.profile_name().is_some_and(|name| {
+                self.catalog.profiles.contains_key(name) || self.catalog.local.contains_key(name)
+            })
+        });
+        let device_ready = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
+            if !live.device_busy && live.session.prompts.current().is_none()
+            && live.session.frames.load().connection_generation > 0
+            && live.profile_name.as_ref().and_then(|name| self.catalog.profiles.get(name))
+                .is_some_and(|profile| profile.player.rustmush && profile.player.device_key.is_some()));
+        let workspace_startup = match self.tabs.active().map(|tab| &tab.page) {
+            Some(Page::Terminal(live)) if matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush) => {
+                MenuItem::item("workspace-startup", "Workspace startup…")
+            }
+            _ => MenuItem::disabled("workspace-startup", "Workspace startup…"),
+        };
+        vec![
+            self.binding_menu(
+                "command-palette",
+                "Command palette…",
+                KeyAction::CommandPalette,
+            ),
+            self.pane_menu(can_restart),
+            command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
+            self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
+            MenuItem::item("inbox", "Attention inbox"),
+            command_menu_item("paste", "Paste", can_paste),
+            command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
+            MenuItem::separator("paste-end"),
+            MenuItem::item("settings", "Settings"),
+            self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
+            workspace_startup,
+            self.discovery_menu(),
+            state_menu_item(
+                "inspector",
+                "Terminal inspector",
+                self.tabs
+                    .active()
+                    .and_then(AppTab::pane_id)
+                    .map(|_| self.show_inspector),
+            ),
+            state_menu_item(
+                "fullscreen",
+                "Fullscreen (F11)",
+                Some(self.windows.borrow().fullscreen()),
+            ),
+            state_menu_item("mute", "Mute", player.as_ref().map(|p| p.mute)),
+            state_menu_item(
+                "game-mode",
+                "Game mode (suppress key repeat)",
+                player.as_ref().map(|p| p.game_mode),
+            ),
+            state_menu_item(
+                "alternate-scroll",
+                "Alternate-screen wheel keys",
+                player.as_ref().map(|p| p.alternate_scroll_enabled()),
+            ),
+            state_menu_item(
+                "remote-sounds",
+                "Remote named sounds",
+                player.as_ref().map(|p| p.remote_sounds_enabled()),
+            ),
+            state_menu_item(
+                "sync-assets",
+                "Remote asset synchronization",
+                player.as_ref().map(|p| p.sync_assets_enabled()),
+            ),
+            MenuItem::separator("profile-actions"),
+            command_menu_item(
+                "shared-folders",
+                folder_shares::LABEL,
+                self.tabs
+                    .active()
+                    .and_then(AppTab::pane_id)
+                    .and_then(|pane| self.folder_authority(pane))
+                    .is_some(),
+            ),
+            if can_edit {
+                MenuItem::item("edit-profile", "Edit current profile…")
+            } else {
+                MenuItem::disabled("edit-profile", "Edit current profile…")
+            },
+            command_menu_item(
+                "enroll",
+                "Enroll this device (at game prompt)",
+                device_ready,
+            ),
+            command_menu_item(
+                "forget-device",
+                "Forget this device (revoke game key)",
+                device_ready,
+            ),
+        ]
+    }
+
     fn binding_menu(&self, key: &str, label: &str, action: KeyAction) -> MenuItem {
         let description = self
             .appearance
@@ -2326,7 +2684,7 @@ impl TerminalApp {
             .map_or_else(|| label.to_owned(), |chord| format!("{label}    {chord}"));
         MenuItem::item(key, description)
     }
-    fn pane_menu(&self) -> MenuItem {
+    fn pane_menu(&self, can_restart: bool) -> MenuItem {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
             return MenuItem::disabled("panes", "Panes");
         }
@@ -2345,7 +2703,13 @@ impl TerminalApp {
         let mut items = vec![
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            command_menu_item("restart-exited", RESTART_EXITED_PANE, can_restart),
             move_item,
+            if self.outgoing.is_none() && self.incoming.is_none() {
+                MenuItem::item("move-tab-window", "Move tab to new window")
+            } else {
+                MenuItem::disabled("move-tab-window", "Move tab to new window")
+            },
             self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
         ];
@@ -2359,6 +2723,16 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if matches!(live.source, Source::Ssh(_) | Source::Local(_)) {
+                items.push(MenuItem::item(
+                    "pane-read-only",
+                    if live.read_only.get() {
+                        "Disable read-only pane input"
+                    } else {
+                        "Enable read-only pane input"
+                    },
+                ));
+            }
             items.push(match live.session.frames.load().copy_output_unavailable() {
                 Some(why) => MenuItem::disabled(
                     "copy-last-output",
@@ -2367,11 +2741,21 @@ impl TerminalApp {
                 None => MenuItem::item("copy-last-output", "Copy last command output"),
             });
             items.push(MenuItem::item("command-history", "Command history"));
+            items.push(command_menu_item(
+                "save-scrollback",
+                scrollback_export::LABEL,
+                self.export.pending.is_none(),
+            ));
+            items.push(match live.session.events.command_watch() {
+                Some(true) => MenuItem::item("command-watch", "Cancel command notification"),
+                Some(false) => MenuItem::item("command-watch", "Notify when command finishes"),
+                None => MenuItem::disabled("command-watch", "Notify when command finishes"),
+            });
             if let Some(menu) = durable_view::pane_menu(live) {
                 items.push(menu);
             }
         }
-        if !self.profiles.is_empty() || !self.local_profiles.is_empty() {
+        if !self.catalog.profile_order.is_empty() {
             for (key, label) in [
                 ("right-profile", "Split right with"),
                 ("below-profile", "Split below with"),
@@ -2379,9 +2763,9 @@ impl TerminalApp {
                 items.push(MenuItem::submenu(
                     key,
                     format!("{label} profile"),
-                    self.profiles
-                        .keys()
-                        .chain(self.local_profiles.keys())
+                    self.catalog
+                        .profile_order
+                        .iter()
                         .map(|name| MenuItem::item(name.clone(), format!("{label} {name}"))),
                 ));
             }
@@ -2447,6 +2831,16 @@ impl TerminalApp {
         ];
         if draft.origin.editing().is_some() {
             fields.push(TextBlock::new().text("Connection changes apply to new sessions. Sound and game options update open tabs.").text_wrapping(TextWrapping::Wrap).into());
+            if let Some(pane) = self.folder_editor_target(draft) {
+                fields.push(
+                    Button::new()
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .on_click(context.callback(move |_| {
+                            Message::FolderShare(folder_shares::Action::Open(pane))
+                        }))
+                        .content(folder_shares::LABEL),
+                );
+            }
         }
         // Keep the feedback slot mounted so save/error messages do not remount inputs.
         if !draft.proxy_jump.is_empty() {
@@ -2742,24 +3136,24 @@ impl TerminalApp {
 }
 
 impl Component for TerminalApp {
-    type Input = Options;
+    type Input = WindowLaunch;
     type Message = Message;
 
-    fn create(options: &Options, context: &ComponentContext<Self>) -> Self {
+    fn create(input: &Self::Input, context: &ComponentContext<Self>) -> Self {
+        let options = &input.options;
+        let opening = &input.opening;
+        let moving = input.transfer.is_some();
         let sender = context.sender();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(Message::Shortcut(shortcut));
         })
         .expect("installing terminal input adapter");
+        let _native = keyboard.scope().enter();
         let store = ProfileStore::new(options.profiles_path.clone())
             .expect("resolving profile configuration path");
-        let (profiles, local_profiles, profile_error) = match store.catalog() {
-            Ok(p) => (p.profiles, p.local, None),
-            Err(e) => (
-                BTreeMap::new(),
-                LocalOptions::installed(),
-                Some(format!("{e:#}")),
-            ),
+        let (catalog, profile_error) = match store.catalog() {
+            Ok(catalog) => (catalog, None),
+            Err(error) => (Profiles::default(), Some(format!("{error:#}"))),
         };
         let label = options
             .initial_profile
@@ -2807,7 +3201,7 @@ impl Component for TerminalApp {
                 .expect("validated keyboard settings"),
         );
         let appearance = Arc::new(RwLock::new(appearance));
-        let grid = if options.cols.is_some() || options.rows.is_some() {
+        let grid = if !moving && (options.cols.is_some() || options.rows.is_some()) {
             Some((options.cols.unwrap_or(120), options.rows.unwrap_or(32)))
         } else {
             None
@@ -2833,14 +3227,14 @@ impl Component for TerminalApp {
             })
             .unwrap_or((1120.0, 760.0));
         let osc52 = appearance.read().unwrap().interaction.osc52;
-        if let Some(workspace) = &options.workspace {
+        if let Some(workspace) = opening.as_ref().map(|window| &window.layout) {
             workspace_view::append_resolved_workspace(
                 &mut tabs,
                 &workspace.layout,
                 workspace.sources.clone(),
                 osc52,
             );
-        } else {
+        } else if !moving {
             tabs.insert(
                 live_tab_sized(
                     label.clone(),
@@ -2853,7 +3247,7 @@ impl Component for TerminalApp {
                 .with_profile(options.initial_profile.clone()),
             );
             for name in &options.extra_profiles {
-                if let Some(source) = profile_source(&profiles, &local_profiles, name) {
+                if let Some(source) = catalog.source(name) {
                     tabs.insert(
                         live_tab_sized(name.clone(), source, size, osc52, None, None)
                             .with_profile(Some(name.clone())),
@@ -2869,9 +3263,16 @@ impl Component for TerminalApp {
                 Some(w11term::pane_layout::Layout::Leaf(_))
             )
         });
-        let registry = Registry::default();
+        let registry = input.transfer.as_ref().map_or_else(
+            || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
+            |transfer| transfer.registry.clone(),
+        );
         let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
+        let folder_messages = control_sender.clone();
+        let folder_wake = Arc::new(move || {
+            let _ = folder_messages.try_send(UiWork::FolderAuthority);
+        });
         let inbox = w11term::events::Inbox::new(move || {
             // If full, a control message will already wake the UI to read the latest count.
             let _ = wake.try_send(UiWork::AttentionChanged);
@@ -2886,20 +3287,49 @@ impl Component for TerminalApp {
             }
         });
         let capture_appearance = appearance.clone();
-        let control = Server::start(registry.clone(), move |frame, size, path| {
+        let capture: w11term::control::CapturePng = Arc::new(move |frame, size, path| {
             let appearance = capture_appearance.read().unwrap().clone();
             crate::renderer::screenshot_with_font(frame, size, path, &appearance)
-        })
-        .expect("starting local control pipe");
+        });
+        registry.set_capture(capture.clone());
+        let control = input.transfer.as_ref().map_or_else(
+            || {
+                Arc::new(
+                    Server::start(registry.clone(), move |frame, size, path| {
+                        capture(frame, size, path)
+                    })
+                    .expect("starting local control pipe"),
+                )
+            },
+            |transfer| transfer.server.clone(),
+        );
+        let active = registry.clone();
+        let sender = context.sender();
+        keyboard.on_activation(move |focused| {
+            if focused {
+                active.activate();
+                sender.send(Message::RefreshProfiles);
+            }
+        });
         let mut app = Self {
+            folder_wake,
             inbox,
+            taskbar: RefCell::default(),
             accessible: Default::default(),
             active_group: None,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
-            window_restored: options.cols.is_some() || options.rows.is_some(),
+            window_restored: moving || options.cols.is_some() || options.rows.is_some(),
             keyboard,
             _control: control,
+            window_launch: options.clone(),
+            opening: opening.clone(),
+            incoming: input.transfer.clone(),
+            outgoing: None,
+            window_timer: None,
+            native_bound: false,
+            window_error: None,
+            export: Default::default(),
             registry,
             control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
             control_task: None,
@@ -2907,6 +3337,8 @@ impl Component for TerminalApp {
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
+            caret_menu_binding: RefCell::new(None),
+            folder_panel_timer: None,
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
             inspection: None,
@@ -2915,10 +3347,10 @@ impl Component for TerminalApp {
             default_source: options.source.clone(),
             default_label: label,
             default_profile: options.initial_profile.clone(),
-            profiles,
-            local_profiles,
+            catalog,
             store,
             profile_error,
+            profile_move_error: None,
             width: client_size.0,
             window_height: client_size.1,
             client_size,
@@ -2937,11 +3369,16 @@ impl Component for TerminalApp {
             selection_pending: true,
             selection_epoch: 0,
         };
+        if let Some(transfer) = &app.incoming {
+            transfer.target.replace(Some(context.sender()));
+        }
+        app.arm_window_tick(context);
+        context.sender().send(Message::WindowTick);
         app.activate(context);
         app.watch_control(context);
         app.sync_selection(context);
         #[cfg(feature = "ui-smoke")]
-        if std::env::var_os("W11TERM_UI_SMOKE").is_some() {
+        if !moving && std::env::var_os("W11TERM_UI_SMOKE").is_some() {
             if let Some(fixture) = std::env::var_os("W11TERM_IMPORT_SMOKE") {
                 let expected = std::path::PathBuf::from(fixture).with_file_name("profiles.json");
                 assert_eq!(
@@ -2979,7 +3416,7 @@ impl Component for TerminalApp {
                 Message::Smoke(0)
             });
         }
-        if let Some(seconds) = options.smoke_seconds {
+        if !moving && let Some(seconds) = options.smoke_seconds {
             context.spawn_background(move |_| {
                 std::thread::sleep(std::time::Duration::from_secs(seconds.min(30)));
                 Message::CloseWindow
@@ -2989,9 +3426,12 @@ impl Component for TerminalApp {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        let _native = self.keyboard.scope().enter();
         if !matches!(
             &message,
             Message::FrameReady(..)
+                | Message::FolderShare(folder_shares::Action::Panel(..))
+                | Message::RefreshProfiles
                 | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
@@ -3011,14 +3451,60 @@ impl Component for TerminalApp {
         ) {
             self.header.borrow_mut().take();
         }
-        if matches!(&message, Message::Control(_) | Message::AttentionChanged) {
-            self.inbox.acknowledge_wake();
+        if matches!(
+            &message,
+            Message::Control(_) | Message::AttentionChanged | Message::FolderAuthority
+        ) {
+            if self.inbox.acknowledge_wake()
+                && let Some(hwnd) = self.keyboard.hwnd()
+            {
+                attention::flash_background_window(hwnd);
+            }
+            self.refresh_open_commands();
             self.watch_control(context);
         }
+        let message = match message {
+            Message::Control(request) => match self.registry.for_this_window(request) {
+                Some(request) => Message::Control(request),
+                None => return,
+            },
+            other => other,
+        };
         match message {
+            Message::FolderShare(action) => self.folder_action(action, context),
+            Message::RestartExited(exit) => {
+                // A native menu may still be delivering a callback for a previous exit or pane.
+                if let Some(id) = self.tab_for_pane(exit.pane)
+                    && let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    && live.session.events.restart_token() == Some(exit.token)
+                {
+                    match live.session.restart_exited(exit.token) {
+                        Ok(()) => live.reset_transport_input(&self.keyboard),
+                        Err(error) => {
+                            self.window_error =
+                                Some(format!("Could not restart pane {}: {error:#}", exit.pane));
+                        }
+                    }
+                }
+                self.refresh_open_commands();
+            }
+            Message::Export(action) => {
+                self.export_scrollback(action, context);
+                self.refresh_open_commands();
+            }
+            Message::DismissWindowError => self.window_error = None,
+            Message::MoveTabToWindow => self.move_tab_window(context),
+            Message::WindowTick => self.window_tick(context),
+            Message::TransferReady(id) => self.offer_group(id, context),
+            Message::TransferClaim(id) => self.claim_group(id, context),
+            Message::TransferDone(id) => self.finish_transfer(id, context),
+            Message::TransferCanceled(id) => self.cancel_transfer(id, context),
             Message::TabTitle(action) => self.edit_tab_title(action),
             Message::Attention(action) => self.handle_attention(action, context),
-            Message::AttentionChanged => {}
+            Message::AttentionChanged | Message::FolderAuthority => {}
             Message::ToggleInspector => {
                 self.show_inspector = !self.show_inspector;
                 self.sync_inspector();
@@ -3038,6 +3524,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::History(action) => self.handle_history(action, context),
+            Message::PaletteChoose(id) => self.choose_command(id, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
@@ -3100,7 +3587,7 @@ impl Component for TerminalApp {
                         let profile = tab
                             .profile_name
                             .as_ref()
-                            .and_then(|name| self.profiles.get(name))
+                            .and_then(|name| self.catalog.profiles.get(name))
                             .context("Use a saved Rustmush profile")?;
                         anyhow::ensure!(
                             profile.player.rustmush,
@@ -3167,6 +3654,7 @@ impl Component for TerminalApp {
                                 let label =
                                     tab.profile_name.as_ref().context("profile was removed")?;
                                 let mut profile = self
+                                    .catalog
                                     .profiles
                                     .get(label)
                                     .context("profile was removed")?
@@ -3184,7 +3672,7 @@ impl Component for TerminalApp {
                                 };
                                 profile.authentication = auth.clone();
                                 self.store.update(label, &profile)?;
-                                self.profiles.insert(label.clone(), profile);
+                                self.catalog.profiles.insert(label.clone(), profile);
                                 auth_update = Some((label.clone(), auth));
                                 Ok(())
                             })();
@@ -3208,6 +3696,7 @@ impl Component for TerminalApp {
                         self.keyboard.set_target(Some((
                             tab.session.input.clone(),
                             tab.session.frames.clone(),
+                            tab.read_only.clone(),
                         )));
                     }
                 }
@@ -3254,7 +3743,7 @@ impl Component for TerminalApp {
                         .clone()
                         .filter(|_| matches!(tab.source, Source::Ssh(_)))
                     {
-                        if let Some(profile) = self.profiles.get_mut(&name) {
+                        if let Some(profile) = self.catalog.profiles.get_mut(&name) {
                             profile.player = preferences.clone();
                             if let Err(error) = self.store.update(&name, profile) {
                                 log::warn!("Saving player preferences: {error:#}");
@@ -3319,7 +3808,9 @@ impl Component for TerminalApp {
                 reply,
             }) => {
                 let result = (|| -> anyhow::Result<serde_json::Value> {
-                    let source = profile_source(&self.profiles, &self.local_profiles, &profile)
+                    let source = self
+                        .catalog
+                        .source(&profile)
                         .with_context(|| format!("unknown profile {profile}"))?;
                     let metrics = self.metrics.get();
                     let explicit_grid = cols.is_some() || rows.is_some();
@@ -3607,6 +4098,7 @@ impl Component for TerminalApp {
             Message::FrameReady(id, epoch) => {
                 if self.tabs.visible(id) && self.watch_epoch == epoch {
                     self.frame_tasks.remove(&id);
+                    let active = self.tabs.active_id() == Some(id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -3634,6 +4126,9 @@ impl Component for TerminalApp {
                         }
                         tab.error = None;
                         tab.files.observe_connection(frame.connection_generation);
+                        if active {
+                            tab.follow_shell_directory(&frame, context);
+                        }
                         let unavailable = frame.copy_output_unavailable();
                         if tab.copy_output_unavailable != unavailable {
                             tab.copy_output_unavailable = unavailable;
@@ -3646,7 +4141,7 @@ impl Component for TerminalApp {
                             self.header.borrow_mut().take();
                         }
                     }
-                    if self.tabs.active_id() == Some(id) {
+                    if active {
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
@@ -3698,6 +4193,20 @@ impl Component for TerminalApp {
                 let _ = context.window().request_close();
             }
             Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::SetPaneReadOnly(enabled) => {
+                if let Some(id) = self.tabs.active_id()
+                    && let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    && matches!(live.source, Source::Ssh(_) | Source::Local(_))
+                {
+                    KeyboardBridge::set_read_only(&live.session.input, &live.read_only, enabled);
+                    live.remote_mouse = RemoteMouse::default();
+                    live.surface.invalidator.invalidate();
+                    self.publish_panes();
+                }
+            }
             Message::PaneRatio(epoch, path, ratio) => {
                 if epoch == self.watch_epoch && self.dragging_divider(epoch, &path) {
                     self.tabs.set_ratio(&path, ratio);
@@ -3774,6 +4283,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
                 Shortcut::MovePaneToExistingTab => self.open_move_picker(context),
                 Shortcut::PickerPlace(side) => {
@@ -3817,6 +4327,9 @@ impl Component for TerminalApp {
                 Shortcut::BeginResize => {
                     self.initial_grid.set(None);
                 }
+                Shortcut::TaskbarCreated => {
+                    self.taskbar.borrow_mut().shell_restarted();
+                }
                 Shortcut::RememberWindow => {
                     if let Some(name) = &self.window_profile {
                         let _ = self.windows.borrow_mut().remember(name);
@@ -3856,7 +4369,7 @@ impl Component for TerminalApp {
                     self.default_label.clone(),
                     self.default_profile
                         .as_ref()
-                        .and_then(|name| profile_source(&self.profiles, &self.local_profiles, name))
+                        .and_then(|name| self.catalog.source(name))
                         .unwrap_or_else(|| self.default_source.clone()),
                     self.default_profile.clone(),
                     context,
@@ -3879,6 +4392,7 @@ impl Component for TerminalApp {
                 } else if label == LAB {
                     self.open(LAB.into(), Source::Demo, None, context);
                 } else if let Some((name, profile)) = self
+                    .catalog
                     .profiles
                     .iter()
                     .find(|(name, ssh)| profile_label(name, ssh) == label)
@@ -3886,7 +4400,7 @@ impl Component for TerminalApp {
                 {
                     self.open(name.clone(), Source::Ssh(profile), Some(name), context);
                 } else if let Some(name) = label.strip_suffix(" · Local")
-                    && let Some(shell) = self.local_profiles.get(name)
+                    && let Some(shell) = self.catalog.local.get(name)
                 {
                     self.open(
                         name.into(),
@@ -3918,16 +4432,44 @@ impl Component for TerminalApp {
                     .and_then(AppTab::profile_name)
                     .map(str::to_owned)
                 {
-                    if self.profiles.contains_key(&name) {
+                    if self.catalog.profiles.contains_key(&name) {
                         self.edit_profile(name, context);
-                    } else if self.local_profiles.contains_key(&name) {
+                    } else if self.catalog.local.contains_key(&name) {
                         self.local_profile_action(local_profile::Action::Open(Some(name)), context);
                     }
                 }
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
-            Message::SettingsMenu => self.utility(true, context),
+            Message::RefreshProfiles => {
+                self.refresh_profiles();
+                for entry in self.tabs.entries() {
+                    if let Page::Terminal(live) = &entry.value.page
+                        && let Some(shares) = &live.folder_sharing
+                    {
+                        shares.refresh_profile();
+                    }
+                }
+            }
+            Message::MoveProfile(name, delta, order) => {
+                match self.store.move_profile(&name, delta, &order) {
+                    Ok(catalog) => {
+                        self.catalog = catalog;
+                        self.profile_error = None;
+                        self.profile_move_error = None;
+                    }
+                    Err(error) => {
+                        self.refresh_profiles();
+                        self.profile_move_error = Some(format!(
+                            "Could not move {name}: {error:#}. Review the current order and try again."
+                        ));
+                    }
+                }
+            }
+            Message::SettingsMenu => {
+                self.refresh_profiles();
+                self.utility(true, context);
+            }
             Message::LocalProfile(action) => self.local_profile_action(action, context),
             Message::Workspace(action) => self.workspace_action(action, context),
             Message::ImportConfig(action) => self.import_action(action, context),
@@ -3999,11 +4541,7 @@ impl Component for TerminalApp {
                 }) = self.tabs.get_mut(id)
                     && tab.gesture == gesture
                 {
-                    if let Some(selection) = tab.selection.borrow_mut().as_mut() {
-                        selection.dragging = false;
-                    }
-                    tab.scroll_direction = 0;
-                    tab.clicked_link = None;
+                    tab.end_pointer_gesture();
                 }
             }
             Message::DividerPress(epoch, path, coordinate) => {
@@ -4189,16 +4727,14 @@ impl Component for TerminalApp {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get_mut(id)
-                    && tab.find.query != text
+                    && tab.find.open
                 {
-                    if text.len() > 4096 {
-                        let mut end = 4096;
-                        while !text.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        text.truncate(end);
+                    Find::limit_query(&mut text, tab.find.regex);
+                    if tab.find.query == text {
+                        return;
                     }
                     tab.find.query = text;
+                    tab.find.pending = true;
                     tab.find.epoch += 1;
                     let epoch = tab.find.epoch;
                     context.spawn_background(move |_| {
@@ -4207,16 +4743,24 @@ impl Component for TerminalApp {
                     });
                 }
             }
-            Message::FindCase(id, sensitive) => {
+            Message::FindOption(id, option, enabled) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
                 }) = self.tabs.get_mut(id)
+                    && tab.find.open
                 {
-                    tab.find.sensitive = sensitive;
+                    let flag = match option {
+                        FindOption::Case => &mut tab.find.sensitive,
+                        FindOption::Regex => &mut tab.find.regex,
+                    };
+                    if *flag == enabled {
+                        return;
+                    }
+                    *flag = enabled;
+                    Find::limit_query(&mut tab.find.query, tab.find.regex);
                     tab.find.epoch += 1;
-                    let epoch = tab.find.epoch;
-                    self.apply_find(id, epoch);
+                    tab.find.apply(&tab.session);
                 }
             }
             Message::FindApply(id, epoch) => self.apply_find(id, epoch),
@@ -4258,7 +4802,8 @@ impl Component for TerminalApp {
         }
     }
 
-    fn view(&self, _options: &Options, context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
+        let _native = self.keyboard.scope().enter();
         if let Some(AppTab {
             label,
             page: Page::Terminal(tab),
@@ -4304,7 +4849,11 @@ impl Component for TerminalApp {
             .tabs
             .active_id()
             .map_or("Terminal", |id| self.tab_label(id));
-        context.window_title(format!("w11term · {title}"));
+        if self.keyboard.hwnd().is_some() {
+            context.window_title(format!("w11term · {title}"));
+        } else {
+            context.window_title(self.keyboard.bootstrap_title());
+        }
         context.window_visuals(
             WindowVisuals::new()
                 .client_size(self.client_size.0, self.client_size.1)
@@ -4333,6 +4882,7 @@ impl Component for TerminalApp {
                 Page::Settings(None) => self.settings_view(context),
                 Page::Attention => self.attention_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
+                Page::SharedFolders(page) => self.folder_panel_view(page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,
@@ -4350,6 +4900,8 @@ impl Component for TerminalApp {
                 Page::ImportConfig(page) => self.import_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
             }
+        } else if self.incoming.is_some() || self.outgoing.is_some() {
+            TextBlock::new().text("Moving tab…").margin(16.0).into()
         } else {
             Border::new().into()
         };
@@ -4363,6 +4915,30 @@ impl Component for TerminalApp {
             ),
             KeyedView::new("content", Border::new().grid_row(1).content(content)),
         ];
+        if let Some(message) = &self.window_error {
+            views.push(KeyedView::new(
+                "window-error",
+                Button::new()
+                    .grid_row(1)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .on_click(context.callback(|_| Message::DismissWindowError))
+                    .content(format!("{message}  ·  Dismiss")),
+            ));
+        }
+        if let Some(message) = &self.export.status {
+            views.push(KeyedView::new(
+                "scrollback-export-status",
+                Button::new()
+                    .grid_row(1)
+                    .automation_name(message)
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .on_click(
+                        context.callback(|_| Message::Export(scrollback_export::Action::Dismiss)),
+                    )
+                    .content(format!("{message}  ·  Dismiss")),
+            ));
+        }
         if let Some(inspection) = &self.inspection
             && self.hints.borrow().is_none()
             && self.copy_mode.borrow().is_none()
@@ -4429,6 +5005,16 @@ impl Component for TerminalApp {
         }
         if let Some(editor) = &self.title_editor {
             views.push(KeyedView::new("rename-tab", editor.view(context)));
+        }
+        if let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.active()
+            && self.title_editor.is_none()
+            && tab.session.frames.load().prompt.is_none()
+            && let Some(dialog) = tab.files.name_dialog(tab.session.pane_id, context)
+        {
+            views.push(KeyedView::new("sftp-name-editor", dialog));
         }
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {
@@ -4774,8 +5360,8 @@ impl TerminalApp {
                     panic!()
                 };
                 assert!(draft.saved, "{:?}", draft.error);
-                assert!(self.profiles.contains_key("corrected"));
-                assert!(!self.profiles.contains_key("typo"));
+                assert!(self.catalog.profiles.contains_key("corrected"));
+                assert!(!self.catalog.profiles.contains_key("typo"));
                 assert_eq!(self.tabs.get(1).unwrap().profile_name(), Some("corrected"));
                 assert_eq!(self.tabs.get(1).unwrap().label, "corrected");
                 let count = self.tabs.entries().len();
@@ -4823,7 +5409,8 @@ impl TerminalApp {
                 );
                 self.update(Message::SaveProfileOnly(copy), context);
                 assert!(
-                    self.profiles.contains_key("corrected") && self.profiles.contains_key("second")
+                    self.catalog.profiles.contains_key("corrected")
+                        && self.catalog.profiles.contains_key("second")
                 );
                 assert_eq!(
                     self.store.load().unwrap()["second"].terminal_type.as_str(),
@@ -4852,11 +5439,11 @@ impl TerminalApp {
                 }).expect("save-and-connect pane is connected to the loopback peer");
                 let pane = existing.value.pane_id().unwrap();
                 let entry = existing.id;
-                let options = self.profiles["corrected"].clone();
+                let options = self.catalog.profiles["corrected"].clone();
                 self.update(Message::ConfirmDeleteProfile(editor, true), context);
-                assert!(!self.profiles.contains_key("corrected"));
+                assert!(!self.catalog.profiles.contains_key("corrected"));
                 self.store.add("corrected", &options).unwrap();
-                self.profiles = self.store.load().unwrap();
+                self.catalog = self.store.catalog().unwrap();
                 let Page::Terminal(live) = &self.tabs.get(entry).unwrap().page else {
                     panic!("connection was closed")
                 };
@@ -4932,6 +5519,18 @@ impl TerminalApp {
                 let prompt = tab.session.prompts.current().unwrap();
                 assert_eq!(tab.prompt_id, Some(prompt.id));
                 assert!(!self.keyboard.has_target());
+                let pane = tab.session.pane_id;
+                self.update(Message::MoveTabToWindow, context);
+                assert!(
+                    self.outgoing.is_none(),
+                    "a pending SSH prompt opened another window"
+                );
+                assert_eq!(self.tab_for_pane(pane), Some(1));
+                assert!(
+                    self.window_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("SSH prompt"))
+                );
                 self.update(
                     tab_menu_message("Move pane to existing tab…".into()),
                     context,
@@ -5132,6 +5731,58 @@ impl TerminalApp {
             std::thread::sleep(Duration::from_millis(400));
             Message::Smoke(step + 1)
         });
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::Find;
+    use w11term::search::{MAX_QUERY_BYTES, SearchSnapshot};
+
+    #[test]
+    fn oversized_regex_retains_one_complete_overflowing_character() {
+        let prefix = "a".repeat(MAX_QUERY_BYTES - 1);
+        let mut regex = format!("{prefix}🦀rest");
+        let mut literal = regex.clone();
+        Find::limit_query(&mut regex, true);
+        Find::limit_query(&mut literal, false);
+        assert_eq!(regex, format!("{prefix}🦀"));
+        assert_eq!(literal, prefix);
+    }
+
+    #[test]
+    fn status_ignores_an_earlier_query_or_option_during_debounce() {
+        let find = Find {
+            query: "abc".into(),
+            regex: true,
+            sensitive: true,
+            ..Find::default()
+        };
+        let result = SearchSnapshot {
+            query: find.query.clone(),
+            regex: true,
+            sensitive: true,
+            total: 3,
+            selected: Some(0),
+            ..SearchSnapshot::default()
+        };
+        assert_eq!(find.status(Some(&result)), "1 / 3");
+        for stale in [
+            SearchSnapshot {
+                query: "ab".into(),
+                ..result.clone()
+            },
+            SearchSnapshot {
+                regex: false,
+                ..result.clone()
+            },
+            SearchSnapshot {
+                sensitive: false,
+                ..result
+            },
+        ] {
+            assert_eq!(find.status(Some(&stale)), "Searching…");
+        }
     }
 }
 

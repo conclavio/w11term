@@ -60,7 +60,8 @@ impl TerminalApp {
             }
             1 => {
                 let mut shell = self
-                    .local_profiles
+                    .catalog
+                    .local
                     .get("Windows PowerShell")
                     .unwrap()
                     .clone();
@@ -70,7 +71,7 @@ impl TerminalApp {
                 self.store
                     .save_local(None, "Fixture PowerShell", &shell)
                     .unwrap();
-                self.local_profiles = self.store.catalog().unwrap().local;
+                self.catalog = self.store.catalog().unwrap();
                 self.update(
                     tab_menu_message("Split right with Fixture PowerShell".into()),
                     context,

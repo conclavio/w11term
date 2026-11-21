@@ -5,7 +5,7 @@ use super::{
     transport::{Driver, Event, OpenShell},
 };
 use crate::{
-    durable::{DiscoveredSession, DurableReference},
+    durable::{Backend, DiscoveredSession, DurableReference, tmux},
     options::SshOptions,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -49,6 +49,7 @@ pub enum DurableAction {
 
 #[derive(Clone, Debug)]
 pub struct DurableState {
+    pub herdr_browser: bool,
     pub phase: DurablePhase,
     pub reference: Option<DurableReference>,
     pub detail: String,
@@ -59,7 +60,14 @@ impl DurableState {
         use DurableAction::*;
         use DurablePhase::*;
         match action {
-            Refresh => self.phase == Choosing,
+            Refresh => {
+                self.phase == Choosing
+                    || (matches!(self.phase, Detached | Missing | Unavailable | Failed)
+                        && self
+                            .reference
+                            .as_ref()
+                            .is_some_and(|r| r.backend != Backend::Zmx))
+            }
             Choose(reference) => {
                 self.phase == Choosing && self.candidates.iter().any(|s| s.reference == reference)
             }
@@ -68,7 +76,22 @@ impl DurableState {
                 matches!(self.phase, Detached | Missing | Failed | Unavailable)
                     && self.reference.is_some()
             }
-            End => matches!(self.phase, Attached | Detached) && self.reference.is_some(),
+            End => {
+                matches!(self.phase, Attached | Detached)
+                    && self
+                        .reference
+                        .as_ref()
+                        .is_some_and(|r| r.backend == Backend::Zmx)
+            }
+            UseDirectShell | StartNew if self.herdr_browser => false,
+            StartNew
+                if self
+                    .reference
+                    .as_ref()
+                    .is_some_and(|r| r.backend != Backend::Zmx) =>
+            {
+                false
+            }
             StartNew | UseDirectShell => {
                 matches!(self.phase, Missing | Unavailable | Ended | Failed)
             }
@@ -100,11 +123,14 @@ pub(crate) struct Worker {
 pub(crate) enum Start {
     Attach(Option<DurableReference>),
     Discover,
+    DiscoverHerdr,
 }
 impl DurableControl {
     pub(crate) fn new(start: Start) -> (Self, Worker) {
+        let herdr_browser = matches!(&start, Start::DiscoverHerdr)
+            || matches!(&start, Start::Attach(Some(r)) if r.backend == Backend::Herdr);
         let (phase, reference, detail) = match start {
-            Start::Discover => (
+            Start::Discover | Start::DiscoverHerdr => (
                 DurablePhase::Discovering,
                 None,
                 "Looking for remote sessions…",
@@ -116,6 +142,7 @@ impl DurableControl {
             ),
         };
         let model = Model(Arc::new(Mutex::new(DurableState {
+            herdr_browser,
             phase,
             reference,
             detail: detail.into(),
@@ -148,6 +175,7 @@ impl DurableControl {
             .context("A durable shell action is already pending or the pane has closed")?;
         if refreshing {
             state.candidates = Arc::new([]);
+            state.reference = None;
         }
         state.phase = if refreshing {
             DurablePhase::Discovering
@@ -178,6 +206,12 @@ pub(super) enum Program {
     End(Model),
 }
 impl Program {
+    pub(super) fn herdr_reference(&self) -> Option<DurableReference> {
+        match self {
+            Self::Attach(model) => model.reference().filter(|r| r.backend == Backend::Herdr),
+            _ => None,
+        }
+    }
     pub(super) fn peer_fingerprint(&self) -> Option<String> {
         match self {
             Self::Attach(model) | Self::End(model) => model.reference().map(|r| r.host_key),
@@ -240,6 +274,15 @@ impl Program {
                     "Saved durable reference belongs to a different SSH host, key or account",
                 ));
             }
+            if reference.backend == Backend::Tmux {
+                ensure!(
+                    matches!(self, Self::Attach(_)),
+                    "Existing tmux sessions can only be attached"
+                );
+                let target = tmux::Target::parse(&reference.name, &reference.generation)
+                    .context("Invalid tmux session reference")?;
+                return attach_tmux(shell, &options, size, target).await;
+            }
         }
         check_version(&shell.link).await?;
         let create = saved.is_none();
@@ -275,41 +318,7 @@ impl Program {
         } else {
             format!("zmx attach {} /bin/false", reference.name)
         };
-        let channel = shell.channel.channel();
-        super::transport::request_terminal(channel, &options, size).await?;
-        channel.exec(true, attach).await?;
-        let mut early = Vec::new();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let mut pending = 2;
-            while pending > 0 {
-                match channel.wait().await {
-                    Some(ChannelMsg::Success) => pending -= 1,
-                    Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
-                        ensure!(
-                            early.len() + data.len() <= 1024 * 1024,
-                            failure(
-                                Failed,
-                                "Too much unverified terminal output before attachment"
-                            )
-                        );
-                        early.extend_from_slice(&data);
-                    }
-                    Some(
-                        ChannelMsg::Failure | ChannelMsg::ExitStatus { .. } | ChannelMsg::Close,
-                    ) => {
-                        return Err(failure(
-                            Unavailable,
-                            "The remote server refused the zmx terminal or exec request",
-                        ));
-                    }
-                    None => bail!("SSH channel closed during durable attachment"),
-                    _ => {}
-                }
-            }
-            Ok(())
-        })
-        .await
-        .context("SSH durable startup timed out")??;
+        let early = exec_pty(shell, &options, size, attach).await?;
         // Exec success precedes starting the remote process. A new daemon may
         // briefly be absent, but a mismatched nonempty label is definitive.
         for attempt in 0..20 {
@@ -329,9 +338,111 @@ impl Program {
     }
 }
 
-struct CommandResult {
-    status: u32,
-    stdout: Vec<u8>,
+async fn exec_pty(
+    shell: &mut OpenShell,
+    options: &SshOptions,
+    size: TerminalSize,
+    command: String,
+) -> Result<Vec<u8>> {
+    use DurablePhase::*;
+    let channel = shell.channel.channel();
+    super::transport::request_terminal(channel, options, size).await?;
+    channel.exec(true, command).await?;
+    let mut early = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut pending = 2;
+        while pending > 0 {
+            match channel.wait().await {
+                Some(ChannelMsg::Success) => pending -= 1,
+                Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
+                    ensure!(
+                        early.len() + data.len() <= 1024 * 1024,
+                        failure(
+                            Failed,
+                            "Too much unverified terminal output before attachment"
+                        )
+                    );
+                    early.extend_from_slice(&data);
+                }
+                Some(ChannelMsg::Failure | ChannelMsg::ExitStatus { .. } | ChannelMsg::Close) => {
+                    return Err(failure(
+                        Unavailable,
+                        "The remote server refused the terminal or exec request",
+                    ));
+                }
+                None => bail!("SSH channel closed during durable attachment"),
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+    .await
+    .context("SSH durable startup timed out")??;
+    Ok(early)
+}
+
+async fn attach_tmux(
+    shell: &mut OpenShell,
+    options: &SshOptions,
+    size: TerminalSize,
+    target: tmux::Target,
+) -> Result<Vec<u8>> {
+    use DurablePhase::*;
+    let mut early = exec_pty(shell, options, size, target.attach()).await?;
+    let channel = shell.channel.channel();
+    let link = &shell.link;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let client = loop {
+            if let Some(end) = early.iter().position(|b| *b == b'\n') {
+                let header = std::str::from_utf8(&early[..end])?.trim_end_matches('\r');
+                let pid = header.parse::<u32>().ok().filter(|pid| *pid != 0 && pid.to_string() == header)
+                    .context("Invalid tmux client PID on the SSH terminal")?;
+                early.drain(..=end);
+                break pid;
+            }
+            ensure!(early.len() <= 32, "Missing tmux client PID on the SSH terminal");
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => early.extend_from_slice(&data),
+                Some(ChannelMsg::ExtendedData { .. } | ChannelMsg::ExitStatus { .. } | ChannelMsg::Close) | None =>
+                    return Err(failure(Unavailable, "Unable to launch tmux on this SSH account")),
+                _ => {}
+            }
+        };
+        // An SSH exec acknowledgement only means the login shell accepted the
+        // command. Withhold input and rendering until this particular tmux
+        // client appears on the selected generation, even on a busy server.
+        let check = async {
+            loop {
+                let clients = bounded_command(link, &target.clients(), 1024 * 1024).await?;
+                if clients.status != 0 {
+                    return Err(failure(Missing, "The selected tmux session is no longer available"));
+                }
+                if target.attached(client, &clients.stdout) { return Ok::<_, anyhow::Error>(()); }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::pin!(check);
+        loop {
+            tokio::select! {
+                result = &mut check => { result?; return Ok(early); }
+                message = channel.wait() => match message {
+                    Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
+                        ensure!(early.len() + data.len() <= 1024 * 1024, "Too much output before tmux attachment");
+                        early.extend_from_slice(&data);
+                    }
+                    Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::Close) | None =>
+                        return Err(failure(Missing, "tmux could not attach the selected session. Check that it still exists.")),
+                    _ => {}
+                }
+            }
+        }
+    }).await.map_err(|_| failure(Unavailable, "Timed out verifying the tmux attachment"))?
+}
+
+pub(super) struct CommandResult {
+    pub(super) status: u32,
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
 }
 
 fn compatible_version(output: &[u8]) -> bool {
@@ -367,7 +478,7 @@ fn compatible_version(output: &[u8]) -> bool {
 async fn command(link: &ConnectionShare, text: &str) -> Result<CommandResult> {
     bounded_command(link, text, 8192).await
 }
-async fn bounded_command(
+pub(super) async fn bounded_command(
     link: &ConnectionShare,
     text: &str,
     limit: usize,
@@ -386,6 +497,7 @@ async fn bounded_command(
         let channel = guard.channel();
         channel.exec(true, text).await?;
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut size = 0usize;
         let mut status = None;
         loop {
@@ -396,13 +508,18 @@ async fn bounded_command(
                         stdout.extend_from_slice(&data);
                     }
                 }
-                Some(ChannelMsg::ExtendedData { data, .. }) => size += data.len(),
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    size += data.len();
+                    if size <= limit {
+                        stderr.extend_from_slice(&data);
+                    }
+                }
                 Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
                 Some(ChannelMsg::Close) | None => break,
                 Some(ChannelMsg::Failure) => {
                     return Err(failure(
                         DurablePhase::Unavailable,
-                        "The SSH server refused a zmx command",
+                        "The SSH server refused the session command",
                     ));
                 }
                 _ => {}
@@ -411,16 +528,20 @@ async fn bounded_command(
                 size <= limit,
                 failure(
                     DurablePhase::Unavailable,
-                    "Unexpected output from remote zmx command"
+                    "Unexpected output from remote session command"
                 )
             );
         }
         let status =
             status.context("SSH command channel closed before reporting an exit status")?;
-        Ok(CommandResult { status, stdout })
+        Ok(CommandResult {
+            status,
+            stdout,
+            stderr,
+        })
     })
     .await
-    .context("Timed out waiting for the remote zmx command")?
+    .context("Timed out waiting for the remote session command")?
 }
 async fn check_version(link: &ConnectionShare) -> Result<()> {
     let version = command(link, "zmx version").await?;
@@ -440,7 +561,7 @@ async fn check_version(link: &ConnectionShare) -> Result<()> {
     );
     Ok(())
 }
-pub(super) async fn discover(
+async fn discover_zmx(
     link: &ConnectionShare,
     options: &SshOptions,
 ) -> Result<Vec<DiscoveredSession>> {
@@ -451,6 +572,78 @@ pub(super) async fn discover(
         "zmx could not list sessions on this account"
     );
     crate::durable::parse_listing(&listing.stdout, options, link.fingerprint())
+}
+
+async fn discover_tmux(
+    link: &ConnectionShare,
+    options: &SshOptions,
+) -> Result<Vec<DiscoveredSession>> {
+    let listing = bounded_command(link, tmux::LIST, 1024 * 1024).await?;
+    if listing.status != 0 {
+        let stderr = String::from_utf8_lossy(&listing.stderr);
+        if listing.status == 1
+            && (stderr.starts_with("no server running on ")
+                || stderr.trim() == "no sessions"
+                || (stderr.starts_with("error connecting to ")
+                    && stderr.trim_end().ends_with("(No such file or directory)")))
+        {
+            return Ok(Vec::new());
+        }
+        ensure!(listing.status != 127, "tmux is unavailable on this account");
+        bail!(
+            "tmux could not list sessions on the default socket (exit {})",
+            listing.status
+        );
+    }
+    Ok(tmux::parse_listing(&listing.stdout)
+        .map_err(anyhow::Error::msg)?
+        .into_iter()
+        .map(|entry| DiscoveredSession {
+            reference: DurableReference {
+                backend: Backend::Tmux,
+                host: options.host.clone(),
+                port: options.port,
+                user: options.user.clone(),
+                host_key: link.fingerprint().into(),
+                name: entry.target.name(),
+                generation: entry.target.generation(),
+            },
+            display_name: entry.name,
+            windows: Some(entry.windows),
+            clients: entry.clients,
+            directory: String::new(),
+            command: String::new(),
+        })
+        .collect())
+}
+
+pub(super) async fn discover(
+    link: &ConnectionShare,
+    options: &SshOptions,
+) -> (Vec<DiscoveredSession>, String) {
+    let mut entries = Vec::new();
+    let mut notices = Vec::new();
+    // Probe sequentially so an SSH account that allows only one command
+    // channel at a time can still browse either installed backend.
+    for result in [
+        discover_zmx(link, options).await,
+        discover_tmux(link, options).await,
+    ] {
+        match result {
+            Ok(sessions) => entries.extend(sessions),
+            Err(err) => notices.push(format!("{err:#}")),
+        }
+    }
+    let detail = match entries.len() {
+        0 if !notices.is_empty() => format!(
+            "No compatible remote sessions found. {}",
+            notices.join(". ")
+        ),
+        0 => "No compatible remote sessions found".into(),
+        1 => "1 remote session".into(),
+        count => format!("{count} remote sessions"),
+    };
+    (entries, detail)
 }
 async fn read_generation(
     link: &ConnectionShare,
@@ -486,13 +679,10 @@ impl Worker {
             if let Some(program) = next.take() {
                 let execute = async {
                     if matches!(program, Program::Discover) {
-                        let entries = driver.discover_sessions().await?;
+                        let herdr = self.model.0.lock().unwrap().herdr_browser;
+                        let (entries, detail) = driver.discover_sessions(herdr).await?;
                         let mut state = self.model.0.lock().unwrap();
-                        state.detail = match entries.len() {
-                            0 => "No compatible remote sessions found".into(),
-                            1 => "1 remote session".into(),
-                            count => format!("{count} remote sessions"),
-                        };
+                        state.detail = detail;
                         state.candidates = entries.into();
                         state.phase = Choosing;
                         Ok(())

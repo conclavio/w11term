@@ -195,6 +195,7 @@ async fn request(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     input
         .send(TransportInput::Sftp(Job {
+            expected_generation: None,
             operation,
             deadline,
             reply,
@@ -215,6 +216,7 @@ impl Drop for RemoteFile {
         if let Some(handle) = self.handle.take() {
             let (reply, _) = oneshot::channel();
             let _ = self.input.send(TransportInput::Sftp(Job {
+                expected_generation: None,
                 operation: Operation::Close { handle },
                 deadline: tokio::time::Instant::now() + Duration::from_secs(15),
                 reply,

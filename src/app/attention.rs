@@ -2,6 +2,7 @@ use super::*;
 
 pub enum Action {
     Open,
+    WatchCommand(bool),
     Visit { pane: u64, sequence: u64 },
     MarkAllRead,
     Clear,
@@ -10,6 +11,16 @@ pub enum Action {
 impl TerminalApp {
     pub(super) fn handle_attention(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
+            Action::WatchCommand(arm) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(live),
+                    ..
+                }) = self.tabs.active()
+                {
+                    live.session.events.set_command_watch(arm);
+                }
+                return;
+            }
             Action::Open => {
                 let existing = self
                     .tabs
@@ -122,5 +133,26 @@ impl TerminalApp {
                     )),
                 Border::new().grid_row(2).content(content),
             ))
+    }
+}
+
+pub(super) fn flash_background_window(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GA_ROOTOWNER, GetAncestor, GetForegroundWindow,
+    };
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if !foreground.is_invalid()
+            && foreground != hwnd
+            && GetAncestor(foreground, GA_ROOTOWNER) != hwnd
+        {
+            let _ = FlashWindowEx(&FLASHWINFO {
+                cbSize: size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_TRAY,
+                uCount: 3,
+                dwTimeout: 0,
+            });
+        }
     }
 }

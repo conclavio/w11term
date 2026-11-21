@@ -128,7 +128,14 @@ impl server::Handler for Peer {
         if data == b"drop" {
             anyhow::bail!("simulated link failure");
         }
-        if data == b"quit" {
+        if data == b"exit-with-tail" {
+            s.exit_status_request(c, 7)?;
+            s.data(
+                c,
+                b"\x1b[?2026h\r\nFINAL-AFTER-EXIT-STATUS\x1b[6n".as_slice(),
+            )?;
+            s.close(c)?;
+        } else if data == b"quit" {
             s.exit_status_request(c, 0)?;
             s.close(c)?;
         } else {
@@ -308,6 +315,21 @@ async fn connection(session: &Session) -> ssh::ConnectionShare {
     .expect("SSH pane did not establish a shell")
 }
 
+async fn wait_for_generation(session: &Session, previous: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = session.frames.load();
+        if frame.connection_generation > previous {
+            return;
+        }
+        assert!(
+            session.frames.changed(frame.generation, deadline).await,
+            "{}",
+            frame.status
+        );
+    }
+}
+
 async fn send(session: &Session, text: &str) {
     let (reply, response) = oneshot::channel();
     session
@@ -441,6 +463,18 @@ async fn split_with_different_host_pin_requires_fresh_verification() {
     })
     .await
     .expect("mismatched split pin should fail host verification");
+    let (first, sequence) = exit_token(&child, 0).await;
+    child.restart_exited(first).unwrap();
+    let (second, _) = exit_token(&child, sequence).await;
+    assert!(second > first);
+    assert!(
+        child
+            .frames
+            .load()
+            .status
+            .contains("host verification failed")
+    );
+    assert_eq!(child.frames.load().connection_generation, 0);
     expect_echo(&original, "still-trusted").await;
     drop((child, original));
     server.abort();
@@ -461,7 +495,20 @@ async fn split_reconnects_using_its_own_authentication_after_link_loss() {
         Some(connection(&original).await),
     );
     drop(connection(&child).await);
+    send(&child, "\x1b]133;C\x07").await;
+    expect_echo(&child, "old-command-running").await;
+    assert!(child.events.set_command_watch(true));
     send(&child, "drop").await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while child.events.command_watch().is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a disconnected pane should cancel its command watch");
+    assert!(!child.events.set_command_watch(true));
+    assert!(child.events.restart_token().is_none());
+    assert!(child.restart_exited(1).is_err());
     enter_password(&child).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while [&original, &child]
@@ -474,8 +521,131 @@ async fn split_reconnects_using_its_own_authentication_after_link_loss() {
     .await
     .expect("both panes should independently reconnect");
     assert!(original.prompts.current().is_none());
+    assert_eq!(child.events.command_watch(), Some(false));
+    assert!(child.events.restart_token().is_none());
+    send(&child, "\x1b]133;D;23\x07").await;
     expect_echo(&child, "ready-again").await;
+    assert!(
+        !child
+            .events
+            .since(0)
+            .events
+            .iter()
+            .any(|e| e.kind == "command-finished")
+    );
     drop((child, original));
+    server.abort();
+}
+
+async fn exit_token(pane: &Session, after: u64) -> (u64, u64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut cursor = after;
+        loop {
+            let batch = pane.events.wait(cursor, Duration::from_secs(4)).await;
+            if let Some(event) = batch
+                .events
+                .iter()
+                .find(|event| event.kind == "pane-exited")
+            {
+                return (event.data["exit_token"].as_u64().unwrap(), event.sequence);
+            }
+            cursor = batch.next;
+        }
+    })
+    .await
+    .expect("no terminal exit after final SSH data")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_restart_publishes_final_output_and_requires_fresh_authentication() {
+    let key = key();
+    let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (port, mut seen, server) = fixture(vec![key]).await;
+    let pane = Session::start(Source::Ssh(options(
+        port,
+        Authentication::Password,
+        Some(pin),
+    )));
+    enter_password(&pane).await;
+    wait_for_generation(&pane, 0).await;
+    expect_echo(&pane, "first-login").await;
+    send(&pane, "exit-with-tail").await;
+    let (token, seq) = exit_token(&pane, 0).await;
+    assert!(
+        pane.frames
+            .load()
+            .rows
+            .iter()
+            .any(|row| row.as_str().contains("FINAL-AFTER-EXIT-STATUS"))
+    );
+    assert_eq!(pane.events.restart_token(), Some(token));
+    let old_generation = pane.frames.load().connection_generation;
+    while seen.try_recv().is_ok() {}
+    let (reply, receipt) = oneshot::channel();
+    pane.input
+        .send(Command::Raw(b"stale raw input".to_vec(), reply))
+        .unwrap();
+    assert!(receipt.await.unwrap().is_err());
+    let successes = std::thread::scope(|scope| {
+        let one = scope.spawn(|| pane.restart_exited(token).is_ok());
+        let two = pane.restart_exited(token).is_ok();
+        usize::from(one.join().unwrap()) + usize::from(two)
+    });
+    assert_eq!(successes, 1);
+    assert!(pane.events.restart_token().is_none());
+    for _ in 0..256 {
+        pane.input.send(Command::Text("offline".into())).unwrap();
+    }
+    enter_password(&pane).await;
+    wait_for_generation(&pane, old_generation).await;
+    expect_echo(&pane, "second-login").await;
+    assert!(pane.frames.load().connection_generation > old_generation);
+    let mut inputs = vec![];
+    while let Ok(record) = seen.try_recv() {
+        if let Seen::Data(bytes) = record {
+            inputs.push(bytes);
+        }
+    }
+    assert_eq!(inputs, [b"second-login".to_vec()]);
+    send(&pane, "quit").await;
+    let (new_token, new_seq) = exit_token(&pane, seq).await;
+    assert!(new_token > token && new_seq > seq);
+    assert!(pane.restart_exited(token).is_err());
+    // Enrollment and revocation broadcast this even to exited sibling panes.
+    pane.input
+        .send(Command::Authenticate(Authentication::KeyboardInteractive))
+        .unwrap();
+    pane.restart_exited(new_token).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = pane.frames.load();
+        if let Some(prompt) = &frame.prompt {
+            assert!(
+                matches!(&prompt.question, Question::Authentication { challenges, .. } if challenges.len() == 2)
+            );
+            pane.prompts
+                .answer(
+                    prompt.id,
+                    Answer::Authentication(
+                        ["pilot", "123456"]
+                            .map(|s| zeroize::Zeroizing::new(s.into()))
+                            .into(),
+                    ),
+                )
+                .unwrap();
+            break;
+        }
+        assert!(pane.frames.changed(frame.generation, deadline).await);
+    }
+    wait_for_generation(&pane, old_generation + 1).await;
+    expect_echo(&pane, "updated-auth").await;
+    send(&pane, "quit").await;
+    assert!(exit_token(&pane, new_seq).await.0 > new_token);
+    let journal = pane.events.clone();
+    let input = pane.input.clone();
+    drop(pane);
+    assert!(journal.restart_token().is_none());
+    assert!(input.is_closed());
     server.abort();
 }
 
