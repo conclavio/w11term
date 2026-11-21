@@ -300,7 +300,8 @@ pub enum Source {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub source: Source,
-    pub workspace: Option<crate::workspace::WorkspaceLaunch>,
+    pub workspace: Option<String>,
+    pub switch_workspace: bool,
     pub benchmark: bool,
     pub smoke_seconds: Option<u64>,
     pub profiles_path: PathBuf,
@@ -320,6 +321,7 @@ impl Options {
         let mut source = Source::Demo;
         let mut profile = None;
         let mut workspace_name = None;
+        let mut switch_workspace = false;
         let mut explicit_source = false;
         let mut profiles_path = default_profiles_path();
         let mut list_profiles = false;
@@ -339,7 +341,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -352,9 +354,10 @@ impl Options {
                     profile = None;
                 }
                 "--profile" => profile = Some(value(&mut args, &arg)?),
-                "--workspace" => {
+                "--workspace" | "--switch-workspace" => {
                     ensure!(workspace_name.is_none(), "Choose one workspace");
                     workspace_name = Some(value(&mut args, &arg)?);
+                    switch_workspace = arg == "--switch-workspace";
                 }
                 "--tab" => extra_profiles.push(value(&mut args, &arg)?),
                 "--cols" => cols = Some(value(&mut args, &arg)?.parse::<usize>()?),
@@ -506,19 +509,10 @@ impl Options {
             rows.is_none_or(|n| (1..=500).contains(&n)),
             "--rows must be 1..500"
         );
-        let workspace = workspace_name
-            .as_deref()
-            .map(|name| {
-                crate::workspace::WorkspaceLaunch::load(
-                    &crate::workspace::WorkspaceStore::open()?,
-                    name,
-                    &profiles_path,
-                )
-            })
-            .transpose()?;
         Ok(Some(Self {
             source,
-            workspace,
+            workspace: workspace_name,
+            switch_workspace,
             benchmark,
             smoke_seconds,
             profiles_path,

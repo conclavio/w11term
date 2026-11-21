@@ -16,9 +16,7 @@ use w11term::{
     interaction::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
-    options::{
-        Authentication, LocalOptions, Options, Source, SshOptions, TerminalType, profile_source,
-    },
+    options::{Authentication, LocalOptions, Source, SshOptions, TerminalType, profile_source},
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
@@ -1665,6 +1663,13 @@ impl TerminalApp {
             }));
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
+            if let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+            {
+                tab.follow_shell_directory(&tab.session.frames.load(), context);
+            }
         }
         self.keyboard.set_search(
             matches!(self.tabs.active(),Some(AppTab{page:Page::Terminal(tab),..}) if tab.find.open && tab.prompt_id.is_none()),
@@ -2806,10 +2811,10 @@ impl TerminalApp {
 }
 
 impl Component for TerminalApp {
-    type Input = Options;
+    type Input = crate::workspace_window::Launch;
     type Message = Message;
 
-    fn create(options: &Options, context: &ComponentContext<Self>) -> Self {
+    fn create((options, opening): &Self::Input, context: &ComponentContext<Self>) -> Self {
         let sender = context.sender();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(Message::Shortcut(shortcut));
@@ -2897,7 +2902,7 @@ impl Component for TerminalApp {
             })
             .unwrap_or((1120.0, 760.0));
         let osc52 = appearance.read().unwrap().interaction.osc52;
-        if let Some(workspace) = &options.workspace {
+        if let Some(workspace) = opening.as_ref().map(|window| &window.layout) {
             workspace_view::append_resolved_workspace(
                 &mut tabs,
                 &workspace.layout,
@@ -2933,7 +2938,7 @@ impl Component for TerminalApp {
                 Some(w11term::pane_layout::Layout::Leaf(_))
             )
         });
-        let registry = Registry::default();
+        let registry = Registry::for_workspace(opening.as_ref().map(|window| window.key.clone()));
         let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
         let inbox = w11term::events::Inbox::new(move || {
@@ -2955,6 +2960,9 @@ impl Component for TerminalApp {
             crate::renderer::screenshot_with_font(frame, size, path, &appearance)
         })
         .expect("starting local control pipe");
+        if let Some(window) = opening {
+            window.published();
+        }
         let mut app = Self {
             inbox,
             accessible: Default::default(),
@@ -3673,6 +3681,7 @@ impl Component for TerminalApp {
             Message::FrameReady(id, epoch) => {
                 if self.tabs.visible(id) && self.watch_epoch == epoch {
                     self.frame_tasks.remove(&id);
+                    let active = self.tabs.active_id() == Some(id);
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -3700,6 +3709,9 @@ impl Component for TerminalApp {
                         }
                         tab.error = None;
                         tab.files.observe_connection(frame.connection_generation);
+                        if active {
+                            tab.follow_shell_directory(&frame, context);
+                        }
                         let unavailable = frame.copy_output_unavailable();
                         if tab.copy_output_unavailable != unavailable {
                             tab.copy_output_unavailable = unavailable;
@@ -3712,7 +3724,7 @@ impl Component for TerminalApp {
                             self.header.borrow_mut().take();
                         }
                     }
-                    if self.tabs.active_id() == Some(id) {
+                    if active {
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
@@ -4339,7 +4351,7 @@ impl Component for TerminalApp {
         }
     }
 
-    fn view(&self, _options: &Options, context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         if let Some(AppTab {
             label,
             page: Page::Terminal(tab),

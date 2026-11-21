@@ -8,6 +8,7 @@ mod renderer;
 mod startup;
 mod ui_timer;
 mod window_state;
+mod workspace_window;
 fn w11term_data_path() -> anyhow::Result<std::path::PathBuf> {
     w11term::keys::data_dir()
 }
@@ -32,6 +33,8 @@ fn run() -> anyhow::Result<()> {
         w11term::session::benchmark();
         return Ok(());
     }
-    windows_reactor::App::run_component::<app::TerminalApp>(options)?;
+    if let Some(launch) = workspace_window::prepare(options)? {
+        windows_reactor::App::run_component::<app::TerminalApp>(launch)?;
+    }
     Ok(())
 }
