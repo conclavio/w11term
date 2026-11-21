@@ -20,7 +20,9 @@ $listing = & $ctl --pid 12345 list | ConvertFrom-Json
 $pane = $listing.result.sessions[0].id
 ```
 
-Omit `--pid` when exactly one instance is running. Zero instances fail immediately; multiple instances require an explicit PID. Pane IDs remain stable through tab reordering and are never reused during that process. Settings and New Profile pages are excluded.
+Omit `--pid` when exactly one process is running. Each process serves all its windows on one pipe. Zero processes fail immediately and multiple processes require an explicit PID. Each session in `list` includes its process-local `window_id`, `tab_id` and pane `id`. Moving a live tab between windows changes its window ID and preserves its tab and pane IDs. Visible panes in all windows report `visible: true`. At most one pane reports `active: true`, in the most recently active window. Settings and New Profile pages are excluded.
+
+`open` uses the most recently active window. `resize` routes to the window that owns the pane, including after a live tab transfer. Closing one window leaves the process pipe and the remaining windows’ sessions accessible. Pipe requests preserve desktop focus.
 
 ```powershell
 # Literal UTF-8, including a carriage return supplied by PowerShell.
