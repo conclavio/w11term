@@ -98,7 +98,7 @@ try {
     }
     $download = Join-Path $State 'download.bin'
     $null = Control @('sftp','--pane',"$pane",'get',"$expected/$witness",$download)
-    if ((Get-FileHash -LiteralPath $download).Hash -cne (Get-FileHash -LiteralPath $source).Hash) {
+    if (![Collections.StructuralComparisons]::StructuralEqualityComparer.Equals([IO.File]::ReadAllBytes($download), $bytes)) {
         throw 'SFTP did not read the Windows fixture through the Linux mount'
     }
     Write-Output "Native UI opened $expected in its originating SSH pane and read $witness"
