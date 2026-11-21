@@ -70,6 +70,71 @@ impl FolderGrantGate {
     pub(crate) fn revoked(&self) -> Result<bool> {
         Ok(retired(&self.marker)? || revision(&self.revision_path)? != self.expected_revision)
     }
+    /// Keep a single admitted filesystem mutation inside the lifetime of this
+    /// profile's consent. The editor waits for these handles before reporting
+    /// successful revocation, including when it runs in another process.
+    pub(crate) fn lock_mutation(&self) -> Result<fs::File> {
+        let lock = mutation_lock(&self.revision_path)?;
+        lock.lock_shared()?;
+        ensure!(!self.revoked()?, "Folder sharing permission was revoked");
+        Ok(lock)
+    }
+}
+
+fn mutation_lock(revision: &Path) -> Result<fs::File> {
+    let parent = revision
+        .parent()
+        .context("Missing folder permission directory")?;
+    fs::create_dir_all(parent)?;
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(revision.with_extension("io-lock"))
+        .context("Opening the folder mutation lock")
+}
+
+#[cfg(test)]
+#[test]
+fn successful_revocation_waits_for_writes_already_admitted() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let catalog = temp.path().join("profiles.json");
+    let token = "0123456789abcdef0123456789abcdef";
+    fs::write(
+        &catalog,
+        serde_json::to_vec(&serde_json::json!({
+            "profiles": {"linux": {"host":"example.test","user":"user","auth":"none","folder_share_id":token}}
+        }))?,
+    )?;
+    let store = ProfileStore::new(catalog)?;
+    let (_, snapshot) = store.inspect_catalog("linux")?;
+    let marker = marker_path(&data, &snapshot.catalog_path, "linux", token)?;
+    let revision = revision_path(&data, &snapshot.catalog_path, "linux")?;
+    let gate = FolderGrantGate::new(marker, revision, None);
+    let admitted = gate.lock_mutation()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let revoke = std::thread::spawn(move || {
+        let _ = tx.send(store.revoke_folder_permissions(&snapshot, &data));
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !gate.revoked()? {
+        ensure!(
+            Instant::now() < deadline,
+            "revocation did not invalidate the grant"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    drop(admitted);
+    rx.recv_timeout(Duration::from_secs(5))??;
+    revoke.join().unwrap();
+    assert!(gate.lock_mutation().is_err());
+    Ok(())
 }
 
 // The marker addresses a single grant namespace across peer fingerprints.
@@ -194,10 +259,12 @@ impl ProfileStore {
                 .and_then(|file| file.sync_all())
                 .context("Recording folder permission revocation")?;
             let new = format!("{:032x}", rand::random::<u128>());
-            save_revision(
-                &revision_path(data_dir, &base.catalog_path, &base.name)?,
-                &new,
-            )?;
+            let revision = revision_path(data_dir, &base.catalog_path, &base.name)?;
+            save_revision(&revision, &new)?;
+            // The marker and revision refuse new requests. Drain requests that
+            // checked consent before either record was written.
+            let writes = mutation_lock(&revision)?;
+            writes.lock()?;
             let entry = profiles
                 .get_mut(&base.name)
                 .unwrap()

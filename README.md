@@ -83,15 +83,19 @@ SFTP v3 requires the server to reject an existing destination. If another proces
 
 ### Share a Windows folder with Linux
 
-Connect to a saved SSH profile, open **caret → Shared folders… → Add folder…**, and choose a local NTFS directory. Check the displayed SSH account, host and fingerprint. Enter a mount name and select **Save folder**. For example, sharing `C:\Projects\sprites` as `sprites` makes its files available **read-only** at `~/windows/sprites` on Linux. Other programs running as that Linux account can read them.
+Connect to a saved SSH profile, open **caret → Shared folders… → Add folder…**, and choose a local NTFS directory. Check the displayed SSH account, host and fingerprint. Enter a mount name and select **Save folder**. For example, sharing `C:\Projects\sprites` as `sprites` makes its files available at `~/windows/sprites` on Linux. New and existing folders default to **Read-only**.
+
+Select **Allow write access** when adding a folder to let programs running as that Linux account create, edit, rename and delete files in it. The saved row shows **Read/write**. To change access, choose **Forget**, then select the directory again. Writable selections exclude w11term’s private data directory and the active profile catalog.
+
+Linux waits for Windows to commit each write. Losing a connection can leave an acknowledged prefix of a large write or upload. Reconnecting opens a new mount and does not replay pending writes. Writable operations require local NTFS with Windows transaction support. A conflicting Windows open or an unsupported operation returns an I/O error to Linux. [Windows transactional file I/O](https://learn.microsoft.com/en-us/windows/win32/fileio/programming-considerations-for-transacted-fileio-)
 
 **Unmount** stops the current export. **Mount** retries it. **Forget** revokes the saved permission. Reconnecting the same profile can remount its folders. A changed host key, account, profile identity or replaced Windows directory requires a new selection. Windows keeps the grants under `%LOCALAPPDATA%\w11term\folder-shares`. A copied profile carries only an opaque identifier. Drive roots, junctions, reparse points and multiply linked files are excluded.
 
 **Mount on connect** is on by default for each saved folder. Clear it when adding a folder to mount it now and leave it unmounted on future connections. You can also change it on the saved row. The checkbox controls future connections. Use **Mount** or **Unmount** for the current one.
 
-If you switch back to a build that predates this checkbox, it will decline to load a permission file containing a disabled folder. Turn **Mount on connect** back on in the newer build to make that file readable by the older one.
+Older builds decline to load a grant file containing settings they do not recognize. Before switching back, forget writable grants and turn **Mount on connect** on for folders you want to keep in a build that predates that checkbox.
 
-To stop sharing every folder for a profile, open **Settings**, edit the saved SSH profile and choose **Revoke all shared folders…**. Confirm the profile name. This works while the host is offline. Running exports for that profile refuse new file reads, and reconnecting leaves the folders unmounted until you select them again. Files already read or cached on Linux remain available there. Other profiles and open SSH shells keep working.
+To stop sharing every folder for a profile, open **Settings**, edit the saved SSH profile and choose **Revoke all shared folders…**. Confirm the profile name. This works while the host is offline. Running exports for that profile refuse new reads and writes. Revocation waits for admitted writes to finish. Reconnecting leaves the folders unmounted until you select them again. Files already read or cached on Linux remain available there. Other profiles and open SSH shells keep working.
 
 On a mounted row, **Copy Linux path** puts its absolute path on the Windows clipboard. **Open in SFTP drawer** returns to the originating pane and lists that path over its SSH connection. This works when the host exposes the mount at the same absolute path through SFTP, even if SFTP starts in another directory.
 
