@@ -1,4 +1,5 @@
 use super::*;
+use std::path::PathBuf;
 use w11term::{
     options::JumpHost,
     ssh_config::{ImportReport, ImportedAlias, import_file},
@@ -8,6 +9,7 @@ pub(super) struct ImportPage {
     path: String,
     revision: u64,
     reading: bool,
+    picking: Option<u64>,
     report: Option<ImportReport>,
     selected: Option<usize>,
     status: String,
@@ -20,6 +22,7 @@ impl Default for ImportPage {
                 .unwrap_or_default(),
             revision: 0,
             reading: false,
+            picking: None,
             report: None,
             selected: None,
             status: String::new(),
@@ -27,6 +30,41 @@ impl Default for ImportPage {
     }
 }
 impl ImportPage {
+    fn begin_picker(&mut self) -> Option<u64> {
+        if self.picking.is_some() || self.reading {
+            return None;
+        }
+        // A fresh ticket also separates two Browse gestures at the same typed path.
+        self.revision += 1;
+        self.picking = Some(self.revision);
+        self.picking
+    }
+    fn finish_picker(
+        &mut self,
+        ticket: u64,
+        active: bool,
+        result: Result<Option<PathBuf>, String>,
+    ) -> Option<PathBuf> {
+        if self.picking != Some(ticket) {
+            return None;
+        }
+        self.picking = None;
+        if self.revision != ticket || !active {
+            return None;
+        }
+        match result {
+            Ok(Some(path)) => {
+                if let Some(text) = path.to_str() {
+                    self.path = text.to_owned();
+                    return Some(path);
+                }
+                self.status = "The selected path cannot be represented as Unicode.".into();
+            }
+            Err(error) => self.status = format!("Could not choose a config file: {error}"),
+            Ok(None) => {}
+        }
+        None
+    }
     fn reset_preview(&mut self) {
         self.revision += 1;
         self.report = None;
@@ -50,11 +88,32 @@ impl ImportPage {
     fn alias(&self) -> Option<&ImportedAlias> {
         self.report.as_ref()?.aliases.get(self.selected?)
     }
+    fn preview(&mut self, id: TabId, path: PathBuf, context: &ComponentContext<TerminalApp>) {
+        self.reset_preview();
+        self.reading = true;
+        let revision = self.revision;
+        context.spawn_background_with_rejection(
+            move |_| {
+                Message::ImportConfig(Action::Read(
+                    id,
+                    revision,
+                    import_file(&path).map_err(|e| format!("{e:#}")),
+                ))
+            },
+            Message::ImportConfig(Action::Read(
+                id,
+                revision,
+                Err("Could not start the config preview. Try again.".into()),
+            )),
+        );
+    }
 }
 
 pub enum Action {
     Show,
     Path(TabId, String),
+    Browse(TabId),
+    Picked(TabId, u64, Result<Option<PathBuf>, String>),
     Preview(TabId),
     Read(TabId, u64, Result<ImportReport, String>),
     Select(TabId, u64, Option<usize>),
@@ -126,31 +185,57 @@ impl TerminalApp {
                     page.path = path;
                 }
             }
+            Action::Browse(id) => {
+                if self.tabs.active_id() != Some(id) {
+                    return;
+                }
+                let owner = self.keyboard.hwnd();
+                let Some(page) = self.import_page_mut(id) else {
+                    return;
+                };
+                let Some(owner) = owner else {
+                    page.status = "The window is unavailable.".into();
+                    return;
+                };
+                let Some(ticket) = page.begin_picker() else {
+                    return;
+                };
+                let current = PathBuf::from(page.path.trim());
+                let owner = owner.0 as usize;
+                context.spawn_background_with_rejection(
+                    move |cancel| {
+                        let result = if cancel.is_cancelled() {
+                            Ok(None)
+                        } else {
+                            file_picker::pick(owner, file_picker::Purpose::SshConfig(current))
+                                .map(|chosen| chosen.map(|file| file.path))
+                                .map_err(|e| format!("{e:#}"))
+                        };
+                        Message::ImportConfig(Action::Picked(id, ticket, result))
+                    },
+                    Message::ImportConfig(Action::Picked(
+                        id,
+                        ticket,
+                        Err("File picker unavailable".into()),
+                    )),
+                );
+            }
+            Action::Picked(id, ticket, result) => {
+                let active = self.tabs.active_id() == Some(id);
+                if let Some(page) = self.import_page_mut(id)
+                    && let Some(path) = page.finish_picker(ticket, active, result)
+                {
+                    page.preview(id, path, context);
+                }
+            }
             Action::Preview(id) => {
                 let Some(page) = self.import_page_mut(id) else {
                     return;
                 };
-                if page.reading || page.path.trim().is_empty() {
+                if page.reading || page.picking.is_some() || page.path.trim().is_empty() {
                     return;
                 }
-                page.reset_preview();
-                page.reading = true;
-                let revision = page.revision;
-                let path = std::path::PathBuf::from(page.path.trim());
-                context.spawn_background_with_rejection(
-                    move |_| {
-                        Message::ImportConfig(Action::Read(
-                            id,
-                            revision,
-                            import_file(&path).map_err(|e| format!("{e:#}")),
-                        ))
-                    },
-                    Message::ImportConfig(Action::Read(
-                        id,
-                        revision,
-                        Err("Could not start the config preview. Try again.".into()),
-                    )),
-                );
+                page.preview(id, PathBuf::from(page.path.trim()), context);
             }
             Action::Read(id, revision, result) => {
                 if let Some(page) = self.import_page_mut(id) {
@@ -216,17 +301,32 @@ impl TerminalApp {
             KeyedView::new("path-label", TextBlock::new().text("Config file")),
             KeyedView::new(
                 "path",
-                TextBox::new()
-                    .automation_name("OpenSSH config path")
-                    .text(&page.path)
-                    .on_text_changed(
-                        context.callback(move |path| Message::ImportConfig(Action::Path(id, path))),
-                    ),
+                Grid::new()
+                    .column_spacing(8.0)
+                    .columns([GridLength::Star(1.0), GridLength::Auto])
+                    .children((
+                        TextBox::new()
+                            .automation_name("OpenSSH config path")
+                            .text(&page.path)
+                            .on_text_changed(context.callback(move |path| {
+                                Message::ImportConfig(Action::Path(id, path))
+                            })),
+                        Button::new()
+                            .grid_column(1)
+                            .is_enabled(!page.reading && page.picking.is_none())
+                            .on_click(
+                                context
+                                    .callback(move |_| Message::ImportConfig(Action::Browse(id))),
+                            )
+                            .content("Browse…"),
+                    )),
             ),
             KeyedView::new(
                 "preview",
                 Button::new()
-                    .is_enabled(!page.reading && !page.path.trim().is_empty())
+                    .is_enabled(
+                        !page.reading && page.picking.is_none() && !page.path.trim().is_empty(),
+                    )
                     .on_click(context.callback(move |_| Message::ImportConfig(Action::Preview(id))))
                     .content(if page.reading {
                         "Reading config…"
@@ -319,22 +419,33 @@ impl TerminalApp {
 #[cfg(feature = "ui-smoke")]
 impl TerminalApp {
     pub(super) fn import_smoke_step(&mut self, step: u8, context: &ComponentContext<Self>) {
+        use std::path::{Path, PathBuf};
         let mut next = step + 1;
         match step {
             0 => {
                 self.utility(true, context);
                 self.update(Message::ImportConfig(Action::Show), context);
                 let id = self.tabs.active_id().unwrap();
-                let fixture = std::env::var("W11TERM_IMPORT_SMOKE").unwrap();
+                let fixture = PathBuf::from(std::env::var_os("W11TERM_IMPORT_SMOKE").unwrap());
                 let page = self.import_page_mut(id).unwrap();
                 assert!(std::path::Path::new(&page.path).ends_with(".ssh/config"));
-                self.update(Message::ImportConfig(Action::Path(id, fixture)), context);
+                let previous = fixture
+                    .with_file_name("previous.conf")
+                    .display()
+                    .to_string();
+                self.update(Message::ImportConfig(Action::Path(id, previous)), context);
                 self.update(Message::ImportConfig(Action::Preview(id)), context);
             }
             1 => {
                 let id = self.tabs.active_id().unwrap();
                 let page = self.import_page_mut(id).unwrap();
-                if page.reading {
+                // The desktop fixture cancels Browse once, then selects the extensionless
+                // config. Continue with the ordinary save/edit checks after its preview.
+                if page.reading
+                    || Path::new(&page.path)
+                        .file_name()
+                        .is_none_or(|n| n != "config")
+                {
                     next = step;
                 } else {
                     let report = page.report.as_ref().expect("could not parse fixture");
@@ -449,6 +560,71 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn previewed_page() -> ImportPage {
+        ImportPage {
+            path: "previous config".into(),
+            report: Some(ImportReport {
+                aliases: vec![ImportedAlias {
+                    name: "previous".into(),
+                    options: None,
+                    warnings: vec![],
+                }],
+                warnings: vec!["preview warning".into()],
+            }),
+            selected: Some(0),
+            status: "previous status".into(),
+            ..ImportPage::default()
+        }
+    }
+
+    #[test]
+    fn cancel_keeps_the_path_selection_and_preview_and_cannot_complete_a_later_picker() {
+        let mut page = previewed_page();
+        let first = page.begin_picker().unwrap();
+        assert!(page.begin_picker().is_none());
+        assert!(page.finish_picker(first, true, Ok(None)).is_none());
+        assert_eq!(page.path, "previous config");
+        assert_eq!(page.alias().unwrap().name, "previous");
+        assert_eq!(page.report.as_ref().unwrap().warnings, ["preview warning"]);
+        assert_eq!(page.status, "previous status");
+
+        let second = page.begin_picker().unwrap();
+        assert!(
+            page.finish_picker(first, true, Ok(Some("obsolete".into())))
+                .is_none()
+        );
+        assert_eq!(page.picking, Some(second));
+        let picked = PathBuf::from(r"C:\fixture\config");
+        assert_eq!(
+            page.finish_picker(second, true, Ok(Some(picked.clone()))),
+            Some(picked.clone())
+        );
+        assert_eq!(page.path, picked.to_str().unwrap());
+        assert!(page.picking.is_none());
+    }
+
+    #[test]
+    fn a_picker_finishing_after_a_path_edit_or_tab_switch_cannot_replace_the_path() {
+        let mut page = previewed_page();
+        let first = page.begin_picker().unwrap();
+        page.reset_preview();
+        page.path = "typed while choosing".into();
+        assert!(
+            page.finish_picker(first, true, Ok(Some("stale file".into())))
+                .is_none()
+        );
+        assert_eq!(page.path, "typed while choosing");
+        assert!(page.report.is_none());
+
+        let second = page.begin_picker().unwrap();
+        assert!(
+            page.finish_picker(second, false, Ok(Some("another file".into())))
+                .is_none()
+        );
+        assert_eq!(page.path, "typed while choosing");
+        assert!(page.begin_picker().is_some());
+    }
 
     #[test]
     fn stale_import_cannot_replace_a_newer_preview_or_revive_a_changed_path() {
