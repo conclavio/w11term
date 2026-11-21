@@ -442,7 +442,7 @@ async fn attach_tmux(
 pub(super) struct CommandResult {
     pub(super) status: u32,
     pub(super) stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
 }
 
 fn compatible_version(output: &[u8]) -> bool {
