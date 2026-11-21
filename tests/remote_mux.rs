@@ -1,5 +1,5 @@
-use std::{env, fs, path::PathBuf};
-use w11term::terminal::{self, Snapshot};
+use std::{env, fs, path::PathBuf, time::Duration};
+use w11term::terminal::{self, Snapshot, TransportInput};
 use wezterm_term::{TerminalSize, image::ImageDataType};
 
 fn grid(rows: usize, cols: usize) -> TerminalSize {
@@ -12,12 +12,12 @@ fn grid(rows: usize, cols: usize) -> TerminalSize {
     }
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "requires the VT artifacts from tests/durable/run-mux-linux.sh"]
-fn real_remote_mux_frames_survive_input_and_resize() {
+async fn real_remote_mux_frames_survive_input_and_resize() {
     let captures = PathBuf::from(env::var_os("W11_MUX_CAPTURES").expect("set W11_MUX_CAPTURES"));
     for case in ["zellij", "venti-default", "venti-sixel"] {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut term = terminal::create(grid(30, 100), tx);
         let mut previous = None;
         for (stage, label) in [("first", "W11FIRST "), ("moved", "W11MOVED ")] {
@@ -28,6 +28,28 @@ fn real_remote_mux_frames_survive_input_and_resize() {
             for chunk in bytes.chunks(4093) {
                 term.advance_bytes(chunk);
             }
+            // The reply writer is asynchronous. XTVERSION is a barrier on that
+            // same writer and leaves screen contents and negotiated modes intact.
+            term.advance_bytes(b"\x1b[>0q");
+            let barrier = format!("\x1bP>|w11term {}\x1b\\", env!("CARGO_PKG_VERSION"));
+            let mut replies = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !replies.ends_with(barrier.as_bytes()) {
+                    let Some(TransportInput::Data(bytes)) = rx.recv().await else {
+                        panic!("terminal reply writer closed");
+                    };
+                    replies.extend(bytes);
+                }
+            })
+            .await
+            .expect("terminal reply barrier timed out");
+            replies.truncate(replies.len() - barrier.len());
+            let expected = fs::read(captures.join(format!("{case}-{stage}.replies"))).unwrap();
+            assert_eq!(
+                String::from_utf8(replies).unwrap(),
+                String::from_utf8(expected).unwrap(),
+                "{case}/{stage}: SSH peer must receive the native terminal's query replies"
+            );
             let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
             assert!(frame.alternate, "{case}/{stage}: expected alternate screen");
             assert!(
@@ -53,7 +75,7 @@ fn real_remote_mux_frames_survive_input_and_resize() {
                             panic!("{case}/{stage}: expected decoded Sixel pixels");
                         };
                         assert!(
-                            data.chunks_exact(4).any(|p| p == [255, 0, 0, 255]),
+                            data.as_chunks::<4>().0.contains(&[255, 0, 0, 255]),
                             "{case}/{stage}: red test image lost"
                         );
                         images.push((x, y));
