@@ -11,6 +11,9 @@ use wezterm_term::{
     CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
 };
 
+mod keypad;
+pub use keypad::KeypadKey;
+
 pub type Rgba = [f32; 4];
 
 pub fn scroll_wheel(
@@ -186,6 +189,8 @@ pub fn send_key_event(
 pub struct KeyDetails {
     pub base: Option<char>,
     pub text: Option<String>,
+    pub keypad: Option<KeypadKey>,
+    pub leds: wezterm_input_types::KeyboardLedStatus,
 }
 pub fn send_key_event_detailed(
     terminal: &mut Terminal,
@@ -202,6 +207,14 @@ pub fn send_key_event_detailed(
         let all = flags
             .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
         let reports = flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
+        if let Some(keypad) = details.keypad
+            && let Some(wire) = keypad.encode(flags, key, modifiers, details, down, repeat)
+        {
+            if !wire.is_empty() {
+                writer.send(TransportInput::Data(wire.into_bytes()))?;
+            }
+            return Ok(());
+        }
         let safety_key = matches!(
             key,
             L::Enter | L::Tab | L::Backspace | L::Char('\r' | '\t' | '\x08')
@@ -1249,6 +1262,115 @@ mod tests {
     }
 
     #[test]
+    fn keypad_matches_stock_kitty_wire_fixture() {
+        #[derive(serde::Deserialize, Debug)]
+        struct Case {
+            key: String,
+            flags: u8,
+            action: String,
+            text: Option<String>,
+            #[serde(default)]
+            num_lock: bool,
+            wire: String,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../tests/fixtures/keyboard/keypad.json")).unwrap();
+        for case in cases {
+            let (key, keypad) = match case.key.as_str() {
+                "ENTER" => (KeyCode::Char('\r'), None),
+                "LEFT" => (KeyCode::LeftArrow, None),
+                "KP_ENTER" => (KeyCode::Char('\r'), Some(KeypadKey::Enter)),
+                "KP_LEFT" => (KeyCode::LeftArrow, Some(KeypadKey::Left)),
+                "KP_DELETE" => (KeyCode::Delete, Some(KeypadKey::Delete)),
+                "KP_BEGIN" => (KeyCode::Clear, Some(KeypadKey::Begin)),
+                "KP_4" => (KeyCode::Char('4'), Some(KeypadKey::Digit4)),
+                "KP_DECIMAL" => (KeyCode::Char(','), Some(KeypadKey::Decimal)),
+                "KP_ADD" => (KeyCode::Char('+'), Some(KeypadKey::Add)),
+                _ => panic!("unhandled fixture {case:?}"),
+            };
+            let (writer, mut wire) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            if case.flags != 0 {
+                terminal.advance_bytes(format!("\x1b[>{}u", case.flags));
+            }
+            let mut details = KeyDetails {
+                keypad,
+                ..Default::default()
+            };
+            details.leds.set(
+                wezterm_input_types::KeyboardLedStatus::NUM_LOCK,
+                case.num_lock,
+            );
+            if case.text.as_deref().is_some_and(|t| t.chars().count() > 1) {
+                details.text = case.text.clone();
+            }
+            let (down, repeat) = match case.action.as_str() {
+                "press" => (true, false),
+                "repeat" => (true, true),
+                "release" => (false, false),
+                _ => panic!("unknown action {case:?}"),
+            };
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                key,
+                KeyModifiers::NONE,
+                down,
+                repeat,
+                &details,
+            )
+            .unwrap();
+            if case.wire.is_empty() {
+                assert!(wire.try_recv().is_err(), "{case:?}");
+            } else {
+                assert_eq!(receive(&mut wire), case.wire.as_bytes(), "{case:?}");
+                assert!(wire.try_recv().is_err(), "{case:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn keypad_text_uses_the_active_layout_and_only_requested_press_events() {
+        let details = KeyDetails {
+            keypad: Some(KeypadKey::Decimal),
+            text: Some("٫ ".into()),
+            leds: wezterm_input_types::KeyboardLedStatus::NUM_LOCK
+                | wezterm_input_types::KeyboardLedStatus::CAPS_LOCK,
+            ..Default::default()
+        };
+        for (flags, modifiers, down, repeat, expected) in [
+            (1, KeyModifiers::NONE, true, false, "٫ "),
+            (3, KeyModifiers::NONE, true, true, "٫ "),
+            (8, KeyModifiers::NONE, true, false, "\x1b[57409;193u"),
+            (
+                27,
+                KeyModifiers::SHIFT,
+                true,
+                false,
+                "\x1b[57409;194;1643:32u",
+            ),
+            (27, KeyModifiers::CTRL, true, true, "\x1b[57409;197:2u"),
+            (27, KeyModifiers::NONE, false, false, "\x1b[57409;193:3u"),
+            (3, KeyModifiers::NONE, false, false, "\x1b[57409;193:3u"),
+        ] {
+            let (writer, mut wire) = mpsc::unbounded_channel();
+            let mut terminal = create(TerminalSize::default(), writer.clone());
+            terminal.advance_bytes(format!("\x1b[>{flags}u"));
+            send_key_event_detailed(
+                &mut terminal,
+                &writer,
+                KeyCode::Char('٫'),
+                modifiers,
+                down,
+                repeat,
+                &details,
+            )
+            .unwrap();
+            assert_eq!(receive(&mut wire), expected.as_bytes());
+        }
+    }
+
+    #[test]
     fn herdr_repaints_preserve_text_title_and_distinguish_replies_from_real_input() {
         #[derive(Default)]
         struct Clipboard(Mutex<Vec<Option<String>>>);
@@ -1382,7 +1504,7 @@ mod tests {
                 repeat,
                 &KeyDetails {
                     base: Some('1'),
-                    text: None,
+                    ..KeyDetails::default()
                 },
             )
             .unwrap();
@@ -1403,6 +1525,7 @@ mod tests {
                 &KeyDetails {
                     base: Some('e'),
                     text: Some("e\u{301}".into()),
+                    ..KeyDetails::default()
                 },
             )
             .unwrap();

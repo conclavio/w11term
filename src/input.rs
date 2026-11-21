@@ -8,7 +8,7 @@ use w11term::{
     pane_layout::Direction,
     session::Command,
     shortcuts::{Action, KeyMap, Shortcuts},
-    terminal::FrameStore,
+    terminal::{FrameStore, KeyDetails, KeypadKey},
 };
 use wezterm_term::{KeyCode, KeyModifiers};
 pub(crate) mod ime;
@@ -39,13 +39,20 @@ pub enum PickerStage {
     Placement,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum KeySlot {
+    Virtual(u32),
+    KeypadScan { scan: u32, extended: bool },
+    KeypadVirtual(u32),
+}
+
 struct State {
     read_only: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     target: Option<Target>,
     shortcut: Box<dyn Fn(Shortcut)>,
-    swallowed: HashSet<u32>,
-    pressed: HashMap<u32, KeyCode>,
-    details: HashMap<u32, w11term::terminal::KeyDetails>,
+    swallowed: HashSet<KeySlot>,
+    pressed: HashMap<KeySlot, KeyCode>,
+    details: HashMap<KeySlot, KeyDetails>,
     surrogate: Option<u16>,
     preferences: Interaction,
     keymap: KeyMap,
@@ -57,7 +64,7 @@ struct State {
     picker: Option<PickerStage>,
     local_mode: Option<LocalMode>,
     // A true entry may repeat a movement first pressed in this copy-mode session.
-    local_held: HashMap<u32, bool>,
+    local_held: HashMap<KeySlot, bool>,
     held_resize: Option<HeldResize>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
@@ -74,7 +81,7 @@ struct Target {
 
 #[derive(Clone, Copy)]
 struct HeldResize {
-    key: u32,
+    key: KeySlot,
     repeat: Option<(KeyModifiers, Direction)>,
 }
 
@@ -742,15 +749,29 @@ pub fn modifiers() -> KeyModifiers {
 fn emit_key(
     sender: &mpsc::UnboundedSender<Command>,
     key: KeyCode,
-    details: Option<&w11term::terminal::KeyDetails>,
+    details: Option<&KeyDetails>,
     modifiers: KeyModifiers,
     down: bool,
     repeat: bool,
 ) {
     let command = if let Some(details) = details {
+        let mut details = details.clone();
+        if details.keypad.is_some() {
+            // Lock modifiers describe this event, including repeats and releases
+            // after the lock changed while the physical key was held.
+            use wezterm_input_types::KeyboardLedStatus as Leds;
+            unsafe {
+                details
+                    .leds
+                    .set(Leds::NUM_LOCK, GetKeyState(VK_NUMLOCK.0.into()) & 1 != 0);
+                details
+                    .leds
+                    .set(Leds::CAPS_LOCK, GetKeyState(VK_CAPITAL.0.into()) & 1 != 0);
+            }
+        }
         Command::DetailedKey {
             key,
-            details: details.clone(),
+            details,
             modifiers,
             down,
             repeat,
@@ -890,8 +911,22 @@ impl State {
         } else {
             raw_vk
         };
+        let scan = ((message.lParam.0 >> 16) & 0xff) as u32;
+        let extended = message.lParam.0 & (1 << 24) != 0;
+        let keypad = match message.message {
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => keypad_key(vk, scan, extended),
+            WM_CHAR | WM_SYSCHAR if vk == 0x0d && extended => Some(KeypadKey::Enter),
+            _ => None,
+        };
+        // Shortcut lookup uses the logical VK. Ownership follows the physical
+        // position, including when Windows changes VK on a Num Lock transition.
+        let slot = match (keypad, scan) {
+            (None, _) => KeySlot::Virtual(vk),
+            (Some(_), 0) => KeySlot::KeypadVirtual(vk),
+            (Some(_), scan) => KeySlot::KeypadScan { scan, extended },
+        };
         if let Some(held) = self.held_resize
-            && held.key == vk
+            && held.key == slot
         {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
@@ -910,7 +945,7 @@ impl State {
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
                     self.held_resize = None;
-                    self.swallowed.remove(&vk);
+                    self.swallowed.remove(&slot);
                     return true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN => self.held_resize = None,
@@ -920,13 +955,13 @@ impl State {
         if self.modal {
             return false;
         }
-        if let Some(&repeat_owned) = self.local_held.get(&vk) {
+        if let Some(&repeat_owned) = self.local_held.get(&slot) {
             match message.message {
                 // A translated control character can arrive after Enter or Escape closed the overlay.
                 WM_CHAR | WM_SYSCHAR if matches!(vk, 0x0d | 0x1b) => return true,
                 WM_KEYUP | WM_SYSKEYUP => {
-                    self.local_held.remove(&vk);
-                    self.swallowed.remove(&vk);
+                    self.local_held.remove(&slot);
+                    self.swallowed.remove(&slot);
                     return true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
@@ -935,7 +970,7 @@ impl State {
                     }
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    self.local_held.remove(&vk);
+                    self.local_held.remove(&slot);
                 }
                 _ => {}
             }
@@ -947,10 +982,10 @@ impl State {
                         return false;
                     }
                     let repeat = message.lParam.0 & (1 << 30) != 0;
-                    if repeat && !self.local_held.contains_key(&vk) {
+                    if repeat && !self.local_held.contains_key(&slot) {
                         return true;
                     }
-                    self.local_held.insert(vk, mode == LocalMode::Copy);
+                    self.local_held.insert(slot, mode == LocalMode::Copy);
                     if mode == LocalMode::Copy {
                         if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, modifiers())
                             && (!repeat || key.repeats())
@@ -966,7 +1001,7 @@ impl State {
                     return true;
                 }
                 WM_KEYUP | WM_SYSKEYUP => {
-                    self.swallowed.remove(&vk);
+                    self.swallowed.remove(&slot);
                     return true;
                 }
                 WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => return true,
@@ -974,7 +1009,7 @@ impl State {
             }
         }
         if let Some(stage) = self.picker {
-            if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
+            if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&slot) {
                 // Fresh Enter and Space belong to the focused placement button
                 // while it is mounted. Space activates native buttons on release.
                 return stage != PickerStage::Placement || !matches!(vk, 0x0d | 0x20);
@@ -998,23 +1033,23 @@ impl State {
                     (PickerStage::Placement, 0x27) => Shortcut::PickerPlace(Direction::Right),
                     (PickerStage::Placement, 0x28) => Shortcut::PickerPlace(Direction::Down),
                     (PickerStage::Placement, 0x0d | 0x20) => {
-                        if repeat && !self.swallowed.contains(&vk) {
+                        if repeat && !self.swallowed.contains(&slot) {
                             // Held in the search field before the buttons appeared.
-                            self.local_held.insert(vk, false);
+                            self.local_held.insert(slot, false);
                         } else {
-                            self.swallowed.insert(vk);
+                            self.swallowed.insert(slot);
                         }
                         return repeat;
                     }
                     _ => return false,
                 };
                 if matches!(action, Shortcut::PickerMove(_)) {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     (self.shortcut)(action);
                 } else {
                     // A selection, placement or cancel key stays local until its
                     // release, even when its action changes the active stage/pane.
-                    self.local_held.insert(vk, false);
+                    self.local_held.insert(slot, false);
                     if !repeat {
                         (self.shortcut)(action);
                     }
@@ -1024,13 +1059,13 @@ impl State {
             // Native text editing owns printable keys, composition and clipboard shortcuts.
             return false;
         }
-        if matches!(vk, 0x09 | 0x0d | 0x20 | 0x26 | 0x28) && self.swallowed.contains(&vk) {
+        if matches!(vk, 0x09 | 0x0d | 0x20 | 0x26 | 0x28) && self.swallowed.contains(&slot) {
             // The button or row that owned the key may have closed the picker.
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => return true,
                 WM_CHAR | WM_SYSCHAR if matches!(vk, 0x09 | 0x0d | 0x20) => return true,
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
-                    self.swallowed.remove(&vk);
+                    self.swallowed.remove(&slot);
                 }
                 _ => {}
             }
@@ -1046,15 +1081,15 @@ impl State {
             if message.lParam.0 & (1 << 30) == 0 {
                 (self.shortcut)(Shortcut::Fullscreen);
             }
-            self.swallowed.insert(vk);
+            self.swallowed.insert(slot);
             return true;
         }
         let mut mods = modifiers();
         if self.switcher {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP)
-                && self.switcher_trigger.released(vk, mods)
+                && self.switcher_trigger.released(slot, mods)
             {
-                self.swallowed.remove(&vk);
+                self.swallowed.remove(&slot);
                 self.switcher = false;
                 (self.shortcut)(Shortcut::CommitTab);
                 return true;
@@ -1071,7 +1106,7 @@ impl State {
                     _ => None,
                 };
                 if let Some(shortcut) = shortcut {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     if matches!(shortcut, Shortcut::CancelTab | Shortcut::CommitTab) {
                         self.switcher = false;
                     }
@@ -1082,7 +1117,7 @@ impl State {
                 return true;
             }
         }
-        if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
+        if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&slot) {
             return true;
         }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
@@ -1102,7 +1137,7 @@ impl State {
                     None
                 };
                 if let Some(shortcut) = find {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     (self.shortcut)(shortcut);
                     return true;
                 }
@@ -1116,10 +1151,10 @@ impl State {
                 if matches!(shortcut, Shortcut::NextTab | Shortcut::PreviousTab)
                     && self.preferences.tab_switcher_mode != TabSwitcherMode::Disabled
                 {
-                    self.switcher_trigger = SwitchTrigger::new(vk, mods);
+                    self.switcher_trigger = SwitchTrigger::new(slot, mods);
                     self.switcher = true;
                 }
-                self.swallowed.insert(vk);
+                self.swallowed.insert(slot);
                 if message.lParam.0 & (1 << 30) == 0 {
                     if matches!(
                         shortcut,
@@ -1132,7 +1167,7 @@ impl State {
                         } else {
                             PickerStage::Search
                         });
-                        self.local_held.insert(vk, false);
+                        self.local_held.insert(slot, false);
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
                         self.local_mode = Some(LocalMode::Hints);
@@ -1141,7 +1176,7 @@ impl State {
                     }
                     if let Shortcut::ResizePane(direction) = shortcut {
                         self.held_resize = Some(HeldResize {
-                            key: vk,
+                            key: slot,
                             repeat: Some((mods, direction)),
                         });
                     }
@@ -1191,31 +1226,31 @@ impl State {
                     None
                 };
                 if let Some(shortcut) = local {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     (self.shortcut)(shortcut);
                     return true;
                 }
                 if mods.contains(KeyModifiers::SHIFT) && vk == VK_PRIOR.0 as u32 {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::Scroll(
                         frames.load().rows.len().saturating_sub(1).max(1) as isize,
                     ));
                     return true;
                 }
                 if mods.contains(KeyModifiers::SHIFT) && vk == VK_NEXT.0 as u32 {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::Scroll(
                         -(frames.load().rows.len().saturating_sub(1).max(1) as isize),
                     ));
                     return true;
                 }
                 if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && matches!(vk, 0x26 | 0x28) {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::Prompt(if vk == 0x26 { -1 } else { 1 }));
                     return true;
                 }
                 if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && matches!(vk, 0x24 | 0x23) {
-                    self.swallowed.insert(vk);
+                    self.swallowed.insert(slot);
                     let _ = sender.send(Command::ScrollEdge(vk == 0x24));
                     return true;
                 }
@@ -1224,17 +1259,23 @@ impl State {
                     return true;
                 }
                 if self.is_read_only() {
-                    self.local_held.insert(vk, false);
+                    self.local_held.insert(slot, false);
                     return true;
                 }
-                let repeat = self.pressed.contains_key(&vk) || message.lParam.0 & (1 << 30) != 0;
-                if repeat {
-                    if let Some(key) = self.pressed.get(&vk)
-                        && !self.game_mode
-                    {
-                        emit_key(sender, *key, self.details.get(&vk), mods, true, true);
+                if let Some(key) = self.pressed.get(&slot) {
+                    if !self.game_mode {
+                        emit_key(sender, *key, self.details.get(&slot), mods, true, true);
                     }
                     return true;
+                }
+                if message.lParam.0 & (1 << 30) != 0 {
+                    // A shared VK (e.g. Enter) can already be down on the
+                    // other cluster. Otherwise this press began in another pane.
+                    let sibling_down = special_key(vk)
+                        .is_some_and(|key| self.pressed.values().any(|held| *held == key));
+                    if !sibling_down {
+                        return true;
+                    }
                 }
                 let mut details = None;
                 let key = special_key(vk).or_else(|| {
@@ -1258,14 +1299,13 @@ impl State {
                             keyboard[index.0 as usize] = 0;
                         }
                     }
-                    let scan = ((message.lParam.0 >> 16) & 0xff) as u32;
                     let base = (!altgr).then(|| unshifted(vk, scan, keyboard)).flatten();
                     let mut translated = [0u16; 8];
                     // This adapter consumes the keydown, so it owns dead-key translation.
                     let count = unsafe {
                         ToUnicodeEx(
                             vk,
-                            ((message.lParam.0 >> 16) & 0xff) as u32,
+                            scan,
                             &keyboard,
                             &mut translated,
                             0,
@@ -1279,19 +1319,26 @@ impl State {
                     let mut chars = text.chars();
                     let first = chars.next()?;
                     let composed = chars.next().is_some();
-                    details = Some(w11term::terminal::KeyDetails {
+                    details = Some(KeyDetails {
                         base,
                         text: composed.then_some(text),
+                        ..KeyDetails::default()
                     });
                     Some(KeyCode::Char(first))
                 });
+                // A keypad function can have a protocol identity even when the
+                // active layout produced no text. Clear has no legacy encoding.
+                let key = key.or_else(|| keypad.map(|_| KeyCode::Clear));
                 if let Some(key) = key {
-                    (self.shortcut)(Shortcut::ClearSelection);
-                    self.pressed.insert(vk, key);
-                    if let Some(details) = details {
-                        self.details.insert(vk, details);
+                    if let Some(keypad) = keypad {
+                        details.get_or_insert_with(KeyDetails::default).keypad = Some(keypad);
                     }
-                    emit_key(sender, key, self.details.get(&vk), mods, true, false);
+                    (self.shortcut)(Shortcut::ClearSelection);
+                    self.pressed.insert(slot, key);
+                    if let Some(details) = details {
+                        self.details.insert(slot, details);
+                    }
+                    emit_key(sender, key, self.details.get(&slot), mods, true, false);
                     true
                 } else {
                     // Modifiers/dead keys must not trigger WinUI keyboard navigation.
@@ -1299,8 +1346,8 @@ impl State {
                 }
             }
             WM_KEYUP | WM_SYSKEYUP => {
-                if let Some(key) = self.pressed.remove(&vk) {
-                    let details = self.details.remove(&vk);
+                if let Some(key) = self.pressed.remove(&slot) {
+                    let details = self.details.remove(&slot);
                     emit_key(sender, key, details.as_ref(), mods, false, false);
                     return true;
                 }
@@ -1413,24 +1460,24 @@ impl From<Action> for Shortcut {
 #[derive(Clone, Copy)]
 enum SwitchTrigger {
     Modifier(KeyModifiers),
-    Key(u32),
+    Key(KeySlot),
 }
 impl SwitchTrigger {
-    fn new(vk: u32, mods: KeyModifiers) -> Self {
+    fn new(slot: KeySlot, mods: KeyModifiers) -> Self {
         [KeyModifiers::CTRL, KeyModifiers::ALT, KeyModifiers::SHIFT]
             .into_iter()
             .find(|flag| mods.contains(*flag))
-            .map_or(Self::Key(vk), Self::Modifier)
+            .map_or(Self::Key(slot), Self::Modifier)
     }
-    fn released(self, vk: u32, mods: KeyModifiers) -> bool {
+    fn released(self, slot: KeySlot, mods: KeyModifiers) -> bool {
         match self {
-            Self::Key(key) => key == vk,
+            Self::Key(key) => key == slot,
             Self::Modifier(flag) => {
                 !mods.contains(flag)
                     && match flag {
-                        KeyModifiers::CTRL => matches!(vk, 0x11 | 0xa2 | 0xa3),
-                        KeyModifiers::ALT => matches!(vk, 0x12 | 0xa4 | 0xa5),
-                        _ => matches!(vk, 0x10 | 0xa0 | 0xa1),
+                        KeyModifiers::CTRL => matches!(slot, KeySlot::Virtual(0x11 | 0xa2 | 0xa3)),
+                        KeyModifiers::ALT => matches!(slot, KeySlot::Virtual(0x12 | 0xa4 | 0xa5)),
+                        _ => matches!(slot, KeySlot::Virtual(0x10 | 0xa0 | 0xa1)),
                     }
             }
         }
@@ -1472,6 +1519,43 @@ fn key_identity(vk: u32, data: isize) -> u32 {
         _ => vk,
     }
 }
+fn keypad_key(vk: u32, scan: u32, extended: bool) -> Option<KeypadKey> {
+    use KeypadKey::*;
+    Some(match vk {
+        0x60..=0x69 => [
+            Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
+        ][(vk - 0x60) as usize],
+        0x6a => Multiply,
+        0x6b => Add,
+        0x6c => Separator,
+        // HID Keypad Comma can reach Windows through a layout-specific VK.
+        0xbc | 0xc2 if scan == 0x7e => Separator,
+        0x6d => Subtract,
+        0x6e => Decimal,
+        0x6f => Divide,
+        0x0d if extended => Enter,
+        // 0x92 is shared with the Japanese dictionary key. 0x59 is keypad '='.
+        0x92 | 0xbb if scan == 0x59 => Equal,
+        // The dedicated navigation cluster uses the same scans with E0 set.
+        // No scan in an injected VK event gives us no keypad evidence.
+        _ if !extended => match (vk, scan) {
+            (0x24, 0x47) => Home,
+            (0x26, 0x48) => Up,
+            (0x21, 0x49) => PageUp,
+            (0x25, 0x4b) => Left,
+            (0x0c, 0x4c) => Begin,
+            (0x27, 0x4d) => Right,
+            (0x23, 0x4f) => End,
+            (0x28, 0x50) => Down,
+            (0x22, 0x51) => PageDown,
+            (0x2d, 0x52) => Insert,
+            (0x2e, 0x53) => Delete,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 fn special_key(vk: u32) -> Option<KeyCode> {
     Some(match vk {
         0x08 => KeyCode::Char('\u{8}'),
@@ -1511,13 +1595,16 @@ mod tests {
 
     #[test]
     fn tab_switcher_commits_when_the_remapped_trigger_is_released() {
-        let trigger = SwitchTrigger::new(0x75, KeyModifiers::ALT | KeyModifiers::SHIFT);
-        assert!(!trigger.released(0xa0, KeyModifiers::ALT));
-        assert!(!trigger.released(0xa4, KeyModifiers::ALT));
-        assert!(trigger.released(0xa4, KeyModifiers::NONE));
-        let single = SwitchTrigger::new(0x77, KeyModifiers::NONE);
-        assert!(!single.released(0xa2, KeyModifiers::NONE));
-        assert!(single.released(0x77, KeyModifiers::NONE));
+        let trigger = SwitchTrigger::new(
+            KeySlot::Virtual(0x75),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert!(!trigger.released(KeySlot::Virtual(0xa0), KeyModifiers::ALT));
+        assert!(!trigger.released(KeySlot::Virtual(0xa4), KeyModifiers::ALT));
+        assert!(trigger.released(KeySlot::Virtual(0xa4), KeyModifiers::NONE));
+        let single = SwitchTrigger::new(KeySlot::Virtual(0x77), KeyModifiers::NONE);
+        assert!(!single.released(KeySlot::Virtual(0xa2), KeyModifiers::NONE));
+        assert!(single.released(KeySlot::Virtual(0x77), KeyModifiers::NONE));
     }
     #[test]
     fn simultaneous_left_and_right_modifiers_have_distinct_press_identities() {
@@ -1532,6 +1619,133 @@ mod tests {
             Some(KeyCode::RightShift)
         );
     }
+    #[test]
+    fn windows_keypad_scans_distinguish_both_clusters_and_all_operators() {
+        use KeypadKey::*;
+        for (vk, scan, key) in [
+            (0x24, 0x47, Home),
+            (0x26, 0x48, Up),
+            (0x21, 0x49, PageUp),
+            (0x25, 0x4b, Left),
+            (0x0c, 0x4c, Begin),
+            (0x27, 0x4d, Right),
+            (0x23, 0x4f, End),
+            (0x28, 0x50, Down),
+            (0x22, 0x51, PageDown),
+            (0x2d, 0x52, Insert),
+            (0x2e, 0x53, Delete),
+        ] {
+            assert_eq!(keypad_key(vk, scan, false), Some(key));
+            assert_eq!(keypad_key(vk, scan, true), None);
+            assert_eq!(keypad_key(vk, 0, false), None);
+        }
+        for (index, key) in [
+            Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(keypad_key(0x60 + index as u32, 0, false), Some(key));
+        }
+        for (vk, scan, extended, key) in [
+            (0x0d, 0x1c, true, Enter),
+            (0x6a, 0x37, false, Multiply),
+            (0x6b, 0x4e, false, Add),
+            (0x6c, 0x7e, false, Separator),
+            (0xc2, 0x7e, false, Separator),
+            (0x6d, 0x4a, false, Subtract),
+            (0x6e, 0x53, false, Decimal),
+            (0x6f, 0x35, true, Divide),
+            (0x92, 0x59, false, Equal),
+        ] {
+            assert_eq!(keypad_key(vk, scan, extended), Some(key));
+        }
+        assert_eq!(keypad_key(0x0d, 0x1c, false), None);
+        assert_eq!(keypad_key(0xbb, 0x0d, false), None); // main '='
+        assert_eq!(keypad_key(0x92, 0, false), None); // Fujitsu dictionary
+    }
+
+    #[test]
+    fn simultaneous_enters_keep_distinct_presses_repeats_and_releases() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut pending) = mpsc::unbounded_channel();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            ..State::new(|_| {})
+        };
+        for (msg, keypad, previous, down, repeat) in [
+            (WM_KEYDOWN, false, false, true, false),
+            (WM_KEYDOWN, true, true, true, false),
+            (WM_KEYDOWN, true, true, true, true),
+            (WM_KEYUP, false, true, false, false),
+            (WM_KEYUP, true, true, false, false),
+        ] {
+            assert!(state.handle(&MSG {
+                message: msg,
+                wParam: WPARAM(0x0d),
+                lParam: LPARAM(
+                    (0x1c << 16) | ((keypad as isize) << 24) | ((previous as isize) << 30)
+                ),
+                ..Default::default()
+            }));
+            let actual = match pending.try_recv().unwrap() {
+                Command::DetailedKey {
+                    key: KeyCode::Char('\r'),
+                    details,
+                    down,
+                    repeat,
+                    ..
+                } => (details.keypad, down, repeat),
+                Command::Key {
+                    key: KeyCode::Char('\r'),
+                    down,
+                    repeat,
+                    ..
+                } => (None, down, repeat),
+                _ => panic!("Expected Enter"),
+            };
+            assert_eq!(actual, (keypad.then_some(KeypadKey::Enter), down, repeat));
+        }
+        assert!(state.pressed.is_empty());
+        assert!(pending.try_recv().is_err());
+    }
+    #[test]
+    fn keypad_game_mode_releases_press_identity_when_num_lock_changes() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut pending) = mpsc::unbounded_channel();
+        let mut state = State {
+            game_mode: true,
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            ..State::new(|_| {})
+        };
+        for (msg, vk, previous) in [
+            (WM_KEYDOWN, VK_LEFT, false),
+            (WM_KEYDOWN, VK_LEFT, true),
+            (WM_KEYUP, VK_NUMPAD4, true),
+        ] {
+            assert!(state.handle(&MSG {
+                message: msg,
+                wParam: WPARAM(vk.0.into()),
+                lParam: LPARAM((0x4b << 16) | ((previous as isize) << 30)),
+                ..Default::default()
+            }));
+        }
+        for expected in [true, false] {
+            assert!(matches!(pending.try_recv(), Ok(Command::DetailedKey {
+                key: KeyCode::LeftArrow, details: KeyDetails {keypad: Some(KeypadKey::Left), ..},
+                down, repeat: false, ..
+            }) if down == expected));
+        }
+        assert!(pending.try_recv().is_err());
+        assert!(state.pressed.is_empty());
+    }
+
     #[test]
     fn sgr_pixel_offsets_use_physical_pixels_at_non_default_dpi() {
         assert_eq!(cell_pixel_offset(13.0, 10.0, 1.0), 3);
@@ -1753,12 +1967,12 @@ mod tests {
                     frames: lab.frames.clone(),
                 }),
                 read_only: Some(locked.clone()),
-                pressed: HashMap::from([(0x58, KeyCode::Char('x'))]),
+                pressed: HashMap::from([(KeySlot::Virtual(0x58), KeyCode::Char('x'))]),
                 details: HashMap::from([(
-                    0x58,
-                    w11term::terminal::KeyDetails {
+                    KeySlot::Virtual(0x58),
+                    KeyDetails {
                         base: Some('x'),
-                        text: None,
+                        ..KeyDetails::default()
                     },
                 )]),
                 surrogate: Some(0xd800),
@@ -1820,7 +2034,7 @@ mod tests {
                 sender: old,
                 frames: lab.frames.clone(),
             }),
-            pressed: HashMap::from([(0x58, KeyCode::Char('x'))]),
+            pressed: HashMap::from([(KeySlot::Virtual(0x58), KeyCode::Char('x'))]),
             surrogate: Some(0xd800),
             ..State::new(|_| {})
         };
@@ -1875,7 +2089,7 @@ mod tests {
         };
         // Opening the picker calls release_keys while Alt+Shift+Down is held.
         state.held_resize = Some(HeldResize {
-            key: VK_DOWN.0 as u32,
+            key: KeySlot::Virtual(VK_DOWN.0.into()),
             repeat: Some((KeyModifiers::ALT | KeyModifiers::SHIFT, Direction::Down)),
         });
         state.release_keys();
@@ -1935,7 +2149,7 @@ mod tests {
         };
         // Held in the shell when the user entered copy mode. Neither a known
         // inherited key nor an orphan repeat can start a movement here.
-        state.local_held.insert(0x26, false);
+        state.local_held.insert(KeySlot::Virtual(0x26), false);
         for event in [
             key(WM_KEYDOWN, 0x26, true),
             key(WM_KEYUP, 0x26, false),
