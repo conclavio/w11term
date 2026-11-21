@@ -91,6 +91,8 @@ async fn native_file_drawer() {
     let (source, remote, opens, server) = fixture_server(false).await;
     let shell_dir = remote.path().join("shell directory");
     fs::create_dir(&shell_dir).unwrap();
+    fs::create_dir(shell_dir.join("src")).unwrap();
+    fs::write(shell_dir.join("src/trace.rs"), b"hint target").unwrap();
     let state = tempfile::tempdir().unwrap();
     let bytes: Vec<_> = (0..(3 * w11term::sftp::CHUNK + 7))
         .map(|i| (i % 251) as u8)

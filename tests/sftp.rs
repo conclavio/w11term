@@ -69,7 +69,7 @@ impl server::Handler for Peer {
             )?;
             s.data(
                 c,
-                b"\x1b]7;file://127.0.0.1/shell%20directory\x1b\\".as_slice(),
+                b"src/trace.rs:11:1\r\n\x1b]7;file://127.0.0.1/shell%20directory\x1b\\".as_slice(),
             )?;
         }
         Ok(())

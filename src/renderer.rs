@@ -302,6 +302,39 @@ impl Renderer {
         self.draw_surface(ctx, ctx.width, ctx.height, ctx.device_changed(), frame)
     }
 
+    pub fn draw_hint_labels<'a>(
+        &self,
+        ctx: &DrawContext<'_>,
+        frame: &Snapshot,
+        hints: impl Iterator<Item = &'a w11term::hints::Hint>,
+    ) -> windows_canvas::Result<()> {
+        let brush = ctx.create_solid_brush(ColorF::WHITE)?;
+        let Metrics {
+            cell_width,
+            cell_height,
+            cols,
+            rows,
+            ..
+        } = self.metrics;
+        for hint in hints.filter(|h| h.row < rows) {
+            let col = frame
+                .cell_map(hint.row)
+                .map_or(hint.col, |map| map.visual(hint.col));
+            if col >= cols {
+                continue;
+            }
+            let width = cell_width * hint.label.len() as f32 + 4.0;
+            let x = (PADDING + col as f32 * cell_width).min((ctx.width - width).max(0.0));
+            let y = PADDING + hint.row as f32 * cell_height;
+            let rect = Rect::from_xywh(x, y, width, cell_height);
+            brush.set_color(ColorF::new(1.0, 0.84, 0.4, 1.0));
+            ctx.fill_rect(&rect, &brush);
+            brush.set_color(ColorF::new(0.06, 0.08, 0.11, 1.0));
+            ctx.draw_text(&hint.label, &self.bold, &rect, &brush);
+        }
+        Ok(())
+    }
+
     pub fn draw_preedit(
         &self,
         ctx: &DrawContext<'_>,

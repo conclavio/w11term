@@ -38,6 +38,7 @@ mod accessibility_smoke;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
+mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
 mod pane_picker;
@@ -297,6 +298,7 @@ fn tab_menu_message(label: String) -> Message {
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
+        "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
         _ => Message::ControlIdle,
     }
 }
@@ -351,6 +353,7 @@ pub struct TerminalApp {
     mru: Vec<TabId>,
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
+    hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
 }
 
 pub enum Message {
@@ -544,6 +547,17 @@ impl TerminalApp {
         };
         let frame = tab.session.frames.load();
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
+        if self.hints.borrow().as_ref().is_some_and(|h| {
+            h.pane == id
+                && (prompt_id.is_some()
+                    || h.frame.connection_generation != frame.connection_generation
+                    || h.frame.cols != frame.cols
+                    || h.frame.rows.len() != frame.rows.len())
+        }) {
+            self.hints.borrow_mut().take();
+            self.keyboard.set_hints(false);
+            tab.surface.invalidator.invalidate();
+        }
         if prompt_id.is_some() && self.picker.take().is_some() {
             self.keyboard.set_picker(false);
         }
@@ -902,6 +916,9 @@ impl TerminalApp {
         if !self.tabs.visible(id) {
             return;
         }
+        if self.hints.borrow().as_ref().is_some_and(|h| h.pane == id) {
+            return;
+        }
         if kind == MouseEventKind::Press && self.tabs.active_id() != Some(id) {
             self.focus_pane(id, context);
         }
@@ -1089,9 +1106,13 @@ impl TerminalApp {
         if should_paste {
             self.paste(false, context);
         }
-        if let Some(uri) = open
-            && safe_url(&uri)
-        {
+        if let Some(uri) = open {
+            Self::open_link(&uri);
+        }
+    }
+
+    fn open_link(uri: &str) {
+        if safe_url(uri) {
             use windows::{
                 Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
                 core::PCWSTR,
@@ -1399,6 +1420,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.close_hints();
         if self.picker.take().is_some() {
             self.keyboard.set_picker(false);
         }
@@ -2146,6 +2168,7 @@ impl TerminalApp {
         let mut items = vec![
             MenuItem::item("split-right", "Split right"),
             MenuItem::item("split-below", "Split below"),
+            MenuItem::item("keyboard-hints", "Keyboard hints"),
         ];
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
@@ -2666,6 +2689,7 @@ impl Component for TerminalApp {
             mru: Vec::new(),
             switcher: None,
             picker: None,
+            hints: Default::default(),
             selection_pending: true,
             selection_epoch: 0,
         };
@@ -2766,6 +2790,7 @@ impl Component for TerminalApp {
                     && !tab.find.open
                     && self.switcher.is_none()
                     && self.picker.is_none()
+                    && self.hints.borrow().is_none()
                 {
                     let frame = tab.session.frames.load();
                     if frame.generation == request.generation {
@@ -3369,7 +3394,9 @@ impl Component for TerminalApp {
                                 });
                             }
                         }
-                        tab.surface.invalidator.invalidate();
+                        if self.hints.borrow().as_ref().is_none_or(|h| h.pane != id) {
+                            tab.surface.invalidator.invalidate();
+                        }
                     }
                     self.watch_frames(context);
                 }
@@ -3458,6 +3485,8 @@ impl Component for TerminalApp {
             }
             Message::Shortcut(shortcut) => match shortcut {
                 Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::KeyboardHints => self.open_hints(),
+                Shortcut::HintKey(key) => self.hint_key(key, context),
                 Shortcut::PickerAccept => self.accept_picker(context),
                 Shortcut::PickerCancel => self.close_picker(context),
                 Shortcut::PickerMove(delta) => {
@@ -3901,6 +3930,7 @@ impl Component for TerminalApp {
             && !tab.browsing_sessions()
             && self.switcher.is_none()
             && self.picker.is_none()
+            && self.hints.borrow().is_none()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
             let metrics = tab.surface.metrics.get();
