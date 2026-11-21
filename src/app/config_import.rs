@@ -189,8 +189,7 @@ impl TerminalApp {
                     .and_then(|_| self.store.catalog())
                 {
                     Ok(catalog) => {
-                        self.profiles = catalog.profiles;
-                        self.local_profiles = catalog.local;
+                        self.catalog = catalog;
                         format!("Saved profile {name}")
                     }
                     Err(error) => format!("{error:#}"),
@@ -286,8 +285,8 @@ impl TerminalApp {
                 fields.push(text("host-warnings", alias.warnings.join("\n")));
             }
             let selected = page.selected.unwrap();
-            let exists = self.profiles.contains_key(&alias.name)
-                || self.local_profiles.contains_key(&alias.name);
+            let exists = self.catalog.profiles.contains_key(&alias.name)
+                || self.catalog.local.contains_key(&alias.name);
             fields.push(KeyedView::new(
                 "save",
                 Button::new()
@@ -360,7 +359,7 @@ impl TerminalApp {
                         Message::ImportConfig(Action::Save(id, revision, unusable)),
                         context,
                     );
-                    assert!(!self.profiles.contains_key("blocked"));
+                    assert!(!self.catalog.profiles.contains_key("blocked"));
                     self.update(
                         Message::ImportConfig(Action::Select(id, revision, Some(via))),
                         context,

@@ -16,7 +16,7 @@ use w11term::{
     interaction::{
         Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
     },
-    options::{Authentication, LocalOptions, Source, SshOptions, TerminalType, profile_source},
+    options::{Authentication, LocalOptions, Profiles, Source, SshOptions, TerminalType},
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
@@ -545,10 +545,10 @@ pub struct TerminalApp {
     default_source: Source,
     default_label: String,
     default_profile: Option<String>,
-    profiles: BTreeMap<String, SshOptions>,
-    local_profiles: BTreeMap<String, LocalOptions>,
+    catalog: Profiles,
     store: ProfileStore,
     profile_error: Option<String>,
+    profile_move_error: Option<String>,
     width: f64,
     selection_pending: bool,
     selection_epoch: u64,
@@ -634,6 +634,8 @@ pub enum Message {
     SyncSelection(u64),
     Shortcut(Shortcut),
     ProfileMenu(String),
+    MoveProfile(String, isize, Arc<[String]>),
+    RefreshProfiles,
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
@@ -1446,40 +1448,61 @@ impl TerminalApp {
         ];
         let mut profiles: Vec<View> =
             vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
-        for (name, ssh) in &self.profiles {
-            let display = profile_label(name, ssh);
-            let name = name.clone();
-            profiles.push(
+        let order: Arc<[String]> = self.catalog.profile_order.as_slice().into();
+        let mut rows = Vec::with_capacity(order.len());
+        for (index, name) in order.iter().enumerate() {
+            let edit_name = name.clone();
+            let (label, edit) = if let Some(ssh) = self.catalog.profiles.get(name) {
+                (
+                    profile_label(name, ssh),
+                    Button::new()
+                        .automation_name(format!("Edit profile {name}"))
+                        .on_click(
+                            context.callback(move |_| Message::EditProfile(edit_name.clone())),
+                        ),
+                )
+            } else {
+                (
+                    format!("{name} · Local"),
+                    Button::new()
+                        .automation_name(format!("Edit local profile {name}"))
+                        .on_click(context.callback(move |_| {
+                            Message::LocalProfile(local_profile::Action::Open(Some(
+                                edit_name.clone(),
+                            )))
+                        })),
+                )
+            };
+            let movement = |direction, delta, enabled| {
+                let order = order.clone();
+                let name = name.clone();
+                Button::new()
+                    .automation_name(format!("Move {name} {direction}"))
+                    .is_enabled(enabled)
+                    .on_click(context.callback(move |_| {
+                        Message::MoveProfile(name.clone(), delta, order.clone())
+                    }))
+                    .content(format!("Move {direction}"))
+            };
+            rows.push(KeyedView::new(
+                name.clone(),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(12.0)
+                    .spacing(8.0)
                     .children((
-                        Button::new()
-                            .automation_name(format!("Edit profile {name}"))
-                            .on_click(context.callback(move |_| Message::EditProfile(name.clone())))
-                            .content("Edit…"),
+                        edit.content("Edit…"),
+                        movement("up", -1, index > 0),
+                        movement("down", 1, index + 1 < order.len()),
                         TextBlock::new()
-                            .text(display)
+                            .text(label)
                             .vertical_alignment(VerticalAlignment::Center),
                     )),
-            );
+            ));
         }
-        if self.profiles.is_empty() {
+        if rows.is_empty() {
             profiles.push(TextBlock::new().text("No saved profiles yet.").into());
-        }
-        for name in self.local_profiles.keys() {
-            let name = name.clone();
-            profiles.push(
-                Button::new()
-                    .automation_name(format!("Edit local profile {name}"))
-                    .on_click(context.callback({
-                        let name = name.clone();
-                        move |_| {
-                            Message::LocalProfile(local_profile::Action::Open(Some(name.clone())))
-                        }
-                    }))
-                    .content(format!("Edit {name} · Local…")),
-            );
+        } else {
+            profiles.push(StackPanel::new().spacing(8.0).keyed_children(rows));
         }
         profiles.push(
             Button::new()
@@ -1488,7 +1511,7 @@ impl TerminalApp {
                 )
                 .content("New local shell profile…"),
         );
-        if let Some(error) = &self.profile_error {
+        for error in self.profile_error.iter().chain(&self.profile_move_error) {
             profiles.push(
                 TextBlock::new()
                     .text(error)
@@ -1716,8 +1739,8 @@ impl TerminalApp {
             .and_then(AppTab::profile_name)
             .filter(|name| {
                 single
-                    && (self.profiles.contains_key(*name)
-                        || self.local_profiles.contains_key(*name))
+                    && (self.catalog.profiles.contains_key(*name)
+                        || self.catalog.local.contains_key(*name))
             })
             .map(str::to_owned);
         let group = self.tabs.active_id().and_then(|id| self.tabs.group_id(id));
@@ -1929,7 +1952,7 @@ impl TerminalApp {
         let profile_name = profile.or_else(|| tab.profile_name.clone());
         let (label, source) = match &profile_name {
             Some(name) => {
-                let source = match profile_source(&self.profiles, &self.local_profiles, name) {
+                let source = match self.catalog.source(name) {
                     Some(source) => source,
                     None if !explicit_profile => tab.source.clone(),
                     None => return,
@@ -2025,6 +2048,25 @@ impl TerminalApp {
         Ok(())
     }
 
+    fn refresh_profiles(&mut self) {
+        match self.store.catalog() {
+            Ok(catalog) => {
+                if self.catalog != catalog || self.profile_error.is_some() {
+                    self.catalog = catalog;
+                    self.profile_error = None;
+                    self.header.borrow_mut().take();
+                }
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                if self.profile_error.as_ref() != Some(&error) {
+                    self.profile_error = Some(error);
+                    self.header.borrow_mut().take();
+                }
+            }
+        }
+    }
+
     fn utility(&mut self, settings: bool, context: &ComponentContext<Self>) {
         let existing = self
             .tabs
@@ -2075,8 +2117,7 @@ impl TerminalApp {
         }
         match self.store.inspect_catalog(&name) {
             Ok((catalog, base)) => {
-                self.profiles = catalog.profiles;
-                self.local_profiles = catalog.local;
+                self.catalog = catalog;
                 self.profile_error = None;
                 self.tabs.insert(AppTab {
                     label: format!("Edit {name}"),
@@ -2107,7 +2148,7 @@ impl TerminalApp {
         };
         let mut name = format!("{} copy", base.name);
         let mut index = 2;
-        while self.profiles.contains_key(&name) || self.local_profiles.contains_key(&name) {
+        while self.catalog.profiles.contains_key(&name) || self.catalog.local.contains_key(&name) {
             name = format!("{} copy {index}", base.name);
             index += 1;
         }
@@ -2150,8 +2191,7 @@ impl TerminalApp {
             }
         };
         let name = base.name.clone();
-        self.profiles = catalog.profiles;
-        self.local_profiles = catalog.local;
+        self.catalog = catalog;
         let linked: Vec<_> = self
             .tabs
             .entries()
@@ -2246,8 +2286,7 @@ impl TerminalApp {
                 DraftOrigin::Copy(base) => self.store.duplicate(base, name, &options)?,
             }
             let (catalog, saved) = self.store.inspect_catalog(name)?;
-            self.profiles = catalog.profiles;
-            self.local_profiles = catalog.local;
+            self.catalog = catalog;
             self.profile_error = None;
             Ok(saved)
         })();
@@ -2404,15 +2443,17 @@ impl TerminalApp {
 
     fn profile_items(&self) -> Vec<MenuItem> {
         let mut menu: Vec<_> = self
-            .profiles
+            .catalog
+            .profile_order
             .iter()
-            .map(|(name, ssh)| MenuItem::item(format!("profile:{name}"), profile_label(name, ssh)))
+            .map(|name| {
+                if let Some(ssh) = self.catalog.profiles.get(name) {
+                    MenuItem::item(format!("profile:{name}"), profile_label(name, ssh))
+                } else {
+                    MenuItem::item(format!("local:{name}"), format!("{name} · Local"))
+                }
+            })
             .collect();
-        menu.extend(
-            self.local_profiles
-                .keys()
-                .map(|name| MenuItem::item(format!("local:{name}"), format!("{name} · Local"))),
-        );
         if self.profile_error.is_some() {
             menu.push(MenuItem::disabled("error", "Could not load profiles"));
         }
@@ -2432,13 +2473,13 @@ impl TerminalApp {
         });
         let can_edit = self.tabs.active().is_some_and(|tab| {
             tab.profile_name().is_some_and(|name| {
-                self.profiles.contains_key(name) || self.local_profiles.contains_key(name)
+                self.catalog.profiles.contains_key(name) || self.catalog.local.contains_key(name)
             })
         });
         let device_ready = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
             if !live.device_busy && live.session.prompts.current().is_none()
             && live.session.frames.load().connection_generation > 0
-            && live.profile_name.as_ref().and_then(|name| self.profiles.get(name))
+            && live.profile_name.as_ref().and_then(|name| self.catalog.profiles.get(name))
                 .is_some_and(|profile| profile.player.rustmush && profile.player.device_key.is_some()));
         let workspace_startup = match self.tabs.active().map(|tab| &tab.page) {
             Some(Page::Terminal(live)) if matches!(&live.source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush) => {
@@ -2586,7 +2627,7 @@ impl TerminalApp {
                 items.push(menu);
             }
         }
-        if !self.profiles.is_empty() || !self.local_profiles.is_empty() {
+        if !self.catalog.profile_order.is_empty() {
             for (key, label) in [
                 ("right-profile", "Split right with"),
                 ("below-profile", "Split below with"),
@@ -2594,9 +2635,9 @@ impl TerminalApp {
                 items.push(MenuItem::submenu(
                     key,
                     format!("{label} profile"),
-                    self.profiles
-                        .keys()
-                        .chain(self.local_profiles.keys())
+                    self.catalog
+                        .profile_order
+                        .iter()
                         .map(|name| MenuItem::item(name.clone(), format!("{label} {name}"))),
                 ));
             }
@@ -2972,13 +3013,9 @@ impl Component for TerminalApp {
         let _native = keyboard.scope().enter();
         let store = ProfileStore::new(options.profiles_path.clone())
             .expect("resolving profile configuration path");
-        let (profiles, local_profiles, profile_error) = match store.catalog() {
-            Ok(p) => (p.profiles, p.local, None),
-            Err(e) => (
-                BTreeMap::new(),
-                LocalOptions::installed(),
-                Some(format!("{e:#}")),
-            ),
+        let (catalog, profile_error) = match store.catalog() {
+            Ok(catalog) => (catalog, None),
+            Err(error) => (Profiles::default(), Some(format!("{error:#}"))),
         };
         let label = options
             .initial_profile
@@ -3072,7 +3109,7 @@ impl Component for TerminalApp {
                 .with_profile(options.initial_profile.clone()),
             );
             for name in &options.extra_profiles {
-                if let Some(source) = profile_source(&profiles, &local_profiles, name) {
+                if let Some(source) = catalog.source(name) {
                     tabs.insert(
                         live_tab_sized(name.clone(), source, size, osc52, None, None)
                             .with_profile(Some(name.clone())),
@@ -3125,9 +3162,11 @@ impl Component for TerminalApp {
             |transfer| transfer.server.clone(),
         );
         let active = registry.clone();
+        let sender = context.sender();
         keyboard.on_activation(move |focused| {
             if focused {
                 active.activate();
+                sender.send(Message::RefreshProfiles);
             }
         });
         let mut app = Self {
@@ -3161,10 +3200,10 @@ impl Component for TerminalApp {
             default_source: options.source.clone(),
             default_label: label,
             default_profile: options.initial_profile.clone(),
-            profiles,
-            local_profiles,
+            catalog,
             store,
             profile_error,
+            profile_move_error: None,
             width: client_size.0,
             window_height: client_size.1,
             client_size,
@@ -3244,6 +3283,7 @@ impl Component for TerminalApp {
         if !matches!(
             &message,
             Message::FrameReady(..)
+                | Message::RefreshProfiles
                 | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
@@ -3367,7 +3407,7 @@ impl Component for TerminalApp {
                         let profile = tab
                             .profile_name
                             .as_ref()
-                            .and_then(|name| self.profiles.get(name))
+                            .and_then(|name| self.catalog.profiles.get(name))
                             .context("Use a saved Rustmush profile")?;
                         anyhow::ensure!(
                             profile.player.rustmush,
@@ -3434,6 +3474,7 @@ impl Component for TerminalApp {
                                 let label =
                                     tab.profile_name.as_ref().context("profile was removed")?;
                                 let mut profile = self
+                                    .catalog
                                     .profiles
                                     .get(label)
                                     .context("profile was removed")?
@@ -3451,7 +3492,7 @@ impl Component for TerminalApp {
                                 };
                                 profile.authentication = auth.clone();
                                 self.store.update(label, &profile)?;
-                                self.profiles.insert(label.clone(), profile);
+                                self.catalog.profiles.insert(label.clone(), profile);
                                 auth_update = Some((label.clone(), auth));
                                 Ok(())
                             })();
@@ -3522,7 +3563,7 @@ impl Component for TerminalApp {
                         .clone()
                         .filter(|_| matches!(tab.source, Source::Ssh(_)))
                     {
-                        if let Some(profile) = self.profiles.get_mut(&name) {
+                        if let Some(profile) = self.catalog.profiles.get_mut(&name) {
                             profile.player = preferences.clone();
                             if let Err(error) = self.store.update(&name, profile) {
                                 log::warn!("Saving player preferences: {error:#}");
@@ -3587,7 +3628,9 @@ impl Component for TerminalApp {
                 reply,
             }) => {
                 let result = (|| -> anyhow::Result<serde_json::Value> {
-                    let source = profile_source(&self.profiles, &self.local_profiles, &profile)
+                    let source = self
+                        .catalog
+                        .source(&profile)
                         .with_context(|| format!("unknown profile {profile}"))?;
                     let metrics = self.metrics.get();
                     let explicit_grid = cols.is_some() || rows.is_some();
@@ -4143,7 +4186,7 @@ impl Component for TerminalApp {
                     self.default_label.clone(),
                     self.default_profile
                         .as_ref()
-                        .and_then(|name| profile_source(&self.profiles, &self.local_profiles, name))
+                        .and_then(|name| self.catalog.source(name))
                         .unwrap_or_else(|| self.default_source.clone()),
                     self.default_profile.clone(),
                     context,
@@ -4166,6 +4209,7 @@ impl Component for TerminalApp {
                 } else if label == LAB {
                     self.open(LAB.into(), Source::Demo, None, context);
                 } else if let Some((name, profile)) = self
+                    .catalog
                     .profiles
                     .iter()
                     .find(|(name, ssh)| profile_label(name, ssh) == label)
@@ -4173,7 +4217,7 @@ impl Component for TerminalApp {
                 {
                     self.open(name.clone(), Source::Ssh(profile), Some(name), context);
                 } else if let Some(name) = label.strip_suffix(" · Local")
-                    && let Some(shell) = self.local_profiles.get(name)
+                    && let Some(shell) = self.catalog.local.get(name)
                 {
                     self.open(
                         name.into(),
@@ -4205,16 +4249,35 @@ impl Component for TerminalApp {
                     .and_then(AppTab::profile_name)
                     .map(str::to_owned)
                 {
-                    if self.profiles.contains_key(&name) {
+                    if self.catalog.profiles.contains_key(&name) {
                         self.edit_profile(name, context);
-                    } else if self.local_profiles.contains_key(&name) {
+                    } else if self.catalog.local.contains_key(&name) {
                         self.local_profile_action(local_profile::Action::Open(Some(name)), context);
                     }
                 }
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
-            Message::SettingsMenu => self.utility(true, context),
+            Message::RefreshProfiles => self.refresh_profiles(),
+            Message::MoveProfile(name, delta, order) => {
+                match self.store.move_profile(&name, delta, &order) {
+                    Ok(catalog) => {
+                        self.catalog = catalog;
+                        self.profile_error = None;
+                        self.profile_move_error = None;
+                    }
+                    Err(error) => {
+                        self.refresh_profiles();
+                        self.profile_move_error = Some(format!(
+                            "Could not move {name}: {error:#}. Review the current order and try again."
+                        ));
+                    }
+                }
+            }
+            Message::SettingsMenu => {
+                self.refresh_profiles();
+                self.utility(true, context);
+            }
             Message::LocalProfile(action) => self.local_profile_action(action, context),
             Message::Workspace(action) => self.workspace_action(action, context),
             Message::ImportConfig(action) => self.import_action(action, context),
@@ -5090,8 +5153,8 @@ impl TerminalApp {
                     panic!()
                 };
                 assert!(draft.saved, "{:?}", draft.error);
-                assert!(self.profiles.contains_key("corrected"));
-                assert!(!self.profiles.contains_key("typo"));
+                assert!(self.catalog.profiles.contains_key("corrected"));
+                assert!(!self.catalog.profiles.contains_key("typo"));
                 assert_eq!(self.tabs.get(1).unwrap().profile_name(), Some("corrected"));
                 assert_eq!(self.tabs.get(1).unwrap().label, "corrected");
                 let count = self.tabs.entries().len();
@@ -5139,7 +5202,8 @@ impl TerminalApp {
                 );
                 self.update(Message::SaveProfileOnly(copy), context);
                 assert!(
-                    self.profiles.contains_key("corrected") && self.profiles.contains_key("second")
+                    self.catalog.profiles.contains_key("corrected")
+                        && self.catalog.profiles.contains_key("second")
                 );
                 assert_eq!(
                     self.store.load().unwrap()["second"].terminal_type.as_str(),
@@ -5168,11 +5232,11 @@ impl TerminalApp {
                 }).expect("save-and-connect pane is connected to the loopback peer");
                 let pane = existing.value.pane_id().unwrap();
                 let entry = existing.id;
-                let options = self.profiles["corrected"].clone();
+                let options = self.catalog.profiles["corrected"].clone();
                 self.update(Message::ConfirmDeleteProfile(editor, true), context);
-                assert!(!self.profiles.contains_key("corrected"));
+                assert!(!self.catalog.profiles.contains_key("corrected"));
                 self.store.add("corrected", &options).unwrap();
-                self.profiles = self.store.load().unwrap();
+                self.catalog = self.store.catalog().unwrap();
                 let Page::Terminal(live) = &self.tabs.get(entry).unwrap().page else {
                     panic!("connection was closed")
                 };

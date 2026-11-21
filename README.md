@@ -41,6 +41,8 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 ## Tabs and profiles
 
+In **Settings → Profiles**, use **Move up** and **Move down** to arrange SSH and local shell profiles together. The **+** menu, split submenus, command palette, and remote session browser use that order. Changes are saved immediately in `profiles.json` and appear in other open windows when you switch to them.
+
 When creating or editing an SSH profile, **SSH terminal type (TERM)** selects the terminfo name sent with each new PTY. Existing profiles use `xterm-256color`. Choose `xterm-sixel` for a host running Venti with Sixel graphics, or choose **Custom…** to enter a terminfo name supported by the host. This setting is stored as `"terminal_type": "xterm-sixel"` for the Sixel preset. Direct shells and PTY-based zmx and tmux attachments request `COLORTERM=truecolor`. A process already running inside a durable session keeps its existing environment.
 
 Open **caret → Command palette…** or press **Ctrl+Shift+K** to search actions for the current window. Search by words in any order, a profile name, or a current shortcut. Use Up and Down to highlight a result, then press Enter or click it. Disabled commands stay visible when their pane or connection requirements are unmet. Escape returns to the current pane. The palette also works from Settings and other utility tabs.
