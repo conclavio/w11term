@@ -275,6 +275,35 @@ async fn wait_detached(link: &ConnectionShare, mount: &str) -> Result<()> {
     Ok(())
 }
 
+async fn unmount_profile(
+    manager: &PaneShares,
+    auth: &Authority,
+    link: &ConnectionShare,
+    name: &str,
+    remote: &str,
+) -> Result<()> {
+    manager.unmount(auth, name)?;
+    if let Err(error) = wait_profile(manager, auth, name, Some(FolderMountStatus::Stopped)).await {
+        // The process status and kernel mount record tell us whether the
+        // daemon, its auto-unmount helper, or only the SSH channel survived.
+        let inspect = r#"awk -v path="$1" '$5 == path' /proc/self/mountinfo
+for proc in /proc/[0-9]*; do
+  read -r comm < "$proc/comm" 2>/dev/null || continue
+  case "$comm" in sshfs|fusermount3) awk '/^(Name|State|Pid|PPid):/' "$proc/status";; esac
+done"#;
+        // $1 is a fixture-generated absolute path.
+        let details = checked(link, &format!("set -- {remote}; {inspect}")).await;
+        return Err(error.context(format!(
+            "unmount {remote}; guest state: {}",
+            match details {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(error) => format!("{error:#}"),
+            }
+        )));
+    }
+    wait_detached(link, remote).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the disposable Linux FUSE guest and pinned loopback SSH supplied by the mount runner"]
 async fn native_windows_passive_sshfs() -> Result<()> {
@@ -331,7 +360,9 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     let manager = pane.profile_folders(scope());
     let auth = ready_authority(&manager).await?;
     manager.add(&auth, &name, selected.clone())?;
-    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted)).await?;
+    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted))
+        .await
+        .context("initial saved grant mount")?;
     let initial = check_mount(&link, &remote, &tile_digest).await?;
 
     // Another lease on this name, even with a different root, must leave the first mount intact.
@@ -365,9 +396,9 @@ async fn native_windows_passive_sshfs() -> Result<()> {
     )
     .await?;
 
-    manager.unmount(&auth, &name)?;
-    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Stopped)).await?;
-    wait_detached(&link, &remote).await?;
+    unmount_profile(&manager, &auth, &link, &name, &remote)
+        .await
+        .context("first explicit unmount after collision and destination checks")?;
 
     let original = fixture.path().join("original");
     fs::rename(&selected, &original)?;
@@ -392,9 +423,9 @@ async fn native_windows_passive_sshfs() -> Result<()> {
         restored != initial,
         "restoring the original reused its old mount"
     );
-    manager.unmount(&auth, &name)?;
-    wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Stopped)).await?;
-    wait_detached(&link, &remote).await?;
+    unmount_profile(&manager, &auth, &link, &name, &remote)
+        .await
+        .context("unmount after restoring the original Windows directory")?;
 
     let manual = FolderMount::start(link.clone(), FolderRoot::open(&selected)?, &name)?;
     wait_status(
