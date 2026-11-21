@@ -98,10 +98,9 @@ def run(args, root, name, mux, term):
     else:
         (config / "zellij").mkdir(parents=True)
         (config / "zellij/config.kdl").write_text("show_startup_tips false\nshow_release_notes false\n")
-        layout = directory / "layout.kdl"
-        layout.write_text(f'layout {{\n pane command="{sys.executable}" {{\n'
-                          f'  args "{pane}"\n }}\n}}\n')
-        command = [binary, "--new-session-with-layout", str(layout), "--session", name]
+        # An explicit initial command suppresses Zellij's first-run desktop
+        # integration wizard, which otherwise receives our pane's first key.
+        command = [binary, "attach", "--create", name, "--", sys.executable, str(pane)]
         stop = [binary, "kill-session", name]
 
     ssh_env = {**os.environ, "TERM": "xterm-256color", "COLORTERM": "truecolor"}
@@ -154,7 +153,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mux-") as tmp:
+        failures = []
         for case in [("zellij", "zellij", "xterm-256color"),
                      ("venti-default", "venti", "xterm-256color"),
                      ("venti-sixel", "venti", "xterm-sixel")]:
-            run(args, Path(tmp), *case)
+            try:
+                run(args, Path(tmp), *case)
+            except Exception as error:
+                error.add_note(case[0])
+                failures.append(error)
+        if failures:
+            raise ExceptionGroup("Remote mux checks failed", failures)
