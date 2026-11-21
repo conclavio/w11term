@@ -22,6 +22,10 @@ pub struct LocalProfileSnapshot {
 }
 
 impl ProfileStore {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn new(path: PathBuf) -> Result<Self> {
         let path = if path.is_absolute() {
             path
