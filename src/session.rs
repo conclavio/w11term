@@ -77,6 +77,7 @@ fn contain_worker_failure(
     work: impl FnOnce(),
 ) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+        events.command_stream(false);
         // Never resume a possibly inconsistent terminal engine after unwinding.
         let mut frame = (*frames.load()).clone();
         frame.generation += 1;
@@ -316,6 +317,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.events.command_stream(false);
         let _ = self.input.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -345,6 +347,9 @@ async fn run(
     let is_demo = matches!(source, Source::Demo);
     let is_ssh = matches!(source, Source::Ssh(_));
     let interactive = is_ssh || matches!(source, Source::Local(_));
+    // A durable backend may reconstruct an old screen at any time. Its OSC
+    // 133 bytes cannot be used to announce a newly completed command.
+    let live_commands = sharing.durable.is_none() && can_watch_commands(&source);
     let endpoint = match &source {
         Source::Ssh(options) => format!("{}@{}:{}", options.user, options.host, options.port),
         _ => String::new(),
@@ -380,6 +385,7 @@ async fn run(
                         .send(ssh::Event::Status(format!("Local shell: {error:#}")))
                         .await;
                 }
+                let _ = output_tx.send(ssh::Event::Disconnected).await;
             });
         }
         Source::Ssh(options) => {
@@ -658,6 +664,7 @@ async fn run(
                         ssh::Event::HerdrViewer => {
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
+                        ssh::Event::Disconnected => events.command_stream(false),
                         ssh::Event::Data(bytes) => {
                             if observed.receiver_count() > 0 {
                                 let _ = observed.send(bytes.clone());
@@ -681,6 +688,7 @@ async fn run(
                             }
                             presentation.dirty = true;
                             connection_generation = generation;
+                            events.command_stream(live_commands);
                         }
                     }
                 }
@@ -689,6 +697,7 @@ async fn run(
             }
         }
     }
+    events.command_stream(false);
     drop(output);
     transports.shutdown().await;
     if let Some(task) = asset_task {
@@ -696,6 +705,14 @@ async fn run(
     }
     if let Some(recorder) = recorder {
         let _ = recorder.finish();
+    }
+}
+
+fn can_watch_commands(source: &Source) -> bool {
+    match source {
+        Source::Ssh(options) => !options.durable,
+        Source::Local(_) => true,
+        Source::Replay(_) | Source::Demo => false,
     }
 }
 
@@ -761,6 +778,26 @@ pub fn benchmark() {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[test]
+    fn command_watch_accepts_live_shells_and_excludes_reconstructed_streams() {
+        let mut ssh: crate::options::SshOptions = serde_json::from_value(
+            serde_json::json!({"user":"user","host":"localhost","auth":"none"}),
+        )
+        .unwrap();
+        assert!(can_watch_commands(&Source::Ssh(ssh.clone())));
+        ssh.durable = true;
+        assert!(!can_watch_commands(&Source::Ssh(ssh)));
+        assert!(can_watch_commands(&Source::Local(
+            crate::options::LocalOptions {
+                executable: "pwsh".into(),
+                args: Vec::new(),
+                cwd: None,
+            }
+        )));
+        assert!(!can_watch_commands(&Source::Demo));
+        assert!(!can_watch_commands(&Source::Replay("history.vt".into())));
+    }
+
     #[test]
     fn panic_publishes_a_visible_failure_and_preserves_last_committed_pixels() {
         let (writer, _) = mpsc::unbounded_channel();

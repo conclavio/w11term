@@ -47,3 +47,8 @@ The original MIT license is preserved in `LICENSE.md`.
   preserves the distinction between a missing status and exit code zero.
   OSC 7 retains the original URI alongside the parsed URL so the embedding can
   validate the authority before using it for the pane's SFTP drawer.
+
+- The embedding receives primary-screen OSC 133 command markers and terminal
+  reset notifications as the parser processes them. This lets the command
+  completion watch observe a short command even when several complete in one
+  input batch or its output has already left scrollback.

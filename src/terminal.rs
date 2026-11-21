@@ -143,6 +143,7 @@ pub(crate) fn enter_herdr_viewer(
             }
         }
     }
+    events.command_stream(false);
     terminal.clear_clipboard();
     terminal.set_notification_handler(Box::new(ViewerAlerts(events.clone())));
     terminal.set_nonblocking_viewer_writers(
@@ -792,6 +793,101 @@ pub fn colors(attrs: &CellAttributes, palette: &ColorPalette) -> (Rgba, Rgba) {
 mod tests {
     use super::*;
     use wezterm_term::{KeyCode, KeyModifiers};
+
+    fn watched_terminal() -> (Terminal, crate::events::Events) {
+        let (mut term, _) = engine();
+        let events = crate::events::Events::default();
+        term.set_notification_handler(Box::new(crate::sound::Alerts {
+            events: events.clone(),
+            notices: mpsc::channel(1).0,
+            player: Default::default(),
+        }));
+        (term, events)
+    }
+
+    fn completions(events: &crate::events::Events) -> Vec<serde_json::Value> {
+        events
+            .since(0)
+            .events
+            .into_iter()
+            .filter(|e| e.kind == "command-finished")
+            .map(|e| e.data)
+            .collect()
+    }
+
+    #[test]
+    fn command_watch_fires_once_for_the_first_paired_primary_command_in_a_batch() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(true);
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;B\x07cancelled\x1b]133;A\x07\x1b]133;D;1\x07\x1b[?1049h\x1b]133;C\x07\x1b]133;D;2\x07\x1b[?1049l");
+        assert_eq!(events.command_watch(), Some(true));
+        term.advance_bytes(b"\x1b[?2026h\x1b]133;C\x07secret\x1b]133;D;42\x07\x1b]133;D;3\x07\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07\x1b[?2026l");
+        assert_eq!(completions(&events), [serde_json::json!({"exit_code":42})]);
+        assert_eq!(events.command_watch(), Some(false));
+        // A late arm after the batch must not fire on the last stored result.
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;D;0\x07");
+        assert_eq!(completions(&events).len(), 1);
+    }
+
+    #[test]
+    fn command_watch_tracks_current_command_across_capture_loss_and_nested_markers() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(true);
+        term.advance_bytes(b"\x1b]133;C;aid=shell\x07private output\x1b[3J");
+        assert!(events.set_command_watch(true));
+        for b in b"\x1b]133;C;aid=shell\x07\x1b]133;C;aid=nested\x07\x1b]133;D;5;aid=nested\x1b\\\x1b]133;A;aid=nested\x07\x1b[?1049h\x1b]133;D;9;aid=shell\x07\x1b[?1049l\x1b]133;N;aid=shell\x1b\\\x1b]133;D;8;aid=shell\x07" {
+            term.advance_bytes([*b]);
+        }
+        assert_eq!(
+            completions(&events),
+            [serde_json::json!({"exit_code":null})]
+        );
+        for end in [b"\x1b]133;A\x07".as_slice(), b"\x1b]133;D\x07"] {
+            assert!(events.set_command_watch(true));
+            term.advance_bytes(b"\x1b]133;C\x07");
+            term.advance_bytes(end);
+        }
+        assert_eq!(
+            completions(&events),
+            vec![serde_json::json!({"exit_code":null}); 3]
+        );
+    }
+
+    #[test]
+    fn command_watch_cancels_on_reset_disconnect_and_viewer_transition() {
+        let (mut term, events) = watched_terminal();
+        assert!(!events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;C\x07historical output");
+        events.command_stream(true);
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;D;11\x07");
+        assert_eq!(events.command_watch(), Some(true));
+        for reset in [b"\x1bc".as_slice(), b"\x1b[!p", b"\x1b]133;B\x07"] {
+            events.set_command_watch(true);
+            term.advance_bytes(b"\x1b]133;C\x07");
+            term.advance_bytes(reset);
+            assert_eq!(events.command_watch(), Some(false));
+            term.advance_bytes(b"\x1b]133;D;42\x07");
+        }
+        events.set_command_watch(true);
+        term.advance_bytes(b"\x1b]133;C\x07");
+        events.command_stream(false);
+        assert_eq!(events.command_watch(), None);
+        term.reset_connection();
+        events.command_stream(true);
+        term.advance_bytes(b"\x1b]133;D;2\x07\x1b]133;C\x07");
+        assert!(events.set_command_watch(true));
+        assert!(events.set_command_watch(false));
+        term.advance_bytes(b"\x1b]133;D;4\x07");
+        assert!(events.set_command_watch(true));
+        enter_herdr_viewer(&mut term, &mpsc::unbounded_channel().0, &events);
+        assert!(!events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;C\x07old bytes\x1b]133;D;99\x07");
+        assert!(completions(&events).is_empty());
+    }
+
     #[test]
     fn completed_shell_output_uses_markers_scrollback_and_real_line_breaks() {
         let (mut term, _) = engine();
@@ -907,16 +1003,20 @@ mod tests {
 
     #[test]
     fn partial_command_output_is_unavailable_after_history_is_cleared() {
-        let (mut term, _) = engine();
+        let (mut term, events) = watched_terminal();
+        events.command_stream(true);
         term.resize(TerminalSize {
             cols: 16,
             rows: 2,
             ..TerminalSize::default()
         });
-        term.advance_bytes(b"\x1b]133;C\x07begin\r\nmiddle\r\nend\x1b[3J\x1b]133;D;7\x07");
+        term.advance_bytes(b"\x1b]133;C\x07begin\r\nmiddle\r\nend\x1b[3J");
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;D;7\x07");
         let command = term.last_command().unwrap();
         assert_eq!(command.exit_code, Some(7));
         assert_eq!(command.output, Err("Command output left scrollback"));
+        assert_eq!(completions(&events), [serde_json::json!({"exit_code":7})]);
     }
 
     #[test]
