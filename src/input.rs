@@ -31,8 +31,9 @@ enum LocalMode {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PickerStage {
+pub enum PickerStage {
     Search,
+    Commands,
     Placement,
 }
 
@@ -140,6 +141,7 @@ pub enum Shortcut {
     FindNext,
     FindPrevious,
     FindClose,
+    CommandPalette,
     PanePicker,
     PickerMove(isize),
     PickerAccept,
@@ -287,11 +289,11 @@ impl KeyboardBridge {
         });
         ime::sync_context();
     }
-    pub fn set_picker(&self, visible: bool) {
+    pub fn set_picker(&self, stage: Option<PickerStage>) {
         INPUT.with(|input| {
             if let Some(s) = input.borrow_mut().as_mut() {
-                s.picker = visible.then_some(PickerStage::Search);
-                if visible {
+                s.picker = stage;
+                if stage.is_some() {
                     ime::cancel();
                     s.local_held.extend(s.pressed.keys().map(|&vk| (vk, false)));
                     s.release_keys();
@@ -853,6 +855,8 @@ impl State {
         }
         if let Some(&repeat_owned) = self.local_held.get(&vk) {
             match message.message {
+                // A translated control character can arrive after Enter or Escape closed the overlay.
+                WM_CHAR | WM_SYSCHAR if matches!(vk, 0x0d | 0x1b) => return true,
                 WM_KEYUP | WM_SYSKEYUP => {
                     self.local_held.remove(&vk);
                     self.swallowed.remove(&vk);
@@ -912,9 +916,16 @@ impl State {
                 let repeat = message.lParam.0 & (1 << 30) != 0;
                 let action = match (stage, vk) {
                     (_, 0x1b) => Shortcut::PickerCancel,
-                    (PickerStage::Search, 0x0d) => Shortcut::PickerAccept,
-                    (PickerStage::Search, 0x26) => Shortcut::PickerMove(-1),
-                    (PickerStage::Search, 0x28) => Shortcut::PickerMove(1),
+                    (PickerStage::Commands, 0x09) => {
+                        Shortcut::PickerMove(if modifiers().contains(KeyModifiers::SHIFT) {
+                            -1
+                        } else {
+                            1
+                        })
+                    }
+                    (PickerStage::Search | PickerStage::Commands, 0x0d) => Shortcut::PickerAccept,
+                    (PickerStage::Search | PickerStage::Commands, 0x26) => Shortcut::PickerMove(-1),
+                    (PickerStage::Search | PickerStage::Commands, 0x28) => Shortcut::PickerMove(1),
                     (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
                     (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),
                     (PickerStage::Placement, 0x27) => Shortcut::PickerPlace(Direction::Right),
@@ -946,11 +957,11 @@ impl State {
             // Native text editing owns printable keys, composition and clipboard shortcuts.
             return false;
         }
-        if matches!(vk, 0x0d | 0x20 | 0x26 | 0x28) && self.swallowed.contains(&vk) {
+        if matches!(vk, 0x09 | 0x0d | 0x20 | 0x26 | 0x28) && self.swallowed.contains(&vk) {
             // The button or row that owned the key may have closed the picker.
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => return true,
-                WM_CHAR | WM_SYSCHAR if matches!(vk, 0x0d | 0x20) => return true,
+                WM_CHAR | WM_SYSCHAR if matches!(vk, 0x09 | 0x0d | 0x20) => return true,
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     self.swallowed.remove(&vk);
                 }
@@ -1045,9 +1056,15 @@ impl State {
                 if message.lParam.0 & (1 << 30) == 0 {
                     if matches!(
                         shortcut,
-                        Shortcut::PanePicker | Shortcut::MovePaneToExistingTab
+                        Shortcut::CommandPalette
+                            | Shortcut::PanePicker
+                            | Shortcut::MovePaneToExistingTab
                     ) {
-                        self.picker = Some(PickerStage::Search);
+                        self.picker = Some(if shortcut == Shortcut::CommandPalette {
+                            PickerStage::Commands
+                        } else {
+                            PickerStage::Search
+                        });
                         self.local_held.insert(vk, false);
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
@@ -1306,6 +1323,7 @@ impl From<Action> for Shortcut {
             Action::MovePane => Self::MovePane,
             Action::MovePaneToExistingTab => Self::MovePaneToExistingTab,
             Action::Workspaces => Self::Workspaces,
+            Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
@@ -1503,6 +1521,51 @@ mod tests {
         assert_eq!(snap_extent(1238, 24, 10), 1234);
         assert_eq!(snap_extent(980, 98, 20), 978);
         assert_eq!(snap_extent(0, 24, 10), 34);
+    }
+
+    #[test]
+    fn remapped_palette_owns_navigation_before_the_overlay_mounts_and_after_accept() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::CommandPalette, Some("F7".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        let key = |message, vk| MSG {
+            message,
+            wParam: WPARAM(vk),
+            ..Default::default()
+        };
+        for vk in [0x76, 0x09, 0x28, 0x26] {
+            assert!(state.handle(&key(WM_KEYDOWN, vk)));
+            assert!(state.handle(&key(WM_KEYUP, vk)));
+        }
+        assert!(!state.handle(&key(WM_CHAR, 'k' as usize)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d)));
+        state.picker = None;
+        assert!(state.handle(&key(WM_CHAR, 0x0d)));
+        assert!(state.handle(&key(WM_KEYUP, 0x0d)));
+        assert_eq!(
+            *actions.borrow(),
+            [
+                Shortcut::CommandPalette,
+                Shortcut::PickerMove(1),
+                Shortcut::PickerMove(1),
+                Shortcut::PickerMove(-1),
+                Shortcut::PickerAccept
+            ]
+        );
+        assert!(input.try_recv().is_err());
     }
 
     #[test]

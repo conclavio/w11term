@@ -43,6 +43,8 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 When creating or editing an SSH profile, **SSH terminal type (TERM)** selects the terminfo name sent with each new PTY. Existing profiles use `xterm-256color`. Choose `xterm-sixel` for a host running Venti with Sixel graphics, or choose **Custom…** to enter a terminfo name supported by the host. This setting is stored as `"terminal_type": "xterm-sixel"` for the Sixel preset. Direct shells and durable attachments both request `COLORTERM=truecolor`. A process already running inside a durable session keeps its existing environment.
 
+Open **caret → Command palette…** or press **Ctrl+Shift+K** to search actions for the current window. Search by words in any order, a profile name, or a current shortcut. Use Up and Down to highlight a result, then press Enter or click it. Disabled commands stay visible when their pane or connection requirements are unmet. Escape returns to the current pane. The palette also works from Settings and other utility tabs.
+
 Use **Ctrl+Shift+P** or **caret → Find pane…** to search every terminal pane in the window, including panes in other tabs and hidden splits. Type part of the terminal title, profile name or SSH `user@host`. Use the arrow keys or hover over a match to preview its live viewport, including terminal graphics. The preview preserves each pane’s grid size and focus. Screen readers can read the last two nonblank preview lines. Press Enter or click a result to focus it. Escape returns to the pane you were using.
 
 The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
@@ -81,7 +83,7 @@ The recipe belongs to that pane in the saved workspace and is bound to its SSH h
 
 Imported `ProxyJump` routes use SSH `direct-tcpip` channels. Each jump host and the final destination have their own authentication and host-key checks. The resulting SSH shell and its SFTP drawer use the destination connection. For a manually configured profile, `proxy_jump` is an ordered array of objects with `host`, `user`, optional `port`, `auth` and optional `host_key`. Each hop supports the same authentication choices as the destination.
 
-Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the pane picker and workspaces. Select **Edit…**, enter a chord such as `Ctrl+Alt+Right` or `F8`, and choose **Save shortcut**. **Clear shortcut** releases its key for the terminal. **Restore default** restores that action’s original binding. The editor identifies conflicts, and pane menus show the current bindings. Changes apply immediately and persist in the per-user settings file.
+Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the command palette, the pane picker and workspaces. Select **Edit…**, enter a chord such as `Ctrl+Alt+Right` or `F8`, and choose **Save shortcut**. **Clear shortcut** releases its key for the terminal. **Restore default** restores that action’s original binding. The editor identifies conflicts, and pane menus show the current bindings. Changes apply immediately and persist in the per-user settings file.
 
 | Pane action | Default shortcut |
 | --- | --- |
@@ -113,7 +115,9 @@ The first connection to an unknown host shows its algorithm and SHA256 fingerpri
 
 In the SSH profile editor, enable **Keep the remote shell running with zmx (Linux)** to let a remote PTY survive a network drop or a w11term restart. The Linux account needs a compatible zmx 1.x executable on its SSH command path and permission to run SSH exec requests. The tested version is 1.0.1. Save the workspace after the first attachment to reopen the same shell and layout together.
 
-From a fresh workspace, choose **caret → Find remote sessions → Find sessions on _profile_**. w11term authenticates to that SSH account and lists its live w11term-managed shells. Each row shows the session name, available command and directory, and attached client count. Select a row to attach in the browser tab. **Refresh** checks the host again. Discovery works with an ordinary saved SSH shell profile and keeps its usual launch behavior. You can save the selected session in a workspace or save an unselected browser to list that host again on reopen.
+From a fresh workspace, choose **caret → Find remote sessions → Find sessions on _profile_**. w11term authenticates to that SSH account and lists its w11term-managed zmx shells and existing tmux sessions on the account’s default socket. Each row shows the session name, backend and attached client count, plus the window count for tmux or the available command and directory for zmx. Select a row to attach in the browser tab. **Refresh** checks the host again. Discovery works with an ordinary saved SSH shell profile and keeps its usual launch behavior. You can save the selected session in a workspace or save an unselected browser to list that host again on reopen.
+
+tmux attaches in its normal full-screen UI on an SSH PTY. Its prefix keys, windows and panes work as they do in a plain SSH attachment. Detach in tmux or use **Remote session → Detach from remote session**. Reattach and workspace restore use the same session ID even after a rename. If the tmux server restarts or the session ends, choose **Remote session → Find remote sessions again** to return to the list. Creation and termination of tmux sessions stay with the remote account. Stock tmux 3.4 on Linux is exercised in CI.
 
 Use **caret → Panes → Remote session** to detach, reattach, or end the remote session. Ending requires confirmation. w11term checks the SSH destination, account, host fingerprint and remote session generation before accepting input. If recovery fails, the pane shows the outcome and offers an explicit choice to start a new durable shell or a plain SSH shell. Ordinary game profiles that accept only shell requests can keep using direct SSH.
 
@@ -197,7 +201,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Ctrl+Shift+Home / Ctrl+Shift+End | Oldest retained history / return to the live screen |
 | Ctrl+Shift+Up / Ctrl+Shift+Down | Previous / next OSC 133 prompt |
 | Ctrl+Shift+F | Find in scrollback; case toggle, highlighted matches, and a match counter |
-| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
+| Ctrl+Shift+K | Search terminal actions and launch profiles |\n| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
 | Enter in find / F3; Shift+Enter / Shift+F3 | Next / previous find result, wrapping at either end |
 | Escape in find | Close find and restore terminal keyboard input |
 | Mouse wheel | Scrollback using Windows' wheel-line/page preference, including accumulated fractional deltas; remote wheel events when mouse reporting is enabled |
