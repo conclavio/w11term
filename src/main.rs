@@ -34,7 +34,9 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
     if let Some(launch) = workspace_window::prepare(options)? {
-        windows_reactor::App::run_component::<app::TerminalApp>(launch)?;
+        windows_reactor::App::run_component::<app::TerminalApp>(app::WindowLaunch::initial(
+            launch,
+        ))?;
     }
     Ok(())
 }

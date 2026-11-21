@@ -62,6 +62,7 @@ struct Pending {
     step: Step,
     reply: oneshot::Receiver<Result<Value, String>>,
     progress: Option<watch::Receiver<TransferProgress>>,
+    destination: Rc<RefCell<LocalSender<Message>>>,
     _timer: crate::ui_timer::RetryTimer,
 }
 
@@ -240,6 +241,17 @@ fn pick_local(owner: usize, remote: Option<&str>) -> Result<Option<PathBuf>> {
 }
 
 impl FileDrawer {
+    pub(super) fn awaiting_native_result(&self) -> bool {
+        self.picking || self.parsing
+    }
+
+    pub(super) fn bind_window(&mut self, sender: LocalSender<Message>) {
+        self.cached.get_mut().take();
+        if let Some(pending) = &self.pending {
+            *pending.destination.borrow_mut() = sender;
+        }
+    }
+
     pub(super) fn busy(&self) -> bool {
         self.picking || self.parsing || self.pending.is_some()
     }
@@ -494,9 +506,10 @@ impl FileDrawer {
         } else {
             (None, None)
         };
-        let sender = context.sender();
+        let destination = Rc::new(RefCell::new(context.sender()));
+        let tick = destination.clone();
         let timer = crate::ui_timer::RetryTimer::new(move || {
-            sender.send(Message::Files(FileAction::Tick(id)));
+            tick.borrow().send(Message::Files(FileAction::Tick(id)));
         })?;
         session
             .input
@@ -511,6 +524,7 @@ impl FileDrawer {
             step,
             reply,
             progress,
+            destination,
             _timer: timer,
         });
         Ok(())

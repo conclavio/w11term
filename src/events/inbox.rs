@@ -9,6 +9,7 @@ const CAPACITY: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct Notice {
+    arrival: u64,
     pub pane: u64,
     pub source: Arc<str>,
     pub sequence: u64,
@@ -82,6 +83,10 @@ impl Inbox {
             state.rows.pop_front();
         }
         state.rows.push_back(Notice {
+            arrival: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             pane,
             source: source.clone(),
             sequence: event.sequence,
@@ -97,6 +102,35 @@ impl Inbox {
 
     pub fn acknowledge_wake(&self) {
         self.state.lock().unwrap().wake_pending = false;
+    }
+
+    pub(super) fn same_window(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    pub(super) fn move_pane_to(&self, pane: u64, target: &Self) {
+        let mut moved = Vec::new();
+        self.state.lock().unwrap().rows.retain(|notice| {
+            if notice.pane == pane {
+                moved.push(notice.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if moved.is_empty() {
+            return;
+        }
+        let mut dest = target.state.lock().unwrap();
+        dest.rows.extend(moved);
+        dest.rows
+            .make_contiguous()
+            .sort_by_key(|notice| notice.arrival);
+        let excess = dest.rows.len().saturating_sub(CAPACITY);
+        dest.rows.drain(..excess);
+        drop(dest);
+        (self.wake)();
+        (target.wake)();
     }
 
     pub fn unread_count(&self) -> usize {
@@ -150,6 +184,31 @@ mod tests {
     use crate::events::Events;
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn moving_panes_keeps_inbox_order_and_read_state_and_routes_new_alerts() {
+        let source = Inbox::new(|| {});
+        let target = Inbox::new(|| {});
+        let a = Events::default();
+        let b = Events::default();
+        a.connect_inbox(1, "ssh", &source);
+        b.connect_inbox(2, "local", &source);
+        a.push("bell", Value::Null);
+        b.push("bell", Value::Null);
+        a.push("bell", Value::Null);
+        assert!(source.mark_read(1, 1));
+        b.connect_inbox(2, "local", &target);
+        a.connect_inbox(1, "ssh", &target);
+        b.push("bell", Value::Null);
+        assert!(source.rows().is_empty());
+        assert_eq!(target.unread_count(), 3);
+        let rows: Vec<_> = target
+            .rows()
+            .into_iter()
+            .map(|n| (n.pane, n.sequence))
+            .collect();
+        assert_eq!(rows, [(2, 2), (1, 2), (2, 1), (1, 1)]);
+    }
 
     #[test]
     fn window_aggregates_panes_and_replays_startup_once_without_consuming_the_journal() {

@@ -221,9 +221,11 @@ impl TerminalApp {
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
         let copy_mode = self.copy_mode.clone();
+        let native_window = self.keyboard.scope();
         #[cfg(feature = "ui-smoke")]
         let paint_count = surface.paint_count.clone();
         let canvas: View = Canvas::invalidated(&surface.invalidator, move |ctx| {
+            let _native = native_window.enter();
             #[cfg(feature = "ui-smoke")]
             paint_count.set(paint_count.get() + 1);
             let hints = hints.borrow();

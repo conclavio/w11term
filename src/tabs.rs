@@ -1,8 +1,15 @@
 //! Ordered tab headers, each with a split layout and a remembered focused entry.
 use crate::pane_layout::{Axis, Direction, Layout};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type TabId = u64;
+
+// A pane can change windows without changing its tab or layout IDs.
+fn next_id() -> TabId {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A user-assigned display name owned by a tab group, independent of its panes.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -48,7 +55,6 @@ pub struct Tabs<T> {
     entries: Vec<Tab<T>>,
     groups: Vec<Group>,
     active_group: Option<TabId>,
-    next_id: TabId,
 }
 
 impl<T> Default for Tabs<T> {
@@ -57,7 +63,6 @@ impl<T> Default for Tabs<T> {
             entries: vec![],
             groups: vec![],
             active_group: None,
-            next_id: 1,
         }
     }
 }
@@ -161,14 +166,12 @@ impl<T> Tabs<T> {
         self.get(self.active_id()?)
     }
     pub fn insert(&mut self, value: T) -> TabId {
-        let id = self.next_id;
-        self.insert_group(id, value);
+        let id = next_id();
+        self.insert_group(id, id, value);
         id
     }
 
-    fn insert_group(&mut self, entry_id: TabId, value: T) {
-        let id = self.next_id;
-        self.next_id += 1;
+    fn insert_group(&mut self, id: TabId, entry_id: TabId, value: T) {
         self.entries.push(Tab {
             id: entry_id,
             group: id,
@@ -190,7 +193,7 @@ impl<T> Tabs<T> {
         }
         let id = self.active_id().expect("a split has a focused pane");
         let value = self.remove(id).expect("focused pane exists");
-        self.insert_group(id, value);
+        self.insert_group(next_id(), id, value);
         true
     }
 
@@ -225,11 +228,10 @@ impl<T> Tabs<T> {
     pub fn split(&mut self, target: TabId, value: T, axis: Axis) -> Option<TabId> {
         let group_id = self.group_id(target)?;
         let group = self.groups.iter_mut().find(|g| g.id == group_id)?;
-        let id = self.next_id;
+        let id = next_id();
         if !group.layout.split(target, id, axis) {
             return None;
         }
-        self.next_id += 1;
         self.entries.push(Tab {
             id,
             group: group_id,
@@ -301,7 +303,7 @@ impl<T> Tabs<T> {
             self.remove_header(group_index);
         }
     }
-    fn remove_header(&mut self, index: usize) {
+    fn remove_header(&mut self, index: usize) -> Group {
         let group = self.groups.remove(index);
         if self.active_group == Some(group.id) {
             self.active_group = self
@@ -310,7 +312,36 @@ impl<T> Tabs<T> {
                 .or_else(|| self.groups.last())
                 .map(|g| g.id);
         }
+        group
     }
+
+    /// Move the owned values and layout into a new window's tab collection.
+    /// The stable group ID also works after its original pane moved or closed.
+    pub fn take_group(&mut self, group_id: TabId) -> Option<Self> {
+        let index = self.groups.iter().position(|group| group.id == group_id)?;
+        let group = self.remove_header(index);
+        let entries = self
+            .entries
+            .extract_if(.., |entry| entry.group == group_id)
+            .collect();
+        Some(Self {
+            entries,
+            groups: vec![group],
+            active_group: Some(group_id),
+        })
+    }
+    /// Return an unclaimed transfer to its previous header position.
+    pub fn restore_group(&mut self, mut moved: Self, index: usize, select: bool) {
+        for (offset, group) in moved.groups.drain(..).enumerate() {
+            if select || self.active_group.is_none() {
+                self.active_group = Some(group.id);
+            }
+            self.groups
+                .insert((index + offset).min(self.groups.len()), group);
+        }
+        self.entries.append(&mut moved.entries);
+    }
+
     /// Close the tab containing the supplied entry, including every split.
     pub fn remove_group(&mut self, entry: TabId) -> bool {
         let Some(id) = self.group_id(entry) else {
@@ -346,6 +377,60 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_a_group_between_windows_keeps_its_live_values_and_layout() {
+        let mut source = Tabs::default();
+        let side = source.insert(Box::new("monitor"));
+        let group = source.insert(Box::new("SSH"));
+        let local = source
+            .split(group, Box::new("PowerShell"), Axis::Columns)
+            .unwrap();
+        let extra = source.split(group, Box::new("logs"), Axis::Rows).unwrap();
+        let actor = std::ptr::from_ref(source.get(local).unwrap().as_ref());
+        source.remove(group);
+        source.select(local);
+        assert!(source.set_ratio(&[], 0.375));
+        assert!(source.toggle_zoom());
+        source.set_group_title(group, Some("Desk".to_owned().try_into().unwrap()));
+        let layout = source.active_layout().unwrap().clone();
+        let mut target = source.take_group(group).unwrap();
+        assert_eq!(source.active_id(), Some(side));
+        assert!(source.get(local).is_none() && source.get(extra).is_none());
+        assert_eq!(target.active_id(), Some(local));
+        assert_eq!(target.group_id(local), Some(group));
+        assert_eq!(target.title_for(extra).unwrap().as_str(), "Desk");
+        assert_eq!(target.active_layout(), Some(&layout));
+        assert!(target.zoomed());
+        assert!(std::ptr::eq(actor, target.get(local).unwrap().as_ref()));
+        assert!(source.take_group(group).is_none());
+        assert_ne!(
+            source.insert(Box::new("new")),
+            target.insert(Box::new("new"))
+        );
+        assert!(source.take_group(side).unwrap().get(side).is_some());
+    }
+
+    #[test]
+    fn returning_an_unclaimed_group_restores_header_order_and_preserves_later_focus() {
+        let mut tabs = Tabs::default();
+        let first = tabs.insert("first");
+        let middle = tabs.insert("middle");
+        let last = tabs.insert("last");
+        let group = tabs.group_id(middle).unwrap();
+        tabs.select(middle);
+        let offer = tabs.take_group(group).unwrap();
+        tabs.select(first);
+        tabs.restore_group(offer, 1, false);
+        assert_eq!(tabs.active_id(), Some(first));
+        assert_eq!(
+            tabs.headers().iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            [first, middle, last]
+        );
+        let offer = tabs.take_group(group).unwrap();
+        tabs.restore_group(offer, 1, true);
+        assert_eq!(tabs.active_id(), Some(middle));
+    }
 
     #[test]
     fn titles_follow_groups_through_moves_and_closing_the_original_pane() {

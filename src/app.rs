@@ -55,6 +55,8 @@ mod session_browser;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
 mod tab_title;
+mod tab_windows;
+pub use tab_windows::WindowLaunch;
 mod workspace_view;
 use pane_view::PaneSurface;
 
@@ -345,6 +347,7 @@ fn tab_menu_message(label: String) -> Message {
         "Enable read-only pane input" => Message::SetPaneReadOnly(true),
         "Disable read-only pane input" => Message::SetPaneReadOnly(false),
         "Move pane to new tab" => Message::MovePaneToTab,
+        "Move tab to new window" => Message::MoveTabToWindow,
         "Move pane to existing tab…" => Message::Shortcut(Shortcut::MovePaneToExistingTab),
         "Paste" => Message::Paste,
         "Paste raw (no bracketed paste)" => Message::PasteRaw,
@@ -394,7 +397,14 @@ pub struct TerminalApp {
     window_restored: bool,
     // Unhook before dropping tabs and shutting down their independent sessions.
     keyboard: KeyboardBridge,
-    _control: Server,
+    _control: Arc<Server>,
+    window_launch: w11term::options::Options,
+    opening: Option<Rc<crate::workspace_window::Opening>>,
+    incoming: Option<Rc<tab_windows::Transfer>>,
+    outgoing: Option<Rc<tab_windows::Transfer>>,
+    window_timer: Option<crate::ui_timer::RetryTimer>,
+    native_bound: bool,
+    window_error: Option<String>,
     registry: Registry,
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiWork>>>,
     control_task: Option<ComponentTask>,
@@ -451,6 +461,13 @@ pub enum Message {
     ZoomPane,
     ClosePane,
     MovePaneToTab,
+    MoveTabToWindow,
+    WindowTick,
+    DismissWindowError,
+    TransferReady(u64),
+    TransferClaim(u64),
+    TransferDone(u64),
+    TransferCanceled(u64),
     PaneFocus(TabId),
     SetPaneReadOnly(bool),
     PaneRatio(u64, Vec<bool>, f64),
@@ -1697,7 +1714,7 @@ impl TerminalApp {
     }
 
     fn restore_window(&self) {
-        if self.initial_grid.get().is_some() {
+        if self.incoming.is_some() || !self.native_bound || self.initial_grid.get().is_some() {
             return;
         }
         if let Some(name) = &self.window_profile {
@@ -2405,6 +2422,11 @@ impl TerminalApp {
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
             move_item,
+            if self.outgoing.is_none() && self.incoming.is_none() {
+                MenuItem::item("move-tab-window", "Move tab to new window")
+            } else {
+                MenuItem::disabled("move-tab-window", "Move tab to new window")
+            },
             self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
         ];
@@ -2811,15 +2833,19 @@ impl TerminalApp {
 }
 
 impl Component for TerminalApp {
-    type Input = crate::workspace_window::Launch;
+    type Input = WindowLaunch;
     type Message = Message;
 
-    fn create((options, opening): &Self::Input, context: &ComponentContext<Self>) -> Self {
+    fn create(input: &Self::Input, context: &ComponentContext<Self>) -> Self {
+        let options = &input.options;
+        let opening = &input.opening;
+        let moving = input.transfer.is_some();
         let sender = context.sender();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(Message::Shortcut(shortcut));
         })
         .expect("installing terminal input adapter");
+        let _native = keyboard.scope().enter();
         let store = ProfileStore::new(options.profiles_path.clone())
             .expect("resolving profile configuration path");
         let (profiles, local_profiles, profile_error) = match store.catalog() {
@@ -2876,7 +2902,7 @@ impl Component for TerminalApp {
                 .expect("validated keyboard settings"),
         );
         let appearance = Arc::new(RwLock::new(appearance));
-        let grid = if options.cols.is_some() || options.rows.is_some() {
+        let grid = if !moving && (options.cols.is_some() || options.rows.is_some()) {
             Some((options.cols.unwrap_or(120), options.rows.unwrap_or(32)))
         } else {
             None
@@ -2909,7 +2935,7 @@ impl Component for TerminalApp {
                 workspace.sources.clone(),
                 osc52,
             );
-        } else {
+        } else if !moving {
             tabs.insert(
                 live_tab_sized(
                     label.clone(),
@@ -2938,7 +2964,10 @@ impl Component for TerminalApp {
                 Some(w11term::pane_layout::Layout::Leaf(_))
             )
         });
-        let registry = Registry::for_workspace(opening.as_ref().map(|window| window.key.clone()));
+        let registry = input.transfer.as_ref().map_or_else(
+            || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
+            |transfer| transfer.registry.clone(),
+        );
         let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
         let inbox = w11term::events::Inbox::new(move || {
@@ -2955,23 +2984,44 @@ impl Component for TerminalApp {
             }
         });
         let capture_appearance = appearance.clone();
-        let control = Server::start(registry.clone(), move |frame, size, path| {
+        let capture: w11term::control::CapturePng = Arc::new(move |frame, size, path| {
             let appearance = capture_appearance.read().unwrap().clone();
             crate::renderer::screenshot_with_font(frame, size, path, &appearance)
-        })
-        .expect("starting local control pipe");
-        if let Some(window) = opening {
-            window.published();
-        }
+        });
+        registry.set_capture(capture.clone());
+        let control = input.transfer.as_ref().map_or_else(
+            || {
+                Arc::new(
+                    Server::start(registry.clone(), move |frame, size, path| {
+                        capture(frame, size, path)
+                    })
+                    .expect("starting local control pipe"),
+                )
+            },
+            |transfer| transfer.server.clone(),
+        );
+        let active = registry.clone();
+        keyboard.on_activation(move |focused| {
+            if focused {
+                active.activate();
+            }
+        });
         let mut app = Self {
             inbox,
             accessible: Default::default(),
             active_group: None,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
-            window_restored: options.cols.is_some() || options.rows.is_some(),
+            window_restored: moving || options.cols.is_some() || options.rows.is_some(),
             keyboard,
             _control: control,
+            window_launch: options.clone(),
+            opening: opening.clone(),
+            incoming: input.transfer.clone(),
+            outgoing: None,
+            window_timer: None,
+            native_bound: false,
+            window_error: None,
             registry,
             control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
             control_task: None,
@@ -3009,11 +3059,16 @@ impl Component for TerminalApp {
             selection_pending: true,
             selection_epoch: 0,
         };
+        if let Some(transfer) = &app.incoming {
+            transfer.target.replace(Some(context.sender()));
+        }
+        app.arm_window_tick(context);
+        context.sender().send(Message::WindowTick);
         app.activate(context);
         app.watch_control(context);
         app.sync_selection(context);
         #[cfg(feature = "ui-smoke")]
-        if std::env::var_os("W11TERM_UI_SMOKE").is_some() {
+        if !moving && std::env::var_os("W11TERM_UI_SMOKE").is_some() {
             if let Some(fixture) = std::env::var_os("W11TERM_IMPORT_SMOKE") {
                 let expected = std::path::PathBuf::from(fixture).with_file_name("profiles.json");
                 assert_eq!(
@@ -3051,7 +3106,7 @@ impl Component for TerminalApp {
                 Message::Smoke(0)
             });
         }
-        if let Some(seconds) = options.smoke_seconds {
+        if !moving && let Some(seconds) = options.smoke_seconds {
             context.spawn_background(move |_| {
                 std::thread::sleep(std::time::Duration::from_secs(seconds.min(30)));
                 Message::CloseWindow
@@ -3061,6 +3116,7 @@ impl Component for TerminalApp {
     }
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
+        let _native = self.keyboard.scope().enter();
         if !matches!(
             &message,
             Message::FrameReady(..)
@@ -3087,7 +3143,21 @@ impl Component for TerminalApp {
             self.inbox.acknowledge_wake();
             self.watch_control(context);
         }
+        let message = match message {
+            Message::Control(request) => match self.registry.for_this_window(request) {
+                Some(request) => Message::Control(request),
+                None => return,
+            },
+            other => other,
+        };
         match message {
+            Message::DismissWindowError => self.window_error = None,
+            Message::MoveTabToWindow => self.move_tab_window(context),
+            Message::WindowTick => self.window_tick(context),
+            Message::TransferReady(id) => self.offer_group(id, context),
+            Message::TransferClaim(id) => self.claim_group(id, context),
+            Message::TransferDone(id) => self.finish_transfer(id, context),
+            Message::TransferCanceled(id) => self.cancel_transfer(id, context),
             Message::TabTitle(action) => self.edit_tab_title(action),
             Message::Attention(action) => self.handle_attention(action, context),
             Message::AttentionChanged => {}
@@ -4352,6 +4422,7 @@ impl Component for TerminalApp {
     }
 
     fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
+        let _native = self.keyboard.scope().enter();
         if let Some(AppTab {
             label,
             page: Page::Terminal(tab),
@@ -4397,7 +4468,11 @@ impl Component for TerminalApp {
             .tabs
             .active_id()
             .map_or("Terminal", |id| self.tab_label(id));
-        context.window_title(format!("w11term · {title}"));
+        if self.keyboard.hwnd().is_some() {
+            context.window_title(format!("w11term · {title}"));
+        } else {
+            context.window_title(self.keyboard.bootstrap_title());
+        }
         context.window_visuals(
             WindowVisuals::new()
                 .client_size(self.client_size.0, self.client_size.1)
@@ -4443,6 +4518,8 @@ impl Component for TerminalApp {
                 Page::ImportConfig(page) => self.import_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
             }
+        } else if self.incoming.is_some() || self.outgoing.is_some() {
+            TextBlock::new().text("Moving tab…").margin(16.0).into()
         } else {
             Border::new().into()
         };
@@ -4456,6 +4533,16 @@ impl Component for TerminalApp {
             ),
             KeyedView::new("content", Border::new().grid_row(1).content(content)),
         ];
+        if let Some(message) = &self.window_error {
+            views.push(KeyedView::new(
+                "window-error",
+                Button::new()
+                    .grid_row(1)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .on_click(context.callback(|_| Message::DismissWindowError))
+                    .content(format!("{message}  ·  Dismiss")),
+            ));
+        }
         if let Some(inspection) = &self.inspection
             && self.hints.borrow().is_none()
             && self.copy_mode.borrow().is_none()
