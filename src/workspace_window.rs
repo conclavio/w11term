@@ -62,11 +62,7 @@ pub fn prepare(options: Options) -> Result<Option<Launch>> {
             }
         }
     }
-    if options.switch_workspace
-        && let Some(pid) = owner(&key)?
-    {
-        drop(lock);
-        activate(pid)?;
+    if options.switch_workspace && focus_existing(&key)? {
         return Ok(None);
     }
     let layout =
@@ -81,29 +77,81 @@ pub fn prepare(options: Options) -> Result<Option<Launch>> {
     )))
 }
 
-fn owner(key: &str) -> Result<Option<u32>> {
+fn owner(key: &str) -> Result<Option<control::WorkspaceOwner>> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(control::workspace_owner(key))
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(4), control::workspace_owner(key))
+                .await
+                .context("Timed out verifying the workspace window")?
+        })
+}
+
+fn focus_existing(key: &str) -> Result<bool> {
+    for _ in 0..2 {
+        let Some(window) = owner(key)? else {
+            return Ok(false);
+        };
+        if activate(&window)? {
+            return Ok(true);
+        }
+        // This verified process exited while its window was being located.
+        // Rediscover before deciding whether the saved layout needs restoring.
+    }
+    bail!("Workspace windows are closing. Try switching again.")
 }
 
 pub fn switch(name: &str, profiles: &Path) -> Result<()> {
     let catalog = w11term::keys::data_dir()?.join("workspaces.json");
-    if let Some(pid) = owner(&workspace_key(&catalog, profiles, name)?)? {
-        return activate(pid);
+    let key = workspace_key(&catalog, profiles, name)?;
+    if focus_existing(&key)? {
+        return Ok(());
     }
     // The child rechecks under the registration lock. Two simultaneous clicks
     // may launch two processes, but only one can start terminal sessions.
-    std::process::Command::new(std::env::current_exe()?)
+    let mut child = std::process::Command::new(std::env::current_exe()?)
         .arg("--profiles")
         .arg(profiles)
         .arg("--switch-workspace")
         .arg(name)
         .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+        .stderr(std::process::Stdio::null())
         .spawn()
         .context("Starting workspace window")?;
-    Ok(())
+    let manifest = control::discovery_dir()?.join(format!("{}.json", child.id()));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                // Surface missing profiles or invalid saved layouts in the picker.
+                WorkspaceLaunch::load(&WorkspaceStore::new(catalog), name, profiles)?;
+                bail!(
+                    "Opening workspace {name} failed ({status}). See {} for details.",
+                    w11term::keys::data_dir()?.join("startup.log").display()
+                );
+            }
+            // A concurrent launch can activate the winner and exit successfully.
+            ensure!(
+                focus_existing(&key)?,
+                "Workspace {name} closed before its window was ready"
+            );
+            return Ok(());
+        }
+        if manifest.try_exists()?
+            && let Some(window) = owner(&key)?
+            && window.pid == child.id()
+            && activate(&window)?
+        {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Workspace {name} has not opened a window yet (PID {}).",
+            child.id()
+        );
+        std::thread::sleep(Duration::from_millis(75));
+    }
 }
 
 fn registration_lock(key: &str) -> Result<File> {
@@ -166,7 +214,7 @@ fn workspace_key(catalog: &Path, profiles: &Path, name: &str) -> Result<String> 
     Ok(URL_SAFE_NO_PAD.encode(hash.finalize()))
 }
 
-fn activate(pid: u32) -> Result<()> {
+fn activate(owner: &control::WorkspaceOwner) -> Result<bool> {
     struct Search {
         pid: u32,
         hwnd: HWND,
@@ -192,27 +240,41 @@ fn activate(pid: u32) -> Result<()> {
         true.into()
     }
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut search = Search {
-        pid,
-        hwnd: HWND::default(),
-    };
+    let pid = owner.pid;
+    let mut restore_sent = false;
+    let mut requested_foreground = false;
     loop {
+        if !owner.is_running()? {
+            return Ok(false);
+        }
+        let mut search = Search {
+            pid,
+            hwnd: HWND::default(),
+        };
         unsafe {
             let _ = EnumWindows(Some(visit), LPARAM((&mut search as *mut Search) as isize));
             if !search.hwnd.is_invalid() {
                 if IsIconic(search.hwnd).as_bool() {
-                    let _ = ShowWindowAsync(search.hwnd, SW_RESTORE);
+                    if !restore_sent {
+                        ensure!(
+                            ShowWindowAsync(search.hwnd, SW_RESTORE).as_bool(),
+                            "Windows declined to restore workspace window {pid}"
+                        );
+                        restore_sent = true;
+                    }
+                } else if GetForegroundWindow() == search.hwnd {
+                    return Ok(true);
+                } else if !requested_foreground {
+                    ensure!(
+                        SetForegroundWindow(search.hwnd).as_bool(),
+                        "Windows declined to foreground workspace window {pid}"
+                    );
+                    requested_foreground = true;
                 }
-                ensure!(
-                    GetForegroundWindow() == search.hwnd
-                        || SetForegroundWindow(search.hwnd).as_bool(),
-                    "Windows declined to foreground workspace window {pid}"
-                );
-                return Ok(());
             }
         }
         if Instant::now() >= deadline {
-            bail!("Workspace PID {pid} has no visible terminal window on this desktop");
+            bail!("Workspace window {pid} did not become visible in the foreground");
         }
         std::thread::sleep(Duration::from_millis(50));
     }

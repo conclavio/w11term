@@ -5,6 +5,7 @@ use w11term::workspace::{SavedLayout, SavedSource, SshStartup, Workspace, Worksp
 pub(super) struct WorkspacePage {
     name: String,
     query: String,
+    switching: bool,
     names: Vec<String>,
     status: String,
     startup: Option<StartupEditor>,
@@ -195,9 +196,14 @@ impl TerminalApp {
                 }
             }
             WorkspaceAction::Switch(id, name) => {
-                if self.workspace_page_mut(id).is_none() {
+                let Some(page) = self.workspace_page_mut(id) else {
+                    return;
+                };
+                if page.switching {
                     return;
                 }
+                page.switching = true;
+                page.status = format!("Switching to {name}…");
                 let profiles = self.store.path().to_owned();
                 context.spawn_background(move |_| {
                     let result = crate::workspace_window::switch(&name, &profiles)
@@ -206,9 +212,11 @@ impl TerminalApp {
                 });
             }
             WorkspaceAction::Switched(id, result) => {
-                if self.workspace_page_mut(id).is_none() {
+                let Some(page) = self.workspace_page_mut(id) else {
                     return;
-                }
+                };
+                page.switching = false;
+                page.status.clear();
                 match result {
                     Ok(_) if self.tabs.headers().len() > 1 => self.close_tab(id, context),
                     Ok(_) => {}
@@ -460,6 +468,7 @@ impl TerminalApp {
                     .spacing(8.0)
                     .children((
                         Button::new()
+                            .is_enabled(!page.switching)
                             .automation_name(format!("Switch to workspace {name}"))
                             .on_click(context.callback(move |_| {
                                 Message::Workspace(WorkspaceAction::Switch(id, switch.clone()))

@@ -6,16 +6,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::windows::named_pipe::{ClientOptions, NamedPipeServer},
+    net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer},
     sync::{mpsc, oneshot},
 };
 use wezterm_term::TerminalSize;
+use windows::Win32::{
+    Foundation::{ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+};
 mod security;
 use security::PipeSecurity;
 
@@ -664,17 +669,36 @@ pub async fn discover() -> Result<Vec<Instance>> {
 
 /// Discovery files are hints. Confirm the workspace with the authenticated server
 /// before using a PID, including when Windows recycles a stale record's PID.
-pub async fn workspace_owner(key: &str) -> Result<Option<u32>> {
+pub struct WorkspaceOwner {
+    pub pid: u32,
+    process: OwnedHandle,
+}
+
+impl WorkspaceOwner {
+    pub fn is_running(&self) -> Result<bool> {
+        match unsafe { WaitForSingleObject(HANDLE(self.process.as_raw_handle()), 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            _ => Err(std::io::Error::last_os_error()).context("Checking workspace process"),
+        }
+    }
+}
+
+pub async fn workspace_owner(key: &str) -> Result<Option<WorkspaceOwner>> {
     workspace_owner_in(&discovery_dir()?, key).await
 }
 
-async fn workspace_owner_in(directory: &Path, key: &str) -> Result<Option<u32>> {
-    for instance in discovery_records(directory)? {
+async fn workspace_owner_in(directory: &Path, key: &str) -> Result<Option<WorkspaceOwner>> {
+    let mut records = discovery_records(directory)?;
+    let current = std::process::id();
+    records.sort_by_key(|record| record.pid != current);
+    let mut owners = Vec::new();
+    for instance in records {
         if instance.workspace.as_deref() != Some(key) {
             continue;
         }
-        let reply = match call(Some(instance.pid), &Request::WorkspaceIdentity).await {
-            Ok(reply) => reply,
+        let pipe = match connect(instance.pid).await {
+            Ok(pipe) => pipe,
             Err(error)
                 if error
                     .downcast_ref::<std::io::Error>()
@@ -684,16 +708,44 @@ async fn workspace_owner_in(directory: &Path, key: &str) -> Result<Option<u32>> 
             }
             Err(error) => return Err(error),
         };
+        // Keep this process object alive through activation. Windows cannot recycle
+        // the PID between the reply on this very pipe and the HWND lookup.
+        let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, instance.pid) } {
+            Ok(handle) => handle,
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
+            Err(error) => return Err(error).context("Opening workspace process"),
+        };
+        let owner = WorkspaceOwner {
+            pid: instance.pid,
+            process: unsafe { OwnedHandle::from_raw_handle(handle.0) },
+        };
+        let reply = match call_on(pipe, &Request::WorkspaceIdentity).await {
+            Ok(reply) => reply,
+            Err(_) if !owner.is_running()? => continue,
+            Err(error) => return Err(error),
+        };
         ensure!(
             reply.ok,
             "Could not verify workspace owner: {}",
             reply.error.unwrap_or_default()
         );
-        if reply.result.as_ref().and_then(Value::as_str) == Some(key) {
-            return Ok(Some(instance.pid));
+        if reply.result.as_ref().and_then(Value::as_str) == Some(key) && owner.is_running()? {
+            if owner.pid == current {
+                return Ok(Some(owner));
+            }
+            owners.push(owner);
         }
     }
-    Ok(None)
+    ensure!(
+        owners.len() < 2,
+        "Multiple windows have this workspace open (PIDs {}). Switch from the window you want to use.",
+        owners
+            .iter()
+            .map(|owner| owner.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(owners.pop())
 }
 
 fn discovery_records(directory: &Path) -> Result<Vec<Instance>> {
@@ -714,7 +766,10 @@ fn discovery_records(directory: &Path) -> Result<Vec<Instance>> {
         let Ok(instance) = serde_json::from_slice::<Instance>(&bytes) else {
             continue;
         };
-        if instance.version == VERSION && instance.pipe == pipe_name(instance.pid) {
+        if entry.file_name() == std::ffi::OsString::from(format!("{}.json", instance.pid))
+            && instance.version == VERSION
+            && instance.pipe == pipe_name(instance.pid)
+        {
             instances.push(instance);
         }
     }
@@ -742,7 +797,10 @@ pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
             instances[0].pid
         }
     };
-    let mut pipe = connect(pid).await?;
+    call_on(connect(pid).await?, request).await
+}
+
+async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> {
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     ensure!(bytes.len() <= MAX_LINE, "request exceeds 2 MiB");
@@ -790,25 +848,37 @@ mod workspace_tests {
         )
         .unwrap();
         assert_eq!(
-            workspace_owner_in(directory.path(), "desk").await.unwrap(),
+            workspace_owner_in(directory.path(), "desk")
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
             Some(pid)
         );
         let record = directory.path().join(format!("{pid}.json"));
         let old_hint = std::fs::read(&record).unwrap();
         server.publish_workspace(Some("other".into())).unwrap();
         assert_eq!(
-            workspace_owner_in(directory.path(), "other").await.unwrap(),
+            workspace_owner_in(directory.path(), "other")
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
             Some(pid)
         );
         std::fs::write(&record, &old_hint).unwrap();
         assert_eq!(
-            workspace_owner_in(directory.path(), "desk").await.unwrap(),
+            workspace_owner_in(directory.path(), "desk")
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
             None
         );
         drop(server);
         std::fs::write(&record, old_hint).unwrap();
         assert_eq!(
-            workspace_owner_in(directory.path(), "desk").await.unwrap(),
+            workspace_owner_in(directory.path(), "desk")
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
             None
         );
     }
