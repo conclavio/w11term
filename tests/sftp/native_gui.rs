@@ -307,6 +307,63 @@ async fn native_new_folder_uses_the_selected_sftp_parent_and_preserves_existing_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "renames a file and a nonempty directory through a live mixed SSH/PowerShell drawer"]
+async fn native_rename_uses_the_selected_sftp_entry_and_preserves_existing_destinations() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let parent = remote.path().join("shell directory");
+    fs::create_dir_all(parent.join("original folder")).unwrap();
+    let file = b"file\x00\x80\xff";
+    let child = b"directory contents\x00\x95";
+    let collision = b"created while the dialog was open\x00\xf0";
+    fs::write(parent.join("before.bin"), file).unwrap();
+    fs::write(parent.join("original folder/inside.bin"), child).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("collision.bin"), collision).unwrap();
+    let wire = remote.path().join("rename-trace.jsonl");
+    let keyboard = remote.path().join("keyboard-input.bin");
+    fs::write(&wire, []).unwrap();
+    fs::write(&keyboard, []).unwrap();
+
+    drive_mixed_gui("rename-entry-ui.ps1", &ssh, state.path());
+
+    assert!(!parent.join("before.bin").exists());
+    assert!(!parent.join("original folder").exists());
+    assert_eq!(fs::read(parent.join("Report 雪.bin")).unwrap(), file);
+    assert_eq!(fs::read(parent.join("raced.bin")).unwrap(), collision);
+    assert_eq!(
+        fs::read(parent.join("build results/inside.bin")).unwrap(),
+        child
+    );
+    let pairs: Vec<[String; 2]> = fs::read_to_string(wire)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            [
+                "/shell directory/before.bin",
+                "/shell directory/Report 雪.bin"
+            ],
+            [
+                "/shell directory/original folder",
+                "/shell directory/build results"
+            ],
+        ]
+    );
+    assert_eq!(fs::read(keyboard).unwrap(), b"rename-ssh-ready");
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "moves a live SSH pane into an existing Windows PowerShell tab through the native UI"]
 async fn native_move_to_existing_tab_preserves_ssh_and_powershell() {
     // Allow a replacement transport so the test can detect one without hanging.
