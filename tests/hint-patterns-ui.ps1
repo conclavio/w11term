@@ -57,6 +57,31 @@ function Edit-Value([string]$Name, [string]$Value) {
     $edit = Wait-Until $Name { Find-Element $Name ([System.Windows.Automation.ControlType]::Edit) }
     $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Value)
 }
+function Replace-RequiredValue([string]$Name, [string]$Value) {
+    # SetValue changes the native textbox before Reactor receives TextChanged.
+    # When the other field is populated, Save's state acknowledges each edit.
+    Edit-Value $Name ''
+    $null = Wait-Until "editor to recognize an empty $Name" {
+        $save = Find-Element 'Save pattern'
+        $save -and -not $save.Current.IsEnabled
+    }
+    Edit-Value $Name $Value
+    $null = Wait-Until "editor to accept $Name '$Value'" {
+        $save = Find-Element 'Save pattern'
+        $save -and $save.Current.IsEnabled
+    }
+}
+function Save-Rule([string]$Name, [string]$Expression) {
+    Click 'Save pattern'
+    $null = Wait-Until 'saved pattern list' { Find-Element 'Add pattern' }
+    $rules = @((Get-Content -Raw -LiteralPath $env:W11TERM_SETTINGS_PATH | ConvertFrom-Json).hint_patterns)
+    if ($rules.Count -ne 1 -or $rules[0].name -cne $Name -or $rules[0].regex -cne $Expression) {
+        throw "Expected saved rule '$Name' / '$Expression'. Found: $($rules | ConvertTo-Json -Compress)"
+    }
+    $null = Wait-Until "rendered rule '$Name' / '$Expression'" {
+        (Find-Element "Edit pattern $Name") -and (Find-Element $Expression ([System.Windows.Automation.ControlType]::Text))
+    }
+}
 function Show-Patterns {
     Click 'Tab menu'
     Invoke-Button (Wait-Until 'settings menu' { Find-Element 'Settings' ([System.Windows.Automation.ControlType]::MenuItem) })
@@ -66,13 +91,45 @@ function Show-Pane {
     Click 'Back to settings'
     Picker-Query 'pattern-fixture.vt'
     Press-Key 13
+    $null = Wait-Until 'closed pane picker' { -not (Find-Element 'Find pane' ([System.Windows.Automation.ControlType]::Edit)) }
     Wait-Focus $pane
 }
-function Test-Match([string]$Name, [string]$Match) {
+function Hint-Message {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $texts = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $texts) |
+        ForEach-Object { $_.Current.Name } | Where-Object { $_ -match 'Esc (cancel|close)' } | Select-Object -First 1
+}
+function Open-Hints {
+    # The replay can reach the control pipe before WinUI has drawn or retitled
+    # the window. KeyboardBridge only accepts messages for the terminal HWND.
+    $script:window = Wait-Until 'rendered replay window ready for keyboard input' {
+        $app.Refresh()
+        if ($app.MainWindowTitle -like 'w11term*pattern-fixture.vt' -and
+            $app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle }
+    }
+    # The fixture starts with an 80x24 PTY and a 1120x760 DIP window. Its
+    # first canvas-sized grid replaces the startup grid and cancels any hints
+    # frozen on the old grid. Wait for the measured viewport to be published.
+    $null = Wait-Until 'canvas-sized replay frame' {
+        $box = Control @('get-text','--pane',"$pane")
+        $box.cols -ne 80 -or $box.rows -ne 24
+    }
     Press-Key 0x77 # the remapped F8 shortcut
-    Press-Key 0x41 # label a
+}
+function Test-Match([string]$Name, [string]$Match) {
+    Open-Hints
     $label = $Name + ' ' + [char]0xb7 + ' Enter copy ' + [char]0xb7 + ' Esc cancel   ' + $Match
-    $null = Wait-Until "hint for $Match" { Find-Element $label }
+    try {
+        $null = Wait-Until "keyboard hints ready for $Match" { (Hint-Message) -like 'Type a hint label*' }
+        Press-Key 0x41 # label a
+        $null = Wait-Until "hint for $Match" { Find-Element $label }
+    } catch {
+        $saved = (Get-Content -Raw -LiteralPath $env:W11TERM_SETTINGS_PATH | ConvertFrom-Json).hint_patterns
+        throw "$_ Rendered hint: '$(Hint-Message)'. Saved rules: $($saved | ConvertTo-Json -Compress)"
+    }
     if ($VerifyClipboard) {
         $before = [HintClipboard]::GetClipboardSequenceNumber()
         Press-Key 13
@@ -109,19 +166,17 @@ try {
             Edit-Value 'Regular expression' 'x*'
             Click 'Save pattern'
             $null = Wait-Until 'validation of empty matches' { Find-Element 'The expression must match at least one character every time.' }
-            Edit-Value 'Regular expression' '\bOPS-[0-9]+\b'
-            Click 'Save pattern'
-            $null = Wait-Until 'saved rule' { Find-Element 'Edit pattern Issue' }
+            Replace-RequiredValue 'Regular expression' '\bOPS-[0-9]+\b'
+            Save-Rule 'Issue' '\bOPS-[0-9]+\b'
             Show-Pane
         }
         Test-Match 'Issue' 'OPS-104'
         if ($launch -eq 2) {
             Show-Patterns
             Click 'Edit pattern Issue'
-            Edit-Value 'Pattern name' 'Bug'
-            Edit-Value 'Regular expression' 'BUG-[0-9]+'
-            Click 'Save pattern'
-            $null = Wait-Until 'renamed rule' { Find-Element 'Edit pattern Bug' }
+            Replace-RequiredValue 'Pattern name' 'Bug'
+            Replace-RequiredValue 'Regular expression' 'BUG-[0-9]+'
+            Save-Rule 'Bug' 'BUG-[0-9]+'
             Show-Pane
             Test-Match 'Bug' 'BUG-203'
             Show-Patterns
@@ -129,7 +184,7 @@ try {
             Click 'Remove pattern'
             $null = Wait-Until 'rule removal' { Find-Element 'Add pattern' }
             Show-Pane
-            Press-Key 0x77
+            Open-Hints
             $null = Wait-Until 'no matches after removal' { Find-Element ('No matching hints in this pane ' + [char]0xb7 + ' Esc close') }
             $settings = Get-Content -Raw -LiteralPath $env:W11TERM_SETTINGS_PATH | ConvertFrom-Json
             if ($settings.hint_patterns) { throw 'Removed pattern was still saved' }
