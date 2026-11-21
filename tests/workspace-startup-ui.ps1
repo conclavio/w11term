@@ -26,9 +26,15 @@ foreach ($mode in @('profile', 'workspace')) {
         $null = Control @('wait-for-text','--pane',"$pane",'--timeout','12','ready')
         Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
         Invoke-Button (Wait-Until 'workspace startup' { Find-Element ('Workspace startup' + [char]0x2026) })
+        # Exercise consecutive changes to both fields before applying the draft.
+        Set-Field 'Remote startup command' 'initial command'
         Set-Field 'Remote starting directory' "/srv/crew's project"
         Set-Field 'Remote startup command' 'tail -f build.log'
+        $preview = 'On reopen ' + [char]0xb7 + " Run tail -f build.log in /srv/crew's project"
+        # WinUI posts TextChanged asynchronously after ValuePattern.SetValue returns.
+        $null = Wait-Until 'the editor to recognize both changes' { Find-Element $preview }
         Invoke-Button (Wait-Until 'Apply to pane' { Find-Element 'Apply to pane' })
+        $null = Wait-Until 'staged workspace command' { Find-Element "$preview. Save or update the workspace to keep this setting." }
         Set-Field 'Workspace name' 'recipe'
         Invoke-Button (Wait-Until 'enabled Save workspace' {
             $button = Find-Element 'Save workspace'
