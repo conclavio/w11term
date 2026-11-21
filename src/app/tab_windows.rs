@@ -37,14 +37,57 @@ pub(super) struct Transfer {
     panes: Vec<u64>,
     source: LocalSender<Message>,
     pub(super) target: RefCell<Option<LocalSender<Message>>>,
-    payload: RefCell<Option<Tabs<AppTab>>>,
+    payload: RefCell<Option<OfferedTab<AppTab>>>,
     pin: RefCell<Option<PaneTransfer>>,
-    index: Cell<usize>,
-    selected: Cell<bool>,
-    bound: Cell<bool>,
-    claimed: Cell<bool>,
-    canceled: Cell<bool>,
+    phase: Cell<TransferPhase>,
     started: Instant,
+}
+
+struct OfferedTab<T> {
+    tab: Tabs<T>,
+    index: usize,
+    was_selected: bool,
+    fallback_group: Option<TabId>,
+}
+
+impl<T> OfferedTab<T> {
+    fn take(source: &mut Tabs<T>, group: TabId, index: usize) -> Option<Self> {
+        let was_selected = source.active_group_id() == Some(group);
+        let tab = source.take_group(group)?;
+        Some(Self {
+            tab,
+            index,
+            was_selected,
+            fallback_group: source.active_group_id(),
+        })
+    }
+
+    fn return_to(self, source: &mut Tabs<T>) {
+        // The automatic fallback may still be active with a different focused split.
+        // A different surviving tab reflects a newer choice in the source window.
+        let select = self.was_selected && source.active_group_id() == self.fallback_group;
+        source.restore_group(self.tab, self.index, select);
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+enum TransferPhase {
+    #[default]
+    Opening,
+    Ready,
+    Offered,
+    Claimed,
+    Canceled,
+}
+
+impl TransferPhase {
+    fn on_tick(self, elapsed: Duration) -> Self {
+        if elapsed >= Duration::from_secs(10) && self != Self::Claimed {
+            Self::Canceled
+        } else {
+            self
+        }
+    }
 }
 
 impl Transfer {
@@ -78,6 +121,14 @@ impl TerminalApp {
     }
 
     pub(super) fn window_tick(&mut self, ctx: &ComponentContext<Self>) {
+        if let Some(offer) = self
+            .incoming
+            .as_ref()
+            .filter(|o| o.phase.get() == TransferPhase::Canceled)
+        {
+            self.cancel_transfer(offer.id(), ctx);
+            return;
+        }
         if !self.native_bound
             && let Some(hwnd) = self.keyboard.try_bind()
         {
@@ -88,11 +139,12 @@ impl TerminalApp {
                         opening.published();
                     }
                     if let Some(offer) = &self.incoming {
-                        offer.bound.set(true);
-                        if offer.canceled.get()
+                        if offer.phase.get() != TransferPhase::Opening
                             || !offer.source.send(Message::TransferReady(offer.id()))
                         {
                             let _ = ctx.window().request_close();
+                        } else {
+                            offer.phase.set(TransferPhase::Ready);
                         }
                     } else if !self.window_restored {
                         self.restore_window();
@@ -102,14 +154,11 @@ impl TerminalApp {
             }
         }
         if let Some(offer) = self.outgoing.clone() {
-            if offer.claimed.get() {
-                self.finish_transfer(offer.id(), ctx);
-            } else if offer.canceled.get()
-                || (!offer.bound.get() && offer.started.elapsed() > Duration::from_secs(10))
-            {
-                self.cancel_transfer(offer.id(), ctx);
-            } else if offer.bound.get() && offer.payload.borrow().is_none() {
-                self.offer_group(offer.id(), ctx);
+            match offer.phase.get().on_tick(offer.started.elapsed()) {
+                TransferPhase::Claimed => self.finish_transfer(offer.id(), ctx),
+                TransferPhase::Canceled => self.cancel_transfer(offer.id(), ctx),
+                TransferPhase::Ready => self.offer_group(offer.id(), ctx),
+                TransferPhase::Opening | TransferPhase::Offered => {}
             }
         }
         if self.native_bound && self.outgoing.is_none() {
@@ -117,6 +166,25 @@ impl TerminalApp {
         } else {
             self.arm_window_tick(ctx);
         }
+    }
+
+    fn tab_move_blocker(&self, leaves: &[TabId]) -> Option<&'static str> {
+        leaves.iter().find_map(|id| {
+            let Page::Terminal(tab) = &self.tabs.get(*id)?.page else {
+                return None;
+            };
+            if (self.tabs.active_id() == Some(*id) && tab.prompt_id.is_some())
+                || tab.session.prompts.current().is_some()
+            {
+                Some("Answer or cancel the SSH prompt before moving this tab.")
+            } else if tab.files.awaiting_native_result() {
+                Some("Finish choosing or preparing files before moving this tab.")
+            } else if tab.device_busy {
+                Some("Wait for the SSH key operation to finish before moving this tab.")
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn move_tab_window(&mut self, ctx: &ComponentContext<Self>) {
@@ -130,8 +198,12 @@ impl TerminalApp {
         let Some(layout) = self.tabs.active_layout() else {
             return;
         };
-        let Some(panes) = layout
-            .leaves()
+        let leaves = layout.leaves();
+        if let Some(reason) = self.tab_move_blocker(&leaves) {
+            self.window_error = Some(reason.into());
+            return;
+        }
+        let Some(panes) = leaves
             .into_iter()
             .map(|leaf| self.tabs.get(leaf)?.pane_id())
             .collect::<Option<Vec<_>>>()
@@ -158,11 +230,7 @@ impl TerminalApp {
             target: Default::default(),
             payload: Default::default(),
             pin: Default::default(),
-            index: Default::default(),
-            selected: Default::default(),
-            bound: Default::default(),
-            claimed: Default::default(),
-            canceled: Default::default(),
+            phase: Default::default(),
             started: Instant::now(),
         });
         self.window_error = None;
@@ -183,11 +251,7 @@ impl TerminalApp {
         let Some(offer) = self.outgoing.clone().filter(|o| o.id() == id) else {
             return;
         };
-        if offer.claimed.get()
-            || offer.canceled.get()
-            || offer.payload.borrow().is_some()
-            || !offer.bound.get()
-        {
+        if offer.phase.get() != TransferPhase::Ready {
             return;
         }
         let headers = self.tabs.headers();
@@ -207,24 +271,35 @@ impl TerminalApp {
             self.cancel_transfer(id, ctx);
             return;
         }
-        if leaves.iter().any(|leaf| {
-            matches!(self.tabs.get(*leaf).map(|t| &t.page), Some(Page::Terminal(t))
-            if t.files.awaiting_native_result() || t.device_busy || t.prompt_id.is_some())
-        }) {
-            return; // A dialog or its background result still belongs to this HWND.
+        if let Some(reason) = self.tab_move_blocker(&leaves) {
+            self.cancel_transfer(id, ctx);
+            self.window_error = Some(reason.into());
+            return;
         }
         let Ok(pin) = self.registry.begin_transfer(&panes) else {
             self.cancel_transfer(id, ctx);
             return;
         };
         offer.pin.replace(Some(pin));
-        offer.index.set(index);
-        offer.selected.set(self.tabs.active_index() == Some(index));
-        if offer.selected.get() {
-            self.keyboard.set_target(None);
+        for leaf in leaves {
+            if let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(leaf)
+            {
+                tab.end_pointer_gesture();
+            }
         }
         self.cancel_frame_tasks();
-        offer.payload.replace(self.tabs.take_group(offer.group));
+        let Some(payload) = OfferedTab::take(&mut self.tabs, offer.group, index) else {
+            self.cancel_transfer(id, ctx);
+            return;
+        };
+        if payload.was_selected {
+            self.keyboard.set_target(None);
+        }
+        offer.payload.replace(Some(payload));
+        offer.phase.set(TransferPhase::Offered);
         self.mru_groups.retain(|g| *g != offer.group);
         self.sync_selection(ctx);
         self.activate(ctx);
@@ -237,13 +312,14 @@ impl TerminalApp {
         let Some(offer) = self
             .incoming
             .clone()
-            .filter(|o| o.id() == id && !o.canceled.get())
+            .filter(|o| o.id() == id && o.phase.get() == TransferPhase::Offered)
         else {
             return;
         };
-        let Some(mut group) = offer.payload.take() else {
+        let Some(payload) = offer.payload.take() else {
             return;
         };
+        let mut group = payload.tab;
         let leaves: Vec<_> = group.entries().iter().map(|t| t.id).collect();
         for leaf in leaves {
             if let Some(AppTab {
@@ -259,19 +335,14 @@ impl TerminalApp {
                 live.find.input = ElementRef::new();
                 live.find.focused = false;
                 live.find.epoch += 1;
-                live.clicked_link = None;
-                live.remote_button = MouseButton::None;
                 live.last_click = None;
-                live.scroll_direction = 0;
-                live.scroll_tick = false;
-                live.gesture += 1;
             }
         }
         self.tabs
             .restore_group(group, self.tabs.headers().len(), true);
         self.activate(ctx);
         self.sync_selection(ctx);
-        offer.claimed.set(true);
+        offer.phase.set(TransferPhase::Claimed);
         offer.pin.take();
         offer.source.send(Message::TransferDone(id));
         self.incoming = None;
@@ -281,7 +352,7 @@ impl TerminalApp {
         if self
             .outgoing
             .as_ref()
-            .is_some_and(|o| o.id() == id && o.claimed.get())
+            .is_some_and(|o| o.id() == id && o.phase.get() == TransferPhase::Claimed)
         {
             self.outgoing = None;
             if self.tabs.entries().is_empty() {
@@ -301,15 +372,14 @@ impl TerminalApp {
         let Some(offer) = self.outgoing.as_ref().filter(|o| o.id() == id).cloned() else {
             return;
         };
-        if offer.claimed.get() {
+        if offer.phase.get() == TransferPhase::Claimed {
             self.finish_transfer(id, ctx);
             return;
         }
-        offer.canceled.set(true);
+        offer.phase.set(TransferPhase::Canceled);
         self.outgoing = None;
-        if let Some(group) = offer.payload.take() {
-            self.tabs
-                .restore_group(group, offer.index.get(), offer.selected.get());
+        if let Some(payload) = offer.payload.take() {
+            payload.return_to(&mut self.tabs);
             self.activate(ctx);
             self.sync_selection(ctx);
         }
@@ -325,16 +395,162 @@ impl TerminalApp {
 impl Drop for TerminalApp {
     fn drop(&mut self) {
         if let Some(offer) = &self.incoming {
-            offer.canceled.set(true);
+            offer.phase.set(TransferPhase::Canceled);
             offer.source.send(Message::TransferCanceled(offer.id()));
         }
         if let Some(offer) = &self.outgoing
-            && !offer.claimed.get()
+            && offer.phase.get() != TransferPhase::Claimed
             && offer.payload.borrow().is_none()
         {
-            offer.canceled.set(true);
-            offer.send_target(Message::TransferCanceled(offer.id()));
+            offer.phase.set(TransferPhase::Canceled);
+            if !offer.send_target(Message::TransferCanceled(offer.id())) {
+                let _ = offer.registry.unregister();
+            }
         }
         let _ = self.registry.unregister();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_keeps_a_newer_source_tab_and_recognizes_the_fallback_by_group() {
+        let mut source = Tabs::default();
+        let first = source.insert("first");
+        let moving = source.insert("moving");
+        let fallback = source.insert("fallback");
+        let sibling = source.split(fallback, "second pane", Axis::Rows).unwrap();
+        let group = source.group_id(moving).unwrap();
+        source.select(moving);
+
+        let offer = OfferedTab::take(&mut source, group, 1).unwrap();
+        assert_eq!(source.active_id(), Some(sibling));
+        source.select(first);
+        offer.return_to(&mut source);
+        assert_eq!(source.active_id(), Some(first));
+        assert_eq!(source.headers()[1].id, moving);
+
+        source.select(moving);
+        let offer = OfferedTab::take(&mut source, group, 1).unwrap();
+        source.select(fallback);
+        offer.return_to(&mut source);
+        assert_eq!(source.active_id(), Some(moving));
+        assert_eq!(source.headers()[1].id, moving);
+
+        source.select(first);
+        let background = OfferedTab::take(&mut source, group, 1).unwrap();
+        background.return_to(&mut source);
+        assert_eq!(source.active_id(), Some(first));
+    }
+
+    #[test]
+    fn transfer_deadline_covers_window_binding_offer_and_unclaimed_payload() {
+        for phase in [
+            TransferPhase::Opening,
+            TransferPhase::Ready,
+            TransferPhase::Offered,
+        ] {
+            assert_eq!(phase.on_tick(Duration::from_secs(9)), phase);
+            assert_eq!(
+                phase.on_tick(Duration::from_secs(10)),
+                TransferPhase::Canceled
+            );
+        }
+        assert_eq!(
+            TransferPhase::Claimed.on_tick(Duration::from_secs(11)),
+            TransferPhase::Claimed
+        );
+    }
+
+    #[tokio::test]
+    async fn ending_source_capture_keeps_selection_and_balances_reported_mouse_input() {
+        use w11term::terminal::{TransportInput, create};
+        let Page::Terminal(mut tab) = live_tab("pointer test".into(), Source::Demo, false).page
+        else {
+            unreachable!()
+        };
+        let point = Point { col: 1, row: 0 };
+        let end = Point { col: 4, row: 0 };
+        let mut selection = Selection::new(point, false, false);
+        selection.update(end);
+        tab.selection.replace(Some(selection));
+        tab.scroll_direction = 2;
+        tab.scroll_tick = true;
+        tab.clicked_link = Some("example".into());
+
+        let press = MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            modifiers: KeyModifiers::NONE,
+            x: 1,
+            y: 3,
+            x_pixel_offset: 0,
+            y_pixel_offset: 1,
+        };
+        let motion = MouseEvent {
+            kind: MouseEventKind::Move,
+            x: 4,
+            ..press
+        };
+        let release = MouseEvent {
+            kind: MouseEventKind::Release,
+            button: MouseButton::None,
+            ..motion
+        };
+        let (wire, mut replies) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = create(TerminalSize::default(), wire);
+        terminal.advance_bytes(b"\x1b[?1002h\x1b[?1006h");
+        terminal
+            .mouse_event(tab.remote_mouse.event(press).unwrap())
+            .unwrap();
+        terminal
+            .mouse_event(tab.remote_mouse.event(motion).unwrap())
+            .unwrap();
+
+        // Intercept the production teardown command and feed it to the actual VT encoder.
+        let (input, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let worker = std::mem::replace(&mut tab.session.input, input);
+        tab.end_pointer_gesture();
+        tab.end_pointer_gesture();
+        tab.session.input = worker;
+        let Command::Mouse(up) = commands.try_recv().unwrap() else {
+            panic!("expected a mouse release")
+        };
+        terminal.mouse_event(up).unwrap();
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            tab.remote_mouse.event(release),
+            None,
+            "late native release after handoff"
+        );
+        terminal
+            .mouse_event(tab.remote_mouse.event(press).unwrap())
+            .unwrap();
+        terminal
+            .mouse_event(tab.remote_mouse.event(release).unwrap())
+            .unwrap();
+        // Dropping the terminal closes its asynchronous writer after the last flush.
+        drop(terminal);
+        let bytes = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut bytes = Vec::new();
+            while let Some(TransportInput::Data(part)) = replies.recv().await {
+                bytes.extend(part);
+            }
+            bytes
+        })
+        .await
+        .expect("VT reply writer did not drain");
+        assert_eq!(
+            bytes,
+            b"\x1b[<0;2;4M\x1b[<32;5;4M\x1b[<0;5;4m\x1b[<0;2;4M\x1b[<0;5;4m"
+        );
+        let selected = tab.selection.borrow();
+        let selected = selected.as_ref().unwrap();
+        assert!(!selected.dragging && selected.active);
+        assert_eq!((selected.anchor, selected.end), (point, end));
+        assert_eq!(tab.scroll_direction, 0);
+        assert!(!tab.scroll_tick && tab.clicked_link.is_none());
     }
 }

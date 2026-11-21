@@ -41,7 +41,7 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 ## Tabs and profiles
 
-When creating or editing an SSH profile, **SSH terminal type (TERM)** selects the terminfo name sent with each new PTY. Existing profiles use `xterm-256color`. Choose `xterm-sixel` for a host running Venti with Sixel graphics, or choose **Custom…** to enter a terminfo name supported by the host. This setting is stored as `"terminal_type": "xterm-sixel"` for the Sixel preset. Direct shells and durable attachments both request `COLORTERM=truecolor`. A process already running inside a durable session keeps its existing environment.
+When creating or editing an SSH profile, **SSH terminal type (TERM)** selects the terminfo name sent with each new PTY. Existing profiles use `xterm-256color`. Choose `xterm-sixel` for a host running Venti with Sixel graphics, or choose **Custom…** to enter a terminfo name supported by the host. This setting is stored as `"terminal_type": "xterm-sixel"` for the Sixel preset. Direct shells and PTY-based zmx and tmux attachments request `COLORTERM=truecolor`. A process already running inside a durable session keeps its existing environment.
 
 Open **caret → Command palette…** or press **Ctrl+Shift+K** to search actions for the current window. Search by words in any order, a profile name, or a current shortcut. Use Up and Down to highlight a result, then press Enter or click it. Disabled commands stay visible when their pane or connection requirements are unmet. Escape returns to the current pane. The palette also works from Settings and other utility tabs.
 
@@ -116,6 +116,14 @@ Programming ligatures default to enabled for adjacent ASCII cells with matching 
 SSH supports OpenSSH private keys supplied with `--identity`, protected w11term device keys, the Windows OpenSSH agent (the default for `ssh user@host`), `--auth none`, `--auth password`, and `--auth keyboard-interactive`. Password and MFA challenges use native dialogs; hidden answers never enter terminal input, profiles, event logs, or recordings. A successful password remains in memory only for reconnection; one-time codes are requested again. Passphrase-protected OpenSSH keys can be used through the agent.
 
 The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`. Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog.
+
+## Browse existing Herdr terminals
+
+Choose **caret → Find remote sessions → Browse Herdr terminals on _profile_** for a saved Linux SSH profile with Herdr Core’s `hc` available to remote SSH commands. Select a terminal by its display name and numeric address (such as `t7`). w11term opens a full interactive viewer over that SSH login. The program receives input and resize events, and continues running after the viewer detaches. This explicit command runs `hc connect`, which can start the account’s Core daemon. Session discovery and attachment use existing terminal records. The adapter targets Core’s generation 1 framed protocol from v0.1.21. [Herdr viewer protocol](https://github.com/herdrdev/herdr-core/blob/v0.1.21/schema/README.md#attach-streams)
+
+Reopen a saved workspace or choose **Remote session → Reattach to remote session** to request the same program again. w11term checks the SSH account and host key, persistent Core ID, terminal address and creation time, and the Linux process’s PID, boot ID and start ticks. Verification requires readable `/proc` entries and SSH exec channels. After a disconnect or a kept terminal replacing its program, the viewer shows its state. Choose an existing terminal again when its identity changes.
+
+Herdr can repaint the screen during attachment or after a slow viewer catches up. For the lifetime of these panes, remote clipboard changes, bells, named sounds and notifications stay disabled. Local copy/paste, terminal input, rendering and SFTP remain available.
 
 ## Durable Linux shells
 

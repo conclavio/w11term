@@ -92,16 +92,21 @@ pub enum TransportInput {
     Authenticate(crate::options::Authentication),
     Sftp(crate::sftp::Job),
     Data(Vec<u8>),
+    /// Parser-generated reply on a viewer transport that distinguishes it from user input.
+    Automatic(Vec<u8>),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
     Resize(TerminalSize),
 }
 
-struct ReplyWriter(mpsc::UnboundedSender<TransportInput>);
+struct ReplyWriter {
+    sender: mpsc::UnboundedSender<TransportInput>,
+    message: fn(Vec<u8>) -> TransportInput,
+}
 
 impl Write for ReplyWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0
-            .send(TransportInput::Data(bytes.to_vec()))
+        self.sender
+            .send((self.message)(bytes.to_vec()))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))?;
         Ok(bytes.len())
     }
@@ -116,8 +121,40 @@ pub fn create(size: TerminalSize, writer: mpsc::UnboundedSender<TransportInput>)
         Arc::new(Config),
         "w11term",
         env!("CARGO_PKG_VERSION"),
-        Box::new(ReplyWriter(writer)),
+        Box::new(ReplyWriter {
+            sender: writer,
+            message: TransportInput::Data,
+        }),
     )
+}
+
+/// Herdr can send a screen reconstruction on attach or while a viewer falls behind.
+/// Screen paint and subsequent live bytes share the same stream.
+pub(crate) fn enter_herdr_viewer(
+    terminal: &mut Terminal,
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    events: &crate::events::Events,
+) {
+    struct ViewerAlerts(crate::events::Events);
+    impl wezterm_term::AlertHandler for ViewerAlerts {
+        fn alert(&mut self, alert: wezterm_term::Alert) {
+            if let wezterm_term::Alert::WindowTitleChanged(title) = alert {
+                self.0.push("title", serde_json::json!({"title": title}));
+            }
+        }
+    }
+    terminal.clear_clipboard();
+    terminal.set_notification_handler(Box::new(ViewerAlerts(events.clone())));
+    terminal.set_nonblocking_viewer_writers(
+        Box::new(ReplyWriter {
+            sender: writer.clone(),
+            message: TransportInput::Data,
+        }),
+        Box::new(ReplyWriter {
+            sender: writer.clone(),
+            message: TransportInput::Automatic,
+        }),
+    );
 }
 
 /// WezTerm's kitty encoder lives in its input-types crate, outside Terminal::key_down.
@@ -1331,6 +1368,86 @@ mod tests {
             .unwrap();
             assert_eq!(receive(&mut wire), expected.as_bytes());
         }
+    }
+
+    #[test]
+    fn herdr_repaints_preserve_text_title_and_distinguish_replies_from_real_input() {
+        #[derive(Default)]
+        struct Clipboard(Mutex<Vec<Option<String>>>);
+        impl wezterm_term::Clipboard for Clipboard {
+            fn set_contents(
+                &self,
+                _: wezterm_term::ClipboardSelection,
+                value: Option<String>,
+            ) -> anyhow::Result<()> {
+                self.0.lock().unwrap().push(value);
+                Ok(())
+            }
+        }
+        let (writer, mut received) = mpsc::unbounded_channel();
+        let mut term = create(Default::default(), writer.clone());
+        let sink = Arc::new(Clipboard::default());
+        let clipboard: Arc<dyn wezterm_term::Clipboard> = sink.clone();
+        term.set_clipboard(&clipboard);
+        let events = crate::events::Events::default();
+        let (notices, mut pending) = mpsc::channel(16);
+        let player = crate::options::PlayerOptions {
+            remote_sounds: Some(true),
+            sync_assets: Some(true),
+            ..Default::default()
+        };
+        term.set_notification_handler(Box::new(crate::sound::Alerts {
+            events: events.clone(),
+            notices,
+            player: Arc::new(std::sync::RwLock::new(player)),
+        }));
+        let effects = b"\x07\x1b]52;c;eA==\x07\x1b]440;1;play;shot\x07\x1b]440;1;pack;v1\x07\x1b]777;notify;title;test\x07";
+        term.advance_bytes(effects);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(
+            events
+                .since(0)
+                .events
+                .iter()
+                .any(|e| e.kind == "notification")
+        );
+        assert!(matches!(
+            pending.try_recv(),
+            Ok(crate::sound::Notice::Play(_))
+        ));
+        assert!(matches!(
+            pending.try_recv(),
+            Ok(crate::sound::Notice::Play(_))
+        ));
+        assert!(matches!(
+            pending.try_recv(),
+            Ok(crate::sound::Notice::Pack(_))
+        ));
+        let cursor = events.since(0).next;
+
+        enter_herdr_viewer(&mut term, &writer, &events);
+        term.reset_connection();
+        for _ in 0..2 {
+            // Reproduce both a whole repaint and OSCs split across DATA frames.
+            for byte in effects {
+                term.advance_bytes([*byte]);
+            }
+            term.advance_bytes(b"\x1b]52;c;?\x07");
+        }
+        term.advance_bytes(b"visible\x1b]2;viewer title\x07\x1b[5n");
+        term.send_paste("typed").unwrap();
+        term.advance_bytes(b"\x1b[5n");
+        assert!(text(&term).contains("visible"));
+        assert_eq!(term.get_title(), "viewer title");
+        let updates = events.since(cursor).events;
+        assert!(updates.iter().any(|event| event.kind == "title"));
+        assert!(updates.iter().all(|event| event.kind == "title"));
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(pending.try_recv().is_err());
+        assert!(matches!(received.try_recv(), Ok(TransportInput::Automatic(v)) if v == b"\x1b[0n"));
+        assert!(matches!(received.try_recv(), Ok(TransportInput::Data(v)) if v == b"typed"));
+        assert!(matches!(received.try_recv(), Ok(TransportInput::Automatic(v)) if v == b"\x1b[0n"));
+        assert!(received.try_recv().is_err());
     }
 
     #[test]

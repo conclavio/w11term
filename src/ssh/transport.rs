@@ -19,6 +19,8 @@ use zeroize::Zeroizing;
 
 #[derive(Debug)]
 pub enum Event {
+    /// Arrives before this viewer's first paint or any reconstructed terminal data.
+    HerdrViewer,
     Data(Vec<u8>),
     Status(String),
     SessionListUpdated(String),
@@ -413,7 +415,7 @@ fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOpti
     match input {
         TransportInput::Resize(new) => *size = new,
         TransportInput::Authenticate(auth) => options.authentication = auth,
-        TransportInput::Data(_) => {}
+        TransportInput::Data(_) | TransportInput::Automatic(_) => {}
         TransportInput::Raw(_, reply) => {
             let _ = reply.send(Err(
                 "SSH is reconnecting; input was not queued or sent".into()
@@ -577,6 +579,7 @@ impl Driver {
     /// connection available for a subsequent attach from the same chooser.
     pub(super) async fn discover_sessions(
         &mut self,
+        herdr: bool,
     ) -> Result<(Vec<crate::durable::DiscoveredSession>, String)> {
         let options = self.options.clone();
         let offered = self
@@ -589,7 +592,16 @@ impl Driver {
                 Some(link) => link,
                 None => connect(&options, self.prompts.as_ref(), &mut self.passwords, None).await?,
             };
-            let entries = super::durability::discover(&link, &options).await;
+            let entries = if herdr {
+                tokio::time::timeout(
+                    Duration::from_secs(25),
+                    super::herdr::discover(&link, &options),
+                )
+                .await
+                .context("Herdr browser timed out")??
+            } else {
+                super::durability::discover(&link, &options).await
+            };
             Ok::<_, anyhow::Error>((link, entries))
         };
         tokio::pin!(scan);
@@ -676,7 +688,8 @@ impl Driver {
                     "Workspace command interrupted; reopen the workspace to run it again",
                 ));
             }
-            if matches!(program, Program::End(_))
+            if program.herdr_reference().is_some()
+                || matches!(program, Program::End(_))
                 || error.downcast_ref::<Permanent>().is_some()
                 || error.downcast_ref::<LifecycleError>().is_some()
                 || !self.options.player.reconnect
@@ -717,6 +730,9 @@ impl Driver {
     }
 }
 async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Program) -> Result<()> {
+    if let Some(reference) = program.herdr_reference() {
+        return run_herdr_channel(shell, driver, program, &reference).await;
+    }
     let Driver {
         options,
         size,
@@ -867,22 +883,13 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 match message {
                     Some(TransportInput::Authenticate(auth)) => options.authentication = auth,
                     Some(TransportInput::Sftp(job)) => {
-                        if job.reply.is_closed() && matches!(job.operation, crate::sftp::Operation::Close { .. }) {
-                            let _ = cleanup_tx.send(job);
-                        } else if let Err(error) = sftp_tx.try_send(job) {
-                            let message = if matches!(&error, mpsc::error::TrySendError::Full(_)) {
-                                "SFTP queue is full"
-                            } else {
-                                "SFTP worker is closed"
-                            };
-                            let _ = error.into_inner().reply.send(Err(message.into()));
-                        }
+                        forward_sftp(&sftp_tx,&cleanup_tx,job);
                     }
-                    Some(TransportInput::Data(_)) if discard_input => {}
+                    Some(TransportInput::Data(_) | TransportInput::Automatic(_)) if discard_input => {}
                     Some(TransportInput::Raw(_, reply)) if discard_input => {
                         let _ = reply.send(Err("RustMUSH resume is pending; input was not queued or sent".into()));
                     }
-                    Some(TransportInput::Data(bytes)) => channel.data(bytes.as_slice()).await?,
+                    Some(TransportInput::Data(bytes) | TransportInput::Automatic(bytes)) => channel.data(bytes.as_slice()).await?,
                     Some(TransportInput::Raw(bytes, reply)) => {
                         let result = channel.data(bytes.as_slice()).await;
                         let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
@@ -904,5 +911,93 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 Some(russh::ChannelMsg::Close)=>return Ok(()),None=>return Err(anyhow::anyhow!("SSH transport closed unexpectedly")),_=>{}
             }
         }
+    }
+}
+
+async fn run_herdr_channel(
+    shell: OpenShell,
+    driver: &mut Driver,
+    program: &Program,
+    reference: &crate::durable::DurableReference,
+) -> Result<()> {
+    let original = driver.size;
+    let cols = u16::try_from(original.cols)?;
+    let rows = u16::try_from(original.rows)?;
+    let link = shell.link;
+    let connecting = tokio::time::timeout(
+        Duration::from_secs(20),
+        super::herdr::attach(shell.channel, &link, reference, cols, rows),
+    );
+    tokio::pin!(connecting);
+    let mut viewer = loop {
+        tokio::select! {
+            message=driver.input.recv()=>match message {Some(message)=>driver.discard_input(message),None=>return Ok(())},
+            result=&mut connecting=>break result.context("Timed out attaching Herdr terminal")??,
+        }
+    };
+    // Commands queued up to this verification belong to the old input epoch.
+    for _ in 0..driver.input.len() {
+        if let Ok(message) = driver.input.try_recv() {
+            driver.discard_input(message);
+        }
+    }
+    if driver.size.cols != original.cols || driver.size.rows != original.rows {
+        viewer
+            .resize(
+                u16::try_from(driver.size.cols)?,
+                u16::try_from(driver.size.rows)?,
+            )
+            .await?;
+    }
+    shell.published.publish(&link);
+    let generation = driver.generation;
+    driver.output.send(Event::HerdrViewer).await?;
+    driver.output.send(Event::Connected(generation)).await?;
+    driver.events.push(
+        "connected",
+        serde_json::json!({"generation":generation,"durable":true,"backend":"herdr"}),
+    );
+    program.ready();
+    let (sftp_tx, sftp_rx) = mpsc::channel(8);
+    let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
+    let mut jobs = tokio::task::JoinSet::new();
+    jobs.spawn(crate::sftp::run(link.handle(), sftp_rx, cleanup_rx));
+    loop {
+        tokio::select! {
+            message=driver.input.recv()=>match message {
+                Some(TransportInput::Data(data))=>viewer.input(&data).await?,
+                Some(TransportInput::Automatic(data))=>viewer.automatic_input(&data).await?,
+                Some(TransportInput::Raw(data,reply))=>{
+                    let result=viewer.input(&data).await;
+                    let _=reply.send(result.as_ref().map(|_|()).map_err(|e|e.to_string()));
+                    result?;
+                }
+                Some(TransportInput::Resize(size))=>{driver.size=size; viewer.resize(u16::try_from(size.cols)?,u16::try_from(size.rows)?).await?;}
+                Some(TransportInput::Authenticate(auth))=>driver.options.authentication=auth,
+                Some(TransportInput::Sftp(job))=>forward_sftp(&sftp_tx,&cleanup_tx,job),
+                None=>{viewer.close().await?;return Ok(());}
+            },
+            data=viewer.next_data()=>match data? {
+                Some(bytes)=>{let size=bytes.len(); if size>0 { driver.output.send(Event::Data(bytes)).await?; viewer.credit(size).await?; }}
+                None=>return Ok(()),
+            }
+        }
+    }
+}
+
+fn forward_sftp(
+    sftp_tx: &mpsc::Sender<crate::sftp::Job>,
+    cleanup_tx: &mpsc::UnboundedSender<crate::sftp::Job>,
+    job: crate::sftp::Job,
+) {
+    if job.reply.is_closed() && matches!(job.operation, crate::sftp::Operation::Close { .. }) {
+        let _ = cleanup_tx.send(job);
+    } else if let Err(error) = sftp_tx.try_send(job) {
+        let message = if matches!(&error, mpsc::error::TrySendError::Full(_)) {
+            "SFTP queue is full"
+        } else {
+            "SFTP worker is closed"
+        };
+        let _ = error.into_inner().reply.send(Err(message.into()));
     }
 }

@@ -79,7 +79,7 @@ struct LiveTab {
     error: Option<String>,
     selection: Rc<RefCell<Option<Selection>>>,
     hover: Rc<RefCell<Option<Link>>>,
-    remote_button: MouseButton,
+    remote_mouse: RemoteMouse,
     clicked_link: Option<String>,
     last_click: Option<(Instant, Point, u8)>,
     scroll_direction: isize,
@@ -99,6 +99,19 @@ struct Find {
     focused: bool,
 }
 impl LiveTab {
+    fn end_pointer_gesture(&mut self) {
+        if let Some(release) = self.remote_mouse.release() {
+            let _ = self.session.input.send(Command::Mouse(release));
+        }
+        if let Some(selection) = self.selection.borrow_mut().as_mut() {
+            selection.dragging = false;
+        }
+        self.clicked_link = None;
+        self.scroll_direction = 0;
+        self.scroll_tick = false;
+        self.gesture += 1;
+    }
+
     fn browsing_sessions(&self) -> bool {
         self.discovery_page.is_some()
             && self
@@ -107,6 +120,40 @@ impl LiveTab {
                 .is_some_and(|state| state.phase.is_browser())
     }
 }
+
+// The window that received a press also owns its release, even if capture is
+// interrupted or the pane's live session moves to another window.
+#[derive(Default)]
+struct RemoteMouse {
+    held: Option<MouseEvent>,
+}
+
+impl RemoteMouse {
+    fn event(&mut self, mut event: MouseEvent) -> Option<MouseEvent> {
+        match event.kind {
+            MouseEventKind::Press if event.button == MouseButton::None => return None,
+            MouseEventKind::Press => self.held = Some(event),
+            MouseEventKind::Release => event.button = self.held.take()?.button,
+            MouseEventKind::Move => {
+                if let Some(held) = &mut self.held {
+                    *held = MouseEvent {
+                        button: held.button,
+                        ..event
+                    };
+                }
+            }
+        }
+        Some(event)
+    }
+
+    fn release(&mut self) -> Option<MouseEvent> {
+        self.held.take().map(|event| MouseEvent {
+            kind: MouseEventKind::Release,
+            ..event
+        })
+    }
+}
+
 impl Default for Find {
     fn default() -> Self {
         Self {
@@ -303,8 +350,17 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(name) = label.strip_prefix("Browse Herdr terminals on ") {
+        return Message::Discovery(session_browser::Action::Discover {
+            name: name.into(),
+            herdr: true,
+        });
+    }
     if let Some(name) = label.strip_prefix("Find sessions on ") {
-        return Message::Discovery(session_browser::Action::Discover(name.into()));
+        return Message::Discovery(session_browser::Action::Discover {
+            name: name.into(),
+            herdr: false,
+        });
     }
     if let Some(action) = durable_view::menu_action(&label) {
         return Message::Durability(action);
@@ -591,7 +647,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             error: None,
             selection: Rc::new(RefCell::new(None)),
             hover: Rc::new(RefCell::new(None)),
-            remote_button: MouseButton::None,
+            remote_mouse: Default::default(),
             clicked_link: None,
             last_click: None,
             scroll_direction: 0,
@@ -686,6 +742,7 @@ impl TerminalApp {
         }
         if tab.connection_generation != frame.connection_generation {
             tab.connection_generation = frame.connection_generation;
+            tab.remote_mouse = RemoteMouse::default();
             self.keyboard.reset_keys();
         }
         if prompt_id.is_some() {
@@ -1086,6 +1143,9 @@ impl TerminalApp {
         } else {
             MouseButton::None
         };
+        if kind == MouseEventKind::Press {
+            tab.gesture += 1;
+        }
         let local_drag = tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
             || tab.clicked_link.is_some();
         if frame.mouse_grabbed
@@ -1094,15 +1154,7 @@ impl TerminalApp {
             && !modifiers.contains(KeyModifiers::SHIFT)
             && !(modifiers.contains(KeyModifiers::CTRL) && link.is_some())
         {
-            let button = if kind == MouseEventKind::Release {
-                std::mem::replace(&mut tab.remote_button, MouseButton::None)
-            } else {
-                if kind == MouseEventKind::Press {
-                    tab.remote_button = button;
-                }
-                button
-            };
-            let _ = tab.session.input.send(Command::Mouse(MouseEvent {
+            if let Some(event) = tab.remote_mouse.event(MouseEvent {
                 kind,
                 x,
                 y: y as i64,
@@ -1118,7 +1170,9 @@ impl TerminalApp {
                 ),
                 button,
                 modifiers,
-            }));
+            }) {
+                let _ = tab.session.input.send(Command::Mouse(event));
+            }
             return;
         }
         let mut should_copy = false;
@@ -1127,7 +1181,6 @@ impl TerminalApp {
         match kind {
             MouseEventKind::Press if button == MouseButton::Middle => {}
             MouseEventKind::Press if button == MouseButton::Right => {
-                tab.gesture += 1;
                 if !preferences.copy_on_select
                     && tab.selection.borrow().as_ref().is_some_and(|s| s.active)
                 {
@@ -1137,7 +1190,6 @@ impl TerminalApp {
                 }
             }
             MouseEventKind::Press if button == MouseButton::Left => {
-                tab.gesture += 1;
                 if modifiers.contains(KeyModifiers::CTRL)
                     && let Some(link) = link
                 {
@@ -3855,7 +3907,7 @@ impl Component for TerminalApp {
                     && matches!(live.source, Source::Ssh(_) | Source::Local(_))
                 {
                     KeyboardBridge::set_read_only(&live.session.input, &live.read_only, enabled);
-                    live.remote_button = MouseButton::None;
+                    live.remote_mouse = RemoteMouse::default();
                     live.surface.invalidator.invalidate();
                     self.publish_panes();
                 }
@@ -4162,11 +4214,7 @@ impl Component for TerminalApp {
                 }) = self.tabs.get_mut(id)
                     && tab.gesture == gesture
                 {
-                    if let Some(selection) = tab.selection.borrow_mut().as_mut() {
-                        selection.dragging = false;
-                    }
-                    tab.scroll_direction = 0;
-                    tab.clicked_link = None;
+                    tab.end_pointer_gesture();
                 }
             }
             Message::DividerPress(epoch, path, coordinate) => {
@@ -5112,6 +5160,18 @@ impl TerminalApp {
                 let prompt = tab.session.prompts.current().unwrap();
                 assert_eq!(tab.prompt_id, Some(prompt.id));
                 assert!(!self.keyboard.has_target());
+                let pane = tab.session.pane_id;
+                self.update(Message::MoveTabToWindow, context);
+                assert!(
+                    self.outgoing.is_none(),
+                    "a pending SSH prompt opened another window"
+                );
+                assert_eq!(self.tab_for_pane(pane), Some(1));
+                assert!(
+                    self.window_error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("SSH prompt"))
+                );
                 self.update(
                     tab_menu_message("Move pane to existing tab…".into()),
                     context,

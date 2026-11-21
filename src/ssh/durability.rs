@@ -49,6 +49,7 @@ pub enum DurableAction {
 
 #[derive(Clone, Debug)]
 pub struct DurableState {
+    pub herdr_browser: bool,
     pub phase: DurablePhase,
     pub reference: Option<DurableReference>,
     pub detail: String,
@@ -65,7 +66,7 @@ impl DurableState {
                         && self
                             .reference
                             .as_ref()
-                            .is_some_and(|r| r.backend == Backend::Tmux))
+                            .is_some_and(|r| r.backend != Backend::Zmx))
             }
             Choose(reference) => {
                 self.phase == Choosing && self.candidates.iter().any(|s| s.reference == reference)
@@ -82,11 +83,12 @@ impl DurableState {
                         .as_ref()
                         .is_some_and(|r| r.backend == Backend::Zmx)
             }
+            UseDirectShell | StartNew if self.herdr_browser => false,
             StartNew
                 if self
                     .reference
                     .as_ref()
-                    .is_some_and(|r| r.backend == Backend::Tmux) =>
+                    .is_some_and(|r| r.backend != Backend::Zmx) =>
             {
                 false
             }
@@ -121,11 +123,14 @@ pub(crate) struct Worker {
 pub(crate) enum Start {
     Attach(Option<DurableReference>),
     Discover,
+    DiscoverHerdr,
 }
 impl DurableControl {
     pub(crate) fn new(start: Start) -> (Self, Worker) {
+        let herdr_browser = matches!(&start, Start::DiscoverHerdr)
+            || matches!(&start, Start::Attach(Some(r)) if r.backend == Backend::Herdr);
         let (phase, reference, detail) = match start {
-            Start::Discover => (
+            Start::Discover | Start::DiscoverHerdr => (
                 DurablePhase::Discovering,
                 None,
                 "Looking for remote sessions…",
@@ -137,6 +142,7 @@ impl DurableControl {
             ),
         };
         let model = Model(Arc::new(Mutex::new(DurableState {
+            herdr_browser,
             phase,
             reference,
             detail: detail.into(),
@@ -200,6 +206,12 @@ pub(super) enum Program {
     End(Model),
 }
 impl Program {
+    pub(super) fn herdr_reference(&self) -> Option<DurableReference> {
+        match self {
+            Self::Attach(model) => model.reference().filter(|r| r.backend == Backend::Herdr),
+            _ => None,
+        }
+    }
     pub(super) fn peer_fingerprint(&self) -> Option<String> {
         match self {
             Self::Attach(model) | Self::End(model) => model.reference().map(|r| r.host_key),
@@ -427,9 +439,9 @@ async fn attach_tmux(
     }).await.map_err(|_| failure(Unavailable, "Timed out verifying the tmux attachment"))?
 }
 
-struct CommandResult {
-    status: u32,
-    stdout: Vec<u8>,
+pub(super) struct CommandResult {
+    pub(super) status: u32,
+    pub(super) stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
 
@@ -466,7 +478,7 @@ fn compatible_version(output: &[u8]) -> bool {
 async fn command(link: &ConnectionShare, text: &str) -> Result<CommandResult> {
     bounded_command(link, text, 8192).await
 }
-async fn bounded_command(
+pub(super) async fn bounded_command(
     link: &ConnectionShare,
     text: &str,
     limit: usize,
@@ -667,7 +679,8 @@ impl Worker {
             if let Some(program) = next.take() {
                 let execute = async {
                     if matches!(program, Program::Discover) {
-                        let (entries, detail) = driver.discover_sessions().await?;
+                        let herdr = self.model.0.lock().unwrap().herdr_browser;
+                        let (entries, detail) = driver.discover_sessions(herdr).await?;
                         let mut state = self.model.0.lock().unwrap();
                         state.detail = detail;
                         state.candidates = entries.into();
