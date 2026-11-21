@@ -147,6 +147,13 @@ impl Session {
         self.ssh_connection.current()
     }
 
+    pub fn profile_folders(
+        &self,
+        scope: crate::folder_grants::FolderScope,
+    ) -> crate::folder_grants::PaneShares {
+        crate::folder_grants::PaneShares::new(self.pane_id, self.ssh_connection.clone(), scope)
+    }
+
     pub fn start_configured_with_connection(
         source: Source,
         size: TerminalSize,

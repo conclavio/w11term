@@ -40,7 +40,7 @@ function Wait-InputWindow {
     $prefix = 'w11term ' + [char]0xb7 + ' '
     return Wait-Until 'the fixture window to bind its keyboard' {
         $app.Refresh()
-        if ($app.MainWindowHandle -ne [IntPtr]::Zero -and $app.MainWindowTitle.StartsWith($prefix)) {
+        if ($app.MainWindowHandle -ne [IntPtr]::Zero -and ([string]$app.MainWindowTitle).StartsWith($prefix)) {
             $app.MainWindowHandle
         }
     }

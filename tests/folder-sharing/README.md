@@ -1,16 +1,20 @@
-# Windows to Linux folder mount pilot
+# Windows to Linux folder mount acceptance test
 
-This fixture tests read-only access to a selected Windows folder. A native Windows w11term session logs into a disposable Linux guest. Its interactive shell stays open while a second SSH channel starts the guest’s stock SSHFS process in passive mode. SSHFS sends SFTP requests over that channel to Windows. Linux lists the selected directory, reads binary files including one under a Unicode directory name, attempts a write, unmounts and checks the original shell.
+This test grants an SSH profile read-only access to a temporary Windows directory through w11term’s folder-sharing API. An unprivileged account on a disposable Linux guest mounts it under `~/windows/` using stock SSHFS in passive mode. The test checks Linux’s mount table for the read-only flag and the identifier of the mount that w11term started.
 
-The fixture creates two sibling Windows directories on NTFS. Only one is selected for export. Linux compares the SHA-256 hash of a 98,321-byte file to the hash computed on Windows and checks that a junction and a hard link into the other directory are inaccessible. Access to user folders from a running application, per-folder writes and remount after reconnect remain on the roadmap.
+Linux reads binary data, compares a 98,321-byte file under a Unicode name against its Windows SHA-256 digest, and tries to write. A sibling’s data must stay inaccessible through both an NTFS junction and a hard link. A second mount request at the same name must preserve the first mount. A nonempty Linux destination and a symlink to an empty directory must also be refused.
+
+After unmounting, the test replaces the Windows directory at its saved path. The manager must report the replacement and leave Linux unmounted. Restoring the original directory must allow the saved grant to mount again.
+
+The original interactive shell must keep its PID through explicit unmount and dropping a mount handle. The test then disconnects the SSH transport and checks that the mount disappears. A fresh pane opens the same temporary profile and grant store, remounts the saved folder, and forgets it. Linux must see the mount disappear again while its new shell remains usable. Reopening the profile must show an empty grant list.
 
 ## Run the fixture
 
-The **Windows folder mount pilot** GitHub Actions workflow builds the guest from Ubuntu packages and runs the test on Windows under QEMU software emulation. The guest SSH listener is forwarded to a Windows loopback port. The runner generates a fresh SSH identity and checks the guest host key against the key on its serial console.
+The **Windows folder mount pilot** GitHub Actions workflow builds two guests from Ubuntu packages and runs them under QEMU on Windows. Both use the same Ubuntu GA kernel. The Ubuntu 26.04 userspace exercises the complete mount lifecycle. The Ubuntu 24.04 userspace checks that w11term identifies its FUSE 3.14 helper and refuses to start a mount while keeping the shell usable. Each guest's SSH listener is forwarded to a Windows loopback port. The runner generates a fresh SSH identity per boot and checks the host key against the guest serial console.
 
 To reproduce with your own test machines:
 
-1. On a disposable x86-64 Ubuntu 24.04 builder, run `sudo bash tests/folder-sharing/guest/build.sh /tmp/sshfs-guest`. Copy its output directory to the Windows test machine.
+1. On a disposable x86-64 Ubuntu 24.04 builder, run `sudo bash tests/folder-sharing/guest/build.sh /tmp/sshfs-guest resolute`. Copy its output directory to the Windows test machine. To reproduce the older-helper check, build the `noble` suite and pass `-LegacyFuse` to the Windows script.
 2. In the Windows checkout, run `cargo test --locked --lib --no-run`. Cargo prints the path of the library test executable.
 3. In PowerShell 7.4 or later, run the command below with QEMU and OpenSSH's `ssh-keygen.exe` available. Substitute the actual executable path printed by Cargo.
 

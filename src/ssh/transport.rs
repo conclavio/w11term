@@ -733,6 +733,7 @@ impl Driver {
     }
 }
 async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Program) -> Result<()> {
+    let _published = shell.published.shell_lifetime(&shell.link);
     if let Some(reference) = program.herdr_reference() {
         return run_herdr_channel(shell, driver, program, &reference).await;
     }

@@ -24,12 +24,28 @@ public static class FixtureDialog {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     private static extern uint GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, uint size, uint flags);
 
+    private static string FinalPath(SafeFileHandle handle) {
+        var result = new StringBuilder(32768);
+        uint count = GetFinalPathNameByHandle(handle, result, (uint)result.Capacity, 0);
+        if (count == 0 || count >= result.Capacity) throw new IOException("Cannot resolve fixture path");
+        return result.ToString();
+    }
+
     private static string DiskPath(string path) {
         using (var file = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
-            var result = new StringBuilder(32768);
-            uint count = GetFinalPathNameByHandle(file.SafeFileHandle, result, (uint)result.Capacity, 0);
-            if (count == 0 || count >= result.Capacity) throw new IOException("Cannot resolve saved path: " + path);
-            return result.ToString();
+            return FinalPath(file.SafeFileHandle);
+        }
+    }
+
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    private static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security,
+        uint disposition, uint flags, IntPtr template);
+
+    public static string DirectoryPath(string path) {
+        // FILE_READ_ATTRIBUTES, all sharing modes, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS.
+        using (var dir = CreateFile(path, 0x80, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (dir.IsInvalid) throw new IOException("Cannot open fixture directory: " + path);
+            return FinalPath(dir);
         }
     }
 
