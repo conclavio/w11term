@@ -7,6 +7,65 @@ use std::{
 mod local;
 pub use local::LocalOptions;
 
+/// Number of physical rows a pane retains above its primary screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "u32")]
+pub struct ScrollbackLines(u16);
+
+impl ScrollbackLines {
+    pub const MAX: u16 = 32_767;
+
+    pub fn get(self) -> usize {
+        usize::from(self.0)
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for ScrollbackLines {
+    fn default() -> Self {
+        Self(10_000)
+    }
+}
+
+impl std::fmt::Display for ScrollbackLines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl TryFrom<u32> for ScrollbackLines {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u32) -> Result<Self> {
+        ensure!(
+            value <= u32::from(Self::MAX),
+            "Scrollback lines must be between 0 and {}",
+            Self::MAX
+        );
+        Ok(Self(value as u16))
+    }
+}
+
+impl std::str::FromStr for ScrollbackLines {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        value
+            .trim()
+            .parse::<u32>()
+            .with_context(|| {
+                format!(
+                    "Enter a whole number of scrollback lines between 0 and {}",
+                    Self::MAX
+                )
+            })?
+            .try_into()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "auth", rename_all = "kebab-case")]
 pub enum Authentication {
@@ -111,6 +170,8 @@ pub struct SshOptions {
     pub port: u16,
     #[serde(default, skip_serializing_if = "TerminalType::is_default")]
     pub terminal_type: TerminalType,
+    #[serde(default, skip_serializing_if = "ScrollbackLines::is_default")]
+    pub scrollback_lines: ScrollbackLines,
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
@@ -142,6 +203,7 @@ impl From<JumpHost> for SshOptions {
             user: hop.user,
             port: hop.port,
             terminal_type: TerminalType::default(),
+            scrollback_lines: ScrollbackLines::default(),
             authentication: hop.authentication,
             host_key: hop.host_key,
             proxy_jump: Vec::new(),
@@ -337,6 +399,16 @@ pub enum Source {
     Ssh(SshOptions),
 }
 
+impl Source {
+    pub fn scrollback_lines(&self) -> ScrollbackLines {
+        match self {
+            Self::Local(shell) => shell.scrollback_lines,
+            Self::Ssh(ssh) => ssh.scrollback_lines,
+            Self::Demo | Self::Replay(_) => ScrollbackLines::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub source: Source,
@@ -422,6 +494,7 @@ impl Options {
                         user: user.into(),
                         port: 22,
                         terminal_type: TerminalType::default(),
+                        scrollback_lines: ScrollbackLines::default(),
                         authentication: Authentication::Agent,
                         host_key: None,
                         proxy_jump: Vec::new(),

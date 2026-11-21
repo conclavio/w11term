@@ -2,18 +2,59 @@ use super::*;
 use std::path::Path;
 use w11term::profiles::LocalProfileSnapshot;
 
-#[derive(Default)]
 pub(super) struct Draft {
     original: Option<LocalProfileSnapshot>,
     name: String,
     executable: String,
     args: Vec<String>,
     cwd: String,
+    scrollback_lines: String,
     powershell_integration: bool,
     error: String,
 }
 
+impl Default for Draft {
+    fn default() -> Self {
+        Self {
+            original: None,
+            name: String::new(),
+            executable: String::new(),
+            args: Vec::new(),
+            cwd: String::new(),
+            scrollback_lines: ScrollbackLines::default().to_string(),
+            powershell_integration: false,
+            error: String::new(),
+        }
+    }
+}
+
 impl Draft {
+    fn from_options(name: String, options: &LocalOptions) -> Self {
+        Self {
+            name,
+            executable: options.executable.display().to_string(),
+            cwd: options
+                .cwd
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            args: options.args.clone(),
+            scrollback_lines: options.scrollback_lines.to_string(),
+            powershell_integration: options.powershell_integration,
+            ..Self::default()
+        }
+    }
+
+    fn options(&self) -> anyhow::Result<LocalOptions> {
+        Ok(LocalOptions {
+            executable: self.executable.trim().into(),
+            args: self.args.clone(),
+            cwd: (!self.cwd.trim().is_empty()).then(|| self.cwd.trim().into()),
+            scrollback_lines: self.scrollback_lines.parse()?,
+            powershell_integration: self.powershell_integration && self.supports_integration(),
+        })
+    }
+
     fn supports_integration(&self) -> bool {
         LocalOptions::supports_powershell_integration(Path::new(self.executable.trim()), &self.args)
     }
@@ -24,6 +65,7 @@ pub enum Field {
     Name,
     Executable,
     Cwd,
+    ScrollbackLines,
     Argument(usize),
 }
 pub enum Action {
@@ -43,21 +85,12 @@ impl TerminalApp {
     ) {
         let id = match action {
             Action::Open(name) => {
-                let mut draft = Draft::default();
-                if let Some(name) = name {
+                let draft = if let Some(name) = name {
                     match self.store.inspect_local(&name) {
                         Ok(base) => {
-                            draft.name = name;
-                            draft.executable = base.options.executable.display().to_string();
-                            draft.cwd = base
-                                .options
-                                .cwd
-                                .as_ref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                            draft.args = base.options.args.clone();
-                            draft.powershell_integration = base.options.powershell_integration;
+                            let mut draft = Draft::from_options(name, &base.options);
                             draft.original = Some(base);
+                            draft
                         }
                         Err(error) => {
                             self.profile_error = Some(format!("{error:#}"));
@@ -65,7 +98,9 @@ impl TerminalApp {
                             return;
                         }
                     }
-                }
+                } else {
+                    Draft::default()
+                };
                 self.tabs.insert(AppTab {
                     label: "Local shell profile".into(),
                     page: Page::LocalProfile(draft),
@@ -92,6 +127,12 @@ impl TerminalApp {
                 Field::Name => draft.name = value,
                 Field::Executable => draft.executable = value,
                 Field::Cwd => draft.cwd = value,
+                Field::ScrollbackLines => {
+                    if draft.scrollback_lines != value {
+                        draft.scrollback_lines = value;
+                        draft.error.clear();
+                    }
+                }
                 Field::Argument(index) => {
                     if let Some(arg) = draft.args.get_mut(index) {
                         *arg = value;
@@ -106,16 +147,12 @@ impl TerminalApp {
                 }
             }
             Action::Save(_) => {
-                let shell = LocalOptions {
-                    executable: draft.executable.trim().into(),
-                    args: draft.args.clone(),
-                    cwd: (!draft.cwd.trim().is_empty()).then(|| draft.cwd.trim().into()),
-                    powershell_integration: draft.powershell_integration
-                        && draft.supports_integration(),
-                };
-                let result = self
-                    .store
-                    .save_local(draft.original.as_ref(), draft.name.trim(), &shell)
+                let result = draft
+                    .options()
+                    .and_then(|shell| {
+                        self.store
+                            .save_local(draft.original.as_ref(), draft.name.trim(), &shell)
+                    })
                     .and_then(|_| self.store.catalog());
                 match result {
                     Ok(catalog) => {
@@ -190,6 +227,12 @@ impl TerminalApp {
                 .text("Starting directory (optional)")
                 .into(),
             edit(Field::Cwd, "Starting directory", &draft.cwd).into(),
+            scrollback_editor(
+                &draft.scrollback_lines,
+                context.callback(move |value| {
+                    Message::LocalProfile(Action::Field(id, Field::ScrollbackLines, value))
+                }),
+            ),
             TextBlock::new().text("Arguments").into(),
         ];
         for (index, arg) in draft.args.iter().enumerate() {
@@ -253,5 +296,34 @@ impl TerminalApp {
                         .map(|(index, field)| KeyedView::new(index.to_string(), field)),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_scrollback_editor_preserves_limits_and_rejects_invalid_changes() {
+        let mut draft = Draft::default();
+        assert_eq!(draft.scrollback_lines, "10000");
+        assert_eq!(
+            draft.options().unwrap().scrollback_lines,
+            ScrollbackLines::default()
+        );
+        for limit in ["0", "32767"] {
+            draft.scrollback_lines = limit.into();
+            let saved = draft.options().unwrap();
+            let reopened = Draft::from_options("PowerShell".into(), &saved);
+            assert_eq!(reopened.scrollback_lines, limit);
+            assert_eq!(
+                reopened.options().unwrap().scrollback_lines,
+                saved.scrollback_lines
+            );
+        }
+        for invalid in ["", "-1", "2.5", "32768"] {
+            draft.scrollback_lines = invalid.into();
+            assert!(draft.options().is_err());
+        }
     }
 }

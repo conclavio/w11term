@@ -565,6 +565,7 @@ mod tests {
         SshOptions {
             host: host.into(),
             user: "tester".into(),
+            scrollback_lines: Default::default(),
             terminal_type: Default::default(),
             port: 22,
             authentication: Authentication::Agent,
@@ -791,6 +792,7 @@ mod tests {
             executable: "powershell.exe".into(),
             args: vec!["-NoProfile".into()],
             cwd: Some(dir.path().to_owned()),
+            scrollback_lines: "420".parse().unwrap(),
             powershell_integration: true,
         };
         let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
@@ -821,6 +823,7 @@ mod tests {
             shell: crate::options::LocalOptions {
                 executable: exe.into(),
                 cwd: Some(cwd.into()),
+                scrollback_lines: Default::default(),
                 powershell_integration: false,
                 args: Vec::new(),
             },

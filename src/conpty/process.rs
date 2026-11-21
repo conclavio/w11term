@@ -268,6 +268,7 @@ mod tests {
             executable: "pwsh.exe".into(),
             args: vec!["-nOlOgO".into()],
             cwd: None,
+            scrollback_lines: Default::default(),
             powershell_integration: true,
         };
         let line = |shell: &LocalOptions, exe: Option<&Path>| {

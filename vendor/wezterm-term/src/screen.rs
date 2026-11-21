@@ -15,7 +15,7 @@ use wezterm_surface::SequenceNo;
 #[derive(Debug, Clone)]
 pub struct Screen {
     /// Holds the line data that comprises the screen contents.
-    /// This is allocated with capacity for the entire scrollback.
+    /// The buffer starts at viewport height and grows as rows enter history.
     /// The last N lines are the visible lines, with those prior being
     /// the lines that have scrolled off the top of the screen.
     /// Index 0 is the topmost line of the screen/scrollback (depending
@@ -49,14 +49,6 @@ pub struct Screen {
     pub(crate) saved_cursor: Option<SavedCursor>,
 }
 
-fn scrollback_size(config: &Arc<dyn TerminalConfiguration>, allow_scrollback: bool) -> usize {
-    if allow_scrollback {
-        config.scrollback_size()
-    } else {
-        0
-    }
-}
-
 impl Screen {
     /// Create a new Screen with the specified dimensions.
     /// The Cells in the viewable portion of the screen are set to the
@@ -71,8 +63,7 @@ impl Screen {
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
-        let mut lines =
-            VecDeque::with_capacity(physical_rows + scrollback_size(config, allow_scrollback));
+        let mut lines = VecDeque::with_capacity(physical_rows);
         for _ in 0..physical_rows {
             let mut line = Line::new(seqno);
             bidi_mode.apply_to_line(&mut line, seqno);
@@ -157,7 +148,11 @@ impl Screen {
     }
 
     fn scrollback_size(&self) -> usize {
-        scrollback_size(&self.config, self.allow_scrollback)
+        if self.allow_scrollback {
+            self.config.scrollback_size()
+        } else {
+            0
+        }
     }
 
     fn rewrap_lines(
@@ -169,6 +164,8 @@ impl Screen {
         seqno: SequenceNo,
     ) -> (usize, PhysRowIndex) {
         let mut rewrapped = VecDeque::new();
+        let capacity = physical_rows + self.scrollback_size();
+        let mut discarded = 0;
         let mut logical_line: Option<Line> = None;
         let mut logical_cursor_x: Option<usize> = None;
         let marker = self
@@ -177,6 +174,7 @@ impl Screen {
         let mut logical_marker = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
+        let num_rows = self.lines.len();
         for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
@@ -206,7 +204,7 @@ impl Screen {
                 }
             };
 
-            if was_wrapped {
+            if was_wrapped && phys_idx + 1 < num_rows {
                 logical_line.replace(line);
                 continue;
             }
@@ -214,7 +212,7 @@ impl Screen {
             if let Some(x) = logical_cursor_x.take() {
                 let num_lines = x / physical_cols;
                 let last_x = x - (num_lines * physical_cols);
-                adjusted_cursor = (last_x, rewrapped.len() + num_lines);
+                adjusted_cursor = (last_x, discarded + rewrapped.len() + num_lines);
 
                 // Special case: if the cursor lands in column zero, we'll
                 // lose track of its logical association with the wrapped
@@ -251,27 +249,35 @@ impl Screen {
                 for row in first_rewrapped..rewrapped.len() {
                     let width = rewrapped[row].len();
                     if col < width || row + 1 == rewrapped.len() {
-                        self.command_start =
-                            Some(((self.stable_row_index_offset + row) as StableRowIndex, col));
+                        self.command_start = Some((
+                            (self.stable_row_index_offset + discarded + row) as StableRowIndex,
+                            col,
+                        ));
                         break;
                     }
                     col -= width;
                 }
             }
+
+            // resize has already pruned blank input rows below the cursor.
+            // On the final logical line, prefer dropping unused bottom rows
+            // over dropping history, while keeping the cursor's row.
+            if phys_idx + 1 == num_rows {
+                while rewrapped.len() > capacity
+                    && discarded + rewrapped.len() > adjusted_cursor.1 + 1
+                    && rewrapped.back().is_some_and(Line::is_whitespace)
+                {
+                    rewrapped.pop_back();
+                }
+            }
+            // Narrowing a screen full of independent log lines can generate
+            // many times its history limit. Release each excess prefix now.
+            let excess = rewrapped.len().saturating_sub(capacity);
+            rewrapped.drain(..excess);
+            discarded += excess;
         }
         self.lines = rewrapped;
-
-        // If we resized narrower and generated additional lines,
-        // we may need to scroll the lines to make room.  However,
-        // if the bottom line(s) are whitespace, we'll prune those
-        // out first in the rewrap case so that we don't lose any
-        // real information off the top of the scrollback
-        let capacity = physical_rows + self.scrollback_size();
-        while self.lines.len() > capacity
-            && self.lines.back().map(Line::is_whitespace).unwrap_or(false)
-        {
-            self.lines.pop_back();
-        }
+        self.stable_row_index_offset += discarded;
 
         adjusted_cursor
     }
@@ -309,6 +315,7 @@ impl Screen {
             }
         }
 
+        let old_origin = self.stable_row_index_offset;
         let (cursor_x, cursor_y) = if physical_cols != self.physical_cols {
             // Check to see if we need to rewrap lines that were
             // wrapped due to reaching the right hand side of the terminal.
@@ -335,12 +342,6 @@ impl Screen {
             (cursor.x, cursor_phys)
         };
 
-        let capacity = physical_rows + self.scrollback_size();
-        let current_capacity = self.lines.capacity();
-        if capacity > current_capacity {
-            self.lines.reserve(capacity - current_capacity);
-        }
-
         // If we resized wider and the rewrap resulted in fewer
         // lines than the viewport size, or we resized taller,
         // pad us back out to the viewport size
@@ -349,6 +350,9 @@ impl Screen {
             self.lines.push_back(Line::new(seqno));
         }
 
+        // cursor_y is measured from the pre-resize origin so ConPTY can
+        // preserve its viewport position even when reflow evicts old rows.
+        let rows_from_old_origin = self.lines.len() + (self.stable_row_index_offset - old_origin);
         let new_cursor_y;
 
         // true if a resize operation should consider rows that have
@@ -387,7 +391,7 @@ impl Screen {
             // moving up into the scrollback and damaging the output
             let required_num_rows_after_cursor =
                 physical_rows.saturating_sub(new_cursor_y as usize);
-            let actual_num_rows_after_cursor = self.lines.len().saturating_sub(cursor_y);
+            let actual_num_rows_after_cursor = rows_from_old_origin.saturating_sub(cursor_y);
             for _ in actual_num_rows_after_cursor..required_num_rows_after_cursor {
                 // FIXME: borrow bidi mode from line
                 self.lines.push_back(Line::new(seqno));
@@ -398,14 +402,25 @@ impl Screen {
             // (the rewrap adjusted physical row of the cursor).  This
             // computes its new VisibleRowIndex given the new viewport size.
             new_cursor_y = cursor_y as VisibleRowIndex
-                - (self.lines.len() as VisibleRowIndex - physical_rows as VisibleRowIndex);
+                - (rows_from_old_origin as VisibleRowIndex - physical_rows as VisibleRowIndex);
         }
 
+        // Reflow and height changes can create history without a scroll_up.
+        // Dropping from the front preserves the cursor relative to the viewport.
+        let capacity = physical_rows + self.scrollback_size();
+        let excess = self.lines.len().saturating_sub(capacity);
+        self.lines.drain(..excess);
+        self.stable_row_index_offset += excess;
+        // A tall viewport or a single long rewrapped line can leave a large
+        // allocation. Release storage beyond the deque's usual growth slack.
+        if self.lines.capacity() > capacity.saturating_mul(2) {
+            self.lines.shrink_to(capacity);
+        }
         self.physical_rows = physical_rows;
         self.physical_cols = physical_cols;
         CursorPosition {
             x: cursor_x,
-            y: new_cursor_y,
+            y: new_cursor_y.clamp(0, physical_rows as VisibleRowIndex - 1),
             shape: cursor.shape,
             visibility: cursor.visibility,
             seqno,

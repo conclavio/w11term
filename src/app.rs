@@ -17,7 +17,9 @@ use w11term::{
         Link, MultiLinePasteWarning, Point, Selection, TabSwitcherMode, link_at, safe_url,
         word_range,
     },
-    options::{Authentication, LocalOptions, Profiles, Source, SshOptions, TerminalType},
+    options::{
+        Authentication, LocalOptions, Profiles, ScrollbackLines, Source, SshOptions, TerminalType,
+    },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
@@ -361,6 +363,7 @@ struct ProfileDraft {
     host: String,
     user: String,
     port: String,
+    scrollback_lines: String,
     terminal_preset: usize,
     custom_terminal: String,
     identity: String,
@@ -385,6 +388,7 @@ impl Default for ProfileDraft {
             host: String::new(),
             user: String::new(),
             port: "22".into(),
+            scrollback_lines: ScrollbackLines::default().to_string(),
             terminal_preset: 0,
             custom_terminal: String::new(),
             identity: String::new(),
@@ -423,6 +427,7 @@ impl ProfileDraft {
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
+            scrollback_lines: options.scrollback_lines.to_string(),
             terminal_preset: match options.terminal_type.as_str() {
                 TerminalType::DEFAULT => 0,
                 TerminalType::SIXEL => 1,
@@ -437,6 +442,28 @@ impl ProfileDraft {
         }
     }
 }
+
+fn scrollback_editor(value: &str, on_change: Callback<String>) -> View {
+    let hint = TextBlock::new().text_wrapping(TextWrapping::Wrap);
+    let hint = match value.parse::<ScrollbackLines>() {
+        Ok(_) => hint.text(format!(
+            "Choose 0 to {} lines for new panes. Set 0 to disable scrollback.",
+            ScrollbackLines::MAX
+        )),
+        Err(error) => hint
+            .text(error.to_string())
+            .foreground(Color::rgb(255, 160, 150)),
+    };
+    StackPanel::new().spacing(5.0).children((
+        TextBlock::new().text("Scrollback lines"),
+        TextBox::new()
+            .automation_name("Scrollback lines")
+            .text(value)
+            .on_text_changed(on_change),
+        hint,
+    ))
+}
+
 fn command_menu_item(key: &str, label: &str, enabled: bool) -> MenuItem {
     if enabled {
         MenuItem::item(key, label)
@@ -553,6 +580,7 @@ pub enum Field {
     Host,
     User,
     Port,
+    ScrollbackLines,
     CustomTerminal,
     Identity,
     Fingerprint,
@@ -2405,6 +2433,7 @@ impl TerminalApp {
             let options = SshOptions {
                 host: host.into(),
                 terminal_type: draft.terminal_type()?,
+                scrollback_lines: draft.scrollback_lines.parse()?,
                 user: user.into(),
                 port: draft
                     .port
@@ -3026,6 +3055,10 @@ impl TerminalApp {
                 )),
             );
         }
+        fields.push(scrollback_editor(
+            &draft.scrollback_lines,
+            context.callback(move |v| Message::Edit(id, Field::ScrollbackLines, v)),
+        ));
         fields.push(
             StackPanel::new().spacing(5.0).children((
                 TextBlock::new().text("SSH terminal type (TERM)"),
@@ -3830,26 +3863,26 @@ impl Component for TerminalApp {
                             let result = (|| -> anyhow::Result<()> {
                                 let label =
                                     tab.profile_name.as_ref().context("profile was removed")?;
-                                let mut profile = self
+                                let cached = self
                                     .catalog
                                     .profiles
-                                    .get(label)
-                                    .context("profile was removed")?
-                                    .clone();
+                                    .get_mut(label)
+                                    .context("profile was removed")?;
                                 let auth = if remove {
                                     Authentication::Password
                                 } else {
                                     Authentication::Identity {
-                                        identity: profile
+                                        identity: cached
                                             .player
                                             .device_key
                                             .clone()
                                             .context("device key path missing")?,
                                     }
                                 };
-                                profile.authentication = auth.clone();
-                                self.store.update(label, &profile)?;
-                                self.catalog.profiles.insert(label.clone(), profile);
+                                let mut updated = cached.clone();
+                                updated.authentication = auth.clone();
+                                self.store.edit(label, label, &updated, cached)?;
+                                *cached = updated;
                                 auth_update = Some((label.clone(), auth));
                                 Ok(())
                             })();
@@ -3920,10 +3953,12 @@ impl Component for TerminalApp {
                         .clone()
                         .filter(|_| matches!(tab.source, Source::Ssh(_)))
                     {
-                        if let Some(profile) = self.catalog.profiles.get_mut(&name) {
-                            profile.player = preferences.clone();
-                            if let Err(error) = self.store.update(&name, profile) {
-                                log::warn!("Saving player preferences: {error:#}");
+                        if let Some(cached) = self.catalog.profiles.get_mut(&name) {
+                            let mut updated = cached.clone();
+                            updated.player = preferences.clone();
+                            match self.store.edit(&name, &name, &updated, cached) {
+                                Ok(()) => *cached = updated,
+                                Err(error) => log::warn!("Saving player preferences: {error:#}"),
                             }
                         }
                         for entry in self.tabs.entries() {
@@ -4921,6 +4956,7 @@ impl Component for TerminalApp {
                         Field::Host => &mut draft.host,
                         Field::User => &mut draft.user,
                         Field::Port => &mut draft.port,
+                        Field::ScrollbackLines => &mut draft.scrollback_lines,
                         Field::CustomTerminal => &mut draft.custom_terminal,
                         Field::Identity => &mut draft.identity,
                         Field::Fingerprint => &mut draft.fingerprint,
@@ -6146,6 +6182,7 @@ mod profile_ui_tests {
             let options = SshOptions {
                 host: "test.invalid".into(),
                 terminal_type: Default::default(),
+                scrollback_lines: "0".parse().unwrap(),
                 user: "pilot+character".into(),
                 port: 6792,
                 authentication,
@@ -6161,6 +6198,7 @@ mod profile_ui_tests {
             let draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
+            assert_eq!(draft.scrollback_lines, "0");
             assert_eq!(draft.fingerprint, "SHA256:test");
             assert!(draft.player.mute && draft.player.game_mode);
             assert_eq!(draft.name, "existing");

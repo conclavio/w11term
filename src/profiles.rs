@@ -161,6 +161,14 @@ impl ProfileStore {
                 );
             }
             fields.insert("args".into(), serde_json::to_value(&shell.args)?);
+            if shell.scrollback_lines.is_default() {
+                fields.remove("scrollback_lines");
+            } else {
+                fields.insert(
+                    "scrollback_lines".into(),
+                    serde_json::to_value(shell.scrollback_lines)?,
+                );
+            }
             if shell.powershell_integration {
                 fields.insert("powershell_integration".into(), true.into());
             } else {
@@ -335,6 +343,9 @@ impl ProfileStore {
             if options.terminal_type.is_default() {
                 object.remove("terminal_type");
             }
+            if options.scrollback_lines.is_default() {
+                object.remove("scrollback_lines");
+            }
             if !keep_route && options.proxy_jump.is_empty() {
                 object.remove("proxy_jump");
             }
@@ -460,6 +471,7 @@ mod tests {
         let store = ProfileStore::new(path.clone()).unwrap();
         let options = SshOptions {
             host: "new.test".into(),
+            scrollback_lines: Default::default(),
             terminal_type: Default::default(),
             user: "root".into(),
             port: 22,
@@ -513,6 +525,75 @@ mod order_tests {
 
     fn disk(store: &ProfileStore) -> Value {
         serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn scrollback_limits_round_trip_for_both_backends_and_can_return_to_default() {
+        let (_dir, store) = fixture();
+        for (limit, disk_value) in [(0, Some(0)), (32_767, Some(32_767)), (10_000, None)] {
+            let previous = store.inspect("Alpha").unwrap().1;
+            let mut ssh = previous.options.clone();
+            ssh.scrollback_lines = limit.try_into().unwrap();
+            store
+                .edit("Alpha", "Alpha", &ssh, &previous.options)
+                .unwrap();
+            let previous = store.inspect_local("Lima").unwrap();
+            let mut shell = previous.options.clone();
+            shell.scrollback_lines = ssh.scrollback_lines;
+            store.save_local(Some(&previous), "Lima", &shell).unwrap();
+
+            let catalog = store.catalog().unwrap();
+            let document = disk(&store);
+            for name in ["Alpha", "Lima"] {
+                assert_eq!(
+                    catalog.source(name).unwrap().scrollback_lines().get(),
+                    limit as usize
+                );
+                assert_eq!(
+                    document["profiles"][name]
+                        .get("scrollback_lines")
+                        .and_then(Value::as_u64),
+                    disk_value
+                );
+            }
+            assert_eq!(document["profiles"]["Alpha"]["extra"], 7);
+            assert_eq!(document["profiles"]["Lima"]["extra"], "local");
+        }
+    }
+
+    #[test]
+    fn malformed_scrollback_limits_report_the_profile() {
+        let (_dir, store) = fixture();
+        let original = disk(&store);
+        for name in ["Alpha", "Lima"] {
+            for invalid in [
+                json!(-1),
+                json!(32_768),
+                json!(0.5),
+                json!("20"),
+                Value::Null,
+            ] {
+                let mut config = original.clone();
+                config["profiles"][name]["scrollback_lines"] = invalid;
+                let bytes = serde_json::to_vec(&config).unwrap();
+                let error = crate::options::parse_profiles(&bytes, store.path()).unwrap_err();
+                assert!(error.to_string().contains(name));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_live_ssh_settings_cannot_restore_an_earlier_scrollback_limit() {
+        let (_dir, store) = fixture();
+        let before = store.inspect("Alpha").unwrap().1.options;
+        let mut edited = before.clone();
+        edited.scrollback_lines = 0.try_into().unwrap();
+        store.edit("Alpha", "Alpha", &edited, &before).unwrap();
+
+        let mut stale = before.clone();
+        stale.player.mute = true;
+        assert!(store.edit("Alpha", "Alpha", &stale, &before).is_err());
+        assert_eq!(store.inspect("Alpha").unwrap().1.options, edited);
     }
 
     #[test]
