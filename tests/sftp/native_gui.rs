@@ -6,9 +6,12 @@ use shared::run_gui;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "manages a verified profile's read-only folder consent with the native Windows folder picker"]
 async fn native_shared_folders_keep_consent_bound_to_the_verified_ssh_profile() {
-    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 3).await else {
+    let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 3).await else {
         unreachable!()
     };
+    // Launch two intentionally disconnects before closing. Its automatic retry
+    // must not take the third server connection reserved for the consent check.
+    ssh.player.reconnect = false;
     let state = tempfile::tempdir().unwrap();
     let selected = state.path().join("Selected folder");
     fs::create_dir(&selected).unwrap();

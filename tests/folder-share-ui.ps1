@@ -78,6 +78,10 @@ function Wait-FailedMount {
             if ($row.Current.Name.StartsWith('Mount failed')) { return $true }
         }
     }
+    foreach ($action in 'Open smoke-share in SFTP drawer', 'Copy Linux path for smoke-share') {
+        $control = Wait-Until "mounted folder shortcut '$action'" { Find-Element $action $button }
+        if ($control.Current.IsEnabled) { throw "A failed mount enabled '$action'" }
+    }
 }
 function Send-ToShell([string]$Text) {
     Click 'Back to terminal'

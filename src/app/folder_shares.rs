@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
-use w11term::ssh::{FolderMountStatus, valid_mount_name};
+use w11term::ssh::{FolderMountStatus, MountedFolder, valid_mount_name};
 
 pub(super) const LABEL: &str = "Shared folders…";
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -19,6 +19,7 @@ pub(super) struct Panel {
     rows: Vec<FolderRow>,
     feedback: String,
     pending: Option<u64>,
+    resolving: Option<u64>,
     draft: Option<(PathBuf, String)>,
 }
 
@@ -35,12 +36,19 @@ pub enum Edit {
     Save,
     Cancel,
     Row(RowAction, String, PathBuf),
+    Mounted(MountedAction, String, String),
+    Resolved(u64, MountedAction, String, Result<MountedFolder, String>),
 }
 #[derive(Clone, Copy)]
 pub enum RowAction {
     Mount,
     Unmount,
     Forget,
+}
+#[derive(Clone, Copy)]
+pub enum MountedAction {
+    Browse,
+    CopyPath,
 }
 
 fn message(token: u64, edit: Edit) -> Message {
@@ -78,6 +86,14 @@ fn status_text(status: &FolderMountStatus) -> String {
         FolderMountStatus::Stopped => "Unmounted".into(),
         FolderMountStatus::Failed(reason) => format!("Mount failed · {reason}"),
     }
+}
+
+fn still_mounted(rows: &[FolderRow], name: &str, expected: &MountedFolder) -> bool {
+    rows.iter().any(|row| {
+        row.name == name
+            && row.status == FolderMountStatus::Mounted
+            && row.mounted.as_ref() == Some(expected)
+    })
 }
 
 impl TerminalApp {
@@ -119,6 +135,7 @@ impl TerminalApp {
             }) = self.tabs.get_mut(previous)
         {
             panel.pending = None;
+            panel.resolving = None;
         }
         if let Some((id, page)) = active {
             let sender = ctx.sender();
@@ -158,6 +175,7 @@ impl TerminalApp {
             None => {
                 panel.rows.clear();
                 panel.pending = None;
+                panel.resolving = None;
                 panel.draft = None;
             }
         }
@@ -185,6 +203,7 @@ impl TerminalApp {
                 rows: vec![],
                 feedback: String::new(),
                 pending: None,
+                resolving: None,
                 draft: None,
             });
             if let Some(id) = existing {
@@ -239,6 +258,7 @@ impl TerminalApp {
                 };
                 let owner = hwnd.0 as usize;
                 let request = token();
+                panel.resolving = None;
                 panel.pending = Some(request);
                 panel.feedback.clear();
                 ctx.spawn_background_with_rejection(
@@ -295,6 +315,53 @@ impl TerminalApp {
             Edit::Row(action, name, path) => {
                 self.folder_row_action(&authority, action, &name, path)
             }
+            Edit::Mounted(action, name, generation) => {
+                if panel.resolving.is_some() || panel.pending.is_some() || panel.draft.is_some() {
+                    return;
+                }
+                match self.resolve_mounted_folder(&authority, &name, &generation) {
+                    Ok(resolve) => {
+                        let request = token();
+                        let rejected = message(
+                            origin,
+                            Edit::Resolved(
+                                request,
+                                action,
+                                name.clone(),
+                                Err("Could not check the mounted folder. Try again.".into()),
+                            ),
+                        );
+                        let Page::SharedFolders(panel) = &mut self.tabs.get_mut(id).unwrap().page
+                        else {
+                            return;
+                        };
+                        panel.resolving = Some(request);
+                        panel.feedback.clear();
+                        ctx.spawn_background_with_rejection(
+                            move |_| {
+                                message(
+                                    origin,
+                                    Edit::Resolved(
+                                        request,
+                                        action,
+                                        name,
+                                        resolve().map_err(|error| format!("{error:#}")),
+                                    ),
+                                )
+                            },
+                            rejected,
+                        );
+                        return;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Edit::Resolved(request, action, name, result) if panel.resolving == Some(request) => {
+                panel.resolving = None;
+                result.map_err(anyhow::Error::msg).and_then(|mounted| {
+                    self.mounted_folder_action(&authority, action, &name, mounted, ctx)
+                })
+            }
             _ => return,
         };
         let Page::SharedFolders(panel) = &mut self.tabs.get_mut(id).unwrap().page else {
@@ -336,6 +403,33 @@ impl TerminalApp {
         }
     }
 
+    fn mounted_folder_action(
+        &mut self,
+        authority: &Authority,
+        action: MountedAction,
+        name: &str,
+        mounted: MountedFolder,
+        ctx: &ComponentContext<Self>,
+    ) -> anyhow::Result<String> {
+        // The disk check was asynchronous. The source pane or this exact
+        // lease could have ended or been replaced while the result was queued.
+        anyhow::ensure!(
+            still_mounted(&self.folder_rows(authority)?, name, &mounted),
+            "The folder mount changed. Reopen its action from the current list."
+        );
+        match action {
+            MountedAction::Browse => {
+                self.browse_mounted_share(authority, &mounted.path, ctx)?;
+                Ok(format!("Opened {name} in the SFTP drawer."))
+            }
+            MountedAction::CopyPath => {
+                w11term::clipboard::write(&mounted.path)
+                    .context("Could not copy the Linux path")?;
+                Ok(format!("Copied the Linux path for {name}."))
+            }
+        }
+    }
+
     pub(super) fn folder_panel_view(&self, panel: &Panel, ctx: &ViewContext<Self>) -> View {
         let origin = panel.token;
         let a = &panel.authority;
@@ -369,6 +463,27 @@ impl TerminalApp {
                 items.push(KeyedView::new("empty", TextBlock::new().text("Choose a Windows folder to mount under ~/windows/ on this SSH account.").text_wrapping(TextWrapping::Wrap)));
             }
             for row in &panel.rows {
+                let mounted_button = |action, label, accessible: String| {
+                    let name = row.name.clone();
+                    let generation = row.mounted.as_ref().map(|mount| mount.generation.clone());
+                    Button::new()
+                        .automation_name(accessible)
+                        .is_enabled(
+                            generation.is_some()
+                                && row.status == FolderMountStatus::Mounted
+                                && panel.resolving.is_none()
+                                && panel.pending.is_none()
+                                && panel.draft.is_none(),
+                        )
+                        .on_click(ctx.callback(move |_| match &generation {
+                            Some(generation) => message(
+                                origin,
+                                Edit::Mounted(action, name.clone(), generation.clone()),
+                            ),
+                            None => Message::ControlIdle,
+                        }))
+                        .content(label)
+                };
                 let row_button = |action, text, enabled| {
                     let name = row.name.clone();
                     let path = row.path.clone();
@@ -393,7 +508,10 @@ impl TerminalApp {
                         .content(
                             StackPanel::new().spacing(4.0).children((
                                 TextBlock::new()
-                                    .text(format!("~/windows/{}", row.name))
+                                    .text(row.mounted.as_ref().map_or_else(
+                                        || format!("~/windows/{}", row.name),
+                                        |mount| mount.path.clone(),
+                                    ))
                                     .font_size(17.0),
                                 TextBlock::new()
                                     .text(row.path.display().to_string())
@@ -418,6 +536,21 @@ impl TerminalApp {
                                             )
                                         },
                                         row_button(RowAction::Forget, "Forget", true),
+                                    )),
+                                StackPanel::new()
+                                    .orientation(Orientation::Horizontal)
+                                    .spacing(8.0)
+                                    .children((
+                                        mounted_button(
+                                            MountedAction::Browse,
+                                            "Open in SFTP drawer",
+                                            format!("Open {} in SFTP drawer", row.name),
+                                        ),
+                                        mounted_button(
+                                            MountedAction::CopyPath,
+                                            "Copy Linux path",
+                                            format!("Copy Linux path for {}", row.name),
+                                        ),
                                     )),
                             )),
                         ),
@@ -468,6 +601,29 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_queued_mount_action_requires_the_original_live_mount() {
+        let original = MountedFolder {
+            generation: "first".into(),
+            path: "/srv/pilot 雪/windows/docs".into(),
+        };
+        let mut rows = vec![FolderRow {
+            name: "docs".into(),
+            path: r"C:\selected".into(),
+            status: FolderMountStatus::Mounted,
+            mounted: Some(original.clone()),
+        }];
+        assert!(still_mounted(&rows, "docs", &original));
+        assert!(!still_mounted(&rows, "other", &original));
+        rows[0].status = FolderMountStatus::Unmounting;
+        assert!(!still_mounted(&rows, "docs", &original));
+        rows[0].status = FolderMountStatus::Mounted;
+        rows[0].mounted.as_mut().unwrap().generation = "remounted".into();
+        assert!(!still_mounted(&rows, "docs", &original));
+        rows[0].mounted = None;
+        assert!(!still_mounted(&rows, "docs", &original));
+    }
 
     #[test]
     fn folder_picker_suggests_an_editable_valid_name_for_unicode_and_long_paths() {

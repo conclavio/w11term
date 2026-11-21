@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 pub(super) use w11term::folder_grants::{Authority, FolderRow};
 use w11term::folder_grants::{FolderScope, PaneShares};
+use w11term::ssh::MountedFolder;
 
 impl TerminalApp {
     /// Keep permissions attached to the live pane across moves and hidden tabs.
@@ -51,6 +52,16 @@ impl TerminalApp {
     }
     pub(super) fn folder_rows(&self, auth: &Authority) -> Result<Vec<FolderRow>> {
         self.folders_for(auth)?.rows(auth)
+    }
+    pub(super) fn resolve_mounted_folder(
+        &self,
+        auth: &Authority,
+        name: &str,
+        generation: &str,
+    ) -> Result<impl FnOnce() -> Result<MountedFolder> + Send + 'static + use<>> {
+        Ok(self
+            .folders_for(auth)?
+            .resolve_mounted(auth, name, generation))
     }
     pub(super) fn folder_add(&self, auth: &Authority, name: &str, path: PathBuf) -> Result<()> {
         self.folders_for(auth)?.add(auth, name, path)
