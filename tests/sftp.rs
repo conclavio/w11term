@@ -509,6 +509,9 @@ async fn fixture(
 }
 
 #[cfg(feature = "ui-smoke")]
+#[path = "sftp/keypad.rs"]
+mod keypad;
+#[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
 #[cfg(feature = "ui-smoke")]
