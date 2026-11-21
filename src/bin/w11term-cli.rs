@@ -24,7 +24,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
                 .with_context(|| format!("{arg} requires a value"))
         };
         match arg.as_str() {
-            "wait-for-text" | "events" | "open" | "resize" | "record" if verb.is_none() => {
+            "wait-for-text" | "events" | "open" | "resize" | "record" | "save-text"
+                if verb.is_none() =>
+            {
                 ensure!(
                     payload.is_none() && path.is_none() && !no_paste,
                     "invalid options before automation command"

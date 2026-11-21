@@ -248,51 +248,6 @@ fn dialog_filename(remote: &str) -> &str {
     }
 }
 
-fn pick_local(owner: usize, remote: Option<&str>) -> Result<Option<PathBuf>> {
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
-    use windows::{
-        Win32::{
-            Foundation::{ERROR_CANCELLED, HWND},
-            System::Com::*,
-            UI::Shell::*,
-        },
-        core::{HRESULT, PCWSTR},
-    };
-    // A fresh STA owns the native modal dialog, independently of the Reactor UI thread.
-    unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-        struct Apartment;
-        impl Drop for Apartment {
-            fn drop(&mut self) {
-                unsafe { CoUninitialize() };
-            }
-        }
-        let _apartment = Apartment;
-        let clsid = if remote.is_some() {
-            FileSaveDialog
-        } else {
-            FileOpenDialog
-        };
-        let dialog: IFileDialog = CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)?;
-        dialog.SetOptions(dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR)?;
-        if let Some(remote) = remote {
-            let suggested: Vec<u16> = dialog_filename(remote)
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
-        }
-        match dialog.Show(Some(HWND(owner as *mut _))) {
-            Err(e) if e.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => return Ok(None),
-            result => result?,
-        }
-        let wide = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
-        let path = OsString::from_wide(wide.as_wide());
-        CoTaskMemFree(Some(wide.0.cast()));
-        Ok(Some(path.into()))
-    }
-}
-
 impl FileDrawer {
     pub(super) fn editing_folder(&self) -> bool {
         self.editor.is_some()
@@ -1156,15 +1111,14 @@ impl TerminalApp {
                     ));
                     context.spawn_background_with_rejection(
                         move |_| {
-                            let suggestion = remote.clone();
-                            let result = std::thread::Builder::new()
-                                .name("SFTP file picker".into())
-                                .spawn(move || pick_local(owner, suggestion.as_deref()))
-                                .map_err(|e| e.to_string())
-                                .and_then(|handle| {
-                                    handle.join().map_err(|_| "File picker stopped".to_owned())
-                                })
-                                .and_then(|result| result.map_err(|e| format!("{e:#}")));
+                            let purpose = remote
+                                .as_deref()
+                                .map_or(file_picker::Purpose::Open, |name| {
+                                    file_picker::Purpose::Save(dialog_filename(name).to_owned())
+                                });
+                            let result = file_picker::pick(owner, purpose)
+                                .map(|selection| selection.map(|file| file.path))
+                                .map_err(|error| format!("{error:#}"));
                             Message::Files(Picked(pane, generation, remote, result))
                         },
                         reject,

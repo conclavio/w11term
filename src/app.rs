@@ -34,6 +34,7 @@ mod attention;
 mod command_history;
 mod config_import;
 mod file_drawer;
+mod file_picker;
 mod keyboard_settings;
 mod local_profile;
 mod pattern_settings;
@@ -51,6 +52,7 @@ mod keyboard_hints;
 mod local_smoke;
 mod pane_picker;
 mod pane_view;
+mod scrollback_export;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
@@ -516,6 +518,11 @@ enum UiWork {
     AttentionChanged,
 }
 
+struct CaretMenuBinding {
+    pane: Option<u64>,
+    on_click: Callback<String>,
+}
+
 pub struct TerminalApp {
     taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
@@ -536,6 +543,7 @@ pub struct TerminalApp {
     window_timer: Option<crate::ui_timer::RetryTimer>,
     native_bound: bool,
     window_error: Option<String>,
+    export: scrollback_export::Export,
     registry: Registry,
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiWork>>>,
     control_task: Option<ComponentTask>,
@@ -543,6 +551,7 @@ pub struct TerminalApp {
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
+    caret_menu_binding: RefCell<Option<CaretMenuBinding>>,
     frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
@@ -573,6 +582,7 @@ pub struct TerminalApp {
 }
 
 pub enum Message {
+    Export(scrollback_export::Action),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
@@ -2362,6 +2372,30 @@ impl TerminalApp {
         }
     }
 
+    fn caret_menu_callback(&self, context: &ViewContext<Self>) -> Callback<String> {
+        let pane = self.tabs.active().and_then(AppTab::pane_id);
+        let mut cached = self.caret_menu_binding.borrow_mut();
+        if let Some(binding) = cached.as_ref()
+            && binding.pane == pane
+        {
+            return binding.on_click.clone();
+        }
+        // Reactor replaces a flyout when its callback changes. Keep the same
+        // callback while repainting the title bar for the same action target.
+        let on_click = context.callback(move |label| {
+            if label == scrollback_export::LABEL {
+                Message::Export(scrollback_export::Action::Start(pane))
+            } else {
+                tab_menu_message(label)
+            }
+        });
+        *cached = Some(CaretMenuBinding {
+            pane,
+            on_click: on_click.clone(),
+        });
+        on_click
+    }
+
     fn header_view(&self, context: &ViewContext<Self>) -> View {
         let mut progress = BTreeMap::new();
         for entry in self.tabs.entries() {
@@ -2437,7 +2471,7 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
                 self.caret_items(),
-                context.callback(tab_menu_message),
+                self.caret_menu_callback(context),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2647,6 +2681,11 @@ impl TerminalApp {
                 None => MenuItem::item("copy-last-output", "Copy last command output"),
             });
             items.push(MenuItem::item("command-history", "Command history"));
+            items.push(command_menu_item(
+                "save-scrollback",
+                scrollback_export::LABEL,
+                self.export.pending.is_none(),
+            ));
             items.push(match live.session.events.command_watch() {
                 Some(true) => MenuItem::item("command-watch", "Cancel command notification"),
                 Some(false) => MenuItem::item("command-watch", "Notify when command finishes"),
@@ -3215,6 +3254,7 @@ impl Component for TerminalApp {
             window_timer: None,
             native_bound: false,
             window_error: None,
+            export: Default::default(),
             registry,
             control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
             control_task: None,
@@ -3222,6 +3262,7 @@ impl Component for TerminalApp {
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
+            caret_menu_binding: RefCell::new(None),
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
             inspection: None,
@@ -3350,6 +3391,10 @@ impl Component for TerminalApp {
             other => other,
         };
         match message {
+            Message::Export(action) => {
+                self.export_scrollback(action, context);
+                self.refresh_open_commands();
+            }
             Message::DismissWindowError => self.window_error = None,
             Message::MoveTabToWindow => self.move_tab_window(context),
             Message::WindowTick => self.window_tick(context),
@@ -4767,6 +4812,20 @@ impl Component for TerminalApp {
                     .grid_row(1)
                     .vertical_alignment(VerticalAlignment::Top)
                     .on_click(context.callback(|_| Message::DismissWindowError))
+                    .content(format!("{message}  ·  Dismiss")),
+            ));
+        }
+        if let Some(message) = &self.export.status {
+            views.push(KeyedView::new(
+                "scrollback-export-status",
+                Button::new()
+                    .grid_row(1)
+                    .automation_name(message)
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .on_click(
+                        context.callback(|_| Message::Export(scrollback_export::Action::Dismiss)),
+                    )
                     .content(format!("{message}  ·  Dismiss")),
             ));
         }

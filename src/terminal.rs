@@ -11,7 +11,9 @@ use wezterm_term::{
     CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
 };
 
+mod export;
 mod keypad;
+pub(crate) use export::export_text;
 pub use keypad::KeypadKey;
 
 pub type Rgba = [f32; 4];

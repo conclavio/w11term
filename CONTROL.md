@@ -40,6 +40,7 @@ $screen = & $ctl --pid 12345 get-text --pane $pane | ConvertFrom-Json
 if ($screen.result.text -notmatch 'fps=') { throw 'HUD missing' }
 
 & $ctl --pid 12345 screenshot --pane $pane .\frame.png
+& $ctl --pid 12345 save-text --pane $pane .\shell-transcript.txt
 ```
 
 `send-text` requires `--no-paste`. It sends the supplied bytes directly to the SSH channel, with no bracketed-paste delimiters, key encoding, UTF-8 normalization, or escape expansion. `--base64`, `--file`, and `--stdin` accept arbitrary bytes including NUL and invalid UTF-8; the limit is 1 MiB per command. A successful reply acknowledges the write to the SSH channel or local ConPTY input pipe. The receiving program may still be processing it. Use `wait-for-text` to wait for output. A write timeout means delivery is unknown; retrying could duplicate input. Demo/replay panes reject raw input. Reconnecting panes reject raw writes and SFTP work rather than queuing them for a later connection.
@@ -47,6 +48,15 @@ if ($screen.result.text -notmatch 'fps=') { throw 'HUD missing' }
 `get-text` returns the current live screen, including alternate-screen TUI content. It excludes scrollback, trims trailing ASCII spaces on each row, and preserves the row count as `lines`. `text` joins those lines with LF. Graphics are not OCRed. Both text and screenshots include a snapshot generation to help correlate results. Reading does not change the user's scrollback position.
 
 `screenshot` renders an immutable snapshot with the same DirectWrite/Direct2D code used by the window, including the selected font, ligature preference, and kitty/sixel images. It exports only the terminal grid, at the pane's last negotiated DPI; title bar, padding, and status bar are excluded. It works for background tabs and covered/minimized windows without selecting a tab or touching focus. Existing destination files are replaced atomically after PNG encoding succeeds. The parent directory must already exist. Captures above 16 megapixels are rejected. Current renderer limitations (including first-frame-only animated images) also apply to PNGs.
+
+`save-text` exports the addressed pane’s retained screen and history as UTF-8
+plain text with CRLF line endings. It joins soft wraps. While the alternate
+screen is active it exports that screen’s rows. The reply contains `pane`,
+`path`, and the number of UTF-8 `bytes` written. The CLI resolves the path from
+its working directory and requires `--overwrite` to replace an existing file.
+The parent directory must exist. The file is published atomically after capture.
+Exports over 32 MiB and captures during a pending synchronized update return
+an error. A retry after the update captures the newly committed text.
 
 ## Pipe protocol, version 1
 
@@ -64,6 +74,7 @@ Open a new pipe connection for each command. Write one UTF-8 JSON object followe
 {"verb":"list"}
 {"verb":"send-text","pane":1,"no_paste":true,"data_base64":"Qk9BUkQN"}
 {"verb":"get-text","pane":1}
+{"verb":"save-text","pane":1,"path":"C:\\tests\\shell-transcript.txt","overwrite":false}
 {"verb":"screenshot","pane":1,"path":"C:\\tests\\frame.png"}
 ```
 
