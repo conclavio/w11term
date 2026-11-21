@@ -1,7 +1,10 @@
 use crate::native_drawing::{GpuImage, NativeDrawing, Typography};
 use std::collections::{HashMap, HashSet};
 use w11term::terminal::{Snapshot, colors, rgba};
-use wezterm_term::{Intensity, Underline, image::ImageDataType};
+use wezterm_term::{
+    Intensity, Underline,
+    image::{ImageCell, ImageDataType},
+};
 use windows_canvas::{
     Brush, ColorF, DrawContext, DrawingSession, Rect, TextFormat, TextLayout, Vector2, WordWrapping,
 };
@@ -550,13 +553,14 @@ impl Renderer {
         // Keep GPU ownership tied to the current visible model. Replacing an id,
         // deleting a placement, changing tabs, or scrolling releases obsolete textures.
         let mut live = HashSet::new();
-        for line in frame.rows.iter().take(self.metrics.rows) {
+        let mut tiles = Vec::new();
+        for (row, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             for cell in line
                 .visible_cells()
                 .take_while(|c| c.cell_index() < self.metrics.cols)
             {
                 if let Some(images) = cell.attrs().images() {
-                    for tile in images.iter() {
+                    for tile in images {
                         let data = tile.image_data();
                         let guard = frame.image_data(data);
                         live.insert(match guard {
@@ -566,6 +570,7 @@ impl Renderer {
                             }
                             _ => data.hash(),
                         });
+                        tiles.push((row, cell.cell_index(), tile));
                     }
                 }
             }
@@ -583,7 +588,12 @@ impl Renderer {
         ctx.clear(color(background));
         let brush = ctx.create_solid_brush(ColorF::WHITE)?;
 
-        // Cell backgrounds, then image/text layers in protocol z order.
+        // Kitty places extremely negative images below explicit cell backgrounds.
+        // Higher image IDs win an equal-z overlap, regardless of arrival order.
+        tiles.sort_by_key(|(_, _, tile)| (tile.z_index(), tile.image_id()));
+        let under_background = tiles.partition_point(|(_, _, tile)| tile.z_index() < i32::MIN / 2);
+        let under_text = tiles.partition_point(|(_, _, tile)| tile.z_index() < 0);
+        self.draw_images(&native, frame, &tiles[..under_background])?;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
             for cell in line
@@ -592,7 +602,11 @@ impl Renderer {
                 .filter(|cell| map.visual(cell.cell_index()) < self.metrics.cols)
             {
                 let (_, bg) = colors(cell.attrs(), &frame.palette);
-                if bg != background {
+                if bg != background
+                    || (under_background != 0
+                        && (cell.attrs().background() != Default::default()
+                            || cell.attrs().reverse()))
+                {
                     brush.set_color(color(bg));
                     ctx.fill_rect(
                         &Rect::from_xywh(
@@ -606,7 +620,7 @@ impl Renderer {
                 }
             }
         }
-        self.draw_images(&native, frame, true)?;
+        self.draw_images(&native, frame, &tiles[under_background..under_text])?;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
             let cells: Vec<_> = line
@@ -700,7 +714,7 @@ impl Renderer {
                 }
             }
         }
-        self.draw_images(&native, frame, false)?;
+        self.draw_images(&native, frame, &tiles[under_text..])?;
         let (row, col, visible) = self.copy_cursor.map_or_else(
             || {
                 (
@@ -786,29 +800,9 @@ impl Renderer {
         &mut self,
         native: &NativeDrawing,
         frame: &Snapshot,
-        below_text: bool,
+        tiles: &[(usize, usize, ImageCell)],
     ) -> windows_canvas::Result<()> {
-        let mut tiles = Vec::new();
-        for (row, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
-            for cell in line
-                .visible_cells()
-                .take_while(|c| c.cell_index() < self.metrics.cols)
-            {
-                let Some(images) = cell.attrs().images() else {
-                    continue;
-                };
-                for tile in images
-                    .iter()
-                    .filter(|tile| (tile.z_index() < 0) == below_text)
-                {
-                    tiles.push((row, cell.cell_index(), tile.clone()));
-                }
-            }
-        }
-        // Sort all placements in each layer, including overlapping placements
-        // anchored in different cells. Stable ties preserve model order.
-        tiles.sort_by_key(|(_, _, tile)| tile.z_index());
-        for (row, column, tile) in tiles {
+        for &(row, column, ref tile) in tiles {
             let data = tile.image_data();
             let guard = frame.image_data(data);
             let key = match guard {
@@ -1454,6 +1448,45 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_explicit_default_rgb_covers_a_below_background_image() {
+        let size = wezterm_term::TerminalSize {
+            cols: 3,
+            rows: 2,
+            pixel_width: 30,
+            pixel_height: 40,
+            dpi: 96,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x1b\\",
+            "\x1b[1;2H\x1b[48;2;0;0;0m \x1b[49m",
+            "\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;/wAA/w==\x1b\\",
+            "\x1b[1;1H\x1b_Ga=p,i=1,p=1,z=-2147483648,c=1,r=1,C=1,q=2\x1b\\",
+            "\x1b[1;2H\x1b_Ga=p,i=1,p=2,z=-2147483648,c=1,r=1,C=1,q=2\x1b\\",
+        ));
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert_eq!(rgba(frame.palette.background), [0.0, 0.0, 0.0, 1.0]);
+        let covered = frame.rows[0].get_cell(1).unwrap();
+        assert!(
+            covered
+                .attrs()
+                .images()
+                .unwrap()
+                .iter()
+                .any(|tile| tile.image_id() == Some(1) && tile.z_index() == i32::MIN)
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("explicit-background.png");
+        screenshot(&frame, size, &path).unwrap();
+        let actual = image::open(path).unwrap().into_rgb8();
+        let y = actual.height() / 4;
+        let cell = |col: u32| actual.get_pixel((2 * col + 1) * actual.width() / 6, y).0;
+        assert_eq!(cell(0), [255, 0, 0], "default background shows the image");
+        assert_eq!(cell(1), [0, 0, 0], "explicit RGB paints over the image");
+    }
+
+    #[test]
     fn offscreen_kitty_reference_cell_centers() {
         #[derive(serde::Deserialize)]
         struct Sample {
@@ -1472,6 +1505,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut terminal = w11term::terminal::create(size, tx);
         terminal.advance_bytes(include_bytes!("../tests/fixtures/kitty/placements.vt"));
+        terminal.advance_bytes(include_bytes!("../tests/fixtures/kitty/layers.vt"));
         let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("w11term.png");

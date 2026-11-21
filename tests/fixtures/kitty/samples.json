@@ -3,5 +3,13 @@
   {"column": 2, "row": 2, "rgb": [255, 0, 0]},
   {"column": 3, "row": 2, "rgb": [0, 255, 0]},
   {"column": 5, "row": 3, "rgb": [0, 0, 255]},
-  {"column": 2, "row": 4, "rgb": [255, 255, 0]}
+  {"column": 2, "row": 4, "rgb": [255, 255, 0]},
+  {"column": 1, "row": 6, "rgb": [255, 0, 0]},
+  {"column": 2, "row": 6, "rgb": [0, 0, 255]},
+  {"column": 3, "row": 6, "rgb": [255, 0, 0]},
+  {"column": 4, "row": 6, "rgb": [255, 0, 0]},
+  {"column": 5, "row": 6, "rgb": [0, 0, 255]},
+  {"column": 6, "row": 6, "rgb": [255, 0, 0]},
+  {"column": 7, "row": 6, "rgb": [0, 255, 0]},
+  {"column": 8, "row": 6, "rgb": [255, 0, 0]}
 ]

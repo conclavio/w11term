@@ -19,6 +19,7 @@ def display(ready):
     import termios
 
     sys.stdout.buffer.write((FIXTURE / "placements.vt").read_bytes())
+    sys.stdout.buffer.write((FIXTURE / "layers.vt").read_bytes())
     sys.stdout.buffer.flush()
     # GTK can resize the PTY after launching this command. Publish measured
     # geometry atomically so a capture never reads a partial or stale startup grid.
