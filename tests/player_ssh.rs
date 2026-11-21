@@ -270,12 +270,25 @@ fn key() -> PrivateKey {
 }
 
 async fn enter_password(session: &Session) {
-    let question = prompt(&session.prompts).await;
-    assert!(matches!(question.question, Question::Authentication { .. }));
+    // The session worker consumes prompt notifications and publishes the prompt
+    // for the UI. A second waiter on that notification can steal its wake-up.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let id = loop {
+        let frame = session.frames.load();
+        if let Some(question) = &frame.prompt {
+            assert!(matches!(question.question, Question::Authentication { .. }));
+            break question.id;
+        }
+        assert!(
+            session.frames.changed(frame.generation, deadline).await,
+            "password prompt did not reach the pane, status was {:?}",
+            frame.status
+        );
+    };
     session
         .prompts
         .answer(
-            question.id,
+            id,
             Answer::Authentication(vec![zeroize::Zeroizing::new("secret".into())]),
         )
         .unwrap();
