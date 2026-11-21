@@ -63,11 +63,36 @@ impl TerminalApp {
             .folders_for(auth)?
             .resolve_mounted(auth, name, generation))
     }
-    pub(super) fn folder_add(&self, auth: &Authority, name: &str, path: PathBuf) -> Result<()> {
-        self.folders_for(auth)?.add(auth, name, path)
+    pub(super) fn folder_add(
+        &self,
+        auth: &Authority,
+        name: &str,
+        path: PathBuf,
+        auto_mount: bool,
+        writable: bool,
+    ) -> Result<()> {
+        self.folders_for(auth)?
+            .add_with_access(auth, name, path, auto_mount, writable)
     }
-    pub(super) fn folder_mount(&self, auth: &Authority, name: &str) -> Result<()> {
-        self.folders_for(auth)?.mount(auth, name)
+    pub(super) fn folder_auto_mount(
+        &self,
+        auth: &Authority,
+        name: &str,
+        grant_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        self.folders_for(auth)?
+            .set_auto_mount(auth, name, grant_id, enabled)
+    }
+    pub(super) fn folder_mount(
+        &self,
+        auth: &Authority,
+        name: &str,
+        grant_id: &str,
+        writable: bool,
+    ) -> Result<()> {
+        self.folders_for(auth)?
+            .mount_selected(auth, name, grant_id, writable)
     }
     pub(super) fn folder_unmount(&self, auth: &Authority, name: &str) -> Result<()> {
         self.folders_for(auth)?.unmount(auth, name)

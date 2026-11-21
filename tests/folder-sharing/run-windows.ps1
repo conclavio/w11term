@@ -120,14 +120,16 @@ try {
     $port = $listeners[0].LocalPort
     Confirm-SshBanner $port
     Write-Host "Guest SSH is ready on 127.0.0.1:$port"
-    $case = if ($LegacyFuse) { 'old_fusermount_refuses_before_export' } else { 'native_windows_passive_sshfs' }
-    $output = Invoke-FixtureProcess $test @('--ignored','--exact',"ssh::folder_mount_fixture::$case",'--nocapture') 180000 @{
-        W11TERM_MOUNT_TEST_PORT = [string]$port
-        W11TERM_MOUNT_TEST_IDENTITY = $identity
-        W11TERM_MOUNT_TEST_HOST_KEY = $hostKey
-    }
-    if ($output -cnotmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
-        throw 'The ignored native mount test did not report exactly one pass'
+    $cases = if ($LegacyFuse) { 'old_fusermount_refuses_before_export' } else { 'native_windows_passive_sshfs','native_windows_writable_sshfs' }
+    foreach ($case in $cases) {
+        $output = Invoke-FixtureProcess $test @('--ignored','--exact',"ssh::folder_mount_fixture::$case",'--nocapture') 180000 @{
+            W11TERM_MOUNT_TEST_PORT = [string]$port
+            W11TERM_MOUNT_TEST_IDENTITY = $identity
+            W11TERM_MOUNT_TEST_HOST_KEY = $hostKey
+        }
+        if ($output -cnotmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
+            throw "$case did not report exactly one pass"
+        }
     }
     if ($GuiExecutable) {
         $gui = (Get-Item -LiteralPath $GuiExecutable).FullName

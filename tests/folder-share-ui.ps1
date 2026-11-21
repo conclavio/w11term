@@ -14,7 +14,8 @@ $selectedDir = Join-Path $State $leaf
 $canonicalDir = [FixtureDialog]::DirectoryPath($selectedDir)
 $profiles = Join-Path $State 'profiles.json'
 $savedProfile = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'
-$identityLabel = 'palette-ssh ' + [char]0xb7 + " $($savedProfile.user)@$($savedProfile.host):$($savedProfile.port) " + [char]0xb7 + ' Read-only'
+$account = "$($savedProfile.user)@$($savedProfile.host):$($savedProfile.port)"
+$identityLabel = 'palette-ssh ' + [char]0xb7 + " $account"
 $menuName = 'Shared folders' + [char]0x2026
 $add = 'Add folder' + [char]0x2026
 $button = [System.Windows.Automation.ControlType]::Button
@@ -33,7 +34,7 @@ function Open-Shares {
     $item = Share-Menu
     if (!$item.Current.IsEnabled) { throw "Disabled shared folders item for verified SSH pane $remote" }
     Invoke-Button $item
-    $null = Wait-Until 'verified profile, account, port and access mode' { Find-Element $identityLabel }
+    $null = Wait-Until 'verified profile, account and port' { Find-Element $identityLabel }
 }
 function Folder-Dialog {
     Find-OwnedDialog 'Choose a folder to share'
@@ -60,25 +61,28 @@ function Wait-SelectedPath {
         throw "$_ Expected '$selectedDir' ($canonicalDir). Reported paths: [$($evidence.paths -join ', ')]. Draft visible: $($evidence.draft). Picker open: $([bool](Folder-Dialog))."
     }
 }
-function Pick-Folder([int]$ButtonId) {
+function Pick-Folder([int]$ButtonId, [string]$Item = $leaf) {
     Click $add
     $dialog = Wait-Until 'owned native folder picker' { Folder-Dialog }
-    if ($ButtonId -eq 1) { Select-DialogItem $dialog $leaf }
+    if ($ButtonId -eq 1) { Select-DialogItem $dialog $Item }
     $null = Wait-Until "folder picker button $ButtonId" { [FixtureDialog]::ClickButton($dialog, $ButtonId) }
     $null = Wait-Until 'folder picker dismissed' { !(Folder-Dialog) }
 }
-function Wait-FailedMount {
-    $null = Wait-Until 'failed SSHFS setup and available retry' {
-        $retry = Find-Element 'Mount smoke-share' $button
+function Wait-FailedMount([string]$Name = 'smoke-share') {
+    $reason = Wait-Until 'failed SSHFS setup and available retry' {
+        $retry = Find-Element "Mount $Name" $button
         if (!$retry -or !$retry.Current.IsEnabled) { return }
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $text = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
         foreach ($row in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text)) {
-            if ($row.Current.Name.StartsWith('Mount failed')) { return $true }
+            if ($row.Current.Name.StartsWith('Mount failed')) { return $row.Current.Name }
         }
     }
-    foreach ($action in 'Open smoke-share in SFTP drawer', 'Copy Linux path for smoke-share') {
+    if ($reason -notlike '*SSH server refused the session command*') {
+        throw "Expected the loopback SSH peer to reject SSHFS setup for '$Name'; received '$reason'"
+    }
+    foreach ($action in "Open $Name in SFTP drawer", "Copy Linux path for $Name") {
         $control = Wait-Until "mounted folder shortcut '$action'" { Find-Element $action $button }
         if ($control.Current.IsEnabled) { throw "A failed mount enabled '$action'" }
     }
@@ -151,6 +155,7 @@ function Test-OfflineRevoke {
         $id = (Get-Content -Raw -LiteralPath $profiles | ConvertFrom-Json).profiles.'palette-ssh'.folder_share_id
         $id -and $id -cne $oldToken -and (Find-Element '~/windows/Selected-folder')
     }
+    Wait-FailedMount 'Selected-folder'
     Send-ToShell 'share-shell-after-revocation'
 }
 for ($launch = 1; $launch -le 3; $launch++) {
@@ -184,17 +189,57 @@ for ($launch = 1; $launch -le 3; $launch++) {
             $value.SetValue('../invalid')
             $null = Wait-Until 'invalid name disables sharing' { $b = Find-Element 'Save folder' $button; $b -and !$b.Current.IsEnabled }
             $value.SetValue('smoke-share')
+            $null = Wait-Until 'specific write consent names the verified account and its file access' {
+                Find-Element "Write access lets $account create, edit and delete files in this Windows folder."
+            }
+            (Wait-CheckBox 'Allow write access' Off).Toggle()
+            $null = Wait-Until 'review names both the write mode and guest destination' {
+                Find-Element 'Remember this folder and mount it read/write at ~/windows/smoke-share'
+            }
+            (Wait-CheckBox 'Mount on connect' On).Toggle()
+            $null = Wait-CheckBox 'Mount on connect' Off
             Click 'Save folder'
             $null = Wait-Until 'saved remote mount path' { Find-Element '~/windows/smoke-share' }
             Wait-FailedMount
+            $null = Wait-Until 'saved row displays its write access' { Find-Element 'Read/write' }
+            if (Find-Element 'Allow write access') { throw 'A saved grant offered an in-place access change' }
             $grantsDir = Join-Path $env:W11TERM_DATA_DIR 'folder-shares'
             $grantFiles = @(Get-ChildItem -LiteralPath $grantsDir -Filter '*.json' -File)
             if ($grantFiles.Length -ne 1) { throw 'Expected exactly one isolated local consent file' }
             $consentFile = $grantFiles[0].FullName
             $consent = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
-            if ($consent.Length -ne 1 -or !(Same-SelectedFolder $consent[0].path) -or $consent[0].name -ne 'smoke-share') {
+            if ($consent.Length -ne 1 -or !(Same-SelectedFolder $consent[0].path) -or $consent[0].name -ne 'smoke-share' -or
+                $consent[0].auto_mount -isnot [bool] -or $consent[0].auto_mount -or
+                $consent[0].writable -isnot [bool] -or !$consent[0].writable) {
                 throw 'Persisted consent did not match the selected test directory and mount name'
             }
+            Pick-Folder 1 'data'
+            (Wait-CheckBox 'Allow write access' Off).Toggle()
+            $null = Wait-Until 'review writable data directory request' {
+                Find-Element 'Remember this folder and mount it read/write at ~/windows/data'
+            }
+            Click 'Save folder'
+            $null = Wait-Until 'write access to application state refused' {
+                Find-Element ('Mount failed ' + [char]0xb7 + " Write access would expose w11term's data directory or profile catalog. Choose a different folder or share it read-only.")
+            }
+            $savedGrants = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
+            if ($savedGrants.Length -ne 1 -or $savedGrants[0].name -ne 'smoke-share') {
+                throw 'Protected app data was persisted as a writable grant'
+            }
+            Click 'Forget data'
+            $null = Wait-Until 'rejected data directory removed' { !(Find-Element '~/windows/data') }
+            (Wait-CheckBox 'Mount on connect for smoke-share' Off).Toggle()
+            $null = Wait-Until 'enabled preference in the saved grant' {
+                $saved = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
+                $saved.Count -eq 1 -and $saved[0].name -ceq 'smoke-share' -and $saved[0].auto_mount -ne $false
+            }
+            (Wait-CheckBox 'Mount on connect for smoke-share' On).Toggle()
+            $null = Wait-Until 'disabled preference in the saved grant' {
+                $saved = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
+                $saved.Count -eq 1 -and $saved[0].auto_mount -eq $false
+            }
+            $null = Wait-CheckBox 'Mount on connect for smoke-share' Off
+            Wait-FailedMount
             Send-ToShell 'share-shell-before-restart'
             $null = Control @('open','--profile','Palette PowerShell')
             $local = Wait-Until 'new PowerShell' { ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id }
@@ -205,8 +250,13 @@ for ($launch = 1; $launch -le 3; $launch++) {
             if ((Share-Menu).Current.IsEnabled) { throw 'Local PowerShell offered folder sharing' }
         } else {
             $null = Wait-Until 'persisted share in restarted process' { Find-Element '~/windows/smoke-share' }
+            $null = Wait-Until 'persisted share retained its write access' { Find-Element 'Read/write' }
             Wait-SelectedPath
+            $null = Wait-CheckBox 'Mount on connect for smoke-share' Off
+            $null = Wait-Until 'manual-only folder stays unmounted on reconnect' { Find-Element 'Unmounted' }
+            Click 'Mount smoke-share'
             Wait-FailedMount
+            $null = Wait-CheckBox 'Mount on connect for smoke-share' Off
             Click 'Forget smoke-share'
             $null = Wait-Until 'forgotten share removed' { (Find-Element 'Requested removal of smoke-share') -and !(Find-Element '~/windows/smoke-share') }
             if ((Test-Path -LiteralPath $consentFile) -and (Get-Content -Raw -LiteralPath $consentFile).Trim() -ne '[]') { throw 'A folder grant survived Forget' }
@@ -215,8 +265,18 @@ for ($launch = 1; $launch -le 3; $launch++) {
             $null = Wait-Until 'palette opens verified panel' { Find-Element $identityLabel }
             Pick-Folder 1
             Wait-SelectedPath
+            $null = Wait-CheckBox 'Allow write access' Off
+            $null = Wait-Until 'reselecting the same Windows directory starts a new read-only consent' {
+                Find-Element 'Remember this folder and mount it read-only at ~/windows/Selected-folder'
+            }
             Click 'Save folder'
             $null = Wait-Until 'saved permission ready for offline revocation' { Find-Element 'Mount Selected-folder' $button }
+            Wait-FailedMount 'Selected-folder'
+            $null = Wait-Until 'new saved row is read-only' { Find-Element 'Read-only' }
+            $newGrant = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
+            if ($newGrant.Count -ne 1 -or $newGrant[0].PSObject.Properties['writable']) {
+                throw 'Default sharing retained earlier write consent'
+            }
             Click $add
             $dialog = Wait-Until 'owned picker before disconnect' { Folder-Dialog }
             Select-DialogItem $dialog $leaf

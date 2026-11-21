@@ -174,11 +174,25 @@ async fn local_process_receives_input_interrupt_and_resize_and_drains_before_exi
     let mut fixture = Fixture::start()?;
     fixture.until("READY-80x24").await?;
     fixture.input.send(TransportInput::Resize(size(104, 33)))?;
+    let (reply, stale) = tokio::sync::oneshot::channel();
+    fixture.input.send(TransportInput::Clipboard {
+        connection: 0,
+        bytes: b"old paste ".to_vec(),
+        reply,
+    })?;
+    assert!(stale.await?.is_err());
     let (ack, rx) = tokio::sync::oneshot::channel();
     fixture
         .input
-        .send(TransportInput::Raw(b"typed input\r".to_vec(), ack))?;
+        .send(TransportInput::Raw(b"typed ".to_vec(), ack))?;
     rx.await?.map_err(anyhow::Error::msg)?;
+    let (reply, delivered) = tokio::sync::oneshot::channel();
+    fixture.input.send(TransportInput::Clipboard {
+        connection: 1,
+        bytes: b"input\r".to_vec(),
+        reply,
+    })?;
+    delivered.await?.map_err(anyhow::Error::msg)?;
     fixture.until("INPUT-typed input-104x33").await?;
     fixture.input.send(TransportInput::Data(vec![3]))?;
     fixture.until("[Local process exited with code 37]").await?;

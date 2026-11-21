@@ -20,7 +20,29 @@ pub(super) struct Panel {
     feedback: String,
     pending: Option<u64>,
     resolving: Option<u64>,
-    draft: Option<(PathBuf, String)>,
+    draft: Option<FolderDraft>,
+}
+
+#[derive(Clone)]
+struct FolderDraft {
+    selection: u64,
+    path: PathBuf,
+    name: String,
+    auto_mount: bool,
+    writable: bool,
+}
+
+impl FolderDraft {
+    fn new(selection: u64, path: PathBuf) -> Self {
+        let name = suggested_name(&path);
+        Self {
+            selection,
+            path,
+            name,
+            auto_mount: true,
+            writable: false,
+        }
+    }
 }
 
 pub enum Action {
@@ -32,16 +54,29 @@ pub enum Edit {
     Back,
     Add,
     Picked(u64, Result<Option<PathBuf>, String>),
-    Name(String),
-    Save,
-    Cancel,
+    Draft(u64, DraftEdit),
+    AutoMount(String, String, bool),
     Row(RowAction, String, PathBuf),
     Mounted(MountedAction, String, String),
     Resolved(u64, MountedAction, String, Result<MountedFolder, String>),
 }
-#[derive(Clone, Copy)]
+pub enum DraftEdit {
+    Name(String),
+    AutoMount(bool),
+    Writable(bool),
+    Save,
+    Cancel,
+}
+
+fn access_label(writable: bool) -> &'static str {
+    if writable { "Read/write" } else { "Read-only" }
+}
+#[derive(Clone)]
 pub enum RowAction {
-    Mount,
+    Mount {
+        grant: Option<String>,
+        writable: bool,
+    },
     Unmount,
     Forget,
 }
@@ -284,33 +319,61 @@ impl TerminalApp {
                 match result {
                     Err(error) => panel.feedback = error,
                     Ok(Some(path)) => {
-                        let name = suggested_name(&path);
-                        panel.draft = Some((path, name));
+                        panel.draft = Some(FolderDraft::new(request, path));
                     }
                     Ok(None) => {}
                 }
                 return;
             }
-            Edit::Name(value) => {
-                if let Some((_, name)) = &mut panel.draft {
-                    *name = value;
-                }
-                return;
-            }
-            Edit::Cancel => {
-                panel.draft = None;
-                panel.feedback.clear();
-                return;
-            }
-            Edit::Save => {
-                let Some((path, name)) = panel.draft.clone() else {
+            Edit::Draft(selection, action) => {
+                let Some(draft) = panel.draft.as_mut().filter(|d| d.selection == selection) else {
                     return;
                 };
-                if !valid_mount_name(&name) {
+                match action {
+                    DraftEdit::Name(value) => {
+                        draft.name = value;
+                        return;
+                    }
+                    DraftEdit::AutoMount(value) => {
+                        draft.auto_mount = value;
+                        return;
+                    }
+                    DraftEdit::Writable(value) => {
+                        draft.writable = value;
+                        return;
+                    }
+                    DraftEdit::Cancel => {
+                        panel.draft = None;
+                        panel.feedback.clear();
+                        return;
+                    }
+                    DraftEdit::Save => {
+                        if !valid_mount_name(&draft.name) {
+                            return;
+                        }
+                        let FolderDraft {
+                            name,
+                            path,
+                            auto_mount,
+                            writable,
+                            ..
+                        } = draft.clone();
+                        self.folder_add(&authority, &name, path, auto_mount, writable)
+                            .map(|()| {
+                                format!(
+                                    "Requested {} mount at ~/windows/{name}",
+                                    access_label(writable).to_ascii_lowercase()
+                                )
+                            })
+                    }
+                }
+            }
+            Edit::AutoMount(name, id, enabled) => {
+                if panel.draft.is_some() || panel.pending.is_some() || panel.resolving.is_some() {
                     return;
                 }
-                self.folder_add(&authority, &name, path)
-                    .map(|()| format!("Requested read-only mount at ~/windows/{name}"))
+                self.folder_auto_mount(&authority, &name, &id, enabled)
+                    .map(|()| String::new())
             }
             Edit::Row(action, name, path) => {
                 self.folder_row_action(&authority, action, &name, path)
@@ -391,8 +454,15 @@ impl TerminalApp {
             "This shared folder has changed. Review the current list."
         );
         match action {
-            RowAction::Mount => self
-                .folder_mount(authority, name)
+            RowAction::Mount { grant, writable } => self
+                .folder_mount(
+                    authority,
+                    name,
+                    grant.as_deref().context(
+                        "This permission was not saved; forget the row and add the folder again",
+                    )?,
+                    writable,
+                )
                 .map(|()| format!("Requested mount of {name}")),
             RowAction::Unmount => self
                 .folder_unmount(authority, name)
@@ -439,10 +509,7 @@ impl TerminalApp {
                 .text("Shared folders")
                 .into(),
             TextBlock::new()
-                .text(format!(
-                    "{} · {}@{}:{} · Read-only",
-                    a.profile, a.user, a.host, a.port
-                ))
+                .text(format!("{} · {}@{}:{}", a.profile, a.user, a.host, a.port))
                 .into(),
             TextBlock::new()
                 .text(&a.fingerprint)
@@ -484,14 +551,17 @@ impl TerminalApp {
                         }))
                         .content(label)
                 };
-                let row_button = |action, text, enabled| {
+                let row_button = |action: RowAction, text, enabled| {
                     let name = row.name.clone();
                     let path = row.path.clone();
                     Button::new()
                         .automation_name(format!("{text} {name}"))
                         .is_enabled(enabled)
                         .on_click(ctx.callback(move |_| {
-                            message(origin, Edit::Row(action, name.clone(), path.clone()))
+                            message(
+                                origin,
+                                Edit::Row(action.clone(), name.clone(), path.clone()),
+                            )
                         }))
                         .content(text)
                 };
@@ -499,6 +569,31 @@ impl TerminalApp {
                     row.status,
                     FolderMountStatus::Stopped | FolderMountStatus::Failed(_)
                 );
+                let preference = row.mount_on_connect.as_ref();
+                let grant_id = preference.map(|p| p.grant_id.clone());
+                let checked = preference.is_some_and(|p| p.enabled);
+                let name = row.name.clone();
+                let check = CheckBox::new()
+                    .automation_name(format!("Mount on connect for {name}"))
+                    .is_checked(checked)
+                    .is_enabled(
+                        preference.is_some_and(|p| !p.pending)
+                            && panel.draft.is_none()
+                            && panel.pending.is_none()
+                            && panel.resolving.is_none(),
+                    )
+                    .on_is_checked_changed(ctx.callback(move |value| match &grant_id {
+                        Some(id) if value != checked => {
+                            message(origin, Edit::AutoMount(name.clone(), id.clone(), value))
+                        }
+                        _ => Message::ControlIdle,
+                    }))
+                    .content("Mount on connect");
+                let mut status = status_text(&row.status);
+                if let Some(error) = preference.and_then(|p| p.error.as_deref()) {
+                    status.push('\n');
+                    status.push_str(error);
+                }
                 items.push(KeyedView::new(
                     format!("share/{}", row.name),
                     Border::new()
@@ -516,15 +611,24 @@ impl TerminalApp {
                                 TextBlock::new()
                                     .text(row.path.display().to_string())
                                     .text_wrapping(TextWrapping::Wrap),
+                                TextBlock::new().text(access_label(row.writable)),
                                 TextBlock::new()
-                                    .text(status_text(&row.status))
+                                    .text(status)
                                     .text_wrapping(TextWrapping::Wrap),
+                                check,
                                 StackPanel::new()
                                     .orientation(Orientation::Horizontal)
                                     .spacing(8.0)
                                     .children((
                                         if stopped {
-                                            row_button(RowAction::Mount, "Mount", true)
+                                            row_button(
+                                                RowAction::Mount {
+                                                    grant: preference.map(|p| p.grant_id.clone()),
+                                                    writable: row.writable,
+                                                },
+                                                "Mount",
+                                                preference.is_some(),
+                                            )
                                         } else {
                                             row_button(
                                                 RowAction::Unmount,
@@ -556,19 +660,35 @@ impl TerminalApp {
                         ),
                 ));
             }
-            if let Some((path, name)) = &panel.draft {
-                items.push(KeyedView::new("draft", StackPanel::new().spacing(6.0).children((
+            if let Some(FolderDraft {
+                selection,
+                path,
+                name,
+                auto_mount,
+                writable,
+            }) = &panel.draft
+            {
+                let selection = *selection;
+                let edit = move |action| message(origin, Edit::Draft(selection, action));
+                items.push(KeyedView::new(format!("draft/{selection}"), StackPanel::new().spacing(6.0).children((
                     TextBlock::new().text(path.display().to_string()).text_wrapping(TextWrapping::Wrap),
                     TextBlock::new().text("Mount name"),
                     TextBox::new().automation_name("Mount name").text(name)
-                        .on_text_changed(ctx.callback(move |text| message(origin, Edit::Name(text)))),
+                        .on_text_changed(ctx.callback(move |text| edit(DraftEdit::Name(text)))),
+                    CheckBox::new().automation_name("Mount on connect").is_checked(*auto_mount)
+                        .on_is_checked_changed(ctx.callback(move |value| edit(DraftEdit::AutoMount(value))))
+                        .content("Mount on connect"),
+                    CheckBox::new().automation_name("Allow write access").is_checked(*writable)
+                        .on_is_checked_changed(ctx.callback(move |value| edit(DraftEdit::Writable(value))))
+                        .content("Allow write access"),
+                    TextBlock::new().text(format!("Write access lets {}@{}:{} create, edit and delete files in this Windows folder.", a.user, a.host, a.port)).text_wrapping(TextWrapping::Wrap),
                     TextBlock::new().text(if valid_mount_name(name) {
-                        format!("Remember this folder and mount it read-only at ~/windows/{name}")
+                        format!("Remember this folder and mount it {} at ~/windows/{name}", access_label(*writable).to_ascii_lowercase())
                     } else { "Use 1–64 letters, digits, dots, underscores or hyphens. Start with a letter or digit.".to_owned() }).text_wrapping(TextWrapping::Wrap),
                     StackPanel::new().orientation(Orientation::Horizontal).spacing(8.0).children((
                         Button::new().style(ButtonStyle::Accent).is_enabled(valid_mount_name(name))
-                            .on_click(ctx.callback(move |_| message(origin, Edit::Save))).content("Save folder"),
-                        Button::new().on_click(ctx.callback(move |_| message(origin, Edit::Cancel))).content("Cancel"),
+                            .on_click(ctx.callback(move |_| edit(DraftEdit::Save))).content("Save folder"),
+                        Button::new().on_click(ctx.callback(move |_| edit(DraftEdit::Cancel))).content("Cancel"),
                     ))
                 ))));
             } else {
@@ -611,8 +731,10 @@ mod tests {
         let mut rows = vec![FolderRow {
             name: "docs".into(),
             path: r"C:\selected".into(),
+            writable: false,
             status: FolderMountStatus::Mounted,
             mounted: Some(original.clone()),
+            mount_on_connect: None,
         }];
         assert!(still_mounted(&rows, "docs", &original));
         assert!(!still_mounted(&rows, "other", &original));
