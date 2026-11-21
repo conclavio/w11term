@@ -4,6 +4,53 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives the command palette across a loopback SSH session and a PowerShell tab"]
+async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":{
+        "palette-ssh":ssh, "Palette PowerShell":{
+            "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]}}}))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.path().join("appearance.json"),
+        br#"{"shortcuts":{"command_palette":"F7","select_tab_1":"F8"}}"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-STA", "-File"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/command-palette-ui.ps1"))
+        .args([
+            "-Gui",
+            env!("CARGO_BIN_EXE_w11term"),
+            "-Cli",
+            env!("CARGO_BIN_EXE_w11term-cli"),
+        ])
+        .arg("-State")
+        .arg(state.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
+    );
+    assert_eq!(fs::read(trace).unwrap(), b"after");
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "moves a live SSH pane into an existing Windows PowerShell tab through the native UI"]
 async fn native_move_to_existing_tab_preserves_ssh_and_powershell() {
     // Allow a replacement transport so the test can detect one without hanging.

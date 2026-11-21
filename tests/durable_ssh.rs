@@ -1,4 +1,4 @@
-//! The loopback peer implements the zmx CLI response contract. Each attach
+//! The loopback peer implements zmx and tmux CLI responses. Each attach
 //! and control command still runs on a real authenticated SSH channel.
 use anyhow::{Result, bail};
 use russh::{
@@ -72,6 +72,8 @@ struct Backend {
     missing_program: bool,
     hold_once: bool,
     replace_on_resume: bool,
+    tmux_name: Option<String>,
+    tmux_available: bool,
 }
 #[derive(Clone, Default)]
 struct Peer {
@@ -159,6 +161,46 @@ impl server::Handler for Peer {
             let mut b = self.backend.lock().unwrap();
             b.commands.push(command.into());
             match args.as_slice() {
+                [
+                    "env",
+                    "LC_ALL=C",
+                    "tmux",
+                    "-uN",
+                    "-L",
+                    "default",
+                    "list-sessions",
+                    ..,
+                ] => match (&b.tmux_name, b.tmux_available) {
+                    (Some(name), _) => (0, format!("$7\t11\t2345\t2\t1\t{name}\n"), false),
+                    (None, true) => (0, String::new(), false),
+                    (None, false) => (127, String::new(), false),
+                },
+                ["sh", "-c", ..]
+                    if command.contains("tmux -uN -L default if-shell -F -t '$7:'") =>
+                {
+                    assert!(command.contains("11/2345/$7}"));
+                    assert!(command.contains(r"'attach-session -t \$7'"));
+                    s.data(c, b"56\r\n".as_slice())?;
+                    if b.tmux_name.is_none() {
+                        (1, String::new(), false)
+                    } else {
+                        s.data(c, b"restore-screen".as_slice())?;
+                        return Ok(());
+                    }
+                }
+                [
+                    "tmux",
+                    "-N",
+                    "-L",
+                    "default",
+                    "list-clients",
+                    "-t",
+                    "'$7'",
+                    ..,
+                ] => {
+                    let hold = std::mem::take(&mut b.hold_once);
+                    (0, "11/2345/$7/56\n".into(), hold)
+                }
                 ["zmx", "version"] if b.missing_program => (127, String::new(), false),
                 ["zmx", "version"] => (0, "zmx\t\t1.0.1\nghostty_vt\tfixture\n".into(), false),
                 ["zmx", "list"] => {
@@ -360,7 +402,9 @@ async fn fresh_client_discovers_an_existing_pty_then_attaches_on_its_verified_co
     );
     {
         let b = fixture.peer.backend.lock().unwrap();
-        assert_eq!(b.commands, ["zmx version", "zmx list"]);
+        assert_eq!(&b.commands[..2], ["zmx version", "zmx list"]);
+        assert!(b.commands[2].contains("tmux -uN -L default list-sessions"));
+        assert_eq!(b.commands.len(), 3);
         assert!(b.grids.is_empty());
         assert!(b.input.is_empty());
     }
@@ -387,7 +431,7 @@ async fn fresh_client_discovers_an_existing_pty_then_attaches_on_its_verified_co
     assert_eq!(b.environments, [("COLORTERM".into(), "truecolor".into())]);
     let probe = format!("zmx get {} w11term_generation", ref1.name);
     assert_eq!(
-        &b.commands[2..],
+        &b.commands[3..],
         [
             "zmx version",
             &probe,
@@ -395,6 +439,121 @@ async fn fresh_client_discovers_an_existing_pty_then_attaches_on_its_verified_co
             &probe
         ]
     );
+}
+
+#[cfg(feature = "ui-smoke")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens an isolated native WinUI window"]
+async fn native_find_tmux_session_on_plain_ssh_profile() {
+    let fixture = Fixture::new().await;
+    fixture.peer.backend.lock().unwrap().tmux_name = Some("weekly ops".into());
+    let dir = tempfile::tempdir().unwrap();
+    gui::run_gui(
+        &Source::Ssh(fixture.options.clone()),
+        dir.path(),
+        &[("W11TERM_DISCOVERY_SMOKE", "1")],
+        "Host discovery smoke passed",
+    )
+    .await;
+    let b = fixture.peer.backend.lock().unwrap();
+    assert!(
+        b.commands
+            .iter()
+            .any(|cmd| cmd.contains("tmux -uN -L default if-shell"))
+    );
+    assert!(
+        b.commands
+            .iter()
+            .all(|cmd| !cmd.contains("new-session") && !cmd.contains("kill-session"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tmux_attaches_only_the_chosen_existing_client_and_restores_the_same_workspace_target() {
+    use DurableAction::*;
+    use w11term::durable::Backend;
+    let fixture = Fixture::new().await;
+    let name = "ops $(display) 'weekly'";
+    fixture.peer.backend.lock().unwrap().tmux_name = Some(name.into());
+    let zmx = existing_session(&fixture);
+    let browser = Session::discover_durable(fixture.options.clone(), Default::default(), false);
+    phase(&browser, DurablePhase::Choosing).await;
+    let state = browser.durable_state().unwrap();
+    let [first, entry] = &*state.candidates else {
+        panic!("{state:?}")
+    };
+    assert_eq!(first.reference, zmx);
+    assert_eq!(
+        (&*entry.display_name, entry.windows, entry.clients),
+        (name, Some(2), 1)
+    );
+    let target = entry.reference.clone();
+    assert_eq!(target.backend, Backend::Tmux);
+    assert_eq!(target.name, "$7");
+    assert!(raw(&browser, "before choice").await.is_err());
+    fixture.peer.backend.lock().unwrap().hold_once = true;
+    browser.durable_action(Choose(target.clone())).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), fixture.peer.checking.notified())
+        .await
+        .unwrap();
+    assert!(raw(&browser, "before client proof").await.is_err());
+    assert!(!screen(&browser, "restore-screen"));
+    fixture.peer.release.notify_one();
+    phase(&browser, DurablePhase::Attached).await;
+    raw(&browser, "selected").await.unwrap();
+    assert!(!browser.durable_state().unwrap().permits(End));
+    browser.durable_action(Detach).unwrap();
+    phase(&browser, DurablePhase::Detached).await;
+    assert!(raw(&browser, "detached").await.is_err());
+    assert_eq!(fixture.peer.backend.lock().unwrap().authenticated, 1);
+    let saved = w11term::workspace::SavedSource::Discovery("pilot".into())
+        .with_session(Some(target.clone()))
+        .unwrap();
+    let restored: w11term::workspace::SavedSource =
+        serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+    drop(browser);
+    fixture.peer.backend.lock().unwrap().tmux_name = Some("renamed".into());
+    let pane = fixture.open(restored.session().cloned());
+    phase(&pane, DurablePhase::Attached).await;
+    pane.durable_action(Detach).unwrap();
+    phase(&pane, DurablePhase::Detached).await;
+    fixture.peer.backend.lock().unwrap().tmux_name = None;
+    pane.durable_action(Reattach).unwrap();
+    phase(&pane, DurablePhase::Missing).await;
+    assert!(raw(&pane, "after removal").await.is_err());
+    assert!(!pane.durable_state().unwrap().permits(StartNew));
+    pane.durable_action(Refresh).unwrap();
+    phase(&pane, DurablePhase::Choosing).await;
+    assert!(pane.durable_state().unwrap().reference.is_none());
+    let backend = fixture.peer.backend.lock().unwrap();
+    assert_eq!(backend.input, [b"selected".to_vec()]);
+    assert!(backend.commands.iter().all(|cmd| !cmd.contains(name)
+        && !cmd.contains("new-session")
+        && !cmd.contains("kill")
+        && cmd != "<direct shell>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tmux_discovery_survives_missing_zmx_and_empty_or_missing_tmux() {
+    let fixture = Fixture::new().await;
+    fixture.peer.backend.lock().unwrap().missing_program = true;
+    let browser = Session::discover_durable(fixture.options.clone(), Default::default(), false);
+    phase(&browser, DurablePhase::Choosing).await;
+    let empty = browser.durable_state().unwrap();
+    assert!(empty.candidates.is_empty() && empty.detail.contains("tmux is unavailable"));
+    fixture.peer.backend.lock().unwrap().tmux_available = true;
+    browser.durable_action(DurableAction::Refresh).unwrap();
+    phase(&browser, DurablePhase::Choosing).await;
+    let empty = browser.durable_state().unwrap();
+    assert!(empty.candidates.is_empty() && !empty.detail.contains("tmux is unavailable"));
+    fixture.peer.backend.lock().unwrap().tmux_name = Some("available".into());
+    browser.durable_action(DurableAction::Refresh).unwrap();
+    phase(&browser, DurablePhase::Choosing).await;
+    assert_eq!(
+        browser.durable_state().unwrap().candidates[0].display_name,
+        "available"
+    );
+    assert!(fixture.peer.backend.lock().unwrap().grids.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

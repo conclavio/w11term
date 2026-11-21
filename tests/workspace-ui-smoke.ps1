@@ -63,7 +63,7 @@ $duplicate = $null
 try {
     $env:W11TERM_DATA_DIR = $data
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
-    Remove-Item Env:W11TERM_UI_SMOKE, Env:W11TERM_WORKSPACE_SMOKE -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Env:W11TERM_UI_SMOKE, Env:W11TERM_WORKSPACE_SMOKE -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($profiles, '{"profiles":{}}', $encoding)
     $fixture = @'
 {
@@ -72,7 +72,7 @@ try {
     "two-tabs": {
       "active_tab": 0,
       "tabs": [
-        {"focused": 22, "layout": {"type": "split", "axis": "columns", "ratio": 0.3333333333333333,
+        {"title": "Build console", "focused": 22, "layout": {"type": "split", "axis": "columns", "ratio": 0.3333333333333333,
           "first":  {"type": "leaf", "slot": 11, "source": {"kind": "demo"}},
           "second": {"type": "leaf", "slot": 22, "source": {"kind": "demo"}}}},
         {"focused": 33, "layout": {"type": "leaf", "slot": 33, "source": {"kind": "demo"}}}
@@ -158,6 +158,7 @@ try {
     }
     Stop-WorkspaceGui $duplicate
     Stop-WorkspaceGui $picker
+    & (Join-Path $PSScriptRoot 'tab-title-ui.ps1') -ProcessId $terminal.Id -Cli $ctl
     Stop-WorkspaceGui $terminal
     # Race two launches for a closed workspace, and verify that only the winner owns panes.
     $first = Start-WorkspaceGui @('--switch-workspace', 'two-tabs') 'switch-first.err'
@@ -192,5 +193,8 @@ try {
     Stop-WorkspaceGui $first
     Stop-WorkspaceGui $picker
     Stop-WorkspaceGui $terminal
-    foreach ($name in $variables) { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
+    foreach ($name in $variables) {
+        if ($null -eq $previous[$name]) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+        else { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
+    }
 }

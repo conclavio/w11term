@@ -4,6 +4,32 @@ use std::collections::HashMap;
 
 pub type TabId = u64;
 
+/// A user-assigned display name owned by a tab group, independent of its panes.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct TabTitle(String);
+
+impl TabTitle {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for TabTitle {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty()
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+            || value.chars().count() > 128
+        {
+            return Err("Use 1–128 characters with no control characters or surrounding spaces");
+        }
+        Ok(Self(value))
+    }
+}
+
 pub struct Tab<T> {
     pub id: TabId,
     pub value: T,
@@ -12,6 +38,7 @@ pub struct Tab<T> {
 
 struct Group {
     id: TabId,
+    title: Option<TabTitle>,
     focused: TabId,
     layout: Layout,
     zoomed: bool,
@@ -60,6 +87,17 @@ impl<T> Tabs<T> {
     }
     pub fn active_id(&self) -> Option<TabId> {
         Some(self.groups.get(self.active_index()?)?.focused)
+    }
+    pub fn title_for(&self, entry: TabId) -> Option<&TabTitle> {
+        let group = self.group_id(entry)?;
+        self.groups.iter().find(|g| g.id == group)?.title.as_ref()
+    }
+
+    /// Use the stable group ID so delayed edits cannot follow a moved pane.
+    pub fn set_group_title(&mut self, group: TabId, title: Option<TabTitle>) {
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
+            g.title = title;
+        }
     }
     pub fn active_index(&self) -> Option<usize> {
         let id = self.active_group?;
@@ -138,6 +176,7 @@ impl<T> Tabs<T> {
         });
         self.groups.push(Group {
             id,
+            title: None,
             focused: entry_id,
             layout: Layout::Leaf(entry_id),
             zoomed: false,
@@ -307,6 +346,35 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn titles_follow_groups_through_moves_and_closing_the_original_pane() {
+        let mut tabs = Tabs::default();
+        let source = tabs.insert("SSH");
+        let sibling = tabs.split(source, "PowerShell", Axis::Columns).unwrap();
+        let destination = tabs.insert("SSH");
+        let title = |s: &str| Some(TabTitle::try_from(s.to_owned()).unwrap());
+        tabs.set_group_title(source, title("Build"));
+        tabs.set_group_title(destination, title("Deploy"));
+        assert_eq!(tabs.title_for(sibling), title("Build").as_ref());
+        assert!(tabs.move_to_existing_tab(source, destination, Direction::Left));
+        assert_eq!(tabs.title_for(source), title("Deploy").as_ref());
+        assert_eq!(tabs.title_for(sibling), title("Build").as_ref());
+        tabs.remove(destination);
+        tabs.set_group_title(destination, None);
+        assert!(tabs.title_for(source).is_none());
+        assert_eq!(tabs.get(source), Some(&"SSH"));
+    }
+
+    #[test]
+    fn workspace_titles_accept_unicode_and_validate_on_deserialization() {
+        for invalid in ["", "  ", " padded", "a\nb", &"x".repeat(129)] {
+            assert!(serde_json::from_value::<TabTitle>(invalid.into()).is_err());
+        }
+        let name = "界".repeat(128);
+        let title: TabTitle = serde_json::from_value(name.clone().into()).unwrap();
+        assert_eq!(serde_json::to_value(title).unwrap(), name);
+    }
     #[test]
     fn moving_the_original_leaf_keeps_its_identity_and_the_previous_tab() {
         let mut tabs = Tabs::default();
