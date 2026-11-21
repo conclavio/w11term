@@ -130,6 +130,13 @@ impl server::Handler for Peer {
         self.events.send(Observed::Data(data.to_vec())).unwrap();
         if data == b"x" {
             session.data(channel, b"x".as_slice())?;
+        } else if data == b"\x1b[2;1R" {
+            // An editor selects a blinking underline, disables blinking, then
+            // asks for the exact style it can save and later restore.
+            session.data(
+                channel,
+                b"\x1b[3 q\x1b[?12l\x1bP$q q\x1b\\\x1b[0 q".as_slice(),
+            )?;
         } else if let Some(bytes) = data.strip_prefix(b"\0sync:") {
             session.data(channel, bytes.to_vec())?;
         }
@@ -228,6 +235,10 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
         assert_eq!(
             next(&mut observed, &session).await,
             Observed::Data(b"\x1b[2;1R".to_vec())
+        );
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(b"\x1bP1$r4 q\x1b\\".to_vec())
         );
         session
             .input
