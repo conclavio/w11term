@@ -12,8 +12,10 @@ on:
       - src/folder_grants/**
       - src/session.rs
       - src/profiles.rs
+      - src/profiles/folder_permissions.rs
       - src/app/folder_sharing_state.rs
       - src/app/folder_shares.rs
+      - src/app/folder_revoke.rs
       - Cargo.toml
       - Cargo.lock
 

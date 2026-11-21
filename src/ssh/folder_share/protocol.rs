@@ -59,8 +59,13 @@ impl Export {
 
     pub(in crate::ssh) fn reply(&mut self, packet: Packet) -> Packet {
         let id = packet.get_request_id();
-        self.request(id, packet)
-            .unwrap_or_else(|code| Packet::error(id, code))
+        if self.root.permits_request() {
+            let reply = self.request(id, packet);
+            if self.root.permits_request() {
+                return reply.unwrap_or_else(|code| Packet::error(id, code));
+            }
+        }
+        Packet::error(id, StatusCode::PermissionDenied)
     }
 
     fn request(&mut self, id: u32, packet: Packet) -> Reply {
@@ -286,6 +291,46 @@ mod tests {
             }
             .into(),
         )
+    }
+
+    #[test]
+    fn retiring_a_profile_denies_open_files_and_buffered_directory_entries() {
+        let folder = tempfile::tempdir().unwrap();
+        let permissions = tempfile::tempdir().unwrap();
+        let marker = permissions.path().join("retired");
+        let gate = crate::profiles::FolderGrantGate::new(
+            marker.clone(),
+            permissions.path().join("revision"),
+            None,
+        );
+        let mut export = Export::new(
+            Root::open(folder.path())
+                .unwrap()
+                .with_profile_permission(gate),
+        );
+        fs::write(folder.path().join("file"), b"private").unwrap();
+        let file = handle(export.reply(open("file", OpenFlags::READ)));
+        let directory = handle(export.reply(opendir("/")));
+        assert!(matches!(read(&mut export, &file, 0, 1), Packet::Data(_)));
+        fs::write(&marker, []).unwrap();
+        status(read(&mut export, &file, 1, 1), StatusCode::PermissionDenied);
+        status(
+            export.reply(
+                ReadDir {
+                    id: ID,
+                    handle: directory,
+                }
+                .into(),
+            ),
+            StatusCode::PermissionDenied,
+        );
+        status(
+            export.reply(open("file", OpenFlags::READ)),
+            StatusCode::PermissionDenied,
+        );
+        // Once closed, a running export cannot be revived by changing the marker.
+        fs::remove_file(marker).unwrap();
+        status(read(&mut export, &file, 0, 1), StatusCode::PermissionDenied);
     }
 
     #[test]

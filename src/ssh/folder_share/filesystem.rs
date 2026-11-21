@@ -53,6 +53,7 @@ pub struct Root {
     directory: File,
     cursor: std::sync::Mutex<()>,
     pub(super) revoked: Arc<AtomicBool>,
+    profile_permission: Option<crate::profiles::FolderGrantGate>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -418,7 +419,31 @@ impl Root {
             directory: selected.file,
             cursor: std::sync::Mutex::new(()),
             revoked,
+            profile_permission: None,
         })
+    }
+
+    pub(crate) fn with_profile_permission(
+        mut self,
+        gate: crate::profiles::FolderGrantGate,
+    ) -> Self {
+        self.profile_permission = Some(gate);
+        self
+    }
+
+    // Runs on the blocking SFTP worker. A profile editor in another process can
+    // retire this token while Linux holds a file handle or a directory snapshot.
+    pub(super) fn permits_request(&self) -> bool {
+        if self.revoked.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(permission) = &self.profile_permission
+            && !matches!(permission.revoked(), Ok(false))
+        {
+            self.revoked.store(true, Ordering::Release);
+            return false;
+        }
+        true
     }
 
     /// Identify the selected directory itself across rename or reopen on the same volume.

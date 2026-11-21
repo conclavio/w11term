@@ -2,6 +2,7 @@
 mod store;
 use crate::{
     options::SshOptions,
+    profiles::FolderEpoch,
     ssh::{
         ConnectionShare, FolderMount, FolderMountStatus, FolderRoot, ShareSlot, valid_mount_name,
     },
@@ -43,6 +44,7 @@ pub struct Authority {
     pub fingerprint: String,
     pub pane: u64,
     generation: u64,
+    epoch: FolderEpoch,
 }
 impl Authority {
     pub(crate) fn check_profile(&self, options: &SshOptions) -> Result<()> {
@@ -100,7 +102,7 @@ struct Core {
 enum Action {
     Refresh,
     Add(Authority, String, PathBuf),
-    Mount(Authority, String, String),
+    Mount(Authority, Grant),
     Forget(Authority, String, Option<String>),
 }
 
@@ -232,7 +234,7 @@ impl PaneShares {
             ),
             "Folder is already active"
         );
-        self.queue(Action::Mount(auth.clone(), name.into(), grant.id.clone()))?;
+        self.queue(Action::Mount(auth.clone(), grant.clone()))?;
         row.mount.take();
         row.status = FolderMountStatus::Starting;
         Ok(())
@@ -330,12 +332,9 @@ impl Core {
                     self.failed(&auth, &name, e);
                 }
             }
-            Action::Mount(auth, name, id) => {
-                let result = self
-                    .saved(&auth, &name, &id)
-                    .and_then(|grant| self.start(&auth, &grant, None));
-                if let Err(e) = result {
-                    self.failed(&auth, &name, e);
+            Action::Mount(auth, grant) => {
+                if let Err(e) = self.start(&auth, &grant, None) {
+                    self.failed(&auth, &grant.name, e);
                 }
             }
             Action::Forget(auth, name, id) => {
@@ -355,9 +354,9 @@ impl Core {
         }
     }
     fn refresh(&self) {
-        let expected = self.slot.generation().map(|(generation, link)| {
+        let expected = self.slot.generation().and_then(|(generation, link)| {
             let (host, user, port, key) = link.verified_endpoint();
-            Authority {
+            let mut auth = Authority {
                 profile: self.scope.profile.clone(),
                 host: host.to_ascii_lowercase(),
                 user: user.into(),
@@ -365,28 +364,25 @@ impl Core {
                 fingerprint: key.into(),
                 pane: self.pane,
                 generation,
-            }
+                epoch: FolderEpoch::default(),
+            };
+            let (epoch, store) = Store::inspect(&self.scope, &auth).ok()?;
+            auth.epoch = epoch;
+            Some((auth, store))
         });
         {
             let mut state = self.state.lock().unwrap();
             if state.closed {
                 return;
             }
-            if state.auth != expected {
+            if state.auth.as_ref() != expected.as_ref().map(|(auth, _)| auth) {
                 state.rows.clear();
                 state.auth = None;
                 state.error = None;
             }
         }
-        let Some(auth) = expected else { return };
-        let store = match Store::for_profile(&self.scope, &auth, false) {
-            Ok(store) => store,
-            Err(_) => {
-                let mut state = self.state.lock().unwrap();
-                state.rows.clear();
-                state.auth = None;
-                return;
-            }
+        let Some((auth, store)) = expected else {
+            return;
         };
         let saved = store.as_ref().map(Store::read).transpose();
         let additions = {
@@ -430,14 +426,11 @@ impl Core {
             }
         }
     }
-    fn saved(&self, auth: &Authority, name: &str, id: &str) -> Result<Grant> {
+    fn current_store(&self, auth: &Authority) -> Result<Store> {
         drop(self.check(auth)?);
-        Store::for_profile(&self.scope, auth, false)?
-            .context("Profile has no folder permissions")?
-            .read()?
-            .into_iter()
-            .find(|g| g.name == name && g.id == id)
-            .context("Shared folder was removed or replaced")
+        let (epoch, store) = Store::inspect(&self.scope, auth)?;
+        ensure!(epoch == auth.epoch, "This shared-folder view has expired");
+        store.context("Profile has no folder permissions")
     }
     fn add(&self, auth: &Authority, name: &str, path: PathBuf) -> Result<()> {
         drop(self.check(auth)?);
@@ -448,8 +441,7 @@ impl Core {
             identity: root.identity()?,
             path,
         };
-        let store =
-            Store::for_profile(&self.scope, auth, true)?.context("Missing profile identity")?;
+        let store = Store::issue(&self.scope, auth, &auth.epoch)?;
         drop(self.check(auth)?);
         store.add(grant.clone())?;
         {
@@ -471,10 +463,9 @@ impl Core {
             root.identity()? == grant.identity,
             "The selected Windows directory was replaced. Forget this permission and choose the folder again"
         );
-        ensure!(
-            self.saved(auth, &grant.name, &grant.id)? == *grant,
-            "Folder permission changed"
-        );
+        let store = self.current_store(auth)?;
+        ensure!(store.read()?.contains(grant), "Folder permission changed");
+        let root = root.with_profile_permission(store.revocation_gate());
         let mut state = self.check(auth)?;
         let row = state
             .rows
@@ -497,9 +488,7 @@ impl Core {
                 id.is_none_or(|id| id == grant.id),
                 "Shared folder was replaced"
             );
-            if let Some(store) = Store::for_profile(&self.scope, auth, false)? {
-                store.remove(&grant)?;
-            }
+            self.current_store(auth)?.remove(&grant)?;
         }
         self.check(auth)?.rows.remove(name);
         Ok(())
