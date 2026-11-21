@@ -27,8 +27,9 @@ impl TerminalApp {
             let scope = profile.map(|name| {
                 FolderScope::new(self.store.path().into(), name.clone(), data_dir.clone())
             });
-            if live.folder_sharing.as_ref().map(PaneShares::scope) != scope.as_ref() {
-                live.folder_sharing = scope.map(|scope| live.session.profile_folders(scope));
+            if live.folder_sharing.as_deref().map(PaneShares::scope) != scope.as_ref() {
+                live.folder_sharing =
+                    scope.map(|scope| Box::new(live.session.profile_folders(scope)));
             }
             if let Some(manager) = &live.folder_sharing {
                 manager.on_authority_change(self.folder_wake.clone());
@@ -40,7 +41,7 @@ impl TerminalApp {
         let Page::Terminal(live) = &tab.page else {
             return None;
         };
-        live.folder_sharing.as_ref()
+        live.folder_sharing.as_deref()
     }
     pub(super) fn folder_authority(&self, pane: u64) -> Option<Authority> {
         self.folder_manager(pane)?.authority()
