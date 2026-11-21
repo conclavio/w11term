@@ -31,6 +31,34 @@ impl Default for Metrics {
     }
 }
 
+/// Renderer coordinates and Reactor pointer events are both expressed in pane-local DIPs.
+pub struct CellHit {
+    pub col: usize,
+    pub row: usize,
+    pub inside: bool,
+}
+impl Metrics {
+    pub fn hit(self, x: f64, y: f64) -> CellHit {
+        let col = ((x as f32 - PADDING) / self.cell_width).floor();
+        let row = ((y as f32 - PADDING) / self.cell_height).floor();
+        CellHit {
+            col: (col as usize).min(self.cols.saturating_sub(1)),
+            row: (row as usize).min(self.rows.saturating_sub(1)),
+            inside: col >= 0.0 && row >= 0.0 && col < self.cols as f32 && row < self.rows as f32,
+        }
+    }
+}
+impl CellHit {
+    pub fn point(&self, frame: &Snapshot) -> w11term::interaction::Point {
+        w11term::interaction::Point {
+            row: frame.first_stable_row + self.row as isize,
+            col: frame
+                .cell_map(self.row)
+                .map_or(self.col, |map| map.logical(self.col)),
+        }
+    }
+}
+
 /// First renderer: cached DirectWrite layouts + GPU-resident Direct2D images.
 /// The engine/transport boundary allows an atlas renderer to replace this independently.
 pub struct Renderer {
