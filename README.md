@@ -49,6 +49,10 @@ Open **caret → Command palette…** or press **Ctrl+Shift+K** to search action
 
 Use **Ctrl+Shift+P** or **caret → Find pane…** to search every terminal pane in the window, including panes in other tabs and hidden splits. Type part of the terminal title, profile name or SSH `user@host`. Use the arrow keys or hover over a match to preview its live viewport, including terminal graphics. The preview preserves each pane’s grid size and focus. Screen readers can read the last two nonblank preview lines. Press Enter or click a result to focus it. Escape returns to the pane you were using.
 
+Choose **caret → Find in all panes…** to search terminal text across this window’s tabs and splits. Type a word or phrase to see each matching pane, its match count and an excerpt from the first match. The search includes retained scrollback and words split across soft wraps. In an alternate-screen application it searches the current screen. Use Up and Down to choose a pane. Enter opens that pane’s Find bar at the displayed match, where you can step through the other occurrences. Escape returns to your original pane and scroll position. You can assign **Find in all panes** a shortcut under **Settings → Keyboard**.
+
+Results show the text present when you searched. Use **Refresh** to include later output. Matching ignores case, accepts up to 4,096 UTF-8 bytes, and shows `10,000+` when a pane contains additional matches.
+
 The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Builds, deployments, and other programs that emit **OSC 9;4** can report progress in the tab header and on the window’s Windows taskbar button. The header shows a percentage, **Paused**, **Error**, or **In progress**. When several panes report at once, an error takes priority, followed by paused, normal, and indeterminate progress. Within the same state the least complete operation wins. Clearing a pane’s progress reveals the next one. [Windows Terminal progress sequences](https://learn.microsoft.com/en-us/windows/terminal/tutorials/progress-bar-sequences)
@@ -86,6 +90,10 @@ Choose **New folder** and enter a name to create a directory under the displayed
 Select a file or directory and choose **Rename…** to change its name in the current remote folder. The drawer checks for an existing destination, sends a standard SFTP rename, and selects the new name after the server confirms it. Renaming a link changes the directory entry itself. If the connection drops before confirmation, refresh the parent directory to see which name the server retained.
 
 SFTP v3 requires the server to reject an existing destination. If another process creates the name between the check and the rename, enforcement depends on the server and filesystem. [SFTP v3 rename semantics](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5) · [OpenSSH implementation](https://github.com/openssh/openssh-portable/blob/V_10_2_P1/sftp-server.c#L1187-L1249)
+
+To remove a remote file, symbolic link or empty directory, select it in the SFTP drawer and choose **Delete…**. The confirmation shows the SSH destination, entry type and full remote path. Deleting a link leaves its target intact. A nonempty directory stays in place with its contents. After confirmation, w11term checks the entry type again on the same SSH connection. If the connection drops before the server acknowledges deletion, refresh the parent directory to check the outcome.
+
+SFTP v3 addresses entries by path. Another process can replace an entry between the final type check and the delete request. [SFTP file removal](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.5) · [Directory removal](https://datatracker.ietf.org/doc/html/draft-ietf-secsh-filexfer-02#section-6.6)
 
 ### Share a Windows folder with Linux
 
