@@ -217,10 +217,16 @@ impl TerminalApp {
     }
     pub(super) fn discovery_menu(&self) -> MenuItem {
         let hosts: Vec<_> = self
-            .profiles
+            .catalog
+            .profile_order
             .iter()
-            .filter(|(_, options)| !options.player.rustmush)
-            .flat_map(|(name, _)| {
+            .filter(|name| {
+                self.catalog
+                    .profiles
+                    .get(*name)
+                    .is_some_and(|options| !options.player.rustmush)
+            })
+            .flat_map(|name| {
                 [
                     MenuItem::item(
                         format!("discover-{name}"),
@@ -253,6 +259,7 @@ impl TerminalApp {
             }
             Action::Discover { name, herdr } => {
                 if let Some(options) = self
+                    .catalog
                     .profiles
                     .get(&name)
                     .filter(|options| !options.player.rustmush)
