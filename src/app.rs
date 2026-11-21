@@ -568,6 +568,7 @@ struct CaretMenuBinding {
 }
 
 pub struct TerminalApp {
+    caret_interval: Option<u32>,
     folder_wake: Arc<dyn Fn() + Send + Sync>,
     folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
     taskbar: RefCell<taskbar::Taskbar>,
@@ -707,7 +708,7 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     MoveProfile(String, isize, Arc<[String]>),
-    RefreshProfiles,
+    WindowActivation(bool),
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
@@ -1873,6 +1874,8 @@ impl TerminalApp {
                 if self.tabs.active_id() == Some(entry.id) {
                     self.metrics = tab.surface.metrics.clone();
                     self.invalidator = tab.surface.invalidator.clone();
+                } else {
+                    tab.surface.pause_cursor();
                 }
                 if self.tabs.visible(entry.id) {
                     tab.surface.invalidator.invalidate();
@@ -3379,10 +3382,11 @@ impl Component for TerminalApp {
         keyboard.on_activation(move |focused| {
             if focused {
                 active.activate();
-                sender.send(Message::RefreshProfiles);
             }
+            sender.send(Message::WindowActivation(focused));
         });
         let mut app = Self {
+            caret_interval: crate::cursor_blink::system_interval(),
             folder_wake,
             inbox,
             taskbar: RefCell::default(),
@@ -3503,7 +3507,7 @@ impl Component for TerminalApp {
             &message,
             Message::FrameReady(..)
                 | Message::FolderShare(folder_shares::Action::Panel(..))
-                | Message::RefreshProfiles
+                | Message::WindowActivation(_)
                 | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
@@ -4414,6 +4418,9 @@ impl Component for TerminalApp {
                 Shortcut::TaskbarCreated => {
                     self.taskbar.borrow_mut().shell_restarted();
                 }
+                Shortcut::CaretSettingsChanged => {
+                    self.caret_interval = crate::cursor_blink::system_interval();
+                }
                 Shortcut::RememberWindow => {
                     if let Some(name) = &self.window_profile {
                         let _ = self.windows.borrow_mut().remember(name);
@@ -4530,7 +4537,17 @@ impl Component for TerminalApp {
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
-            Message::RefreshProfiles => {
+            Message::WindowActivation(false) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active()
+                {
+                    tab.surface.pause_cursor();
+                }
+            }
+            Message::WindowActivation(true) => {
+                self.caret_interval = crate::cursor_blink::system_interval();
                 self.refresh_profiles();
                 for entry in self.tabs.entries() {
                     if let Page::Terminal(live) = &entry.value.page

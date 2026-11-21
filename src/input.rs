@@ -134,6 +134,7 @@ pub enum Shortcut {
     RememberWindow,
     BeginResize,
     TaskbarCreated,
+    CaretSettingsChanged,
     NextTab,
     PreviousTab,
     NewTab,
@@ -237,6 +238,18 @@ impl Drop for ThreadHooks {
 }
 
 impl KeyboardBridge {
+    pub fn terminal_focused(&self, sender: &mpsc::UnboundedSender<Command>) -> bool {
+        let _native = self.scope.enter();
+        with_input(|input| {
+            input.borrow().as_ref().is_some_and(|state| {
+                state.terminal_focused()
+                    && state
+                        .target
+                        .as_ref()
+                        .is_some_and(|target| target.sender.same_channel(sender))
+            })
+        })
+    }
     pub fn install(shortcut: impl Fn(Shortcut) + 'static) -> windows::core::Result<Self> {
         let scope = WindowScope::default();
         let _guard = scope.enter();
@@ -662,7 +675,13 @@ unsafe extern "system" fn window_proc(
     let taskbar_created = message != 0 && message == *TASKBAR_CREATED;
     if !matches!(
         message,
-        WM_ACTIVATE | WM_CLOSE | WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE | WM_SIZING | WM_NCDESTROY
+        WM_ACTIVATE
+            | WM_SETTINGCHANGE
+            | WM_CLOSE
+            | WM_ENTERSIZEMOVE
+            | WM_EXITSIZEMOVE
+            | WM_SIZING
+            | WM_NCDESTROY
     ) && !taskbar_created
     {
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
@@ -671,12 +690,16 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     };
     let _guard = scope.enter();
-    if taskbar_created {
+    if taskbar_created || message == WM_SETTINGCHANGE {
         with_input(|s| {
             if let Ok(s) = s.try_borrow()
                 && let Some(s) = s.as_ref()
             {
-                (s.shortcut)(Shortcut::TaskbarCreated);
+                (s.shortcut)(if taskbar_created {
+                    Shortcut::TaskbarCreated
+                } else {
+                    Shortcut::CaretSettingsChanged
+                });
             }
         });
     }
@@ -983,16 +1006,17 @@ impl State {
         self.report_focus();
     }
 
+    fn terminal_focused(&self) -> bool {
+        window::active()
+            && !self.search
+            && !self.modal
+            && !self.switcher
+            && self.picker.is_none()
+            && self.local_mode.is_none()
+    }
     fn report_focus(&self) {
         if let Some(target) = &self.target {
-            let _ = target.sender.send(Command::Focus(
-                window::active()
-                    && !self.search
-                    && !self.modal
-                    && !self.switcher
-                    && self.picker.is_none()
-                    && self.local_mode.is_none(),
-            ));
+            let _ = target.sender.send(Command::Focus(self.terminal_focused()));
         }
     }
 

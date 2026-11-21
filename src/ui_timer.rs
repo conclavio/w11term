@@ -1,4 +1,4 @@
-//! UI-thread retry timer, independent of Reactor's bounded background worker pool.
+//! UI-thread timers, independent of Reactor's bounded background worker pool.
 use std::{cell::RefCell, collections::HashMap};
 use windows::Win32::{Foundation::*, UI::WindowsAndMessaging::*};
 type Callback = Box<dyn FnMut()>;
@@ -6,7 +6,11 @@ thread_local! { static CALLBACKS: RefCell<HashMap<usize, Callback>> = RefCell::d
 pub struct RetryTimer(usize);
 impl RetryTimer {
     pub fn new(callback: impl FnMut() + 'static) -> windows::core::Result<Self> {
-        let id = unsafe { SetTimer(None, 0, 100, Some(tick)) };
+        Self::with_interval(100, callback)
+    }
+
+    pub fn with_interval(ms: u32, callback: impl FnMut() + 'static) -> windows::core::Result<Self> {
+        let id = unsafe { SetTimer(None, 0, ms, Some(tick)) };
         if id == 0 {
             return Err(windows::core::Error::from_thread());
         }

@@ -1917,6 +1917,37 @@ mod tests {
             _ => panic!("unexpected resize"),
         }
     }
+    #[test]
+    fn cursor_blink_mode_preserves_shape_and_reports_the_latest_request() {
+        use termwiz::surface::CursorShape::*;
+        let (mut terminal, mut replies) = engine();
+        for (request, expected, answer) in [
+            ("", Default, 2),
+            ("\x1b[?12h", BlinkingBlock, 1),
+            ("\x1b[?12l", SteadyBlock, 2),
+            ("\x1b[4 q\x1b[?12h", BlinkingUnderline, 1),
+            ("\x1b[?12l", SteadyUnderline, 2),
+            ("\x1b[5 q", BlinkingBar, 1),
+            ("\x1b[?12l", SteadyBar, 2),
+            ("\x1b[?12h", BlinkingBar, 1),
+            ("\x1b[2 q", SteadyBlock, 2),
+            ("\x1b[1 q\x1b[?25l", BlinkingBlock, 1),
+            ("\x1b[0 q", Default, 2),
+            ("\x1b[?12h\x1bc", Default, 2),
+        ] {
+            terminal.advance_bytes(request.as_bytes());
+            terminal.advance_bytes(b"\x1b[?12$p");
+            assert_eq!(terminal.cursor_pos().shape, expected);
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1b[?12;{answer}$y").as_bytes()
+            );
+        }
+        terminal.advance_bytes(b"\x1b[?12h");
+        terminal.reset_connection();
+        terminal.advance_bytes(b"\x1b[?12$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?12;2$y");
+    }
     fn text(t: &Terminal) -> String {
         let s = t.screen();
         s.lines_in_phys_range(s.phys_row(0)..s.phys_row(0) + s.physical_rows)
