@@ -106,6 +106,7 @@ impl server::Handler for Peer {
         s.channel_success(c)?;
         s.data(c, b"ready\r\n".as_slice())?;
         if self.root.join("shell directory").is_dir() {
+            s.data(c, b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07first result\r\n\x1b]133;D;0\x07".as_slice())?;
             s.data(
                 c,
                 b"\x1b]133;A\x07$ \x1b]133;B\x07status\r\n\x1b]133;C\x07".as_slice(),

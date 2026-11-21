@@ -677,7 +677,9 @@ impl<'a> Performer<'a> {
             // reset graphic rendition, erase all positions, move active position to first
             // character position of first line.
             Esc::Code(EscCode::FullReset) => {
-                self.last_command = None;
+                self.command_history = Default::default();
+                self.capturing_shell_input = false;
+                self.command_label = None;
                 self.current_dir = None;
                 let seqno = self.seqno;
                 self.pen = Default::default();
@@ -877,9 +879,7 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. },
             ) => {
-                if self.screen.command_start.is_some() {
-                    self.finish_command_output(None);
-                }
+                self.next_shell_prompt();
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
             }
@@ -891,20 +891,20 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. },
             ) => {
-                if self.screen.command_start.is_some() {
-                    self.finish_command_output(None);
-                }
+                self.next_shell_prompt();
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker { .. },
             ) => {
+                self.begin_command_input();
                 self.pen.set_semantic_type(SemanticType::Input);
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilEndOfLine { .. },
             ) => {
+                self.begin_command_input();
                 self.pen.set_semantic_type(SemanticType::Input);
                 self.clear_semantic_attribute_on_newline = true;
             }
