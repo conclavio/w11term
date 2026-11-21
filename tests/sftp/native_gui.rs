@@ -40,6 +40,26 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches captured OSC 133 command text and copies the selected command on a hosted Windows desktop"]
+async fn native_ssh_command_history_searches_and_copies_the_full_command() {
+    let long = format!("deploy {} [Ångström]", "x".repeat(128));
+    let mut stream = String::new();
+    for (command, output, status) in [
+        (&long[..], "archived deploy output", 17),
+        ("check-status", "[Ångström] appears only in this output", 0),
+    ] {
+        stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;{status}\x07"));
+    }
+    stream.push_str("history-search-ready\r\n");
+    run_palette_fixture(
+        "search-command-history-ui.ps1",
+        b"history-resumed",
+        Some(&stream),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "samples a cursor cell on the focused native SSH canvas"]
 async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
     let (Source::Ssh(ssh), _remote, shells, server) = fixture_connections(false, 1).await else {

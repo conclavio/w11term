@@ -1974,7 +1974,10 @@ impl TerminalApp {
             8 => {
                 self.history_smoke_verify_older();
                 self.update(
-                    Message::History(super::command_history::Action::Return),
+                    Message::History(super::command_history::Action::InPane(
+                        pane,
+                        super::command_history::HistoryAction::Return,
+                    )),
                     context,
                 );
                 assert_eq!(self.tabs.active_id(), Some(id));
