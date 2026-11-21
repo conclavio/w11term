@@ -358,7 +358,7 @@ mod tests {
         assert!(child.wait()?.success());
 
         fs::write(&store.path, backup)?;
-        assert_eq!(store.read()?, [sibling.clone()]);
+        assert_eq!(store.read()?.as_slice(), std::slice::from_ref(&sibling));
         assert!(store.add(target.clone()).is_err());
         let replacement = Grant {
             id: format!("{:032x}", 3),
