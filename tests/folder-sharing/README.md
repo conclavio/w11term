@@ -8,6 +8,8 @@ After unmounting, the test replaces the Windows directory at its saved path. The
 
 The original interactive shell must keep its PID through explicit unmount and dropping a mount handle. The test then disconnects the SSH transport and checks that the mount disappears. A fresh pane opens the same temporary profile and grant store, remounts the saved folder, and forgets it. Linux must see the mount disappear again while its new shell remains usable. Reopening the profile must show an empty grant list.
 
+The profile-wide revocation test gives two profiles on the same SSH account three distinct folders. Linux keeps a file open after reading its first byte. A second Windows process revokes one profile through the Settings API. Linux tries to read 64 MiB farther into that open file and tries new filenames in both revoked folders. Those reads must fail, both mounts must disappear, and the other profile must still read new data from its original mount. Both shells keep their PIDs. Once both SSH connections have closed, the test revokes the remaining profile offline. Reopening it must show no saved folders or mounts until a fresh selection authorizes sharing again.
+
 ## Run the fixture
 
 The **Windows folder mount pilot** GitHub Actions workflow builds two guests from Ubuntu packages and runs them under QEMU on Windows. Both use the same Ubuntu GA kernel. The Ubuntu 26.04 userspace exercises the complete mount lifecycle. The Ubuntu 24.04 userspace checks that w11term identifies its FUSE 3.14 helper and refuses to start a mount while keeping the shell usable. Each guest's SSH listener is forwarded to a Windows loopback port. The runner generates a fresh SSH identity per boot and checks the host key against the guest serial console.

@@ -5,6 +5,7 @@ use super::{
 use crate::{
     folder_grants::{Authority, FolderScope, PaneShares},
     options::{Authentication, Source, SshOptions},
+    profiles::ProfileStore,
     session::{Command, Session},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -30,21 +31,25 @@ async fn checked(link: &ConnectionShare, command: &str) -> Result<Vec<u8>> {
 }
 
 async fn shell_pid(pane: &Session, label: &str) -> Result<u32> {
+    shell_probe(pane, label, "w11result=$$").await
+}
+
+async fn shell_probe(pane: &Session, label: &str, script: &str) -> Result<u32> {
     let (ack, acknowledged) = tokio::sync::oneshot::channel();
     pane.input
         .send(Command::Raw(
-            format!("printf '\\n{label}=%s\\n' \"$$\"\r").into_bytes(),
+            format!("{script}; printf '\\n{label}=%s\\n' \"$w11result\"\r").into_bytes(),
             ack,
         ))
         .map_err(|_| anyhow::anyhow!("interactive pane closed"))?;
     timeout(Duration::from_secs(5), acknowledged)
         .await
-        .context("interactive shell did not accept the PID probe")??
+        .context("interactive shell did not accept the probe")??
         .map_err(anyhow::Error::msg)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let frame = pane.frames.load();
-        if let Some(pid) = frame.rows.iter().find_map(|row| {
+        if let Some(value) = frame.rows.iter().find_map(|row| {
             row.as_str()
                 .trim()
                 .strip_prefix(label)?
@@ -52,18 +57,22 @@ async fn shell_pid(pane: &Session, label: &str) -> Result<u32> {
                 .parse()
                 .ok()
         }) {
-            return Ok(pid);
+            return Ok(value);
         }
         ensure!(
             pane.frames.changed(frame.generation, deadline).await,
-            "missing shell PID marker {label}"
+            "missing shell result {label}"
         );
     }
 }
 
-async fn check_mount(link: &ConnectionShare, mount: &str, tile_digest: &str) -> Result<String> {
+async fn mount_record(link: &ConnectionShare, mount: &str) -> Result<Vec<u8>> {
     let record = format!("awk '$5 == \"{mount}\" {{ print }}' /proc/self/mountinfo");
-    let bytes = checked(link, &record).await?;
+    checked(link, &record).await
+}
+
+async fn check_mount(link: &ConnectionShare, mount: &str, tile_digest: &str) -> Result<String> {
+    let bytes = mount_record(link, mount).await?;
     let line = std::str::from_utf8(&bytes)?;
     let (fields, fs) = line
         .split_once(" - ")
@@ -262,9 +271,8 @@ async fn expect_refused(
 }
 
 async fn wait_detached(link: &ConnectionShare, mount: &str) -> Result<()> {
-    let record = format!("awk '$5 == \"{mount}\" {{ print }}' /proc/self/mountinfo");
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !checked(link, &record).await?.is_empty() {
+    while !mount_record(link, mount).await?.is_empty() {
         ensure!(
             Instant::now() < deadline,
             "detached share is still mounted at {mount}"
@@ -343,7 +351,14 @@ async fn old_fusermount_refuses_before_export() -> Result<()> {
 #[ignore = "requires the disposable Linux FUSE guest and pinned loopback SSH supplied by the mount runner"]
 async fn native_windows_passive_sshfs() -> Result<()> {
     let options = options()?;
-    let (pane, link) = login(&options).await?;
+    individual_grants(&options).await?;
+    profile_revocation(&options)
+        .await
+        .context("profile-wide folder permissions")
+}
+
+async fn individual_grants(options: &SshOptions) -> Result<()> {
+    let (pane, link) = login(options).await?;
     let before = shell_pid(&pane, "BEFORE_MOUNT").await?;
     let fixture = tempfile::tempdir()?;
     let selected = fixture.path().join("selected");
@@ -494,7 +509,7 @@ async fn native_windows_passive_sshfs() -> Result<()> {
             "en",
         )
         .await?;
-    let (new_pane, new_link) = login(&options).await?;
+    let (new_pane, new_link) = login(options).await?;
     ensure!(
         !Arc::ptr_eq(&new_link.handle(), &link.handle()),
         "fixture did not open a fresh authenticated connection"
@@ -537,5 +552,185 @@ async fn native_windows_passive_sshfs() -> Result<()> {
         fs::read(path)? == CONTENT && fs::read(secret)? == b"sibling data",
         "Windows fixture changed"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "invoked by the folder fixture in a separate Windows process"]
+fn revoke_from_settings_process() -> Result<()> {
+    let dir = std::path::PathBuf::from(
+        env::var_os("W11TERM_TEST_REVOKE_DIR").context("missing fixture directory")?,
+    );
+    let profile = env::var("W11TERM_TEST_REVOKE_PROFILE")?;
+    let store = ProfileStore::new(dir.join("profiles.json"))?;
+    let (_, snapshot) = store.inspect_catalog(&profile)?;
+    store.revoke_folder_permissions(&snapshot, &dir.join("permissions"))?;
+    Ok(())
+}
+
+fn revoke_in_other_process(dir: &Path, profile: &str) -> Result<()> {
+    let output = ProcessCommand::new(env::current_exe()?)
+        .args([
+            "--ignored",
+            "--exact",
+            "ssh::folder_mount_fixture::revoke_from_settings_process",
+        ])
+        .env("W11TERM_TEST_REVOKE_DIR", dir)
+        .env("W11TERM_TEST_REVOKE_PROFILE", profile)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    ensure!(
+        output.status.success() && stdout.contains("1 passed"),
+        "revoking {profile} in the Settings process: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+async fn close_transport(link: &ConnectionShare) -> Result<()> {
+    let handle = link.handle();
+    handle
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "offline grant fixture",
+            "en",
+        )
+        .await?;
+    timeout(Duration::from_secs(8), async {
+        while !handle.is_closed() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("SSH transport remained active before offline revoke")?;
+    Ok(())
+}
+
+async fn profile_revocation(options: &SshOptions) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let dir = temp.path();
+    let catalog = dir.join("profiles.json");
+    // The two named profiles deliberately use exactly the same SSH account.
+    fs::write(
+        &catalog,
+        serde_json::to_vec(
+            &serde_json::json!({"profiles":{"subject":options, "neighbor":options}}),
+        )?,
+    )?;
+    let scope =
+        |profile: &str| FolderScope::new(catalog.clone(), profile.into(), dir.join("permissions"));
+    let remote = |name: &str| format!("{HOME}/windows/{name}");
+    let names = ["revoked-first", "revoked-second", "other-profile"];
+    let fresh = format!("uncached-{:032x}", rand::random::<u128>());
+    for name in names {
+        let root = dir.join(name);
+        fs::create_dir(&root)?;
+        fs::write(root.join(NAME), name)?;
+    }
+    const DISTANT_OFFSET: u64 = 64 * 1024 * 1024;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut held = fs::File::create(dir.join(names[0]).join("held.bin"))?;
+        held.write_all(b"A")?;
+        held.seek(SeekFrom::Start(DISTANT_OFFSET))?;
+        held.write_all(b"Z")?;
+    }
+
+    {
+        let (pane, link) = login(options).await?;
+        let (neighbor_pane, neighbor_link) = login(options).await?;
+        let pid = shell_pid(&pane, "SUBJECT_BEFORE").await?;
+        let neighbor_pid = shell_pid(&neighbor_pane, "NEIGHBOR_BEFORE").await?;
+        let subject = pane.profile_folders(scope("subject"));
+        let neighbor = neighbor_pane.profile_folders(scope("neighbor"));
+        for (manager, name) in [
+            (&subject, names[0]),
+            (&subject, names[1]),
+            (&neighbor, names[2]),
+        ] {
+            let auth = ready_authority(manager).await?;
+            manager.add(&auth, name, dir.join(name))?;
+            wait_profile(manager, &auth, name, Some(FolderMountStatus::Mounted)).await?;
+            ensure!(
+                checked(&link, &format!("cat {}/{NAME}", remote(name))).await? == name.as_bytes()
+            );
+        }
+        let guard = remote(names[2]);
+        let guard_record = mount_record(&neighbor_link, &guard).await?;
+        ensure!(!guard_record.is_empty(), "other profile was never mounted");
+        let open = format!(
+            "exec 9<{}/held.bin && dd bs=1 count=1 status=none <&9 >/dev/null; w11result=$?",
+            remote(names[0])
+        );
+        ensure!(
+            shell_probe(&pane, "OPEN_BEFORE_REVOKE", &open).await? == 0,
+            "could not open the live share and read its first byte"
+        );
+
+        revoke_in_other_process(dir, "subject")?;
+        // New filenames and bytes cannot have been served by the Linux cache.
+        // Try to read before waiting for the asynchronous SSHFS teardown.
+        for name in names {
+            fs::write(dir.join(name).join("after-revoke"), &fresh)?;
+        }
+        // The first read advanced this description by one byte. Seek far past
+        // Linux read-ahead using the same fd, without looking up the path again.
+        let held_read = format!(
+            "dd iflag=skip_bytes skip={} bs=1 count=1 status=none <&9 >/dev/null; w11result=$?; exec 9<&-",
+            DISTANT_OFFSET - 1
+        );
+        ensure!(
+            shell_probe(&pane, "HELD_AFTER_REVOKE", &held_read).await? != 0,
+            "an existing file descriptor served an uncached read after revocation"
+        );
+        for name in &names[..2] {
+            let result =
+                bounded_command(&link, &format!("cat {}/after-revoke", remote(name)), 1024).await?;
+            ensure!(
+                result.status != 0 && result.stdout.is_empty(),
+                "revoked mount {name} served a new read"
+            );
+        }
+        for name in &names[..2] {
+            wait_detached(&link, &remote(name)).await?;
+        }
+        ensure!(
+            guard_record == mount_record(&neighbor_link, &guard).await?,
+            "revoking a profile replaced its neighbor's mount"
+        );
+        ensure!(
+            checked(&neighbor_link, &format!("cat {guard}/after-revoke")).await?
+                == fresh.as_bytes()
+        );
+        ensure!(shell_pid(&pane, "SUBJECT_AFTER").await? == pid);
+        ensure!(shell_pid(&neighbor_pane, "NEIGHBOR_AFTER").await? == neighbor_pid);
+        close_transport(&link).await?;
+        close_transport(&neighbor_link).await?;
+    }
+    // Both Session objects, managers and authenticated connections have gone.
+    // The neighbor still has a saved permission, but cannot receive a UI wake.
+    revoke_in_other_process(dir, "neighbor")?;
+    let (pane, link) = login(options).await?;
+    let subject = pane.profile_folders(scope("subject"));
+    let subject_auth = ready_authority(&subject).await?;
+    ensure!(
+        subject.rows(&subject_auth)?.is_empty(),
+        "live revocation did not persist for the subject"
+    );
+    drop(subject);
+    let manager = pane.profile_folders(scope("neighbor"));
+    let auth = ready_authority(&manager).await?;
+    ensure!(
+        manager.rows(&auth)?.is_empty(),
+        "an offline-revoked permission reappeared"
+    );
+    let name = names[2];
+    let mount = remote(name);
+    wait_detached(&link, &mount).await?;
+    manager.add(&auth, name, dir.join(name))?;
+    wait_profile(&manager, &auth, name, Some(FolderMountStatus::Mounted)).await?;
+    ensure!(checked(&link, &format!("cat {mount}/after-revoke")).await? == fresh.as_bytes());
+    manager.forget(&auth, name)?;
+    wait_detached(&link, &mount).await?;
     Ok(())
 }
