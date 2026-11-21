@@ -41,6 +41,8 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 ## Tabs and profiles
 
+Use **Ctrl+Shift+P** or **caret → Find pane…** to search every terminal pane in the window, including panes in other tabs and hidden splits. Type part of the terminal title, profile name or SSH `user@host`. Use the arrow keys to highlight a match, then press Enter to focus it. Escape returns to the pane you were using.
+
 The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
@@ -162,6 +164,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Ctrl+Shift+Home / Ctrl+Shift+End | Oldest retained history / return to the live screen |
 | Ctrl+Shift+Up / Ctrl+Shift+Down | Previous / next OSC 133 prompt |
 | Ctrl+Shift+F | Find in scrollback; case toggle, highlighted matches, and a match counter |
+| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
 | Enter in find / F3; Shift+Enter / Shift+F3 | Next / previous find result, wrapping at either end |
 | Escape in find | Close find and restore terminal keyboard input |
 | Mouse wheel | Scrollback using Windows' wheel-line/page preference, including accumulated fractional deltas; remote wheel events when mouse reporting is enabled |

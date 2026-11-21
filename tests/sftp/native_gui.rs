@@ -4,6 +4,65 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives the native pane picker with two SSH peers and Windows PowerShell"]
+async fn native_pane_picker_routes_keys_across_tabs_and_restores_focus_on_escape() {
+    let (source, _remote, opens, server) = fixture_connections(false, 2).await;
+    let Source::Ssh(dev1) = source else {
+        unreachable!()
+    };
+    let mut dev2 = dev1.clone();
+    dev2.user = "navigator".into();
+    let state = tempfile::tempdir().unwrap();
+    let data = state.path().join("data");
+    fs::create_dir(&data).unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles": {"dev1": dev1, "dev2": dev2}})).unwrap(),
+    )
+    .unwrap();
+    let leaf = |slot: u32, source: Value| json!({"type":"leaf", "slot":slot, "source":source});
+    let ssh = |name| json!({"kind":"saved_profile", "value":name});
+    let local = json!({"kind":"local","value":{"name":"Windows PowerShell",
+        "shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}});
+    let workspace = json!({"active_tab":0,"tabs":[
+        {"focused":1,"layout":leaf(1, ssh("dev1"))},
+        {"focused":3,"layout":{"type":"split","axis":"columns","ratio":0.5,
+            "first":leaf(2, ssh("dev2")), "second":leaf(3, local)}}
+    ]});
+    fs::write(
+        data.join("workspaces.json"),
+        serde_json::to_vec(&json!({"version":1,"workspaces":{"picker":workspace}})).unwrap(),
+    )
+    .unwrap();
+    let result = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-STA", "-File"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pane-picker-ui.ps1"))
+        .args([
+            "-Gui",
+            env!("CARGO_BIN_EXE_w11term"),
+            "-Cli",
+            env!("CARGO_BIN_EXE_w11term-cli"),
+        ])
+        .arg("-State")
+        .arg(state.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "switching panes reopened an SSH connection"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens an isolated native WinUI window"]
 async fn native_ssh_split() {
     let (source, _root, opens, server) = fixture_server(false).await;

@@ -36,6 +36,7 @@ struct State {
     grid: Option<Grid>,
     window: Option<HWND>,
     search: bool,
+    picker: bool,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
     zoom_remainder: i32,
@@ -113,6 +114,10 @@ pub enum Shortcut {
     FindNext,
     FindPrevious,
     FindClose,
+    PanePicker,
+    PickerMove(isize),
+    PickerAccept,
+    PickerCancel,
 }
 
 pub struct KeyboardBridge {
@@ -167,6 +172,7 @@ impl KeyboardBridge {
                 grid: None,
                 window: None,
                 search: false,
+                picker: false,
                 wheel_panes: WheelPanes::default(),
                 wheel_remainder: 0,
                 zoom_remainder: 0,
@@ -254,7 +260,23 @@ impl KeyboardBridge {
                 }
                 s.search = visible;
                 if let Some(target) = &s.target {
-                    let _ = target.sender.send(Command::Focus(!visible));
+                    let _ = target.sender.send(Command::Focus(!visible && !s.picker));
+                }
+            }
+        });
+        ime::sync_context();
+    }
+    pub fn set_picker(&self, visible: bool) {
+        INPUT.with(|input| {
+            if let Some(s) = input.borrow_mut().as_mut() {
+                s.picker = visible;
+                if visible {
+                    ime::cancel();
+                    s.release_keys();
+                    s.wheel_panes.hovered = None;
+                    if let Some(target) = &s.target {
+                        let _ = target.sender.send(Command::Focus(false));
+                    }
                 }
             }
         });
@@ -402,7 +424,9 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         }
                     }
                     if let Some(target) = &state.target {
-                        let _ = target.sender.send(Command::Focus(focused && !state.search));
+                        let _ = target
+                            .sender
+                            .send(Command::Focus(focused && !state.search && !state.picker));
                     }
                 }
             });
@@ -702,6 +726,37 @@ impl State {
         if self.modal {
             return false;
         }
+        if self.picker {
+            if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
+                return true;
+            }
+            if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                let action = match vk {
+                    0x26 => Shortcut::PickerMove(-1),
+                    0x28 => Shortcut::PickerMove(1),
+                    0x1b => Shortcut::PickerCancel,
+                    0x0d => Shortcut::PickerAccept,
+                    _ => return false,
+                };
+                self.swallowed.insert(vk);
+                if message.lParam.0 & (1 << 30) == 0 || matches!(action, Shortcut::PickerMove(_)) {
+                    (self.shortcut)(action);
+                }
+                return true;
+            }
+            // Native text editing owns printable keys, composition and clipboard shortcuts.
+            return false;
+        }
+        if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN)
+            && matches!(vk, 0x1b | 0x0d | 0x26 | 0x28)
+            && self.swallowed.contains(&vk)
+        {
+            // A held picker key can repeat after Enter or Escape removed the overlay.
+            if message.lParam.0 & (1 << 30) != 0 {
+                return true;
+            }
+            self.swallowed.remove(&vk);
+        }
         if ime::active() {
             match message.message {
                 WM_CHAR | WM_SYSCHAR => return true,
@@ -781,6 +836,8 @@ impl State {
                 pane_shortcut(vk, mods, self.target.is_some() && !self.search, right_alt);
             let shortcut = if pane_action.is_some() {
                 pane_action
+            } else if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x50 {
+                Some(Shortcut::PanePicker)
             } else if mods.contains(KeyModifiers::CTRL) && vk == VK_TAB.0 as u32 {
                 Some(if mods.contains(KeyModifiers::SHIFT) {
                     Shortcut::PreviousTab
@@ -808,6 +865,9 @@ impl State {
                 }
                 self.swallowed.insert(vk);
                 if message.lParam.0 & (1 << 30) == 0 {
+                    if matches!(shortcut, Shortcut::PanePicker) {
+                        self.picker = true;
+                    }
                     (self.shortcut)(shortcut);
                 }
                 return true;
@@ -993,7 +1053,7 @@ impl State {
         }
     }
     fn wheel(&mut self, delta: i16, mods: KeyModifiers) -> bool {
-        if self.modal || self.switcher {
+        if self.modal || self.switcher || self.picker {
             return false;
         }
         let Some(target) = &self.target else {
@@ -1267,6 +1327,7 @@ mod tests {
             grid: None,
             window: None,
             search: false,
+            picker: false,
             wheel_panes: WheelPanes::default(),
             wheel_remainder: 0,
             zoom_remainder: 0,
@@ -1313,6 +1374,26 @@ mod tests {
             "find text must stay in the native textbox"
         );
         state.search = false;
+        state.picker = true;
+        assert!(!state.handle(&MSG {
+            message: WM_CHAR,
+            wParam: WPARAM('q' as usize),
+            ..Default::default()
+        }));
+        let enter = |message, repeat| MSG {
+            message,
+            wParam: WPARAM(VK_RETURN.0 as usize),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        assert!(state.handle(&enter(WM_KEYDOWN, false)));
+        state.picker = false;
+        assert!(state.handle(&enter(WM_KEYDOWN, true)));
+        assert!(state.handle(&enter(WM_KEYUP, false)));
+        assert!(
+            new_input.try_recv().is_err(),
+            "picker input reached the shell"
+        );
         state.game_mode = true;
         let key_message = |message, repeat| MSG {
             message,

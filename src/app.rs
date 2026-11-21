@@ -40,6 +40,7 @@ mod durable_view;
 mod ime_smoke;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod pane_picker;
 mod pane_view;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
@@ -281,6 +282,7 @@ fn tab_menu_message(label: String) -> Message {
         "Forget this device (revoke game key)" => Message::DeviceAction(true),
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
+        "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         _ => Message::ControlIdle,
     }
 }
@@ -334,9 +336,13 @@ pub struct TerminalApp {
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     mru: Vec<TabId>,
     switcher: Option<TabSwitcher>,
+    picker: Option<pane_picker::Picker>,
 }
 
 pub enum Message {
+    PickerQuery(String),
+    PickerChoose(u64),
+    PickerFocus(u8),
     LocalProfile(local_profile::Action),
     Files(FileAction),
     AccessibleSelection(crate::accessibility::SelectionRequest),
@@ -518,6 +524,9 @@ impl TerminalApp {
         };
         let frame = tab.session.frames.load();
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
+        if prompt_id.is_some() && self.picker.take().is_some() {
+            self.keyboard.set_picker(false);
+        }
         let changed = prompt_id != tab.prompt_id;
         self.keyboard
             .set_game_mode(tab.session.player.read().unwrap().game_mode);
@@ -1369,6 +1378,9 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        if self.picker.take().is_some() {
+            self.keyboard.set_picker(false);
+        }
         let single = matches!(
             self.tabs.active_layout(),
             Some(w11term::pane_layout::Layout::Leaf(_))
@@ -2040,6 +2052,7 @@ impl TerminalApp {
             .menu(Menu::new(
                 [
                     self.pane_menu(),
+                    MenuItem::item("pane-picker", "Find pane…"),
                     MenuItem::item("paste", "Paste"),
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
@@ -2630,6 +2643,7 @@ impl Component for TerminalApp {
             measured_layout: None,
             mru: Vec::new(),
             switcher: None,
+            picker: None,
             selection_pending: true,
             selection_epoch: 0,
         };
@@ -2688,6 +2702,8 @@ impl Component for TerminalApp {
             &message,
             Message::FrameReady(..)
                 | Message::Files(..)
+                | Message::PickerQuery(..)
+                | Message::PickerFocus(..)
                 | Message::PaneRatio(..)
                 | Message::DividerPress(..)
                 | Message::DividerEnd(..)
@@ -2713,6 +2729,9 @@ impl Component for TerminalApp {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
+            Message::PickerQuery(query) => self.filter_picker(query),
+            Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
+            Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::Files(action) => self.file_action(action, context),
             Message::AccessibleSelection(request) => {
                 if let Some(AppTab {
@@ -2723,6 +2742,7 @@ impl Component for TerminalApp {
                     && tab.prompt_id.is_none()
                     && !tab.find.open
                     && self.switcher.is_none()
+                    && self.picker.is_none()
                 {
                     let frame = tab.session.frames.load();
                     if frame.generation == request.generation {
@@ -3413,6 +3433,14 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::PickerAccept => self.accept_picker(context),
+                Shortcut::PickerCancel => self.close_picker(context),
+                Shortcut::PickerMove(delta) => {
+                    if let Some(picker) = &mut self.picker {
+                        picker.move_by(delta);
+                    }
+                }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
@@ -3802,6 +3830,9 @@ impl Component for TerminalApp {
             }
             Message::FindApply(id, epoch) => self.apply_find(id, epoch),
             Message::FindFocus(id, epoch, attempt) => {
+                if self.picker.is_some() {
+                    return;
+                }
                 let sender = context.sender();
                 if self.tabs.active_id() == Some(id)
                     && let Some(AppTab {
@@ -3844,6 +3875,7 @@ impl Component for TerminalApp {
             && tab.prompt_id.is_none()
             && !tab.find.open
             && self.switcher.is_none()
+            && self.picker.is_none()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
             let metrics = tab.surface.metrics.get();
@@ -3970,6 +4002,9 @@ impl Component for TerminalApp {
                             .keyed_children(choices),
                     ),
             ));
+        }
+        if let Some(picker) = &self.picker {
+            views.push(KeyedView::new("pane-picker", picker.view(self, context)));
         }
         if let Some(id) = self.tabs.active_id()
             && let Some(AppTab {
