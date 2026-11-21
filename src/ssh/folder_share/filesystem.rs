@@ -18,8 +18,9 @@ use windows::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FILE_NAMES_INFORMATION, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-            FILE_SYNCHRONOUS_IO_NONALERT, FileNamesInformation, NtCreateFile, NtQueryDirectoryFile,
+            FILE_LINK_ENTRY_INFORMATION, FILE_LINKS_INFORMATION, FILE_NAMES_INFORMATION, FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileHardLinkInformation,
+            FileNamesInformation, NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile,
         },
     },
     Win32::{
@@ -247,6 +248,9 @@ fn describe(file: &File, name: &str) -> io::Result<Entry> {
     {
         return Err(excluded());
     }
+    if name != "/" && name.encode_utf16().count() <= 12 {
+        check_primary_name(file)?;
+    }
     let len = if is_dir {
         0
     } else {
@@ -257,6 +261,64 @@ fn describe(file: &File, name: &str) -> io::Result<Entry> {
         is_dir,
         len,
     })
+}
+
+// A DOS alias can have an arbitrary 8.3 spelling. Query the primary basename
+// from the opened object itself so such an alias cannot expose a name that
+// directory enumeration deliberately omits (e.g. a trailing period).
+fn check_primary_name(file: &File) -> io::Result<()> {
+    #[repr(C, align(8))]
+    struct SingleLink {
+        needed: u32,
+        count: u32,
+        next: u32,
+        padding: u32,
+        parent_id: i64,
+        chars: u32,
+        name: [u16; 255],
+    }
+    const {
+        assert!(
+            offset_of!(SingleLink, name)
+                == offset_of!(FILE_LINKS_INFORMATION, Entry)
+                    + offset_of!(FILE_LINK_ENTRY_INFORMATION, FileName)
+        );
+    }
+    let mut link = SingleLink {
+        needed: 0,
+        count: 0,
+        next: 0,
+        padding: 0,
+        parent_id: 0,
+        chars: 0,
+        name: [0; 255],
+    };
+    let mut ios = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtQueryInformationFile(
+            handle(file),
+            &mut ios,
+            (&raw mut link).cast(),
+            size_of::<SingleLink>() as u32,
+            FileHardLinkInformation,
+        )
+    };
+    nt_result(status)?;
+    let length = link.chars as usize; // This information class counts UTF-16 code units.
+    if link.count != 1 || link.next != 0 || length > link.name.len() {
+        return Err(excluded());
+    }
+    if ios.Information < offset_of!(SingleLink, name) + length * 2 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid NTFS link record",
+        ));
+    }
+    let primary = String::from_utf16(&link.name[..length]).map_err(|_| excluded())?;
+    if !valid_component(&primary) {
+        return Err(excluded());
+    }
+    Ok(())
 }
 
 impl Entry {
@@ -624,6 +686,68 @@ mod tests {
             assert_eq!(other.join().unwrap()?, expected);
             Ok(())
         })
+    }
+
+    #[test]
+    fn ntfs_short_alias_cannot_reveal_an_omitted_long_name() -> io::Result<()> {
+        use std::{
+            ffi::OsString,
+            os::windows::ffi::{OsStrExt, OsStringExt},
+            path::PathBuf,
+        };
+        fn short_name(path: &Path) -> io::Result<String> {
+            let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut result = vec![0u16; 32768];
+            let len =
+                unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut result)) } as usize;
+            if len == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let path = PathBuf::from(OsString::from_wide(&result[..len]));
+            Ok(path.file_name().unwrap().to_str().unwrap().to_owned())
+        }
+        let temp = tempfile::tempdir()?;
+        let root = Root::open(temp.path())?;
+        // The extended prefix is local test setup for an actual NTFS name that
+        // normal Win32 path processing would have trimmed.
+        let directory = fs::canonicalize(temp.path())?;
+        let hidden = directory.join("private long filename.");
+        let hidden_dir = directory.join("private directory.");
+        let ordinary = directory.join("ordinary long filename.txt");
+        fs::write(&hidden, b"hidden")?;
+        fs::create_dir(&hidden_dir)?;
+        fs::write(hidden_dir.join("entry"), b"hidden")?;
+        fs::write(&ordinary, b"public")?;
+        fs::write(directory.join("README.md"), b"short primary name")?;
+        assert_eq!(read(&root, "README.md")?, b"short primary name");
+        assert_eq!(read(&root, &short_name(&ordinary)?)?, b"public");
+        let alias = short_name(&hidden)?;
+        if valid_component(&alias) {
+            assert_eq!(
+                root.file(&alias).unwrap_err().kind(),
+                ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                root.metadata(&alias).unwrap_err().kind(),
+                ErrorKind::PermissionDenied
+            );
+            eprintln!("verified the volume's actual 8.3 alias for the omitted entry");
+        } else {
+            // 8.3 generation is disabled on some NTFS volumes. In that case the
+            // OS returns the long name directly, which the virtual parser rejects.
+            assert_eq!(
+                root.file(&alias).unwrap_err().kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+        let parent_alias = short_name(&hidden_dir)?;
+        assert!(root.file(&format!("{parent_alias}/entry")).is_err());
+        assert!(root.list(&parent_alias).is_err());
+        assert_eq!(root.list("/")?.len(), 2);
+        fs::remove_file(hidden)?;
+        fs::remove_file(hidden_dir.join("entry"))?;
+        fs::remove_dir(hidden_dir)?;
+        Ok(())
     }
 
     #[test]
