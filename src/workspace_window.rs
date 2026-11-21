@@ -62,7 +62,7 @@ pub fn prepare(options: Options) -> Result<Option<Launch>> {
             }
         }
     }
-    if options.switch_workspace && focus_existing(&key)? {
+    if options.switch_workspace && focus_existing(&key, None)? {
         return Ok(None);
     }
     let layout =
@@ -77,20 +77,23 @@ pub fn prepare(options: Options) -> Result<Option<Launch>> {
     )))
 }
 
-fn owner(key: &str) -> Result<Option<control::WorkspaceOwner>> {
+fn owner(key: &str, caller: Option<control::WindowId>) -> Result<Option<control::WorkspaceOwner>> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
-            tokio::time::timeout(Duration::from_secs(4), control::workspace_owner(key))
-                .await
-                .context("Timed out verifying the workspace window")?
+            tokio::time::timeout(
+                Duration::from_secs(4),
+                control::workspace_owner_for(key, caller),
+            )
+            .await
+            .context("Timed out verifying the workspace window")?
         })
 }
 
-fn focus_existing(key: &str) -> Result<bool> {
+fn focus_existing(key: &str, caller: Option<control::WindowId>) -> Result<bool> {
     for _ in 0..2 {
-        let Some(window) = owner(key)? else {
+        let Some(window) = owner(key, caller)? else {
             return Ok(false);
         };
         if activate(&window)? {
@@ -102,10 +105,10 @@ fn focus_existing(key: &str) -> Result<bool> {
     bail!("Workspace windows are closing. Try switching again.")
 }
 
-pub fn switch(name: &str, profiles: &Path) -> Result<()> {
+pub fn switch(name: &str, profiles: &Path, caller: control::WindowId) -> Result<()> {
     let catalog = w11term::keys::data_dir()?.join("workspaces.json");
     let key = workspace_key(&catalog, profiles, name)?;
-    if focus_existing(&key)? {
+    if focus_existing(&key, Some(caller))? {
         return Ok(());
     }
     // The child rechecks under the registration lock. Two simultaneous clicks
@@ -133,13 +136,13 @@ pub fn switch(name: &str, profiles: &Path) -> Result<()> {
             }
             // A concurrent launch can activate the winner and exit successfully.
             ensure!(
-                focus_existing(&key)?,
+                focus_existing(&key, Some(caller))?,
                 "Workspace {name} closed before its window was ready"
             );
             return Ok(());
         }
         if manifest.try_exists()?
-            && let Some(window) = owner(&key)?
+            && let Some(window) = owner(&key, Some(caller))?
             && window.pid == child.id()
             && activate(&window)?
         {
@@ -170,6 +173,7 @@ pub fn save(
     profiles: &Path,
     layout: &Workspace,
     server: &control::Server,
+    window_id: control::WindowId,
 ) -> Result<()> {
     let catalog = w11term::keys::data_dir()?.join("workspaces.json");
     let key = workspace_key(&catalog, profiles, name)?;
@@ -178,7 +182,7 @@ pub fn save(
         .context("Another window is launching this workspace. Try saving again.")?;
     WorkspaceStore::new(catalog).save(name, layout)?;
     server
-        .publish_workspace(Some(key))
+        .publish_window_workspace(window_id, Some(key))
         .context("Workspace saved, but its window could not be registered")
 }
 
@@ -218,6 +222,9 @@ fn activate(owner: &control::WorkspaceOwner) -> Result<bool> {
     struct Search {
         pid: u32,
         hwnd: HWND,
+        window_id: Option<control::WindowId>,
+        registered: usize,
+        ambiguous: bool,
     }
     unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
         // EnumWindows invokes us synchronously on this thread.
@@ -225,15 +232,28 @@ fn activate(owner: &control::WorkspaceOwner) -> Result<bool> {
         unsafe {
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            if pid == search.pid
-                && IsWindowVisible(hwnd).as_bool()
-                && GetWindow(hwnd, GW_OWNER).is_err()
-            {
+            if pid == search.pid && IsWindowVisible(hwnd).as_bool() {
+                if let Some(id) = search.window_id {
+                    if (search.registered == 0 || search.registered == hwnd.0 as usize)
+                        && control::native_window_matches(hwnd.0 as usize, id)
+                    {
+                        search.hwnd = hwnd;
+                        return false.into();
+                    }
+                    return true.into();
+                }
+                // Previous single-window releases did not publish a logical ID.
+                if GetWindow(hwnd, GW_OWNER).is_ok() {
+                    return true.into();
+                }
                 let mut title = [0u16; 16];
                 let len = GetWindowTextW(hwnd, &mut title);
                 if String::from_utf16_lossy(&title[..len as usize]).starts_with("w11term") {
+                    if !search.hwnd.is_invalid() {
+                        search.ambiguous = true;
+                        return false.into();
+                    }
                     search.hwnd = hwnd;
-                    return false.into();
                 }
             }
         }
@@ -250,9 +270,16 @@ fn activate(owner: &control::WorkspaceOwner) -> Result<bool> {
         let mut search = Search {
             pid,
             hwnd: HWND::default(),
+            window_id: owner.window_id,
+            registered: owner.hwnd,
+            ambiguous: false,
         };
         unsafe {
             let _ = EnumWindows(Some(visit), LPARAM((&mut search as *mut Search) as isize));
+            ensure!(
+                !search.ambiguous,
+                "Older workspace process {pid} has multiple terminal windows"
+            );
             if !search.hwnd.is_invalid() {
                 if IsIconic(search.hwnd).as_bool() {
                     if !restore_sent {
