@@ -62,6 +62,8 @@ try {
         $journal.events | Where-Object { $_.kind -eq 'connected' -and $_.data.generation -gt 1 }
     }
     Wait-Header 'palette-ssh'
+    Set-SshProgress $right '1;77' "77% $dot palette-ssh"
+    Set-SshProgress $right '0' 'palette-ssh'
     Wait-Focus $local
     Wait-Header 'Palette PowerShell'
     if ((Read-ShellPid 'after') -ne $shellPid) { throw 'Background SSH progress interrupted PowerShell' }
@@ -71,7 +73,9 @@ try {
     Type-Line "[Console]::Write([char]27 + ']9;4;1;63' + [char]7)"
     Wait-Header "63% $dot Palette PowerShell"
     Type-Line 'exit 23'
-    $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','Local process exited with code 23')
+    $null = Wait-Until 'local PowerShell exit status' {
+        (Control @('get-text','--pane',"$local")).status -eq 'Local process exited with code 23'
+    }
     Wait-Header 'Palette PowerShell'
 
     Press-Key 0x77 # F8 selects tab 1 and restores its last active split.
