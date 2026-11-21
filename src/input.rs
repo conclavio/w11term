@@ -146,7 +146,7 @@ pub enum Shortcut {
     RememberWindow,
     BeginResize,
     TaskbarCreated,
-    CaretSettingsChanged,
+    CaretPresentationChanged,
     NextTab,
     PreviousTab,
     NewTab,
@@ -255,7 +255,8 @@ impl KeyboardBridge {
         let _native = self.scope.enter();
         with_input(|input| {
             input.borrow().as_ref().is_some_and(|state| {
-                state.terminal_focused()
+                window::visible()
+                    && state.terminal_focused()
                     && state
                         .target
                         .as_ref()
@@ -698,6 +699,8 @@ unsafe extern "system" fn window_proc(
         message,
         WM_ACTIVATE
             | WM_SETTINGCHANGE
+            | WM_SIZE
+            | WM_WINDOWPOSCHANGED
             | WM_CLOSE
             | WM_ENTERSIZEMOVE
             | WM_EXITSIZEMOVE
@@ -711,19 +714,6 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     };
     let _guard = scope.enter();
-    if taskbar_created || message == WM_SETTINGCHANGE {
-        with_input(|s| {
-            if let Ok(s) = s.try_borrow()
-                && let Some(s) = s.as_ref()
-            {
-                (s.shortcut)(if taskbar_created {
-                    Shortcut::TaskbarCreated
-                } else {
-                    Shortcut::CaretSettingsChanged
-                });
-            }
-        });
-    }
     if message == WM_ACTIVATE {
         window::activated((wparam.0 & 0xffff) != WA_INACTIVE as usize);
     }
@@ -749,6 +739,21 @@ unsafe extern "system" fn window_proc(
         });
     }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+    let visibility_changed =
+        matches!(message, WM_SIZE | WM_WINDOWPOSCHANGED) && scope.refresh_visibility(hwnd);
+    if taskbar_created || message == WM_SETTINGCHANGE || visibility_changed {
+        with_input(|s| {
+            if let Ok(s) = s.try_borrow()
+                && let Some(s) = s.as_ref()
+            {
+                (s.shortcut)(if taskbar_created {
+                    Shortcut::TaskbarCreated
+                } else {
+                    Shortcut::CaretPresentationChanged
+                });
+            }
+        });
+    }
     if matches!(message, WM_EXITSIZEMOVE | WM_CLOSE) {
         with_input(|s| {
             if let Ok(s) = s.try_borrow()

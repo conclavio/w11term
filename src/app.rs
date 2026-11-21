@@ -4533,7 +4533,7 @@ impl Component for TerminalApp {
                 Shortcut::TaskbarCreated => {
                     self.taskbar.borrow_mut().shell_restarted();
                 }
-                Shortcut::CaretSettingsChanged => {
+                Shortcut::CaretPresentationChanged => {
                     self.caret_interval = crate::cursor_blink::system_interval();
                 }
                 Shortcut::RememberWindow => {

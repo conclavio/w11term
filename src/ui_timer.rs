@@ -5,16 +5,34 @@ type Callback = Box<dyn FnMut()>;
 thread_local! { static CALLBACKS: RefCell<HashMap<usize, Callback>> = RefCell::default(); }
 pub struct RetryTimer(usize);
 impl RetryTimer {
-    pub fn new(callback: impl FnMut() + 'static) -> windows::core::Result<Self> {
-        Self::with_interval(100, callback)
+    pub fn new(mut callback: impl FnMut() + 'static) -> windows::core::Result<Self> {
+        Self::with_next_delay(100, move || {
+            callback();
+            100
+        })
     }
 
-    pub fn with_interval(ms: u32, callback: impl FnMut() + 'static) -> windows::core::Result<Self> {
+    /// The callback can adjust the next delay without allocating another Win32 timer.
+    pub fn with_next_delay(
+        ms: u32,
+        mut callback: impl FnMut() -> u32 + 'static,
+    ) -> windows::core::Result<Self> {
         let id = unsafe { SetTimer(None, 0, ms, Some(tick)) };
         if id == 0 {
             return Err(windows::core::Error::from_thread());
         }
-        CALLBACKS.with(|entries| entries.borrow_mut().insert(id, Box::new(callback)));
+        let mut delay = ms;
+        CALLBACKS.with(|entries| {
+            entries.borrow_mut().insert(
+                id,
+                Box::new(move || {
+                    let next = callback();
+                    if next != delay && unsafe { SetTimer(None, id, next, Some(tick)) } != 0 {
+                        delay = next;
+                    }
+                }),
+            )
+        });
         Ok(Self(id))
     }
 }
