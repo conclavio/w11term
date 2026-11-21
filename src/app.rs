@@ -459,6 +459,8 @@ fn tab_menu_message(label: String) -> Message {
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
         "Command history" => Message::History(command_history::Action::Open),
+        "Notify when command finishes" => Message::Attention(attention::Action::WatchCommand(true)),
+        "Cancel command notification" => Message::Attention(attention::Action::WatchCommand(false)),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
@@ -2623,6 +2625,11 @@ impl TerminalApp {
                 None => MenuItem::item("copy-last-output", "Copy last command output"),
             });
             items.push(MenuItem::item("command-history", "Command history"));
+            items.push(match live.session.events.command_watch() {
+                Some(true) => MenuItem::item("command-watch", "Cancel command notification"),
+                Some(false) => MenuItem::item("command-watch", "Notify when command finishes"),
+                None => MenuItem::disabled("command-watch", "Notify when command finishes"),
+            });
             if let Some(menu) = durable_view::pane_menu(live) {
                 items.push(menu);
             }
@@ -3304,7 +3311,12 @@ impl Component for TerminalApp {
             self.header.borrow_mut().take();
         }
         if matches!(&message, Message::Control(_) | Message::AttentionChanged) {
-            self.inbox.acknowledge_wake();
+            if self.inbox.acknowledge_wake()
+                && let Some(hwnd) = self.keyboard.hwnd()
+            {
+                attention::flash_background_window(hwnd);
+            }
+            self.refresh_open_commands();
             self.watch_control(context);
         }
         let message = match message {

@@ -1,6 +1,7 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
 use std::sync::Arc;
+pub use wezterm_escape_parser::osc::FinalTermSemanticPrompt;
 use wezterm_escape_parser::parser::Parser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +78,10 @@ pub enum Alert {
 
 pub trait AlertHandler: Send + Sync {
     fn alert(&mut self, alert: Alert);
+
+    /// Live primary-screen markers, observed in parser order before history capture.
+    fn semantic_prompt(&mut self, _marker: &FinalTermSemanticPrompt) {}
+    fn terminal_reset(&mut self) {}
 }
 
 pub trait DownloadHandler: Send + Sync {

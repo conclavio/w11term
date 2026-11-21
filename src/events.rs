@@ -30,6 +30,38 @@ struct State {
     next: u64,
     events: VecDeque<Event>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
+    command_watch: Option<CommandWatch>,
+}
+
+#[derive(Debug, Default)]
+struct CommandWatch {
+    armed: bool,
+    running: Option<RunningCommand>,
+}
+
+#[derive(Debug)]
+struct RunningCommand {
+    /// Keep a fixed-size identity even if the shell supplies a large OSC 133 aid.
+    aid: Option<[u8; 32]>,
+}
+
+fn application_id(aid: Option<&str>) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    aid.map(|id| Sha256::digest(id.as_bytes()).into())
+}
+
+impl State {
+    fn watch_state(&self) -> Option<bool> {
+        self.command_watch.as_ref().map(|watch| watch.armed)
+    }
+
+    fn refresh_watch(&self, previous: Option<bool>) {
+        if previous != self.watch_state()
+            && let Some((_, _, inbox)) = &self.inbox
+        {
+            inbox.refresh();
+        }
+    }
 }
 #[derive(Clone, Debug, Default)]
 pub struct Events {
@@ -37,6 +69,90 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
+    /// None while disconnected or on streams that may repaint historical bytes.
+    pub fn command_watch(&self) -> Option<bool> {
+        self.state.lock().unwrap().watch_state()
+    }
+
+    pub fn set_command_watch(&self, armed: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        let Some(watch) = &mut state.command_watch else {
+            return false;
+        };
+        watch.armed = armed;
+        state.refresh_watch(previous);
+        true
+    }
+
+    pub(crate) fn command_stream(&self, live: bool) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        state.command_watch = live.then(CommandWatch::default);
+        state.refresh_watch(previous);
+    }
+
+    pub(crate) fn reset_command_watch(&self) {
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        if let Some(watch) = &mut state.command_watch {
+            *watch = CommandWatch::default();
+        }
+        state.refresh_watch(previous);
+    }
+
+    pub(crate) fn semantic_prompt(&self, marker: &wezterm_term::FinalTermSemanticPrompt) {
+        use wezterm_term::FinalTermSemanticPrompt::*;
+        let mut state = self.state.lock().unwrap();
+        let previous = state.watch_state();
+        let Some(watch) = &mut state.command_watch else {
+            return;
+        };
+        let (aid, exit_code) = match marker {
+            MarkEndOfInputAndStartOfOutput { aid } => {
+                // A repeated start or a nested shell cannot steal the original watch.
+                watch.running.get_or_insert_with(|| RunningCommand {
+                    aid: application_id(aid.as_deref()),
+                });
+                return;
+            }
+            CommandStatus { status, aid } => (aid, *status),
+            FreshLineAndStartPrompt { aid, .. } | MarkEndOfCommandWithFreshLine { aid, .. } => {
+                (aid, None)
+            }
+            // Without an end marker or a fresh prompt, a new input phase
+            // abandons the previous unqualified command. It cannot prove success.
+            MarkEndOfPromptAndStartOfInputUntilNextMarker
+            | MarkEndOfPromptAndStartOfInputUntilEndOfLine => {
+                if watch
+                    .running
+                    .as_ref()
+                    .is_some_and(|command| command.aid.is_none())
+                {
+                    *watch = CommandWatch::default();
+                    state.refresh_watch(previous);
+                }
+                return;
+            }
+            StartPrompt(_) | FreshLine => return,
+        };
+        if !watch
+            .running
+            .as_ref()
+            .is_some_and(|command| command.aid == application_id(aid.as_deref()))
+        {
+            return;
+        }
+        watch.running = None;
+        if std::mem::take(&mut watch.armed) {
+            self.append(
+                state,
+                "command-finished",
+                serde_json::json!({"exit_code":exit_code}),
+            );
+        }
+    }
+
     /// Attach a pane to its owning window, preserving acknowledgements when it moves.
     pub fn connect_inbox(&self, pane: u64, label: &str, inbox: &Inbox) {
         let mut state = self.state.lock().unwrap();
@@ -49,7 +165,7 @@ impl Events {
         } else {
             let label = Arc::from(label);
             for event in &state.events {
-                inbox.receive(pane, &label, event);
+                inbox.receive(pane, &label, event, false);
             }
             state.inbox = Some((pane, label, inbox.clone()));
         }
@@ -66,7 +182,10 @@ impl Events {
         } else {
             data
         };
-        let mut state = self.state.lock().unwrap();
+        self.append(self.state.lock().unwrap(), kind, data);
+    }
+
+    fn append(&self, mut state: std::sync::MutexGuard<'_, State>, kind: &str, data: Value) {
         state.next += 1;
         let sequence = state.next;
         let timestamp_ms = SystemTime::now()
@@ -80,7 +199,7 @@ impl Events {
             data,
         };
         if let Some((pane, label, inbox)) = &state.inbox {
-            inbox.receive(*pane, label, &event);
+            inbox.receive(*pane, label, &event, true);
         }
         state.events.push_back(event);
         if state.events.len() > CAPACITY {

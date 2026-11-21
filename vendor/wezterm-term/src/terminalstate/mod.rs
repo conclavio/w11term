@@ -1560,6 +1560,9 @@ impl TerminalState {
                 }
             }
             Device::SoftReset => {
+                if let Some(handler) = self.alert_handler.as_mut() {
+                    handler.terminal_reset();
+                }
                 // TODO: see https://vt100.net/docs/vt510-rm/DECSTR.html
                 self.pen = CellAttributes::default();
                 self.insert = false;
