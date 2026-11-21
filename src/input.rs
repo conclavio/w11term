@@ -38,6 +38,7 @@ pub enum PickerStage {
 }
 
 struct State {
+    read_only: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     target: Option<Target>,
     shortcut: Box<dyn Fn(Shortcut)>,
     swallowed: HashSet<u32>,
@@ -161,6 +162,11 @@ pub struct KeyboardBridge {
     focus: HHOOK,
     mouse: HHOOK,
 }
+type PaneTarget = (
+    mpsc::UnboundedSender<Command>,
+    FrameStore,
+    std::rc::Rc<std::cell::Cell<bool>>,
+);
 
 pub fn window() -> Option<HWND> {
     INPUT.with(|s| s.borrow().as_ref().and_then(|s| s.window))
@@ -202,12 +208,46 @@ impl KeyboardBridge {
         })
     }
 
-    pub fn set_target(&self, target: Option<(mpsc::UnboundedSender<Command>, FrameStore)>) {
+    pub fn set_target(&self, target: Option<PaneTarget>) {
         INPUT.with(|input| {
             if let Some(state) = input.borrow_mut().as_mut() {
-                state.retarget(target.map(|(sender, frames)| Target { sender, frames }));
+                state.read_only = target.as_ref().map(|(_, _, locked)| locked.clone());
+                state.retarget(target.map(|(sender, frames, _)| Target { sender, frames }));
             }
         });
+        ime::sync_context();
+    }
+
+    pub fn set_read_only(
+        sender: &mpsc::UnboundedSender<Command>,
+        flag: &std::cell::Cell<bool>,
+        enabled: bool,
+    ) {
+        if flag.get() == enabled {
+            return;
+        }
+        let cancel_composition = enabled
+            && INPUT.with_borrow_mut(|input| {
+                if let Some(state) = input.as_mut()
+                    && state
+                        .target
+                        .as_ref()
+                        .is_some_and(|t| t.sender.same_channel(sender))
+                {
+                    state
+                        .local_held
+                        .extend(state.pressed.keys().map(|vk| (*vk, false)));
+                    state.release_keys();
+                    return true;
+                }
+                false
+            });
+        if cancel_composition {
+            ime::cancel();
+        }
+        if sender.send(Command::SetReadOnly(enabled)).is_ok() {
+            flag.set(enabled);
+        }
         ime::sync_context();
     }
     pub fn set_wheel_panes(
@@ -731,11 +771,15 @@ fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
     (chars.next().is_none() && !first.is_control()).then_some(first)
 }
 impl State {
+    fn is_read_only(&self) -> bool {
+        self.read_only.as_ref().is_some_and(|locked| locked.get())
+    }
     fn new(shortcut: impl Fn(Shortcut) + 'static) -> Self {
         Self {
             target: None,
             shortcut: Box::new(shortcut),
             swallowed: HashSet::new(),
+            read_only: None,
             pressed: HashMap::new(),
             details: HashMap::new(),
             surrogate: None,
@@ -1156,6 +1200,10 @@ impl State {
                     let _ = sender.send(Command::ReloadDemo);
                     return true;
                 }
+                if self.is_read_only() {
+                    self.local_held.insert(vk, false);
+                    return true;
+                }
                 let repeat = self.pressed.contains_key(&vk) || message.lParam.0 & (1 << 30) != 0;
                 if repeat {
                     if let Some(key) = self.pressed.get(&vk)
@@ -1236,6 +1284,9 @@ impl State {
                 false
             }
             WM_CHAR => {
+                if self.is_read_only() {
+                    return true;
+                }
                 (self.shortcut)(Shortcut::ClearSelection);
                 let unit = vk as u16;
                 if (0xd800..=0xdbff).contains(&unit) {
@@ -1665,6 +1716,73 @@ mod tests {
             input.try_recv().is_err(),
             "picker keys reached the terminal"
         );
+    }
+
+    #[test]
+    fn locking_a_pane_releases_the_held_key_before_lock_and_swallows_its_remaining_repeats() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut pending) = mpsc::unbounded_channel();
+        let locked = std::rc::Rc::new(std::cell::Cell::new(false));
+        INPUT.with_borrow_mut(|slot| {
+            *slot = Some(State {
+                target: Some(Target {
+                    sender: sender.clone(),
+                    frames: lab.frames.clone(),
+                }),
+                read_only: Some(locked.clone()),
+                pressed: HashMap::from([(0x58, KeyCode::Char('x'))]),
+                details: HashMap::from([(
+                    0x58,
+                    w11term::terminal::KeyDetails {
+                        base: Some('x'),
+                        text: None,
+                    },
+                )]),
+                surrogate: Some(0xd800),
+                ..State::new(|_| {})
+            })
+        });
+        KeyboardBridge::set_read_only(&sender, &locked, true);
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::DetailedKey {
+                key: KeyCode::Char('x'),
+                down: false,
+                repeat: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::SetReadOnly(true)
+        ));
+        KeyboardBridge::set_read_only(&sender, &locked, false);
+        assert!(matches!(
+            pending.try_recv().unwrap(),
+            Command::SetReadOnly(false)
+        ));
+        INPUT.with_borrow_mut(|slot| {
+            let mut state = slot.take().unwrap();
+            assert!(state.surrogate.is_none());
+            assert!(state.handle(&MSG {
+                message: WM_KEYDOWN,
+                wParam: WPARAM(0x58),
+                lParam: LPARAM(1 << 30),
+                ..Default::default()
+            }));
+            assert!(state.handle(&MSG {
+                message: WM_KEYUP,
+                wParam: WPARAM(0x58),
+                ..Default::default()
+            }));
+            assert!(pending.try_recv().is_err());
+            assert!(state.handle(&MSG {
+                message: WM_CHAR,
+                wParam: WPARAM('x' as usize),
+                ..Default::default()
+            }));
+            assert!(matches!(pending.try_recv().unwrap(), Command::Text(s) if s == "x"));
+        });
     }
 
     #[test]

@@ -15,6 +15,7 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
         label: "lab".into(),
         active: false,
         visible: false,
+        read_only: false,
         input: session.input.clone(),
     }]);
     let capture: w11term::control::CapturePng = Arc::new(|_, _, _| anyhow::bail!("unused"));
@@ -75,6 +76,7 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
         label: "lab".into(),
         active: false,
         visible: false,
+        read_only: false,
         input: session.input.clone(),
     }]);
     let discovery = tempfile::tempdir().unwrap();
@@ -159,6 +161,7 @@ async fn list_keeps_closed_sessions_with_an_explicit_error() {
         label: "failed".into(),
         active: false,
         visible: true,
+        read_only: false,
         input,
     }]);
     let result = registry
