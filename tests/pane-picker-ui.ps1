@@ -36,6 +36,30 @@ try {
     $null = Control @('send-text','--pane',"$left",'--no-paste','--base64',$osc)
     $null = Wait-Until 'remote window title' { (Control @('get-text','--pane',"$left")).title -eq 'build-output' }
 
+    # Ring and notify from the SSH split in the other tab. Verify the window-wide
+    # badge updates while input stays on dev1, then select the exact sending split.
+    $notice = [Text.Encoding]::UTF8.GetBytes("$([char]7)$([char]27)]9;compile finished$([char]27)\")
+    $null = Control @('send-text','--pane',"$right",'--no-paste','--base64',[Convert]::ToBase64String($notice))
+    $inbox = Wait-Until 'two unread alerts from background dev2' { Find-Element 'Attention inbox, 2 unread' }
+    Wait-Focus $left
+    Assert-Input $left 'before-inbox' @($right,$local)
+    Invoke-Button $inbox
+    $dot = [char]0x00b7
+    $row = "dev2 $dot Pane $right $dot"
+    $null = Wait-Until 'unread background bell' { Find-Element "Unread $dot $row Bell" }
+    Invoke-Button (Wait-Until 'unread background message' { Find-Element "Unread $dot $row compile finished" })
+    Wait-Focus $right
+    Assert-Input $right 'after-inbox' @($left,$local)
+    Invoke-Button (Wait-Until 'one remaining unread alert' { Find-Element 'Attention inbox, 1 unread' })
+    $null = Wait-Until 'the visited row to be read' { Find-Element "Read $dot $row compile finished" }
+    Invoke-Button (Wait-Until 'mark all read action' { Find-Element 'Mark all read' })
+    $null = Wait-Until 'the bell to be read' { Find-Element "Read $dot $row Bell" }
+    Invoke-Button (Wait-Until 'clear inbox action' { Find-Element 'Clear inbox' })
+    $null = Wait-Until 'empty inbox' { Find-Element 'No bells or notifications' }
+    Picker-Query 'build-output'
+    Press-Key 13
+    Wait-Focus $left
+
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
     Invoke-Button (Wait-Until 'inspector menu item' { Find-Element 'Terminal inspector: Off' })
     $null = Wait-Until 'initial primary screen' { Find-Element 'Screen   Primary' }

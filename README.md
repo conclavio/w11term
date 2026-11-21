@@ -55,6 +55,8 @@ Saved workspaces record the local executable, arguments and directory. Opening t
 
 On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** or drop local files onto the drawer to upload into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
 
+The **Inbox** button beside the tab menu shows how many bells and terminal notifications are unread across this window. The inbox keeps the newest 128 alerts, including alerts from background tabs and splits. Select a message to mark it read and focus its source pane. **Mark all read** acknowledges the remaining messages, and **Clear inbox** empties the list. Both leave the per-pane control event journals available to scripts.
+
 Choose **caret → Panes → Open files here** to open the drawer at the directory the focused shell last reported with OSC 7. For example, `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s existing SSH connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. An absent, invalid or foreign-host report opens the usual SFTP working directory. The drawer stays where you opened it until you navigate or choose the action again.
 
 **Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.
