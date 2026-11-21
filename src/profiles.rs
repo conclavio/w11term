@@ -26,6 +26,32 @@ pub struct LocalProfileSnapshot {
     pub name: String,
     pub options: crate::options::LocalOptions,
     raw: Option<serde_json::Value>,
+    removal: Option<LocalProfileRemoval>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LocalProfileRemoval {
+    Delete,
+    RestoreDefaults,
+}
+
+impl LocalProfileSnapshot {
+    pub fn removal(&self) -> Option<LocalProfileRemoval> {
+        self.removal
+    }
+
+    fn check_current(
+        &self,
+        entries: &serde_json::Map<String, serde_json::Value>,
+        catalog: &Profiles,
+    ) -> Result<()> {
+        ensure!(
+            entries.get(&self.name) == self.raw.as_ref()
+                && catalog.local.get(&self.name) == Some(&self.options),
+            "Local profile changed on disk; reopen the editor before saving"
+        );
+        Ok(())
+    }
 }
 
 /// Maintain an explicit ordering when a profile changes identity. With no
@@ -115,10 +141,19 @@ impl ProfileStore {
             .local
             .remove(name)
             .context("Local profile was removed or its backend changed")?;
+        let raw = raw["profiles"].get(name).cloned();
+        let removal = raw.as_ref().map(|_| {
+            if crate::options::LocalOptions::installed().contains_key(name) {
+                LocalProfileRemoval::RestoreDefaults
+            } else {
+                LocalProfileRemoval::Delete
+            }
+        });
         Ok(LocalProfileSnapshot {
             name: name.into(),
             options,
-            raw: raw["profiles"].get(name).cloned(),
+            raw,
+            removal,
         })
     }
 
@@ -128,32 +163,69 @@ impl ProfileStore {
         name: &str,
         shell: &crate::options::LocalOptions,
     ) -> Result<()> {
+        self.write_local(original, name, shell, false)
+    }
+
+    pub fn duplicate_local(
+        &self,
+        source: &LocalProfileSnapshot,
+        name: &str,
+        shell: &crate::options::LocalOptions,
+    ) -> Result<()> {
+        self.write_local(Some(source), name, shell, true)
+    }
+
+    pub fn remove_local(&self, base: &LocalProfileSnapshot) -> Result<Profiles> {
+        self.modify(|profiles, catalog| {
+            base.check_current(profiles, catalog)?;
+            let action = base
+                .removal
+                .context("This shell uses its installed defaults")?;
+            let installed = crate::options::LocalOptions::installed().contains_key(&base.name);
+            ensure!(
+                installed == (action == LocalProfileRemoval::RestoreDefaults),
+                "The installed shell changed; reopen the profile before continuing"
+            );
+            profiles.remove(&base.name);
+            // A discovered profile comes back in the same position after its override is removed.
+            Ok(if installed {
+                None
+            } else {
+                order_after_edit(catalog, Some(&base.name), None)
+            })
+        })
+    }
+
+    fn write_local(
+        &self,
+        base: Option<&LocalProfileSnapshot>,
+        name: &str,
+        shell: &crate::options::LocalOptions,
+        copy: bool,
+    ) -> Result<()> {
         ensure!(
             !name.is_empty() && name == name.trim() && !name.chars().any(char::is_control),
             "Enter a local profile name"
         );
         shell.validate()?;
         self.modify(|profiles, catalog| {
-            if let Some(base) = original {
-                ensure!(
-                    profiles.get(&base.name) == base.raw.as_ref()
-                        && catalog.local.get(&base.name) == Some(&base.options),
-                    "Local profile changed on disk; reopen the editor before saving"
-                );
+            if let Some(base) = base {
+                base.check_current(profiles, catalog)?;
             }
+            let original = base.filter(|_| !copy);
             ensure!(
                 original.is_some_and(|base| base.name == name)
                     || (!profiles.contains_key(name) && !catalog.local.contains_key(name)),
                 "Profile {name} already exists"
             );
-            let mut entry = original
+            let mut entry = base
                 .and_then(|base| base.raw.clone())
                 .unwrap_or_else(|| serde_json::json!({}));
             let fields = entry
                 .as_object_mut()
                 .context("Local profile must be an object")?;
             fields.insert("backend".into(), "local".into());
-            let stored = original.filter(|base| base.raw.is_some());
+            let stored = base.filter(|base| base.raw.is_some());
             if stored.is_none_or(|base| base.options.executable != shell.executable) {
                 fields.insert(
                     "executable".into(),
@@ -525,6 +597,91 @@ mod order_tests {
 
     fn disk(store: &ProfileStore) -> Value {
         serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn copy_local_preserves_relative_launch_paths_and_refuses_stale_or_occupied_entries() {
+        let (_dir, store) = fixture();
+        let mut doc = disk(&store);
+        let local = json!({"backend":"local", "executable":"bin/shell.exe", "cwd":"build", "args":["two words"], "scrollback_lines":87, "extra":{"version":2}});
+        doc["profiles"]["Lima"] = local.clone();
+        doc["profile_order"] = json!(["Zulu", "Lima", "Alpha"]);
+        std::fs::write(store.path(), doc.to_string()).unwrap();
+        let source = store.inspect_local("Lima").unwrap();
+        assert!(source.removal() == Some(LocalProfileRemoval::Delete));
+        let copy = store.catalog().unwrap().copy_name("Lima");
+        for taken in ["Alpha", "Lima"] {
+            assert!(
+                store
+                    .duplicate_local(&source, taken, &source.options)
+                    .is_err()
+            );
+        }
+        let mut edited = source.options.clone();
+        edited.args.push("-new".into());
+        store.duplicate_local(&source, &copy, &edited).unwrap();
+        let document = disk(&store);
+        assert_eq!(document["profiles"]["Lima"], local);
+        let mut expected_copy = local;
+        expected_copy["args"] = json!(["two words", "-new"]);
+        assert_eq!(document["profiles"][&copy], expected_copy);
+        let catalog = store.catalog().unwrap();
+        assert_eq!(catalog.copy_name("Lima"), "Lima copy 2");
+        assert_eq!(catalog.profile_order.last(), Some(&copy));
+
+        let mut changed = document;
+        changed["profiles"]["Lima"]["extra"]["version"] = json!(3);
+        std::fs::write(store.path(), changed.to_string()).unwrap();
+        assert!(store.duplicate_local(&source, "another", &edited).is_err());
+        assert!(store.remove_local(&source).is_err());
+        assert_eq!(disk(&store), changed);
+        let catalog = store
+            .remove_local(&store.inspect_local(&copy).unwrap())
+            .unwrap();
+        assert!(!catalog.profile_order.contains(&copy));
+        assert!(catalog.local.contains_key("Lima"));
+        assert!(store.inspect_local(&copy).is_err());
+    }
+
+    #[test]
+    fn removing_an_installed_override_restores_its_defaults_and_menu_position() {
+        let (_dir, store) = fixture();
+        let Some((name, defaults)) = crate::options::LocalOptions::installed().into_iter().next()
+        else {
+            return;
+        };
+        let pristine = store.inspect_local(&name).unwrap();
+        assert!(pristine.removal().is_none());
+        assert!(store.remove_local(&pristine).is_err());
+        store
+            .duplicate_local(&pristine, "discovered copy", &defaults)
+            .unwrap();
+        assert_eq!(store.catalog().unwrap().local["discovered copy"], defaults);
+        let catalog = store.catalog().unwrap();
+        let index = catalog
+            .profile_order
+            .iter()
+            .position(|entry| entry == &name)
+            .unwrap();
+        let order = store
+            .move_profile(
+                &name,
+                if index > 0 { -1 } else { 1 },
+                &catalog.profile_order,
+            )
+            .unwrap()
+            .profile_order;
+
+        let mut edited = defaults.clone();
+        edited.scrollback_lines = 0.try_into().unwrap();
+        store.save_local(Some(&pristine), &name, &edited).unwrap();
+        let base = store.inspect_local(&name).unwrap();
+        assert!(base.removal() == Some(LocalProfileRemoval::RestoreDefaults));
+        let restored = store.remove_local(&base).unwrap();
+        assert_eq!(restored.profile_order, order);
+        assert_eq!(restored.local[&name], defaults);
+        assert!(disk(&store)["profiles"].get(&name).is_none());
+        assert!(store.remove_local(&base).is_err());
     }
 
     #[test]

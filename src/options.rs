@@ -282,6 +282,16 @@ impl Default for Profiles {
 }
 
 impl Profiles {
+    pub fn copy_name(&self, original: &str) -> String {
+        let mut name = format!("{original} copy");
+        let mut index = 2;
+        while self.profiles.contains_key(&name) || self.local.contains_key(&name) {
+            name = format!("{original} copy {index}");
+            index += 1;
+        }
+        name
+    }
+
     fn cli_order(&self) -> Vec<&String> {
         if self.has_explicit_order {
             self.profile_order.iter().collect()

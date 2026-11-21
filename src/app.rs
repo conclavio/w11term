@@ -351,14 +351,14 @@ impl AppTab {
 }
 
 #[derive(Clone, Default)]
-enum DraftOrigin {
+enum DraftOrigin<T = ProfileSnapshot> {
     #[default]
     New,
-    Edit(ProfileSnapshot),
-    Copy(ProfileSnapshot),
+    Edit(T),
+    Copy(T),
 }
-impl DraftOrigin {
-    fn editing(&self) -> Option<&ProfileSnapshot> {
+impl<T> DraftOrigin<T> {
+    fn editing(&self) -> Option<&T> {
         match self {
             Self::Edit(base) => Some(base),
             _ => None,
@@ -2347,12 +2347,7 @@ impl TerminalApp {
         let Some(base) = draft.origin.editing() else {
             return;
         };
-        let mut name = format!("{} copy", base.name);
-        let mut index = 2;
-        while self.catalog.profiles.contains_key(&name) || self.catalog.local.contains_key(&name) {
-            name = format!("{} copy {index}", base.name);
-            index += 1;
-        }
+        let name = self.catalog.copy_name(&base.name);
         let copy = ProfileDraft {
             origin: DraftOrigin::Copy(base.clone()),
             ..ProfileDraft::from_options(name, &base.options)

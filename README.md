@@ -155,6 +155,8 @@ The **+ → New Profile…** form supports host, user, port, agent/key-file/none
 
 From the profile editor, **Duplicate saved profile…** opens a copy of the last saved settings, including key paths and custom fields. Give the copy a name, then choose **Save copy** or **Save and connect**. **Delete profile…** asks you to confirm the saved name. Open sessions in this window keep running independently, and key files stay on disk.
 
+In a local shell profile editor, **Duplicate saved profile…** copies the saved executable, arguments, starting directory and scrollback settings. Change the name or settings and select **Save copy**. **Delete profile…** removes a custom profile after confirmation and leaves open shells running. If you customized an automatically discovered PowerShell profile, **Restore defaults…** removes its saved overrides and keeps the installed shell in the menu.
+
 The caret menu displays **On**/**Off** for fullscreen, mute, game mode, alternate-screen wheel keys, remote named sounds, and asset synchronization, using the active terminal’s effective settings. Terminal-only actions are disabled when a settings/form tab is selected.
 
 Choose **caret → Terminal inspector** to see the focused pane’s live cell grid, primary or alternate screen, mouse tracking and encoding, keyboard encoding and kitty flags, bracketed paste, and synchronized output. The panel follows focus across splits and tabs. It reads the local parser, so it can show a pending synchronized update while the terminal still displays the last committed frame. Close it with **×** or the caret menu.
