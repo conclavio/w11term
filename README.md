@@ -47,7 +47,7 @@ The native WinUI tab strip sits in the title bar. Click **+** to open a profile 
 
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
 
-Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. The control CLI keeps targeting the same pane as focus and layout change.
+Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.
 
 Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
 
@@ -79,6 +79,7 @@ Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the pane pic
 | --- | --- |
 | Split right or below | Ctrl+Alt+Shift+Right or Down |
 | Focus a neighbor | Ctrl+Alt+Arrow |
+| Resize the focused split | Alt+Shift+Arrow |
 | Zoom pane or restore layout | Ctrl+Alt+Shift+Z |
 | Close focused pane | Ctrl+Alt+Shift+W |
 

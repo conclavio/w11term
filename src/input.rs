@@ -42,6 +42,7 @@ struct State {
     picker: bool,
     hints: bool,
     hint_held: HashSet<u32>,
+    held_resize: Option<(u32, KeyModifiers, Direction)>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
     zoom_remainder: i32,
@@ -104,6 +105,7 @@ pub enum Shortcut {
     SplitRight,
     SplitBelow,
     FocusPane(Direction),
+    ResizePane(Direction),
     ZoomPane,
     ClosePane,
     Select(usize),
@@ -188,6 +190,7 @@ impl KeyboardBridge {
                 picker: false,
                 hints: false,
                 hint_held: HashSet::new(),
+                held_resize: None,
                 wheel_panes: WheelPanes::default(),
                 wheel_remainder: 0,
                 zoom_remainder: 0,
@@ -711,6 +714,7 @@ fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
 }
 impl State {
     fn release_keys(&mut self) {
+        self.held_resize = None;
         if let Some(target) = &self.target {
             for (vk, key) in self.pressed.drain() {
                 emit_key(
@@ -768,6 +772,26 @@ impl State {
         };
         if self.modal {
             return false;
+        }
+        if let Some((key, required, direction)) = self.held_resize
+            && key == vk
+        {
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
+                    if self.target.is_some()
+                        && !self.hints
+                        && !self.picker
+                        && !self.switcher
+                        && !self.search
+                        && modifiers() == required
+                    {
+                        (self.shortcut)(Shortcut::ResizePane(direction));
+                    }
+                    return true;
+                }
+                WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => self.held_resize = None,
+                _ => {}
+            }
         }
         if self.hint_held.contains(&vk) {
             match message.message {
@@ -928,6 +952,9 @@ impl State {
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
                         self.hints = true;
+                    }
+                    if let Shortcut::ResizePane(direction) = shortcut {
+                        self.held_resize = Some((vk, mods, direction));
                     }
                     (self.shortcut)(shortcut);
                 }
@@ -1163,6 +1190,10 @@ impl From<Action> for Shortcut {
             Action::FocusRight => Self::FocusPane(Direction::Right),
             Action::FocusUp => Self::FocusPane(Direction::Up),
             Action::FocusDown => Self::FocusPane(Direction::Down),
+            Action::ResizeLeft => Self::ResizePane(Direction::Left),
+            Action::ResizeRight => Self::ResizePane(Direction::Right),
+            Action::ResizeUp => Self::ResizePane(Direction::Up),
+            Action::ResizeDown => Self::ResizePane(Direction::Down),
             Action::SplitRight => Self::SplitRight,
             Action::SplitBelow => Self::SplitBelow,
             Action::ZoomPane => Self::ZoomPane,
@@ -1393,6 +1424,7 @@ mod tests {
             picker: false,
             hints: false,
             hint_held: HashSet::new(),
+            held_resize: None,
             wheel_panes: WheelPanes::default(),
             wheel_remainder: 0,
             zoom_remainder: 0,

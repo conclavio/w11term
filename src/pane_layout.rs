@@ -16,6 +16,15 @@ pub enum Direction {
     Down,
 }
 
+impl Direction {
+    pub fn axis(self) -> Axis {
+        match self {
+            Self::Left | Self::Right => Axis::Columns,
+            Self::Up | Self::Down => Axis::Rows,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bounds {
     pub left: f64,
@@ -101,6 +110,66 @@ impl Layout {
         }
         (*here == axis && child.bounds(id).is_some()).then(|| (Vec::new(), self, in_second))
     }
+
+    /// Space this subtree needs to leave one usable cell in every leaf at its current ratios.
+    fn minimum_extent(&self, dimension: Axis, leaf: f64, divider: f64) -> f64 {
+        match self {
+            Self::Leaf(_) => leaf,
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let a = first.minimum_extent(dimension, leaf, divider);
+                let b = second.minimum_extent(dimension, leaf, divider);
+                if *axis == dimension {
+                    (a / ratio).max(b / (1.0 - ratio)) + divider
+                } else {
+                    a.max(b)
+                }
+            }
+        }
+    }
+
+    /// Move the nearest matching divider by five percent of its own span.
+    /// Arrow direction describes divider motion from either side of the split.
+    pub fn keyboard_resize(
+        &self,
+        id: u64,
+        direction: Direction,
+        leaf_minimum: f64,
+        divider: f64,
+        measure: impl FnOnce(&Self) -> Option<f64>,
+    ) -> Option<(Vec<bool>, f64)> {
+        let axis = direction.axis();
+        let (path, node, _) = self.divider_for(id, axis)?;
+        let Self::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let available = measure(node)? - divider;
+        if !available.is_finite() || available <= 0.0 {
+            return None;
+        }
+        let next = match direction {
+            Direction::Left | Direction::Up => {
+                let minimum = first.minimum_extent(axis, leaf_minimum, divider) / available;
+                (ratio - 0.05).max(minimum).min(*ratio)
+            }
+            Direction::Right | Direction::Down => {
+                let maximum = 1.0 - second.minimum_extent(axis, leaf_minimum, divider) / available;
+                (ratio + 0.05).min(maximum).max(*ratio)
+            }
+        };
+        (next != *ratio).then_some((path, next))
+    }
+
     fn visit(&self, bounds: Bounds, visit: &mut impl FnMut(u64, Bounds)) {
         match self {
             Self::Leaf(id) => visit(*id, bounds),
@@ -222,6 +291,65 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrow_moves_the_closest_matching_divider_from_either_side() {
+        let mut layout = Layout::Leaf(1);
+        layout.split(1, 2, Axis::Columns);
+        layout.split(2, 3, Axis::Rows);
+        layout.split(3, 4, Axis::Columns);
+        layout.set_ratio(&[true, true], 0.7);
+        for pane in [3, 4] {
+            for (direction, path, ratio) in [
+                (Direction::Left, vec![true, true], 0.65),
+                (Direction::Right, vec![true, true], 0.75),
+                (Direction::Up, vec![true], 0.45),
+                (Direction::Down, vec![true], 0.55),
+            ] {
+                let (actual, value) = layout
+                    .keyboard_resize(pane, direction, 40.0, 6.0, |_| Some(600.0))
+                    .unwrap();
+                assert_eq!(actual, path);
+                assert!((value - ratio).abs() < 1e-9);
+            }
+        }
+        assert!(
+            layout
+                .keyboard_resize(1, Direction::Up, 40.0, 6.0, |_| Some(600.0))
+                .is_none()
+        );
+        assert!(
+            layout
+                .keyboard_resize(99, Direction::Left, 40.0, 6.0, |_| Some(600.0))
+                .is_none()
+        );
+        assert!(
+            layout
+                .keyboard_resize(1, Direction::Left, 40.0, 6.0, |_| None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resizing_an_ancestor_keeps_the_smallest_nested_leaf_usable() {
+        let mut layout = Layout::Leaf(1);
+        layout.split(1, 2, Axis::Rows);
+        layout.split(2, 3, Axis::Rows);
+        layout.set_ratio(&[true], 0.25);
+        // The second branch needs 166 pixels for its 40-pixel first leaf and divider.
+        layout.set_ratio(&[], 0.55);
+        let nudge =
+            |layout: &Layout, dir| layout.keyboard_resize(1, dir, 40.0, 6.0, |_| Some(406.0));
+        let (path, limit) = nudge(&layout, Direction::Down).unwrap();
+        assert!((limit - (1.0 - 166.0 / 400.0)).abs() < 1e-9);
+        assert!(layout.set_ratio(&path, limit));
+        assert!(nudge(&layout, Direction::Down).is_none());
+        assert!(nudge(&layout, Direction::Up).unwrap().1 < limit);
+        // A small window or a previous drag can already violate a minimum.
+        layout.set_ratio(&[], 0.8);
+        assert!(nudge(&layout, Direction::Down).is_none());
+        assert_eq!(nudge(&layout, Direction::Up).unwrap().1, 0.75);
+    }
 
     #[test]
     fn nested_split_and_resize_affect_only_the_chosen_subtree() {
