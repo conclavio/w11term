@@ -216,6 +216,9 @@ type JobResult = Result<Value, String>;
 
 #[derive(Debug)]
 pub struct Job {
+    /// A UI mutation approved against a particular live SSH connection.
+    /// The worker owns that connection and rejects stale approvals before I/O.
+    pub expected_generation: Option<u64>,
     pub operation: Operation,
     pub deadline: Instant,
     pub reply: oneshot::Sender<JobResult>,
@@ -250,6 +253,7 @@ impl Drop for PendingReply {
 
 pub(crate) async fn run(
     session: Arc<russh::client::Handle<crate::ssh::Handler>>,
+    generation: u64,
     mut jobs: mpsc::Receiver<Job>,
     mut cleanup: mpsc::UnboundedReceiver<Job>,
 ) {
@@ -262,11 +266,18 @@ pub(crate) async fn run(
             _ = tokio::time::sleep(Duration::from_secs(300)) => { engine = None; continue; }
         };
         let Job {
+            expected_generation,
             operation,
             deadline,
             reply,
             progress,
         } = job;
+        if expected_generation.is_some_and(|expected| expected != generation) {
+            let _ = reply.send(Err(
+                "SSH connection changed; operation was not started".into()
+            ));
+            continue;
+        }
         if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
             continue;
         }
@@ -588,7 +599,13 @@ impl Engine {
                 ok
             }
             Mkdir { path, attrs } => {
-                self.raw.mkdir(path, attrs.protocol()?).await?;
+                self.raw.mkdir(path, attrs.protocol()?).await.map_err(|error| {
+                    if matches!(error, Error::Status(ref status) if !matches!(status.status_code, StatusCode::NoConnection | StatusCode::ConnectionLost)) {
+                        anyhow::Error::from(error)
+                    } else {
+                        anyhow::Error::from(error).context("Folder creation outcome unknown; refresh to check")
+                    }
+                })?;
                 ok
             }
             Rename { from, to } => {

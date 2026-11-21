@@ -779,7 +779,12 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let mut children = tokio::task::JoinSet::new();
-    children.spawn(crate::sftp::run(shell.link.handle(), sftp_rx, cleanup_rx));
+    children.spawn(crate::sftp::run(
+        shell.link.handle(),
+        generation,
+        sftp_rx,
+        cleanup_rx,
+    ));
     if !managed {
         request_terminal(channel, options, *size).await?;
         if let Some(probe) = &probe {
@@ -961,7 +966,12 @@ async fn run_herdr_channel(
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let mut jobs = tokio::task::JoinSet::new();
-    jobs.spawn(crate::sftp::run(link.handle(), sftp_rx, cleanup_rx));
+    jobs.spawn(crate::sftp::run(
+        link.handle(),
+        generation,
+        sftp_rx,
+        cleanup_rx,
+    ));
     loop {
         tokio::select! {
             message=driver.input.recv()=>match message {

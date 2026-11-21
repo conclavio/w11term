@@ -390,6 +390,14 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         _: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("mkdir-trace").exists() {
+            let mut trace = fs::OpenOptions::new()
+                .append(true)
+                .open(self.root.join("mkdir-trace"))
+                .map_err(io)?;
+            writeln!(trace, "{path}").map_err(io)?;
+        }
         fs::create_dir(self.path(&path)).map_err(io)?;
         Ok(status(id))
     }
@@ -519,6 +527,44 @@ mod native_gui;
 mod tab_windows;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let generation = pane.frames.load().connection_generation;
+    let baseline = opens.load(Ordering::Relaxed);
+    for expected in [generation + 1, generation] {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        pane.input
+            .send(Command::Sftp(w11term::sftp::Job {
+                operation: w11term::sftp::Operation::Mkdir {
+                    path: "/approved".into(),
+                    attrs: Default::default(),
+                },
+                expected_generation: Some(expected),
+                deadline,
+                reply,
+                progress: None,
+            }))
+            .unwrap();
+        let result = tokio::time::timeout_at(deadline, result)
+            .await
+            .unwrap()
+            .unwrap();
+        if expected != generation {
+            assert!(result.unwrap_err().contains("operation was not started"));
+            assert!(!remote.path().join("approved").exists());
+            assert_eq!(opens.load(Ordering::Relaxed), baseline);
+        } else {
+            result.unwrap();
+            assert!(remote.path().join("approved").is_dir());
+            assert_eq!(opens.load(Ordering::Relaxed), baseline + 1);
+        }
+    }
+    drop(pane);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lost_workspace_exec_reply_does_not_dispatch_command_again() {
     let (Source::Ssh(mut ssh), remote, opens, server) = fixture_connections(false, 2).await else {
         unreachable!()
@@ -619,6 +665,7 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         pane.input
             .send(Command::Sftp(Job {
+                expected_generation: None,
                 operation,
                 deadline,
                 reply,
@@ -695,6 +742,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         session
             .input
             .send(Command::Sftp(Job {
+                expected_generation: None,
                 operation,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 reply,
@@ -1089,7 +1137,7 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         let _=fs::remove_file(root.path().join("read-entered"));
         fs::write(root.path().join("pause-reads"),[]).unwrap();
         let (reply,response)=tokio::sync::oneshot::channel();
-        session.input.send(Command::Sftp(w11term::sftp::Job{operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply,progress:None})).unwrap();
+        session.input.send(Command::Sftp(w11term::sftp::Job{expected_generation:None,operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply,progress:None})).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !root.path().join("read-entered").exists() { tokio::task::yield_now().await; }
         }).await.unwrap();
