@@ -178,6 +178,25 @@ findmnt --kernel --raw --noheadings --nocanonicalize --mountpoint "$HOME/windows
 // renamed. Never send a path-based unmount or remove a user's directory.
 const ABSENT: &str = r#"exec /usr/bin/awk -v type="fuse.sshfs.$2" '{for (i=7;i<=NF;i++) if ($i == "-" && $(i+1) == type) found=1} END {exit found ? 1 : 0}' /proc/self/mountinfo"#;
 
+// libfuse 3.15 taught its setuid helper to retry the dead-filesystem check
+// as the mount owner. Earlier helpers silently leave owner-only mounts
+// behind after the SSHFS process exits.
+const HELPER_VERSION: &str =
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin; LC_ALL=C; export PATH LC_ALL; exec fusermount3 --version";
+
+fn check_helper_version(stdout: &[u8]) -> Result<()> {
+    let version = std::str::from_utf8(stdout)
+        .ok()
+        .and_then(|line| line.trim().strip_prefix("fusermount3 version: "))
+        .and_then(|number| semver::Version::parse(number).ok())
+        .context("Could not verify fusermount3. Install FUSE 3.15.0 or newer on the SSH host")?;
+    ensure!(
+        version >= semver::Version::new(3, 15, 0),
+        "Found fusermount3 {version}. Upgrade the SSH host's fuse3 package to 3.15.0 or newer for reliable owner-only unmount"
+    );
+    Ok(())
+}
+
 async fn verify(link: &ConnectionShare, remote: &Remote, absent: bool) -> Result<()> {
     let command = remote.command(if absent { ABSENT } else { PROBE });
     loop {
@@ -233,6 +252,17 @@ async fn run(
     if *stop.borrow() {
         return Ok(());
     }
+    let helper = tokio::select! {
+        biased;
+        _ = stop.changed() => return Ok(()),
+        answer = bounded_command(&link, HELPER_VERSION, 1024) =>
+            answer.context("Could not check fusermount3 on the SSH host")?,
+    };
+    ensure!(
+        helper.status == 0,
+        "Could not run fusermount3. Install FUSE 3.15.0 or newer on the SSH host"
+    );
+    check_helper_version(&helper.stdout)?;
     let mut shell = tokio::select! {
         biased;
         _ = stop.changed() => return Ok(()),
@@ -506,6 +536,26 @@ async fn serve(
 mod tests {
     use super::*;
     use russh_sftp::protocol::{RealPath, Status};
+
+    #[test]
+    fn helper_must_support_owner_only_auto_unmount() {
+        for output in [
+            "fusermount3 version: 3.15.0\n",
+            "fusermount3 version: 3.17.2",
+        ] {
+            assert!(check_helper_version(output.as_bytes()).is_ok(), "{output}");
+        }
+        for output in [
+            "fusermount3 version: 3.14.9",
+            "fusermount3 version: 3.15.0-rc.1",
+            "fusermount3 version: unknown",
+            "sshfs version: 3.17.2",
+            "",
+        ] {
+            let error = check_helper_version(output.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("3.15.0 or newer"), "{output}");
+        }
+    }
 
     #[tokio::test]
     async fn verified_mount_can_disappear_before_ssh_close_but_startup_must_exit() -> Result<()> {
