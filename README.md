@@ -43,6 +43,8 @@ Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI
 
 When creating or editing an SSH profile, **SSH terminal type (TERM)** selects the terminfo name sent with each new PTY. Existing profiles use `xterm-256color`. Choose `xterm-sixel` for a host running Venti with Sixel graphics, or choose **Custom…** to enter a terminfo name supported by the host. This setting is stored as `"terminal_type": "xterm-sixel"` for the Sixel preset. Direct shells and durable attachments both request `COLORTERM=truecolor`. A process already running inside a durable session keeps its existing environment.
 
+Open **caret → Command palette…** or press **Ctrl+Shift+K** to search actions for the current window. Search by words in any order, a profile name, or a current shortcut. Use Up and Down to highlight a result, then press Enter or click it. Disabled commands stay visible when their pane or connection requirements are unmet. Escape returns to the current pane. The palette also works from Settings and other utility tabs.
+
 Use **Ctrl+Shift+P** or **caret → Find pane…** to search every terminal pane in the window, including panes in other tabs and hidden splits. Type part of the terminal title, profile name or SSH `user@host`. Use the arrow keys or hover over a match to preview its live viewport, including terminal graphics. The preview preserves each pane’s grid size and focus. Screen readers can read the last two nonblank preview lines. Press Enter or click a result to focus it. Escape returns to the pane you were using.
 
 The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
@@ -52,6 +54,8 @@ Use **caret → Panes** to split right or below. Splitting the current host open
 Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.
 
 To move a running shell beside one in another tab, choose **caret → Panes → Move pane to existing tab…**. Search for the destination by title, profile or SSH address and press Enter or click it. Press an arrow key or choose **Move left**, **Move right**, **Move above** or **Move below**. Escape cancels at either step. The moved pane keeps focus, scrollback and its control ID. SSH channels and local processes keep running. The source tab closes if its last pane moves. You can assign a shortcut in Keyboard settings.
+
+Choose **caret → Rename tab…** to give a group of panes a name such as `Production logs`. The tab strip, window title, tab switcher and pane picker use the name as you move between panes. Saving a workspace keeps the name. Choose **Use default** to return to the focused pane’s label. The control pipe’s `list` reply includes the optional `tab_title` alongside each pane’s own `label` and terminal `title`.
 
 Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
 
@@ -77,7 +81,7 @@ The recipe belongs to that pane in the saved workspace and is bound to its SSH h
 
 Imported `ProxyJump` routes use SSH `direct-tcpip` channels. Each jump host and the final destination have their own authentication and host-key checks. The resulting SSH shell and its SFTP drawer use the destination connection. For a manually configured profile, `proxy_jump` is an ordered array of objects with `host`, `user`, optional `port`, `auth` and optional `host_key`. Each hop supports the same authentication choices as the destination.
 
-Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the pane picker and workspaces. Select **Edit…**, enter a chord such as `Ctrl+Alt+Right` or `F8`, and choose **Save shortcut**. **Clear shortcut** releases its key for the terminal. **Restore default** restores that action’s original binding. The editor identifies conflicts, and pane menus show the current bindings. Changes apply immediately and persist in the per-user settings file.
+Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the command palette, the pane picker and workspaces. Select **Edit…**, enter a chord such as `Ctrl+Alt+Right` or `F8`, and choose **Save shortcut**. **Clear shortcut** releases its key for the terminal. **Restore default** restores that action’s original binding. The editor identifies conflicts, and pane menus show the current bindings. Changes apply immediately and persist in the per-user settings file.
 
 | Pane action | Default shortcut |
 | --- | --- |
@@ -195,7 +199,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Ctrl+Shift+Home / Ctrl+Shift+End | Oldest retained history / return to the live screen |
 | Ctrl+Shift+Up / Ctrl+Shift+Down | Previous / next OSC 133 prompt |
 | Ctrl+Shift+F | Find in scrollback; case toggle, highlighted matches, and a match counter |
-| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
+| Ctrl+Shift+K | Search terminal actions and launch profiles |\n| Ctrl+Shift+P | Find a pane by title, profile or SSH destination |
 | Enter in find / F3; Shift+Enter / Shift+F3 | Next / previous find result, wrapping at either end |
 | Escape in find | Close find and restore terminal keyboard input |
 | Mouse wheel | Scrollback using Windows' wheel-line/page preference, including accumulated fractional deltas; remote wheel events when mouse reporting is enabled |

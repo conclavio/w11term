@@ -24,6 +24,7 @@ pub enum Action {
     ClosePane,
     MovePane,
     MovePaneToExistingTab,
+    CommandPalette,
     PanePicker,
     KeyboardHints,
     CopyMode,
@@ -85,6 +86,13 @@ pub const BINDINGS: &[Binding] = &[
         "Move pane to existing tab…",
         0,
         Mods::NONE,
+    ),
+    Binding::new(
+        CommandPalette,
+        "command_palette",
+        "Command palette",
+        0x4b,
+        CTRL_SHIFT,
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
     Binding::new(

@@ -287,6 +287,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
             registry.replace([Pane {
                 id: 7,
                 tab_id: 2,
+                tab_title: None,
                 label: "loopback".into(),
                 active: false,
                 visible: false,

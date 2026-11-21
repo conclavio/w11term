@@ -42,8 +42,7 @@ $terminal = $null
 try {
     $env:W11TERM_DATA_DIR = $data
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
-    [Environment]::SetEnvironmentVariable('W11TERM_UI_SMOKE', $null, 'Process')
-    [Environment]::SetEnvironmentVariable('W11TERM_WORKSPACE_SMOKE', $null, 'Process')
+    Remove-Item -LiteralPath Env:W11TERM_UI_SMOKE, Env:W11TERM_WORKSPACE_SMOKE -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($profiles, '{"profiles":{}}', $encoding)
     $fixture = @'
 {
@@ -52,7 +51,7 @@ try {
     "two-tabs": {
       "active_tab": 0,
       "tabs": [
-        {"focused": 22, "layout": {"type": "split", "axis": "columns", "ratio": 0.3333333333333333,
+        {"title": "Build console", "focused": 22, "layout": {"type": "split", "axis": "columns", "ratio": 0.3333333333333333,
           "first":  {"type": "leaf", "slot": 11, "source": {"kind": "demo"}},
           "second": {"type": "leaf", "slot": 22, "source": {"kind": "demo"}}}},
         {"focused": 33, "layout": {"type": "leaf", "slot": 33, "source": {"kind": "demo"}}}
@@ -96,6 +95,7 @@ try {
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $ready) { throw "Workspace layout, focus or grid mismatch. Last list: $($reply | ConvertTo-Json -Depth 5 -Compress). See $state" }
+    & (Join-Path $PSScriptRoot 'tab-title-ui.ps1') -ProcessId $terminal.Id -Cli $ctl
     Stop-WorkspaceGui $terminal
     $env:W11TERM_UI_SMOKE = '1'
     $env:W11TERM_WORKSPACE_SMOKE = '1'
@@ -111,5 +111,8 @@ try {
     Write-Output "Workspace smoke passed. Artifacts: $state"
 } finally {
     Stop-WorkspaceGui $terminal
-    foreach ($name in $variables) { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
+    foreach ($name in $variables) {
+        if ($null -eq $previous[$name]) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+        else { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
+    }
 }
