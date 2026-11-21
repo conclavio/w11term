@@ -25,6 +25,17 @@ public static class FixtureMessages {
 }
 '@
 
+# The SSH fixture opens this file for append on each DATA packet. Keep the
+# reader open across delivery so every packet can be traced even during a poll.
+function Open-PeerTraceReader([string]$Path) {
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    return [IO.BinaryReader]::new($stream)
+}
+function Read-PeerTrace([IO.BinaryReader]$Reader) {
+    $Reader.BaseStream.Position = 0
+    return ,$Reader.ReadBytes([int]$Reader.BaseStream.Length)
+}
+
 function Wait-Until([string]$Description, [scriptblock]$Probe) {
     $until = [DateTime]::UtcNow.AddSeconds(15)
     do {

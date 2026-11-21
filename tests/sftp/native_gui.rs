@@ -40,6 +40,20 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "samples a cursor cell on the focused native SSH canvas"]
+async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
+    let (Source::Ssh(ssh), _remote, shells, server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    // The input-recording fixture also prints every PTY resize. Keep this SSH
+    // shell quiet so only the requested VT sequences can move the test cursor.
+    drive_mixed_gui("cursor-blink-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "watches OSC 133 commands in a background SSH tab while a real PowerShell stays active"]
 async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
@@ -130,6 +144,24 @@ async fn native_regex_find_in_mixed_panes_keeps_search_input_off_the_wire() {
     }
     history.push_str("find-fixture-ready\r\n");
     run_palette_fixture("regex-find-ui.ps1", b"find-ssh-resumed", Some(&history)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "finds offscreen text across SSH and PowerShell tabs and checks both viewports and local Find state"]
+async fn native_find_in_all_panes_preserves_views_and_reveals_the_chosen_ssh_match() {
+    let mut history = String::new();
+    for row in 0..280 {
+        let content = match row {
+            12 => "ssh-first Fleet.Target north".into(),
+            105 => "ssh-second FLEET.TARGET south".into(),
+            198 => "ssh-prior-anchor".into(),
+            _ => format!("SSH history row {row}"),
+        };
+        history.push_str(&content);
+        history.push_str("\r\n");
+    }
+    history.push_str("ssh-window-search-ready\r\n");
+    run_palette_fixture("find-all-panes-ui.ps1", b"global-ssh-ok", Some(&history)).await;
 }
 
 async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Option<&str>) {
@@ -523,6 +555,65 @@ async fn native_rename_uses_the_selected_sftp_entry_and_preserves_existing_desti
         opens.load(Ordering::Relaxed),
         2,
         "one SSH shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "deletes only explicitly confirmed SFTP entries through the native drawer and preserves link targets across reconnect"]
+async fn native_delete_keeps_cancelled_entries_links_targets_and_nonempty_folders() {
+    let (Source::Ssh(mut ssh), remote, _, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let root = remote.path();
+    let parent = root.join("shell directory");
+    fs::create_dir_all(parent.join("full")).unwrap();
+    fs::create_dir(parent.join("empty")).unwrap();
+    fs::create_dir(parent.join("missing-target")).unwrap();
+    for (name, data) in [
+        ("keep.txt", "cancelled"),
+        ("purge.bin", "temporary"),
+        ("race.txt", "changed before confirmation"),
+        ("full/child", "untouched"),
+    ] {
+        fs::write(parent.join(name), data).unwrap();
+    }
+    directory_junction(&parent, "directory-link", "full");
+    directory_junction(&parent, "dangling-link", "missing-target");
+    fs::remove_dir(parent.join("missing-target")).unwrap();
+    fs::write(root.join("keyboard-input.bin"), []).unwrap();
+    fs::write(root.join("delete-trace.jsonl"), []).unwrap();
+    fs::write(root.join("omit-listed-mode"), "purge.bin").unwrap();
+    fs::write(root.join("disconnect-on-eot"), []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("delete-entry-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(parent.join("keep.txt")).unwrap(), b"cancelled");
+    assert_eq!(fs::read(parent.join("full/child")).unwrap(), b"untouched");
+    assert_eq!(
+        fs::read(parent.join("original-race.txt")).unwrap(),
+        b"changed before confirmation"
+    );
+    assert!(parent.join("race.txt").is_dir());
+    for removed in ["purge.bin", "directory-link", "dangling-link", "empty"] {
+        assert!(
+            fs::symlink_metadata(parent.join(removed)).is_err(),
+            "{removed}"
+        );
+    }
+    assert_eq!(
+        super::remove::trace(root),
+        [
+            ["RMDIR", "/shell directory/full"],
+            ["REMOVE", "/shell directory/purge.bin"],
+            ["REMOVE", "/shell directory/directory-link"],
+            ["REMOVE", "/shell directory/dangling-link"],
+            ["RMDIR", "/shell directory/empty"],
+        ]
+    );
+    assert_eq!(
+        fs::read(root.join("keyboard-input.bin")).unwrap(),
+        b"\x04delete-ssh-ready"
     );
     server.abort();
 }
