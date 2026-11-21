@@ -11,6 +11,7 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
     registry.replace([Pane {
         id: 1,
         tab_id: 10,
+        tab_title: None,
         label: "lab".into(),
         active: false,
         visible: false,
@@ -70,6 +71,7 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
     registry.replace([Pane {
         id: 1,
         tab_id: 10,
+        tab_title: None,
         label: "lab".into(),
         active: false,
         visible: false,
@@ -153,6 +155,7 @@ async fn list_keeps_closed_sessions_with_an_explicit_error() {
     registry.replace([Pane {
         id: 17,
         tab_id: 3,
+        tab_title: None,
         label: "failed".into(),
         active: false,
         visible: true,

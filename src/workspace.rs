@@ -347,6 +347,8 @@ impl SavedLayout {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceTab {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<crate::tabs::TabTitle>,
     pub focused: u64,
     pub layout: SavedLayout,
 }
@@ -406,7 +408,11 @@ impl Workspace {
             let focused = *slots
                 .get(&focused)
                 .context("Focused pane missing from workspace")?;
-            saved.tabs.push(WorkspaceTab { focused, layout });
+            saved.tabs.push(WorkspaceTab {
+                title: None,
+                focused,
+                layout,
+            });
         }
         saved.validate()?;
         Ok(saved)
