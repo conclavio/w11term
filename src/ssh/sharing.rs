@@ -104,6 +104,9 @@ pub(super) struct ShellChannel {
 }
 
 impl ShellChannel {
+    pub(super) fn into_stream(mut self) -> russh::ChannelStream<client::Msg> {
+        self.channel.take().unwrap().into_stream()
+    }
     pub(super) fn channel(&mut self) -> &mut Channel<client::Msg> {
         self.channel.as_mut().unwrap()
     }

@@ -187,6 +187,23 @@ impl Session {
         )
     }
 
+    /// Explicit opt-in: hc connect can start the user's Herdr Core daemon.
+    pub fn discover_herdr(
+        mut options: crate::options::SshOptions,
+        size: TerminalSize,
+        allow_clipboard: bool,
+    ) -> Self {
+        options.durable = true;
+        Self::start_worker(
+            Source::Ssh(options),
+            size,
+            allow_clipboard,
+            None,
+            Some(ssh::DurableStart::DiscoverHerdr),
+            None,
+        )
+    }
+
     pub fn durable_state(&self) -> Option<ssh::DurableState> {
         self.durable.as_ref().map(|control| control.state())
     }
@@ -606,20 +623,38 @@ async fn run(
             }
             Some(event) = output.recv() => {
                 let anchor = (scroll_offset>0 && !terminal.is_alt_screen_active()).then(||terminal.screen().visible_row_to_stable_row(0)-scroll_offset as isize);
-                match event {
-                    ssh::Event::Data(bytes) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes); }
-                    ssh::Event::Status(message) => { log::info!("{message}"); status = message; }
-                    ssh::Event::SessionListUpdated(message) => { status = message; presentation.refresh_view = true; }
-                    ssh::Event::Connected(generation)=>{if generation>1{terminal.reset_connection();scroll_offset=0;}presentation.dirty=true;connection_generation=generation;},
-                }
-                // Coalesce a bounded amount of already-arrived output per snapshot.
-                for _ in 0..7 {
-                    match output.try_recv() {
-                        Ok(ssh::Event::Data(bytes)) => {if observed.receiver_count()>0{let _=observed.send(bytes.clone());}record_output(&mut recorder,&bytes,&events);total_bytes += bytes.len() as u64; presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes); }
-                        Ok(ssh::Event::Status(message)) => status = message,
-                        Ok(ssh::Event::SessionListUpdated(message)) => { status = message; presentation.refresh_view = true; }
-                        Ok(ssh::Event::Connected(generation))=>{if generation>1{terminal.reset_connection();scroll_offset=0;}presentation.dirty=true;connection_generation=generation;},
-                        Err(_) => break,
+                // Preserve mode transitions and data order even when the first paint
+                // and a connection event arrive together in a single snapshot batch.
+                let ready = std::iter::from_fn(|| output.try_recv().ok());
+                for event in std::iter::once(event).chain(ready).take(8) {
+                    match event {
+                        ssh::Event::HerdrViewer => {
+                            terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
+                        }
+                        ssh::Event::Data(bytes) => {
+                            if observed.receiver_count() > 0 {
+                                let _ = observed.send(bytes.clone());
+                            }
+                            record_output(&mut recorder, &bytes, &events);
+                            total_bytes += bytes.len() as u64;
+                            presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                        }
+                        ssh::Event::Status(message) => {
+                            log::info!("{message}");
+                            status = message;
+                        }
+                        ssh::Event::SessionListUpdated(message) => {
+                            status = message;
+                            presentation.refresh_view = true;
+                        }
+                        ssh::Event::Connected(generation) => {
+                            if generation > 1 {
+                                terminal.reset_connection();
+                                scroll_offset = 0;
+                            }
+                            presentation.dirty = true;
+                            connection_generation = generation;
+                        }
                     }
                 }
                 if let Some(anchor)=anchor && !terminal.is_alt_screen_active() {scroll_offset=(terminal.screen().visible_row_to_stable_row(0)-anchor).max(0).min(crate::search::max_offset(&terminal) as isize) as usize;}

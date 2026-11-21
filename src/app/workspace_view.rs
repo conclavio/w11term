@@ -270,11 +270,19 @@ impl TerminalApp {
                 anyhow::bail!("Expected a terminal pane")
             };
             let source = if live.discovery_page.is_some() {
-                SavedSource::Discovery(
-                    live.profile_name
-                        .clone()
-                        .context("Missing discovery profile")?,
-                )
+                let name = live
+                    .profile_name
+                    .clone()
+                    .context("Missing discovery profile")?;
+                if live
+                    .session
+                    .durable_state()
+                    .is_some_and(|state| state.herdr_browser)
+                {
+                    SavedSource::HerdrDiscovery(name)
+                } else {
+                    SavedSource::Discovery(name)
+                }
             } else {
                 SavedSource::capture(&live.source, live.profile_name.as_deref())?
             };
@@ -455,6 +463,7 @@ pub(super) fn append_resolved_workspace(
                 options.clone(),
                 osc52,
                 saved.session().cloned(),
+                saved.is_herdr_browser(),
             );
         }
         if let (SavedSource::Startup { launch, .. }, Source::Ssh(options)) = (saved, &source) {
