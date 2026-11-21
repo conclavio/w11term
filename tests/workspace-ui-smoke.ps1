@@ -50,8 +50,9 @@ function Assert-FailedLaunch([string]$Name, [string]$Expected, [string]$Mode = '
 }
 
 function Open-WorkspacePicker {
-    Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
-    Invoke-Button (Wait-Until 'Workspaces menu item' { Find-Element ('Workspaces' + [char]0x2026) })
+    # A native flyout can dismiss when activation moves between the fixture's
+    # windows. Address the Workspaces action to the intended HWND each time.
+    Press-Key 0x77 # F8 in this fixture
     Wait-Until 'workspace search box' { Find-Element 'Find workspace' }
 }
 
@@ -63,6 +64,7 @@ $duplicate = $null
 try {
     $env:W11TERM_DATA_DIR = $data
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
+    [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"workspaces":"F8"}}', $encoding)
     Remove-Item -LiteralPath Env:W11TERM_UI_SMOKE, Env:W11TERM_WORKSPACE_SMOKE -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($profiles, '{"profiles":{}}', $encoding)
     $fixture = @'
@@ -129,16 +131,18 @@ try {
             $targetWindow = $terminal.MainWindowHandle
             [void][WorkspaceFocus]::ShowWindowAsync($targetWindow, 6)
             $null = Wait-Until 'workspace minimized' { [WorkspaceFocus]::IsIconic($targetWindow) }
+            $search = Wait-Until 'search field after failed launch' { Find-Element 'Find workspace' }
         }
         $search.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('TWO')
         $switch = Wait-Until 'filtered switch result' {
             if (-not (Find-Element 'Switch to workspace missing-profile')) { Find-Element 'Switch to workspace two-tabs' }
         }
         Invoke-Button $switch
-        $null = Wait-Until 'original workspace in foreground' {
+        $null = Wait-Until "original workspace in foreground and picker closed (switch $attempt)" {
             [uint32]$foregroundPid = 0
             [void][WorkspaceFocus]::GetWindowThreadProcessId([WorkspaceFocus]::GetForegroundWindow(), [ref]$foregroundPid)
-            $foregroundPid -eq $terminal.Id -and -not [WorkspaceFocus]::IsIconic($targetWindow)
+            $foregroundPid -eq $terminal.Id -and -not [WorkspaceFocus]::IsIconic($targetWindow) -and
+                -not (Find-Element 'Find workspace')
         }
         $reply = & $ctl --pid $terminal.Id list | ConvertFrom-Json
         if (-not $reply.ok -or (@($reply.result.sessions.id | Sort-Object) -join ',') -ne $ids) {
