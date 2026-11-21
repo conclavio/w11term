@@ -16,6 +16,8 @@ A Windows user should be able to put a remote editor beside a build log, open a 
 
 RustMUSH cockpit reattachment follows the general-purpose roadmap. A Windows machine and an ordinary Linux SSH host suffice to exercise all five releases.
 
+The general-purpose backlog also includes [mounting selected Windows folders on a Linux SSH host](#mount-selected-windows-folders-on-a-linux-ssh-host).
+
 ## Current capabilities
 
 Each terminal tab has its own session, scrollback, search state and programmable control surface. Scripts can target a background session by ID, write raw bytes, wait for a regex, read committed screen text, capture PNGs and record VT output. The same authenticated SSH connection also supports SFTP. Profiles already support creation, editing and renaming, plus key, agent, password and keyboard-interactive authentication. [Current features](../README.md#tabs-and-profiles) · [Control and SFTP API](../CONTROL.md)
@@ -89,6 +91,16 @@ Add **Local PowerShell** to the same **+** and split menus as SSH profiles. A lo
 Choose the backend when opening the pane. An SSH pane exchanges terminal bytes directly with its russh channel, preserving the existing path for kitty graphics, keyboard negotiation and raw control writes. A local pane launches its child attached to a Windows pseudoconsole. w11term reads ConPTY’s output pipe into the same VT engine and renderer, writes terminal input to its input pipe, and passes cell-grid changes to `ResizePseudoConsole`. Only local sessions incur ConPTY’s translation and I/O costs. Keep SFTP and remote reattachment scoped to SSH panes. [Windows pseudoconsole lifecycle](https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session) · [Grid resizing](https://learn.microsoft.com/en-us/windows/console/resizepseudoconsole)
 
 **Acceptance.** Split a live SSH tab and select **Local PowerShell**. Verify that typing, Ctrl+C, resize and exit reach the intended pane, and that closing the local shell cleans up its child and pipe handles while the SSH session continues. Drive the remote pane through the CLI during local output and compare its received bytes and captured image with the direct-SSH fixture. Restore the layout and verify the local pane opens in its configured directory.
+
+## Mount selected Windows folders on a Linux SSH host
+
+Let an SSH profile share one or more folders chosen with the Windows folder picker. For example, the profile could mount `C:\Projects\sprites` at `~/windows/sprites` when it connects. A Linux editor or build can then use ordinary filesystem paths. Show each share’s host, mount point, access mode and mount status in w11term, with an **Unmount** action. Sharing starts disabled. Each folder defaults to read-only, with write access granted separately per folder.
+
+Use a separate SSH exec channel on the authenticated connection, without a PTY. Linux runs SSHFS in its documented `-o passive` mode, which carries SFTP requests on standard input and output. w11term serves those requests from a Windows directory handle scoped to the selected folder. FUSE supplies the Linux mount. This design requires SSHFS, permission to use FUSE and permission to run the mount command on the host. It needs neither a Windows filesystem driver nor an inbound listener. If the mount fails, show the reason and keep the shell usable. [SSHFS manual, passive mode](https://github.com/libfuse/sshfs/blob/ba33bab77006cfb81cbd6ecc44a8fc2728d24793/sshfs.rst#L150-L154)
+
+Bind each share to the verified host and SSH account. Refuse drive roots and use a user-owned, empty Linux mount point with SSHFS’s default owner-only access. Programs running as that Linux user can access the mount. Enforce read-only mode and containment on Windows for every operation, including rename and link handling. Path traversal, Windows device paths, alternate data streams and junctions must never give the remote host access outside the selected tree. On unmount or connection loss, close the export and invalidate its handles. A reconnect may remount configured folders after host verification. An interrupted write must surface an error and must never be silently replayed.
+
+**Acceptance.** Mount a temporary Windows folder on a real Linux FUSE host. Read a file through the mount, verify that a sibling folder stays inaccessible even through a junction, and verify that read-only mode rejects changes. Enable writes for that folder and exercise create, rename and delete from Linux. Drop the SSH connection during I/O, reconnect, and check that old handles fail, the configured share remounts and the terminal still accepts input. Also exercise explicit unmount and a host without SSHFS.
 
 ## Subsequent features for RustMUSH
 
