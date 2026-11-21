@@ -6,7 +6,11 @@ Linux reads binary data, compares a 98,321-byte file under a Unicode name agains
 
 After unmounting, the test replaces the Windows directory at its saved path. The manager must report the replacement and leave Linux unmounted. Restoring the original directory must allow the saved grant to mount again.
 
-The original interactive shell must keep its PID through explicit unmount and dropping a mount handle. The test then disconnects the SSH transport and checks that the mount disappears. A fresh pane opens the same temporary profile and grant store, remounts the saved folder, and forgets it. Linux must see the mount disappear again while its new shell remains usable. Reopening the profile must show an empty grant list.
+The original interactive shell must keep its PID through explicit unmount and dropping a mount handle. The test saves a second folder, turns off **Mount on connect** for it, and checks that its live Linux mount keeps the same mount record and readable contents. Disconnecting the SSH transport must release both mounts.
+
+On a fresh SSH connection, only the enabled folder mounts automatically. The test mounts the disabled folder manually, reads its Windows file, and verifies that its saved preference is still off. It then unmounts the folder and turns the preference on. The folder must stay unmounted until the next connection, where it receives a new mount generation. Forgetting both folders must leave an empty grant list. Each interactive shell must keep its PID while its mounts change.
+
+The native UI test on the same guest turns off the saved checkbox on a live mount, opens the Files drawer at its Linux path, and downloads a Windows-only file over the originating SSH connection. The Windows loopback UI test also saves a new folder with the checkbox off and checks its state after restarting w11term.
 
 The profile-wide revocation test gives two profiles on the same SSH account three distinct folders. Linux keeps a file open after reading its first byte. A second Windows process revokes one profile through the Settings API. Linux tries to read 64 MiB farther into that open file and tries new filenames in both revoked folders. Those reads must fail, both mounts must disappear, and the other profile must still read new data from its original mount. Both shells keep their PIDs. Once both SSH connections have closed, the test revokes the remaining profile offline. Reopening it must show no saved folders or mounts until a fresh selection authorizes sharing again.
 

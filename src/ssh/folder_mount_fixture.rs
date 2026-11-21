@@ -286,6 +286,37 @@ async fn wait_profile(
     .await
 }
 
+async fn saved_preference(
+    manager: &PaneShares,
+    auth: &Authority,
+    name: &str,
+    expected: bool,
+) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(preference) = manager
+            .rows(auth)?
+            .into_iter()
+            .find(|row| row.name == name)
+            .and_then(|row| row.mount_on_connect)
+        {
+            ensure!(
+                preference.error.is_none(),
+                "saving {name}: {:?}",
+                preference.error
+            );
+            if !preference.pending && preference.enabled == expected {
+                return Ok(preference.grant_id);
+            }
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "{name} did not save mount-on-connect={expected}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn expect_refused(
     link: &ConnectionShare,
     path: &Path,
@@ -567,6 +598,29 @@ async fn individual_grants(options: &SshOptions) -> Result<()> {
     manager.mount(&auth, &name)?;
     wait_profile(&manager, &auth, &name, Some(FolderMountStatus::Mounted)).await?;
     let before_disconnect = check_mount(&link, &remote, &tile_digest).await?;
+    let manual_name = format!("{name}-manual");
+    let manual_remote = format!("{HOME}/windows/{manual_name}");
+    let manual_local = fixture.path().join("manual");
+    fs::create_dir(&manual_local)?;
+    fs::write(manual_local.join(NAME), b"manual grant")?;
+    manager.add(&auth, &manual_name, manual_local)?;
+    wait_profile(
+        &manager,
+        &auth,
+        &manual_name,
+        Some(FolderMountStatus::Mounted),
+    )
+    .await?;
+    let id = saved_preference(&manager, &auth, &manual_name, true).await?;
+    let record = mount_record(&link, &manual_remote).await?;
+    ensure!(!record.is_empty(), "the second grant never mounted");
+    manager.set_auto_mount(&auth, &manual_name, &id, false)?;
+    ensure!(saved_preference(&manager, &auth, &manual_name, false).await? == id);
+    ensure!(
+        mount_record(&link, &manual_remote).await? == record,
+        "disabling remount replaced the current mount"
+    );
+    ensure!(checked(&link, &format!("cat {manual_remote}/{NAME}")).await? == b"manual grant");
     ensure!(shell_pid(&pane, "AFTER_MOUNT").await? == before);
     let still_live = pane
         .ssh_connection()
@@ -591,6 +645,7 @@ async fn individual_grants(options: &SshOptions) -> Result<()> {
     // Keep the old manager and lease alive until the guest confirms transport
     // loss itself revoked the mount.
     wait_detached(&new_link, &remote).await?;
+    wait_detached(&new_link, &manual_remote).await?;
     drop(manager);
     drop(pane);
     let new_pid = shell_pid(&new_pane, "RECONNECTED").await?;
@@ -607,6 +662,54 @@ async fn individual_grants(options: &SshOptions) -> Result<()> {
         check_mount(&new_link, &remote, &tile_digest).await? != before_disconnect,
         "saved grant reused its stale mount"
     );
+    wait_profile(
+        &reopened,
+        &new_auth,
+        &manual_name,
+        Some(FolderMountStatus::Stopped),
+    )
+    .await?;
+    ensure!(saved_preference(&reopened, &new_auth, &manual_name, false).await? == id);
+    ensure!(
+        mount_record(&new_link, &manual_remote).await?.is_empty(),
+        "disabled grant auto-mounted beside the enabled one"
+    );
+    reopened.mount(&new_auth, &manual_name)?;
+    wait_profile(
+        &reopened,
+        &new_auth,
+        &manual_name,
+        Some(FolderMountStatus::Mounted),
+    )
+    .await?;
+    ensure!(checked(&new_link, &format!("cat {manual_remote}/{NAME}")).await? == b"manual grant");
+    let manual_generation = mount_record(&new_link, &manual_remote).await?;
+    ensure!(
+        !manual_generation.is_empty() && manual_generation != record,
+        "manual mount did not create a fresh generation"
+    );
+    ensure!(saved_preference(&reopened, &new_auth, &manual_name, false).await? == id);
+    unmount_profile(
+        &reopened,
+        &new_auth,
+        &new_link,
+        &manual_name,
+        &manual_remote,
+    )
+    .await?;
+    reopened.set_auto_mount(&new_auth, &manual_name, &id, true)?;
+    ensure!(saved_preference(&reopened, &new_auth, &manual_name, true).await? == id);
+    wait_profile(
+        &reopened,
+        &new_auth,
+        &manual_name,
+        Some(FolderMountStatus::Stopped),
+    )
+    .await?;
+    ensure!(
+        mount_record(&new_link, &manual_remote).await?.is_empty(),
+        "enabling remount started a stopped share immediately"
+    );
     ensure!(
         reopened.forget(&auth, &name).is_err(),
         "previous pane authority could change a new mount"
@@ -615,13 +718,43 @@ async fn individual_grants(options: &SshOptions) -> Result<()> {
     wait_profile(&reopened, &new_auth, &name, None).await?;
     wait_detached(&new_link, &remote).await?;
     drop(reopened);
-    let after_forget = new_pane.profile_folders(scope());
+    ensure!(shell_pid(&new_pane, "AFTER_FORGET").await? == new_pid);
+
+    close_transport(&new_link).await?;
+    drop(new_pane);
+    let (last_pane, last_link) = login(options).await?;
+    let last_pid = shell_pid(&last_pane, "FINAL_RECONNECT").await?;
+    let reenabled = last_pane.profile_folders(scope());
+    let last_auth = ready_authority(&reenabled).await?;
+    wait_profile(
+        &reenabled,
+        &last_auth,
+        &manual_name,
+        Some(FolderMountStatus::Mounted),
+    )
+    .await?;
+    ensure!(saved_preference(&reenabled, &last_auth, &manual_name, true).await? == id);
+    ensure!(checked(&last_link, &format!("cat {manual_remote}/{NAME}")).await? == b"manual grant");
+    let record = mount_record(&last_link, &manual_remote).await?;
+    ensure!(
+        !record.is_empty() && record != manual_generation,
+        "re-enabled folder did not remount on the next connection"
+    );
+    ensure!(
+        mount_record(&last_link, &remote).await?.is_empty(),
+        "forgotten sibling remounted"
+    );
+    reenabled.forget(&last_auth, &manual_name)?;
+    wait_profile(&reenabled, &last_auth, &manual_name, None).await?;
+    wait_detached(&last_link, &manual_remote).await?;
+    drop(reenabled);
+    let after_forget = last_pane.profile_folders(scope());
     let auth = ready_authority(&after_forget).await?;
     ensure!(
         after_forget.rows(&auth)?.is_empty(),
         "the forgotten grant reappeared when the saved profile was reopened"
     );
-    ensure!(shell_pid(&new_pane, "AFTER_FORGET").await? == new_pid);
+    ensure!(shell_pid(&last_pane, "AFTER_FINAL_FORGET").await? == last_pid);
     ensure!(
         fs::read(path)? == CONTENT && fs::read(secret)? == b"sibling data",
         "Windows fixture changed"

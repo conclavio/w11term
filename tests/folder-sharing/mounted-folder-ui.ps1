@@ -78,6 +78,11 @@ try {
         }
         Start-Sleep -Milliseconds 100
     }
+    (Wait-CheckBox "Mount on connect for $name" On).Toggle()
+    $null = Wait-CheckBox "Mount on connect for $name" Off
+    if (!(Find-Element $expected) -or !(Enabled $open) -or !(Enabled $copy)) {
+        throw 'Disabling mount on connect changed the live share or its actions'
+    }
     if ($CheckClipboard) {
         . (Join-Path $PSScriptRoot '../support/clipboard.ps1')
         $before = [FixtureClipboard]::GetClipboardSequenceNumber()

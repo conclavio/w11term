@@ -97,6 +97,15 @@ function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Typ
 function Invoke-Button($Element) {
     $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }
+function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$State) {
+    Wait-Until "enabled checkbox '$Name' in state $State" {
+        $element = Find-Element $Name ([System.Windows.Automation.ControlType]::CheckBox)
+        if ($element -and $element.Current.IsEnabled) {
+            $pattern = $element.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+            if ($pattern.Current.ToggleState -eq $State) { $pattern }
+        }
+    }
+}
 function Post-Key([uint32]$Message, [uint32]$Key) {
     # Address this process's window. This never types into the foreground application.
     if (-not [FixtureMessages]::PostKey($window, $Message, $Key)) {

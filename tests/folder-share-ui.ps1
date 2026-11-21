@@ -184,6 +184,8 @@ for ($launch = 1; $launch -le 3; $launch++) {
             $value.SetValue('../invalid')
             $null = Wait-Until 'invalid name disables sharing' { $b = Find-Element 'Save folder' $button; $b -and !$b.Current.IsEnabled }
             $value.SetValue('smoke-share')
+            (Wait-CheckBox 'Mount on connect' On).Toggle()
+            $null = Wait-CheckBox 'Mount on connect' Off
             Click 'Save folder'
             $null = Wait-Until 'saved remote mount path' { Find-Element '~/windows/smoke-share' }
             Wait-FailedMount
@@ -192,9 +194,22 @@ for ($launch = 1; $launch -le 3; $launch++) {
             if ($grantFiles.Length -ne 1) { throw 'Expected exactly one isolated local consent file' }
             $consentFile = $grantFiles[0].FullName
             $consent = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
-            if ($consent.Length -ne 1 -or !(Same-SelectedFolder $consent[0].path) -or $consent[0].name -ne 'smoke-share') {
+            if ($consent.Length -ne 1 -or !(Same-SelectedFolder $consent[0].path) -or $consent[0].name -ne 'smoke-share' -or
+                $consent[0].auto_mount -isnot [bool] -or $consent[0].auto_mount) {
                 throw 'Persisted consent did not match the selected test directory and mount name'
             }
+            (Wait-CheckBox 'Mount on connect for smoke-share' Off).Toggle()
+            $null = Wait-Until 'enabled preference in the saved grant' {
+                $saved = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
+                $saved.Count -eq 1 -and $saved[0].name -ceq 'smoke-share' -and $saved[0].auto_mount -ne $false
+            }
+            (Wait-CheckBox 'Mount on connect for smoke-share' On).Toggle()
+            $null = Wait-Until 'disabled preference in the saved grant' {
+                $saved = @(Get-Content -Raw -LiteralPath $consentFile | ConvertFrom-Json)
+                $saved.Count -eq 1 -and $saved[0].auto_mount -eq $false
+            }
+            $null = Wait-CheckBox 'Mount on connect for smoke-share' Off
+            Wait-FailedMount
             Send-ToShell 'share-shell-before-restart'
             $null = Control @('open','--profile','Palette PowerShell')
             $local = Wait-Until 'new PowerShell' { ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id }
@@ -206,7 +221,11 @@ for ($launch = 1; $launch -le 3; $launch++) {
         } else {
             $null = Wait-Until 'persisted share in restarted process' { Find-Element '~/windows/smoke-share' }
             Wait-SelectedPath
+            $null = Wait-CheckBox 'Mount on connect for smoke-share' Off
+            $null = Wait-Until 'manual-only folder stays unmounted on reconnect' { Find-Element 'Unmounted' }
+            Click 'Mount smoke-share'
             Wait-FailedMount
+            $null = Wait-CheckBox 'Mount on connect for smoke-share' Off
             Click 'Forget smoke-share'
             $null = Wait-Until 'forgotten share removed' { (Find-Element 'Requested removal of smoke-share') -and !(Find-Element '~/windows/smoke-share') }
             if ((Test-Path -LiteralPath $consentFile) -and (Get-Content -Raw -LiteralPath $consentFile).Trim() -ne '[]') { throw 'A folder grant survived Forget' }
