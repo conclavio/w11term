@@ -125,6 +125,9 @@ impl TerminalApp {
             directory,
             message: None,
         });
+        if let Some(inspector) = &mut self.inspection {
+            inspector.clear_pointer();
+        }
         self.keyboard.set_hints(true);
         tab.surface.invalidator.invalidate();
     }

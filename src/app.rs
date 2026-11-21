@@ -948,15 +948,17 @@ impl TerminalApp {
         };
         let metrics = tab.surface.metrics.get();
         let frame = tab.session.frames.load();
-        let x = (((pointer.x as f32 - PADDING).max(0.0) / metrics.cell_width).floor() as usize)
-            .min(metrics.cols.saturating_sub(1));
-        let y = (((pointer.y as f32 - PADDING).max(0.0) / metrics.cell_height).floor() as usize)
-            .min(metrics.rows.saturating_sub(1));
-        let point = Point {
-            row: frame.first_stable_row + y as isize,
-            col: frame.cell_map(y).map_or(x, |map| map.logical(x)),
-        };
+        let hit = metrics.hit(pointer.x, pointer.y);
+        let (x, y) = (hit.col, hit.row);
+        let point = hit.point(&frame);
         let link = link_at(&frame, point, preferences.detect_urls);
+        if let Some(inspector) = &mut self.inspection {
+            if inspector.pane == tab.session.pane_id {
+                inspector.observe_pointer((pointer.x, pointer.y), &hit, &frame, link.as_ref());
+            } else {
+                inspector.clear_pointer();
+            }
+        }
         if *tab.hover.borrow() != link {
             *tab.hover.borrow_mut() = link.clone();
             tab.surface.invalidator.invalidate();
@@ -3414,6 +3416,15 @@ impl Component for TerminalApp {
                             return;
                         }
                         tab.observed_frame = frame.generation;
+                        if let Some(inspector) = &mut self.inspection
+                            && inspector.pane == tab.session.pane_id
+                        {
+                            inspector.refresh_pointer(
+                                tab.surface.metrics.get(),
+                                &frame,
+                                self.appearance.read().unwrap().interaction.detect_urls,
+                            );
+                        }
                         tab.error = None;
                         tab.files.observe_connection(frame.connection_generation);
                         let unavailable = frame.copy_output_unavailable();
@@ -3781,7 +3792,14 @@ impl Component for TerminalApp {
                     self.divider_drag.borrow_mut().take();
                 }
             }
-            Message::HoverPane(id) => self.keyboard.hover_pane(id),
+            Message::HoverPane(id) => {
+                self.keyboard.hover_pane(id);
+                if self.tabs.active_id() != Some(id)
+                    && let Some(inspector) = &mut self.inspection
+                {
+                    inspector.clear_pointer();
+                }
+            }
             Message::PointerExit(id) => {
                 self.keyboard.leave_pane(id);
                 if let Some(AppTab {
@@ -3789,6 +3807,11 @@ impl Component for TerminalApp {
                     ..
                 }) = self.tabs.get(id)
                 {
+                    if let Some(inspector) = &mut self.inspection
+                        && inspector.pane == tab.session.pane_id
+                    {
+                        inspector.clear_pointer();
+                    }
                     tab.hover.borrow_mut().take();
                     tab.surface.invalidator.invalidate();
                 }
