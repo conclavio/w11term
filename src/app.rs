@@ -36,6 +36,8 @@ mod command_history;
 mod config_import;
 mod file_drawer;
 mod file_picker;
+mod folder_shares;
+mod folder_sharing_state;
 mod keyboard_settings;
 mod local_profile;
 mod pattern_settings;
@@ -65,6 +67,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    folder_sharing: Option<Box<w11term::folder_grants::PaneShares>>,
     read_only: Rc<Cell<bool>>,
     startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
@@ -269,6 +272,7 @@ enum SettingsEditor {
     Patterns(pattern_settings::PatternPage),
 }
 enum Page {
+    SharedFolders(folder_shares::Panel),
     Attention,
     CommandHistory(command_history::HistoryPage),
     Terminal(LiveTab),
@@ -534,6 +538,7 @@ pub enum Field {
 }
 
 enum UiWork {
+    FolderAuthority,
     Control(w11term::control::UiRequest),
     AttentionChanged,
 }
@@ -545,6 +550,8 @@ struct CaretMenuBinding {
 }
 
 pub struct TerminalApp {
+    folder_wake: Arc<dyn Fn() + Send + Sync>,
+    folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
     taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
     show_inspector: bool,
@@ -609,6 +616,8 @@ pub struct ExitedPane {
 }
 
 pub enum Message {
+    FolderAuthority,
+    FolderShare(folder_shares::Action),
     RestartExited(ExitedPane),
     Export(scrollback_export::Action),
     TabTitle(tab_title::Action),
@@ -744,6 +753,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            folder_sharing: None,
             startup: None,
             observed_frame: 0,
             files: Box::default(),
@@ -810,6 +820,7 @@ impl TerminalApp {
                     {
                         Ok(UiWork::Control(request)) => return Message::Control(request),
                         Ok(UiWork::AttentionChanged) => return Message::AttentionChanged,
+                        Ok(UiWork::FolderAuthority) => return Message::FolderAuthority,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(_) => return Message::ControlIdle,
                     }
@@ -857,6 +868,7 @@ impl TerminalApp {
             tab.prompt_id = prompt_id;
         }
         if tab.connection_generation != frame.connection_generation {
+            self.header.borrow_mut().take();
             tab.connection_generation = frame.connection_generation;
             tab.reset_transport_input(&self.keyboard);
         }
@@ -1762,6 +1774,8 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.bind_folder_shares();
+        self.activate_folder_panel(context);
         self.title_editor = None;
         self.cancel_inactive_name_editor();
         self.close_copy_mode();
@@ -2096,6 +2110,7 @@ impl TerminalApp {
                     self.catalog = catalog;
                     self.profile_error = None;
                     self.header.borrow_mut().take();
+                    self.bind_folder_shares();
                 }
             }
             Err(error) => {
@@ -2415,6 +2430,9 @@ impl TerminalApp {
         // Reactor replaces a flyout when its callback changes. Keep the same
         // callback while repainting the title bar for the same action target.
         let on_click = context.callback(move |label: String| match label.as_str() {
+            folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
+                Message::FolderShare(folder_shares::Action::Open(id))
+            }),
             scrollback_export::LABEL => Message::Export(scrollback_export::Action::Start(pane)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
             _ => tab_menu_message(label),
@@ -2629,6 +2647,15 @@ impl TerminalApp {
                 player.as_ref().map(|p| p.sync_assets_enabled()),
             ),
             MenuItem::separator("profile-actions"),
+            command_menu_item(
+                "shared-folders",
+                folder_shares::LABEL,
+                self.tabs
+                    .active()
+                    .and_then(AppTab::pane_id)
+                    .and_then(|pane| self.folder_authority(pane))
+                    .is_some(),
+            ),
             if can_edit {
                 MenuItem::item("edit-profile", "Edit current profile…")
             } else {
@@ -2804,6 +2831,16 @@ impl TerminalApp {
         ];
         if draft.origin.editing().is_some() {
             fields.push(TextBlock::new().text("Connection changes apply to new sessions. Sound and game options update open tabs.").text_wrapping(TextWrapping::Wrap).into());
+            if let Some(pane) = self.folder_editor_target(draft) {
+                fields.push(
+                    Button::new()
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .on_click(context.callback(move |_| {
+                            Message::FolderShare(folder_shares::Action::Open(pane))
+                        }))
+                        .content(folder_shares::LABEL),
+                );
+            }
         }
         // Keep the feedback slot mounted so save/error messages do not remount inputs.
         if !draft.proxy_jump.is_empty() {
@@ -3232,6 +3269,10 @@ impl Component for TerminalApp {
         );
         let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
+        let folder_messages = control_sender.clone();
+        let folder_wake = Arc::new(move || {
+            let _ = folder_messages.try_send(UiWork::FolderAuthority);
+        });
         let inbox = w11term::events::Inbox::new(move || {
             // If full, a control message will already wake the UI to read the latest count.
             let _ = wake.try_send(UiWork::AttentionChanged);
@@ -3271,6 +3312,7 @@ impl Component for TerminalApp {
             }
         });
         let mut app = Self {
+            folder_wake,
             inbox,
             taskbar: RefCell::default(),
             accessible: Default::default(),
@@ -3296,6 +3338,7 @@ impl Component for TerminalApp {
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
             caret_menu_binding: RefCell::new(None),
+            folder_panel_timer: None,
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
             inspection: None,
@@ -3387,6 +3430,7 @@ impl Component for TerminalApp {
         if !matches!(
             &message,
             Message::FrameReady(..)
+                | Message::FolderShare(folder_shares::Action::Panel(..))
                 | Message::RefreshProfiles
                 | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
@@ -3407,7 +3451,10 @@ impl Component for TerminalApp {
         ) {
             self.header.borrow_mut().take();
         }
-        if matches!(&message, Message::Control(_) | Message::AttentionChanged) {
+        if matches!(
+            &message,
+            Message::Control(_) | Message::AttentionChanged | Message::FolderAuthority
+        ) {
             if self.inbox.acknowledge_wake()
                 && let Some(hwnd) = self.keyboard.hwnd()
             {
@@ -3424,6 +3471,7 @@ impl Component for TerminalApp {
             other => other,
         };
         match message {
+            Message::FolderShare(action) => self.folder_action(action, context),
             Message::RestartExited(exit) => {
                 // A native menu may still be delivering a callback for a previous exit or pane.
                 if let Some(id) = self.tab_for_pane(exit.pane)
@@ -3456,7 +3504,7 @@ impl Component for TerminalApp {
             Message::TransferCanceled(id) => self.cancel_transfer(id, context),
             Message::TabTitle(action) => self.edit_tab_title(action),
             Message::Attention(action) => self.handle_attention(action, context),
-            Message::AttentionChanged => {}
+            Message::AttentionChanged | Message::FolderAuthority => {}
             Message::ToggleInspector => {
                 self.show_inspector = !self.show_inspector;
                 self.sync_inspector();
@@ -4393,7 +4441,16 @@ impl Component for TerminalApp {
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
-            Message::RefreshProfiles => self.refresh_profiles(),
+            Message::RefreshProfiles => {
+                self.refresh_profiles();
+                for entry in self.tabs.entries() {
+                    if let Page::Terminal(live) = &entry.value.page
+                        && let Some(shares) = &live.folder_sharing
+                    {
+                        shares.refresh_profile();
+                    }
+                }
+            }
             Message::MoveProfile(name, delta, order) => {
                 match self.store.move_profile(&name, delta, &order) {
                     Ok(catalog) => {
@@ -4825,6 +4882,7 @@ impl Component for TerminalApp {
                 Page::Settings(None) => self.settings_view(context),
                 Page::Attention => self.attention_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
+                Page::SharedFolders(page) => self.folder_panel_view(page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,
