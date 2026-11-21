@@ -20,6 +20,8 @@ public static class TabFixtureWindows {
     [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
     public static IntPtr[] OwnedBy(int expected) {
         var found = new List<IntPtr>();
         EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
@@ -54,9 +56,24 @@ function Use-Window([IntPtr]$Hwnd) {
         while ([TabFixtureWindows]::GetForegroundWindow() -ne $Hwnd -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 20 }
         if ([TabFixtureWindows]::GetForegroundWindow() -ne $Hwnd) {
             $focusable = Wait-Until 'focusable button in the fixture HWND' { Find-Here $Hwnd 'New tab' }
-            $focusable.SetFocus()
+            try { $focusable.SetFocus() } catch [System.Management.Automation.MethodInvocationException] {
+                # The HWND restore below handles a declined UI Automation focus request.
+            }
         }
-        $null = Wait-Until "foreground for fixture HWND $Hwnd" { [TabFixtureWindows]::GetForegroundWindow() -eq $Hwnd }
+        if ([TabFixtureWindows]::GetForegroundWindow() -ne $Hwnd) {
+            # Windows can decline activation by a background automation process.
+            # Request a real restore on the verified fixture window's own GUI thread.
+            $null = [TabFixtureWindows]::ShowWindowAsync($Hwnd, 7) # SW_SHOWMINNOACTIVE
+            $null = Wait-Until 'fixture HWND to minimize' { [TabFixtureWindows]::IsIconic($Hwnd) }
+            $null = [TabFixtureWindows]::ShowWindowAsync($Hwnd, 9) # SW_RESTORE
+            $null = Wait-Until 'fixture HWND to restore' { ![TabFixtureWindows]::IsIconic($Hwnd) }
+        }
+        $null = Wait-Until "foreground for fixture HWND $Hwnd" {
+            if ([TabFixtureWindows]::GetForegroundWindow() -eq $Hwnd) { return $true }
+            if ([TabFixtureWindows]::OwnedBy($app.Id) -notcontains $Hwnd) { throw "Fixture HWND $Hwnd closed while activating" }
+            $null = [TabFixtureWindows]::SetForegroundWindow($Hwnd)
+            return [TabFixtureWindows]::GetForegroundWindow() -eq $Hwnd
+        }
     }
 }
 
