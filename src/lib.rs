@@ -7,6 +7,7 @@ pub mod demo;
 pub mod durable;
 pub mod enroll;
 pub mod events;
+pub mod hints;
 pub mod interaction;
 pub mod keys;
 pub mod options;

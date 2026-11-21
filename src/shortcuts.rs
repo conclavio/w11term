@@ -20,6 +20,7 @@ pub enum Action {
     ClosePane,
     MovePane,
     PanePicker,
+    KeyboardHints,
     NextTab,
     PreviousTab,
     NewTab,
@@ -68,6 +69,13 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(ClosePane, "close_pane", "Close pane", 0x57, PANE),
     Binding::new(MovePane, "move_pane", "Move pane to new tab", 0, Mods::NONE),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
+    Binding::new(
+        KeyboardHints,
+        "keyboard_hints",
+        "Keyboard hints",
+        0x48,
+        CTRL_SHIFT,
+    ),
     Binding::new(Workspaces, "workspaces", "Workspaces", 0, Mods::NONE),
     Binding::new(NextTab, "next_tab", "Next tab", 0x09, Mods::CTRL),
     Binding::new(
@@ -109,6 +117,7 @@ impl Action {
                 | ZoomPane
                 | ClosePane
                 | MovePane
+                | KeyboardHints
         )
     }
 }
@@ -380,6 +389,27 @@ mod tests {
                 .unwrap()
                 .resolve(0x50, CTRL_SHIFT, true, false),
             Some(FocusRight)
+        );
+    }
+    #[test]
+    fn editing_the_hint_binding_releases_its_old_chord() {
+        let mut shortcuts = Shortcuts::default();
+        let f8 = "F8".parse::<Chord>().unwrap();
+        shortcuts.set(KeyboardHints, Some(f8)).unwrap();
+        let map = shortcuts.keymap().unwrap();
+        assert_eq!(map.resolve(0x48, CTRL_SHIFT, true, false), None);
+        assert_eq!(
+            map.resolve(f8.key, f8.mods, true, false),
+            Some(KeyboardHints)
+        );
+        assert_eq!(map.resolve(f8.key, f8.mods, false, false), None);
+        shortcuts.set(KeyboardHints, None).unwrap();
+        assert_eq!(
+            shortcuts
+                .keymap()
+                .unwrap()
+                .resolve(f8.key, f8.mods, true, false),
+            None
         );
     }
     #[test]

@@ -218,12 +218,15 @@ impl TerminalApp {
         let area = surface.area.clone();
         let selection = tab.selection.clone();
         let hover = tab.hover.clone();
+        let hints = self.hints.clone();
         #[cfg(feature = "ui-smoke")]
         let paint_count = surface.paint_count.clone();
         let canvas: View = Canvas::invalidated(&surface.invalidator, move |ctx| {
             #[cfg(feature = "ui-smoke")]
             paint_count.set(paint_count.get() + 1);
-            let frame = frames.load();
+            let hints = hints.borrow();
+            let hints = hints.as_ref().filter(|h| h.pane == id);
+            let frame = hints.map_or_else(|| frames.load(), |h| h.frame.clone());
             let mut renderer = renderer.borrow_mut();
             let measured = renderer.draw(ctx, &frame)?;
             renderer.draw_interaction(
@@ -232,6 +235,9 @@ impl TerminalApp {
                 selection.borrow().as_ref(),
                 hover.borrow().as_ref(),
             )?;
+            if let Some(hints) = hints {
+                renderer.draw_hint_labels(ctx, &frame, hints.visible_labels())?;
+            }
             metrics.set(measured);
             area.set(Some((ctx.width, ctx.height, measured.scale)));
             if let Some(preedit) = crate::input::ime::preedit(&sender) {
@@ -342,6 +348,22 @@ impl TerminalApp {
                 Border::new()
                     .background(Color::rgb(14, 16, 20))
                     .content(browser),
+            ))
+        } else {
+            content
+        };
+        let content = if let Some(hints) = self.hints.borrow().as_ref().filter(|h| h.pane == id) {
+            Grid::new().children((
+                content,
+                Border::new()
+                    .background(Color::rgb(28, 34, 41))
+                    .padding(4.0)
+                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .content(
+                        TextBlock::new()
+                            .text(hints.instructions())
+                            .text_wrapping(TextWrapping::Wrap),
+                    ),
             ))
         } else {
             content

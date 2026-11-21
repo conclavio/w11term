@@ -280,43 +280,7 @@ pub fn link_at(frame: &Snapshot, point: Point, detect: bool) -> Option<Link> {
             ));
         }
     }
-    for (start, c) in text.char_indices() {
-        if !matches!(c, 'h' | 'H' | 'm' | 'M' | 'w' | 'W') {
-            continue;
-        }
-        let tail = &text[start..];
-        let lower = tail
-            .chars()
-            .take(8)
-            .collect::<String>()
-            .to_ascii_lowercase();
-        if !(lower.starts_with("https://")
-            || lower.starts_with("http://")
-            || lower.starts_with("mailto:")
-            || lower.starts_with("www."))
-        {
-            continue;
-        }
-        let end = tail
-            .find(|c: char| {
-                c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '"' | '\'' | '`')
-            })
-            .unwrap_or(tail.len());
-        let mut url = &tail[..end];
-        while let Some(c) = url.chars().last() {
-            let unbalanced = match c {
-                ')' => url.matches(')').count() > url.matches('(').count(),
-                ']' => url.matches(']').count() > url.matches('[').count(),
-                '}' => url.matches('}').count() > url.matches('{').count(),
-                _ => false,
-            };
-            if unbalanced || matches!(c, '.' | ',' | ';' | '!' | '?') {
-                url = &url[..url.len() - c.len_utf8()];
-            } else {
-                break;
-            }
-        }
-        let range = start..start + url.len();
+    for (range, uri) in text_urls(&text) {
         let spans: Vec<_> = map
             .iter()
             .filter(|(r, _, _)| r.start < range.end && r.end > range.start)
@@ -326,17 +290,43 @@ pub fn link_at(frame: &Snapshot, point: Point, detect: bool) -> Option<Link> {
             .iter()
             .any(|(row, cols)| *row == point.row && cols.contains(&point.col))
         {
-            let uri = if url.to_ascii_lowercase().starts_with("www.") {
-                format!("https://{url}")
-            } else {
-                url.to_owned()
-            };
-            if safe_url(&uri) {
-                return Some(Link { uri, spans });
-            }
+            return Some(Link { uri, spans });
         }
     }
     None
+}
+
+/// Shared by pointer hit testing and keyboard hints, including punctuation rules.
+pub(crate) fn text_urls(text: &str) -> impl Iterator<Item = (Range<usize>, String)> + '_ {
+    static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)(?:https?://|mailto:|www\.)[^\s\p{Cc}<>"'`]*"#).unwrap()
+    });
+    URL.find_iter(text).filter_map(|m| {
+        let mut url = m.as_str();
+        let surplus = |open, close| {
+            url.matches(close)
+                .count()
+                .saturating_sub(url.matches(open).count())
+        };
+        let mut excess = [surplus('(', ')'), surplus('[', ']'), surplus('{', '}')];
+        while let Some(byte) = url.as_bytes().last() {
+            if let Some(i) = b")]}".iter().position(|c| c == byte) {
+                if excess[i] == 0 {
+                    break;
+                }
+                excess[i] -= 1;
+            } else if !b".,;!?".contains(byte) {
+                break;
+            }
+            url = &url[..url.len() - 1];
+        }
+        let uri = if url.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("www.")) {
+            format!("https://{url}")
+        } else {
+            url.to_owned()
+        };
+        safe_url(&uri).then_some((m.start()..m.start() + url.len(), uri))
+    })
 }
 
 #[cfg(test)]

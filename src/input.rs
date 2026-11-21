@@ -40,6 +40,8 @@ struct State {
     window: Option<HWND>,
     search: bool,
     picker: bool,
+    hints: bool,
+    hint_held: HashSet<u32>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
     zoom_remainder: i32,
@@ -121,6 +123,8 @@ pub enum Shortcut {
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
+    KeyboardHints,
+    HintKey(u32),
     MovePane,
     Workspaces,
 }
@@ -182,6 +186,8 @@ impl KeyboardBridge {
                 window: None,
                 search: false,
                 picker: false,
+                hints: false,
+                hint_held: HashSet::new(),
                 wheel_panes: WheelPanes::default(),
                 wheel_remainder: 0,
                 zoom_remainder: 0,
@@ -276,7 +282,9 @@ impl KeyboardBridge {
                 }
                 s.search = visible;
                 if let Some(target) = &s.target {
-                    let _ = target.sender.send(Command::Focus(!visible && !s.picker));
+                    let _ = target
+                        .sender
+                        .send(Command::Focus(!visible && !s.picker && !s.hints));
                 }
             }
         });
@@ -293,6 +301,25 @@ impl KeyboardBridge {
                     if let Some(target) = &s.target {
                         let _ = target.sender.send(Command::Focus(false));
                     }
+                }
+            }
+        });
+        ime::sync_context();
+    }
+    pub fn set_hints(&self, visible: bool) {
+        INPUT.with(|input| {
+            if let Some(s) = input.borrow_mut().as_mut() {
+                s.hints = visible;
+                if visible {
+                    ime::cancel();
+                    s.hint_held.extend(s.pressed.keys().copied());
+                    s.release_keys();
+                    s.wheel_panes.hovered = None;
+                }
+                if let Some(target) = &s.target {
+                    let _ = target.sender.send(Command::Focus(
+                        !visible && !s.search && !s.picker && !s.modal,
+                    ));
                 }
             }
         });
@@ -440,9 +467,9 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         }
                     }
                     if let Some(target) = &state.target {
-                        let _ = target
-                            .sender
-                            .send(Command::Focus(focused && !state.search && !state.picker));
+                        let _ = target.sender.send(Command::Focus(
+                            focused && !state.search && !state.picker && !state.hints,
+                        ));
                     }
                 }
             });
@@ -742,6 +769,43 @@ impl State {
         if self.modal {
             return false;
         }
+        if self.hint_held.contains(&vk) {
+            match message.message {
+                WM_KEYUP | WM_SYSKEYUP => {
+                    self.hint_held.remove(&vk);
+                    self.swallowed.remove(&vk);
+                    return true;
+                }
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => return true,
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    self.hint_held.remove(&vk);
+                }
+                _ => {}
+            }
+        }
+        if self.hints {
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    if vk == VK_F4.0 as u32 && modifiers().contains(KeyModifiers::ALT) {
+                        return false;
+                    }
+                    self.hint_held.insert(vk);
+                    if message.lParam.0 & (1 << 30) == 0
+                        && matches!(vk, 0x41..=0x5a | 0x08 | 0x1b | 0x0d)
+                        && !modifiers().intersects(KeyModifiers::CTRL | KeyModifiers::ALT)
+                    {
+                        (self.shortcut)(Shortcut::HintKey(vk));
+                    }
+                    return true;
+                }
+                WM_KEYUP | WM_SYSKEYUP => {
+                    self.swallowed.remove(&vk);
+                    return true;
+                }
+                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => return true,
+                _ => {}
+            }
+        }
         if self.picker {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
                 return true;
@@ -861,6 +925,9 @@ impl State {
                 if message.lParam.0 & (1 << 30) == 0 {
                     if matches!(shortcut, Shortcut::PanePicker) {
                         self.picker = true;
+                    }
+                    if matches!(shortcut, Shortcut::KeyboardHints) {
+                        self.hints = true;
                     }
                     (self.shortcut)(shortcut);
                 }
@@ -1043,7 +1110,7 @@ impl State {
         }
     }
     fn wheel(&mut self, delta: i16, mods: KeyModifiers) -> bool {
-        if self.modal || self.switcher || self.picker {
+        if self.modal || self.switcher || self.picker || self.hints {
             return false;
         }
         let Some(target) = &self.target else {
@@ -1103,6 +1170,7 @@ impl From<Action> for Shortcut {
             Action::MovePane => Self::MovePane,
             Action::Workspaces => Self::Workspaces,
             Action::PanePicker => Self::PanePicker,
+            Action::KeyboardHints => Self::KeyboardHints,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
             Action::NewTab => Self::NewTab,
@@ -1323,6 +1391,8 @@ mod tests {
             window: None,
             search: false,
             picker: false,
+            hints: false,
+            hint_held: HashSet::new(),
             wheel_panes: WheelPanes::default(),
             wheel_remainder: 0,
             zoom_remainder: 0,
@@ -1388,6 +1458,22 @@ mod tests {
         assert!(
             new_input.try_recv().is_err(),
             "picker input reached the shell"
+        );
+        state.hints = true;
+        let hint = |msg, repeat| MSG {
+            message: msg,
+            wParam: WPARAM(b'C' as usize),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        assert!(state.handle(&hint(WM_KEYDOWN, false)));
+        assert!(state.handle(&hint(WM_CHAR, false)));
+        state.hints = false;
+        assert!(state.handle(&hint(WM_KEYDOWN, true)));
+        assert!(state.handle(&hint(WM_KEYUP, false)));
+        assert!(
+            new_input.try_recv().is_err(),
+            "a hint key reached the terminal after dismissal"
         );
         state.game_mode = true;
         let key_message = |message, repeat| MSG {
