@@ -7,6 +7,19 @@ permissions:
   contents: read
 
 jobs:
+  herdr:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Reattach to stock Herdr Core over loopback SSH
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends openssh-server
+          sh tests/durable/herdr-linux.sh
+
   recovery:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
