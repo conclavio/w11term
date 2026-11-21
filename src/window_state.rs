@@ -46,7 +46,7 @@ fn fit_axis(position: i32, size: i32, start: i32, end: i32, minimum: i32) -> (i3
         size,
     )
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
     pub x: i32,
     pub y: i32,
@@ -60,7 +60,9 @@ pub struct Placement {
 }
 #[derive(Default)]
 pub struct Windows {
+    scope: crate::input::WindowScope,
     pub profiles: BTreeMap<String, Placement>,
+    saved_profiles: BTreeMap<String, Placement>,
     pub grid: Option<(usize, usize)>,
     fullscreen: Option<NormalWindow>,
 }
@@ -71,11 +73,13 @@ struct NormalWindow {
 }
 impl Windows {
     pub fn load() -> Self {
-        let profiles = crate::w11term_data_path()
+        let profiles: BTreeMap<String, Placement> = crate::w11term_data_path()
             .and_then(|p| std::fs::read(p.join("windows.json")).map_err(Into::into))
             .and_then(|b| serde_json::from_slice(&b).map_err(Into::into))
             .unwrap_or_default();
         Self {
+            scope: crate::input::WindowScope::current(),
+            saved_profiles: profiles.clone(),
             profiles,
             fullscreen: None,
             grid: None,
@@ -85,7 +89,7 @@ impl Windows {
         self.fullscreen.is_some()
     }
     pub fn remember(&mut self, name: &str) -> Result<()> {
-        let hwnd = crate::input::window().context("window is not ready")?;
+        let hwnd = self.scope.hwnd().context("window is not ready")?;
         let grid = self
             .fullscreen
             .as_ref()
@@ -117,10 +121,45 @@ impl Windows {
         );
         let dir = crate::w11term_data_path()?;
         std::fs::create_dir_all(&dir)?;
-        let mut f = tempfile::NamedTempFile::new_in(&dir)?;
-        serde_json::to_writer_pretty(&mut f, &self.profiles)?;
+        self.save_placements(&dir, name)
+    }
+    fn save_placements(&mut self, dir: &std::path::Path, current: &str) -> Result<()> {
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("windows.lock"))?;
+        lock.try_lock()
+            .context("Another window is saving its placement")?;
+        let path = dir.join("windows.json");
+        let mut latest: BTreeMap<String, Placement> = match std::fs::read(&path) {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).unwrap_or_else(|_| self.saved_profiles.clone())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        // Apply this window's profile renames and newly measured placement to
+        // the latest map. A sibling window may have saved other profiles.
+        for removed in self
+            .saved_profiles
+            .keys()
+            .filter(|key| !self.profiles.contains_key(*key))
+        {
+            latest.remove(removed);
+        }
+        for (name, placement) in &self.profiles {
+            if name == current || self.saved_profiles.get(name) != Some(placement) {
+                latest.insert(name.clone(), placement.clone());
+            }
+        }
+        let mut f = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer_pretty(&mut f, &latest)?;
         f.write_all(b"\n")?;
-        f.persist(dir.join("windows.json"))?;
+        f.persist(path)?;
+        self.saved_profiles = latest.clone();
+        self.profiles = latest;
         Ok(())
     }
     pub fn restore(&self, name: &str) -> Result<()> {
@@ -130,7 +169,7 @@ impl Windows {
         let Some(p) = self.profiles.get(name) else {
             return Ok(());
         };
-        let hwnd = crate::input::window().context("window is not ready")?;
+        let hwnd = self.scope.hwnd().context("window is not ready")?;
         unsafe {
             let desired = RECT {
                 left: p.x,
@@ -164,7 +203,7 @@ impl Windows {
         Ok(())
     }
     pub fn toggle(&mut self) -> Result<()> {
-        let hwnd = crate::input::window().context("window is not ready")?;
+        let hwnd = self.scope.hwnd().context("window is not ready")?;
         unsafe {
             if let Some(NormalWindow {
                 placement,
@@ -222,6 +261,40 @@ impl Windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saving_after_a_sibling_preserves_its_placements_and_profile_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = Placement {
+            x: 0,
+            y: 0,
+            width: 600,
+            height: 400,
+            maximized: false,
+            cols: None,
+            rows: None,
+        };
+        let mut first = Windows::default();
+        first.profiles.insert("old".into(), initial.clone());
+        first.save_placements(dir.path(), "old").unwrap();
+        let mut second = Windows {
+            profiles: first.profiles.clone(),
+            saved_profiles: first.saved_profiles.clone(),
+            ..Default::default()
+        };
+        first.profiles.remove("old");
+        first.profiles.insert("renamed".into(), initial.clone());
+        first.save_placements(dir.path(), "renamed").unwrap();
+        second.profiles.insert("other".into(), initial);
+        second.save_placements(dir.path(), "other").unwrap();
+        assert_eq!(
+            second
+                .profiles
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["other", "renamed"]
+        );
+    }
     #[test]
     fn geometry_converges_or_falls_back_and_new_requests_reset_budget() {
         let request = RequestedGrid::new(Some((170, 48)));

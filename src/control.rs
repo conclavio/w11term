@@ -1,4 +1,4 @@
-//! Local, current-user-only automation. This module never accesses a window or keyboard.
+//! Local, current-user-only automation. Control requests never focus a desktop window.
 use crate::{session::Command, terminal::Snapshot};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -6,17 +6,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::windows::named_pipe::{ClientOptions, NamedPipeServer},
+    net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer},
     sync::{mpsc, oneshot},
 };
 use wezterm_term::TerminalSize;
+use windows::Win32::{
+    Foundation::{ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+};
+mod registry;
 mod security;
+pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
 
 pub const VERSION: u32 = 1;
@@ -32,6 +39,10 @@ pub enum Request {
     Record {
         pane: u64,
         path: Option<PathBuf>,
+    },
+    Restart {
+        pane: u64,
+        exit_token: u64,
     },
     WaitForText {
         pane: u64,
@@ -67,6 +78,10 @@ pub enum Request {
         operation: crate::sftp::Operation,
     },
     List,
+    WorkspaceIdentity,
+    WorkspaceWindows {
+        key: String,
+    },
     SendText {
         pane: u64,
         data_base64: String,
@@ -74,6 +89,12 @@ pub enum Request {
     },
     GetText {
         pane: u64,
+    },
+    SaveText {
+        pane: u64,
+        path: PathBuf,
+        #[serde(default)]
+        overwrite: bool,
     },
     Screenshot {
         pane: u64,
@@ -142,6 +163,7 @@ impl Reply {
 
 #[derive(Clone)]
 pub struct Pane {
+    pub read_only: bool,
     pub id: u64,
     pub tab_id: u64,
     pub tab_title: Option<String>,
@@ -150,33 +172,18 @@ pub struct Pane {
     pub visible: bool,
     pub input: mpsc::UnboundedSender<Command>,
 }
-#[derive(Clone, Default)]
-pub struct Registry(
-    Arc<Mutex<BTreeMap<u64, Pane>>>,
-    Arc<Mutex<Option<UiHandler>>>,
-);
 impl Registry {
-    pub fn set_ui(&self, handler: impl Fn(UiRequest) + Send + Sync + 'static) {
-        *self.1.lock().unwrap() = Some(Arc::new(handler));
+    async fn pane_events(pane: &Pane) -> Result<crate::events::Events> {
+        let (reply, response) = oneshot::channel();
+        pane.input
+            .send(Command::Events(reply))
+            .context("pane is closed")?;
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("pane did not respond")?
+            .context("pane is closed")
     }
-    fn ui(&self) -> Result<UiHandler> {
-        self.1
-            .lock()
-            .unwrap()
-            .clone()
-            .context("this instance has no GUI control handler")
-    }
-    pub fn replace(&self, panes: impl IntoIterator<Item = Pane>) {
-        *self.0.lock().unwrap() = panes.into_iter().map(|p| (p.id, p)).collect();
-    }
-    fn pane(&self, id: u64) -> Result<Pane> {
-        self.0
-            .lock()
-            .unwrap()
-            .get(&id)
-            .cloned()
-            .with_context(|| format!("unknown pane {id}"))
-    }
+
     async fn capture(pane: &Pane) -> Result<(Snapshot, TerminalSize)> {
         let (tx, rx) = oneshot::channel();
         pane.input
@@ -211,7 +218,7 @@ impl Registry {
             } => {
                 validate_grid(cols.unwrap_or(120), rows.unwrap_or(32))?;
                 let (reply, response) = oneshot::channel();
-                self.ui()?(UiRequest::Open {
+                self.active_ui()?(UiRequest::Open {
                     profile,
                     cols,
                     rows,
@@ -226,19 +233,27 @@ impl Registry {
             }
             Request::Resize { pane, cols, rows } => {
                 validate_grid(cols, rows)?;
-                self.pane(pane)?;
                 let (reply, response) = oneshot::channel();
-                self.ui()?(UiRequest::Resize {
+                self.resize(
                     pane,
-                    cols,
-                    rows,
-                    reply,
-                });
+                    UiRequest::Resize {
+                        pane,
+                        cols,
+                        rows,
+                        reply,
+                    },
+                );
                 tokio::time::timeout(TIMEOUT, response)
                     .await
                     .context("resize timed out; geometry may have changed")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
+            }
+            Request::Restart { pane, exit_token } => {
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
+                events.restart_exited(&target.input, exit_token)?;
+                Ok(json!({"pane":pane,"exit_token":exit_token,"accepted":true}))
             }
             Request::Events {
                 pane,
@@ -249,19 +264,15 @@ impl Registry {
                     timeout_seconds <= 3600,
                     "events timeout must be 0..=3600 seconds"
                 );
-                let (reply, response) = oneshot::channel();
-                self.pane(pane)?
-                    .input
-                    .send(Command::Events(reply))
-                    .context("pane is closed")?;
-                let events = tokio::time::timeout(TIMEOUT, response).await??;
+                let events = Self::pane_events(&self.pane(pane)?).await?;
                 ensure!(
                     since <= events.since(0).next,
                     "event cursor is ahead of this pane; check the instance/pane identity"
                 );
-                Ok(
-                    json!({"pane":pane,"journal":events.wait(since,Duration::from_secs(timeout_seconds)).await}),
-                )
+                let journal = events
+                    .wait(since, Duration::from_secs(timeout_seconds))
+                    .await;
+                Ok(json!({"pane":pane,"journal":journal,"restart_token":events.restart_token()}))
             }
             Request::WaitForText {
                 pane,
@@ -330,6 +341,7 @@ impl Registry {
                 self.pane(pane)?
                     .input
                     .send(Command::Sftp(crate::sftp::Job {
+                        expected_generation: None,
                         operation,
                         deadline,
                         reply,
@@ -343,10 +355,11 @@ impl Registry {
                     .map_err(anyhow::Error::msg)?;
                 Ok(json!({"pane":pane,"sftp":result}))
             }
+            Request::WorkspaceIdentity => Ok(json!(self.legacy_workspace())),
+            Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
             Request::List => {
-                let panes: Vec<_> = self.0.lock().unwrap().values().cloned().collect();
                 let mut sessions = Vec::new();
-                for pane in panes {
+                for (window_id, pane) in self.listing() {
                     let mut session = match Self::capture(&pane).await {
                         Ok((frame, size)) => json!({
                             "title": frame.title,
@@ -361,12 +374,14 @@ impl Registry {
                         }
                     };
                     session["id"] = pane.id.into();
+                    session["window_id"] = window_id.into();
                     session["tab_id"] = pane.tab_id.into();
                     if let Some(title) = pane.tab_title {
                         session["tab_title"] = title.into();
                     }
                     session["label"] = pane.label.into();
                     session["active"] = pane.active.into();
+                    session["read_only"] = pane.read_only.into();
                     session["visible"] = pane.visible.into();
                     sessions.push(session);
                 }
@@ -413,9 +428,34 @@ impl Registry {
                     json!({"pane":pane,"generation":frame.generation,"cols":size.cols,"rows":size.rows,"lines":lines,"text":lines.join("\n"),"title":frame.title,"status":frame.status,"alternate_screen":frame.alternate}),
                 )
             }
+            Request::SaveText {
+                pane,
+                path,
+                overwrite,
+            } => {
+                ensure!(path.is_absolute(), "save-text path must be absolute");
+                let (reply, snapshot) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::ExportText(reply))
+                    .context("pane is closed")?;
+                let text = tokio::time::timeout(TIMEOUT, snapshot)
+                    .await
+                    .context("scrollback capture timed out")?
+                    .context("pane closed before capture")?
+                    .map_err(anyhow::Error::msg)?;
+                let bytes = text.len();
+                let saved_path = tokio::task::spawn_blocking(move || {
+                    crate::transcript::save(&path, &text, overwrite)?;
+                    anyhow::Ok(path)
+                })
+                .await??;
+                Ok(json!({"pane":pane,"path":saved_path,"bytes":bytes}))
+            }
             Request::Screenshot { pane, path } => {
                 ensure!(path.is_absolute(), "screenshot path must be absolute");
-                let (frame, size) = Self::capture(&self.pane(pane)?).await?;
+                let (target, capture_png) = self.capture_for(pane, capture_png)?;
+                let (frame, size) = Self::capture(&target).await?;
                 let generation = frame.generation;
                 let saved_path = path.clone();
                 let (width, height) =
@@ -438,6 +478,10 @@ fn validate_grid(cols: usize, rows: usize) -> Result<()> {
 pub fn pipe_name(pid: u32) -> String {
     format!(r"\\.\pipe\w11term-{pid}")
 }
+pub fn desktop_scope() -> Result<(String, u32, u32)> {
+    security::current_scope()
+}
+
 pub fn discovery_dir() -> Result<PathBuf> {
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?)
@@ -450,6 +494,22 @@ pub struct Instance {
     pub version: u32,
     pub pid: u32,
     pub pipe: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_windows: Option<Vec<WorkspaceHint>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceHint {
+    pub window_id: WindowId,
+    pub workspace: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceMatch {
+    window_id: WindowId,
+    hwnd: usize,
 }
 
 /// Owns the listener and discovery record. Drop stops it and removes our record.
@@ -457,6 +517,7 @@ pub struct Server {
     stop: Option<oneshot::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
     manifest: PathBuf,
+    registry: Registry,
 }
 impl Server {
     pub fn start(
@@ -482,6 +543,7 @@ impl Server {
         let pid = std::process::id();
         let manifest = directory.join(format!("{pid}.json"));
         let worker_manifest = manifest.clone();
+        let process_registry = registry.clone();
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new().name("terminal-control".into()).spawn(move || {
@@ -524,20 +586,23 @@ impl Server {
             stop: Some(stop_tx),
             worker: Some(worker),
             manifest,
+            registry: process_registry,
         };
-        let instance = Instance {
-            version: VERSION,
-            pid,
-            pipe: pipe_name(pid),
-        };
-        let mut file = tempfile::NamedTempFile::new_in(&directory)?;
-        serde_json::to_writer(&mut file, &instance)?;
-        file.persist(&server.manifest)?;
+        server.registry.set_manifest(server.manifest.clone())?;
         Ok(server)
+    }
+
+    pub fn publish_workspace(&self, workspace: Option<String>) -> Result<()> {
+        self.publish_window_workspace(self.registry.window_id(), workspace)
+    }
+
+    pub fn publish_window_workspace(&self, id: WindowId, workspace: Option<String>) -> Result<()> {
+        self.registry.publish_workspace(id, workspace)
     }
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        self.registry.stop_publishing();
         let _ = std::fs::remove_file(&self.manifest);
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -623,7 +688,146 @@ async fn connect(pid: u32) -> Result<tokio::net::windows::named_pipe::NamedPipeC
     }
 }
 pub async fn discover() -> Result<Vec<Instance>> {
-    let directory = discovery_dir()?;
+    let mut instances = Vec::new();
+    for instance in discovery_records(&discovery_dir()?)? {
+        if connect(instance.pid).await.is_ok() {
+            instances.push(instance);
+        }
+    }
+    Ok(instances)
+}
+
+/// Discovery files are hints. Confirm the workspace with the authenticated server
+/// before using a PID, including when Windows recycles a stale record's PID.
+pub struct WorkspaceOwner {
+    pub pid: u32,
+    pub window_id: Option<WindowId>,
+    pub hwnd: usize,
+    process: Arc<OwnedHandle>,
+}
+
+impl WorkspaceOwner {
+    pub fn is_running(&self) -> Result<bool> {
+        match unsafe { WaitForSingleObject(HANDLE(self.process.as_raw_handle()), 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            _ => Err(std::io::Error::last_os_error()).context("Checking workspace process"),
+        }
+    }
+}
+
+pub async fn workspace_owner(key: &str) -> Result<Option<WorkspaceOwner>> {
+    workspace_owner_for(key, None).await
+}
+
+pub async fn workspace_owner_for(
+    key: &str,
+    caller: Option<WindowId>,
+) -> Result<Option<WorkspaceOwner>> {
+    workspace_owner_in(&discovery_dir()?, key, caller).await
+}
+
+async fn workspace_owner_in(
+    directory: &Path,
+    key: &str,
+    caller: Option<WindowId>,
+) -> Result<Option<WorkspaceOwner>> {
+    let mut records = discovery_records(directory)?;
+    let current = std::process::id();
+    records.sort_by_key(|record| record.pid != current);
+    let mut owners = Vec::new();
+    for instance in records {
+        let modern = instance.workspace_windows.is_some();
+        if !instance.workspace_windows.as_ref().map_or_else(
+            || instance.workspace.as_deref() == Some(key),
+            |windows| windows.iter().any(|w| w.workspace == key),
+        ) {
+            continue;
+        }
+        let pipe = match connect(instance.pid).await {
+            Ok(pipe) => pipe,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        // Keep this process object alive through activation. Windows cannot recycle
+        // the PID between the reply on this very pipe and the HWND lookup.
+        let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, instance.pid) } {
+            Ok(handle) => handle,
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => continue,
+            Err(error) => return Err(error).context("Opening workspace process"),
+        };
+        let process = Arc::new(unsafe { OwnedHandle::from_raw_handle(handle.0) });
+        let owner = WorkspaceOwner {
+            pid: instance.pid,
+            window_id: None,
+            hwnd: 0,
+            process: process.clone(),
+        };
+        let request = if modern {
+            Request::WorkspaceWindows {
+                key: key.to_owned(),
+            }
+        } else {
+            Request::WorkspaceIdentity
+        };
+        let reply = match call_on(pipe, &request).await {
+            Ok(reply) => reply,
+            Err(_) if !owner.is_running()? => continue,
+            Err(error) => return Err(error),
+        };
+        ensure!(
+            reply.ok,
+            "Could not verify workspace owner: {}",
+            reply.error.unwrap_or_default()
+        );
+        if !owner.is_running()? {
+            continue;
+        }
+        if modern {
+            let matches: Vec<WorkspaceMatch> = serde_json::from_value(
+                reply
+                    .result
+                    .context("Missing workspace window identities")?,
+            )?;
+            for matched in matches {
+                ensure!(matched.window_id != 0, "Invalid workspace window ID");
+                let window = WorkspaceOwner {
+                    pid: owner.pid,
+                    process: process.clone(),
+                    window_id: Some(matched.window_id),
+                    hwnd: matched.hwnd,
+                };
+                if window.pid == current && window.window_id == caller {
+                    return Ok(Some(window));
+                }
+                owners.push(window);
+            }
+        } else if reply.result.as_ref().and_then(Value::as_str) == Some(key) {
+            owners.push(owner);
+        }
+    }
+    ensure!(
+        owners.len() < 2,
+        "Multiple windows have this workspace open (PIDs {}). Switch from the window you want to use.",
+        owners
+            .iter()
+            .map(|owner| match owner.window_id {
+                Some(id) => format!("{} window {id}", owner.pid),
+                None => owner.pid.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(owners.pop())
+}
+
+fn discovery_records(directory: &Path) -> Result<Vec<Instance>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -641,9 +845,9 @@ pub async fn discover() -> Result<Vec<Instance>> {
         let Ok(instance) = serde_json::from_slice::<Instance>(&bytes) else {
             continue;
         };
-        if instance.version == VERSION
+        if entry.file_name() == std::ffi::OsString::from(format!("{}.json", instance.pid))
+            && instance.version == VERSION
             && instance.pipe == pipe_name(instance.pid)
-            && connect(instance.pid).await.is_ok()
         {
             instances.push(instance);
         }
@@ -672,7 +876,10 @@ pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
             instances[0].pid
         }
     };
-    let mut pipe = connect(pid).await?;
+    call_on(connect(pid).await?, request).await
+}
+
+async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> {
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     ensure!(bytes.len() <= MAX_LINE, "request exceeds 2 MiB");
@@ -703,4 +910,81 @@ pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
         "unsupported control protocol version"
     );
     Ok(reply)
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn verifies_workspace_identity_against_live_server_and_ignores_dead_pid() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let server = Server::start_in_directory(
+            Registry::for_workspace(Some("desk".into())),
+            |_, _, _| unreachable!(),
+            directory.path().into(),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "desk", None)
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
+            Some(pid)
+        );
+        let record = directory.path().join(format!("{pid}.json"));
+        let old_hint = std::fs::read(&record).unwrap();
+        let mut legacy: Value = serde_json::from_slice(&old_hint).unwrap();
+        legacy.as_object_mut().unwrap().remove("workspace_windows");
+        std::fs::write(&record, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let older = workspace_owner_in(directory.path(), "desk", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((older.pid, older.window_id), (pid, None));
+
+        let sibling = server
+            .registry
+            .register_window(2, Some("desk".into()))
+            .unwrap();
+        assert!(
+            workspace_owner_in(directory.path(), "desk", None)
+                .await
+                .is_err()
+        );
+        for id in [1, 2] {
+            let exact = workspace_owner_in(directory.path(), "desk", Some(id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!((exact.pid, exact.window_id), (pid, Some(id)));
+        }
+        sibling.unregister().unwrap();
+        server.publish_workspace(Some("other".into())).unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "other", None)
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
+            Some(pid)
+        );
+        std::fs::write(&record, &old_hint).unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "desk", None)
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
+            None
+        );
+        drop(server);
+        std::fs::write(&record, old_hint).unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "desk", None)
+                .await
+                .unwrap()
+                .map(|owner| owner.pid),
+            None
+        );
+    }
 }

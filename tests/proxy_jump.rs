@@ -7,6 +7,7 @@ use russh::{
     server,
 };
 use std::{
+    fmt::Write,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -19,6 +20,7 @@ use tokio::{
 use w11term::{
     events::Events,
     options::{Authentication, JumpHost, SshOptions},
+    profiles::ProfileStore,
     prompts::Prompts,
     ssh::{self, Event},
     terminal::TransportInput,
@@ -146,11 +148,19 @@ impl Fixture {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut endpoints = Vec::new();
         let mut servers = Vec::new();
+        let mut known_hosts = String::new();
         let mut next = None;
         for index in (0..HOSTS.len()).rev() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
             let address = listener.local_addr()?;
             let host = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+            writeln!(
+                known_hosts,
+                "[{}]:{} {}",
+                HOSTS[index],
+                address.port(),
+                host.public_key().to_openssh()?
+            )?;
             let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
             let path = keys.path().join(format!("id-{index}"));
             std::fs::write(&path, identity.to_openssh(LineEnding::LF)?.as_bytes())?;
@@ -181,6 +191,7 @@ impl Fixture {
             next = Some(address);
         }
         endpoints.reverse();
+        std::fs::write(keys.path().join("known_hosts"), known_hosts)?;
         let mut options = SshOptions::from(endpoints.pop().unwrap());
         options.proxy_jump = endpoints;
         options.player.reconnect = false;
@@ -190,6 +201,63 @@ impl Fixture {
             servers,
             keys,
         })
+    }
+    /// Use the same importer and save path as Settings, then open the saved route.
+    /// Each alias, identity and independently trusted server lives in the fixture.
+    fn import_saved_route(&mut self) -> Result<()> {
+        let dir = self.keys.path().join("SSH fragments");
+        std::fs::create_dir(&dir)?;
+        let ports = [
+            self.options.proxy_jump[0].port,
+            self.options.proxy_jump[1].port,
+            self.options.port,
+        ];
+        let aliases = ["outer", "inner", "destination"];
+        for (i, alias) in aliases.iter().enumerate() {
+            let identity = self.keys.path().join(format!("id-{i}"));
+            let mut section = format!(
+                "Host {alias}\n HostName {}\n User {}\n Port {}\n IdentityFile \"{}\"\n",
+                HOSTS[i],
+                USERS[i],
+                ports[i],
+                identity.display()
+            );
+            if i == 2 {
+                section.push_str(" ProxyJump outer,inner\n");
+            }
+            std::fs::write(dir.join(format!("{i}-{alias}.conf")), section)?;
+        }
+        let config = self.keys.path().join("config");
+        std::fs::write(
+            &config,
+            format!("Include \"{}/*.conf\"\nHost *\n Port 1\n", dir.display()),
+        )?;
+        let report = w11term::ssh_config::import_file(&config)?;
+        assert_eq!(report.aliases.len(), 3, "{:?}", report.warnings);
+        let entry = report
+            .aliases
+            .iter()
+            .find(|a| a.name == "destination")
+            .unwrap();
+        let options = entry
+            .options
+            .as_ref()
+            .unwrap_or_else(|| panic!("{:?}", entry.warnings));
+        let store = ProfileStore::new(self.keys.path().join("profiles.json"))?;
+        store.add(&entry.name, options)?;
+        let mut saved = store.load()?;
+        assert_eq!(saved.len(), 1);
+        self.options = saved.remove("destination").unwrap();
+        assert!(
+            self.options.host_key.is_none()
+                && self
+                    .options
+                    .proxy_jump
+                    .iter()
+                    .all(|hop| hop.host_key.is_none())
+        );
+        self.options.player.reconnect = false;
+        Ok(())
     }
     fn connect(
         &self,
@@ -221,9 +289,11 @@ impl Drop for Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn two_jumps_authenticate_independently_and_close_with_the_terminal() {
+async fn imported_config_fragments_connect_through_both_trusted_jumps_and_close_with_the_terminal()
+{
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut fixture = Fixture::start().await?;
+        fixture.import_saved_route()?;
         let (input, mut output, task) = fixture.connect();
         let mut echo = Vec::new();
         while let Some(event) = output.recv().await {

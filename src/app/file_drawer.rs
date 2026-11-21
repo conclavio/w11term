@@ -11,13 +11,18 @@ const PAGE_SIZE: usize = 32;
 pub enum FileAction {
     Toggle,
     OpenHere,
+    Follow(u64, u64, bool),
     Reveal(u64, u64, String, Option<String>),
     Close(u64),
     Browse(u64, u64, String),
-    Choose(u64, String),
+    Choose(u64, u64, ListedEntry),
+    Rename(u64, u64, ListedEntry),
+    NewFolder(u64, u64, String),
+    EditName(u64, u64, u64, String),
+    FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, usize),
     Replace(u64, u64, bool),
-    Pick(u64, u64, Option<String>),
+    Pick(u64, u64, String, Option<String>),
     Picked(u64, u64, Option<String>, Result<Option<PathBuf>, String>),
     Drop(u64, u64, String, Vec<PathBuf>),
     Listed(u64, u64, String, Result<Vec<Entry>, String>),
@@ -29,10 +34,15 @@ pub(super) struct FileDrawer {
     pub(super) open: bool,
     generation: u64,
     directory: Option<String>,
+    following: bool,
+    last_report: Option<Arc<str>>,
     entries: Vec<Entry>,
+    listing_revision: u64,
     page: usize,
     selected: Option<String>,
-    reveal_name: Option<String>,
+    reveal: Option<RevealTarget>,
+    editor: Option<NameEditor>,
+    editor_serial: u64,
     replace: bool,
     picking: bool,
     parsing: bool,
@@ -48,17 +58,86 @@ pub struct Entry {
     directory: Option<bool>,
 }
 
+#[derive(Clone)]
+pub struct ListedEntry {
+    parent: String,
+    revision: u64,
+    name: String,
+}
+
+enum RevealTarget {
+    Existing(String),
+    Changed(EntryChange),
+}
+impl RevealTarget {
+    fn name(&self) -> &str {
+        match self {
+            Self::Existing(name) => name,
+            Self::Changed(change) => change.name(),
+        }
+    }
+}
+
+struct NameEditor {
+    serial: u64,
+    parent: String,
+    name: String,
+    original: Option<ListedEntry>,
+}
+
+impl NameEditor {
+    fn destination(&self) -> Result<String> {
+        if let Some(original) = &self.original {
+            ensure!(self.name != original.name, "Enter a different name");
+        }
+        entry_path(&self.parent, &self.name)
+    }
+}
+
+enum EntryChange {
+    CreateFolder(String),
+    Rename { from: String, to: String },
+}
+impl EntryChange {
+    fn name(&self) -> &str {
+        match self {
+            Self::CreateFolder(name) => name,
+            Self::Rename { to, .. } => to,
+        }
+    }
+    fn description(&self) -> String {
+        match self {
+            Self::CreateFolder(name) => format!("creation of {name}"),
+            Self::Rename { from, to } => format!("rename of {from} to {to}"),
+        }
+    }
+    fn completed(&self) -> String {
+        match self {
+            Self::CreateFolder(name) => format!("Created folder {name}"),
+            Self::Rename { from, to } => format!("Renamed {from} to {to}"),
+        }
+    }
+    fn error(&self, error: &str) -> String {
+        match self {
+            Self::CreateFolder(name) => format!("Could not create folder {name}: {error}"),
+            Self::Rename { from, to } => format!("Rename {from} to {to}: {error}"),
+        }
+    }
+}
+
 enum Step {
     Canonical,
     Listing(String),
     Upload(String),
     Download(String),
+    Change { parent: String, change: EntryChange },
 }
 
 struct Pending {
     step: Step,
     reply: oneshot::Receiver<Result<Value, String>>,
     progress: Option<watch::Receiver<TransferProgress>>,
+    destination: Rc<RefCell<LocalSender<Message>>>,
     _timer: crate::ui_timer::RetryTimer,
 }
 
@@ -68,6 +147,39 @@ fn remote_child(directory: &str, name: &str) -> Result<String> {
         "Invalid remote filename"
     );
     Ok(format!("{}/{}", directory.trim_end_matches('/'), name))
+}
+
+fn entry_path(parent: &str, name: &str) -> Result<String> {
+    // Windows SFTP servers can interpret a backslash as a path separator, too.
+    ensure!(
+        !name.trim().is_empty() && !name.contains('\\') && !name.chars().any(char::is_control),
+        "Enter one name without path separators or control characters"
+    );
+    remote_child(parent, name)
+}
+
+// The SFTP response can already be ready when the reconnect frame reaches
+// the UI before its polling timer. Keep a known result without resubmission.
+fn change_reconnect_status(
+    change: &EntryChange,
+    reply: &mut oneshot::Receiver<Result<Value, String>>,
+) -> String {
+    match reply.try_recv() {
+        Ok(Ok(_)) => format!(
+            "{} before SSH reconnected. Refresh to browse.",
+            change.completed()
+        ),
+        Ok(Err(error)) => change.error(&error),
+        // An admitted worker request has a PendingReply guard that explicitly
+        // delivers an unknown-outcome error if the worker stops in flight.
+        Err(oneshot::error::TryRecvError::Closed) => {
+            format!("SSH reconnected before {} started.", change.description())
+        }
+        Err(oneshot::error::TryRecvError::Empty) => format!(
+            "SSH reconnected during {}. The outcome is unknown. Refresh to check.",
+            change.description()
+        ),
+    }
 }
 
 /// OSC 7 is a path hint for the existing SFTP connection. Preserve the raw
@@ -191,75 +303,178 @@ fn dialog_filename(remote: &str) -> &str {
     }
 }
 
-fn pick_local(owner: usize, remote: Option<&str>) -> Result<Option<PathBuf>> {
-    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
-    use windows::{
-        Win32::{
-            Foundation::{ERROR_CANCELLED, HWND},
-            System::Com::*,
-            UI::Shell::*,
-        },
-        core::{HRESULT, PCWSTR},
-    };
-    // A fresh STA owns the native modal dialog, independently of the Reactor UI thread.
-    unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-        struct Apartment;
-        impl Drop for Apartment {
-            fn drop(&mut self) {
-                unsafe { CoUninitialize() };
-            }
-        }
-        let _apartment = Apartment;
-        let clsid = if remote.is_some() {
-            FileSaveDialog
-        } else {
-            FileOpenDialog
-        };
-        let dialog: IFileDialog = CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)?;
-        dialog.SetOptions(dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR)?;
-        if let Some(remote) = remote {
-            let suggested: Vec<u16> = dialog_filename(remote)
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
-        }
-        match dialog.Show(Some(HWND(owner as *mut _))) {
-            Err(e) if e.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => return Ok(None),
-            result => result?,
-        }
-        let wide = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
-        let path = OsString::from_wide(wide.as_wide());
-        CoTaskMemFree(Some(wide.0.cast()));
-        Ok(Some(path.into()))
-    }
-}
-
 impl FileDrawer {
+    pub(super) fn editing_name(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    pub(super) fn cancel_name_edit(&mut self) {
+        if self.editor.take().is_some() {
+            self.cached.get_mut().take();
+        }
+    }
+
+    fn has_entry(&self, entry: &ListedEntry) -> bool {
+        self.directory.as_ref() == Some(&entry.parent)
+            && self.listing_revision == entry.revision
+            && self
+                .entries
+                .iter()
+                .skip(self.page * PAGE_SIZE)
+                .take(PAGE_SIZE)
+                .any(|e| e.name == entry.name)
+    }
+
+    fn check_selected(&self, entry: &ListedEntry) -> Result<()> {
+        ensure!(
+            self.selected.as_ref() == Some(&entry.name) && self.has_entry(entry),
+            "The selection changed. Select the entry to rename again."
+        );
+        Ok(())
+    }
+
+    fn begin_name_edit(&mut self, parent: String, original: Option<ListedEntry>) -> Result<()> {
+        ensure!(
+            self.open && !self.busy() && self.directory.as_ref() == Some(&parent),
+            "The directory changed. Open the file action again."
+        );
+        if let Some(entry) = &original {
+            self.check_selected(entry)?;
+            entry_path(&parent, &entry.name)?;
+        }
+        self.editor_serial = self.editor_serial.wrapping_add(1);
+        self.editor = Some(NameEditor {
+            serial: self.editor_serial,
+            parent,
+            name: original
+                .as_ref()
+                .map_or_else(String::new, |entry| entry.name.clone()),
+            original,
+        });
+        Ok(())
+    }
+
+    fn finish_edit(
+        &mut self,
+        serial: u64,
+        result: ContentDialogResult,
+    ) -> Result<Option<(NameEditor, String)>> {
+        if !self.editor.as_ref().is_some_and(|e| e.serial == serial) {
+            return Ok(None);
+        }
+        let editor = self.editor.take().unwrap();
+        if result != ContentDialogResult::Primary {
+            return Ok(None);
+        }
+        ensure!(
+            self.open && self.directory.as_ref() == Some(&editor.parent),
+            "The directory changed. Open the file action again."
+        );
+        if let Some(entry) = &editor.original {
+            self.check_selected(entry)?;
+        }
+        let path = editor.destination()?;
+        Ok(Some((editor, path)))
+    }
+
+    pub(super) fn name_dialog(
+        &self,
+        pane: u64,
+        context: &ViewContext<TerminalApp>,
+    ) -> Option<View> {
+        let editor = self.editor.as_ref()?;
+        let serial = editor.serial;
+        let generation = self.generation;
+        let valid = editor.destination();
+        let (title, label, confirm) = if editor.original.is_some() {
+            ("Rename entry", "New name", "Rename")
+        } else {
+            ("New folder", "Folder name", "Create")
+        };
+        let mut fields = vec![KeyedView::new(
+            "name",
+            TextBox::new()
+                .automation_name(label)
+                .text(&editor.name)
+                .on_text_changed(context.callback(move |name| {
+                    Message::Files(FileAction::EditName(pane, generation, serial, name))
+                })),
+        )];
+        if !editor.name.is_empty()
+            && let Err(error) = &valid
+        {
+            fields.push(KeyedView::new(
+                "error",
+                TextBlock::new().text(error.to_string()),
+            ));
+        }
+        Some(
+            ContentDialog::new()
+                .title(title)
+                .primary_button_text(confirm)
+                .is_primary_button_enabled(valid.is_ok())
+                .close_button_text("Cancel")
+                .is_open(true)
+                .on_closed(context.callback(move |result| {
+                    Message::Files(FileAction::FinishEdit(pane, generation, serial, result))
+                }))
+                .content(
+                    StackPanel::new()
+                        .spacing(8.0)
+                        .min_width(300.0)
+                        .keyed_children(fields),
+                ),
+        )
+    }
+
+    pub(super) fn awaiting_native_result(&self) -> bool {
+        self.picking || self.parsing || self.editing_name()
+    }
+
+    pub(super) fn bind_window(&mut self, sender: LocalSender<Message>) {
+        self.cached.get_mut().take();
+        if let Some(pending) = &self.pending {
+            *pending.destination.borrow_mut() = sender;
+        }
+    }
+
     pub(super) fn busy(&self) -> bool {
-        self.picking || self.parsing || self.pending.is_some()
+        self.awaiting_native_result() || self.pending.is_some()
     }
 
     pub(super) fn observe_connection(&mut self, generation: u64) {
         if self.generation == generation {
             return;
         }
-        let status = if self
-            .pending
-            .as_ref()
-            .is_some_and(|p| matches!(p.step, Step::Upload(_)))
-        {
-            "SSH reconnected during upload. The remote file may be incomplete. Refresh to browse."
-        } else {
-            "SSH connected. Refresh to browse."
+        let status = match self.pending.as_mut() {
+            Some(Pending { step: Step::Change { change, .. }, reply, .. }) => {
+                change_reconnect_status(change, reply)
+            }
+            Some(Pending { step: Step::Upload(_), .. }) =>
+                "SSH reconnected during upload. The remote file may be incomplete. Refresh to browse.".into(),
+            _ => match &self.reveal {
+                Some(RevealTarget::Changed(change)) => format!("{} before SSH reconnected. Refresh to browse.", change.completed()),
+                _ => "SSH connected. Refresh to browse.".into(),
+            }
         };
         *self = Self {
             open: self.open,
+            following: self.following,
             generation,
-            status: status.into(),
+            status,
             ..Self::default()
         };
+    }
+
+    /// Sample only when ready to browse. A burst during a transfer or listing is
+    /// coalesced into the latest report, without changing any transfer destination.
+    fn follow_target(&mut self, report: &Option<Arc<str>>, host: &str) -> Option<String> {
+        if !self.open || !self.following || self.busy() || self.last_report == *report {
+            return None;
+        }
+        self.last_report.clone_from(report);
+        shell_directory(report.as_deref(), host)
+            .filter(|path| Some(path) != self.directory.as_ref())
     }
 
     fn panel(&self, pane: u64, ssh: &SshOptions, context: &ViewContext<TerminalApp>) -> View {
@@ -282,6 +497,12 @@ impl FileDrawer {
             .iter()
             .find(|e| Some(&e.name) == self.selected.as_ref());
         let path = selected.and_then(|e| remote_child(folder, &e.name).ok());
+        let revision = self.listing_revision;
+        let listed = |name: String| ListedEntry {
+            revision,
+            parent: folder.into(),
+            name,
+        };
         let mut controls: Vec<View> = vec![
             Grid::new()
                 .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -311,7 +532,30 @@ impl FileDrawer {
                         ),
                     ),
                     button("Refresh", ready, Browse(pane, generation, folder.into())),
-                    button("Upload…", writable, Pick(pane, generation, None)),
+                    button(
+                        "Upload…",
+                        writable,
+                        Pick(pane, generation, folder.into(), None),
+                    ),
+                )),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .children((
+                    button(
+                        "New folder",
+                        writable,
+                        NewFolder(pane, generation, folder.into()),
+                    ),
+                    button(
+                        "Rename…",
+                        writable && selected.is_some_and(|e| entry_path(folder, &e.name).is_ok()),
+                        Rename(
+                            pane,
+                            generation,
+                            listed(self.selected.clone().unwrap_or_default()),
+                        ),
+                    ),
                 )),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
@@ -325,9 +569,15 @@ impl FileDrawer {
                     button(
                         "Download…",
                         ready && selected.is_some_and(|e| e.directory != Some(true)),
-                        Pick(pane, generation, path),
+                        Pick(pane, generation, folder.into(), path),
                     ),
                 )),
+            CheckBox::new()
+                .is_checked(self.following)
+                .on_is_checked_changed(
+                    context.callback(move |v| Message::Files(Follow(pane, generation, v))),
+                )
+                .content(TextBlock::new().text("Follow shell directory")),
             CheckBox::new()
                 .is_enabled(ready)
                 .is_checked(self.replace)
@@ -395,6 +645,7 @@ impl FileDrawer {
                     name.clone()
                 };
                 let active = self.selected.as_ref() == Some(&name);
+                let entry_action = Choose(pane, generation, listed(name));
                 KeyedView::new(
                     entry.name.as_str(),
                     Button::new()
@@ -405,9 +656,7 @@ impl FileDrawer {
                             ButtonStyle::Subtle
                         })
                         .horizontal_alignment(HorizontalAlignment::Stretch)
-                        .on_click(
-                            context.callback(move |_| Message::Files(Choose(pane, name.clone()))),
-                        )
+                        .on_click(context.callback(move |_| Message::Files(entry_action.clone())))
                         .content(
                             TextBlock::new()
                                 .text(label)
@@ -469,13 +718,15 @@ impl FileDrawer {
         } else {
             (None, None)
         };
-        let sender = context.sender();
+        let destination = Rc::new(RefCell::new(context.sender()));
+        let tick = destination.clone();
         let timer = crate::ui_timer::RetryTimer::new(move || {
-            sender.send(Message::Files(FileAction::Tick(id)));
+            tick.borrow().send(Message::Files(FileAction::Tick(id)));
         })?;
         session
             .input
             .send(Command::Sftp(Job {
+                expected_generation: matches!(step, Step::Change { .. }).then_some(self.generation),
                 operation,
                 progress: tx_progress,
                 deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
@@ -486,6 +737,7 @@ impl FileDrawer {
             step,
             reply,
             progress,
+            destination,
             _timer: timer,
         });
         Ok(())
@@ -499,7 +751,7 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.status = "Reading directory…".into();
-        self.reveal_name = None;
+        self.reveal = None;
         self.job(
             id,
             session,
@@ -564,7 +816,16 @@ impl FileDrawer {
                 }
                 return Ok(());
             }
-            Err(oneshot::error::TryRecvError::Closed) => Err("SSH connection closed".into()),
+            Err(oneshot::error::TryRecvError::Closed) => {
+                if let Step::Change { change, .. } = &pending.step {
+                    Err(format!(
+                        "SSH connection closed before {} started.",
+                        change.description()
+                    ))
+                } else {
+                    Err("SSH connection closed".into())
+                }
+            }
             Ok(result) => result,
         };
         self.cached.borrow_mut().take();
@@ -572,6 +833,9 @@ impl FileDrawer {
         let reply = match result {
             Ok(reply) => reply,
             Err(error) => {
+                if let Step::Change { change, .. } = &step {
+                    bail!("{}", change.error(&error));
+                }
                 if let Step::Upload(name) = &step {
                     if !self.replace && self.entries.iter().any(|entry| &entry.name == name) {
                         bail!("Upload of {name} failed (replacing files is off): {error}");
@@ -635,6 +899,26 @@ impl FileDrawer {
                     self.upload_next(id, session, context)?;
                 }
             }
+            Step::Change { parent, change } => {
+                self.status = change.completed();
+                // The old name no longer identifies the entry the user selected.
+                // If the follow-up listing fails, do not leave stale rows actionable.
+                if matches!(change, EntryChange::Rename { .. }) {
+                    self.entries.clear();
+                    self.selected = None;
+                    self.page = 0;
+                }
+                self.reveal = Some(RevealTarget::Changed(change));
+                self.job(
+                    id,
+                    session,
+                    Operation::Ls {
+                        path: parent.clone(),
+                    },
+                    Step::Listing(parent),
+                    context,
+                )?;
+            }
             Step::Download(name) => {
                 self.status = format!("Downloaded {name} ({} bytes)", reply["bytes_transferred"])
             }
@@ -643,7 +927,58 @@ impl FileDrawer {
     }
 }
 
+impl LiveTab {
+    pub(super) fn follow_shell_directory(
+        &mut self,
+        frame: &w11term::terminal::Snapshot,
+        context: &ComponentContext<TerminalApp>,
+    ) {
+        if !self.files.following || !self.files.open {
+            return;
+        }
+        let Source::Ssh(ssh) = &self.source else {
+            return;
+        };
+        self.files.observe_connection(frame.connection_generation);
+        if let Some(path) = self
+            .files
+            .follow_target(&frame.reported_directory, &ssh.host)
+        {
+            self.files.cached.borrow_mut().take();
+            if let Err(error) =
+                self.files
+                    .browse(self.session.pane_id, &self.session, path, context)
+            {
+                self.files.status = format!("{error:#}");
+            }
+        }
+    }
+}
+
 impl TerminalApp {
+    pub(super) fn cancel_inactive_name_editor(&mut self) {
+        let inactive = self
+            .tabs
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.value.page {
+                Page::Terminal(tab)
+                    if Some(entry.id) != self.tabs.active_id() && tab.files.editing_name() =>
+                {
+                    Some(entry.id)
+                }
+                _ => None,
+            });
+        if let Some(id) = inactive
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+        {
+            tab.files.cancel_name_edit();
+        }
+    }
+
     pub(super) fn with_file_drawer(&self, content: View, context: &ViewContext<Self>) -> View {
         let Some(AppTab {
             page: Page::Terminal(tab),
@@ -682,9 +1017,14 @@ impl TerminalApp {
                 None => return,
             },
             Close(id)
+            | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
-            | Choose(id, _)
+            | Choose(id, ..)
+            | Rename(id, ..)
+            | NewFolder(id, ..)
+            | EditName(id, ..)
+            | FinishEdit(id, ..)
             | Page(id, _)
             | Replace(id, ..)
             | Pick(id, ..)
@@ -710,21 +1050,28 @@ impl TerminalApp {
         let session = &tab.session;
         let files = &mut tab.files;
         let frame = session.frames.load();
+        let was_editing = files.editing_name();
         files.observe_connection(frame.connection_generation);
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
+        if matches!(&action, NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
         {
+            if was_editing && visible && !files.editing_name() {
+                self.connection_ui(id);
+            }
             return;
         }
-        if !matches!(action, Tick(_)) {
+        if !matches!(action, Tick(_) | EditName(..)) {
             files.cached.borrow_mut().take();
         }
         let result = (|| -> Result<()> {
             match action {
                 Toggle => {
                     files.open = !files.open;
+                    if !files.open {
+                        files.cancel_name_edit();
+                    }
                     self.initial_grid.set(None);
                     crate::input::clear_grid();
                     if files.open && files.directory.is_none() && !files.busy() {
@@ -742,31 +1089,52 @@ impl TerminalApp {
                     }
                 }
                 Close(_) => {
+                    files.cancel_name_edit();
                     files.open = false;
+                }
+                Follow(_, _, enabled) => {
+                    if files.open && files.following != enabled {
+                        files.following = enabled;
+                        files.last_report = None;
+                    }
                 }
                 Reveal(_, _, directory, name) => {
                     if !files.busy() {
                         files.open = true;
+                        files.following = false;
                         self.initial_grid.set(None);
                         crate::input::clear_grid();
                         files.browse(pane, session, directory, context)?;
-                        files.reveal_name = name;
+                        files.reveal = name.map(RevealTarget::Existing);
                     }
                 }
                 Tick(_) => files.tick(pane, session, context)?,
                 Listed(_, _, path, result) if files.parsing => {
                     files.parsing = false;
                     files.entries = result.map_err(|e| anyhow!("{e}"))?;
+                    files.listing_revision = files.listing_revision.wrapping_add(1);
                     files.directory = Some(path);
                     files.selected = None;
                     files.page = 0;
                     if files.status == "Reading directory…" {
                         files.status.clear();
                     }
-                    if let Some(name) = files.reveal_name.take() {
-                        if let Some(i) = files.entries.iter().position(|entry| entry.name == name) {
+                    if let Some(target) = files.reveal.take() {
+                        let name = target.name();
+                        if let Some(i) = files.entries.iter().position(|entry| {
+                            entry.name == name
+                                && (!matches!(
+                                    target,
+                                    RevealTarget::Changed(EntryChange::CreateFolder(_))
+                                ) || entry.directory != Some(false))
+                        }) {
                             files.page = i / PAGE_SIZE;
-                            files.selected = Some(name);
+                            files.selected = Some(name.into());
+                        } else if let RevealTarget::Changed(change) = &target {
+                            files.status = format!(
+                                "{}, but the new entry is no longer listed as expected",
+                                change.completed()
+                            );
                         } else {
                             files.status = format!("No entry named {name} in this directory");
                         }
@@ -796,9 +1164,72 @@ impl TerminalApp {
                         files.upload_next(pane, session, context)?;
                     }
                 }
+                EditName(_, _, serial, name) => {
+                    if let Some(editor) = files.editor.as_mut().filter(|e| e.serial == serial) {
+                        editor.name = name;
+                    }
+                }
+                FinishEdit(_, _, serial, result) => {
+                    if let Some((
+                        NameEditor {
+                            parent,
+                            name,
+                            original,
+                            ..
+                        },
+                        path,
+                    )) = files.finish_edit(serial, result)?
+                    {
+                        let (change, operation) = if let Some(entry) = original {
+                            files.status = format!("Renaming {} to {name}…", entry.name);
+                            let from = entry_path(&parent, &entry.name)?;
+                            (
+                                EntryChange::Rename {
+                                    from: entry.name,
+                                    to: name,
+                                },
+                                Operation::RenameEntry { from, to: path },
+                            )
+                        } else {
+                            files.status = format!("Creating folder {name}…");
+                            (
+                                EntryChange::CreateFolder(name),
+                                Operation::Mkdir {
+                                    path,
+                                    attrs: Default::default(),
+                                },
+                            )
+                        };
+                        files.job(
+                            pane,
+                            session,
+                            operation,
+                            Step::Change { parent, change },
+                            context,
+                        )?;
+                    }
+                }
                 _ if files.busy() || !files.open => {}
-                Browse(_, _, path) => files.browse(pane, session, path, context)?,
-                Choose(_, name) => files.selected = Some(name),
+                NewFolder(_, _, parent)
+                    if frame.prompt.is_none() && self.title_editor.is_none() =>
+                {
+                    files.begin_name_edit(parent, None)?;
+                }
+                Rename(_, _, entry) if frame.prompt.is_none() && self.title_editor.is_none() => {
+                    files.begin_name_edit(entry.parent.clone(), Some(entry))?;
+                }
+                NewFolder(..) | Rename(..) => {}
+                Browse(_, _, path) => {
+                    if files.directory.as_ref() != Some(&path) {
+                        files.following = false;
+                    }
+                    files.browse(pane, session, path, context)?;
+                }
+                Choose(_, _, entry) => {
+                    if files.has_entry(&entry) {
+                        files.selected = Some(entry.name);
+                    }
+                }
                 Page(_, page) => {
                     files.page = page.min(files.entries.len().saturating_sub(1) / PAGE_SIZE);
                     files.selected = None;
@@ -817,7 +1248,11 @@ impl TerminalApp {
                     files.uploads.extend(paths);
                     files.upload_next(pane, session, context)?;
                 }
-                Pick(_, _, remote) => {
+                Pick(_, _, directory, remote) => {
+                    ensure!(
+                        files.directory.as_ref() == Some(&directory),
+                        "The directory changed. Select the file operation again."
+                    );
                     let owner = crate::input::window().context("Window is not ready")?.0 as usize;
                     files.picking = true;
                     let generation = files.generation;
@@ -829,15 +1264,14 @@ impl TerminalApp {
                     ));
                     context.spawn_background_with_rejection(
                         move |_| {
-                            let suggestion = remote.clone();
-                            let result = std::thread::Builder::new()
-                                .name("SFTP file picker".into())
-                                .spawn(move || pick_local(owner, suggestion.as_deref()))
-                                .map_err(|e| e.to_string())
-                                .and_then(|handle| {
-                                    handle.join().map_err(|_| "File picker stopped".to_owned())
-                                })
-                                .and_then(|result| result.map_err(|e| format!("{e:#}")));
+                            let purpose = remote
+                                .as_deref()
+                                .map_or(file_picker::Purpose::Open, |name| {
+                                    file_picker::Purpose::Save(dialog_filename(name).to_owned())
+                                });
+                            let result = file_picker::pick(owner, purpose)
+                                .map(|selection| selection.map(|file| file.path))
+                                .map_err(|error| format!("{error:#}"));
                             Message::Files(Picked(pane, generation, remote, result))
                         },
                         reject,
@@ -849,8 +1283,22 @@ impl TerminalApp {
         })();
         if let Err(error) = result {
             files.uploads.clear();
-            files.status = format!("{error:#}");
+            files.status = match files.reveal.take() {
+                Some(RevealTarget::Changed(change)) => {
+                    format!(
+                        "{}, but refreshing the directory failed: {error:#}",
+                        change.completed()
+                    )
+                }
+                _ => format!("{error:#}"),
+            };
             files.cached.borrow_mut().take();
+        }
+        if visible {
+            tab.follow_shell_directory(&frame, context);
+            if was_editing != tab.files.editing_name() {
+                self.connection_ui(id);
+            }
         }
     }
 }
@@ -1005,6 +1453,55 @@ impl TerminalApp {
             7 => {
                 assert_eq!(files.selected.as_deref(), Some("trace.rs"));
                 assert!(self.hints.borrow().is_none());
+                self.file_action(FileAction::Follow(pane, files.generation, true), context);
+                9
+            }
+            9 => {
+                assert_eq!(
+                    files.directory.as_deref(),
+                    Some("/shell directory"),
+                    "{status}"
+                );
+                // The loopback shell echoes terminal output over the established SSH channel.
+                let (ack, _) = oneshot::channel();
+                tab.session
+                    .input
+                    .send(Command::Raw(
+                        b"\x1b]7;file://127.0.0.1/shell%20directory/src\x07".to_vec(),
+                        ack,
+                    ))
+                    .unwrap();
+                10
+            }
+            10 if files.directory.as_deref() != Some("/shell directory/src") => 10,
+            10 => {
+                assert!(files.entries.iter().any(|entry| entry.name == "trace.rs"));
+                self.file_action(
+                    FileAction::Browse(pane, files.generation, "/".into()),
+                    context,
+                );
+                11
+            }
+            11 => {
+                assert_eq!(files.directory.as_deref(), Some("/"), "{status}");
+                assert!(!files.following);
+                let (ack, _) = oneshot::channel();
+                tab.session
+                    .input
+                    .send(Command::Raw(
+                        b"\x1b]7;file://127.0.0.1/shell%20directory\x07".to_vec(),
+                        ack,
+                    ))
+                    .unwrap();
+                12
+            }
+            12 if tab.session.frames.load().reported_directory.as_deref()
+                != Some("file://127.0.0.1/shell%20directory") =>
+            {
+                12
+            }
+            12 => {
+                assert_eq!(files.directory.as_deref(), Some("/"));
                 let groups: Vec<_> = self.tabs.headers().into_iter().map(|h| h.id).collect();
                 for group in groups {
                     self.close_tab(group, context);
@@ -1025,6 +1522,47 @@ impl TerminalApp {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn follow_coalesces_reports_while_busy_and_ignores_stale_or_foreign_reports() {
+        let mut drawer = FileDrawer {
+            following: true,
+            open: true,
+            directory: Some("/a".into()),
+            ..Default::default()
+        };
+        let report = |s: &str| Some(Arc::<str>::from(s));
+        assert!(
+            drawer
+                .follow_target(&report("file://peer/a"), "peer")
+                .is_none()
+        );
+        drawer.picking = true;
+        assert!(
+            drawer
+                .follow_target(&report("file://peer/b"), "peer")
+                .is_none()
+        );
+        drawer.picking = false;
+        let latest = report("file://peer/c");
+        assert_eq!(drawer.follow_target(&latest, "peer").as_deref(), Some("/c"));
+        assert!(drawer.follow_target(&latest, "peer").is_none());
+        assert!(
+            drawer
+                .follow_target(&report("file://other/d"), "peer")
+                .is_none()
+        );
+        drawer.open = false;
+        assert!(
+            drawer
+                .follow_target(&report("file://peer/z"), "peer")
+                .is_none()
+        );
+        drawer.open = true;
+        drawer.observe_connection(2);
+        assert!(drawer.following);
+        assert_eq!(drawer.follow_target(&latest, "peer").as_deref(), Some("/c"));
+    }
 
     #[test]
     fn shell_directory_uses_only_an_absolute_path_on_this_ssh_host() {
@@ -1079,6 +1617,230 @@ mod tests {
         for invalid in ["", ".", "..", "a/b", "bad\0name"] {
             assert!(remote_child("/", invalid).is_err());
         }
+    }
+
+    #[test]
+    fn new_folder_is_one_remote_component_and_preserves_unicode_and_spaces() {
+        assert_eq!(
+            entry_path("/work/", " Résumé 2026 ").unwrap(),
+            "/work/ Résumé 2026 "
+        );
+        for name in [
+            "",
+            " \t ",
+            ".",
+            "..",
+            "a/b",
+            "/abs",
+            r"a\b",
+            r"..\escape",
+            "bad\0name",
+            "line\nbreak",
+        ] {
+            assert!(entry_path("/work", name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn folder_dialog_captures_parent_and_defers_follow_until_its_own_completion() {
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 4,
+            following: true,
+            directory: Some("/work".into()),
+            ..Default::default()
+        };
+        assert!(drawer.begin_name_edit("/obsolete".into(), None).is_err());
+        drawer.begin_name_edit("/work".into(), None).unwrap();
+        let first = drawer.editor_serial;
+        let changed = Some(Arc::from("file://server/new"));
+        assert!(drawer.follow_target(&changed, "server").is_none());
+        drawer.cancel_name_edit();
+        drawer.begin_name_edit("/work".into(), None).unwrap();
+        let current = drawer.editor_serial;
+        drawer.editor.as_mut().unwrap().name = "prepared".into();
+        assert!(
+            drawer
+                .finish_edit(first, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert!(drawer.editing_name());
+        let (editor, path) = drawer
+            .finish_edit(current, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (&*editor.parent, &*editor.name, &*path),
+            ("/work", "prepared", "/work/prepared")
+        );
+        assert!(
+            drawer
+                .finish_edit(current, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            drawer.follow_target(&changed, "server").as_deref(),
+            Some("/new")
+        );
+        drawer.begin_name_edit("/work".into(), None).unwrap();
+        drawer.directory = Some("/other".into());
+        assert!(
+            drawer
+                .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+        drawer.begin_name_edit("/other".into(), None).unwrap();
+        drawer.observe_connection(5);
+        assert!(
+            drawer
+                .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert!(drawer.directory.is_none());
+    }
+
+    #[test]
+    fn rename_is_bound_to_the_listed_source_until_confirmed() {
+        let source = ListedEntry {
+            parent: "/work".into(),
+            revision: 1,
+            name: "alias".into(),
+        };
+        let mut drawer = FileDrawer {
+            open: true,
+            following: true,
+            directory: Some(source.parent.clone()),
+            listing_revision: source.revision,
+            entries: vec![Entry {
+                name: source.name.clone(),
+                directory: None,
+            }],
+            selected: Some(source.name.clone()),
+            ..Default::default()
+        };
+        let begin = |drawer: &mut FileDrawer| {
+            drawer.begin_name_edit(source.parent.clone(), Some(source.clone()))
+        };
+        begin(&mut drawer).unwrap();
+        assert_eq!(drawer.editor.as_ref().unwrap().name, source.name);
+        assert!(drawer.editor.as_ref().unwrap().destination().is_err()); // unchanged
+        assert!(
+            drawer
+                .follow_target(&Some(Arc::from("file://host/elsewhere")), "host")
+                .is_none()
+        );
+        drawer.editor.as_mut().unwrap().name = "new name 雪".into();
+        let old = drawer.editor_serial;
+        assert!(
+            drawer
+                .finish_edit(old, ContentDialogResult::None)
+                .unwrap()
+                .is_none()
+        );
+        begin(&mut drawer).unwrap();
+        let current = drawer.editor_serial;
+        assert!(
+            drawer
+                .finish_edit(old, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        drawer.editor.as_mut().unwrap().name = "new name 雪".into();
+        let (editor, path) = drawer
+            .finish_edit(current, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/work/new name 雪");
+        assert_eq!(editor.original.unwrap().name, "alias");
+        assert!(
+            drawer
+                .finish_edit(current, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+
+        begin(&mut drawer).unwrap();
+        drawer.editor.as_mut().unwrap().name = "new".into();
+        drawer.listing_revision += 1; // same parent and filename in a replacement listing
+        assert!(
+            drawer
+                .finish_edit(drawer.editor_serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+        assert!(begin(&mut drawer).is_err());
+        drawer.listing_revision = source.revision;
+        drawer.selected = None;
+        assert!(begin(&mut drawer).is_err());
+        drawer.selected = Some(source.name.clone());
+        begin(&mut drawer).unwrap();
+        drawer.observe_connection(2);
+        assert!(
+            drawer
+                .finish_edit(current, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert!(begin(&mut drawer).is_err());
+    }
+
+    #[test]
+    fn rename_preserves_a_known_result_while_the_connection_changes() {
+        let change = EntryChange::Rename {
+            from: "old".into(),
+            to: "new".into(),
+        };
+        let (pending, mut reply) = oneshot::channel();
+        assert!(change_reconnect_status(&change, &mut reply).contains("outcome is unknown"));
+        pending.send(Ok(json!({}))).unwrap();
+        assert!(change_reconnect_status(&change, &mut reply).starts_with("Renamed old to new"));
+        let (pending, mut reply) = oneshot::channel();
+        pending
+            .send(Err("outcome unknown; refresh".into()))
+            .unwrap();
+        assert_eq!(
+            change_reconnect_status(&change, &mut reply),
+            "Rename old to new: outcome unknown; refresh"
+        );
+        let (pending, mut reply) = oneshot::channel();
+        drop(pending);
+        assert!(
+            change_reconnect_status(&change, &mut reply)
+                .contains("before rename of old to new started")
+        );
+        let mut drawer = FileDrawer {
+            reveal: Some(RevealTarget::Changed(change)),
+            ..Default::default()
+        };
+        drawer.observe_connection(2);
+        assert!(
+            drawer
+                .status
+                .starts_with("Renamed old to new before SSH reconnected")
+        );
+    }
+
+    #[test]
+    fn folder_reconnect_status_keeps_success_failure_and_unknown_outcomes_distinct() {
+        let change = EntryChange::CreateFolder("test".into());
+        let (pending, mut reply) = oneshot::channel();
+        assert!(change_reconnect_status(&change, &mut reply).contains("outcome is unknown"));
+        pending.send(Ok(json!({}))).unwrap();
+        assert!(change_reconnect_status(&change, &mut reply).starts_with("Created folder test"));
+        let (pending, mut reply) = oneshot::channel();
+        pending.send(Err("permission denied".into())).unwrap();
+        assert_eq!(
+            change_reconnect_status(&change, &mut reply),
+            "Could not create folder test: permission denied"
+        );
+        let (pending, mut reply) = oneshot::channel();
+        drop(pending);
+        assert!(
+            change_reconnect_status(&change, &mut reply)
+                .contains("before creation of test started")
+        );
     }
 
     #[test]

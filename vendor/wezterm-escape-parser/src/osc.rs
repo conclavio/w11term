@@ -319,20 +319,29 @@ impl OperatingSystemCommand {
             ManipulateSelectionData => Self::parse_selection(osc),
             SystemNotification => {
                 if osc.len() >= 3 && osc[1] == b"4" {
-                    fn get_pct(v: &&[u8]) -> u8 {
-                        let number = str::from_utf8(v).unwrap_or("0");
-                        number.parse::<u8>().unwrap_or(0).max(0).min(100)
-                    }
+                    // Missing percentages default to zero. Clamp decimal values
+                    // as they are parsed, including those wider than a machine word.
+                    let percentage = || -> Result<u8> {
+                        let digits = osc.get(3).copied().unwrap_or_default();
+                        let mut value = 0u8;
+                        for &digit in digits {
+                            if !digit.is_ascii_digit() {
+                                bail!("invalid progress percentage");
+                            }
+                            value = value.saturating_mul(10).saturating_add(digit - b'0').min(100);
+                        }
+                        Ok(value)
+                    };
                     match osc[2] {
                         b"0" => return Ok(OperatingSystemCommand::ConEmuProgress(Progress::None)),
                         b"1" => {
-                            let pct = osc.get(3).map(get_pct).unwrap_or(0);
+                            let pct = percentage()?;
                             return Ok(OperatingSystemCommand::ConEmuProgress(
                                 Progress::SetPercentage(pct),
                             ));
                         }
                         b"2" => {
-                            let pct = osc.get(3).map(get_pct).unwrap_or(0);
+                            let pct = percentage()?;
                             return Ok(OperatingSystemCommand::ConEmuProgress(Progress::SetError(
                                 pct,
                             )));
@@ -343,7 +352,9 @@ impl OperatingSystemCommand {
                             ));
                         }
                         b"4" => {
-                            return Ok(OperatingSystemCommand::ConEmuProgress(Progress::Paused));
+                            return Ok(OperatingSystemCommand::ConEmuProgress(Progress::Paused(
+                                percentage()?,
+                            )));
                         }
                         _ => {}
                     }
@@ -611,7 +622,8 @@ impl Display for OperatingSystemCommand {
             ConEmuProgress(Progress::SetPercentage(pct)) => write!(f, "9;4;1;{pct}")?,
             ConEmuProgress(Progress::SetError(pct)) => write!(f, "9;4;2;{pct}")?,
             ConEmuProgress(Progress::SetIndeterminate) => write!(f, "9;4;3")?,
-            ConEmuProgress(Progress::Paused) => write!(f, "9;4;4")?,
+            ConEmuProgress(Progress::Paused(0)) => write!(f, "9;4;4")?,
+            ConEmuProgress(Progress::Paused(pct)) => write!(f, "9;4;4;{pct}")?,
         };
         // Use the longer form ST as neovim doesn't like the BEL version
         write!(f, "\x1b\\")?;
@@ -883,7 +895,7 @@ pub enum Progress {
     SetPercentage(u8),
     SetError(u8),
     SetIndeterminate,
-    Paused,
+    Paused(u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1738,7 +1750,7 @@ mod test {
         );
         assert_eq!(
             parse(&["9", "4", "4"], "\x1b]9;4;4\x1b\\"),
-            OperatingSystemCommand::ConEmuProgress(Progress::Paused)
+            OperatingSystemCommand::ConEmuProgress(Progress::Paused(0))
         );
     }
 

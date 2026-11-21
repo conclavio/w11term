@@ -1,0 +1,16 @@
+Port 22
+ListenAddress 0.0.0.0
+HostKey /run/w11term-host-ed25519
+PidFile /run/w11term-sshd.pid
+AllowUsers w11fixture
+PermitRootLogin no
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+AllowAgentForwarding no
+AllowTcpForwarding no
+X11Forwarding no
+PrintMotd no
+Subsystem sftp internal-sftp

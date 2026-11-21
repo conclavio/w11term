@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::Request;
-pub const HELP: &str = "w11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID [--stop | PATH]";
+pub const HELP: &str = "w11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID [--stop | PATH]\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -17,6 +17,8 @@ pub fn parse(
     let mut since = None;
     let mut text = None;
     let mut stop = false;
+    let mut overwrite = false;
+    let mut exit_token = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
             args.next()
@@ -39,12 +41,16 @@ pub fn parse(
             }
             "--since" if verb == "events" => since = Some(value(&mut args)?.parse()?),
             "--stop" if verb == "record" => stop = true,
+            "--overwrite" if verb == "save-text" => overwrite = true,
+            "--exit-token" if verb == "restart" => exit_token = Some(value(&mut args)?.parse()?),
             "--" if verb == "wait-for-text" => {
                 ensure!(text.is_none(), "only one pattern is accepted");
                 text = Some(value(&mut args)?);
                 ensure!(args.next().is_none(), "unexpected argument after pattern");
             }
-            _ if !arg.starts_with("--") && matches!(verb, "wait-for-text" | "record") => {
+            _ if !arg.starts_with("--")
+                && matches!(verb, "wait-for-text" | "record" | "save-text") =>
+            {
                 ensure!(text.is_none(), "only one pattern/path is accepted");
                 text = Some(arg);
             }
@@ -77,6 +83,15 @@ pub fn parse(
             regex,
             timeout_seconds: timeout.unwrap_or(30),
         },
+        "restart" => Request::Restart {
+            pane: pane.context("--pane is required")?,
+            exit_token: exit_token.context("--exit-token is required (from events)")?,
+        },
+        "save-text" => Request::SaveText {
+            pane: pane.context("--pane is required")?,
+            path: std::path::absolute(text.context("save-text requires a destination path")?)?,
+            overwrite,
+        },
         "record" => {
             ensure!(stop != text.is_some(), "provide PATH or --stop");
             Request::Record {
@@ -104,5 +119,32 @@ mod tests {
         assert!(p("resize", &["--pane", "1", "--cols", "120"]).is_err());
         assert!(p("record", &["--pane", "1", "--stop", "file.vt"]).is_err());
         assert!(p("open", &["--profile", "play", "--pane", "1"]).is_err());
+        assert!(
+            matches!(p("save-text", &["--pane", "2", "shell log.txt"]).unwrap().1,
+            Request::SaveText { pane: 2, path, overwrite: false } if path.is_absolute())
+        );
+        assert!(matches!(
+            p("save-text", &["--overwrite", "--pane", "2", "log.txt"])
+                .unwrap()
+                .1,
+            Request::SaveText {
+                overwrite: true,
+                ..
+            }
+        ));
+        assert!(p("save-text", &["--pane", "2"]).is_err());
+        assert!(p("record", &["--pane", "2", "--overwrite", "log.txt"]).is_err());
+        assert!(matches!(
+            p("restart", &["--pane", "2", "--exit-token", "13"])
+                .unwrap()
+                .1,
+            Request::Restart {
+                pane: 2,
+                exit_token: 13
+            }
+        ));
+        assert!(p("restart", &["--pane", "2"]).is_err());
+        assert!(p("restart", &["--exit-token", "2"]).is_err());
+        assert!(p("events", &["--pane", "2", "--exit-token", "1"]).is_err());
     }
 }

@@ -121,6 +121,7 @@ impl Fixture {
             executable: std::env::current_exe()?,
             args: child_args("native_child"),
             cwd: Some(cwd.path().into()),
+            powershell_integration: false,
         };
         let (input, rx) = mpsc::unbounded_channel();
         let (tx, output) = mpsc::channel(3);
@@ -141,7 +142,8 @@ impl Fixture {
                         self.screen.push_str(&String::from_utf8_lossy(&bytes))
                     }
                     Some(Event::Status(status)) => self.screen.push_str(&format!("\n[{status}]\n")),
-                    Some(Event::Connected(_)) => {}
+                    Some(Event::Connected(_) | Event::Disconnected) => {}
+                    Some(Event::HerdrViewer) => panic!("ConPTY supplied an SSH viewer stream"),
                     Some(Event::SessionListUpdated(_)) => {
                         panic!("ConPTY supplied an SSH session list")
                     }
@@ -248,6 +250,7 @@ async fn missing_executable_returns_a_launch_error_and_releases_endpoints() -> R
         executable: dir.path().join("missing-w11term-fixture.exe"),
         args: vec![],
         cwd: None,
+        powershell_integration: false,
     };
     let (_input, rx) = mpsc::unbounded_channel();
     let (tx, mut output) = mpsc::channel(1);
@@ -255,5 +258,40 @@ async fn missing_executable_returns_a_launch_error_and_releases_endpoints() -> R
         tokio::time::timeout(Duration::from_secs(3), run(options, size(80, 24), rx, tx)).await?;
     assert!(format!("{:#}", result.unwrap_err()).contains("missing-w11term-fixture.exe"));
     assert!(output.recv().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_local_launch_offers_one_fresh_restart_per_termination() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let options = LocalOptions {
+        executable: dir.path().join("missing-w11term-fixture.exe"),
+        args: vec![],
+        cwd: None,
+        powershell_integration: false,
+    };
+    let pane = crate::session::Session::start(crate::options::Source::Local(options));
+    let mut cursor = 0;
+    for token in 1..=2 {
+        let batch = pane.events.wait(cursor, Duration::from_secs(5)).await;
+        let exit = batch
+            .events
+            .iter()
+            .find(|e| e.kind == "pane-exited")
+            .context("missing exit event")?;
+        assert_eq!(exit.data, serde_json::json!({"exit_token":token}));
+        assert!(
+            pane.frames
+                .load()
+                .status
+                .contains("missing-w11term-fixture.exe")
+        );
+        assert_eq!(pane.frames.load().connection_generation, 0);
+        if token == 1 {
+            pane.restart_exited(token)?;
+        }
+        assert!(pane.restart_exited(token - 1).is_err());
+        cursor = batch.next;
+    }
     Ok(())
 }
