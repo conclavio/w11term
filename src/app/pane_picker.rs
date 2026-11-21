@@ -95,21 +95,63 @@ impl Drop for Preview {
     }
 }
 
-// Bound the spoken description even for a very large PTY. The canvas shows the whole grid.
+// Sample nearby rows for the screen reader. The canvas shows the whole grid.
 fn preview_summary(frame: &Snapshot) -> String {
-    let mut lines: Vec<String> = frame
-        .rows
-        .iter()
+    const MAX_COLUMNS: usize = 1024;
+    const MAX_CHARS: usize = 120;
+    let Some(last_row) = frame.rows.len().checked_sub(1) else {
+        return String::new();
+    };
+    let cursor_row = usize::try_from(frame.cursor.y)
+        .ok()
+        .and_then(|y| y.checked_add(frame.scroll_offset))
+        .filter(|&y| y <= last_row);
+    let anchor = cursor_row.unwrap_or(last_row);
+    let nearby = (anchor.saturating_sub(6)..=anchor)
         .rev()
-        .filter_map(|line| {
-            let text = line.as_str();
-            let text = text.trim();
-            (!text.is_empty()).then(|| text.chars().take(120).collect())
-        })
-        .take(2)
-        .collect();
-    lines.reverse();
-    lines.join(" / ")
+        .chain(anchor + 1..=(anchor + 2).min(last_row));
+    let mut lines = Vec::new();
+    for row in nearby {
+        // Line's cell iterator advances from the beginning. Bound that work as
+        // well as the string, including an unusually long combining sequence.
+        let start = if Some(row) == cursor_row {
+            frame
+                .cursor
+                .x
+                .min(MAX_COLUMNS)
+                .saturating_sub(MAX_CHARS / 2)
+        } else {
+            0
+        };
+        let mut sample = String::new();
+        let mut remaining = MAX_CHARS;
+        for cell in frame.rows[row]
+            .visible_cells()
+            .take_while(|c| c.cell_index() < frame.cols.min(MAX_COLUMNS))
+            .skip_while(|c| c.cell_index() < start)
+        {
+            for ch in cell.str().chars().take(remaining) {
+                sample.push(ch);
+                remaining -= 1;
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        let text = sample.trim();
+        if !text.is_empty() {
+            lines.push((row, text.to_owned()));
+            if lines.len() == 2 {
+                break;
+            }
+        }
+    }
+    lines.sort_by_key(|(row, _)| *row);
+    lines
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 struct Choice {
@@ -514,6 +556,28 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spoken_preview_samples_the_cursor_neighborhood_on_large_sparse_screens() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(
+            TerminalSize {
+                cols: 500,
+                rows: 64,
+                ..Default::default()
+            },
+            tx,
+        );
+        terminal.advance_bytes(b"old headline\x1b[60;1Hunrelated footer\x1b[12;1Hbuild completed\x1b[13;465Hhidden-marker-live");
+        let snapshot = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        assert_eq!(
+            preview_summary(&snapshot),
+            "build completed / hidden-marker-live"
+        );
+
+        terminal.advance_bytes(b"\x1b[30;1H");
+        let snapshot = Snapshot::capture(&terminal, None, 2, 0, String::new(), 0);
+        assert_eq!(preview_summary(&snapshot), "");
+    }
     fn row(pane: u64, title: &str, label: &str, destination: &str) -> Choice {
         Choice {
             pane,
