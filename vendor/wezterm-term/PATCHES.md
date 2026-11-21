@@ -60,3 +60,8 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - `Screen::physical_lines` provides a borrowed, double-ended iterator over
   retained rows for plain-text exports without cloning scrollback.
+
+- A terminal may replace its input and reply writer after the previous
+  transport has exited. Pending bytes on the old writer keep their original
+  destination while the next shell starts in the same terminal model.
+  The embedding can track window focus locally while the peer is offline.

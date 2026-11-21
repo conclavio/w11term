@@ -11,11 +11,18 @@ use std::{
 };
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
+mod launch;
 mod presentation;
+use launch::Phase;
 use presentation::Presentation;
 
 #[derive(Debug)]
+pub struct ClaimedRestart(pub(crate) u64);
+
+#[derive(Debug)]
 pub enum Command {
+    /// The caller claims this exited launch through Events::restart_exited.
+    RestartExited(ClaimedRestart),
     /// Ordered with both native input and control-pipe writes on this pane.
     SetReadOnly(bool),
     /// Input method committed text has no corresponding physical key presses.
@@ -79,6 +86,7 @@ fn contain_worker_failure(
     work: impl FnOnce(),
 ) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+        events.close_restart();
         events.command_stream(false);
         events.set_progress(wezterm_term::Progress::None);
         // Never resume a possibly inconsistent terminal engine after unwinding.
@@ -118,6 +126,10 @@ struct Services {
 }
 
 impl Session {
+    pub fn restart_exited(&self, token: u64) -> anyhow::Result<()> {
+        self.events.restart_exited(&self.input, token)
+    }
+
     pub fn start(source: Source) -> Self {
         Self::start_sized(source, TerminalSize::default())
     }
@@ -268,12 +280,12 @@ impl Session {
             .filter(|_| matches!(source, Source::Ssh(_)))
             .map(ssh::DurableControl::new)
             .unzip();
-        let sharing = ssh::Sharing {
-            published: ssh_connection.clone(),
-            offered: connection.filter(|_| matches!(source, Source::Ssh(_))),
-            durable: lifecycle,
+        let sharing = ssh::Sharing::new(
+            ssh_connection.clone(),
+            connection.filter(|_| matches!(source, Source::Ssh(_))),
+            lifecycle,
             startup,
-        };
+        );
         let worker = thread::Builder::new()
             .name("terminal-session".into())
             .spawn(move || {
@@ -320,6 +332,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.events.close_restart();
         self.events.command_stream(false);
         let _ = self.input.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
@@ -332,7 +345,7 @@ async fn run(
     source: Source,
     mut terminal: wezterm_term::Terminal,
     mut commands: mpsc::UnboundedReceiver<Command>,
-    writer: mpsc::UnboundedSender<TransportInput>,
+    mut writer: mpsc::UnboundedSender<TransportInput>,
     mut transport_input: mpsc::UnboundedReceiver<TransportInput>,
     frames: FrameStore,
     services: Services,
@@ -353,6 +366,12 @@ async fn run(
     // A durable backend may reconstruct an old screen at any time. Its OSC
     // 133 bytes cannot be used to announce a newly completed command.
     let live_commands = sharing.durable.is_none() && can_watch_commands(&source);
+    let restartable = can_restart(live_commands, sharing.startup.as_ref());
+    let mut launch =
+        launch::Launcher::new(source.clone(), sharing, prompts.clone(), events.clone());
+    let mut launch_id = 1u64;
+    let mut phase = Phase::Running;
+    let mut queued_before_connection = 0usize;
     let mut show_progress = interactive;
     let endpoint = match &source {
         Source::Ssh(options) => format!("{}@{}:{}", options.user, options.host, options.port),
@@ -379,46 +398,8 @@ async fn run(
     let mut replay = None;
     let mut transports = tokio::task::JoinSet::new();
     match source {
-        Source::Local(shell) => {
-            status = format!("Starting {}…", shell.executable.display());
-            transports.spawn(async move {
-                if let Err(error) =
-                    crate::conpty::run(shell, size, transport_input, output_tx.clone()).await
-                {
-                    let _ = output_tx
-                        .send(ssh::Event::Status(format!("Local shell: {error:#}")))
-                        .await;
-                }
-                let _ = output_tx.send(ssh::Event::Disconnected).await;
-            });
-        }
-        Source::Ssh(options) => {
-            status = format!(
-                "Connecting to {}@{}:{}…",
-                options.user, options.host, options.port
-            );
-            let prompts = prompts.clone();
-            let events = events.clone();
-            transports.spawn_on(
-                async move {
-                    let result = ssh::run_with_sharing(
-                        options,
-                        size,
-                        transport_input,
-                        output_tx.clone(),
-                        Some(prompts),
-                        events,
-                        sharing,
-                    )
-                    .await;
-                    let message = match result {
-                        Ok(()) => "Disconnected".into(),
-                        Err(error) => format!("SSH: {error:#}"),
-                    };
-                    let _ = output_tx.send(ssh::Event::Status(message)).await;
-                },
-                ssh::NETWORK.handle(),
-            );
+        Source::Local(_) | Source::Ssh(_) => {
+            status = launch.start(&mut transports, size, transport_input, output_tx);
         }
         Source::Replay(path) => {
             match std::fs::read(&path) {
@@ -492,6 +473,12 @@ async fn run(
                 connection: connection_generation,
             },
         );
+        if phase == Phase::PublishingExit {
+            phase = Phase::Exited;
+            if restartable {
+                events.pane_exited(launch_id);
+            }
+        }
         if inspecting {
             frames.set_inspection(Some(terminal::TerminalModes::read(&terminal)));
         }
@@ -513,6 +500,18 @@ async fn run(
                 presentation.dirty=true;
             }
             command = commands.recv() => {
+                let queued_offline = queued_before_connection > 0;
+                queued_before_connection = queued_before_connection.saturating_sub(1);
+                let command = if phase != Phase::Running || queued_offline {
+                    match command {
+                        Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
+                        Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
+                        Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
+                        Some(Command::Key {..} | Command::DetailedKey {..} | Command::Composed(_) | Command::Text(_) | Command::Paste(_) | Command::Mouse(_)) => continue,
+                        Some(Command::Wheel(lines, _)) => Some(Command::Scroll(lines)),
+                        other => other,
+                    }
+                } else { command };
                 let command = if read_only {
                     match command {
                         Some(Command::Raw(_, reply)) => {
@@ -529,6 +528,24 @@ async fn run(
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
+                    Some(Command::RestartExited(ClaimedRestart(token))) => {
+                        if phase == Phase::Exited && restartable && token == launch_id {
+                            launch_id += 1;
+                            phase = Phase::Restarting { reset: true };
+                            terminal.reset_connection();
+                            scroll_offset = 0;
+                            last_mouse.button = wezterm_term::MouseButton::None;
+                            let (tx, rx) = mpsc::unbounded_channel();
+                            terminal::replace_transport(&mut terminal, tx.clone());
+                            writer = tx;
+                            let (output_tx, new_output) = mpsc::channel(32);
+                            output = new_output;
+                            status = launch.start(&mut transports, size, rx, output_tx);
+                            presentation.dirty = true;
+                            search.refresh(&terminal, scroll_offset);
+                        }
+                        Ok(())
+                    }
                     Some(Command::Shutdown) | None => break,
                     Some(Command::SetReadOnly(enabled)) => {
                         read_only = enabled;
@@ -546,7 +563,7 @@ async fn run(
                             else {let stopped=recorder.take().context("pane is not recording")?;let bytes=stopped.bytes;let path=stopped.path.clone();stopped.finish()?;events.push("recording-stopped",serde_json::json!({"bytes":bytes}));Ok(serde_json::json!({"recording":false,"path":path,"bytes":bytes}))}
                         })();let _=reply.send(result.map_err(|e|format!("{e:#}")));Ok(())
                     },
-                    Some(Command::Authenticate(auth))=>{let _=writer.send(TransportInput::Authenticate(auth));Ok(())},
+                    Some(Command::Authenticate(auth))=>{launch.set_authentication(auth.clone());let _=writer.send(TransportInput::Authenticate(auth));Ok(())},
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
                     Some(Command::Inspect(enabled))=>{
@@ -664,7 +681,31 @@ async fn run(
                 presentation.dirty|=scroll_offset!=old_offset;
                 if changes_screen && search.open && !search_dirty {search_dirty=true;search_refresh=tokio::time::Instant::now()+std::time::Duration::from_millis(150);}
             }
-            Some(event) = output.recv() => {
+            event = output.recv(), if interactive && phase != Phase::Exited => {
+                let Some(event) = event else {
+                    // All sender clones are gone and every final Data/Status was processed.
+                    // A transient disconnect with a scheduled reconnect never closes this queue.
+                    let joined = transports.join_next().await;
+                    prompts.cancel();
+                    events.command_stream(false);
+                    events.set_progress(wezterm_term::Progress::None);
+                    if let Some(task) = asset_task.take() { task.abort(); }
+                    pending_pack = Default::default();
+                    while let Ok(notice) = notices.try_recv() {
+                        if let crate::sound::Notice::Play(name) = notice
+                            && sounds.try_send(name).is_err() {
+                            events.push("sound-error",serde_json::json!({"reason":"audio queue full"}));
+                        }
+                    }
+                    if let Some(Err(error)) = joined { status = format!("Terminal transport failed: {error}"); }
+                    // A peer that exits halfway through a synchronized update
+                    // cannot deliver an end marker. Publish its final image
+                    // before making the restart token visible.
+                    if terminal.synchronized_output() { presentation.expire(&mut terminal); }
+                    presentation.dirty = true;
+                    phase = Phase::PublishingExit;
+                    continue;
+                };
                 let anchor = (scroll_offset>0 && !terminal.is_alt_screen_active()).then(||terminal.screen().visible_row_to_stable_row(0)-scroll_offset as isize);
                 // Preserve mode transitions and data order even when the first paint
                 // and a connection event arrive together in a single snapshot batch.
@@ -677,6 +718,7 @@ async fn run(
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
                         ssh::Event::Disconnected => {
+                            if let Phase::Restarting { reset } = &mut phase { *reset = false; }
                             events.command_stream(false);
                             events.set_progress(wezterm_term::Progress::None);
                             show_progress = interactive;
@@ -702,13 +744,19 @@ async fn run(
                             presentation.refresh_view = true;
                         }
                         ssh::Event::Connected(generation) => {
-                            if generation > 1 {
+                            if matches!(phase, Phase::Restarting { .. }) {
+                                // Anything already waiting in this FIFO predates the ready frame.
+                                // Apply local configuration, but never deliver its queued user input.
+                                queued_before_connection = commands.len();
+                            }
+                            if generation > 1 && !matches!(phase, Phase::Restarting { reset: true }) {
                                 terminal.reset_connection();
                                 events.set_progress(wezterm_term::Progress::None);
                                 scroll_offset = 0;
                             }
                             presentation.dirty = true;
                             connection_generation = generation;
+                            phase = Phase::Running;
                             events.command_stream(live_commands);
                         }
                     }
@@ -735,6 +783,10 @@ fn can_watch_commands(source: &Source) -> bool {
         Source::Local(_) => true,
         Source::Replay(_) | Source::Demo => false,
     }
+}
+
+fn can_restart(live_shell: bool, startup: Option<&crate::workspace::SshStartup>) -> bool {
+    live_shell && startup.is_none_or(|recipe| recipe.command.is_empty())
 }
 
 fn record_output(
@@ -806,6 +858,12 @@ mod failure_tests {
         )
         .unwrap();
         assert!(can_watch_commands(&Source::Ssh(ssh.clone())));
+        let directory =
+            crate::workspace::SshStartup::new(&ssh, "/work".into(), String::new()).unwrap();
+        let command =
+            crate::workspace::SshStartup::new(&ssh, "/work".into(), "build".into()).unwrap();
+        assert!(can_restart(true, None) && can_restart(true, Some(&directory)));
+        assert!(!can_restart(true, Some(&command)) && !can_restart(false, None));
         ssh.durable = true;
         assert!(!can_watch_commands(&Source::Ssh(ssh)));
         assert!(can_watch_commands(&Source::Local(

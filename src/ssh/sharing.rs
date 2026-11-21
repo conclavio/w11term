@@ -176,4 +176,39 @@ pub(crate) struct Sharing {
     pub published: ShareSlot,
     pub offered: Option<ConnectionShare>,
     pub durable: Option<super::durability::Worker>,
+    generations: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Sharing {
+    pub(crate) fn new(
+        published: ShareSlot,
+        offered: Option<ConnectionShare>,
+        durable: Option<super::durability::Worker>,
+        startup: Option<crate::workspace::SshStartup>,
+    ) -> Self {
+        Self {
+            published,
+            offered,
+            durable,
+            startup,
+            ..Default::default()
+        }
+    }
+
+    /// Only the original launch can consume a shared connection or attach worker.
+    pub(crate) fn for_launch(&mut self) -> Self {
+        Self {
+            published: self.published.clone(),
+            offered: self.offered.take(),
+            durable: self.durable.take(),
+            startup: self.startup.clone(),
+            generations: self.generations.clone(),
+        }
+    }
+
+    pub(crate) fn next_generation(&self) -> u64 {
+        self.generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
 }

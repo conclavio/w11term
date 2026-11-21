@@ -130,6 +130,16 @@ pub fn create(size: TerminalSize, writer: mpsc::UnboundedSender<TransportInput>)
     )
 }
 
+pub(crate) fn replace_transport(
+    terminal: &mut Terminal,
+    writer: mpsc::UnboundedSender<TransportInput>,
+) {
+    terminal.replace_writer(Box::new(ReplyWriter {
+        sender: writer,
+        message: TransportInput::Data,
+    }));
+}
+
 /// Herdr can send a screen reconstruction on attach or while a viewer falls behind.
 /// Screen paint and subsequent live bytes share the same stream.
 pub(crate) fn enter_herdr_viewer(
