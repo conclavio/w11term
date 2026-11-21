@@ -630,7 +630,7 @@ impl Renderer {
             &brush,
         );
         brush.set_color(ColorF::new(0.59, 0.64, 0.71, 1.0));
-        let label = format!(
+        let mut label = format!(
             "{}   ·   {} × {}   ·   {} KiB{}",
             frame.status,
             self.metrics.cols,
@@ -642,6 +642,10 @@ impl Renderer {
                 ""
             }
         );
+        if let Some(code) = frame.last_command.as_ref().and_then(|c| c.exit_code) {
+            use std::fmt::Write as _;
+            let _ = write!(label, "   ·   exit {code}");
+        }
         ctx.draw_text(
             &label,
             &self.small,

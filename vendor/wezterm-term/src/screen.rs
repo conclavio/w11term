@@ -28,6 +28,8 @@ pub struct Screen {
     /// increment this.  We use this offset to translate between
     /// PhysRowIndex and StableRowIndex.
     stable_row_index_offset: usize,
+    /// Start of the primary shell's current OSC 133 C/D output range.
+    pub(crate) command_start: Option<(StableRowIndex, usize)>,
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
@@ -84,6 +86,7 @@ impl Screen {
             physical_rows,
             physical_cols,
             stable_row_index_offset: 0,
+            command_start: None,
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
@@ -92,6 +95,65 @@ impl Screen {
 
     pub fn full_reset(&mut self) {
         self.keyboard_stack.clear();
+        self.command_start = None;
+    }
+
+    pub(crate) fn finish_command_output(
+        &mut self,
+        end_row: VisibleRowIndex,
+        end_col: usize,
+    ) -> Result<String, &'static str> {
+        let (start_row, start_col) = self
+            .command_start
+            .take()
+            .ok_or("No command output marker")?;
+        let start = self
+            .stable_row_to_phys(start_row)
+            .ok_or("Command output left scrollback")?;
+        let end = self.phys_row(end_row);
+        if (start, start_col) > (end, end_col) || end >= self.lines.len() {
+            return Err("Command output is no longer on screen");
+        }
+        // Match the embedding's plain-text clipboard limit. Never silently
+        // substitute a partial command or allocate an unbounded second history.
+        const MAX_OUTPUT: usize = 1024 * 1024;
+        let mut output = String::new();
+        for row in start..=end {
+            let line = &self.lines[row];
+            let first = if row == start { start_col } else { 0 };
+            let last = if row == end {
+                end_col
+            } else {
+                self.physical_cols
+            };
+            let hard_break = row < end && !line.last_cell_was_wrapped();
+            let mut pending_spaces = 0;
+            for cell in line
+                .visible_cells()
+                .skip_while(|c| c.cell_index() < first)
+                .take_while(|c| c.cell_index() < last)
+            {
+                // Scrollback lines can be padded to the viewport width.
+                // Drop trailing padding only where a real newline follows.
+                if hard_break && cell.str() == " " {
+                    pending_spaces += 1;
+                    continue;
+                }
+                if output.len() + pending_spaces + cell.str().len() > MAX_OUTPUT {
+                    return Err("Command output exceeds the 1 MiB clipboard limit");
+                }
+                output.extend(std::iter::repeat_n(' ', pending_spaces));
+                pending_spaces = 0;
+                output.push_str(cell.str());
+            }
+            if hard_break {
+                if output.len() + 2 > MAX_OUTPUT {
+                    return Err("Command output exceeds the 1 MiB clipboard limit");
+                }
+                output.push_str("\r\n");
+            }
+        }
+        Ok(output)
     }
 
     fn scrollback_size(&self) -> usize {
@@ -109,11 +171,20 @@ impl Screen {
         let mut rewrapped = VecDeque::new();
         let mut logical_line: Option<Line> = None;
         let mut logical_cursor_x: Option<usize> = None;
+        let marker = self
+            .command_start
+            .and_then(|(row, col)| self.stable_row_to_phys(row).map(|row| (row, col)));
+        let mut logical_marker = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
         for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
+            if let Some((row, col)) = marker {
+                if phys_idx == row {
+                    logical_marker = Some(logical_line.as_ref().map_or(0, Line::len) + col);
+                }
+            }
 
             if was_wrapped {
                 line.set_last_cell_was_wrapped(false, seqno);
@@ -166,11 +237,25 @@ impl Screen {
                 }
             }
 
+            let first_rewrapped = rewrapped.len();
             if line.len() <= physical_cols {
                 rewrapped.push_back(line);
             } else {
                 for line in line.wrap(physical_cols, seqno) {
                     rewrapped.push_back(line);
+                }
+            }
+            if let Some(mut col) = logical_marker.take() {
+                // Use the actual wrapped lengths: a wide grapheme can move to
+                // the next row while there is still a single column available.
+                for row in first_rewrapped..rewrapped.len() {
+                    let width = rewrapped[row].len();
+                    if col < width || row + 1 == rewrapped.len() {
+                        self.command_start =
+                            Some(((self.stable_row_index_offset + row) as StableRowIndex, col));
+                        break;
+                    }
+                    col -= width;
                 }
             }
         }

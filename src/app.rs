@@ -48,6 +48,7 @@ use pane_view::PaneSurface;
 
 struct LiveTab {
     files: Box<FileDrawer>,
+    copy_output_unavailable: Option<&'static str>,
     confirm_end: bool,
     durable_phase: Option<w11term::ssh::DurablePhase>,
     source: Source,
@@ -256,6 +257,8 @@ fn tab_menu_message(label: String) -> Message {
     }
     match label.split(": ").next().unwrap_or(&label) {
         "SFTP files" => Message::Files(FileAction::Toggle),
+        "Open files here" => Message::Files(FileAction::OpenHere),
+        "Copy last command output" => Message::CopyLastCommand,
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
@@ -367,6 +370,7 @@ pub enum Message {
     GenerateKey(TabId),
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
+    CopyLastCommand,
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
     FrameReady(TabId, u64),
@@ -436,6 +440,7 @@ fn live_tab_sized(
         label,
         page: Page::Terminal(LiveTab {
             files: Box::default(),
+            copy_output_unavailable: Some("waiting for shell markers"),
             source,
             confirm_end: false,
             durable_phase: None,
@@ -2110,14 +2115,23 @@ impl TerminalApp {
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
             items.push(MenuItem::item("files", "SFTP files"));
+            items.push(MenuItem::item("files-here", "Open files here"));
         }
         if let Some(AppTab {
             page: Page::Terminal(live),
             ..
         }) = self.tabs.active()
-            && let Some(menu) = durable_view::pane_menu(live)
         {
-            items.push(menu);
+            items.push(match live.session.frames.load().copy_output_unavailable() {
+                Some(why) => MenuItem::disabled(
+                    "copy-last-output",
+                    format!("Copy last command output ({why})"),
+                ),
+                None => MenuItem::item("copy-last-output", "Copy last command output"),
+            });
+            if let Some(menu) = durable_view::pane_menu(live) {
+                items.push(menu);
+            }
         }
         if !self.profiles.is_empty() || !self.local_profiles.is_empty() {
             for (key, label) in [
@@ -2687,6 +2701,18 @@ impl Component for TerminalApp {
             self.watch_control(context);
         }
         match message {
+            Message::CopyLastCommand => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active()
+                    && let Some(command) = &tab.session.frames.load().last_command
+                    && let Ok(text) = &command.output
+                    && let Err(error) = w11term::clipboard::write(text)
+                {
+                    log::warn!("Copy last command output: {error:#}");
+                }
+            }
             Message::Files(action) => self.file_action(action, context),
             Message::AccessibleSelection(request) => {
                 if let Some(AppTab {
@@ -3248,8 +3274,13 @@ impl Component for TerminalApp {
                     }) = self.tabs.get_mut(id)
                     {
                         tab.error = None;
-                        tab.files
-                            .observe_connection(tab.session.frames.load().connection_generation);
+                        let frame = tab.session.frames.load();
+                        tab.files.observe_connection(frame.connection_generation);
+                        let unavailable = frame.copy_output_unavailable();
+                        if tab.copy_output_unavailable != unavailable {
+                            tab.copy_output_unavailable = unavailable;
+                            self.header.borrow_mut().take();
+                        }
                         let phase = tab.session.durable_state().map(|s| s.phase);
                         if tab.durable_phase != phase {
                             tab.durable_phase = phase;
