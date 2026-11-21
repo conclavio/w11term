@@ -22,7 +22,7 @@ use w11term::{
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
     shortcuts::Action as KeyAction,
-    tabs::{TabId, Tabs},
+    tabs::{PaneSwap, TabId, Tabs},
 };
 use wezterm_term::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 use windows_canvas::{Canvas, Invalidator};
@@ -505,6 +505,10 @@ fn tab_menu_message(label: String) -> Message {
         "Resize right" => Message::Shortcut(Shortcut::ResizePane(Direction::Right)),
         "Resize up" => Message::Shortcut(Shortcut::ResizePane(Direction::Up)),
         "Resize down" => Message::Shortcut(Shortcut::ResizePane(Direction::Down)),
+        "Swap pane left" => Message::Shortcut(Shortcut::SwapPane(Direction::Left)),
+        "Swap pane right" => Message::Shortcut(Shortcut::SwapPane(Direction::Right)),
+        "Swap pane up" => Message::Shortcut(Shortcut::SwapPane(Direction::Up)),
+        "Swap pane down" => Message::Shortcut(Shortcut::SwapPane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Close pane" => Message::ClosePane,
         "Enable read-only pane input" => Message::SetPaneReadOnly(true),
@@ -527,6 +531,7 @@ fn tab_menu_message(label: String) -> Message {
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         "Command palette…" => Message::Shortcut(Shortcut::CommandPalette),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
+        pane_picker::FIND_TEXT_LABEL => Message::Shortcut(Shortcut::FindAllPanes),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
         "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
         _ => Message::ControlIdle,
@@ -563,11 +568,53 @@ struct CaretMenuBinding {
     pane: Option<u64>,
     paste: Option<clipboard_paste::Origin>,
     group: Option<TabId>,
+    swaps: PaneSwaps,
     exited: Option<ExitedPane>,
     on_click: Callback<String>,
 }
 
+/// The neighboring leaves offered while this menu is visible.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct PaneSwaps {
+    left: Option<PaneSwap>,
+    right: Option<PaneSwap>,
+    up: Option<PaneSwap>,
+    down: Option<PaneSwap>,
+}
+
+impl PaneSwaps {
+    fn for_tab<T>(tabs: &Tabs<T>) -> Self {
+        if !matches!(
+            tabs.active_layout(),
+            Some(w11term::pane_layout::Layout::Split { .. })
+        ) {
+            return Self::default();
+        }
+        Self {
+            left: tabs.pane_swap(Direction::Left),
+            right: tabs.pane_swap(Direction::Right),
+            up: tabs.pane_swap(Direction::Up),
+            down: tabs.pane_swap(Direction::Down),
+        }
+    }
+
+    fn get(&self, direction: Direction) -> Option<PaneSwap> {
+        match direction {
+            Direction::Left => self.left,
+            Direction::Right => self.right,
+            Direction::Up => self.up,
+            Direction::Down => self.down,
+        }
+    }
+
+    fn message(&self, direction: Direction) -> Message {
+        self.get(direction)
+            .map_or(Message::ControlIdle, Message::SwapPanes)
+    }
+}
+
 pub struct TerminalApp {
+    caret_interval: Option<u32>,
     folder_wake: Arc<dyn Fn() + Send + Sync>,
     folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
     taskbar: RefCell<taskbar::Taskbar>,
@@ -597,7 +644,7 @@ pub struct TerminalApp {
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
-    caret_menu_binding: RefCell<Option<CaretMenuBinding>>,
+    caret_menu_binding: Rc<RefCell<Option<CaretMenuBinding>>>,
     frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
@@ -646,6 +693,7 @@ pub enum Message {
     ToggleInspector,
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
+    PaneText(pane_picker::TextAction),
     PickerHover(u64),
     PickerFrame(u64, u64),
     PickerChoose(u64),
@@ -656,6 +704,7 @@ pub enum Message {
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
     PaneNeighbor(Direction),
+    SwapPanes(PaneSwap),
     ZoomPane,
     ClosePane,
     MovePaneToTab,
@@ -707,7 +756,7 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     MoveProfile(String, isize, Arc<[String]>),
-    RefreshProfiles,
+    WindowActivation(bool),
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
@@ -904,17 +953,17 @@ impl TerminalApp {
         }
         if prompt_id.is_some() {
             self.title_editor = None;
-            tab.files.cancel_name_edit();
+            tab.files.cancel_entry_dialog();
         }
         self.clipboard.connection_changed(
             tab.session.pane_id,
             frame.connection_generation,
-            prompt_id.is_some() || tab.read_only.get() || tab.files.editing_name(),
+            prompt_id.is_some() || tab.read_only.get() || tab.files.entry_dialog_open(),
         );
         self.keyboard.set_modal(
             prompt_id.is_some()
                 || self.title_editor.is_some()
-                || tab.files.editing_name()
+                || tab.files.entry_dialog_open()
                 || self.clipboard.is_open(),
         );
         let choosing = tab.browsing_sessions();
@@ -1801,7 +1850,7 @@ impl TerminalApp {
         self.bind_folder_shares();
         self.activate_folder_panel(context);
         self.title_editor = None;
-        self.cancel_inactive_name_editor();
+        self.cancel_inactive_entry_dialog();
         self.close_copy_mode();
         self.close_hints();
         self.sync_inspector();
@@ -1873,6 +1922,8 @@ impl TerminalApp {
                 if self.tabs.active_id() == Some(entry.id) {
                     self.metrics = tab.surface.metrics.clone();
                     self.invalidator = tab.surface.invalidator.clone();
+                } else {
+                    tab.surface.pause_cursor();
                 }
                 if self.tabs.visible(entry.id) {
                     tab.surface.invalidator.invalidate();
@@ -2452,6 +2503,7 @@ impl TerminalApp {
         &self,
         context: &ViewContext<Self>,
         exited: Option<ExitedPane>,
+        swaps: PaneSwaps,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let paste = self.paste_origin();
@@ -2461,6 +2513,7 @@ impl TerminalApp {
             && binding.pane == pane
             && binding.paste == paste
             && binding.group == group
+            && binding.swaps == swaps
             && binding.exited == exited
         {
             return binding.on_click.clone();
@@ -2477,12 +2530,16 @@ impl TerminalApp {
             "Paste raw (no bracketed paste)" => {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
             }
-            _ => bind_tab_action(tab_menu_message(label), group),
+            _ => match tab_menu_message(label) {
+                Message::Shortcut(Shortcut::SwapPane(direction)) => swaps.message(direction),
+                message => bind_tab_action(message, group),
+            },
         });
         *cached = Some(CaretMenuBinding {
             pane,
             paste,
             group,
+            swaps,
             exited,
             on_click: on_click.clone(),
         });
@@ -2557,6 +2614,7 @@ impl TerminalApp {
                 context.callback(Message::ProfileMenu),
             ));
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
+        let swaps = self.pane_swaps();
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2564,8 +2622,8 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                self.caret_items(exited.is_some()),
-                self.caret_menu_callback(context, exited),
+                self.caret_items(exited.is_some(), &swaps),
+                self.caret_menu_callback(context, exited, swaps),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2617,7 +2675,7 @@ impl TerminalApp {
         menu
     }
 
-    fn caret_items(&self, can_restart: bool) -> Vec<MenuItem> {
+    fn caret_items(&self, can_restart: bool, swaps: &PaneSwaps) -> Vec<MenuItem> {
         let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
@@ -2645,10 +2703,15 @@ impl TerminalApp {
                 "Command palette…",
                 KeyAction::CommandPalette,
             ),
-            self.pane_menu(can_restart),
+            self.pane_menu(can_restart, swaps),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.duplicate_tab_item(),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
+            self.binding_menu(
+                "find-all-panes",
+                pane_picker::FIND_TEXT_LABEL,
+                KeyAction::FindAllPanes,
+            ),
             MenuItem::item("inbox", "Attention inbox"),
             command_menu_item("paste", "Paste", can_paste),
             command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
@@ -2742,7 +2805,15 @@ impl TerminalApp {
             Err(reason) => MenuItem::disabled(binding.id, format!("{}: {reason}", binding.label)),
         }
     }
-    fn pane_menu(&self, can_restart: bool) -> MenuItem {
+    fn pane_swaps(&self) -> PaneSwaps {
+        if self.incoming.is_some() || self.outgoing.is_some() {
+            PaneSwaps::default()
+        } else {
+            PaneSwaps::for_tab(&self.tabs)
+        }
+    }
+
+    fn pane_menu(&self, can_restart: bool, swaps: &PaneSwaps) -> MenuItem {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
             return MenuItem::disabled("panes", "Panes");
         }
@@ -2827,6 +2898,19 @@ impl TerminalApp {
                         .map(|name| MenuItem::item(name.clone(), format!("{label} {name}"))),
                 ));
             }
+        }
+        for (action, target) in [
+            (KeyAction::SwapPaneLeft, swaps.left),
+            (KeyAction::SwapPaneRight, swaps.right),
+            (KeyAction::SwapPaneUp, swaps.up),
+            (KeyAction::SwapPaneDown, swaps.down),
+        ] {
+            let binding = action.binding();
+            items.push(if target.is_some() {
+                self.binding_menu(binding.id, binding.label, action)
+            } else {
+                MenuItem::disabled(binding.id, binding.label)
+            });
         }
         if self
             .tabs
@@ -3207,6 +3291,8 @@ impl Component for TerminalApp {
         let paste_origin = clipboard.input_origin.clone();
         let active_group = Rc::new(Cell::new(None));
         let shortcut_group = active_group.clone();
+        let caret_menu_binding: Rc<RefCell<Option<CaretMenuBinding>>> = Rc::default();
+        let shortcut_menu = caret_menu_binding.clone();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(match shortcut {
                 Shortcut::Paste | Shortcut::PasteRaw => {
@@ -3215,6 +3301,10 @@ impl Component for TerminalApp {
                         shortcut == Shortcut::PasteRaw,
                     ))
                 }
+                Shortcut::SwapPane(direction) => shortcut_menu
+                    .borrow()
+                    .as_ref()
+                    .map_or(Message::ControlIdle, |menu| menu.swaps.message(direction)),
                 _ => bind_tab_action(Message::Shortcut(shortcut), shortcut_group.get()),
             });
         })
@@ -3379,10 +3469,11 @@ impl Component for TerminalApp {
         keyboard.on_activation(move |focused| {
             if focused {
                 active.activate();
-                sender.send(Message::RefreshProfiles);
             }
+            sender.send(Message::WindowActivation(focused));
         });
         let mut app = Self {
+            caret_interval: crate::cursor_blink::system_interval(),
             folder_wake,
             inbox,
             taskbar: RefCell::default(),
@@ -3408,7 +3499,7 @@ impl Component for TerminalApp {
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
-            caret_menu_binding: RefCell::new(None),
+            caret_menu_binding,
             folder_panel_timer: None,
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
@@ -3503,7 +3594,7 @@ impl Component for TerminalApp {
             &message,
             Message::FrameReady(..)
                 | Message::FolderShare(folder_shares::Action::Panel(..))
-                | Message::RefreshProfiles
+                | Message::WindowActivation(_)
                 | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
@@ -3511,6 +3602,7 @@ impl Component for TerminalApp {
                     pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
                 )
                 | Message::PickerQuery(..)
+                | Message::PaneText(..)
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
@@ -3610,6 +3702,7 @@ impl Component for TerminalApp {
             Message::History(action) => self.handle_history(action, context),
             Message::PaletteChoose(id) => self.choose_command(id, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
+            Message::PaneText(action) => self.pane_text_action(action, context),
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
@@ -4292,13 +4385,46 @@ impl Component for TerminalApp {
                 }
             }
             Message::PaneRatio(epoch, path, ratio) => {
-                if epoch == self.watch_epoch && self.dragging_divider(epoch, &path) {
-                    self.tabs.set_ratio(&path, ratio);
+                if epoch == self.watch_epoch
+                    && self.dragging_divider(epoch, &path)
+                    && self.tabs.set_ratio(&path, ratio)
+                    && self
+                        .caret_menu_binding
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|menu| menu.swaps != self.pane_swaps())
+                {
+                    // A drag can change which leaf has the longest shared edge.
+                    self.header.borrow_mut().take();
                 }
             }
             Message::PaneNeighbor(direction) => {
                 if self.tabs.focus_neighbor(direction) {
                     self.activate(context);
+                }
+            }
+            Message::SwapPanes(target) => {
+                if self.incoming.is_none()
+                    && self.outgoing.is_none()
+                    && self.tabs.swap_panes(target)
+                {
+                    let panes = target.panes();
+                    self.keyboard.panes_swapped(panes);
+                    for id in panes {
+                        if let Some(AppTab {
+                            page: Page::Terminal(live),
+                            ..
+                        }) = self.tabs.get_mut(id)
+                        {
+                            live.end_pointer_gesture();
+                            live.last_click = None;
+                            live.hover.borrow_mut().take();
+                            live.surface.invalidator.invalidate();
+                        }
+                    }
+                    self.divider_drag.borrow_mut().take();
+                    self.sync_ime_surface();
+                    self.publish_panes();
                 }
             }
             Message::ZoomPane => {
@@ -4369,6 +4495,7 @@ impl Component for TerminalApp {
             Message::Shortcut(shortcut) => match shortcut {
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::FindAllPanes => self.open_text_picker(context),
                 Shortcut::MovePaneToExistingTab => self.open_move_picker(context),
                 Shortcut::PickerPlace(side) => {
                     if let Some((source, target)) =
@@ -4387,10 +4514,13 @@ impl Component for TerminalApp {
                     if let Some(picker) = &mut self.picker {
                         picker.move_by(delta);
                         self.sync_picker_preview(context);
+                        self.announce_text_selection();
                     }
                 }
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
                 Shortcut::ResizePane(direction) => self.keyboard_resize(direction),
+                // The native shortcut and palette bind both panes before dispatch.
+                Shortcut::SwapPane(_) => {}
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)
@@ -4413,6 +4543,9 @@ impl Component for TerminalApp {
                 }
                 Shortcut::TaskbarCreated => {
                     self.taskbar.borrow_mut().shell_restarted();
+                }
+                Shortcut::CaretPresentationChanged => {
+                    self.caret_interval = crate::cursor_blink::system_interval();
                 }
                 Shortcut::RememberWindow => {
                     if let Some(name) = &self.window_profile {
@@ -4530,7 +4663,17 @@ impl Component for TerminalApp {
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
-            Message::RefreshProfiles => {
+            Message::WindowActivation(false) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tabs.active()
+                {
+                    tab.surface.pause_cursor();
+                }
+            }
+            Message::WindowActivation(true) => {
+                self.caret_interval = crate::cursor_blink::system_interval();
                 self.refresh_profiles();
                 for entry in self.tabs.entries() {
                     if let Page::Terminal(live) = &entry.value.page
@@ -5114,7 +5257,8 @@ impl Component for TerminalApp {
         }) = self.tabs.active()
             && self.title_editor.is_none()
             && tab.session.frames.load().prompt.is_none()
-            && let Some(dialog) = tab.files.name_dialog(tab.session.pane_id, context)
+            && let Source::Ssh(ssh) = &tab.source
+            && let Some(dialog) = tab.files.entry_dialog(tab.session.pane_id, ssh, context)
         {
             views.push(KeyedView::new("sftp-name-editor", dialog));
         }
@@ -5891,6 +6035,43 @@ mod find_tests {
 #[cfg(test)]
 mod profile_ui_tests {
     use super::*;
+
+    #[test]
+    fn swap_actions_use_the_neighbors_offered_when_invoked() {
+        let mut tabs = Tabs::default();
+        let first = tabs.insert(());
+        let second = tabs.split(first, (), Axis::Columns).unwrap();
+        let third = tabs.split(second, (), Axis::Rows).unwrap();
+        tabs.select(second);
+        let swaps = PaneSwaps::for_tab(&tabs);
+        for (action, direction, available) in [
+            (KeyAction::SwapPaneLeft, Direction::Left, true),
+            (KeyAction::SwapPaneRight, Direction::Right, false),
+            (KeyAction::SwapPaneUp, Direction::Up, false),
+            (KeyAction::SwapPaneDown, Direction::Down, true),
+        ] {
+            assert_eq!(Shortcut::from(action), Shortcut::SwapPane(direction));
+            let label = format!("{}    F8", action.binding().label);
+            let Message::Shortcut(Shortcut::SwapPane(parsed)) = tab_menu_message(label) else {
+                panic!("missing pane swap for {action:?}");
+            };
+            assert_eq!(parsed, direction);
+            assert_eq!(
+                matches!(swaps.message(parsed), Message::SwapPanes(_)),
+                available
+            );
+        }
+        let Message::SwapPanes(pending) = swaps.message(Direction::Left) else {
+            unreachable!()
+        };
+        tabs.select(third);
+        assert!(!tabs.swap_panes(pending));
+        let fresh = tabs.pane_swap(Direction::Left).unwrap();
+        assert_ne!(
+            command_palette::CommandId::SwapPanes(pending),
+            command_palette::CommandId::SwapPanes(fresh)
+        );
+    }
 
     #[test]
     fn duplicate_tab_actions_capture_the_group_at_invocation() {

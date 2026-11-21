@@ -1,5 +1,8 @@
 use super::*;
 use w11term::terminal::{FrameStore, Snapshot};
+mod text_search;
+pub use text_search::Action as TextAction;
+pub(super) const FIND_TEXT_LABEL: &str = "Find in all panes…";
 
 struct Preview {
     pane: u64,
@@ -222,6 +225,7 @@ impl Choice {
 enum Mode {
     Commands,
     Focus,
+    Text,
     Destination { source: TabId },
     Placement { source: TabId, target: TabId },
 }
@@ -233,6 +237,7 @@ pub(super) struct Picker {
     default_side: ElementRef<Button>,
     matches: Vec<Choice>,
     commands: Vec<command_palette::Row>,
+    text: text_search::Results,
     selected: usize,
     preview: Option<Preview>,
 }
@@ -256,11 +261,13 @@ impl Picker {
     }
 
     pub(super) fn move_by(&mut self, amount: isize) {
-        if self.placement().is_some() {
+        if self.placement().is_some() || self.text.revealing {
             return;
         }
         let count = if self.mode == Mode::Commands {
             self.commands.len()
+        } else if self.mode == Mode::Text {
+            self.text.rows.len()
         } else {
             self.matches.len()
         };
@@ -271,6 +278,9 @@ impl Picker {
     }
 
     pub(super) fn view(&self, app: &TerminalApp, ctx: &ViewContext<TerminalApp>) -> View {
+        if self.mode == Mode::Text {
+            return self.text_view(app, ctx);
+        }
         if self.mode == Mode::Commands {
             return command_palette::view(
                 &self.commands,
@@ -578,6 +588,17 @@ impl TerminalApp {
         self.start_picker(Mode::Focus, ctx);
     }
 
+    pub(super) fn open_text_picker(&mut self, ctx: &ComponentContext<Self>) {
+        if matches!(self.tabs.active().map(|t| &t.page), Some(Page::Terminal(live)) if live.device_busy || live.session.prompts.current().is_some())
+        {
+            if self.picker.is_none() {
+                self.keyboard.set_picker(None);
+            }
+            return;
+        }
+        self.start_picker(Mode::Text, ctx);
+    }
+
     pub(super) fn open_move_picker(&mut self, ctx: &ComponentContext<Self>) {
         if let Some(source) = self.move_source() {
             self.start_picker(Mode::Destination { source }, ctx);
@@ -605,6 +626,8 @@ impl TerminalApp {
         }
         let (matches, commands) = if mode == Mode::Commands {
             (vec![], self.command_rows(""))
+        } else if mode == Mode::Text {
+            (vec![], vec![])
         } else {
             (self.picker_choices(mode), vec![])
         };
@@ -620,6 +643,7 @@ impl TerminalApp {
             query: String::new(),
             matches,
             commands,
+            text: text_search::Results::default(),
             selected,
             preview: None,
         });
@@ -655,7 +679,7 @@ impl TerminalApp {
 
     pub(super) fn filter_picker(&mut self, query: String, ctx: &ComponentContext<Self>) {
         let Some(picker) = &self.picker else { return };
-        if picker.placement().is_some() || picker.query == query {
+        if picker.placement().is_some() || picker.query == query || picker.mode == Mode::Text {
             return;
         }
         if picker.mode == Mode::Commands {
@@ -732,6 +756,14 @@ impl TerminalApp {
     }
 
     pub(super) fn accept_picker(&mut self, ctx: &ComponentContext<Self>) {
+        if let Some(picker) = &self.picker
+            && picker.mode == Mode::Text
+        {
+            if let Some(action) = picker.text_choice(picker.selected) {
+                self.pane_text_action(action, ctx);
+            }
+            return;
+        }
         if let Some(picker) = &self.picker
             && picker.mode == Mode::Commands
         {
@@ -819,7 +851,8 @@ impl TerminalApp {
     }
 
     pub(super) fn close_picker(&mut self, ctx: &ComponentContext<Self>) {
-        if self.picker.is_some() {
+        // Once Enter commits a reveal, its acknowledgement owns the next focus change.
+        if self.picker.as_ref().is_some_and(|p| !p.text.revealing) {
             // Searching and moving the highlight never changed the active tab or pane.
             self.activate(ctx);
         }

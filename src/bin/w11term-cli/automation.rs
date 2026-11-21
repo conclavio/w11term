@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::Request;
-pub const HELP: &str = "w11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID [--stop | PATH]\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID [--stop | PATH]\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -12,6 +12,7 @@ pub fn parse(
     let mut rows = None;
     let mut profile = None;
     let mut activate = false;
+    let mut all_panes = false;
     let mut regex = false;
     let mut timeout = None;
     let mut since = None;
@@ -27,6 +28,7 @@ pub fn parse(
         match arg.as_str() {
             "--pid" => pid = Some(value(&mut args)?.parse()?),
             "--pane" => pane = Some(value(&mut args)?.parse()?),
+            "--all-panes" if verb == "find-text" => all_panes = true,
             "--cols" if matches!(verb, "open" | "resize") => {
                 cols = Some(value(&mut args)?.parse()?)
             }
@@ -43,13 +45,13 @@ pub fn parse(
             "--stop" if verb == "record" => stop = true,
             "--overwrite" if verb == "save-text" => overwrite = true,
             "--exit-token" if verb == "restart" => exit_token = Some(value(&mut args)?.parse()?),
-            "--" if verb == "wait-for-text" => {
+            "--" if matches!(verb, "find-text" | "wait-for-text") => {
                 ensure!(text.is_none(), "only one pattern is accepted");
                 text = Some(value(&mut args)?);
                 ensure!(args.next().is_none(), "unexpected argument after pattern");
             }
             _ if !arg.starts_with("--")
-                && matches!(verb, "wait-for-text" | "record" | "save-text") =>
+                && matches!(verb, "find-text" | "wait-for-text" | "record" | "save-text") =>
             {
                 ensure!(text.is_none(), "only one pattern/path is accepted");
                 text = Some(arg);
@@ -77,6 +79,24 @@ pub fn parse(
             since: since.unwrap_or(0),
             timeout_seconds: timeout.unwrap_or(0),
         },
+        "find-text" => {
+            ensure!(
+                all_panes != pane.is_some(),
+                "specify --pane ID or --all-panes"
+            );
+            let pattern = text.context("literal search text is required")?;
+            ensure!(!pattern.is_empty(), "search text is empty");
+            ensure!(
+                pattern.len() <= w11term::search::MAX_QUERY_BYTES,
+                "search text exceeds {} UTF-8 bytes",
+                w11term::search::MAX_QUERY_BYTES
+            );
+            Request::FindText {
+                pattern,
+                pane,
+                all_panes,
+            }
+        }
         "wait-for-text" => Request::WaitForText {
             pane: pane.context("--pane is required")?,
             pattern: text.context("a literal pattern or regular expression is required")?,

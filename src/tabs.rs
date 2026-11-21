@@ -5,6 +5,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type TabId = u64;
 
+/// A directional swap offered for a specific pair of visible panes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaneSwap {
+    group: TabId,
+    source: TabId,
+    neighbor: TabId,
+    direction: Direction,
+}
+
+impl PaneSwap {
+    pub fn panes(self) -> [TabId; 2] {
+        [self.source, self.neighbor]
+    }
+}
+
 // A pane can change windows without changing its tab or layout IDs.
 fn next_id() -> TabId {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -144,6 +159,36 @@ impl<T> Tabs<T> {
         group.focused = next;
         true
     }
+
+    pub fn pane_swap(&self, direction: Direction) -> Option<PaneSwap> {
+        let group = self.groups.get(self.active_index()?)?;
+        if group.zoomed {
+            return None;
+        }
+        Some(PaneSwap {
+            group: group.id,
+            source: group.focused,
+            neighbor: group.layout.neighbor(group.focused, direction)?,
+            direction,
+        })
+    }
+
+    pub fn swap_panes(&mut self, target: PaneSwap) -> bool {
+        if self.pane_swap(target.direction) != Some(target) {
+            return false;
+        }
+        let index = self.active_index().expect("validated tab is active");
+        self.groups[index].layout.replace_leaves(&mut |id| {
+            if id == target.source {
+                target.neighbor
+            } else if id == target.neighbor {
+                target.source
+            } else {
+                id
+            }
+        });
+        true
+    }
     pub fn toggle_zoom(&mut self) -> bool {
         let Some(index) = self.active_index() else {
             return false;
@@ -187,15 +232,6 @@ impl<T> Tabs<T> {
         mut prepare: impl FnMut(&T) -> Result<P, E>,
         mut create: impl FnMut(P) -> T,
     ) -> Result<Option<TabId>, E> {
-        fn replace_leaves(layout: &mut Layout, replace: &mut impl FnMut(TabId) -> TabId) {
-            match layout {
-                Layout::Leaf(id) => *id = replace(*id),
-                Layout::Split { first, second, .. } => {
-                    replace_leaves(first, replace);
-                    replace_leaves(second, replace);
-                }
-            }
-        }
         let Some(index) = self.active_index() else {
             return Ok(None);
         };
@@ -210,7 +246,7 @@ impl<T> Tabs<T> {
         let mut layout = original.layout.clone();
         let mut group = None;
         let mut focused = None;
-        replace_leaves(&mut layout, &mut |source| {
+        layout.replace_leaves(&mut |source| {
             let id = next_id();
             let group = *group.get_or_insert(id);
             if original.focused == source {
@@ -444,6 +480,68 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_exchanges_only_neighboring_rectangles_and_keeps_the_focused_session() {
+        let mut tabs = Tabs::default();
+        let ssh = tabs.insert("SSH");
+        let logs = tabs.split(ssh, "logs", Axis::Columns).unwrap();
+        let shell = tabs.split(logs, "PowerShell", Axis::Rows).unwrap();
+        tabs.set_ratio(&[], 0.62);
+        tabs.set_ratio(&[true], 0.3);
+        tabs.select(ssh);
+        let before = tabs.active_layout().unwrap().clone();
+        let target = tabs.pane_swap(Direction::Right).unwrap();
+        assert_eq!(target.neighbor, shell); // The lower pane has the longer shared edge.
+        assert!(tabs.swap_panes(target));
+        let after = tabs.active_layout().unwrap();
+        assert_eq!(after.bounds(ssh), before.bounds(shell));
+        assert_eq!(after.bounds(shell), before.bounds(ssh));
+        assert_eq!(after.bounds(logs), before.bounds(logs));
+        assert_eq!(after.leaves(), [shell, logs, ssh]);
+        assert_eq!(tabs.active(), Some(&"SSH"));
+        assert_eq!(tabs.active_id(), Some(ssh));
+        assert_eq!(tabs.get(shell), Some(&"PowerShell"));
+        assert!(!tabs.swap_panes(target));
+        let reverse = tabs.pane_swap(Direction::Left).unwrap();
+        assert!(tabs.swap_panes(reverse));
+        assert_eq!(tabs.active_layout(), Some(&before));
+    }
+
+    #[test]
+    fn swap_requires_the_same_visible_source_and_neighbor_at_dispatch() {
+        let mut tabs = Tabs::default();
+        let a = tabs.insert("a");
+        assert!(tabs.pane_swap(Direction::Right).is_none());
+        let b = tabs.split(a, "b", Axis::Columns).unwrap();
+        let target = tabs.pane_swap(Direction::Left).unwrap();
+        let before = tabs.active_layout().unwrap().clone();
+        assert!(tabs.pane_swap(Direction::Right).is_none());
+
+        tabs.select(a);
+        assert!(!tabs.swap_panes(target));
+        tabs.select(b);
+        assert!(tabs.toggle_zoom());
+        assert!(tabs.pane_swap(Direction::Left).is_none());
+        assert!(!tabs.swap_panes(target));
+        assert!(tabs.toggle_zoom());
+        let elsewhere = tabs.insert("another tab");
+        assert!(!tabs.swap_panes(target));
+        assert_eq!(tabs.active_id(), Some(elsewhere));
+        tabs.select(b);
+        assert_eq!(tabs.active_layout(), Some(&before));
+
+        // The same source can acquire a different neighbor while a flyout is open.
+        let replacement = tabs.split(a, "new neighbor", Axis::Columns).unwrap();
+        tabs.select(b);
+        assert_eq!(
+            tabs.pane_swap(Direction::Left).unwrap().neighbor,
+            replacement
+        );
+        let changed = tabs.active_layout().unwrap().clone();
+        assert!(!tabs.swap_panes(target));
+        assert_eq!(tabs.active_layout(), Some(&changed));
+    }
 
     #[test]
     fn duplicate_group_preflights_all_leaves_and_preserves_nested_layout_focus_zoom_and_order() {
