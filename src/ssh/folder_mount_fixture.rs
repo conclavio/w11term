@@ -305,6 +305,41 @@ done"#;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the disposable Linux guest with its stock pre-3.15 FUSE helper"]
+async fn old_fusermount_refuses_before_export() -> Result<()> {
+    let (pane, link) = login(&options()?).await?;
+    let pid = shell_pid(&pane, "BEFORE_OLD_HELPER").await?;
+    let output = checked(&link, "fusermount3 --version").await?;
+    let version = std::str::from_utf8(&output)?
+        .trim()
+        .strip_prefix("fusermount3 version: ")
+        .context("unrecognized guest FUSE helper")?;
+    ensure!(
+        version.starts_with("3.14."),
+        "the legacy test requires a real 3.14.x helper, found {version}"
+    );
+
+    let clean_home = format!("test ! -e {HOME}/windows");
+    checked(&link, &clean_home).await?;
+    let fixture = tempfile::tempdir()?;
+    fs::write(fixture.path().join(NAME), CONTENT)?;
+    let name = format!("legacy-{:016x}", rand::random::<u64>());
+    expect_refused(
+        &link,
+        fixture.path(),
+        &name,
+        &[&format!("Found fusermount3 {version}. Upgrade")],
+    )
+    .await?;
+    wait_detached(&link, &format!("{HOME}/windows/{name}")).await?;
+    checked(&link, &clean_home)
+        .await
+        .context("old helper created a mount or lock directory")?;
+    ensure!(shell_pid(&pane, "AFTER_OLD_HELPER").await? == pid);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the disposable Linux FUSE guest and pinned loopback SSH supplied by the mount runner"]
 async fn native_windows_passive_sshfs() -> Result<()> {
     let options = options()?;
