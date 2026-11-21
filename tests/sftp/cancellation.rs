@@ -56,6 +56,7 @@ async fn wait_for_packet(log: &Path, packet: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_before_admission_never_opens_a_channel_or_changes_either_file() {
     let (pane, _, remote, opens, server) = fixture(false).await;
+    let shell_channels = opens.load(Ordering::Relaxed);
     let local = tempfile::tempdir().unwrap();
     let path = local.path().join("saved");
     fs::write(&path, b"keep local").unwrap();
@@ -70,7 +71,7 @@ async fn cancelled_before_admission_never_opens_a_channel_or_changes_either_file
         assert_eq!(reply["bytes_transferred"], 0);
         assert_eq!(reply["remote_may_be_partial"], false);
     }
-    assert_eq!(opens.load(Ordering::Relaxed), 0);
+    assert_eq!(opens.load(Ordering::Relaxed), shell_channels);
     assert_eq!(fs::read(path).unwrap(), b"keep local");
     assert_eq!(fs::read(destination).unwrap(), b"keep remote");
     assert_eq!(fs::read_dir(local.path()).unwrap().count(), 1);
@@ -98,6 +99,7 @@ async fn cancelling_inflight_packets_closes_the_handle_and_preserves_unrelated_j
     .unwrap()["handle"]
         .as_u64()
         .unwrap();
+    let shared_channels = opens.load(Ordering::Relaxed);
     let log = remote.path().join("transfer-trace");
     fs::write(&log, []).unwrap();
     let gate = remote.path().join("hold-transfer-read");
@@ -169,7 +171,7 @@ async fn cancelling_inflight_packets_closes_the_handle_and_preserves_unrelated_j
     guarded_job(&pane, None, Operation::Close { handle: cli_handle })
         .await
         .unwrap();
-    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(opens.load(Ordering::Relaxed), shared_channels);
     server.abort();
 }
 

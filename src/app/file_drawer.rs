@@ -193,7 +193,7 @@ enum Step {
 }
 
 enum TransferFile {
-    Upload(String),
+    Upload { name: String, remote: String },
     Download(String),
 }
 
@@ -201,8 +201,8 @@ impl TransferFile {
     fn outcome(&self, reply: &Value) -> String {
         let bytes = &reply["bytes_transferred"];
         match (self, reply["cancelled"].as_bool() == Some(true)) {
-            (Self::Upload(name), true) => {
-                let path = reply["remote"].as_str().unwrap_or(name);
+            (Self::Upload { remote, .. }, true) => {
+                let path = reply["remote"].as_str().unwrap_or(remote);
                 if reply["remote_may_be_partial"] == true {
                     format!(
                         "Cancelled upload of {path} ({bytes} bytes acknowledged). The remote file may be incomplete."
@@ -218,19 +218,37 @@ impl TransferFile {
                     "Cancelled download of {name} ({bytes} bytes written to the temporary file)."
                 )
             }
-            (Self::Upload(name), false) => format!("Uploaded {name} ({bytes} bytes)"),
+            (Self::Upload { name, .. }, false) => format!("Uploaded {name} ({bytes} bytes)"),
             (Self::Download(name), false) => format!("Downloaded {name} ({bytes} bytes)"),
         }
     }
 
-    fn reconnect_status(&self, reply: &mut oneshot::Receiver<Result<Value, String>>) -> String {
+    fn interrupted(&self, bytes: u64) -> String {
+        match self {
+            Self::Upload { remote, .. } => format!(
+                "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote file may be incomplete."
+            ),
+            Self::Download(remote) => format!(
+                "Download of {remote} was interrupted with at least {bytes} bytes written to the temporary file. The outcome is unknown. Check the local destination."
+            ),
+        }
+    }
+
+    fn reconnect_status(
+        &self,
+        reply: &mut oneshot::Receiver<Result<Value, String>>,
+        bytes: u64,
+    ) -> String {
         match reply.try_recv() {
-            Ok(Ok(result)) => format!("{} SSH reconnected. Refresh to browse.", self.outcome(&result)),
+            Ok(Ok(result)) => format!(
+                "{} SSH reconnected. Refresh to browse.",
+                self.outcome(&result)
+            ),
             Ok(Err(error)) => error,
-            Err(_) => match self {
-                Self::Upload(_) => "SSH reconnected during upload. The remote file may be incomplete. Refresh to browse.".into(),
-                Self::Download(_) => "SSH reconnected during download. The outcome is unknown. Check the local destination.".into(),
-            },
+            Err(_) => format!(
+                "SSH reconnected. {} Refresh to browse.",
+                self.interrupted(bytes)
+            ),
         }
     }
 }
@@ -754,8 +772,9 @@ impl FileDrawer {
             Some(Pending {
                 step: Step::Transfer(file),
                 reply,
+                transfer: Some(transfer),
                 ..
-            }) => file.reconnect_status(reply),
+            }) => file.reconnect_status(reply, transfer.progress.borrow().bytes),
             _ => match &self.reveal {
                 Some(RevealTarget::Changed(change)) => format!(
                     "{} before SSH reconnected. Refresh to browse.",
@@ -1185,10 +1204,10 @@ impl FileDrawer {
             session,
             Operation::Put {
                 local,
-                remote,
+                remote: remote.clone(),
                 overwrite: self.replace,
             },
-            Step::Transfer(TransferFile::Upload(name)),
+            Step::Transfer(TransferFile::Upload { name, remote }),
             context,
         )
     }
@@ -1219,6 +1238,13 @@ impl FileDrawer {
                         "SSH connection closed before {} started.",
                         change.description()
                     ))
+                } else if let (Step::Transfer(file), Some(transfer)) =
+                    (&pending.step, &pending.transfer)
+                {
+                    let error = file.interrupted(transfer.progress.borrow().bytes);
+                    self.pending.take();
+                    self.cached.borrow_mut().take();
+                    bail!("{error}");
                 } else {
                     Err("SSH connection closed".into())
                 }
@@ -1236,7 +1262,7 @@ impl FileDrawer {
                 if let Step::Change { change, .. } = &step {
                     bail!("{}", change.error(&error));
                 }
-                if let Step::Transfer(TransferFile::Upload(name)) = &step {
+                if let Step::Transfer(TransferFile::Upload { name, .. }) = &step {
                     if !self.replace && self.entries.iter().any(|entry| &entry.name == name) {
                         bail!("Upload of {name} failed (replacing files is off): {error}");
                     }
@@ -2737,7 +2763,10 @@ mod tests {
 
     #[test]
     fn transfer_status_respects_completion_cancellation_and_uncertain_remote_results() {
-        let upload = TransferFile::Upload("large.bin".into());
+        let upload = TransferFile::Upload {
+            name: "large.bin".into(),
+            remote: "/srv/uploads/large.bin".into(),
+        };
         let download = TransferFile::Download("/large.bin".into());
         let complete = json!({"bytes_transferred": 128});
         let cancelled = json!({"cancelled": true, "remote": "/srv/uploads/large.bin", "bytes_transferred": 64, "remote_may_be_partial": true});
@@ -2762,15 +2791,14 @@ mod tests {
         assert!(message.contains("64 bytes written to the temporary file"));
 
         let (worker, mut reply) = oneshot::channel();
-        assert!(
-            upload
-                .reconnect_status(&mut reply)
-                .contains("remote file may be incomplete")
-        );
+        let interrupted = upload.reconnect_status(&mut reply, 32);
+        assert!(interrupted.contains("/srv/uploads/large.bin"));
+        assert!(interrupted.contains("at least 32 bytes acknowledged"));
+        assert!(interrupted.contains("remote file may be incomplete"));
         worker.send(Ok(cancelled)).unwrap();
         assert!(
             upload
-                .reconnect_status(&mut reply)
+                .reconnect_status(&mut reply, 32)
                 .starts_with("Cancelled upload of /srv/uploads/large.bin (64 bytes acknowledged)")
         );
         let (worker, mut reply) = oneshot::channel();
@@ -2778,14 +2806,14 @@ mod tests {
             .send(Err("WRITE timed out; outcome is unknown".into()))
             .unwrap();
         assert_eq!(
-            upload.reconnect_status(&mut reply),
+            upload.reconnect_status(&mut reply, 32),
             "WRITE timed out; outcome is unknown"
         );
         let (worker, mut reply) = oneshot::channel();
         worker.send(Ok(complete)).unwrap();
         assert!(
             download
-                .reconnect_status(&mut reply)
+                .reconnect_status(&mut reply, 64)
                 .starts_with("Downloaded /large.bin (128 bytes)")
         );
     }
