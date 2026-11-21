@@ -1,27 +1,6 @@
+use super::guarded_job as run;
 use super::*;
-use w11term::sftp::{Job, Operation};
-
-async fn run(
-    pane: &Session,
-    generation: Option<u64>,
-    operation: Operation,
-) -> Result<Value, String> {
-    let (reply, response) = tokio::sync::oneshot::channel();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    pane.input
-        .send(Command::Sftp(Job {
-            expected_generation: generation,
-            operation,
-            deadline,
-            reply,
-            progress: None,
-        }))
-        .unwrap();
-    tokio::time::timeout_at(deadline + Duration::from_secs(1), response)
-        .await
-        .unwrap()
-        .unwrap()
-}
+use w11term::sftp::Operation;
 
 fn rename(from: &str, to: &str) -> Operation {
     Operation::RenameEntry {
@@ -31,11 +10,7 @@ fn rename(from: &str, to: &str) -> Operation {
 }
 
 fn trace(root: &std::path::Path) -> Vec<[String; 2]> {
-    fs::read_to_string(root.join("rename-trace.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+    mutation_trace(root, "rename-trace.jsonl")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -110,18 +85,7 @@ async fn drawer_rename_names_the_link_itself_and_refuses_a_dangling_destination(
     let approved = Some(pane.frames.load().connection_generation);
     fs::write(root.join("rename-trace.jsonl"), []).unwrap();
     fs::create_dir(root.join("target")).unwrap();
-    // A directory junction is an actual name-surrogate reparse point and
-    // requires neither Developer Mode nor the symbolic-link privilege.
-    let made = std::process::Command::new("cmd.exe")
-        .args(["/d", "/c", "mklink", "/j", "link", "target"])
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(
-        made.status.success(),
-        "{}",
-        String::from_utf8_lossy(&made.stderr)
-    );
+    directory_junction(root, "link", "target");
     run(&pane, approved, rename("/link", "/new-link"))
         .await
         .unwrap();
