@@ -577,7 +577,7 @@ impl Driver {
     /// connection available for a subsequent attach from the same chooser.
     pub(super) async fn discover_sessions(
         &mut self,
-    ) -> Result<Vec<crate::durable::DiscoveredSession>> {
+    ) -> Result<(Vec<crate::durable::DiscoveredSession>, String)> {
         let options = self.options.clone();
         let offered = self
             .sharing
@@ -589,7 +589,7 @@ impl Driver {
                 Some(link) => link,
                 None => connect(&options, self.prompts.as_ref(), &mut self.passwords, None).await?,
             };
-            let entries = super::durability::discover(&link, &options).await?;
+            let entries = super::durability::discover(&link, &options).await;
             Ok::<_, anyhow::Error>((link, entries))
         };
         tokio::pin!(scan);

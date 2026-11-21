@@ -1,5 +1,5 @@
 use super::*;
-use w11term::durable::DurableReference;
+use w11term::durable::{Backend, DurableReference};
 use w11term::ssh::{DurableAction, DurablePhase};
 
 pub enum Action {
@@ -90,20 +90,35 @@ pub(super) fn discovery_view(
     }
     for entry in state.candidates.iter().skip(page * PER_PAGE).take(PER_PAGE) {
         let reference = entry.reference.clone();
-        let name = &reference.name;
         let count = entry.clients;
         let clients = if count == 1 {
             "1 client".into()
         } else {
             format!("{count} clients")
         };
-        let label = [name.as_str(), &entry.command, &entry.directory, &clients]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
+        let backend = match reference.backend {
+            Backend::Zmx => "zmx",
+            Backend::Tmux => "tmux",
+        };
+        let windows = match entry.windows {
+            Some(1) => "1 window".into(),
+            Some(n) => format!("{n} windows"),
+            None => String::new(),
+        };
+        let label = [
+            entry.display_name.as_str(),
+            backend,
+            &entry.command,
+            &entry.directory,
+            &windows,
+            &clients,
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
         rows.push(KeyedView::new(
-            name.clone(),
+            format!("{backend}-{}", reference.name),
             Button::new()
                 .automation_name(format!("Attach to {label}"))
                 .on_click(context.callback(move |_| {
