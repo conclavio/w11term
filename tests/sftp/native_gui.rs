@@ -10,6 +10,12 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
+async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
+    run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "locks and unlocks input in a live SSH and PowerShell split through the native UI"]
 async fn native_read_only_input_is_per_pane_in_a_mixed_split() {
     run_palette_fixture("read-only-pane-ui.ps1", b"resumed", None).await;

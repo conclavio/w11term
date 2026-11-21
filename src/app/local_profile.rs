@@ -107,8 +107,7 @@ impl TerminalApp {
                     Ok(catalog) => {
                         let original = draft.original.as_ref().map(|base| base.name.clone());
                         let name = draft.name.trim().to_owned();
-                        self.local_profiles = catalog.local;
-                        self.profiles = catalog.profiles;
+                        self.catalog = catalog;
                         if let Some(old) = original {
                             if self.default_profile.as_ref() == Some(&old)
                                 && matches!(self.default_source, Source::Local(_))
@@ -116,7 +115,7 @@ impl TerminalApp {
                                 self.default_profile = Some(name.clone());
                                 self.default_label = name.clone();
                                 self.default_source =
-                                    Source::Local(self.local_profiles[&name].clone());
+                                    Source::Local(self.catalog.local[&name].clone());
                             }
                             let live: Vec<_> = self
                                 .tabs

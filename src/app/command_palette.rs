@@ -90,11 +90,21 @@ fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
     });
     rows.sort_by_cached_key(|row| {
         let label = row.label.to_lowercase();
+        // Stable sorting keeps profiles within each action in the Settings order.
+        let group = [
+            "new tab with ",
+            "split right with ",
+            "split below with ",
+            "find sessions on ",
+            "browse herdr terminals on ",
+        ]
+        .into_iter()
+        .find(|prefix| label.starts_with(prefix));
         (
             !row.enabled,
             label != query,
             !label.starts_with(&query),
-            label,
+            group.map_or(label, str::to_owned),
         )
     });
     rows
@@ -322,6 +332,40 @@ pub(super) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_results_preserve_menu_order_within_each_action() {
+        let mut rows = Vec::new();
+        menu_rows(
+            vec![
+                MenuItem::item("local:z", "Zulu · Local"),
+                MenuItem::item("profile:a", "Alpha    user@host:22"),
+            ],
+            true,
+            &mut rows,
+        );
+        menu_rows(
+            vec![
+                MenuItem::item("z", "Split right with Zulu"),
+                MenuItem::item("a", "Split right with Alpha"),
+            ],
+            false,
+            &mut rows,
+        );
+        let labels = filter(rows, "with")
+            .into_iter()
+            .map(|r| r.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "New tab with Zulu · Local",
+                "New tab with Alpha    user@host:22",
+                "Split right with Zulu",
+                "Split right with Alpha",
+            ]
+        );
+    }
 
     #[test]
     fn nested_profile_names_survive_filtering_and_dispatch() {

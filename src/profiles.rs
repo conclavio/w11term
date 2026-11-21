@@ -1,5 +1,5 @@
 //! Profile persistence preserves unrelated JSON fields and replaces the file atomically.
-use crate::options::{SshOptions, load_profiles};
+use crate::options::{Profiles, SshOptions, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
@@ -19,6 +19,29 @@ pub struct LocalProfileSnapshot {
     pub name: String,
     pub options: crate::options::LocalOptions,
     raw: Option<serde_json::Value>,
+}
+
+/// Maintain an explicit ordering when a profile changes identity. With no
+/// explicit order, ordinary edits continue using the alphabetical defaults.
+fn order_after_edit(
+    catalog: &Profiles,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Option<Vec<String>> {
+    if !catalog.has_explicit_order || old == new {
+        return None;
+    }
+    let mut order = catalog.profile_order.clone();
+    if let Some(index) = old.and_then(|name| order.iter().position(|entry| entry == name)) {
+        if let Some(new) = new {
+            order[index] = new.into();
+        } else {
+            order.remove(index);
+        }
+    } else if let Some(new) = new {
+        order.push(new.into());
+    }
+    Some(order)
 }
 
 impl ProfileStore {
@@ -41,6 +64,37 @@ impl ProfileStore {
 
     pub fn catalog(&self) -> Result<crate::options::Profiles> {
         load_profiles(&self.path)
+    }
+
+    /// Move one position relative to the catalog shown to the user. Validate
+    /// membership and order while holding the same lock used by profile edits.
+    pub fn move_profile(
+        &self,
+        name: &str,
+        delta: isize,
+        expected_order: &[String],
+    ) -> Result<Profiles> {
+        ensure!(
+            matches!(delta, -1 | 1),
+            "Move a profile up or down by one position"
+        );
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.profile_order == expected_order,
+                "Profile order changed on disk; refresh before moving"
+            );
+            let mut order = catalog.profile_order.clone();
+            let index = order
+                .iter()
+                .position(|entry| entry == name)
+                .with_context(|| format!("Profile {name} is no longer available"))?;
+            let next = index
+                .checked_add_signed(delta)
+                .filter(|&next| next < order.len())
+                .context("This profile is already at the end in that direction")?;
+            order.swap(index, next);
+            Ok(Some(order))
+        })
     }
 
     pub fn inspect_local(&self, name: &str) -> Result<LocalProfileSnapshot> {
@@ -72,17 +126,17 @@ impl ProfileStore {
             "Enter a local profile name"
         );
         shell.validate()?;
-        self.modify(|profiles, _| {
+        self.modify(|profiles, catalog| {
             if let Some(base) = original {
                 ensure!(
-                    profiles.get(&base.name) == base.raw.as_ref(),
+                    profiles.get(&base.name) == base.raw.as_ref()
+                        && catalog.local.get(&base.name) == Some(&base.options),
                     "Local profile changed on disk; reopen the editor before saving"
                 );
             }
             ensure!(
                 original.is_some_and(|base| base.name == name)
-                    || (!profiles.contains_key(name)
-                        && !crate::options::LocalOptions::installed().contains_key(name)),
+                    || (!profiles.contains_key(name) && !catalog.local.contains_key(name)),
                 "Profile {name} already exists"
             );
             let mut entry = original
@@ -109,8 +163,13 @@ impl ProfileStore {
                 profiles.remove(&base.name);
             }
             profiles.insert(name.into(), entry);
-            Ok(())
+            Ok(order_after_edit(
+                catalog,
+                original.map(|base| base.name.as_str()),
+                Some(name),
+            ))
         })
+        .map(|_| ())
     }
 
     /// Both the editor and the conflict check use the same read of profiles.json.
@@ -166,14 +225,15 @@ impl ProfileStore {
     }
 
     pub fn delete(&self, base: &ProfileSnapshot) -> Result<()> {
-        self.modify(|profiles, _| {
+        self.modify(|profiles, catalog| {
             ensure!(
                 profiles.get(&base.name) == Some(&base.raw),
                 "Profile changed on disk; reopen the editor before deleting"
             );
             profiles.remove(&base.name);
-            Ok(())
+            Ok(order_after_edit(catalog, Some(&base.name), None))
         })
+        .map(|_| ())
     }
     fn write(
         &self,
@@ -198,19 +258,15 @@ impl ProfileStore {
         );
         ensure!(options.port != 0, "Port must be between 1 and 65535");
         options.validate_route()?;
-        self.modify(|profiles, before| {
+        self.modify(|profiles, catalog| {
             if let Some(copy) = copy {
                 ensure!(
                     profiles.get(&copy.name) == Some(&copy.raw),
                     "Source profile changed on disk; reopen the editor before duplicating"
                 );
             } else if let (Some(expected), Some(original)) = (expected, original) {
-                let current = crate::options::parse_profiles(
-                    before.context("Profile file was removed; close and reopen the editor")?,
-                    &self.path,
-                )?;
                 ensure!(
-                    current.profiles.get(original) == Some(expected),
+                    catalog.profiles.get(original) == Some(expected),
                     "Profile changed on disk; close and reopen the editor before saving"
                 );
             }
@@ -225,8 +281,7 @@ impl ProfileStore {
             }
             ensure!(
                 original == Some(name)
-                    || (!profiles.contains_key(name)
-                        && !crate::options::LocalOptions::installed().contains_key(name)),
+                    || (!profiles.contains_key(name) && !catalog.local.contains_key(name)),
                 "Profile {name} already exists"
             );
             let mut value = original
@@ -275,17 +330,18 @@ impl ProfileStore {
                 profiles.remove(original);
             }
             profiles.insert(name.into(), value);
-            Ok(())
+            Ok(order_after_edit(catalog, original, Some(name)))
         })
+        .map(|_| ())
     }
 
     fn modify(
         &self,
         change: impl FnOnce(
             &mut serde_json::Map<String, serde_json::Value>,
-            Option<&[u8]>,
-        ) -> Result<()>,
-    ) -> Result<()> {
+            &Profiles,
+        ) -> Result<Option<Vec<String>>>,
+    ) -> Result<Profiles> {
         let parent = self
             .path
             .parent()
@@ -306,17 +362,19 @@ impl ProfileStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.into()),
         };
-        let mut document: serde_json::Value = match &before {
-            Some(bytes) => serde_json::from_slice(bytes).context("Reading existing profiles")?,
-            None => serde_json::json!({"profiles": {}}),
-        };
+        let bytes = before.as_deref().unwrap_or(br#"{"profiles":{}}"#);
+        let catalog = crate::options::parse_profiles(bytes, &self.path)?;
+        let mut document: serde_json::Value =
+            serde_json::from_slice(bytes).context("Reading existing profiles")?;
         let profiles = document
             .get_mut("profiles")
             .and_then(|v| v.as_object_mut())
             .context("Configuration must contain a profiles object")?;
-        change(profiles, before.as_deref())?;
-        // Validate the serialized profile, including its selected authentication mode.
-        let _ = crate::options::parse_profiles(&serde_json::to_vec(&document)?, &self.path)?;
+        if let Some(order) = change(profiles, &catalog)? {
+            document["profile_order"] = serde_json::to_value(order)?;
+        }
+        // Return the catalog from the exact document being committed.
+        let result = crate::options::parse_profiles(&serde_json::to_vec(&document)?, &self.path)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         serde_json::to_writer_pretty(&mut file, &document)?;
         file.write_all(b"\n")?;
@@ -331,7 +389,7 @@ impl ProfileStore {
             "Profiles changed while saving; try again"
         );
         file.persist(&self.path).context("Saving profiles")?;
-        Ok(())
+        Ok(result)
     }
 }
 
@@ -372,6 +430,155 @@ mod tests {
         );
         assert!(store.add("new", &options).is_err());
         assert_eq!(std::fs::read(path).unwrap(), saved);
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn fixture() -> (tempfile::TempDir, ProfileStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(dir.path().join("profiles.json")).unwrap();
+        std::fs::write(
+            store.path(),
+            serde_json::to_vec(&json!({
+                "theme":{"tone":"dark"},
+                "profiles":{
+                    "Alpha":{"host":"a.test","user":"one","auth":"none","extra":7},
+                    "Zulu":{"host":"z.test","user":"two","auth":"none"},
+                    "Lima":{"backend":"local","executable":"cmd.exe","extra":"local"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (dir, store)
+    }
+
+    fn disk(store: &ProfileStore) -> Value {
+        serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn move_is_one_step_and_stale_views_cannot_overwrite_the_next_edit() {
+        let (_dir, store) = fixture();
+        let original = store.catalog().unwrap();
+        let mut doc = disk(&store);
+        // An unrelated external edit made after rendering must survive the reorder.
+        doc["theme"]["accent"] = json!("green");
+        std::fs::write(store.path(), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let moved = store
+            .move_profile("Zulu", -1, &original.profile_order)
+            .unwrap();
+        let mut expected = original.profile_order.clone();
+        expected.swap(0, 1);
+        assert_eq!(moved.profile_order, expected);
+        assert_eq!(moved, store.catalog().unwrap());
+        doc["profile_order"] = json!(expected);
+        assert_eq!(disk(&store), doc);
+        for (name, delta, order) in [
+            ("Zulu", 1, &original.profile_order),
+            ("Zulu", -1, &expected),
+            (expected.last().unwrap(), 1, &expected),
+            ("absent", 1, &expected),
+            ("Alpha", 2, &expected),
+        ] {
+            assert!(store.move_profile(name, delta, order).is_err());
+        }
+        assert_eq!(disk(&store), doc);
+        // A new unseen profile also invalidates the old view.
+        store.add("External", &moved.profiles["Alpha"]).unwrap();
+        assert!(store.move_profile("Alpha", -1, &expected).is_err());
+        assert_eq!(
+            store.catalog().unwrap().profile_order.last().unwrap(),
+            "External"
+        );
+    }
+
+    #[test]
+    fn concurrent_moves_from_the_same_view_have_one_winner_and_rename_keeps_its_slot() {
+        let (_dir, store) = fixture();
+        let (_, base) = store.inspect("Alpha").unwrap();
+        let order = store.catalog().unwrap().profile_order;
+        let barrier = std::sync::Barrier::new(2);
+        let move_one = |name, delta| {
+            let other = ProfileStore::new(store.path().to_owned()).unwrap();
+            barrier.wait();
+            other.move_profile(name, delta, &order)
+        };
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| move_one("Alpha", 1));
+            let second = move_one("Lima", -1);
+            [first.join().unwrap(), second]
+        });
+        let mut winners = results.into_iter().filter_map(Result::ok);
+        let last = winners.next().expect("one writer must succeed");
+        assert!(winners.next().is_none());
+        assert_eq!(store.catalog().unwrap(), last);
+        store
+            .edit("Alpha", "Renamed", &base.options, &base.options)
+            .unwrap();
+        let mut expected = last.profile_order;
+        let at = expected.iter().position(|s| s == "Alpha").unwrap();
+        expected[at] = "Renamed".into();
+        assert_eq!(store.catalog().unwrap().profile_order, expected);
+    }
+
+    #[test]
+    fn explicit_order_follows_ssh_and_local_edits_without_materializing_builtin_shells() {
+        let (_dir, store) = fixture();
+        let mut doc = disk(&store);
+        doc["profile_order"] = json!(["Lima", "faded", "Zulu", "Lima"]);
+        std::fs::write(store.path(), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let order = store.catalog().unwrap().profile_order;
+        let (_, base) = store.inspect("Zulu").unwrap();
+        store
+            .edit("Zulu", "Remote", &base.options, &base.options)
+            .unwrap();
+        let local = store.inspect_local("Lima").unwrap();
+        store
+            .save_local(Some(&local), "Build", &local.options)
+            .unwrap();
+        let (_, fresh) = store.inspect("Remote").unwrap();
+        store.duplicate(&fresh, "Copy", &fresh.options).unwrap();
+        store.save_local(None, "New shell", &local.options).unwrap();
+        let mut expected = order;
+        expected[0] = "Build".into();
+        expected[1] = "Remote".into();
+        expected.extend(["Copy".into(), "New shell".into()]);
+        assert_eq!(store.catalog().unwrap().profile_order, expected);
+        let (_, duplicate) = store.inspect("Copy").unwrap();
+        store.delete(&duplicate).unwrap();
+        expected.retain(|n| n != "Copy");
+        let saved = disk(&store);
+        assert_eq!(saved["profile_order"], json!(expected));
+        assert_eq!(saved["profiles"]["Build"]["extra"], "local");
+        assert_eq!(saved["profiles"]["Alpha"]["extra"], 7);
+        assert_eq!(saved["profiles"].as_object().unwrap().len(), 4);
+        assert!(saved["profiles"].get("Zulu").is_none());
+        assert!(saved["profiles"].get("Lima").is_none());
+        // An installed local shell is still launchable solely through discovery.
+        if let Some((builtin, _)) = crate::options::LocalOptions::installed().into_iter().next() {
+            let moved = store.move_profile(&builtin, -1, &expected).unwrap();
+            assert!(moved.local.contains_key(&builtin));
+            assert!(disk(&store)["profiles"].get(&builtin).is_none());
+        }
+    }
+
+    #[test]
+    fn ordinary_profile_edits_keep_an_absent_order_implicit() {
+        let (_dir, store) = fixture();
+        let (_, base) = store.inspect("Zulu").unwrap();
+        store
+            .edit("Zulu", "Bravo", &base.options, &base.options)
+            .unwrap();
+        store.duplicate(&base, "unused", &base.options).unwrap_err();
+        store.add("Aardvark", &base.options).unwrap();
+        let catalog = store.catalog().unwrap();
+        assert_eq!(&catalog.profile_order[..3], &["Aardvark", "Alpha", "Bravo"]);
+        assert!(disk(&store).get("profile_order").is_none());
     }
 }
 

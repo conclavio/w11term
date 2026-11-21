@@ -260,7 +260,7 @@ impl TerminalApp {
                         .remove(&name)
                         .with_context(|| format!("Workspace {name} was removed"))?;
                     let osc52 = self.appearance.read().unwrap().interaction.osc52;
-                    append_workspace(&mut self.tabs, &workspace, &self.profiles, osc52)
+                    append_workspace(&mut self.tabs, &workspace, &self.catalog.profiles, osc52)
                 });
                 match result {
                     Ok(()) => {
