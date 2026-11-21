@@ -427,6 +427,13 @@ async fn fixture_server(reject: bool) -> FixtureServer {
     fixture_connections(reject, 1).await
 }
 async fn fixture_connections(reject: bool, connections: usize) -> FixtureServer {
+    fixture_counting_accepts(reject, connections, Arc::default()).await
+}
+async fn fixture_counting_accepts(
+    reject: bool,
+    connections: usize,
+    accepted: Arc<AtomicUsize>,
+) -> FixtureServer {
     use russh::keys::{Algorithm, HashAlg, PrivateKey};
     let root = tempfile::tempdir().unwrap();
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -447,6 +454,7 @@ async fn fixture_connections(reject: bool, connections: usize) -> FixtureServer 
         let mut peers = tokio::task::JoinSet::new();
         for _ in 0..connections {
             let (stream, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::Relaxed);
             let peer = Peer {
                 channels: HashMap::new(),
                 root: root_path.clone(),

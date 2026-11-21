@@ -23,6 +23,7 @@ pub enum Action {
     ZoomPane,
     ClosePane,
     MovePane,
+    MovePaneToExistingTab,
     PanePicker,
     KeyboardHints,
     CopyMode,
@@ -78,6 +79,13 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(ZoomPane, "zoom_pane", "Zoom pane", 0x5a, PANE),
     Binding::new(ClosePane, "close_pane", "Close pane", 0x57, PANE),
     Binding::new(MovePane, "move_pane", "Move pane to new tab", 0, Mods::NONE),
+    Binding::new(
+        MovePaneToExistingTab,
+        "move_pane_to_existing_tab",
+        "Move pane to existing tab…",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
     Binding::new(
         KeyboardHints,
@@ -138,6 +146,7 @@ impl Action {
                 | ZoomPane
                 | ClosePane
                 | MovePane
+                | MovePaneToExistingTab
                 | KeyboardHints
                 | CopyMode
         )
@@ -400,6 +409,25 @@ mod tests {
             Some(FocusRight)
         );
     }
+    #[test]
+    fn move_to_existing_tab_binds_only_in_a_terminal() {
+        let mut shortcuts = Shortcuts::default();
+        assert_eq!(shortcuts.get(MovePaneToExistingTab.binding()), None);
+        let chord: Chord = "Ctrl+Shift+M".parse().unwrap();
+        shortcuts.set(MovePaneToExistingTab, Some(chord)).unwrap();
+        let json = serde_json::to_string(&shortcuts).unwrap();
+        assert_eq!(json, r#"{"move_pane_to_existing_tab":"Ctrl+Shift+M"}"#);
+        let keymap = serde_json::from_str::<Shortcuts>(&json)
+            .unwrap()
+            .keymap()
+            .unwrap();
+        assert_eq!(
+            keymap.resolve(chord.key, chord.mods, true, false),
+            Some(MovePaneToExistingTab)
+        );
+        assert_eq!(keymap.resolve(chord.key, chord.mods, false, false), None);
+    }
+
     #[test]
     fn an_existing_override_wins_over_a_new_default() {
         let existing: Shortcuts =

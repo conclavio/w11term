@@ -180,7 +180,7 @@ fn eligible() -> bool {
                     && !s.search
                     && !s.modal
                     && !s.switcher
-                    && !s.picker
+                    && s.picker.is_none()
                     && s.local_mode.is_none()
             })
         })

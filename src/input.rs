@@ -30,6 +30,12 @@ enum LocalMode {
     Copy,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerStage {
+    Search,
+    Placement,
+}
+
 struct State {
     target: Option<Target>,
     shortcut: Box<dyn Fn(Shortcut)>,
@@ -45,7 +51,7 @@ struct State {
     grid: Option<Grid>,
     window: Option<HWND>,
     search: bool,
-    picker: bool,
+    picker: Option<PickerStage>,
     local_mode: Option<LocalMode>,
     // A true entry may repeat a movement first pressed in this copy-mode session.
     local_held: HashMap<u32, bool>,
@@ -138,11 +144,13 @@ pub enum Shortcut {
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
+    PickerPlace(Direction),
     KeyboardHints,
     HintKey(u32),
     CopyMode,
     CopyKey(w11term::copy_mode::CopyKey),
     MovePane,
+    MovePaneToExistingTab,
     Workspaces,
 }
 
@@ -184,36 +192,7 @@ impl KeyboardBridge {
                 return Err(error);
             }
         };
-        INPUT.with(|input| {
-            *input.borrow_mut() = Some(State {
-                target: None,
-                shortcut: Box::new(shortcut),
-                swallowed: HashSet::new(),
-                pressed: HashMap::new(),
-                details: HashMap::new(),
-                surrogate: None,
-                preferences: Interaction::default(),
-                keymap: Shortcuts::default()
-                    .keymap()
-                    .expect("unique default bindings"),
-                switcher_trigger: SwitchTrigger::Modifier(KeyModifiers::CTRL),
-                selection: false,
-                switcher: false,
-                grid: None,
-                window: None,
-                search: false,
-                picker: false,
-                local_mode: None,
-                local_held: HashMap::new(),
-                held_resize: None,
-                wheel_panes: WheelPanes::default(),
-                wheel_remainder: 0,
-                zoom_remainder: 0,
-                modal: false,
-                game_mode: false,
-                close_handler: None,
-            })
-        });
+        INPUT.with(|input| *input.borrow_mut() = Some(State::new(shortcut)));
         Ok(Self {
             messages: hook,
             focus,
@@ -301,7 +280,7 @@ impl KeyboardBridge {
                 s.search = visible;
                 if let Some(target) = &s.target {
                     let _ = target.sender.send(Command::Focus(
-                        !visible && !s.picker && s.local_mode.is_none(),
+                        !visible && s.picker.is_none() && s.local_mode.is_none(),
                     ));
                 }
             }
@@ -311,9 +290,10 @@ impl KeyboardBridge {
     pub fn set_picker(&self, visible: bool) {
         INPUT.with(|input| {
             if let Some(s) = input.borrow_mut().as_mut() {
-                s.picker = visible;
+                s.picker = visible.then_some(PickerStage::Search);
                 if visible {
                     ime::cancel();
+                    s.local_held.extend(s.pressed.keys().map(|&vk| (vk, false)));
                     s.release_keys();
                     s.wheel_panes.hovered = None;
                     if let Some(target) = &s.target {
@@ -323,6 +303,15 @@ impl KeyboardBridge {
             }
         });
         ime::sync_context();
+    }
+    pub fn set_picker_placement(&self) {
+        INPUT.with(|input| {
+            if let Some(s) = input.borrow_mut().as_mut()
+                && s.picker.is_some()
+            {
+                s.picker = Some(PickerStage::Placement);
+            }
+        });
     }
     pub fn set_hints(&self, visible: bool) {
         self.set_local_mode(visible.then_some(LocalMode::Hints));
@@ -345,7 +334,7 @@ impl KeyboardBridge {
                 }
                 if let Some(target) = &s.target {
                     let _ = target.sender.send(Command::Focus(
-                        mode.is_none() && !s.search && !s.picker && !s.modal,
+                        mode.is_none() && !s.search && s.picker.is_none() && !s.modal,
                     ));
                 }
             }
@@ -495,7 +484,10 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     }
                     if let Some(target) = &state.target {
                         let _ = target.sender.send(Command::Focus(
-                            focused && !state.search && !state.picker && state.local_mode.is_none(),
+                            focused
+                                && !state.search
+                                && state.picker.is_none()
+                                && state.local_mode.is_none(),
                         ));
                     }
                 }
@@ -737,6 +729,37 @@ fn unshifted(vk: u32, scan: u32, mut keyboard: [u8; 256]) -> Option<char> {
     (chars.next().is_none() && !first.is_control()).then_some(first)
 }
 impl State {
+    fn new(shortcut: impl Fn(Shortcut) + 'static) -> Self {
+        Self {
+            target: None,
+            shortcut: Box::new(shortcut),
+            swallowed: HashSet::new(),
+            pressed: HashMap::new(),
+            details: HashMap::new(),
+            surrogate: None,
+            preferences: Interaction::default(),
+            keymap: Shortcuts::default()
+                .keymap()
+                .expect("unique default bindings"),
+            switcher_trigger: SwitchTrigger::Modifier(KeyModifiers::CTRL),
+            selection: false,
+            switcher: false,
+            grid: None,
+            window: None,
+            search: false,
+            picker: None,
+            local_mode: None,
+            local_held: HashMap::new(),
+            held_resize: None,
+            wheel_panes: WheelPanes::default(),
+            wheel_remainder: 0,
+            zoom_remainder: 0,
+            modal: false,
+            game_mode: false,
+            close_handler: None,
+        }
+    }
+
     fn release_keys(&mut self) {
         // The physical key still belongs to the old shortcut until key-up.
         // A picker or native text field can receive repeat messages before then.
@@ -807,7 +830,7 @@ impl State {
                         && self.target.is_some()
                         && !self.modal
                         && self.local_mode.is_none()
-                        && !self.picker
+                        && self.picker.is_none()
                         && !self.switcher
                         && !self.search
                         && modifiers() == required
@@ -879,36 +902,60 @@ impl State {
                 _ => {}
             }
         }
-        if self.picker {
+        if let Some(stage) = self.picker {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
-                return true;
+                // Fresh Enter and Space belong to the focused placement button
+                // while it is mounted. Space activates native buttons on release.
+                return stage != PickerStage::Placement || !matches!(vk, 0x0d | 0x20);
             }
             if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-                let action = match vk {
-                    0x26 => Shortcut::PickerMove(-1),
-                    0x28 => Shortcut::PickerMove(1),
-                    0x1b => Shortcut::PickerCancel,
-                    0x0d => Shortcut::PickerAccept,
+                let repeat = message.lParam.0 & (1 << 30) != 0;
+                let action = match (stage, vk) {
+                    (_, 0x1b) => Shortcut::PickerCancel,
+                    (PickerStage::Search, 0x0d) => Shortcut::PickerAccept,
+                    (PickerStage::Search, 0x26) => Shortcut::PickerMove(-1),
+                    (PickerStage::Search, 0x28) => Shortcut::PickerMove(1),
+                    (PickerStage::Placement, 0x25) => Shortcut::PickerPlace(Direction::Left),
+                    (PickerStage::Placement, 0x26) => Shortcut::PickerPlace(Direction::Up),
+                    (PickerStage::Placement, 0x27) => Shortcut::PickerPlace(Direction::Right),
+                    (PickerStage::Placement, 0x28) => Shortcut::PickerPlace(Direction::Down),
+                    (PickerStage::Placement, 0x0d | 0x20) => {
+                        if repeat && !self.swallowed.contains(&vk) {
+                            // Held in the search field before the buttons appeared.
+                            self.local_held.insert(vk, false);
+                        } else {
+                            self.swallowed.insert(vk);
+                        }
+                        return repeat;
+                    }
                     _ => return false,
                 };
-                self.swallowed.insert(vk);
-                if message.lParam.0 & (1 << 30) == 0 || matches!(action, Shortcut::PickerMove(_)) {
+                if matches!(action, Shortcut::PickerMove(_)) {
+                    self.swallowed.insert(vk);
                     (self.shortcut)(action);
+                } else {
+                    // A selection, placement or cancel key stays local until its
+                    // release, even when its action changes the active stage/pane.
+                    self.local_held.insert(vk, false);
+                    if !repeat {
+                        (self.shortcut)(action);
+                    }
                 }
                 return true;
             }
             // Native text editing owns printable keys, composition and clipboard shortcuts.
             return false;
         }
-        if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN)
-            && matches!(vk, 0x1b | 0x0d | 0x26 | 0x28)
-            && self.swallowed.contains(&vk)
-        {
-            // A held picker key can repeat after Enter or Escape removed the overlay.
-            if message.lParam.0 & (1 << 30) != 0 {
-                return true;
+        if matches!(vk, 0x0d | 0x20 | 0x26 | 0x28) && self.swallowed.contains(&vk) {
+            // The button or row that owned the key may have closed the picker.
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => return true,
+                WM_CHAR | WM_SYSCHAR if matches!(vk, 0x0d | 0x20) => return true,
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    self.swallowed.remove(&vk);
+                }
+                _ => {}
             }
-            self.swallowed.remove(&vk);
         }
         if ime::active() {
             match message.message {
@@ -996,8 +1043,12 @@ impl State {
                 }
                 self.swallowed.insert(vk);
                 if message.lParam.0 & (1 << 30) == 0 {
-                    if matches!(shortcut, Shortcut::PanePicker) {
-                        self.picker = true;
+                    if matches!(
+                        shortcut,
+                        Shortcut::PanePicker | Shortcut::MovePaneToExistingTab
+                    ) {
+                        self.picker = Some(PickerStage::Search);
+                        self.local_held.insert(vk, false);
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
                         self.local_mode = Some(LocalMode::Hints);
@@ -1191,7 +1242,7 @@ impl State {
         }
     }
     fn wheel(&mut self, delta: i16, mods: KeyModifiers) -> bool {
-        if self.modal || self.switcher || self.picker || self.local_mode.is_some() {
+        if self.modal || self.switcher || self.picker.is_some() || self.local_mode.is_some() {
             return false;
         }
         let Some(target) = &self.target else {
@@ -1253,6 +1304,7 @@ impl From<Action> for Shortcut {
             Action::ZoomPane => Self::ZoomPane,
             Action::ClosePane => Self::ClosePane,
             Action::MovePane => Self::MovePane,
+            Action::MovePaneToExistingTab => Self::MovePaneToExistingTab,
             Action::Workspaces => Self::Workspaces,
             Action::PanePicker => Self::PanePicker,
             Action::KeyboardHints => Self::KeyboardHints,
@@ -1454,6 +1506,105 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_pane_routes_only_fresh_picker_actions_and_keeps_button_keys_native() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::MovePaneToExistingTab, Some("F8".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            keymap: bindings.keymap().unwrap(),
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        let key_event = |message, vk: u32, repeat| MSG {
+            message,
+            wParam: WPARAM(vk as usize),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        // The UI has not processed the queued open message yet.
+        assert!(state.handle(&key_event(WM_KEYDOWN, VK_F8.0.into(), false)));
+        assert!(!state.handle(&key_event(WM_CHAR, u32::from('q'), false)));
+        assert!(state.handle(&key_event(WM_KEYUP, VK_F8.0.into(), false)));
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[Shortcut::MovePaneToExistingTab]
+        );
+        actions.borrow_mut().clear();
+        let enter = |message, repeat| MSG {
+            message,
+            wParam: WPARAM(VK_RETURN.0 as usize),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        assert!(state.handle(&enter(WM_KEYDOWN, false)));
+        state.picker = Some(PickerStage::Placement);
+        assert!(state.handle(&enter(WM_KEYDOWN, true)));
+        assert!(state.handle(&enter(WM_KEYUP, false)));
+        assert!(!state.handle(&enter(WM_KEYDOWN, false)));
+        assert!(!state.handle(&enter(WM_KEYUP, false)));
+        assert!(state.handle(&key_event(WM_KEYDOWN, 0x20, true)));
+        assert!(state.handle(&key_event(WM_KEYUP, 0x20, false)));
+        assert!(!state.handle(&key_event(WM_KEYDOWN, 0x20, false)));
+        assert!(state.handle(&key_event(WM_KEYDOWN, 0x20, true)));
+        assert!(!state.handle(&key_event(WM_KEYUP, 0x20, false)));
+        assert_eq!(actions.borrow().as_slice(), &[Shortcut::PickerAccept]);
+        for (vk, direction) in [
+            (0x25, Direction::Left),
+            (0x26, Direction::Up),
+            (0x27, Direction::Right),
+            (0x28, Direction::Down),
+        ] {
+            state.picker = Some(PickerStage::Search);
+            if matches!(vk, 0x25 | 0x27) {
+                assert!(
+                    !state.handle(&key_event(WM_KEYDOWN, vk, false)),
+                    "search caret"
+                );
+            }
+            state.picker = Some(PickerStage::Placement);
+            actions.borrow_mut().clear();
+            assert!(state.handle(&key_event(WM_KEYDOWN, vk, true)));
+            assert!(state.handle(&key_event(WM_KEYUP, vk, false)));
+            assert!(
+                actions.borrow().is_empty(),
+                "a held arrow committed a placement"
+            );
+            assert!(state.handle(&key_event(WM_KEYDOWN, vk, false)));
+            state.picker = None;
+            assert!(state.handle(&key_event(WM_KEYDOWN, vk, true)));
+            assert!(state.handle(&key_event(WM_KEYUP, vk, false)));
+            assert_eq!(
+                actions.borrow().as_slice(),
+                &[Shortcut::PickerPlace(direction)]
+            );
+        }
+        state.picker = Some(PickerStage::Placement);
+        assert!(state.handle(&key_event(WM_KEYDOWN, 0x1b, false)));
+        state.picker = None;
+        assert!(state.handle(&key_event(WM_KEYDOWN, 0x1b, true)));
+        assert!(state.handle(&key_event(WM_KEYUP, 0x1b, false)));
+        assert_eq!(actions.borrow().last(), Some(&Shortcut::PickerCancel));
+        state.picker = Some(PickerStage::Placement);
+        assert!(!state.handle(&enter(WM_KEYDOWN, false)));
+        state.picker = None;
+        assert!(state.handle(&enter(WM_KEYDOWN, true)));
+        assert!(state.handle(&key_event(WM_CHAR, 0x0d, false)));
+        assert!(state.handle(&enter(WM_KEYUP, false)));
+        assert!(
+            input.try_recv().is_err(),
+            "picker keys reached the terminal"
+        );
+    }
+
+    #[test]
     fn switching_tabs_releases_held_keys_to_the_old_session_and_forms_receive_native_input() {
         let lab = Session::start(Source::Demo);
         let (old, mut old_input) = mpsc::unbounded_channel();
@@ -1463,29 +1614,9 @@ mod tests {
                 sender: old,
                 frames: lab.frames.clone(),
             }),
-            shortcut: Box::new(|_| {}),
-            swallowed: HashSet::new(),
             pressed: HashMap::from([(0x58, KeyCode::Char('x'))]),
-            details: HashMap::new(),
             surrogate: Some(0xd800),
-            preferences: Interaction::default(),
-            keymap: Shortcuts::default().keymap().unwrap(),
-            switcher_trigger: SwitchTrigger::Modifier(KeyModifiers::CTRL),
-            selection: false,
-            switcher: false,
-            grid: None,
-            window: None,
-            search: false,
-            picker: false,
-            local_mode: None,
-            local_held: HashMap::new(),
-            held_resize: None,
-            wheel_panes: WheelPanes::default(),
-            wheel_remainder: 0,
-            zoom_remainder: 0,
-            modal: false,
-            game_mode: false,
-            close_handler: None,
+            ..State::new(|_| {})
         };
         state.retarget(Some(Target {
             sender: new,
@@ -1526,7 +1657,7 @@ mod tests {
             "find text must stay in the native textbox"
         );
         state.search = false;
-        state.picker = true;
+        state.picker = Some(PickerStage::Search);
         let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
         let observed = actions.clone();
         state.shortcut = Box::new(move |action| observed.borrow_mut().push(action));
@@ -1563,7 +1694,7 @@ mod tests {
             ..Default::default()
         };
         assert!(state.handle(&enter(WM_KEYDOWN, false)));
-        state.picker = false;
+        state.picker = None;
         assert!(state.handle(&enter(WM_KEYDOWN, true)));
         assert!(state.handle(&enter(WM_KEYUP, false)));
         assert!(
