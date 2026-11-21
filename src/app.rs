@@ -20,6 +20,7 @@ use w11term::{
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
+    shortcuts::Action as KeyAction,
     tabs::{TabId, Tabs},
 };
 use wezterm_term::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind, TerminalSize};
@@ -31,6 +32,7 @@ const LAB: &str = "Terminal lab";
 
 mod config_import;
 mod file_drawer;
+mod keyboard_settings;
 mod local_profile;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
@@ -39,6 +41,7 @@ mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
 mod inspector;
+mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
 mod pane_picker;
@@ -125,7 +128,7 @@ enum Page {
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
     Workspaces(workspace_view::WorkspacePage),
-    Settings,
+    Settings(Option<keyboard_settings::KeyboardPage>),
     NewProfile(ProfileDraft),
 }
 struct AppTab {
@@ -272,7 +275,11 @@ fn tab_menu_message(label: String) -> Message {
             return Message::SplitPane(axis, Some(name.to_owned()));
         }
     }
-    match label.split(": ").next().unwrap_or(&label) {
+    // Menu callbacks return the displayed label, including the current shortcut.
+    let command = label
+        .split_once("    ")
+        .map_or(label.as_str(), |(name, _)| name);
+    match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         "SFTP files" => Message::Files(FileAction::Toggle),
         "Open files here" => Message::Files(FileAction::OpenHere),
@@ -300,6 +307,7 @@ fn tab_menu_message(label: String) -> Message {
         "Settings" => Message::SettingsMenu,
         "Workspaces…" => Message::Workspace(workspace_view::WorkspaceAction::Show),
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
+        "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
         _ => Message::ControlIdle,
     }
 }
@@ -356,6 +364,7 @@ pub struct TerminalApp {
     mru: Vec<TabId>,
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
+    hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
 }
 
 pub enum Message {
@@ -409,6 +418,7 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     SettingsMenu,
+    Keyboard(keyboard_settings::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
     Font(Option<usize>),
@@ -551,6 +561,17 @@ impl TerminalApp {
         };
         let frame = tab.session.frames.load();
         let prompt_id = frame.prompt.as_ref().map(|p| p.id);
+        if self.hints.borrow().as_ref().is_some_and(|h| {
+            h.pane == id
+                && (prompt_id.is_some()
+                    || h.frame.connection_generation != frame.connection_generation
+                    || h.frame.cols != frame.cols
+                    || h.frame.rows.len() != frame.rows.len())
+        }) {
+            self.hints.borrow_mut().take();
+            self.keyboard.set_hints(false);
+            tab.surface.invalidator.invalidate();
+        }
         if prompt_id.is_some() && self.picker.take().is_some() {
             self.keyboard.set_picker(false);
         }
@@ -909,6 +930,9 @@ impl TerminalApp {
         if !self.tabs.visible(id) {
             return;
         }
+        if self.hints.borrow().as_ref().is_some_and(|h| h.pane == id) {
+            return;
+        }
         if kind == MouseEventKind::Press && self.tabs.active_id() != Some(id) {
             self.focus_pane(id, context);
         }
@@ -1096,9 +1120,13 @@ impl TerminalApp {
         if should_paste {
             self.paste(false, context);
         }
-        if let Some(uri) = open
-            && safe_url(&uri)
-        {
+        if let Some(uri) = open {
+            Self::open_link(&uri);
+        }
+    }
+
+    fn open_link(uri: &str) {
+        if safe_url(uri) {
             use windows::{
                 Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
                 core::PCWSTR,
@@ -1244,6 +1272,13 @@ impl TerminalApp {
                 .content("Import OpenSSH config…"),
         );
         children.splice(1..1, profiles);
+        children.insert(
+            1,
+            Button::new()
+                .automation_name("Keyboard")
+                .on_click(context.callback(|_| Message::Keyboard(keyboard_settings::Edit::Show)))
+                .content("Keyboard"),
+        );
         children.push(
             TextBlock::new()
                 .text(format!(
@@ -1411,6 +1446,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.close_hints();
         self.sync_inspector();
         if self.picker.take().is_some() {
             self.keyboard.set_picker(false);
@@ -1720,7 +1756,7 @@ impl TerminalApp {
             .iter()
             .find(|t| {
                 if settings {
-                    matches!(t.value.page, Page::Settings)
+                    matches!(t.value.page, Page::Settings(_))
                 } else {
                     matches!(&t.value.page, Page::NewProfile(draft) if matches!(draft.origin, DraftOrigin::New))
                 }
@@ -1736,7 +1772,7 @@ impl TerminalApp {
                     "New Profile".into()
                 },
                 page: if settings {
-                    Page::Settings
+                    Page::Settings(None)
                 } else {
                     Page::NewProfile(ProfileDraft::default())
                 },
@@ -2086,12 +2122,12 @@ impl TerminalApp {
             .menu(Menu::new(
                 [
                     self.pane_menu(),
-                    MenuItem::item("pane-picker", "Find pane…"),
+                    self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
                     MenuItem::item("paste", "Paste"),
                     MenuItem::item("paste-raw", "Paste raw (no bracketed paste)"),
                     MenuItem::separator("paste-end"),
                     MenuItem::item("settings", "Settings"),
-                    MenuItem::item("workspaces", "Workspaces…"),
+                    self.binding_menu("workspaces", "Workspaces…", KeyAction::Workspaces),
                     self.discovery_menu(),
                     state_menu_item(
                         "inspector",
@@ -2160,13 +2196,24 @@ impl TerminalApp {
             )
     }
 
+    fn binding_menu(&self, key: &str, label: &str, action: KeyAction) -> MenuItem {
+        let description = self
+            .appearance
+            .read()
+            .unwrap()
+            .shortcuts
+            .get(action.binding())
+            .map_or_else(|| label.to_owned(), |chord| format!("{label}    {chord}"));
+        MenuItem::item(key, description)
+    }
     fn pane_menu(&self) -> MenuItem {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
             return MenuItem::disabled("panes", "Panes");
         }
         let mut items = vec![
-            MenuItem::item("split-right", "Split right"),
-            MenuItem::item("split-below", "Split below"),
+            self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
+            self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
         ];
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
@@ -2210,24 +2257,25 @@ impl TerminalApp {
             .is_some_and(|layout| matches!(layout, w11term::pane_layout::Layout::Split { .. }))
         {
             items.push(MenuItem::separator("pane-actions"));
-            for (key, label) in [
-                ("left", "Focus left"),
-                ("right", "Focus right"),
-                ("up", "Focus above"),
-                ("down", "Focus below"),
+            for (key, action) in [
+                ("left", KeyAction::FocusLeft),
+                ("right", KeyAction::FocusRight),
+                ("up", KeyAction::FocusUp),
+                ("down", KeyAction::FocusDown),
             ] {
-                items.push(MenuItem::item(key, label));
+                items.push(self.binding_menu(key, action.binding().label, action));
             }
-            items.push(MenuItem::item(
+            items.push(self.binding_menu(
                 "zoom-pane",
                 if self.tabs.zoomed() {
                     "Restore panes"
                 } else {
                     "Zoom pane"
                 },
+                KeyAction::ZoomPane,
             ));
-            items.push(MenuItem::item("close-pane", "Close pane"));
-            items.push(MenuItem::item("move-pane", "Move pane to new tab"));
+            items.push(self.binding_menu("close-pane", "Close pane", KeyAction::ClosePane));
+            items.push(self.binding_menu("move-pane", "Move pane to new tab", KeyAction::MovePane));
         }
         MenuItem::submenu("panes", "Panes", items)
     }
@@ -2569,6 +2617,12 @@ impl Component for TerminalApp {
             appearance.font_size,
         )
         .expect("creating DirectWrite formats");
+        keyboard.set_shortcuts(
+            appearance
+                .shortcuts
+                .keymap()
+                .expect("validated keyboard settings"),
+        );
         let appearance = Arc::new(RwLock::new(appearance));
         let grid = if options.cols.is_some() || options.rows.is_some() {
             Some((options.cols.unwrap_or(120), options.rows.unwrap_or(32)))
@@ -2689,6 +2743,7 @@ impl Component for TerminalApp {
             mru: Vec::new(),
             switcher: None,
             picker: None,
+            hints: Default::default(),
             selection_pending: true,
             selection_epoch: 0,
         };
@@ -2748,6 +2803,7 @@ impl Component for TerminalApp {
             &message,
             Message::FrameReady(..)
                 | Message::Files(..)
+                | Message::Keyboard(keyboard_settings::Edit::Text(..))
                 | Message::PickerQuery(..)
                 | Message::PickerFocus(..)
                 | Message::PaneRatio(..)
@@ -2795,6 +2851,7 @@ impl Component for TerminalApp {
                     && !tab.find.open
                     && self.switcher.is_none()
                     && self.picker.is_none()
+                    && self.hints.borrow().is_none()
                 {
                     let frame = tab.session.frames.load();
                     if frame.generation == request.generation {
@@ -3408,7 +3465,9 @@ impl Component for TerminalApp {
                                 });
                             }
                         }
-                        tab.surface.invalidator.invalidate();
+                        if self.hints.borrow().as_ref().is_none_or(|h| h.pane != id) {
+                            tab.surface.invalidator.invalidate();
+                        }
                     }
                     self.watch_frames(context);
                 }
@@ -3497,6 +3556,8 @@ impl Component for TerminalApp {
             }
             Message::Shortcut(shortcut) => match shortcut {
                 Shortcut::PanePicker => self.open_picker(context),
+                Shortcut::KeyboardHints => self.open_hints(),
+                Shortcut::HintKey(key) => self.hint_key(key, context),
                 Shortcut::PickerAccept => self.accept_picker(context),
                 Shortcut::PickerCancel => self.close_picker(context),
                 Shortcut::PickerMove(delta) => {
@@ -3511,6 +3572,11 @@ impl Component for TerminalApp {
                 }
                 Shortcut::ZoomPane => self.update(Message::ZoomPane, context),
                 Shortcut::ClosePane => self.update(Message::ClosePane, context),
+                Shortcut::MovePane => self.update(Message::MovePaneToTab, context),
+                Shortcut::Workspaces => self.update(
+                    Message::Workspace(workspace_view::WorkspaceAction::Show),
+                    context,
+                ),
                 Shortcut::Fullscreen => {
                     if let Err(error) = self.windows.borrow_mut().toggle() {
                         log::warn!("Fullscreen: {error:#}");
@@ -3628,6 +3694,7 @@ impl Component for TerminalApp {
                     }
                 }
             }
+            Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::SettingsMenu => self.utility(true, context),
             Message::LocalProfile(action) => self.local_profile_action(action, context),
             Message::Workspace(action) => self.workspace_action(action, context),
@@ -3940,6 +4007,7 @@ impl Component for TerminalApp {
             && !tab.browsing_sessions()
             && self.switcher.is_none()
             && self.picker.is_none()
+            && self.hints.borrow().is_none()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
             let metrics = tab.surface.metrics.get();
@@ -3996,7 +4064,12 @@ impl Component for TerminalApp {
                     }
                     _ => self.pane_view(id, tab, false, context),
                 },
-                Page::Settings => self.settings_view(context),
+                Page::Settings(None) => self.settings_view(context),
+                Page::Settings(Some(page)) => keyboard_settings::keyboard_view(
+                    page,
+                    &self.appearance.read().unwrap().shortcuts,
+                    context,
+                ),
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),
@@ -4015,7 +4088,9 @@ impl Component for TerminalApp {
             ),
             KeyedView::new("content", Border::new().grid_row(1).content(content)),
         ];
-        if let Some(inspection) = &self.inspection {
+        if let Some(inspection) = &self.inspection
+            && self.hints.borrow().is_none()
+        {
             views.push(KeyedView::new(
                 "terminal-inspector",
                 inspection.view(context),
@@ -4761,6 +4836,23 @@ impl TerminalApp {
 #[cfg(test)]
 mod profile_ui_tests {
     use super::*;
+    #[test]
+    fn pane_menu_dispatch_preserves_profile_names_and_ignores_shortcut_labels() {
+        for label in [
+            "Focus right",
+            "Focus right    Ctrl+Alt+Right",
+            "Focus right    F8",
+        ] {
+            assert!(matches!(
+                tab_menu_message(label.into()),
+                Message::PaneNeighbor(Direction::Right)
+            ));
+        }
+        assert!(
+            matches!(tab_menu_message("Split right with tests    F8".into()),
+            Message::SplitPane(Axis::Columns,Some(name)) if name=="tests    F8")
+        );
+    }
     #[test]
     fn state_labels_dispatch_the_same_action_before_and_after_toggling() {
         for (state, expected) in [(true, "Mute: On"), (false, "Mute: Off")] {

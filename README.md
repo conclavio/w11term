@@ -67,7 +67,9 @@ Each restored pane receives a new process-local control ID. SSH panes normally s
 
 Imported `ProxyJump` routes use SSH `direct-tcpip` channels. Each jump host and the final destination have their own authentication and host-key checks. The resulting SSH shell and its SFTP drawer use the destination connection. For a manually configured profile, `proxy_jump` is an ordered array of objects with `host`, `user`, optional `port`, `auth` and optional `host_key`. Each hop supports the same authentication choices as the destination.
 
-| Pane action | Shortcut |
+Choose **Settings → Keyboard** to edit shortcuts for panes, tabs, the pane picker and workspaces. Select **Edit…**, enter a chord such as `Ctrl+Alt+Right` or `F8`, and choose **Save shortcut**. **Clear shortcut** releases its key for the terminal. **Restore default** restores that action’s original binding. The editor identifies conflicts, and pane menus show the current bindings. Changes apply immediately and persist in the per-user settings file.
+
+| Pane action | Default shortcut |
 | --- | --- |
 | Split right or below | Ctrl+Alt+Shift+Right or Down |
 | Focus a neighbor | Ctrl+Alt+Arrow |
@@ -145,6 +147,10 @@ cargo run -- --demo --smoke-seconds 5
 The benchmark measures **only VT parsing and scrollback**. It excludes snapshot creation, rendering, SSH, and input-to-screen latency. Debug-build results are not performance claims. Build with `cargo build --release` for performance work. The release GUI executable does not attach a console.
 
 ## Controls
+
+**Ctrl+Shift+H** or **caret → Panes → Keyboard hints** freezes the focused viewport and labels its URLs and file paths. Type the letters shown beside a target. **Enter** opens a URL or copies a path, **C** copies either, **Backspace** edits the label, and **Esc** returns to the live pane. URLs use the same link rules as Ctrl+click, including OSC 8 hyperlinks. Paths can include quoted spaces, soft wraps, and compiler-style line and column suffixes.
+
+On an SSH pane, **R** reveals a selected Unix path in the existing SFTP drawer and selects its directory entry. Relative paths use the OSC 7 directory reported by that SSH host when hints opened. Absolute paths work without a directory report. Local Windows paths and paths with no usable remote base can still be copied.
 
 For focus-independent automation, raw SSH input, screen text, PNG capture, and launch geometry, see [External control](CONTROL.md).
 

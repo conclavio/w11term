@@ -4,6 +4,62 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits keyboard settings and restarts a native SSH and Windows PowerShell workspace"]
+async fn native_shortcut_rebind_releases_previous_key_and_persists_after_restart() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let data = state.path().join("data");
+    fs::create_dir(&data).unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":{"fixture-ssh":ssh}})).unwrap(),
+    )
+    .unwrap();
+    let workspace = json!({"active_tab":0, "tabs":[{"focused":1, "layout":{
+        "type":"split", "axis":"columns", "ratio":0.5,
+        "first":{"type":"leaf","slot":1,"source":{"kind":"saved_profile","value":"fixture-ssh"}},
+        "second":{"type":"leaf","slot":2,"source":{"kind":"local","value":{"name":"Windows PowerShell",
+            "shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}}}
+    }}]});
+    fs::write(
+        data.join("workspaces.json"),
+        serde_json::to_vec(&json!({"version":1,"workspaces":{"shortcuts":workspace}})).unwrap(),
+    )
+    .unwrap();
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-STA", "-File"])
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/shortcuts-ui.ps1"))
+        .args([
+            "-Gui",
+            env!("CARGO_BIN_EXE_w11term"),
+            "-Cli",
+            env!("CARGO_BIN_EXE_w11term-cli"),
+        ])
+        .arg("-State")
+        .arg(state.path())
+        .arg("-Trace")
+        .arg(&trace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
+    );
+    // Only the released F7 reached SSH on each launch. F8 and subsequent
+    // text were consumed locally or directed to the neighboring PowerShell.
+    assert_eq!(fs::read(trace).unwrap(), b"\x1b[18~\x1b[18~");
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives the native pane picker with two SSH peers and Windows PowerShell"]
 async fn native_pane_picker_routes_keys_across_tabs_and_restores_focus_on_escape() {
     let (source, _remote, opens, server) = fixture_connections(false, 2).await;
@@ -13,6 +69,12 @@ async fn native_pane_picker_routes_keys_across_tabs_and_restores_focus_on_escape
     let mut dev2 = dev1.clone();
     dev2.user = "navigator".into();
     let state = tempfile::tempdir().unwrap();
+    // An unmodified key exercises the editable hints action on the fixture window.
+    fs::write(
+        state.path().join("appearance.json"),
+        br#"{"shortcuts":{"keyboard_hints":"F8"}}"#,
+    )
+    .unwrap();
     let data = state.path().join("data");
     fs::create_dir(&data).unwrap();
     fs::write(
@@ -91,6 +153,8 @@ async fn native_file_drawer() {
     let (source, remote, opens, server) = fixture_server(false).await;
     let shell_dir = remote.path().join("shell directory");
     fs::create_dir(&shell_dir).unwrap();
+    fs::create_dir(shell_dir.join("src")).unwrap();
+    fs::write(shell_dir.join("src/trace.rs"), b"hint target").unwrap();
     let state = tempfile::tempdir().unwrap();
     let bytes: Vec<_> = (0..(3 * w11term::sftp::CHUNK + 7))
         .map(|i| (i % 251) as u8)

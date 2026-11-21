@@ -11,6 +11,7 @@ const PAGE_SIZE: usize = 32;
 pub enum FileAction {
     Toggle,
     OpenHere,
+    Reveal(u64, u64, String, Option<String>),
     Close(u64),
     Browse(u64, u64, String),
     Choose(u64, String),
@@ -31,6 +32,7 @@ pub(super) struct FileDrawer {
     entries: Vec<Entry>,
     page: usize,
     selected: Option<String>,
+    reveal_name: Option<String>,
     replace: bool,
     picking: bool,
     parsing: bool,
@@ -70,7 +72,7 @@ fn remote_child(directory: &str, name: &str) -> Result<String> {
 
 /// OSC 7 is a path hint for the existing SFTP connection. Preserve the raw
 /// authority: a URL library can normalize an explicit "localhost" to "".
-fn shell_directory(report: Option<&str>, host: &str) -> Option<String> {
+pub(super) fn shell_directory(report: Option<&str>, host: &str) -> Option<String> {
     let raw = report?;
     let (scheme, rest) = raw.split_once("://")?;
     let (authority, path) = rest.split_once('/')?;
@@ -235,7 +237,7 @@ fn pick_local(owner: usize, remote: Option<&str>) -> Result<Option<PathBuf>> {
 }
 
 impl FileDrawer {
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.picking || self.parsing || self.pending.is_some()
     }
 
@@ -497,6 +499,7 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.status = "Reading directory…".into();
+        self.reveal_name = None;
         self.job(
             id,
             session,
@@ -679,6 +682,7 @@ impl TerminalApp {
                 None => return,
             },
             Close(id)
+            | Reveal(id, ..)
             | Browse(id, ..)
             | Choose(id, _)
             | Page(id, _)
@@ -710,7 +714,7 @@ impl TerminalApp {
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
+        if matches!(&action, Reveal(_, g, ..) | Browse(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) if *g != files.generation)
         {
             return;
         }
@@ -740,6 +744,15 @@ impl TerminalApp {
                 Close(_) => {
                     files.open = false;
                 }
+                Reveal(_, _, directory, name) => {
+                    if !files.busy() {
+                        files.open = true;
+                        self.initial_grid.set(None);
+                        crate::input::clear_grid();
+                        files.browse(pane, session, directory, context)?;
+                        files.reveal_name = name;
+                    }
+                }
                 Tick(_) => files.tick(pane, session, context)?,
                 Listed(_, _, path, result) if files.parsing => {
                     files.parsing = false;
@@ -749,6 +762,14 @@ impl TerminalApp {
                     files.page = 0;
                     if files.status == "Reading directory…" {
                         files.status.clear();
+                    }
+                    if let Some(name) = files.reveal_name.take() {
+                        if let Some(i) = files.entries.iter().position(|entry| entry.name == name) {
+                            files.page = i / PAGE_SIZE;
+                            files.selected = Some(name);
+                        } else {
+                            files.status = format!("No entry named {name} in this directory");
+                        }
                     }
                 }
                 Picked(_, _, remote, result) if files.picking => {
@@ -949,6 +970,30 @@ impl TerminalApp {
                 return;
             }
             5 => {
+                self.update(tab_menu_message("Keyboard hints".into()), context);
+                assert!(self.hints.borrow().as_ref().is_some_and(|h| {
+                    h.visible_labels()
+                        .any(|item| item.label == "a" && item.target.text() == "src/trace.rs")
+                }));
+                use windows::Win32::{
+                    Foundation::{LPARAM, WPARAM},
+                    UI::WindowsAndMessaging::{PostMessageW, WM_KEYDOWN, WM_KEYUP},
+                };
+                let window = crate::input::window().unwrap();
+                for &key in b"AR" {
+                    for message in [WM_KEYDOWN, WM_KEYUP] {
+                        unsafe {
+                            PostMessageW(Some(window), message, WPARAM(key as usize), LPARAM(1))
+                                .unwrap();
+                        }
+                    }
+                }
+                7
+            }
+            7 if files.directory.as_deref() != Some("/shell directory/src") => 7,
+            7 => {
+                assert_eq!(files.selected.as_deref(), Some("trace.rs"));
+                assert!(self.hints.borrow().is_none());
                 let groups: Vec<_> = self.tabs.headers().into_iter().map(|h| h.id).collect();
                 for group in groups {
                     self.close_tab(group, context);

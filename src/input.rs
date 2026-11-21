@@ -7,6 +7,7 @@ use w11term::{
     interaction::{Interaction, TabSwitcherMode},
     pane_layout::Direction,
     session::Command,
+    shortcuts::{Action, KeyMap, Shortcuts},
     terminal::FrameStore,
 };
 use wezterm_term::{KeyCode, KeyModifiers};
@@ -31,12 +32,16 @@ struct State {
     details: HashMap<u32, w11term::terminal::KeyDetails>,
     surrogate: Option<u16>,
     preferences: Interaction,
+    keymap: KeyMap,
+    switcher_trigger: SwitchTrigger,
     selection: bool,
     switcher: bool,
     grid: Option<Grid>,
     window: Option<HWND>,
     search: bool,
     picker: bool,
+    hints: bool,
+    hint_held: HashSet<u32>,
     wheel_panes: WheelPanes,
     wheel_remainder: i32,
     zoom_remainder: i32,
@@ -118,6 +123,10 @@ pub enum Shortcut {
     PickerMove(isize),
     PickerAccept,
     PickerCancel,
+    KeyboardHints,
+    HintKey(u32),
+    MovePane,
+    Workspaces,
 }
 
 pub struct KeyboardBridge {
@@ -167,12 +176,18 @@ impl KeyboardBridge {
                 details: HashMap::new(),
                 surrogate: None,
                 preferences: Interaction::default(),
+                keymap: Shortcuts::default()
+                    .keymap()
+                    .expect("unique default bindings"),
+                switcher_trigger: SwitchTrigger::Modifier(KeyModifiers::CTRL),
                 selection: false,
                 switcher: false,
                 grid: None,
                 window: None,
                 search: false,
                 picker: false,
+                hints: false,
+                hint_held: HashSet::new(),
                 wheel_panes: WheelPanes::default(),
                 wheel_remainder: 0,
                 zoom_remainder: 0,
@@ -231,6 +246,13 @@ impl KeyboardBridge {
             }
         });
     }
+    pub fn set_shortcuts(&self, keymap: KeyMap) {
+        INPUT.with(|i| {
+            if let Some(s) = i.borrow_mut().as_mut() {
+                s.keymap = keymap;
+            }
+        });
+    }
     pub fn set_selection(&self, selected: bool) {
         INPUT.with(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
@@ -260,7 +282,9 @@ impl KeyboardBridge {
                 }
                 s.search = visible;
                 if let Some(target) = &s.target {
-                    let _ = target.sender.send(Command::Focus(!visible && !s.picker));
+                    let _ = target
+                        .sender
+                        .send(Command::Focus(!visible && !s.picker && !s.hints));
                 }
             }
         });
@@ -277,6 +301,25 @@ impl KeyboardBridge {
                     if let Some(target) = &s.target {
                         let _ = target.sender.send(Command::Focus(false));
                     }
+                }
+            }
+        });
+        ime::sync_context();
+    }
+    pub fn set_hints(&self, visible: bool) {
+        INPUT.with(|input| {
+            if let Some(s) = input.borrow_mut().as_mut() {
+                s.hints = visible;
+                if visible {
+                    ime::cancel();
+                    s.hint_held.extend(s.pressed.keys().copied());
+                    s.release_keys();
+                    s.wheel_panes.hovered = None;
+                }
+                if let Some(target) = &s.target {
+                    let _ = target.sender.send(Command::Focus(
+                        !visible && !s.search && !s.picker && !s.modal,
+                    ));
                 }
             }
         });
@@ -424,9 +467,9 @@ unsafe extern "system" fn focus_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         }
                     }
                     if let Some(target) = &state.target {
-                        let _ = target
-                            .sender
-                            .send(Command::Focus(focused && !state.search && !state.picker));
+                        let _ = target.sender.send(Command::Focus(
+                            focused && !state.search && !state.picker && !state.hints,
+                        ));
                     }
                 }
             });
@@ -726,6 +769,43 @@ impl State {
         if self.modal {
             return false;
         }
+        if self.hint_held.contains(&vk) {
+            match message.message {
+                WM_KEYUP | WM_SYSKEYUP => {
+                    self.hint_held.remove(&vk);
+                    self.swallowed.remove(&vk);
+                    return true;
+                }
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => return true,
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    self.hint_held.remove(&vk);
+                }
+                _ => {}
+            }
+        }
+        if self.hints {
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN => {
+                    if vk == VK_F4.0 as u32 && modifiers().contains(KeyModifiers::ALT) {
+                        return false;
+                    }
+                    self.hint_held.insert(vk);
+                    if message.lParam.0 & (1 << 30) == 0
+                        && matches!(vk, 0x41..=0x5a | 0x08 | 0x1b | 0x0d)
+                        && !modifiers().intersects(KeyModifiers::CTRL | KeyModifiers::ALT)
+                    {
+                        (self.shortcut)(Shortcut::HintKey(vk));
+                    }
+                    return true;
+                }
+                WM_KEYUP | WM_SYSKEYUP => {
+                    self.swallowed.remove(&vk);
+                    return true;
+                }
+                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => return true,
+                _ => {}
+            }
+        }
         if self.picker {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&vk) {
                 return true;
@@ -774,24 +854,22 @@ impl State {
         let mut mods = modifiers();
         if self.switcher {
             if matches!(message.message, WM_KEYUP | WM_SYSKEYUP)
-                && matches!(vk, 0x11 | 0xa2 | 0xa3)
-                && !mods.contains(KeyModifiers::CTRL)
+                && self.switcher_trigger.released(vk, mods)
             {
+                self.swallowed.remove(&vk);
                 self.switcher = false;
                 (self.shortcut)(Shortcut::CommitTab);
                 return true;
             }
             if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-                let shortcut = match vk {
-                    0x26 => Some(Shortcut::PreviousTab),
-                    0x28 => Some(Shortcut::NextTab),
-                    0x1b => Some(Shortcut::CancelTab),
-                    0x0d => Some(Shortcut::CommitTab),
-                    0x09 => Some(if mods.contains(KeyModifiers::SHIFT) {
-                        Shortcut::PreviousTab
-                    } else {
-                        Shortcut::NextTab
-                    }),
+                let binding = self.keymap.resolve(vk, mods, false, unsafe {
+                    GetKeyState(VK_RMENU.0 as i32) < 0
+                });
+                let shortcut = match (binding, vk) {
+                    (Some(Action::PreviousTab), _) | (_, 0x26) => Some(Shortcut::PreviousTab),
+                    (Some(Action::NextTab), _) | (_, 0x28) => Some(Shortcut::NextTab),
+                    (_, 0x1b) => Some(Shortcut::CancelTab),
+                    (_, 0x0d) => Some(Shortcut::CommitTab),
                     _ => None,
                 };
                 if let Some(shortcut) = shortcut {
@@ -832,41 +910,24 @@ impl State {
                 }
             }
             let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
-            let pane_action =
-                pane_shortcut(vk, mods, self.target.is_some() && !self.search, right_alt);
-            let shortcut = if pane_action.is_some() {
-                pane_action
-            } else if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x50 {
-                Some(Shortcut::PanePicker)
-            } else if mods.contains(KeyModifiers::CTRL) && vk == VK_TAB.0 as u32 {
-                Some(if mods.contains(KeyModifiers::SHIFT) {
-                    Shortcut::PreviousTab
-                } else {
-                    Shortcut::NextTab
-                })
-            } else if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x54 {
-                Some(Shortcut::NewTab)
-            } else if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x57 {
-                Some(Shortcut::CloseTab)
-            } else if mods.contains(KeyModifiers::CTRL | KeyModifiers::ALT)
-                && (0x31..=0x39).contains(&vk)
-                // AltGr is also represented as Ctrl+Alt; it must remain text input.
-                && !right_alt
-            {
-                Some(Shortcut::Select((vk - 0x31) as usize))
-            } else {
-                None
-            };
+            let shortcut = self
+                .keymap
+                .resolve(vk, mods, self.target.is_some() && !self.search, right_alt)
+                .map(Shortcut::from);
             if let Some(shortcut) = shortcut {
                 if matches!(shortcut, Shortcut::NextTab | Shortcut::PreviousTab)
                     && self.preferences.tab_switcher_mode != TabSwitcherMode::Disabled
                 {
+                    self.switcher_trigger = SwitchTrigger::new(vk, mods);
                     self.switcher = true;
                 }
                 self.swallowed.insert(vk);
                 if message.lParam.0 & (1 << 30) == 0 {
                     if matches!(shortcut, Shortcut::PanePicker) {
                         self.picker = true;
+                    }
+                    if matches!(shortcut, Shortcut::KeyboardHints) {
+                        self.hints = true;
                     }
                     (self.shortcut)(shortcut);
                 }
@@ -932,16 +993,12 @@ impl State {
                     ));
                     return true;
                 }
-                if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT)
-                    && matches!(vk, 0x26 | 0x28)
-                {
+                if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && matches!(vk, 0x26 | 0x28) {
                     self.swallowed.insert(vk);
                     let _ = sender.send(Command::Prompt(if vk == 0x26 { -1 } else { 1 }));
                     return true;
                 }
-                if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT)
-                    && matches!(vk, 0x24 | 0x23)
-                {
+                if mods == (KeyModifiers::CTRL | KeyModifiers::SHIFT) && matches!(vk, 0x24 | 0x23) {
                     self.swallowed.insert(vk);
                     let _ = sender.send(Command::ScrollEdge(vk == 0x24));
                     return true;
@@ -1053,7 +1110,7 @@ impl State {
         }
     }
     fn wheel(&mut self, delta: i16, mods: KeyModifiers) -> bool {
-        if self.modal || self.switcher || self.picker {
+        if self.modal || self.switcher || self.picker || self.hints {
             return false;
         }
         let Some(target) = &self.target else {
@@ -1099,34 +1156,54 @@ impl State {
         true
     }
 }
-fn pane_shortcut(
-    vk: u32,
-    mods: KeyModifiers,
-    terminal_focused: bool,
-    right_alt: bool,
-) -> Option<Shortcut> {
-    if !terminal_focused || right_alt {
-        return None;
-    }
-    let pane_mods = KeyModifiers::CTRL | KeyModifiers::ALT;
-    if mods == pane_mods {
-        Some(Shortcut::FocusPane(match vk {
-            0x25 => Direction::Left,
-            0x26 => Direction::Up,
-            0x27 => Direction::Right,
-            0x28 => Direction::Down,
-            _ => return None,
-        }))
-    } else if mods == (pane_mods | KeyModifiers::SHIFT) {
-        match vk {
-            0x27 => Some(Shortcut::SplitRight),
-            0x28 => Some(Shortcut::SplitBelow),
-            0x5a => Some(Shortcut::ZoomPane),
-            0x57 => Some(Shortcut::ClosePane),
-            _ => None,
+impl From<Action> for Shortcut {
+    fn from(action: Action) -> Self {
+        match action {
+            Action::FocusLeft => Self::FocusPane(Direction::Left),
+            Action::FocusRight => Self::FocusPane(Direction::Right),
+            Action::FocusUp => Self::FocusPane(Direction::Up),
+            Action::FocusDown => Self::FocusPane(Direction::Down),
+            Action::SplitRight => Self::SplitRight,
+            Action::SplitBelow => Self::SplitBelow,
+            Action::ZoomPane => Self::ZoomPane,
+            Action::ClosePane => Self::ClosePane,
+            Action::MovePane => Self::MovePane,
+            Action::Workspaces => Self::Workspaces,
+            Action::PanePicker => Self::PanePicker,
+            Action::KeyboardHints => Self::KeyboardHints,
+            Action::NextTab => Self::NextTab,
+            Action::PreviousTab => Self::PreviousTab,
+            Action::NewTab => Self::NewTab,
+            Action::CloseTab => Self::CloseTab,
+            Action::SelectTab(number) => Self::Select(usize::from(number - 1)),
         }
-    } else {
-        None
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SwitchTrigger {
+    Modifier(KeyModifiers),
+    Key(u32),
+}
+impl SwitchTrigger {
+    fn new(vk: u32, mods: KeyModifiers) -> Self {
+        [KeyModifiers::CTRL, KeyModifiers::ALT, KeyModifiers::SHIFT]
+            .into_iter()
+            .find(|flag| mods.contains(*flag))
+            .map_or(Self::Key(vk), Self::Modifier)
+    }
+    fn released(self, vk: u32, mods: KeyModifiers) -> bool {
+        match self {
+            Self::Key(key) => key == vk,
+            Self::Modifier(flag) => {
+                !mods.contains(flag)
+                    && match flag {
+                        KeyModifiers::CTRL => matches!(vk, 0x11 | 0xa2 | 0xa3),
+                        KeyModifiers::ALT => matches!(vk, 0x12 | 0xa4 | 0xa5),
+                        _ => matches!(vk, 0x10 | 0xa0 | 0xa1),
+                    }
+            }
+        }
     }
 }
 pub fn cell_pixel_offset(coordinate: f32, cell: f32, scale: f32) -> isize {
@@ -1203,30 +1280,14 @@ mod tests {
     use w11term::{options::Source, session::Session};
 
     #[test]
-    fn pane_shortcuts_require_terminal_focus_and_leave_altgr_and_tab_digits_available() {
-        let navigate = KeyModifiers::CTRL | KeyModifiers::ALT;
-        let action = navigate | KeyModifiers::SHIFT;
-        for (vk, mods, expected) in [
-            (0x25, navigate, Shortcut::FocusPane(Direction::Left)),
-            (0x26, navigate, Shortcut::FocusPane(Direction::Up)),
-            (0x27, navigate, Shortcut::FocusPane(Direction::Right)),
-            (0x28, navigate, Shortcut::FocusPane(Direction::Down)),
-            (0x27, action, Shortcut::SplitRight),
-            (0x28, action, Shortcut::SplitBelow),
-            (0x5a, action, Shortcut::ZoomPane),
-            (0x57, action, Shortcut::ClosePane),
-        ] {
-            assert_eq!(pane_shortcut(vk, mods, true, false), Some(expected));
-            assert_eq!(pane_shortcut(vk, mods, false, false), None);
-            assert_eq!(pane_shortcut(vk, mods, true, true), None);
-            assert_eq!(
-                pane_shortcut(vk, mods | KeyModifiers::SUPER, true, false),
-                None
-            );
-        }
-        for vk in 0x31..=0x39 {
-            assert_eq!(pane_shortcut(vk, navigate, true, false), None);
-        }
+    fn tab_switcher_commits_when_the_remapped_trigger_is_released() {
+        let trigger = SwitchTrigger::new(0x75, KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert!(!trigger.released(0xa0, KeyModifiers::ALT));
+        assert!(!trigger.released(0xa4, KeyModifiers::ALT));
+        assert!(trigger.released(0xa4, KeyModifiers::NONE));
+        let single = SwitchTrigger::new(0x77, KeyModifiers::NONE);
+        assert!(!single.released(0xa2, KeyModifiers::NONE));
+        assert!(single.released(0x77, KeyModifiers::NONE));
     }
     #[test]
     fn simultaneous_left_and_right_modifiers_have_distinct_press_identities() {
@@ -1322,12 +1383,16 @@ mod tests {
             details: HashMap::new(),
             surrogate: Some(0xd800),
             preferences: Interaction::default(),
+            keymap: Shortcuts::default().keymap().unwrap(),
+            switcher_trigger: SwitchTrigger::Modifier(KeyModifiers::CTRL),
             selection: false,
             switcher: false,
             grid: None,
             window: None,
             search: false,
             picker: false,
+            hints: false,
+            hint_held: HashSet::new(),
             wheel_panes: WheelPanes::default(),
             wheel_remainder: 0,
             zoom_remainder: 0,
@@ -1393,6 +1458,22 @@ mod tests {
         assert!(
             new_input.try_recv().is_err(),
             "picker input reached the shell"
+        );
+        state.hints = true;
+        let hint = |msg, repeat| MSG {
+            message: msg,
+            wParam: WPARAM(b'C' as usize),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        assert!(state.handle(&hint(WM_KEYDOWN, false)));
+        assert!(state.handle(&hint(WM_CHAR, false)));
+        state.hints = false;
+        assert!(state.handle(&hint(WM_KEYDOWN, true)));
+        assert!(state.handle(&hint(WM_KEYUP, false)));
+        assert!(
+            new_input.try_recv().is_err(),
+            "a hint key reached the terminal after dismissal"
         );
         state.game_mode = true;
         let key_message = |message, repeat| MSG {

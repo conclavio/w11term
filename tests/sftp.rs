@@ -69,7 +69,7 @@ impl server::Handler for Peer {
             )?;
             s.data(
                 c,
-                b"\x1b]7;file://127.0.0.1/shell%20directory\x1b\\".as_slice(),
+                b"src/trace.rs:11:1\r\n\x1b]7;file://127.0.0.1/shell%20directory\x1b\\".as_slice(),
             )?;
         }
         Ok(())
@@ -81,6 +81,13 @@ impl server::Handler for Peer {
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
         if self.channels.contains_key(&c) {
+            #[cfg(feature = "ui-smoke")]
+            if self.root.join("keyboard-input.bin").exists() {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.root.join("keyboard-input.bin"))?
+                    .write_all(data)?;
+            }
             s.data(c, data.to_vec())?;
         }
         Ok(())
