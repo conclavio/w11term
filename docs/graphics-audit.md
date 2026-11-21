@@ -99,6 +99,11 @@ dbus-run-session -- xvfb-run -a /usr/bin/python3 tests/kitty-reference.py artifa
 Each job uploads its full window PNG, terminal log, package versions, measured
 PTY geometry and a per-cell report with pixel coordinates and expected and
 observed RGB. A mismatch of 32 or more in any channel fails the check.
+The Linux captures use 9-pixel-wide cells so each placeholder cell has a
+single center pixel. Ghostty's default 10-pixel-wide cell puts the center
+between two pixels. On the red/green boundary its right-hand pixel already
+contains interpolated green. The Ghostty harness sets `adjust-cell-width=-1`
+for the pinned font and Xvfb display.
 The five colored sample points test placement and selected pixels. GPU interpolation,
 general deletion selectors, placeholders under every rendition attribute, and every
 possible compositing edge remain outside this fixture.
