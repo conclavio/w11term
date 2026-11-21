@@ -538,6 +538,12 @@ enum UiWork {
     AttentionChanged,
 }
 
+struct CaretMenuBinding {
+    pane: Option<u64>,
+    exited: Option<ExitedPane>,
+    on_click: Callback<String>,
+}
+
 pub struct TerminalApp {
     taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
@@ -566,6 +572,7 @@ pub struct TerminalApp {
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
+    caret_menu_binding: RefCell<Option<CaretMenuBinding>>,
     frame_tasks: BTreeMap<TabId, ComponentTask>,
     watcher_retry: Option<crate::ui_timer::RetryTimer>,
     watch_epoch: u64,
@@ -2392,6 +2399,34 @@ impl TerminalApp {
         }
     }
 
+    fn caret_menu_callback(
+        &self,
+        context: &ViewContext<Self>,
+        exited: Option<ExitedPane>,
+    ) -> Callback<String> {
+        let pane = self.tabs.active().and_then(AppTab::pane_id);
+        let mut cached = self.caret_menu_binding.borrow_mut();
+        if let Some(binding) = cached.as_ref()
+            && binding.pane == pane
+            && binding.exited == exited
+        {
+            return binding.on_click.clone();
+        }
+        // Reactor replaces a flyout when its callback changes. Keep the same
+        // callback while repainting the title bar for the same action target.
+        let on_click = context.callback(move |label: String| match label.as_str() {
+            scrollback_export::LABEL => Message::Export(scrollback_export::Action::Start(pane)),
+            RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
+            _ => tab_menu_message(label),
+        });
+        *cached = Some(CaretMenuBinding {
+            pane,
+            exited,
+            on_click: on_click.clone(),
+        });
+        on_click
+    }
+
     fn header_view(&self, context: &ViewContext<Self>) -> View {
         let mut progress = BTreeMap::new();
         for entry in self.tabs.entries() {
@@ -2459,7 +2494,6 @@ impl TerminalApp {
                 self.profile_items(),
                 context.callback(Message::ProfileMenu),
             ));
-        let pane = self.tabs.active().and_then(AppTab::pane_id);
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
@@ -2469,15 +2503,7 @@ impl TerminalApp {
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
                 self.caret_items(exited.is_some()),
-                context.callback(move |label: String| match label.as_str() {
-                    scrollback_export::LABEL => {
-                        Message::Export(scrollback_export::Action::Start(pane))
-                    }
-                    RESTART_EXITED_PANE => {
-                        exited.map_or(Message::ControlIdle, Message::RestartExited)
-                    }
-                    _ => tab_menu_message(label),
-                }),
+                self.caret_menu_callback(context, exited),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -3269,6 +3295,7 @@ impl Component for TerminalApp {
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
+            caret_menu_binding: RefCell::new(None),
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
             inspection: None,
