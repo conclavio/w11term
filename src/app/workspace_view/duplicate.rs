@@ -3,9 +3,16 @@ use anyhow::{Result, bail, ensure};
 
 /// A duplicate starts ordinary shells only. Keep this check cheap enough for
 /// disabled menu/palette state; filesystem preflight happens on invocation.
-fn eligible(source: &Source, discovery: bool, startup: bool) -> Result<()> {
-    if startup {
-        bail!("This tab contains an SSH workspace startup command or directory");
+fn eligible(source: &Source, discovery: bool, startup: Option<&SshStartup>) -> Result<()> {
+    if let Some(startup) = startup {
+        ensure!(
+            startup.command.is_empty(),
+            "This tab contains an SSH workspace startup command"
+        );
+        let Source::Ssh(options) = source else {
+            bail!("A remote starting directory requires an SSH pane")
+        };
+        startup.check_target(options)?;
     }
     if discovery {
         bail!("This tab contains a remote session browser or viewer");
@@ -45,6 +52,7 @@ struct NewShell {
     profile: Option<String>,
     size: TerminalSize,
     read_only: bool,
+    startup: Option<Box<SshStartup>>,
 }
 
 impl NewShell {
@@ -70,12 +78,25 @@ impl NewShell {
             label,
             size: live.last_size.get().unwrap_or_default(),
             read_only: live.read_only.get(),
+            startup: live.startup.clone(),
         })
     }
 
     fn launch(self, osc52: bool) -> AppTab {
-        let tab = live_tab_sized(self.label, self.source, self.size, osc52, None, None)
-            .with_profile(self.profile);
+        let tab = if let (Some(startup), Source::Ssh(options)) = (self.startup, &self.source) {
+            // A directory-only recipe opens an interactive shell. Its directory
+            // was bound to this endpoint when the user saved it in w11term.
+            let session =
+                Session::start_workspace_ssh(options.clone(), self.size, osc52, (*startup).clone());
+            let mut tab = live_tab_for_session(self.label, self.source, session);
+            if let Page::Terminal(live) = &mut tab.page {
+                live.startup = Some(startup);
+            }
+            tab
+        } else {
+            live_tab_sized(self.label, self.source, self.size, osc52, None, None)
+        }
+        .with_profile(self.profile);
         if let Page::Terminal(live) = &tab.page {
             KeyboardBridge::set_read_only(&live.session.input, &live.read_only, self.read_only);
         }
@@ -101,7 +122,7 @@ impl TerminalApp {
             eligible(
                 &live.source,
                 live.discovery_page.is_some(),
-                live.startup.is_some(),
+                live.startup.as_deref(),
             )?;
             if let Source::Ssh(_) = &live.source
                 && live.session.player.read().unwrap().rustmush
@@ -165,15 +186,22 @@ mod tests {
     #[test]
     fn duplicate_accepts_ordinary_shells_and_refuses_startup_or_attachment_replay() {
         let standard = Source::Ssh(ssh());
-        assert!(eligible(&standard, false, false).is_ok());
+        assert!(eligible(&standard, false, None).is_ok());
+        let directory =
+            SshStartup::new(&ssh(), "/srv/crew's project".into(), String::new()).unwrap();
+        assert!(eligible(&standard, false, Some(&directory)).is_ok());
+        let mut changed = ssh();
+        changed.host = "different.test".into();
+        assert!(eligible(&Source::Ssh(changed), false, Some(&directory)).is_err());
+        let command = SshStartup::new(&ssh(), String::new(), "echo hello".into()).unwrap();
         assert!(
-            eligible(&standard, true, false)
+            eligible(&standard, true, None)
                 .unwrap_err()
                 .to_string()
                 .contains("viewer")
         );
         assert!(
-            eligible(&standard, false, true)
+            eligible(&standard, false, Some(&command))
                 .unwrap_err()
                 .to_string()
                 .contains("workspace startup")
@@ -181,7 +209,7 @@ mod tests {
         let mut durable = ssh();
         durable.durable = true;
         assert!(
-            eligible(&Source::Ssh(durable), false, false)
+            eligible(&Source::Ssh(durable), false, None)
                 .unwrap_err()
                 .to_string()
                 .contains("durable")
@@ -189,7 +217,7 @@ mod tests {
         let mut game = ssh();
         game.player.rustmush = true;
         assert!(
-            eligible(&Source::Ssh(game), false, false)
+            eligible(&Source::Ssh(game), false, None)
                 .unwrap_err()
                 .to_string()
                 .contains("RustMUSH")
@@ -200,7 +228,7 @@ mod tests {
             local("cmd.exe", &[]),
             local("wsl.exe", &[]),
         ] {
-            assert!(eligible(&source, false, false).is_ok(), "{source:?}");
+            assert!(eligible(&source, false, None).is_ok(), "{source:?}");
         }
         for source in [
             Source::Demo,
@@ -210,7 +238,7 @@ mod tests {
             local("maintenance.cmd", &[]),
             local("wsl.exe", &["--exec", "make"]),
         ] {
-            assert!(eligible(&source, false, false).is_err(), "{source:?}");
+            assert!(eligible(&source, false, None).is_err(), "{source:?}");
         }
     }
 
