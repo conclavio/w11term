@@ -81,7 +81,7 @@ jobs:
         run: cargo build --locked --features ui-smoke --bins --example echo_server
       - name: Set the desktop size for native resize and accessibility assertions
         run: Set-DisplayResolution -Width 1920 -Height 1080 -Force
-      - name: Verify SSH splits, shortcuts, pane picker focus, file transfers, ConPTY, durable panes and accessibility
+      - name: Verify native SSH and ConPTY workflows, command notifications, durable panes and accessibility
         run: cargo test --locked --features ui-smoke --test accessibility --test durable_ssh --test sftp -- --ignored --test-threads=1
       - name: Copy Unicode text through the real OSC 52 clipboard path
         run: |

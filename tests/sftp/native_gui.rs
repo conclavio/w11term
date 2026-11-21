@@ -10,6 +10,48 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "watches OSC 133 commands in a background SSH tab while a real PowerShell stays active"]
+async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    let start = "\x1b]133;A\x07$ \x1b]133;B\x07build\r\n\x1b]133;C\x07";
+    fs::write(
+        remote.path().join("copy-history.vt"),
+        format!("{start}command-started\r\n"),
+    )
+    .unwrap();
+
+    // The peer echoes these packets. Each witness is rendered after the OSC, so
+    // the UI driver can check both positive and negative outcomes without sleeps.
+    let mut packets = serde_json::Map::new();
+    let mut expected = Vec::new();
+    for (witness, prefix, completion) in [
+        ("first-complete", "", "\x1b]133;D;17\x07"),
+        ("not-rearmed", start, "\x1b]133;D;0\x07"),
+        ("cancel-complete", start, "\x1b]133;D;9\x07"),
+        ("next-complete", start, "\x1b]133;D\x07"),
+    ] {
+        let bytes = format!("{prefix}{completion}{witness}\r\n");
+        expected.extend_from_slice(bytes.as_bytes());
+        packets.insert(witness.to_owned(), Value::String(bytes));
+    }
+    fs::write(
+        state.path().join("commands.json"),
+        serde_json::to_vec(&packets).unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("command-finish-ui.ps1", &ssh, state.path());
+    expected.extend_from_slice(b"ssh-resumed");
+    assert_eq!(fs::read(trace).unwrap(), expected);
+    assert_eq!(opens.load(Ordering::Relaxed), 1, "one live shell channel");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reorders saved SSH and local profiles in Settings and launches them from the native menu"]
 async fn native_profile_order_survives_restart_and_launches_the_selected_backend() {
     run_palette_fixture("profile-order-ui.ps1", b"ordered-ssh", None).await;
