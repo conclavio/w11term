@@ -47,6 +47,8 @@ pub enum Command {
     Text(String),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
+    /// Capture immutable UTF-8 text on this worker. The caller owns all file I/O.
+    ExportText(tokio::sync::oneshot::Sender<Result<String, &'static str>>),
     Resize(TerminalSize),
     Scroll(isize),
     ScrollTo(isize),
@@ -568,6 +570,12 @@ async fn run(
                     }
                     Some(Command::Capture(reply)) => {
                         let _ = reply.send(presentation.capture());
+                        Ok(())
+                    }
+                    Some(Command::ExportText(reply)) => {
+                        if !reply.is_closed() {
+                            let _ = reply.send(terminal::export_text(&terminal));
+                        }
                         Ok(())
                     }
                     Some(Command::Key { key, modifiers, down,repeat }) => {

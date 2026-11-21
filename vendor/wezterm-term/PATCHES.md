@@ -57,3 +57,6 @@ The original MIT license is preserved in `LICENSE.md`.
   states with an omitted or zero value reuse the previous percentage, including
   across indeterminate updates. A fresh warning starts at 10%, matching Windows
   Terminal. RIS and transport reset clear both the state and the stored value.
+
+- `Screen::physical_lines` provides a borrowed, double-ended iterator over
+  retained rows for plain-text exports without cloning scrollback.
