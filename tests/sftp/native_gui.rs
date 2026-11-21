@@ -39,8 +39,15 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
     if let Some(history) = history {
         fs::write(remote.path().join("copy-history.vt"), history).unwrap();
     }
+    drive_mixed_gui(script, &ssh, state.path());
+    assert_eq!(fs::read(trace).unwrap(), expected_input);
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+fn drive_mixed_gui(script: &str, ssh: &SshOptions, state: &std::path::Path) {
     fs::write(
-        state.path().join("profiles.json"),
+        state.join("profiles.json"),
         serde_json::to_vec(&json!({"profiles":{
         "palette-ssh":ssh, "Palette PowerShell":{
             "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]}}}))
@@ -48,7 +55,7 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
     )
     .unwrap();
     fs::write(
-        state.path().join("appearance.json"),
+        state.join("appearance.json"),
         br#"{"shortcuts":{"command_palette":"F7","select_tab_1":"F8","copy_mode":"F9"}}"#,
     )
     .unwrap();
@@ -66,7 +73,7 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
             env!("CARGO_BIN_EXE_w11term-cli"),
         ])
         .arg("-State")
-        .arg(state.path())
+        .arg(state)
         .output()
         .unwrap();
     assert!(
@@ -74,10 +81,61 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
         "{}\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
-        fs::read_to_string(state.path().join("gui.log")).unwrap_or_default()
+        fs::read_to_string(state.join("gui.log")).unwrap_or_default()
     );
-    assert_eq!(fs::read(trace).unwrap(), expected_input);
-    assert_eq!(opens.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "creates remote folders through the native SFTP drawer while a PowerShell pane is live"]
+async fn native_new_folder_uses_the_selected_sftp_parent_and_preserves_existing_entries() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let parent = remote.path().join("shell directory").join("projects");
+    let existing = parent.join("kept");
+    fs::create_dir_all(&existing).unwrap();
+    let directory_sentinel = b"keep\0the\x80child";
+    fs::write(existing.join("sentinel.bin"), directory_sentinel).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let raced_file = [0, 255, 17, 13, 10, 128];
+    fs::write(state.path().join("collision.bin"), raced_file).unwrap();
+    let mkdir_trace = remote.path().join("mkdir-trace");
+    fs::write(&mkdir_trace, []).unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+
+    drive_mixed_gui("new-folder-ui.ps1", &ssh, state.path());
+
+    let mut names: Vec<_> = fs::read_dir(&parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Logs 雪 (1)", "kept", "raced.bin"]);
+    assert!(parent.join("Logs 雪 (1)").is_dir());
+    assert_eq!(
+        fs::read(existing.join("sentinel.bin")).unwrap(),
+        directory_sentinel
+    );
+    assert_eq!(fs::read(parent.join("raced.bin")).unwrap(), raced_file);
+    assert_eq!(
+        fs::read_to_string(mkdir_trace)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "/shell directory/projects/kept",
+            "/shell directory/projects/raced.bin",
+            "/shell directory/projects/Logs 雪 (1)",
+        ],
+        "cancel sends no MKDIR and each confirmed action uses the canonical parent"
+    );
+    assert_eq!(fs::read(trace).unwrap(), b"folder-ssh-resumed");
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and one SFTP channel"
+    );
     server.abort();
 }
 
