@@ -29,6 +29,7 @@ function Tap([uint32]$Vk, [int]$Scan, [bool]$Extended) {
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profile','keypad-fixture','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
+    $traceReader = Open-PeerTraceReader $Trace
     $window = Wait-Until 'bound fixture window' {
         $app.Refresh()
         if ($app.MainWindowTitle -like 'w11term *keypad-fixture*') { $app.MainWindowHandle }
@@ -59,10 +60,10 @@ try {
     Tap 0x7B 0x58 $false # F12 marks the end of the same message queue
     $fence = if ($Kitty) { [char]27 + '[24;1:3~' } else { [char]27 + '[24~' }
     $null = Wait-Until 'SSH peer to receive the trailing F12' {
-        try { [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Trace)).EndsWith($fence) }
-        catch [IO.IOException] { $false }
+        [Text.Encoding]::ASCII.GetString((Read-PeerTrace $traceReader)).EndsWith($fence)
     }
 } finally {
+    if ($traceReader) { $traceReader.Dispose() }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
