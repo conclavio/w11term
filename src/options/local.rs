@@ -20,12 +20,15 @@ impl LocalOptions {
     /// Only append a startup file when all existing arguments have an
     /// unambiguous, interactive meaning in both PowerShell 5.1 and 7.
     pub fn supports_powershell_integration(executable: &Path, args: &[String]) -> bool {
-        executable
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.eq_ignore_ascii_case("powershell.exe") || name.eq_ignore_ascii_case("pwsh.exe")
-            })
+        let Some(name) = executable.file_name() else {
+            return false;
+        };
+        let full_name =
+            name.eq_ignore_ascii_case("powershell.exe") || name.eq_ignore_ascii_case("pwsh.exe");
+        // CreateProcessW adds .exe to a bare command name, but not to a path.
+        let bare_name = name == executable.as_os_str()
+            && (name.eq_ignore_ascii_case("powershell") || name.eq_ignore_ascii_case("pwsh"));
+        (full_name || bare_name)
             && args.iter().all(|arg| {
                 ["-NoProfile", "-NoLogo", "-NoExit", "-STA", "-MTA"]
                     .iter()
@@ -138,12 +141,16 @@ mod tests {
             &["-nOpROFILE", "-NoLOGO", "-noexit"]
         ));
         assert!(supports("pwsh.exe", &["-MTA"]));
+        assert!(supports("pWsH", &["-NoProfile"]));
+        assert!(supports("PowerShell", &[]));
         for exe in [
             "cmd.exe",
             "powershell.cmd",
             "pwsh.exe.cmd",
             "other-pwsh.exe",
-            "pwsh",
+            r".\pwsh",
+            r"C:\shells\powershell",
+            "pwsh.",
         ] {
             assert!(!supports(exe, &[]), "{exe}");
         }
