@@ -60,6 +60,7 @@ pub enum Command {
     Search {
         query: String,
         sensitive: bool,
+        regex: bool,
     },
     SearchNavigate(isize),
     SearchClose,
@@ -626,8 +627,10 @@ async fn run(
                     }
                     Some(Command::ScrollEdge(oldest)) => { if !terminal.is_alt_screen_active() {scroll_offset = if oldest {crate::search::max_offset(&terminal)}else{0};} Ok(()) }
                     Some(Command::Prompt(direction)) => {scroll_offset = crate::search::prompt_offset(&mut terminal,scroll_offset,direction);Ok(())}
-                    Some(Command::Search {query,sensitive}) => {
-                        if query.len()<=4096 {scroll_offset=search.configure(query,sensitive,&terminal,scroll_offset);search_dirty=false;} Ok(())
+                    Some(Command::Search { query, sensitive, regex }) => {
+                        scroll_offset = search.configure_with_mode(query, sensitive, regex, &terminal, scroll_offset);
+                        search_dirty = false;
+                        Ok(())
                     }
                     Some(Command::SearchNavigate(direction)) => {
                         if search_dirty {search.refresh(&terminal,scroll_offset);search_dirty=false;}

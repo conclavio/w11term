@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 public static class FixtureMessages {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(
         IntPtr hwnd, uint msg, UIntPtr key, IntPtr detail);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }
 '@
 
@@ -18,6 +19,16 @@ function Wait-Until([string]$Description, [scriptblock]$Probe) {
         Start-Sleep -Milliseconds 80
     } while ([DateTime]::UtcNow -lt $until)
     throw "Timed out waiting for $Description"
+}
+function Wait-InputWindow {
+    # The GUI replaces its bootstrap title only after installing the HWND's input route.
+    $prefix = 'w11term ' + [char]0xb7 + ' '
+    return Wait-Until 'the fixture window to bind its keyboard' {
+        $app.Refresh()
+        if ($app.MainWindowHandle -ne [IntPtr]::Zero -and $app.MainWindowTitle.StartsWith($prefix)) {
+            $app.MainWindowHandle
+        }
+    }
 }
 function Control([string[]]$Command) {
     $reply = & $Cli --pid $app.Id @Command | ConvertFrom-Json
@@ -57,6 +68,26 @@ function Post-Key([uint32]$Message, [uint32]$Key) {
 function Press-Key([uint32]$Key) {
     Post-Key 0x100 $Key
     Post-Key 0x101 $Key
+}
+function Open-Palette([string]$Command) {
+    Press-Key 0x76 # F7 in the fixture's keymap
+    try {
+        return Wait-Until "F7 to focus command search for '$Command'" {
+            $entry = Find-Element 'Search commands' ([System.Windows.Automation.ControlType]::Edit)
+            if ($entry -and $entry.Current.HasKeyboardFocus) { $entry }
+        }
+    } catch {
+        $mounted = $null -ne (Find-Element 'Search commands' ([System.Windows.Automation.ControlType]::Edit))
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        $focus = if ($focused -and $focused.Current.ProcessId -eq $app.Id) { $focused.Current.Name } else { '(outside fixture)' }
+        throw "$_ Search edit mounted: $mounted. Foreground HWND: $([FixtureMessages]::GetForegroundWindow()), fixture HWND: $window. Focus: $focus"
+    }
+}
+function Run-Palette([string]$Command) {
+    $field = Open-Palette $Command
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
+    Invoke-Button (Wait-Until $Command { Find-Element $Command ([System.Windows.Automation.ControlType]::Button) })
+    $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
 }
 function Wait-Focus([int]$Pane) {
     try {

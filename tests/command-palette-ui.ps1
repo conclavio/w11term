@@ -7,14 +7,6 @@ $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 
-function Open-Palette {
-    Press-Key 0x76 # F7 is this fixture's remapped palette shortcut
-    return Wait-Until 'keyboard focus in command search' {
-        $element = Find-Element 'Search commands'
-        if ($element -and $element.Current.HasKeyboardFocus) { return $element }
-    }
-}
-
 function Search-Command($Field, [string]$Query, [string]$Expected) {
     $Field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
     return Wait-Until "command result $Expected" {
@@ -24,11 +16,11 @@ function Search-Command($Field, [string]$Query, [string]$Expected) {
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
-    $window = Wait-Until 'window handle' { $app.Refresh(); if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } }
+    $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
-    $field = Open-Palette
+    $field = Open-Palette 'Move pane to existing tab'
     $disabled = Search-Command $field 'move existing' ('Move pane to existing tab' + [char]0x2026)
     if ($disabled.Current.IsEnabled) { throw 'Move needs a second terminal tab' }
     Press-Key 13
@@ -55,17 +47,17 @@ try {
     Press-Key 13
     $null = Control @('wait-for-text','--pane',"$local",'--timeout','10','palette-local-42')
 
-    $field = Open-Palette
+    $field = Open-Palette 'Rename tab'
     $null = Search-Command $field 'rename' ('Rename tab' + [char]0x2026)
     Press-Key 13
     $null = Wait-Until 'tab name dialog' { Find-Element 'Tab name' }
     Invoke-Button (Wait-Until 'cancel rename' { Find-Element 'Cancel' ([System.Windows.Automation.ControlType]::Button) })
     $null = Wait-Until 'tab name dialog to close' { !(Find-Element 'Tab name') }
-    $field = Open-Palette
+    $field = Open-Palette 'Settings'
     $null = Search-Command $field 'settings' 'Settings'
     Press-Key 13
     $null = Wait-Until 'settings utility tab' { Find-Element 'Keyboard' }
-    $field = Open-Palette
+    $field = Open-Palette 'Copy selection'
     $disabled = Search-Command $field 'copy selection' 'Copy selection    Ctrl+Shift+C'
     if ($disabled.Current.IsEnabled) { throw 'Settings has no terminal selection' }
     $null = Search-Command $field 'F8' 'Select tab 1    F8'
