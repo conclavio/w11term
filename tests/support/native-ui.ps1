@@ -7,6 +7,21 @@ public static class FixtureMessages {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(
         IntPtr hwnd, uint msg, UIntPtr key, IntPtr detail);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint MapVirtualKeyW(uint key, uint mapping);
+    public static bool PostKey(IntPtr hwnd, uint msg, uint key) {
+        uint detail = 0;
+        if (msg == 0x100 || msg == 0x101) { // WM_KEYDOWN / WM_KEYUP
+            uint scan = MapVirtualKeyW(key, 4); // MAPVK_VK_TO_VSC_EX, including the E0 prefix
+            detail = 1 | ((scan & 0xff) << 16);
+            // Windows can report the shared keypad scan for arrows/navigation. The
+            // generic fixtures press the dedicated cluster; keypad fixtures encode their own.
+            if ((scan >> 8) == 0xe0 || (key >= 0x21 && key <= 0x28) || key == 0x2d || key == 0x2e)
+                detail |= 1u << 24;
+            // TranslateMessage treats a release with the transition bit clear as another press.
+            if (msg == 0x101) detail |= 0xc0000000u;
+        }
+        return PostMessage(hwnd, msg, new UIntPtr(key), new IntPtr(unchecked((int)detail)));
+    }
 }
 '@
 
@@ -61,7 +76,7 @@ function Invoke-Button($Element) {
 }
 function Post-Key([uint32]$Message, [uint32]$Key) {
     # Address this process's window. This never types into the foreground application.
-    if (-not [FixtureMessages]::PostMessage($window, $Message, [UIntPtr]::new($Key), [IntPtr]::Zero)) {
+    if (-not [FixtureMessages]::PostKey($window, $Message, $Key)) {
         throw "Could not post key event to the fixture window"
     }
 }
