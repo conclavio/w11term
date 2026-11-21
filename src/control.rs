@@ -40,6 +40,10 @@ pub enum Request {
         pane: u64,
         path: Option<PathBuf>,
     },
+    Restart {
+        pane: u64,
+        exit_token: u64,
+    },
     WaitForText {
         pane: u64,
         pattern: String,
@@ -169,6 +173,17 @@ pub struct Pane {
     pub input: mpsc::UnboundedSender<Command>,
 }
 impl Registry {
+    async fn pane_events(pane: &Pane) -> Result<crate::events::Events> {
+        let (reply, response) = oneshot::channel();
+        pane.input
+            .send(Command::Events(reply))
+            .context("pane is closed")?;
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("pane did not respond")?
+            .context("pane is closed")
+    }
+
     async fn capture(pane: &Pane) -> Result<(Snapshot, TerminalSize)> {
         let (tx, rx) = oneshot::channel();
         pane.input
@@ -234,6 +249,12 @@ impl Registry {
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
             }
+            Request::Restart { pane, exit_token } => {
+                let target = self.pane(pane)?;
+                let events = Self::pane_events(&target).await?;
+                events.restart_exited(&target.input, exit_token)?;
+                Ok(json!({"pane":pane,"exit_token":exit_token,"accepted":true}))
+            }
             Request::Events {
                 pane,
                 since,
@@ -243,19 +264,15 @@ impl Registry {
                     timeout_seconds <= 3600,
                     "events timeout must be 0..=3600 seconds"
                 );
-                let (reply, response) = oneshot::channel();
-                self.pane(pane)?
-                    .input
-                    .send(Command::Events(reply))
-                    .context("pane is closed")?;
-                let events = tokio::time::timeout(TIMEOUT, response).await??;
+                let events = Self::pane_events(&self.pane(pane)?).await?;
                 ensure!(
                     since <= events.since(0).next,
                     "event cursor is ahead of this pane; check the instance/pane identity"
                 );
-                Ok(
-                    json!({"pane":pane,"journal":events.wait(since,Duration::from_secs(timeout_seconds)).await}),
-                )
+                let journal = events
+                    .wait(since, Duration::from_secs(timeout_seconds))
+                    .await;
+                Ok(json!({"pane":pane,"journal":journal,"restart_token":events.restart_token()}))
             }
             Request::WaitForText {
                 pane,

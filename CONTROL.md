@@ -124,7 +124,7 @@ the current window grid. Replies return `pane`, `cols`, `rows`, and `active`. Ne
 tabs may still be connecting or awaiting a native trust/authentication prompt;
 scripts can inspect `list`. No command starts a new GUI process.
 
-`events` returns `{"pane":1,"journal":{"events":[...],"next":42,"oldest":1,"lost":false}}`.
+`events` returns `{"pane":1,"journal":{"events":[...],"next":42,"oldest":1,"lost":false},"restart_token":null}`.
 Each event has `sequence`, Unix `timestamp_ms`, `kind`, and JSON `data`. Use the
 returned `next` for the next request. `--timeout` long-polls until an event arrives
 (default 0, range 0–3600). Cursors are per pane and process; a future cursor fails.
@@ -139,11 +139,27 @@ the originating pane. Its data is `{"exit_code":17}` for a reported status or
 `{"exit_code":null}` when the shell supplied none. Command lines and output stay
 out of this event.
 
+When a direct SSH shell or local program finishes, a restartable pane emits
+`pane-exited` with `{"exit_token":1}`. The top-level `restart_token` in the
+events result identifies its current exit, even if the event has aged out.
+Use that token with the same process and pane ID to restart the program in
+place. Each exit can be claimed once. Live and reconnecting panes have a
+null token. The restart reply acknowledges the request. Use `list` to observe
+the new connection generation or `wait-for-text` for an application prompt.
+
+```powershell
+$state = (& $ctl --pid 12345 events --pane $pane | ConvertFrom-Json).result
+if ($null -ne $state.restart_token) {
+    & $ctl --pid 12345 restart --pane $pane --exit-token $state.restart_token
+}
+```
+
 ```json
 {"verb":"wait-for-text","pane":1,"pattern":"fps=\\d+","regex":true,"timeout_seconds":15}
 {"verb":"resize","pane":1,"cols":170,"rows":48}
 {"verb":"open","profile":"play-6792","cols":170,"rows":48,"activate":false}
 {"verb":"events","pane":1,"since":42,"timeout_seconds":30}
+{"verb":"restart","pane":1,"exit_token":1}
 ```
 
 ## VT recording
