@@ -5,6 +5,15 @@ param(
     [string]$CliPath
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class WorkspaceFocus {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+}
+'@
 $gui = (Resolve-Path -LiteralPath $GuiPath).Path
 if (-not $CliPath) { $CliPath = Join-Path (Split-Path -Parent $gui) 'w11term-cli.exe' }
 $ctl = (Resolve-Path -LiteralPath $CliPath).Path
@@ -39,11 +48,13 @@ function Assert-FailedLaunch([string]$Name, [string]$Expected) {
 }
 
 $terminal = $null
+$picker = $null
+$first = $null
+$second = $null
 try {
     $env:W11TERM_DATA_DIR = $data
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
-    [Environment]::SetEnvironmentVariable('W11TERM_UI_SMOKE', $null, 'Process')
-    [Environment]::SetEnvironmentVariable('W11TERM_WORKSPACE_SMOKE', $null, 'Process')
+    Remove-Item Env:W11TERM_UI_SMOKE, Env:W11TERM_WORKSPACE_SMOKE -ErrorAction SilentlyContinue
     [IO.File]::WriteAllText($profiles, '{"profiles":{}}', $encoding)
     $fixture = @'
 {
@@ -96,7 +107,46 @@ try {
         Start-Sleep -Milliseconds 100
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $ready) { throw "Workspace layout, focus or grid mismatch. Last list: $($reply | ConvertTo-Json -Depth 5 -Compress). See $state" }
+    $ids = @($sessions.id | Sort-Object) -join ','
+    $picker = Start-WorkspaceGui @('--demo') 'picker.err'
+    $app = $picker
+    $window = Wait-Until 'picker window' { $app.Refresh(); if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $app.MainWindowHandle } }
+    foreach ($attempt in 1..2) {
+        Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
+        Invoke-Button (Wait-Until 'Workspaces menu item' { Find-Element ('Workspaces' + [char]0x2026) })
+        $search = Wait-Until 'workspace search box' { Find-Element 'Find workspace' }
+        $search.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('TWO')
+        $switch = Wait-Until 'filtered switch result' {
+            if (-not (Find-Element 'Switch to workspace missing-profile')) { Find-Element 'Switch to workspace two-tabs' }
+        }
+        Invoke-Button $switch
+        $null = Wait-Until 'original workspace in foreground' {
+            [uint32]$foregroundPid = 0
+            [void][WorkspaceFocus]::GetWindowThreadProcessId([WorkspaceFocus]::GetForegroundWindow(), [ref]$foregroundPid)
+            $foregroundPid -eq $terminal.Id
+        }
+        $reply = & $ctl --pid $terminal.Id list | ConvertFrom-Json
+        if (-not $reply.ok -or (@($reply.result.sessions.id | Sort-Object) -join ',') -ne $ids) {
+            throw 'Workspace switch replaced the original pane IDs'
+        }
+    }
+    Stop-WorkspaceGui $picker
     Stop-WorkspaceGui $terminal
+    # Race two launches for a closed workspace, and verify that only the winner owns panes.
+    $first = Start-WorkspaceGui @('--switch-workspace', 'two-tabs') 'switch-first.err'
+    $second = Start-WorkspaceGui @('--switch-workspace', 'two-tabs') 'switch-second.err'
+    $deadline = [DateTime]::UtcNow.AddSeconds(20)
+    while (-not $first.HasExited -and -not $second.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    $owners = @($first, $second | Where-Object { -not $_.HasExited })
+    $followers = @($first, $second | Where-Object HasExited)
+    if ($owners.Count -ne 1 -or $followers.Count -ne 1 -or $followers[0].ExitCode -ne 0) {
+        throw "Concurrent switches did not elect exactly one owner. See $state"
+    }
+    $reply = & $ctl --pid $owners[0].Id list | ConvertFrom-Json
+    if (-not $reply.ok -or @($reply.result.sessions).Count -ne 3) { throw 'Closed workspace did not restore three panes' }
+    Stop-WorkspaceGui $owners[0]
     $env:W11TERM_UI_SMOKE = '1'
     $env:W11TERM_WORKSPACE_SMOKE = '1'
     $terminal = Start-WorkspaceGui @('--demo') 'save-restore.err'
@@ -110,6 +160,9 @@ try {
     }
     Write-Output "Workspace smoke passed. Artifacts: $state"
 } finally {
+    Stop-WorkspaceGui $second
+    Stop-WorkspaceGui $first
+    Stop-WorkspaceGui $picker
     Stop-WorkspaceGui $terminal
     foreach ($name in $variables) { [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process') }
 }

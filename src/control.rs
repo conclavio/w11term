@@ -67,6 +67,7 @@ pub enum Request {
         operation: crate::sftp::Operation,
     },
     List,
+    WorkspaceIdentity,
     SendText {
         pane: u64,
         data_base64: String,
@@ -153,8 +154,17 @@ pub struct Pane {
 pub struct Registry(
     Arc<Mutex<BTreeMap<u64, Pane>>>,
     Arc<Mutex<Option<UiHandler>>>,
+    Arc<Mutex<Option<String>>>,
 );
 impl Registry {
+    pub fn for_workspace(key: Option<String>) -> Self {
+        Self(
+            Default::default(),
+            Default::default(),
+            Arc::new(Mutex::new(key)),
+        )
+    }
+
     pub fn set_ui(&self, handler: impl Fn(UiRequest) + Send + Sync + 'static) {
         *self.1.lock().unwrap() = Some(Arc::new(handler));
     }
@@ -342,6 +352,7 @@ impl Registry {
                     .map_err(anyhow::Error::msg)?;
                 Ok(json!({"pane":pane,"sftp":result}))
             }
+            Request::WorkspaceIdentity => Ok(json!(*self.2.lock().unwrap())),
             Request::List => {
                 let panes: Vec<_> = self.0.lock().unwrap().values().cloned().collect();
                 let mut sessions = Vec::new();
@@ -434,6 +445,10 @@ fn validate_grid(cols: usize, rows: usize) -> Result<()> {
 pub fn pipe_name(pid: u32) -> String {
     format!(r"\\.\pipe\w11term-{pid}")
 }
+pub fn desktop_scope() -> Result<(String, u32, u32)> {
+    security::current_scope()
+}
+
 pub fn discovery_dir() -> Result<PathBuf> {
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?)
@@ -446,6 +461,8 @@ pub struct Instance {
     pub version: u32,
     pub pid: u32,
     pub pipe: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// Owns the listener and discovery record. Drop stops it and removes our record.
@@ -453,6 +470,7 @@ pub struct Server {
     stop: Option<oneshot::Sender<()>>,
     worker: Option<std::thread::JoinHandle<()>>,
     manifest: PathBuf,
+    workspace: Arc<Mutex<Option<String>>>,
 }
 impl Server {
     pub fn start(
@@ -478,6 +496,7 @@ impl Server {
         let pid = std::process::id();
         let manifest = directory.join(format!("{pid}.json"));
         let worker_manifest = manifest.clone();
+        let workspace = registry.2.clone();
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let worker = std::thread::Builder::new().name("terminal-control".into()).spawn(move || {
@@ -520,16 +539,31 @@ impl Server {
             stop: Some(stop_tx),
             worker: Some(worker),
             manifest,
+            workspace,
         };
+        let key = server.workspace.lock().unwrap().clone();
+        server.publish_workspace(key)?;
+        Ok(server)
+    }
+
+    pub fn publish_workspace(&self, workspace: Option<String>) -> Result<()> {
+        let mut registered = self.workspace.lock().unwrap();
+        let pid = std::process::id();
         let instance = Instance {
             version: VERSION,
             pid,
             pipe: pipe_name(pid),
+            workspace: workspace.clone(),
         };
-        let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+        let mut file = tempfile::NamedTempFile::new_in(
+            self.manifest
+                .parent()
+                .context("Invalid discovery directory")?,
+        )?;
         serde_json::to_writer(&mut file, &instance)?;
-        file.persist(&server.manifest)?;
-        Ok(server)
+        file.persist(&self.manifest)?;
+        *registered = workspace;
+        Ok(())
     }
 }
 impl Drop for Server {
@@ -619,7 +653,50 @@ async fn connect(pid: u32) -> Result<tokio::net::windows::named_pipe::NamedPipeC
     }
 }
 pub async fn discover() -> Result<Vec<Instance>> {
-    let directory = discovery_dir()?;
+    let mut instances = Vec::new();
+    for instance in discovery_records(&discovery_dir()?)? {
+        if connect(instance.pid).await.is_ok() {
+            instances.push(instance);
+        }
+    }
+    Ok(instances)
+}
+
+/// Discovery files are hints. Confirm the workspace with the authenticated server
+/// before using a PID, including when Windows recycles a stale record's PID.
+pub async fn workspace_owner(key: &str) -> Result<Option<u32>> {
+    workspace_owner_in(&discovery_dir()?, key).await
+}
+
+async fn workspace_owner_in(directory: &Path, key: &str) -> Result<Option<u32>> {
+    for instance in discovery_records(directory)? {
+        if instance.workspace.as_deref() != Some(key) {
+            continue;
+        }
+        let reply = match call(Some(instance.pid), &Request::WorkspaceIdentity).await {
+            Ok(reply) => reply,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        ensure!(
+            reply.ok,
+            "Could not verify workspace owner: {}",
+            reply.error.unwrap_or_default()
+        );
+        if reply.result.as_ref().and_then(Value::as_str) == Some(key) {
+            return Ok(Some(instance.pid));
+        }
+    }
+    Ok(None)
+}
+
+fn discovery_records(directory: &Path) -> Result<Vec<Instance>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -637,10 +714,7 @@ pub async fn discover() -> Result<Vec<Instance>> {
         let Ok(instance) = serde_json::from_slice::<Instance>(&bytes) else {
             continue;
         };
-        if instance.version == VERSION
-            && instance.pipe == pipe_name(instance.pid)
-            && connect(instance.pid).await.is_ok()
-        {
+        if instance.version == VERSION && instance.pipe == pipe_name(instance.pid) {
             instances.push(instance);
         }
     }
@@ -699,4 +773,43 @@ pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
         "unsupported control protocol version"
     );
     Ok(reply)
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn verifies_workspace_identity_against_live_server_and_ignores_dead_pid() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let server = Server::start_in_directory(
+            Registry::for_workspace(Some("desk".into())),
+            |_, _, _| unreachable!(),
+            directory.path().into(),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "desk").await.unwrap(),
+            Some(pid)
+        );
+        let record = directory.path().join(format!("{pid}.json"));
+        let old_hint = std::fs::read(&record).unwrap();
+        server.publish_workspace(Some("other".into())).unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "other").await.unwrap(),
+            Some(pid)
+        );
+        std::fs::write(&record, &old_hint).unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "desk").await.unwrap(),
+            None
+        );
+        drop(server);
+        std::fs::write(&record, old_hint).unwrap();
+        assert_eq!(
+            workspace_owner_in(directory.path(), "desk").await.unwrap(),
+            None
+        );
+    }
 }
