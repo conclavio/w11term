@@ -99,7 +99,7 @@ done
 chroot "$root" sshfs -h >"$work/sshfs-help" 2>&1
 grep -F -- '-o passive' "$work/sshfs-help"
 
-cp "$kernel/boot/vmlinuz-$abi" "$out/vmlinuz"
+install -m 0644 "$kernel/boot/vmlinuz-$abi" "$out/vmlinuz"
 (cd "$root"; find . -print0 | sort -z | cpio --null --quiet -o -H newc | gzip -1) >"$out/initramfs.gz"
 {
     echo "Kernel: $kernel_pkg"
