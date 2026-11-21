@@ -252,7 +252,7 @@ mod tests {
                 "id": first.id, "name": first.name, "path": first.path, "identity": first.identity
             })])?,
         )?;
-        assert_eq!(store.read()?, [first.clone()]);
+        assert_eq!(store.read()?.as_slice(), std::slice::from_ref(&first));
         store.set_auto_mount(&first, false)?;
         let other_writer = Store::inspect(&scope, &auth)?.1.unwrap();
         let mut second = grant(dir.path().join("second"), 2);
@@ -306,7 +306,7 @@ mod tests {
         };
         store.add(replacement.clone())?;
         assert!(store.set_auto_mount(&first, false).is_err());
-        assert_eq!(store.read()?, [replacement.clone()]);
+        assert_eq!(store.read()?.as_slice(), std::slice::from_ref(&replacement));
         let catalog = ProfileStore::new(scope.catalog.clone())?;
         let (_, profile) = catalog.inspect_catalog(&scope.profile)?;
         catalog.revoke_folder_permissions(&profile, &scope.store_dir)?;
