@@ -7,6 +7,7 @@ pub enum CommandId {
     SaveScrollback(Option<u64>),
     SharedFolders(Option<u64>),
     RestartExited(Option<ExitedPane>),
+    Clipboard(Option<clipboard_paste::Origin>, bool),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -123,6 +124,12 @@ impl TerminalApp {
         let mut rows = vec![];
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         menu_rows(self.caret_items(exited.is_some()), false, &mut rows);
+        let origin = self.paste_origin();
+        for row in &mut rows {
+            if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
+                row.id = CommandId::Clipboard(origin, shortcut == Shortcut::PasteRaw);
+            }
+        }
         menu_rows(self.profile_items(), true, &mut rows);
         let live = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live),
@@ -242,6 +249,9 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::Clipboard(origin, raw) => {
+                Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
+            }
             CommandId::SharedFolders(Some(pane)) => {
                 Message::FolderShare(folder_shares::Action::Open(pane))
             }

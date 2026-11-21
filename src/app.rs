@@ -14,7 +14,8 @@ use w11term::{
     appearance::{Appearance, installed_fonts},
     control::{Pane, Registry, Server},
     interaction::{
-        Link, Point, Selection, TabSwitcherMode, link_at, paste_text, safe_url, word_range,
+        Link, MultiLinePasteWarning, Point, Selection, TabSwitcherMode, link_at, safe_url,
+        word_range,
     },
     options::{Authentication, LocalOptions, Profiles, Source, SshOptions, TerminalType},
     pane_layout::{Axis, Direction},
@@ -32,6 +33,7 @@ const LAB: &str = "Terminal lab";
 const RESTART_EXITED_PANE: &str = "Restart exited pane";
 
 mod attention;
+mod clipboard_paste;
 mod command_history;
 mod config_import;
 mod file_drawer;
@@ -261,6 +263,7 @@ struct TabSwitcher {
 #[derive(Clone, Copy)]
 pub enum InteractionField {
     CopyOnSelect,
+    LargePasteWarning,
     TrimBlock,
     TrimPaste,
     Snap,
@@ -548,6 +551,7 @@ enum UiWork {
 
 struct CaretMenuBinding {
     pane: Option<u64>,
+    paste: Option<clipboard_paste::Origin>,
     exited: Option<ExitedPane>,
     on_click: Callback<String>,
 }
@@ -608,6 +612,7 @@ pub struct TerminalApp {
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
     title_editor: Option<tab_title::Editor>,
+    clipboard: clipboard_paste::State,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
     copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
 }
@@ -699,6 +704,7 @@ pub enum Message {
     Font(Option<usize>),
     Ligatures(bool),
     Interaction(InteractionField, bool),
+    MultilinePasteWarning(MultiLinePasteWarning, bool),
     TabMode(Option<usize>),
     PickTab(TabId),
     CaptureLost(TabId),
@@ -707,7 +713,7 @@ pub enum Message {
     DragScroll(TabId),
     PasteRaw,
     Paste,
-    RawPaste(Result<(), String>),
+    Clipboard(clipboard_paste::Action),
     CopyResult(TabId, u64, Result<(), String>),
     Pointer(TabId, PointerEventInfo, MouseEventKind),
     RenderError(TabId, String),
@@ -874,14 +880,30 @@ impl TerminalApp {
         if tab.connection_generation != frame.connection_generation {
             self.header.borrow_mut().take();
             tab.connection_generation = frame.connection_generation;
+            self.clipboard.input_origin.update(|origin| {
+                origin.map(|mut origin| {
+                    if origin.pane == tab.session.pane_id {
+                        origin.connection = frame.connection_generation;
+                    }
+                    origin
+                })
+            });
             tab.reset_transport_input(&self.keyboard);
         }
         if prompt_id.is_some() {
             self.title_editor = None;
             tab.files.cancel_name_edit();
         }
+        self.clipboard.connection_changed(
+            tab.session.pane_id,
+            frame.connection_generation,
+            prompt_id.is_some() || tab.read_only.get() || tab.files.editing_name(),
+        );
         self.keyboard.set_modal(
-            prompt_id.is_some() || self.title_editor.is_some() || tab.files.editing_name(),
+            prompt_id.is_some()
+                || self.title_editor.is_some()
+                || tab.files.editing_name()
+                || self.clipboard.is_open(),
         );
         let choosing = tab.browsing_sessions();
         if changed {
@@ -1123,46 +1145,6 @@ impl TerminalApp {
                 log::warn!("Copy: {e:#}");
             }
         }
-    }
-    fn paste(&mut self, raw: bool, context: &ComponentContext<Self>) {
-        if let Some(AppTab {
-            page: Page::Terminal(tab),
-            ..
-        }) = self.tabs.active()
-        {
-            if tab.read_only.get() {
-                return;
-            }
-            match w11term::clipboard::read() {
-                Ok(text) => {
-                    if raw {
-                        if !text.is_empty() {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            if tab
-                                .session
-                                .input
-                                .send(Command::Raw(text.into_bytes(), tx))
-                                .is_ok()
-                            {
-                                context.spawn_background(move |_| {
-                                    Message::RawPaste(rx.blocking_recv().unwrap_or_else(|_| {
-                                        Err("SSH session closed before acknowledging paste".into())
-                                    }))
-                                });
-                            }
-                        }
-                    } else {
-                        let preferences = self.appearance.read().unwrap();
-                        let text = paste_text(&text, preferences.interaction.trim_paste);
-                        if !text.is_empty() {
-                            let _ = tab.session.input.send(Command::Paste(text.into()));
-                        }
-                    }
-                }
-                Err(e) => log::warn!("Paste: {e:#}"),
-            }
-        }
-        self.clear_selection();
     }
     fn switch_tabs(&mut self, delta: isize, context: &ComponentContext<Self>) {
         let mode = self
@@ -1627,6 +1609,11 @@ impl TerminalApp {
                 appearance.interaction.trim_paste,
             ),
             (
+                InteractionField::LargePasteWarning,
+                "Warn about large pastes",
+                appearance.interaction.large_paste_warning,
+            ),
+            (
                 InteractionField::Snap,
                 "Snap window resizing to the character grid",
                 appearance.interaction.snap_to_grid_on_resize,
@@ -1659,6 +1646,25 @@ impl TerminalApp {
                 )),
             );
         }
+        children.push(TextBlock::new().text("Multiline paste warning").into());
+        for (mode, label) in [
+            (MultiLinePasteWarning::Automatic, "Automatic"),
+            (MultiLinePasteWarning::Always, "Always"),
+            (MultiLinePasteWarning::Never, "Never"),
+        ] {
+            children.push(
+                RadioButton::new()
+                    .group_name("Multiline paste warning")
+                    .automation_name(label)
+                    .is_checked(appearance.interaction.multi_line_paste_warning == mode)
+                    .on_checked(
+                        context
+                            .callback(move |checked| Message::MultilinePasteWarning(mode, checked)),
+                    )
+                    .content(label),
+            );
+        }
+        children.push(TextBlock::new().text("Automatic warns when the application will receive multiple lines without bracketed paste. Raw paste always sends text without brackets.").text_wrapping(TextWrapping::Wrap).into());
         children.push(TextBlock::new().text("Clipboard copies contain plain text only. Alt+drag selects a block. Hold Shift to select or paste over a mouse-reporting TUI.").text_wrapping(TextWrapping::Wrap).into());
         children.push(TextBlock::new().text("Tab switcher").into());
         children.push(
@@ -1778,6 +1784,8 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.clipboard.input_origin.set(self.paste_origin());
+        self.discard_inactive_paste();
         self.bind_folder_shares();
         self.activate_folder_panel(context);
         self.title_editor = None;
@@ -2434,9 +2442,11 @@ impl TerminalApp {
         exited: Option<ExitedPane>,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
+        let paste = self.paste_origin();
         let mut cached = self.caret_menu_binding.borrow_mut();
         if let Some(binding) = cached.as_ref()
             && binding.pane == pane
+            && binding.paste == paste
             && binding.exited == exited
         {
             return binding.on_click.clone();
@@ -2449,10 +2459,15 @@ impl TerminalApp {
             }),
             scrollback_export::LABEL => Message::Export(scrollback_export::Action::Start(pane)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
+            "Paste" => Message::Clipboard(clipboard_paste::Action::Start(paste, false)),
+            "Paste raw (no bracketed paste)" => {
+                Message::Clipboard(clipboard_paste::Action::Start(paste, true))
+            }
             _ => tab_menu_message(label),
         });
         *cached = Some(CaretMenuBinding {
             pane,
+            paste,
             exited,
             on_click: on_click.clone(),
         });
@@ -3159,8 +3174,18 @@ impl Component for TerminalApp {
         let opening = &input.opening;
         let moving = input.transfer.is_some();
         let sender = context.sender();
+        let clipboard = clipboard_paste::State::default();
+        let paste_origin = clipboard.input_origin.clone();
         let keyboard = KeyboardBridge::install(move |shortcut| {
-            sender.send(Message::Shortcut(shortcut));
+            sender.send(match shortcut {
+                Shortcut::Paste | Shortcut::PasteRaw => {
+                    Message::Clipboard(clipboard_paste::Action::Start(
+                        paste_origin.get(),
+                        shortcut == Shortcut::PasteRaw,
+                    ))
+                }
+                _ => Message::Shortcut(shortcut),
+            });
         })
         .expect("installing terminal input adapter");
         let _native = keyboard.scope().enter();
@@ -3379,6 +3404,7 @@ impl Component for TerminalApp {
             switcher: None,
             picker: None,
             title_editor: None,
+            clipboard,
             hints: Default::default(),
             copy_mode: Default::default(),
             selection_pending: true,
@@ -3500,7 +3526,10 @@ impl Component for TerminalApp {
                     && live.session.events.restart_token() == Some(exit.token)
                 {
                     match live.session.restart_exited(exit.token) {
-                        Ok(()) => live.reset_transport_input(&self.keyboard),
+                        Ok(()) => {
+                            self.clipboard.connection_changed(exit.pane, 0, true);
+                            live.reset_transport_input(&self.keyboard);
+                        }
                         Err(error) => {
                             self.window_error =
                                 Some(format!("Could not restart pane {}: {error:#}", exit.pane));
@@ -4496,15 +4525,23 @@ impl Component for TerminalApp {
             Message::CopyResult(pane, request, result) => {
                 self.finish_keyboard_copy(pane, request, result)
             }
-            Message::RawPaste(result) => {
-                if let Err(error) = result {
-                    log::warn!("Raw paste: {error}");
+            Message::Clipboard(action) => self.clipboard_action(action, context),
+            Message::MultilinePasteWarning(mode, checked) => {
+                if checked {
+                    let mut appearance = self.appearance.read().unwrap().clone();
+                    if appearance.interaction.multi_line_paste_warning != mode {
+                        appearance.interaction.multi_line_paste_warning = mode;
+                        self.save_preferences(appearance);
+                    }
                 }
             }
             Message::Interaction(field, value) => {
                 let mut appearance = self.appearance.read().unwrap().clone();
                 let setting = match field {
                     InteractionField::CopyOnSelect => &mut appearance.interaction.copy_on_select,
+                    InteractionField::LargePasteWarning => {
+                        &mut appearance.interaction.large_paste_warning
+                    }
                     InteractionField::TrimBlock => &mut appearance.interaction.trim_block_selection,
                     InteractionField::TrimPaste => &mut appearance.interaction.trim_paste,
                     InteractionField::Snap => &mut appearance.interaction.snap_to_grid_on_resize,
@@ -4818,6 +4855,7 @@ impl Component for TerminalApp {
                 }
             }
         }
+        self.discard_inactive_paste();
     }
 
     fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
@@ -4833,6 +4871,7 @@ impl Component for TerminalApp {
             && self.picker.is_none()
             && self.hints.borrow().is_none()
             && self.title_editor.is_none()
+            && !self.clipboard.is_open()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
             let marked = self
@@ -5023,6 +5062,9 @@ impl Component for TerminalApp {
         }
         if let Some(editor) = &self.title_editor {
             views.push(KeyedView::new("rename-tab", editor.view(context)));
+        }
+        if let Some(dialog) = self.paste_dialog(context) {
+            views.push(dialog);
         }
         if let Some(AppTab {
             page: Page::Terminal(tab),
