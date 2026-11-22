@@ -1,4 +1,4 @@
-use crate::options::ColorScheme;
+use crate::options::ResolvedColorScheme;
 use wezterm_term::color::{ColorPalette, SrgbaTuple};
 
 fn rgb(value: u32) -> SrgbaTuple {
@@ -6,11 +6,11 @@ fn rgb(value: u32) -> SrgbaTuple {
     (red, green, blue).into()
 }
 
-pub(super) fn palette(scheme: ColorScheme) -> ColorPalette {
+pub(super) fn palette(scheme: ResolvedColorScheme) -> ColorPalette {
     // One Half colors in ANSI order, from Windows Terminal's defaults.json.
     // https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalSettingsModel/defaults.json
     let (foreground, background, cursor, ansi) = match scheme {
-        ColorScheme::Default => {
+        ResolvedColorScheme::Default => {
             return ColorPalette {
                 foreground: SrgbaTuple(0.86, 0.88, 0.91, 1.0),
                 background: SrgbaTuple(0.055, 0.063, 0.078, 1.0),
@@ -18,7 +18,7 @@ pub(super) fn palette(scheme: ColorScheme) -> ColorPalette {
                 ..ColorPalette::default()
             };
         }
-        ColorScheme::OneHalfDark => (
+        ResolvedColorScheme::OneHalfDark => (
             0xdcdfe4,
             0x282c34,
             0xffffff,
@@ -27,7 +27,7 @@ pub(super) fn palette(scheme: ColorScheme) -> ColorPalette {
                 0x5a6374, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xdcdfe4,
             ],
         ),
-        ColorScheme::OneHalfLight => (
+        ResolvedColorScheme::OneHalfLight => (
             0x383a42,
             0xfafafa,
             0x4f525d,
@@ -46,7 +46,7 @@ pub(super) fn palette(scheme: ColorScheme) -> ColorPalette {
         ..ColorPalette::default()
     };
     palette.colors.0[..16].copy_from_slice(&ansi.map(rgb));
-    if scheme == ColorScheme::OneHalfLight {
+    if scheme == ResolvedColorScheme::OneHalfLight {
         palette.selection_bg = rgb(0x383a42);
         palette.selection_fg = rgb(background);
     }
@@ -55,15 +55,16 @@ pub(super) fn palette(scheme: ColorScheme) -> ColorPalette {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::terminal::{Snapshot, TransportInput, create_with_profile, set_color_scheme};
+    use super::{ColorPalette, SrgbaTuple, palette, rgb};
+    use crate::options::ResolvedColorScheme as ColorScheme;
+    use crate::terminal::{Snapshot, TransportInput, create_with_palette, set_color_scheme};
     use tokio::sync::mpsc;
     use wezterm_term::Terminal;
 
     fn engine(scheme: ColorScheme) -> (Terminal, mpsc::UnboundedReceiver<TransportInput>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
-            create_with_profile(Default::default(), tx, Default::default(), scheme),
+            create_with_palette(Default::default(), tx, Default::default(), scheme),
             rx,
         )
     }

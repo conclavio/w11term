@@ -14,6 +14,7 @@ use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 #[cfg(test)]
 mod clear_scrollback_tests;
 mod clipboard;
+mod colors;
 mod launch;
 pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
 #[cfg(test)]
@@ -146,6 +147,7 @@ pub struct Session {
 }
 
 struct Services {
+    colors: colors::PaneColors,
     prompts: crate::prompts::Prompts,
     events: crate::events::Events,
     player: Arc<std::sync::RwLock<crate::options::PlayerOptions>>,
@@ -322,11 +324,13 @@ impl Session {
         let worker_player = player.clone();
         let (notice_tx, notice_rx) = mpsc::channel(64);
         let (writer, transport_input) = mpsc::unbounded_channel();
-        let mut terminal = terminal::create_with_profile(
+        let colors =
+            colors::PaneColors::new(source.color_scheme(), crate::windows_appearance::subscribe);
+        let mut terminal = terminal::create_with_palette(
             size,
             writer.clone(),
             source.scrollback_lines(),
-            source.color_scheme(),
+            colors.effective(),
         );
         let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard));
         let clipboard: Arc<dyn wezterm_term::Clipboard> =
@@ -379,6 +383,7 @@ impl Session {
                         transport_input,
                         worker_frames,
                         Services {
+                            colors,
                             prompts: worker_prompts,
                             events: worker_events,
                             player: worker_player,
@@ -427,6 +432,7 @@ async fn run(
     services: Services,
 ) {
     let Services {
+        mut colors,
         prompts,
         events,
         player,
@@ -436,7 +442,10 @@ async fn run(
     } = services;
     let mut size = terminal.get_size();
     let scrollback_lines = source.scrollback_lines();
-    let mut color_scheme = source.color_scheme();
+    let mut applied_scheme = colors.effective();
+    // A theme change between capturing the initial frame and starting this worker
+    // must be reflected before we parse a peer's first color-scheme query.
+    colors.sample();
     let (output_tx, mut output) = mpsc::channel(32);
     let is_demo = matches!(source, Source::Demo);
     let is_ssh = matches!(source, Source::Ssh(_));
@@ -511,6 +520,11 @@ async fn run(
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
+        if colors.effective() != applied_scheme {
+            applied_scheme = colors.effective();
+            terminal::set_color_scheme(&mut terminal, scrollback_lines, applied_scheme);
+            presentation.dirty = true;
+        }
         if let Some(version) = pending_pack.next(
             asset_task.is_some(),
             is_ssh && player.read().unwrap().sync_assets_enabled(),
@@ -564,6 +578,7 @@ async fn run(
         }
         let animation_deadline = presentation.animation_deadline(&terminal);
         tokio::select! {
+            _ = colors.changed() => {},
             _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if animation_deadline.is_some() => {
                 presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
             },
@@ -659,11 +674,7 @@ async fn run(
                     }
                     Some(Command::Shutdown) | None => break,
                     Some(Command::SetColorScheme(scheme)) => {
-                        if color_scheme != scheme {
-                            terminal::set_color_scheme(&mut terminal, scrollback_lines, scheme);
-                            color_scheme = scheme;
-                            presentation.dirty = true;
-                        }
+                        colors.choose(scheme);
                         Ok(())
                     }
                     Some(Command::SetReadOnly(enabled)) => {

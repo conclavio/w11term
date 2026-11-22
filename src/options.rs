@@ -15,22 +15,53 @@ pub enum ColorScheme {
     Default,
     OneHalfDark,
     OneHalfLight,
+    FollowWindows,
 }
 
 impl ColorScheme {
-    pub const ALL: [Self; 3] = [Self::Default, Self::OneHalfDark, Self::OneHalfLight];
+    pub const ALL: [Self; 4] = [
+        Self::Default,
+        Self::OneHalfDark,
+        Self::OneHalfLight,
+        Self::FollowWindows,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "w11term (default)",
             Self::OneHalfDark => "One Half Dark",
             Self::OneHalfLight => "One Half Light",
+            Self::FollowWindows => "Follow Windows",
+        }
+    }
+
+    pub(crate) fn resolve(
+        self,
+        appearance: impl FnOnce() -> crate::windows_appearance::WindowsAppearance,
+    ) -> ResolvedColorScheme {
+        use crate::windows_appearance::WindowsAppearance;
+        match self {
+            Self::Default => ResolvedColorScheme::Default,
+            Self::OneHalfDark => ResolvedColorScheme::OneHalfDark,
+            Self::OneHalfLight => ResolvedColorScheme::OneHalfLight,
+            Self::FollowWindows => match appearance() {
+                WindowsAppearance::Light => ResolvedColorScheme::OneHalfLight,
+                WindowsAppearance::Dark => ResolvedColorScheme::OneHalfDark,
+            },
         }
     }
 
     pub(crate) fn is_default(&self) -> bool {
         *self == Self::Default
     }
+}
+
+/// Only concrete palettes enter a terminal's configuration and snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedColorScheme {
+    Default,
+    OneHalfDark,
+    OneHalfLight,
 }
 
 /// Number of physical rows a pane retains above its primary screen.

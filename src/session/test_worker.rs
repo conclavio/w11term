@@ -27,9 +27,28 @@ pub(super) async fn with_demo(
     size: TerminalSize,
     exercise: impl AsyncFnOnce(mpsc::UnboundedSender<Command>, FrameStore),
 ) {
+    with_demo_colors(
+        size,
+        colors::PaneColors::new(ColorScheme::Default, crate::windows_appearance::subscribe),
+        None,
+        exercise,
+    )
+    .await;
+}
+
+pub(super) async fn with_demo_colors(
+    size: TerminalSize,
+    colors: colors::PaneColors,
+    viewer: Option<mpsc::UnboundedSender<TransportInput>>,
+    exercise: impl AsyncFnOnce(mpsc::UnboundedSender<Command>, FrameStore),
+) {
     let (input, commands) = mpsc::unbounded_channel();
     let (writer, transport) = mpsc::unbounded_channel();
-    let terminal = terminal::create(size, writer.clone());
+    let mut terminal =
+        terminal::create_with_palette(size, writer.clone(), Default::default(), colors.effective());
+    if let Some(viewer) = viewer {
+        terminal::enter_herdr_viewer(&mut terminal, &viewer, &Default::default());
+    }
     let initial = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
     let frames = FrameStore::new(initial.clone());
     let (_notices, notices) = mpsc::channel(1);
@@ -41,6 +60,7 @@ pub(super) async fn with_demo(
         transport,
         frames.clone(),
         Services {
+            colors,
             prompts: Default::default(),
             events: Default::default(),
             player: Default::default(),
