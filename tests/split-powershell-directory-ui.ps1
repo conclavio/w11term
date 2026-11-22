@@ -28,8 +28,10 @@ function Send-Line([int]$Pane, [string]$Line) {
 function Confirm-Directory([int]$Pane, [string]$Token) {
     # Keep the result short enough to fit a split. Only executed output contains the marker.
     # A hosted runner can reach its temp folder using its short or long name.
-    # Only the intended literal folder contains this unique relative filename.
-    Send-Line $Pane ('if ($PWD.Provider.Name -eq "FileSystem" -and (Test-Path -LiteralPath $env:W11TERM_CWD_PROOF -PathType Leaf)) { "cwd-" + "' + $Token + '" + "-" + $PID } else { "wrong cwd: " + $PWD.ProviderPath }')
+    # PS 5.1 mis-escapes brackets in the current folder when resolving even a
+    # -LiteralPath relative to it. Look up the sentinel using the shell's
+    # actual absolute folder, which may use the runner's short or long spelling.
+    Send-Line $Pane ('if ($PWD.Provider.Name -eq "FileSystem" -and [IO.File]::Exists([IO.Path]::Combine($PWD.ProviderPath,$env:W11TERM_CWD_PROOF))) { "cwd-" + "' + $Token + '" + "-" + $PID } else { "wrong cwd: " + $PWD.ProviderPath }')
     $pattern = "cwd-$Token-([0-9]+)"
     try {
         $frame = Control @('wait-for-text','--pane',"$Pane",'--timeout','20','--regex',$pattern)
