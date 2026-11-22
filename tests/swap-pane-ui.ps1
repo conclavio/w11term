@@ -52,23 +52,42 @@ function Measure-Positions($Panes, [string]$AtLeft, [string]$AtTop, [string]$AtB
     }
     return @($left,$top,$bottom)
 }
-function Same-Grid($Actual, $Original) {
-    return $Actual.cols -eq $Original.cols -and $Actual.rows -eq $Original.rows
+function Describe-Panes($Panes) {
+    @($Panes | Sort-Object label | Select-Object label,id,tab_id,window_id,connection_generation,active,visible,cols,rows) |
+        ConvertTo-Json -Compress
+}
+function Same-Grid($Actual, $Expected) {
+    $Actual.cols -eq $Expected.cols -and $Actual.rows -eq $Expected.rows
+}
+function Wait-Layout([string]$AtLeft, [string]$AtTop, [string]$AtBottom, $Before = $null, [switch]$AfterSwap) {
+    try {
+        Wait-Until "the three panes at $AtLeft / $AtTop / $AtBottom" {
+            $now = Read-Layout
+            if (!$now -or !$now['palette-ssh'].active) { return }
+            foreach ($name in $Before.Keys) {
+                $a = $Before[$name]
+                $b = $now[$name]
+                if ($a.id -ne $b.id -or $a.tab_id -ne $b.tab_id -or $a.window_id -ne $b.window_id -or
+                    $a.connection_generation -ne $b.connection_generation) { return }
+            }
+            # PTY resize acknowledgement is asynchronous. Compare the current
+            # grids with the slot shapes, including the equal-width right column.
+            $left = $now[$AtLeft]
+            $top = $now[$AtTop]
+            $bottom = $now[$AtBottom]
+            if ($AfterSwap -and !((Same-Grid $left $Before['palette-ssh']) -and
+                    (Same-Grid $top $Before['Upper PowerShell']) -and (Same-Grid $bottom $Before['Lower PowerShell']))) { return }
+            if ($left.cols -lt $top.cols -and $top.cols -eq $bottom.cols -and
+                $left.rows -gt $bottom.rows -and $bottom.rows -gt $top.rows) { $now }
+        }
+    } catch {
+        $reason = $_
+        $observed = try { Describe-Panes (Control @('list')).sessions } catch { "control list failed: $_" }
+        throw "$reason. Original panes: $(Describe-Panes $Before.Values). Current panes: $observed"
+    }
 }
 function Wait-Swap([string]$AtLeft, [string]$AtTop, [string]$AtBottom) {
-    $result = Wait-Until "the same three panes at $AtLeft / $AtTop / $AtBottom" {
-        $now = Read-Layout
-        if (!$now -or !$now['palette-ssh'].active) { return }
-        foreach ($name in $original.Keys) {
-            $a = $original[$name]
-            $b = $now[$name]
-            if ($a.id -ne $b.id -or $a.tab_id -ne $b.tab_id -or $a.window_id -ne $b.window_id -or
-                $a.connection_generation -ne $b.connection_generation) { return }
-        }
-        if ((Same-Grid $now[$AtLeft] $original['palette-ssh']) -and
-            (Same-Grid $now[$AtTop] $original['Upper PowerShell']) -and
-            (Same-Grid $now[$AtBottom] $original['Lower PowerShell'])) { $now }
-    }
+    $result = Wait-Layout $AtLeft $AtTop $AtBottom $original -AfterSwap
     $positions = Measure-Positions $result $AtLeft $AtTop $AtBottom
     for ($i = 0; $i -lt 3; $i++) {
         if (!$positions[$i].Equals($baseline[$i])) { throw "Slot $i changed from $($baseline[$i]) to $($positions[$i])" }
@@ -110,13 +129,10 @@ foreach ($recipe in @('original','swapped')) {
     try {
         $window = Wait-InputWindow
         $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
-        $layout = Wait-Until "three visible native terminals in $recipe" {
-            $panes = Read-Layout
-            if (!$panes -or !$panes['palette-ssh'].active) { return }
-            $left = if ($recipe -eq 'original') { $panes['palette-ssh'] } else { $panes['Lower PowerShell'] }
-            $top = if ($recipe -eq 'original') { $panes['Upper PowerShell'] } else { $panes['palette-ssh'] }
-            $bottom = if ($recipe -eq 'original') { $panes['Lower PowerShell'] } else { $panes['Upper PowerShell'] }
-            if ($left.cols -lt $top.cols -and $left.rows -gt $bottom.rows -and $bottom.rows -gt $top.rows) { $panes }
+        $layout = if ($recipe -eq 'original') {
+            Wait-Layout 'palette-ssh' 'Upper PowerShell' 'Lower PowerShell'
+        } else {
+            Wait-Layout 'Lower PowerShell' 'palette-ssh' 'Upper PowerShell'
         }
         $ssh = $layout['palette-ssh'].id
         $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','15','ready')
@@ -125,8 +141,6 @@ foreach ($recipe in @('original','swapped')) {
             Send-FocusedSsh $ssh 'reopened/'
             continue
         }
-        $original = $layout
-        $baseline = Measure-Positions $layout 'palette-ssh' 'Upper PowerShell' 'Lower PowerShell'
         $upper = $layout['Upper PowerShell'].id
         $lower = $layout['Lower PowerShell'].id
         foreach ($shell in @($upper,$lower)) {
@@ -137,6 +151,10 @@ foreach ($recipe in @('original','swapped')) {
         if ($upperPid -eq $lowerPid) { throw 'Expected separate PowerShell processes' }
         Send-FocusedSsh $ssh 'before/'
         Assert-NoLeftNeighbor
+        $baseline = Measure-Positions $layout 'palette-ssh' 'Upper PowerShell' 'Lower PowerShell'
+        # Initial worker frames can still report their startup grid. Freeze the
+        # exact slot sizes only after the live shells and UIA canvases are ready.
+        $original = Wait-Layout 'palette-ssh' 'Upper PowerShell' 'Lower PowerShell' $layout
         # Both right-hand cells touch SSH. The lower pane has the larger shared edge.
         Run-Palette 'Swap pane right'
         Wait-Swap 'Lower PowerShell' 'Upper PowerShell' 'palette-ssh'
