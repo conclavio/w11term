@@ -201,6 +201,20 @@ SSH supports OpenSSH private keys supplied with `--identity`, protected w11term 
 
 The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`. Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog.
 
+To trust a fleet’s SSH host CA, add its public key to `%USERPROFILE%\.ssh\known_hosts`.
+For example, a line beginning with `@cert-authority *.example.net ssh-ed25519`
+followed by the CA’s base64 key covers that domain on port 22. For port 2222 use
+`[*.example.net]:2222` as the host pattern. Each ProxyJump hop uses its own
+hostname, port and trust entries.
+
+For a matching CA entry, w11term requests an OpenSSH host certificate and
+checks its signature, host principal, validity interval, critical options and
+revocations. A valid certificate from the trusted CA can authorize a rotated
+host key without a first-connect prompt. A profile fingerprint still pins the
+individual host key. Durable sessions and folder grants retain their existing
+host-key binding. The supported host certificate and CA key types are Ed25519
+and ECDSA P-256, P-384 and P-521. [OpenSSH known_hosts format](https://man.openbsd.org/sshd.8#SSH_KNOWN_HOSTS_FILE_FORMAT)
+
 ## Forward a local port
 
 If a development server on the SSH host listens on `127.0.0.1:8000`, open the command palette in its SSH pane and choose **Forward a local port…**. Enter `8000` as the remote port. Leave the Windows port empty to have Windows assign one, or enter a specific port. Choose **Start forwarding**, then **Copy address** to use the Windows endpoint in your browser or TCP client. You can close the manager while the forward is running. For example, if Windows assigns port `54210`, visit `http://127.0.0.1:54210/` for an HTTP service.

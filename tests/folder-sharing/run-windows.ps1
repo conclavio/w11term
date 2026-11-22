@@ -3,6 +3,7 @@
 param(
     [Parameter(Mandatory)][string]$GuestDirectory,
     [Parameter(Mandatory)][string]$TestExecutable,
+    [string]$HostCertificateTestExecutable,
     [string]$QemuExecutable = 'qemu-system-x86_64.exe',
     [switch]$LegacyFuse,
     [string]$GuiExecutable,
@@ -120,6 +121,24 @@ try {
     $port = $listeners[0].LocalPort
     Confirm-SshBanner $port
     Write-Host "Guest SSH is ready on 127.0.0.1:$port"
+    if ($HostCertificateTestExecutable) {
+        # The guest reports its public CA before its readiness marker. Its signing key stays in RAM.
+        if ((Read-Serial) -cnotmatch '(?m)^W11TERM_SSH_HOST_CA (ssh-ed25519 [A-Za-z0-9+/]{68})\r*\n') {
+            throw 'Missing the guest host CA on its serial console'
+        }
+        $certificateTests = (Get-Item -LiteralPath $HostCertificateTestExecutable).FullName
+        $output = Invoke-FixtureProcess $certificateTests @('--ignored','--exact','stock_openssh_host_certificate','--nocapture') 120000 @{
+            W11TERM_CERT_TEST_PORT = [string]$port
+            W11TERM_CERT_TEST_CA = $Matches[1]
+            W11TERM_CERT_TEST_IDENTITY = $identity
+        }
+        if ($output -cnotmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
+            throw 'The OpenSSH host certificate regression did not report exactly one pass'
+        }
+        # This runs before the mount tests log in. The two rejected certificates must never reach login.
+        $logins = [regex]::Matches((Read-Serial), 'Accepted publickey for w11fixture from ').Count
+        if ($logins -ne 1) { throw "Expected exactly one accepted public-key login in sshd's log, got $logins" }
+    }
     $cases = if ($LegacyFuse) { 'old_fusermount_refuses_before_export' } else { 'native_windows_passive_sshfs','native_windows_writable_sshfs' }
     foreach ($case in $cases) {
         $output = Invoke-FixtureProcess $test @('--ignored','--exact',"ssh::folder_mount_fixture::$case",'--nocapture') 180000 @{

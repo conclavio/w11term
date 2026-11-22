@@ -3,7 +3,10 @@
 use anyhow::Result;
 use russh::{
     Channel, ChannelId, ChannelOpenFailure, Pty,
-    keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding},
+    keys::{
+        Algorithm, HashAlg, PrivateKey, PublicKey,
+        ssh_key::{LineEnding, certificate},
+    },
     server,
 };
 use std::{
@@ -149,17 +152,33 @@ impl Fixture {
         let mut endpoints = Vec::new();
         let mut servers = Vec::new();
         let mut known_hosts = String::new();
+        let ca = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
         let mut next = None;
         for index in (0..HOSTS.len()).rev() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
             let address = listener.local_addr()?;
             let host = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+            // All three peers offer both forms. Only the two private names trust
+            // the CA. The public jump has a conventional known_hosts entry.
+            let mut cert = certificate::Builder::new_with_random_nonce(
+                &mut rand::rng(),
+                host.public_key().key_data().clone(),
+                0,
+                u64::MAX,
+            )?;
+            cert.cert_type(certificate::CertType::Host)?;
+            cert.valid_principal(HOSTS[index])?;
+            let (marker, trusted_key) = if index == 0 {
+                ("", host.public_key())
+            } else {
+                ("@cert-authority ", ca.public_key())
+            };
             writeln!(
                 known_hosts,
-                "[{}]:{} {}",
+                "{marker}[{}]:{} {}",
                 HOSTS[index],
                 address.port(),
-                host.public_key().to_openssh()?
+                trusted_key.to_openssh()?
             )?;
             let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
             let path = keys.path().join(format!("id-{index}"));
@@ -172,6 +191,7 @@ impl Fixture {
                 host_key: Some(host.public_key().fingerprint(HashAlg::Sha256).to_string()),
             });
             let config = Arc::new(server::Config {
+                certificates: vec![cert.sign(&ca)?],
                 keys: vec![host],
                 auth_rejection_time: Duration::ZERO,
                 ..Default::default()
