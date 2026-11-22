@@ -1,5 +1,5 @@
 use super::*;
-use w11term::{ssh::ConnectionShare, workspace::SshStartup};
+use w11term::{options::PlayerOptions, ssh::ConnectionShare, workspace::SshStartup};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Origin {
@@ -20,6 +20,16 @@ pub(super) fn message(axis: Axis, target: Option<&Origin>) -> Message {
     target.cloned().map_or(Message::ControlIdle, |origin| {
         Message::SplitInDirectory(axis, origin)
     })
+}
+
+fn child_options(connection: &SshOptions, pane: &SshOptions, player: PlayerOptions) -> SshOptions {
+    // A shared transport can serve PTYs opened with different TERM and history settings.
+    SshOptions {
+        terminal_type: pane.terminal_type.clone(),
+        scrollback_lines: pane.scrollback_lines,
+        player,
+        ..connection.clone()
+    }
 }
 
 impl LiveTab {
@@ -73,8 +83,14 @@ impl TerminalApp {
         if current != target {
             return;
         }
-        let mut options = connection.options().clone();
-        options.player = tab.session.player.read().unwrap().clone();
+        let Source::Ssh(pane) = &tab.source else {
+            return;
+        };
+        let options = child_options(
+            connection.options(),
+            pane,
+            tab.session.player.read().unwrap().clone(),
+        );
         let Ok(startup) = SshStartup::new(&options, current.directory, String::new()) else {
             return;
         };
@@ -112,6 +128,28 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_inherits_the_originating_ptys_settings_on_a_shared_transport() {
+        let connection: SshOptions = serde_json::from_value(serde_json::json!({
+            "host":"example.test", "user":"login", "auth":"identity", "identity":"active-key"
+        }))
+        .unwrap();
+        let pane: SshOptions = serde_json::from_value(serde_json::json!({
+            "host":"example.test", "user":"login", "auth":"password",
+            "terminal_type":"xterm-sixel", "scrollback_lines":18
+        }))
+        .unwrap();
+        let player = PlayerOptions {
+            mute: true,
+            ..Default::default()
+        };
+        let child = child_options(&connection, &pane, player.clone());
+        assert_eq!(child.authentication, connection.authentication);
+        assert_eq!(child.terminal_type, pane.terminal_type);
+        assert_eq!(child.scrollback_lines, pane.scrollback_lines);
+        assert_eq!(child.player, player);
+    }
 
     #[test]
     fn queued_directory_actions_keep_the_parent_and_the_directory_that_was_offered() {
