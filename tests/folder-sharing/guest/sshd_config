@@ -1,6 +1,7 @@
 Port 22
 ListenAddress 0.0.0.0
 HostKey /run/w11term-host-ed25519
+HostCertificate /run/w11term-host-ed25519-cert.pub
 PidFile /run/w11term-sshd.pid
 AllowUsers w11fixture
 PermitRootLogin no

@@ -86,9 +86,10 @@ remaining worthwhile findings from the source review at 331a550.
 ## Deliberate remaining limits
 
 L17/L20 performance changes remain deferred pending profiling. The memory bounds
-are not a universal cap on all terminal/scrollback image allocations. Full kitty
-animation rendering and host-certificate authority verification remain unsupported.
-The latter fails explicitly rather than offering TOFU.
+are not a universal cap on all terminal/scrollback image allocations. At review time
+the client declined host certificate authorities. It now verifies scoped OpenSSH
+host CAs. Current animation coverage is documented in the graphics audit.
+[SSH host verification](../README.md) · [Graphics audit](graphics-audit.md)
 
 The application retains challenge answers in zeroizing strings, but russh's public
 keyboard-interactive API takes owned Vec<String> and does not guarantee zeroizing

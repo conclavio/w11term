@@ -987,6 +987,89 @@ async fn first_trust_is_saved_known_host_skips_prompt_and_changed_key_fails() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the disposable stock OpenSSH guest in tests/folder-sharing"]
+async fn stock_openssh_host_certificate() -> Result<()> {
+    let port = std::env::var("W11TERM_CERT_TEST_PORT")?.parse()?;
+    let authority = std::env::var("W11TERM_CERT_TEST_CA")?;
+    let identity =
+        std::env::var_os("W11TERM_CERT_TEST_IDENTITY").expect("missing fixture identity");
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("known_hosts");
+    let record = |host: &str, ca: &str| format!("@cert-authority [{host}]:{port} {ca}\n");
+    let connect = |host: &str, authentication| {
+        let mut target = options(port, authentication, None);
+        target.host = host.into();
+        target.user = "w11fixture".into();
+        target.player.reconnect = false;
+        let prompts = Prompts::with_known_hosts(path.clone());
+        (start(target, prompts.clone()), prompts)
+    };
+
+    // Stock sshd offers both the leaf and its certificate. Only the signing CA is trusted.
+    let valid = record("127.0.0.1", &authority);
+    std::fs::write(&path, &valid)?;
+    let (mut client, prompts) = connect(
+        "127.0.0.1",
+        Authentication::Identity {
+            identity: identity.into(),
+        },
+    );
+    let mut transcript = Vec::new();
+    tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            tokio::select! {
+                _ = prompts.changed() => anyhow::bail!("unexpected prompt during certificate login: {:?}", prompts.current()),
+                event = client.output.recv() => match event {
+                    Some(Event::Connected(1)) => {
+                        // The echoed command does not contain the expected response as a literal.
+                        client.input.send(TransportInput::Data(b"printf '\\nw11term-cert-%s\\n' \"$(id -un)\"; exit\r".to_vec()))
+                            .map_err(|_| anyhow::anyhow!("SSH input closed before the login probe"))?;
+                    }
+                    Some(Event::Data(bytes)) => transcript.extend_from_slice(&bytes),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+        client.task.await?
+    }).await??;
+    let transcript = String::from_utf8_lossy(&transcript);
+    assert!(
+        transcript
+            .lines()
+            .any(|line| line == "w11term-cert-w11fixture"),
+        "unexpected shell response: {transcript:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, valid);
+
+    // localhost reaches the same listener, but only 127.0.0.1 is a signed principal.
+    let other_ca = key().public_key().to_openssh()?;
+    for (host, ca, expected) in [
+        ("localhost", authority.as_str(), "no matching principal"),
+        (
+            "127.0.0.1",
+            other_ca.as_str(),
+            "untrusted SSH host certificate",
+        ),
+    ] {
+        let saved = record(host, ca);
+        std::fs::write(&path, &saved)?;
+        // A password prompt here would prove we started authentication before validating the certificate.
+        let (mut client, prompts) = connect(host, Authentication::Password);
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = &mut client.task => result,
+                _ = prompts.changed() => panic!("unexpected prompt for {host}: {:?}", prompts.current()),
+            }
+        }).await??;
+        let error = result.expect_err("untrusted connection accepted");
+        assert!(format!("{error:#}").contains(expected), "{host}: {error:#}");
+        assert_eq!(std::fs::read_to_string(&path)?, saved);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoked_key_fails_before_prompt_or_auth_even_with_an_explicit_pin() {
     let server_key = key();
     let pin = server_key

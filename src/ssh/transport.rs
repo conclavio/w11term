@@ -42,20 +42,14 @@ fn stop(message: impl Into<String>) -> anyhow::Error {
 pub(crate) struct Handler {
     options: SshOptions,
     prompts: Option<Prompts>,
+    known_hosts: std::path::PathBuf,
     fingerprint: Arc<std::sync::OnceLock<String>>,
     durable_peer: Option<String>,
 }
 impl Handler {
-    fn known(&self, key: &russh::keys::PublicKey) -> Result<bool> {
-        let path = self
-            .prompts
-            .as_ref()
-            .and_then(Prompts::known_hosts)
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
-            .context("cannot locate known_hosts")?;
+    fn known(&self, key: &PublicKeyOrCertificate) -> Result<bool> {
         super::known_hosts::verify(
-            &path,
+            &self.known_hosts,
             &self.options.host,
             self.options.port,
             key,
@@ -64,28 +58,19 @@ impl Handler {
     }
 
     fn learn(&self, key: &russh::keys::PublicKey) -> Result<()> {
-        use russh::keys::known_hosts;
-        if let Some(path) = self.prompts.as_ref().and_then(Prompts::known_hosts) {
-            known_hosts::learn_known_hosts_path(
-                &self.options.host.to_ascii_lowercase(),
-                self.options.port,
-                key,
-                path,
-            )?;
-        } else {
-            known_hosts::learn_known_hosts(
-                &self.options.host.to_ascii_lowercase(),
-                self.options.port,
-                key,
-            )?;
-        }
+        russh::keys::known_hosts::learn_known_hosts_path(
+            &self.options.host.to_ascii_lowercase(),
+            self.options.port,
+            key,
+            &self.known_hosts,
+        )?;
         Ok(())
     }
 }
 impl client::Handler for Handler {
     type Error = anyhow::Error;
-    async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
-        let key = key.public_key();
+    async fn check_server_key(&mut self, presented: &PublicKeyOrCertificate) -> Result<bool> {
+        let key = presented.public_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         if self
             .durable_peer
@@ -98,7 +83,7 @@ impl client::Handler for Handler {
             self.fingerprint.get_or_init(|| fingerprint.clone()) == &fingerprint,
             Permanent("SSH peer changed its host key during this connection".into())
         );
-        match self.known(&key) {
+        match self.known(presented) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(e) => {
@@ -121,7 +106,7 @@ impl client::Handler for Handler {
             matches!(answer, Answer::Trust(true)),
             Permanent("host key was not accepted".into())
         );
-        match self.known(&key) {
+        match self.known(presented) {
             Ok(true) => {}
             Ok(false) => self
                 .learn(&key)
@@ -382,7 +367,16 @@ pub(super) async fn handshake(
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 ) -> Result<(client::Handle<Handler>, String)> {
+    let known_hosts = prompts
+        .and_then(Prompts::known_hosts)
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
+        .ok_or_else(|| stop("cannot locate known_hosts"))?;
+    let trust_host_ca =
+        super::known_hosts::has_authority(&known_hosts, &options.host, options.port)
+            .map_err(|error| stop(format!("reading host certificate authorities: {error:#}")))?;
     let config = Arc::new(client::Config {
+        preferred: super::negotiation::preferred(trust_host_ca),
         nodelay: true,
         keepalive_interval: Some(Duration::from_secs(5)),
         keepalive_max: 2,
@@ -397,6 +391,7 @@ pub(super) async fn handshake(
             Handler {
                 options: options.clone(),
                 prompts: prompts.cloned(),
+                known_hosts,
                 fingerprint: fingerprint.clone(),
                 durable_peer: durable_peer.map(str::to_owned),
             },

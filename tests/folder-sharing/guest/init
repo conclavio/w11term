@@ -40,12 +40,17 @@ chmod 0600 "$auth/authorized_keys"
 chown w11fixture:w11fixture "$auth/authorized_keys"
 
 ssh-keygen -q -t ed25519 -N '' -f /run/w11term-host-ed25519
+ssh-keygen -q -t ed25519 -N '' -f /run/w11term-host-ca
+ssh-keygen -q -s /run/w11term-host-ca -I w11term-fixture -h -n 127.0.0.1 \
+    -V -5m:+1h /run/w11term-host-ed25519.pub
 /usr/sbin/sshd -t -f /etc/ssh/w11term-fixture.conf
 /usr/sbin/sshd -D -e -f /etc/ssh/w11term-fixture.conf &
 server=$!
 for _ in $(seq 1 100); do
     kill -0 "$server"
     if ss -H -lnt 'sport = :22' | grep -q .; then
+        read -r kind blob _ </run/w11term-host-ca.pub
+        printf 'W11TERM_SSH_HOST_CA %s %s\n' "$kind" "$blob"
         read -r kind blob _ </run/w11term-host-ed25519.pub
         printf 'W11TERM_SSH_HOST_KEY %s %s\n' "$kind" "$blob"
         wait "$server"
