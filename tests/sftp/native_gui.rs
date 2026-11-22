@@ -569,6 +569,12 @@ async fn native_powershell_shell_integration_records_history_and_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reveals a PowerShell diagnostic in the native File Explorer beside a live SSH pane"]
+async fn native_local_path_hint_selects_the_file_in_explorer() {
+    run_palette_fixture("reveal-local-path-ui.ps1", b"ssh-neighbor-ok", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "duplicates, deletes and restores PowerShell profiles while SSH and a copied shell stay live"]
 async fn native_local_profile_copy_delete_and_restore_defaults() {
     run_palette_fixture("local-profile-actions-ui.ps1", b"profile-actions-ok", None).await;

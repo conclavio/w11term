@@ -55,6 +55,7 @@ mod accessibility_smoke;
 mod command_palette;
 mod directory_split;
 mod durable_view;
+mod explorer;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
 mod inspector;
@@ -834,6 +835,7 @@ pub enum Message {
     PickerFocus(u8),
     LocalProfile(local_profile::Action),
     Files(FileAction),
+    HintRevealed(Arc<()>, Result<(), String>),
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
     OpenInDirectory(directory_split::Destination, directory_split::Origin),
@@ -4391,6 +4393,7 @@ impl Component for TerminalApp {
                     self.connection_ui(id);
                 }
             }
+            Message::HintRevealed(request, result) => self.hint_revealed(request, result),
             Message::ControlIdle => {}
             Message::WatchRejected => {
                 if self.watcher_retry.is_none() {

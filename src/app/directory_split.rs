@@ -89,6 +89,10 @@ fn local_directory(report: &str, computer: Option<&str>) -> Option<PathBuf> {
     Some(cwd)
 }
 
+pub(super) fn reported_local_directory(report: Option<&str>) -> Option<PathBuf> {
+    local_directory(report?, std::env::var("COMPUTERNAME").ok().as_deref())
+}
+
 impl LiveTab {
     fn ssh_directory_split(&self) -> Option<(Origin, ConnectionShare)> {
         if !self.session.is_direct_ssh_shell() {
@@ -115,12 +119,12 @@ impl LiveTab {
         if !self.can_report_split_directory(frame.connection_generation) {
             return None;
         }
-        let report = frame.reported_directory.as_deref()?;
-        let computer = std::env::var("COMPUTERNAME").ok();
         Some(Origin {
             pane: self.session.pane_id,
             generation: frame.connection_generation,
-            directory: Directory::Local(local_directory(report, computer.as_deref())?),
+            directory: Directory::Local(reported_local_directory(
+                frame.reported_directory.as_deref(),
+            )?),
             listing_revision: None,
         })
     }
