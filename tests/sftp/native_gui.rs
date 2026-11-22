@@ -40,6 +40,59 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reads OSC 133 captures from a read-only, inactive SSH pane across a live reconnect"]
+async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let state = tempfile::tempdir().unwrap();
+    let command = format!("show {} 界", "cmd".repeat(60));
+    let output = format!("résultat-{}\r\n\r\nend", "out".repeat(60));
+    let mut stream = format!(
+        "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07\x1b[31m{output}\x1b[0m\x1b]133;D;17\x07\r\n"
+    );
+    // A shell may omit both the command and its exit code. Empty captured
+    // output still differs from output that has already fallen out of history.
+    stream.push_str("\x1b]133;A\x07$ \x1b]133;C\x07\x1b]133;D\x07\r\n");
+    stream.push_str("\x1b]133;A\x07$ \x1b]133;B\x07archived\r\n\x1b]133;C\x07");
+    stream.push_str(&"older row\r\n".repeat(150));
+    stream.push_str("\x1b[3J\x1b]133;D;3\x07\r\nhistory-one-ready\r\n");
+    fs::write(remote.path().join("copy-history.vt"), stream).unwrap();
+    fs::write(remote.path().join("keyboard-input.bin"), []).unwrap();
+    fs::write(remote.path().join("keep-first-connection"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.path().join("replacement.vt"),
+        b"\x1b]133;A\x07$ \x1b]133;B\x07replacement\r\n\x1b]133;C\x07second transport\x1b]133;D;0\x07\r\nhistory-two-ready\r\n",
+    ).unwrap();
+    drive_mixed_gui("control-command-history-ui.ps1", &ssh, state.path());
+    eprintln!(
+        "Command IDs on the original and reconnected SSH sessions: {}",
+        fs::read_to_string(state.path().join("observed-command-ids")).unwrap()
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 2, "two SSH transports");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one shell on each connection"
+    );
+    assert!(
+        fs::read(remote.path().join("keyboard-input.bin"))
+            .unwrap()
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "searches captured OSC 133 command text and copies the selected command on a hosted Windows desktop"]
 async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     let long = format!("deploy {} [Ångström]", "x".repeat(128));

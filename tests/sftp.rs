@@ -118,6 +118,26 @@ impl server::Handler for Peer {
         if self.root.join("copy-history.vt").is_file() {
             s.data(c, fs::read(self.root.join("copy-history.vt"))?)?;
         }
+        #[cfg(feature = "ui-smoke")]
+        {
+            // Let a read-only, background pane lose its connection from the server side.
+            let gate = self.root.join("keep-first-connection");
+            if gate.is_file() {
+                let peer = s.handle();
+                tokio::spawn(async move {
+                    while gate.is_file() {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    let _ = peer
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "fixture reconnect".into(),
+                            "en".into(),
+                        )
+                        .await;
+                });
+            }
+        }
         if self.root.join("shell directory").is_dir() {
             s.data(c, b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07first result\r\n\x1b]133;D;0\x07".as_slice())?;
             s.data(

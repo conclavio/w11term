@@ -25,7 +25,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         };
         match arg.as_str() {
             "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
-            | "save-text" | "restart"
+            | "save-text" | "restart" | "list-commands" | "get-command"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -159,6 +159,39 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_history_requires_the_listed_pane_id_and_generation_for_lookup() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pane 2 list-commands --pid 7").unwrap(),
+            (Some(7), Request::ListCommands { pane: 2 })
+        ));
+        assert!(matches!(
+            parse_line("--pid 7 get-command --id 53 --connection-generation 0 --pane 2").unwrap(),
+            (
+                Some(7),
+                Request::GetCommand {
+                    pane: 2,
+                    id: 53,
+                    connection_generation: 0
+                }
+            )
+        ));
+        for line in [
+            "list-commands",
+            "list-commands --pane 2 --id 53",
+            "list-commands --pane 2 --connection-generation 1",
+            "get-command --pane 2 --id 53",
+            "get-command --pane 2 --connection-generation 0",
+            "get-command --id 53 --connection-generation 1",
+            "get-command --pane 2 --id 53 --connection-generation -1",
+            "get-command --pane 2 --id foo --connection-generation 1",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
     #[test]
     fn find_text_requires_an_explicit_scope_and_keeps_literal_input() {
         let parse_args = |args: &[&str]| parse(args.iter().map(|arg| arg.to_string()));

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::Request;
-pub const HELP: &str = "w11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID [--stop | PATH]\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID [--stop | PATH]\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -20,6 +20,8 @@ pub fn parse(
     let mut stop = false;
     let mut overwrite = false;
     let mut exit_token = None;
+    let mut command_id = None;
+    let mut connection_generation = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
             args.next()
@@ -45,6 +47,10 @@ pub fn parse(
             "--stop" if verb == "record" => stop = true,
             "--overwrite" if verb == "save-text" => overwrite = true,
             "--exit-token" if verb == "restart" => exit_token = Some(value(&mut args)?.parse()?),
+            "--id" if verb == "get-command" => command_id = Some(value(&mut args)?.parse()?),
+            "--connection-generation" if verb == "get-command" => {
+                connection_generation = Some(value(&mut args)?.parse()?)
+            }
             "--" if matches!(verb, "find-text" | "wait-for-text") => {
                 ensure!(text.is_none(), "only one pattern is accepted");
                 text = Some(value(&mut args)?);
@@ -102,6 +108,15 @@ pub fn parse(
             pattern: text.context("a literal pattern or regular expression is required")?,
             regex,
             timeout_seconds: timeout.unwrap_or(30),
+        },
+        "list-commands" => Request::ListCommands {
+            pane: pane.context("--pane is required")?,
+        },
+        "get-command" => Request::GetCommand {
+            pane: pane.context("--pane is required")?,
+            id: command_id.context("--id is required (from list-commands)")?,
+            connection_generation: connection_generation
+                .context("--connection-generation is required (from list-commands)")?,
         },
         "restart" => Request::Restart {
             pane: pane.context("--pane is required")?,
