@@ -25,6 +25,7 @@ mod command_history;
 mod find;
 mod registry;
 mod security;
+pub use command_history::CommandStatus;
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
 
@@ -104,6 +105,8 @@ pub enum Request {
     },
     ListCommands {
         pane: u64,
+        #[serde(default, skip_serializing_if = "CommandStatus::is_all")]
+        status: CommandStatus,
     },
     GetCommand {
         pane: u64,
@@ -453,7 +456,7 @@ impl Registry {
                 pane,
                 all_panes,
             } => self.find_text(pattern, pane, all_panes).await,
-            Request::ListCommands { pane } => self.list_commands(pane).await,
+            Request::ListCommands { pane, status } => self.list_commands(pane, status).await,
             Request::GetCommand {
                 pane,
                 id,

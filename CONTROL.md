@@ -119,6 +119,10 @@ until the shell marks a completed command. A missing command line or exit status
 is JSON `null`. Listing transfers only this metadata and preserves keyboard focus
 and the scroll position.
 
+Use `--status failed` for nonzero exit codes, `--status succeeded` for zero, or
+`--status unknown` when the shell omitted the exit code. The default is `all`.
+Filtered listings keep the original IDs, generation, and newest-first order.
+
 To get the latest command’s output, pass its ID and the generation from the same
 listing. A generation of zero is valid.
 
@@ -139,6 +143,7 @@ Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-commands","pane":2}
+{"verb":"list-commands","pane":2,"status":"failed"}
 {"verb":"get-command","pane":2,"id":5,"connection_generation":1}
 ```
 

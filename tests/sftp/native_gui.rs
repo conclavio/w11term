@@ -497,15 +497,21 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "searches captured OSC 133 command text and copies the selected command on a hosted Windows desktop"]
+#[ignore = "filters OSC 133 history by command and status through native controls and the CLI"]
 async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     let long = format!("deploy {} [Ångström]", "x".repeat(128));
     let mut stream = String::new();
     for (command, output, status) in [
-        (&long[..], "archived deploy output", 17),
-        ("check-status", "[Ångström] appears only in this output", 0),
+        (&long[..], "archived deploy output", ";17"),
+        ("deploy audit", "no status reported", ""),
+        ("deploy retry", "retry failed", ";2"),
+        (
+            "check-status",
+            "[Ångström] appears only in this output",
+            ";0",
+        ),
     ] {
-        stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;{status}\x07"));
+        stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D{status}\x07"));
     }
     stream.push_str("history-search-ready\r\n");
     run_palette_fixture(
