@@ -29,6 +29,7 @@ pub enum FileAction {
     Close(u64),
     CancelTransfer(TransferId),
     Browse(u64, u64, String),
+    GoToFolder(u64, u64, u64),
     OpenEntry(u64, u64, ListedEntry),
     EditFilter(u64, u64, u64, bool),
     FocusFilter(u64, u64, u64, u8),
@@ -56,8 +57,8 @@ pub(super) struct FileDrawer {
     generation: u64,
     directory: Option<String>,
     bookmarks: Option<bookmarks::List>,
-    /// Pending bookmark navigation keeps the current listing until the target is readable.
-    opening_bookmark: Option<String>,
+    /// Describes an explicit navigation request if either REALPATH or listing fails.
+    opening_target: Option<String>,
     following: bool,
     last_report: Option<Arc<str>>,
     entries: Vec<Entry>,
@@ -138,12 +139,13 @@ impl RevealTarget {
 
 struct EntryDialog {
     serial: u64,
-    parent: String,
+    parent: Option<String>,
     name: String,
     action: EditAction,
 }
 
 enum EditAction {
+    GoToFolder { revision: u64 },
     Create,
     Rename(ListedEntry),
     Delete(ListedEntry, EntryKind),
@@ -152,7 +154,7 @@ enum EditAction {
 impl EditAction {
     fn original(&self) -> Option<&ListedEntry> {
         match self {
-            Self::Create => None,
+            Self::GoToFolder { .. } | Self::Create => None,
             Self::Rename(entry) | Self::Delete(entry, _) => Some(entry),
         }
     }
@@ -160,14 +162,29 @@ impl EditAction {
 
 impl EntryDialog {
     fn destination(&self) -> Result<String> {
+        let parent = || self.parent.as_deref().context("Missing remote directory");
         match &self.action {
-            EditAction::Rename(original) => {
-                ensure!(self.name != original.name, "Enter a different name")
+            EditAction::GoToFolder { .. } => {
+                ensure!(!self.name.is_empty(), "Enter a remote folder path");
+                ensure!(!self.name.contains('\0'), "A path cannot contain NUL");
+                if self.name.starts_with('/') {
+                    Ok(self.name.clone())
+                } else {
+                    let directory = self
+                        .parent
+                        .as_deref()
+                        .context("Enter an absolute path until a remote directory is open")?;
+                    // Let the server resolve dot components and symlinks; shell syntax is literal.
+                    let slash = if directory.ends_with('/') { "" } else { "/" };
+                    Ok(format!("{directory}{slash}{}", self.name))
+                }
             }
-            EditAction::Delete(original, _) => return delete_path(&self.parent, &original.name),
-            EditAction::Create => {}
+            EditAction::Rename(original) if self.name == original.name => {
+                bail!("Enter a different name")
+            }
+            EditAction::Delete(original, _) => delete_path(parent()?, &original.name),
+            EditAction::Rename(_) | EditAction::Create => entry_path(parent()?, &self.name),
         }
-        entry_path(&self.parent, &self.name)
     }
 }
 
@@ -612,7 +629,7 @@ impl FileDrawer {
     }
 
     fn accept_listing(&mut self, path: String, entries: Vec<Entry>) {
-        self.opening_bookmark = None;
+        self.opening_target = None;
         self.end_filter_edit();
         if self.directory.as_ref() != Some(&path) {
             self.filter.clear();
@@ -678,6 +695,23 @@ impl FileDrawer {
                 "The server did not identify the listed entry as the selected type"
             );
         }
+        self.show_entry_dialog(Some(parent), action);
+        Ok(())
+    }
+
+    fn begin_go_to_folder(&mut self, revision: u64) {
+        if self.open
+            && self.generation != 0
+            && !self.busy()
+            && self.bookmarks.is_none()
+            && revision == self.listing_revision
+        {
+            self.end_filter_edit();
+            self.show_entry_dialog(self.directory.clone(), EditAction::GoToFolder { revision });
+        }
+    }
+
+    fn show_entry_dialog(&mut self, parent: Option<String>, action: EditAction) {
         self.dialog_serial = self.dialog_serial.wrapping_add(1);
         self.dialog = Some(EntryDialog {
             serial: self.dialog_serial,
@@ -687,7 +721,6 @@ impl FileDrawer {
                 .map_or_else(String::new, |entry| entry.name.clone()),
             action,
         });
-        Ok(())
     }
 
     fn finish_edit(
@@ -703,7 +736,9 @@ impl FileDrawer {
             return Ok(None);
         }
         ensure!(
-            self.open && self.directory.as_ref() == Some(&dialog.parent),
+            self.open
+                && self.directory == dialog.parent
+                && !matches!(dialog.action, EditAction::GoToFolder { revision } if revision != self.listing_revision),
             "The directory changed. Open the file action again."
         );
         if let Some(entry) = dialog.action.original() {
@@ -751,15 +786,17 @@ impl FileDrawer {
                     ),
             );
         }
-        let (title, label, confirm) = if matches!(dialog.action, EditAction::Rename(_)) {
-            ("Rename entry", "New name", "Rename")
-        } else {
-            ("New folder", "Folder name", "Create")
+        let (title, label, confirm) = match dialog.action {
+            EditAction::GoToFolder { .. } => ("Go to folder", "Remote folder path", "Open"),
+            EditAction::Rename(_) => ("Rename entry", "New name", "Rename"),
+            EditAction::Create => ("New folder", "Folder name", "Create"),
+            EditAction::Delete(..) => unreachable!(),
         };
         let mut fields = vec![KeyedView::new(
             "name",
             TextBox::new()
                 .automation_name(label)
+                .placeholder_text(label)
                 .text(&dialog.name)
                 .on_text_changed(context.callback(move |name| {
                     Message::Files(FileAction::EditName(pane, generation, serial, name))
@@ -924,10 +961,18 @@ impl FileDrawer {
                         .grid_column(1)
                         .content(button("Close", true, Close(pane))),
                 )),
-            TextBlock::new()
-                .text(folder)
-                .text_wrapping(TextWrapping::Wrap)
-                .into(),
+            Grid::new()
+                .columns([GridLength::Star(1.0), GridLength::Auto])
+                .children((
+                    TextBlock::new()
+                        .text(folder)
+                        .text_wrapping(TextWrapping::Wrap),
+                    Border::new().grid_column(1).content(button(
+                        "Go to folder…",
+                        ready && generation != 0,
+                        GoToFolder(pane, generation, revision),
+                    )),
+                )),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
@@ -1264,7 +1309,7 @@ impl FileDrawer {
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.bookmarks = None;
-        self.opening_bookmark = None;
+        self.opening_target = None;
         self.end_filter_edit();
         self.status = "Reading directory…".into();
         self.reveal = None;
@@ -1275,6 +1320,20 @@ impl FileDrawer {
             Step::Canonical,
             context,
         )
+    }
+
+    fn browse_named(
+        &mut self,
+        pane: u64,
+        session: &Session,
+        path: String,
+        description: String,
+        context: &ComponentContext<TerminalApp>,
+    ) -> Result<()> {
+        self.following = false;
+        let result = self.browse(pane, session, path, context);
+        self.opening_target = Some(description);
+        result
     }
 
     fn upload_next(
@@ -1545,7 +1604,7 @@ impl TerminalApp {
         files.open = true;
         files.end_filter_edit();
         files.bookmarks = None;
-        files.opening_bookmark = None;
+        files.opening_target = None;
         files.following = false;
         files.reveal = None;
         files.directory = None;
@@ -1655,6 +1714,7 @@ impl TerminalApp {
             | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
+            | GoToFolder(id, ..)
             | OpenEntry(id, ..)
             | EditFilter(id, ..)
             | FocusFilter(id, ..)
@@ -1710,7 +1770,7 @@ impl TerminalApp {
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) if *g != files.generation)
+        if matches!(&action, NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -1855,6 +1915,15 @@ impl TerminalApp {
                     )) = files.finish_edit(serial, result)?
                     {
                         let (change, operation) = match action {
+                            EditAction::GoToFolder { .. } => {
+                                return files.browse_named(
+                                    pane,
+                                    session,
+                                    path,
+                                    format!("folder {name}"),
+                                    context,
+                                );
+                            }
                             EditAction::Delete(entry, kind) => {
                                 files.status = format!("Deleting {}…", entry.name);
                                 (
@@ -1864,7 +1933,7 @@ impl TerminalApp {
                             }
                             EditAction::Rename(entry) => {
                                 files.status = format!("Renaming {} to {name}…", entry.name);
-                                let from = entry_path(&parent, &entry.name)?;
+                                let from = entry_path(&entry.parent, &entry.name)?;
                                 (
                                     EntryChange::Rename {
                                         from: entry.name,
@@ -1884,6 +1953,7 @@ impl TerminalApp {
                                 )
                             }
                         };
+                        let parent = parent.context("Missing remote directory")?;
                         let deleting = matches!(change, EntryChange::Delete(_));
                         files.job(
                             pane,
@@ -1938,6 +2008,11 @@ impl TerminalApp {
                     }
                 }
                 ClearFilter(..) => files.set_filter(String::new()),
+                GoToFolder(_, _, revision) => {
+                    if may_open_dialog {
+                        files.begin_go_to_folder(revision);
+                    }
+                }
                 NewFolder(_, _, parent)
                     if frame.prompt.is_none() && self.title_editor.is_none() =>
                 {
@@ -2059,8 +2134,8 @@ impl TerminalApp {
         })();
         if let Err(error) = result {
             files.uploads.clear();
-            files.status = match (files.opening_bookmark.take(), files.reveal.take()) {
-                (Some(path), _) => format!("Could not open bookmark {path}: {error:#}"),
+            files.status = match (files.opening_target.take(), files.reveal.take()) {
+                (Some(target), _) => format!("Could not open {target}: {error:#}"),
                 (_, Some(RevealTarget::Changed(change))) => {
                     format!(
                         "{}, but refreshing the directory failed: {error:#}",
@@ -2661,6 +2736,111 @@ mod tests {
     }
 
     #[test]
+    fn go_to_folder_uses_literal_paths_and_leaves_resolution_to_sftp() {
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 4,
+            ..Default::default()
+        };
+        drawer.accept_listing("/work/チーム".into(), listing());
+        drawer.set_filter("plain".into());
+        drawer.set_page(1);
+        let selected = drawer.page_entries().next().unwrap().name.clone();
+        drawer.selected = Some(selected.clone());
+        let revision = drawer.listing_revision;
+        drawer.begin_go_to_folder(revision - 1);
+        assert!(drawer.dialog.is_none());
+        for (entered, expected) in [
+            ("/absolute/雪 $HOME/", "/absolute/雪 $HOME/"),
+            ("//path//as/typed", "//path//as/typed"),
+            ("../a/./b", "/work/チーム/../a/./b"),
+            (" spaced ", "/work/チーム/ spaced "),
+            ("~/$(cmd);*\\name", "/work/チーム/~/$(cmd);*\\name"),
+            (".", "/work/チーム/."),
+        ] {
+            drawer.begin_go_to_folder(revision);
+            drawer.dialog.as_mut().unwrap().name = entered.into();
+            let (_, path) = drawer
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+                .unwrap()
+                .unwrap();
+            assert_eq!(path, expected);
+            assert_eq!(drawer.directory.as_deref(), Some("/work/チーム"));
+            assert_eq!(drawer.listing_revision, revision);
+            assert_eq!(drawer.selected.as_ref(), Some(&selected));
+            assert_eq!(drawer.filter, "plain");
+            assert_eq!(drawer.page, 1);
+        }
+        drawer.directory = Some("/".into());
+        drawer.begin_go_to_folder(revision);
+        drawer.dialog.as_mut().unwrap().name = "entry".into();
+        assert_eq!(
+            drawer.dialog.as_ref().unwrap().destination().unwrap(),
+            "/entry"
+        );
+    }
+
+    #[test]
+    fn go_to_folder_recovers_an_unlisted_home_and_rejects_stale_dialogs() {
+        let mut drawer = FileDrawer {
+            open: true,
+            ..Default::default()
+        };
+        drawer.begin_go_to_folder(0);
+        assert!(drawer.dialog.is_none());
+        drawer.observe_connection(1);
+        drawer.begin_go_to_folder(0);
+        let dialog = drawer.dialog.as_mut().unwrap();
+        assert!(dialog.destination().is_err());
+        dialog.name = "/bad\0path".into();
+        assert!(dialog.destination().is_err());
+        dialog.name = "../relative".into();
+        assert!(dialog.destination().is_err());
+        dialog.name = "/recovery".into();
+        assert_eq!(dialog.destination().unwrap(), "/recovery");
+        let cancelled = dialog.serial;
+        assert!(
+            drawer
+                .finish_edit(cancelled, ContentDialogResult::None)
+                .unwrap()
+                .is_none()
+        );
+        drawer.begin_go_to_folder(0);
+        assert!(
+            drawer
+                .finish_edit(cancelled, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        drawer.dialog.as_mut().unwrap().name = "/recovery".into();
+        let (_, path) = drawer
+            .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, "/recovery");
+        drawer.accept_listing(path, listing());
+        let revision = drawer.listing_revision;
+        drawer.begin_go_to_folder(revision);
+        drawer.dialog.as_mut().unwrap().name = ".".into();
+        drawer.accept_listing("/recovery".into(), Vec::new());
+        assert!(
+            drawer
+                .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
+                .is_err()
+        );
+        drawer.begin_go_to_folder(drawer.listing_revision);
+        let obsolete = drawer.dialog_serial;
+        drawer.observe_connection(2);
+        assert!(
+            drawer
+                .finish_edit(obsolete, ContentDialogResult::Primary)
+                .unwrap()
+                .is_none()
+        );
+        assert!(drawer.directory.is_none());
+    }
+
+    #[test]
     fn folder_dialog_captures_parent_and_defers_follow_until_its_own_completion() {
         let mut drawer = FileDrawer {
             open: true,
@@ -2698,8 +2878,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            (&*dialog.parent, &*dialog.name, &*path),
-            ("/work", "prepared", "/work/prepared")
+            (dialog.parent.as_deref(), &*dialog.name, &*path),
+            (Some("/work"), "prepared", "/work/prepared")
         );
         assert!(
             drawer

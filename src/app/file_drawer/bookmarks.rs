@@ -158,10 +158,8 @@ impl FileDrawer {
                     list.paths = paths;
                 }
                 ensure!(found, "This bookmark was removed");
-                self.following = false;
-                self.browse(pane, session, path.clone(), context)?;
-                self.opening_bookmark = Some(path);
-                return Ok(());
+                let description = format!("bookmark {path}");
+                return self.browse_named(pane, session, path, description, context);
             }
             Action::Back => unreachable!(),
         };

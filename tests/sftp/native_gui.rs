@@ -1202,6 +1202,47 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens literal remote paths in the native SFTP drawer after an initial listing error"]
+async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let parent = remote.path().join("Pilot's $Logs [2026]");
+    let child = parent.join("year 1 雪");
+    fs::create_dir(remote.path().join("shell directory")).unwrap();
+    fs::create_dir_all(&child).unwrap();
+    fs::write(child.join("witness.txt"), b"still here").unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    let listings = remote.path().join("listing-trace");
+    fs::write(&trace, []).unwrap();
+    fs::write(&listings, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("sftp-go-to-folder-ui.ps1", &ssh, state.path());
+
+    let wire = fs::read_to_string(listings).unwrap();
+    let opened: Vec<_> = wire
+        .lines()
+        .filter_map(|line| line.strip_prefix("OPENDIR "))
+        .collect();
+    assert_eq!(
+        opened,
+        [
+            "/shell directory",
+            "/Pilot's $Logs [2026]",
+            "/Pilot's $Logs [2026]/year 1 雪",
+            "/Pilot's $Logs [2026]/year 1 雪/missing",
+        ]
+    );
+    assert_eq!(fs::read(trace).unwrap(), b"after-navigation");
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "creates remote folders through the native SFTP drawer while a PowerShell pane is live"]
 async fn native_new_folder_uses_the_selected_sftp_parent_and_preserves_existing_entries() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

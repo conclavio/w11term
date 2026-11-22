@@ -101,6 +101,8 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
+Choose **Go to folder…** to enter a remote directory directly. An absolute path such as `/var/log` works even if the starting directory could not be listed. Relative paths start in the displayed directory. The SFTP server resolves `.`, `..` and symbolic links. Enter spaces, quotes and dollar signs literally. If the folder cannot be opened, the drawer keeps the previous listing and selection.
+
 Choose **Cancel transfer** to stop the current upload or download and skip the rest of that batch. The drawer waits for the server to acknowledge an in-flight request. A cancelled download leaves an existing local file intact. If an upload has already opened the remote file, it can leave a partial file, including when replacing an existing file. The drawer reports the remote path and acknowledged byte count. The SSH shell and subsequent transfers remain available.
 
 Choose **Filter filenames…** and type part of a name to search the entire directory listing, including later pages. Matching ignores case and treats punctuation literally. Filtering uses the listing already in memory. **Done** returns keyboard input to the terminal and keeps the results visible. **Clear filter** brings back all entries. Refresh keeps your filter in the current directory, and opening another directory starts with its full listing.
