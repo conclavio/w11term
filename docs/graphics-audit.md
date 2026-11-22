@@ -124,6 +124,13 @@ Kitty 0.45 and Direct2D share the `clear-number.vt` comparison. Kitty 0.32.2
 applies number deletion to every image with that number.
 [Kitty 0.45](https://github.com/kovidgoyal/kitty/blob/v0.45.0/kitty/graphics.c#L2011-L2020) · [Kitty 0.32.2](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L1885-L1888)
 
+Animation frame deletion uses `d=f/F` with an image ID or number and a
+one-based frame number in `r`. A missing or zero `r` selects the first frame.
+A number beyond the end selects the last frame. Lowercase `f` keeps the
+only remaining frame, while uppercase `F` removes its image and placements.
+The shared `clear-frame.vt` fixture checks these results in stock kitty and
+Direct2D. [Kitty 0.45 frame deletion](https://github.com/kovidgoyal/kitty/blob/v0.45.0/kitty/graphics.c#L1591-L1630)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

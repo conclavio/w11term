@@ -745,8 +745,23 @@ impl TerminalState {
                     .collect();
                 self.kitty_selected_for_deletion(keys, delete)
             }
-            _ => {
-                log::warn!("unhandled KittyImage::Delete {:?}", what);
+            KittyImageDelete::AnimationFrames {
+                image_id,
+                image_number,
+                frame_number,
+                delete,
+            } => {
+                let id = match (
+                    image_id.filter(|&id| id != 0),
+                    image_number.filter(|&n| n != 0),
+                ) {
+                    (Some(id), None) => Some(id),
+                    (None, Some(number)) => self.kitty_img.id_for_number(number),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    self.kitty_delete_frame(id, frame_number.unwrap_or(0), delete);
+                }
                 return;
             }
         };
@@ -765,6 +780,60 @@ impl TerminalState {
         if self.kitty_img.release_unplaced_images(free_ids) {
             self.image_cache.clear();
         }
+    }
+
+    fn kitty_delete_frame(&mut self, id: u32, frame_number: u32, delete: bool) {
+        let Some(image) = self.kitty_img.id_to_data.get(&id) else {
+            return;
+        };
+        let mut data = image.data();
+        let ImageDataType::AnimRgba8 {
+            width,
+            height,
+            durations,
+            frames,
+            hashes,
+        } = &mut *data
+        else {
+            drop(data);
+            if delete {
+                self.kitty_delete(KittyImageDelete::ByImageId {
+                    image_id: id,
+                    placement_id: None,
+                    delete: true,
+                });
+            }
+            return;
+        };
+
+        // Kitty treats an omitted or zero number as the first frame, and
+        // numbers above the end as the last frame.
+        let removed = (frame_number.saturating_sub(1) as usize).min(frames.len() - 1);
+        let freed = frames.remove(removed).len();
+        durations.remove(removed);
+        hashes.remove(removed);
+        let remaining = frames.len();
+        let root_gap = durations[0];
+        if remaining == 1 {
+            *data = ImageDataType::Rgba8 {
+                data: frames.pop().unwrap(),
+                width: *width,
+                height: *height,
+                hash: hashes[0],
+            };
+        }
+        if let Some(playback) = self.kitty_img.playback.get_mut(&id) {
+            playback.frame_removed(
+                &data,
+                removed,
+                remaining,
+                root_gap,
+                self.kitty_animation_time.unwrap_or_else(Instant::now),
+            );
+        }
+        drop(data);
+        self.kitty_img.used_memory = self.kitty_img.used_memory.saturating_sub(freed);
+        self.image_cache.clear();
     }
 
     fn kitty_delete_selection(

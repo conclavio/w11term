@@ -41,6 +41,39 @@ fn range_deletion_round_trips_icat_and_rejects_malformed_bounds() {
     }
 }
 
+#[test]
+fn animation_deletion_round_trips_image_and_frame_selectors() {
+    use termwiz::escape::{Action, KittyImage, apc::KittyImageDelete, parser::Parser};
+    for (fields, image_id, image_number, frame_number, delete) in [
+        ("d=f,i=7,r=3", Some(7), None, Some(3), false),
+        ("d=F,I=9", None, Some(9), None, true),
+    ] {
+        let wire = format!("\x1b_Ga=d,{fields}\x1b\\");
+        let actions = Parser::new().parse_as_vec(wire.as_bytes());
+        let reencoded: String = actions.iter().map(ToString::to_string).collect();
+        for bytes in [wire.as_bytes(), reencoded.as_bytes()] {
+            let Action::KittyImage(command) = &Parser::new().parse_as_vec(bytes)[0] else {
+                panic!("expected a kitty command");
+            };
+            let KittyImage::Delete { what, .. } = command.as_ref() else {
+                panic!("expected deletion");
+            };
+            assert_eq!(
+                *what,
+                KittyImageDelete::AnimationFrames {
+                    image_id,
+                    image_number,
+                    frame_number,
+                    delete
+                }
+            );
+        }
+    }
+    for fields in ["i=7,r=", "i=7,r=-1", "i=7,r=4294967296", "i=oops", "I=oops"] {
+        assert!(KittyImage::parse_apc(format!("Ga=d,d=F,{fields}").as_bytes()).is_none());
+    }
+}
+
 fn engine() -> (
     Terminal,
     tokio::sync::mpsc::UnboundedReceiver<TransportInput>,
@@ -223,6 +256,62 @@ fn virtual_time_skips_whole_laps_and_preserves_live_pane_pacing() {
     assert!(!t.advance_kitty_animations(end));
     assert_eq!(t.kitty_animation_frame(Some(8)), 2);
     assert_eq!(t.kitty_animation_deadline(), None);
+}
+
+#[test]
+fn deleting_frames_rebases_running_playback_and_retires_the_last_frame() {
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    let start = Instant::now();
+    let (mut t, _) = engine();
+    t.set_kitty_animation_time(Some(start));
+    t.advance_bytes(ANIMATION);
+    t.advance_kitty_animations(start + ms(30));
+    let old_green = frame(&t, None, 0);
+    let green = Some([0, 255, 0, 255]);
+    let blue = Some([0, 0, 255, 255]);
+    assert_eq!(pixel(&old_green, 0, 0, 8), green);
+    assert_eq!(t.kitty_animation_deadline(), Some(start + ms(60)));
+
+    t.set_kitty_animation_time(Some(start + ms(40)));
+    t.advance_bytes(b"\x1b_Ga=d,d=f,i=8\x1b\\");
+    assert_eq!(t.kitty_animation_frame(Some(8)), 0);
+    assert_eq!(pixel(&frame(&t, Some(&old_green), 0), 0, 0, 8), green);
+    assert_eq!(t.kitty_animation_deadline(), Some(start + ms(60)));
+    assert!(t.advance_kitty_animations(start + ms(60)));
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 8), blue);
+
+    t.set_kitty_animation_time(Some(start + ms(70)));
+    t.advance_bytes(b"\x1b_Ga=d,d=F,i=8,r=4294967295\x1b\\");
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 8), green);
+    assert_eq!(t.kitty_animation_deadline(), None);
+    t.advance_bytes(b"\x1b_Ga=d,d=f,i=8,r=0\x1b\\");
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 8), green);
+    t.advance_bytes(b"\x1b_Ga=f,i=8,f=32,s=1,v=1,z=51,q=2;AAD//w==\x1b\\");
+    assert_eq!(t.kitty_animation_deadline(), Some(start + ms(107)));
+    t.advance_bytes(b"\x1b_Ga=d,d=F,i=8,r=1\x1b\\\x1b_Ga=d,d=F,i=8\x1b\\");
+    assert_eq!(t.kitty_animation_deadline(), None);
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 8), None);
+    assert_eq!(
+        pixel(&old_green, 0, 0, 8),
+        green,
+        "published frames remain immutable"
+    );
+}
+
+#[test]
+fn deleting_the_current_middle_frame_restarts_the_successors_gap() {
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    let start = Instant::now();
+    let (mut t, _) = engine();
+    t.set_kitty_animation_time(Some(start));
+    t.advance_bytes(ANIMATION);
+    t.advance_kitty_animations(start + ms(30));
+    t.set_kitty_animation_time(Some(start + ms(35)));
+    t.advance_bytes(b"\x1b_Ga=d,d=f,i=8,r=2\x1b\\");
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 8), Some([0, 0, 255, 255]));
+    assert_eq!(t.kitty_animation_deadline(), Some(start + ms(86)));
 }
 
 #[test]
