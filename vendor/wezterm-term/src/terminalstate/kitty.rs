@@ -526,10 +526,11 @@ impl TerminalState {
                     })
                     .ok_or("ENOENT")
                     .and_then(|(id, img)| {
+                        let now = self.kitty_animation_time.unwrap_or_else(Instant::now);
                         self.kitty_img.playback.entry(id).or_default().control(
                             &mut img.data(),
                             control,
-                            Instant::now(),
+                            now,
                         )
                     });
                 self.kitty_send_response(
@@ -998,6 +999,9 @@ impl TerminalState {
             None | Some(0) => 40,
             Some(n) => n.max(0) as u64,
         });
+        let old_gap = self
+            .kitty_animation_time
+            .and_then(|_| self.kitty_img.playback.get(&image_id)?.frame_gap(&anim));
 
         match &mut *anim {
             ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
@@ -1152,7 +1156,11 @@ impl TerminalState {
                 .root_gap = frame_gap;
         }
         if let Some(playback) = self.kitty_img.playback.get_mut(&image_id) {
-            playback.frames_changed(&anim, Instant::now());
+            playback.frames_changed(
+                &anim,
+                self.kitty_animation_time.unwrap_or_else(Instant::now),
+                old_gap,
+            );
         }
         drop(anim);
         self.kitty_img.used_memory += growth;

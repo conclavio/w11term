@@ -300,6 +300,41 @@ stream can still be opened with `--replay`.
 {"verb":"record","pane":1,"path":null}
 ```
 
+### Inspect one recorded update at a time
+
+Choose **Open recording paused…** in the command palette or the tab menu’s
+**Recordings** submenu to start before the first output. **Next recorded update**
+applies all output and resizes at the next distinct capture timestamp in file
+order. **Resume replay** runs at the recorded pace. **Pause replay** freezes
+the playhead, the synchronized-output timeout and kitty image animation.
+
+```powershell
+.\w11term.exe --replay-timed .\cockpit.vt --paused
+# Use the replay window's process ID and its pane ID from w11term-cli list.
+& $ctl --pid $replayPid playback --pane $pane --step
+& $ctl --pid $replayPid get-text --pane $pane
+& $ctl --pid $replayPid screenshot --pane $pane .\cockpit-update.png
+& $ctl --pid $replayPid playback --pane $pane --resume
+```
+
+`playback --pane ID` returns the pane ID, `state`, `position_us` and
+`duration_us`. The times are microseconds from the beginning of the capture.
+The duration is available after validation. States are `loading`, `playing`,
+`paused`, `complete` and `failed`. A failed replay includes an `error`.
+Control operations address a background pane without activating its tab.
+
+A step returns after its timestamp group has been processed. During a
+synchronized update, `get-text` and `screenshot` keep showing the previous
+committed screen until an end marker or the 150 ms presentation timeout.
+An interval with several recorded writes can therefore take several steps
+to produce a visible change. Stepping over trailing silence reaches the end
+of the capture.
+
+```json
+{"verb":"playback","pane":1}
+{"verb":"playback","pane":1,"action":"step"}
+```
+
 ## SFTP
 
 SFTP is available through a pane's **existing authenticated SSH connection**, on a separate, lazily opened subsystem channel. It never starts a local shell, opens a second SSH login, or changes window/tab focus. A server must offer the `sftp` subsystem; a rejected subsystem leaves the terminal usable. Remote paths are evaluated by the server, independently of the shell's current directory. Use `realpath .` to discover the SFTP working directory, and prefer absolute remote paths in scripts.

@@ -32,6 +32,7 @@ struct State {
     events: VecDeque<Event>,
     progress: wezterm_term::Progress,
     recording: Option<(u64, Arc<Path>)>,
+    replay: Option<crate::session::ReplayState>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
     restart_token: Option<u64>,
@@ -89,6 +90,19 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
+    pub fn replay_state(&self) -> Option<crate::session::ReplayState> {
+        self.state.lock().unwrap().replay
+    }
+
+    pub(crate) fn set_replay_state(&self, replay: crate::session::ReplayState) {
+        let mut state = self.state.lock().unwrap();
+        if state.replay.replace(replay) != Some(replay)
+            && let Some((_, _, inbox)) = &state.inbox
+        {
+            inbox.refresh();
+        }
+    }
+
     /// Sequence of the current recording's start, retained after journal eviction.
     pub fn recording(&self) -> Option<u64> {
         self.state

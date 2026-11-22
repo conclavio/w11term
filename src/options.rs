@@ -524,11 +524,19 @@ pub enum Source {
     /// A raw capture opened in the recording viewer, with desktop effects suppressed.
     ViewRecording(PathBuf),
     TimedReplay(PathBuf),
+    PausedReplay(PathBuf),
     Local(LocalOptions),
     Ssh(SshOptions),
 }
 
 impl Source {
+    pub fn start_paused(self) -> Result<Self> {
+        match self {
+            Self::TimedReplay(path) => Ok(Self::PausedReplay(path)),
+            _ => bail!("Starting paused requires a timed recording with its .vt.jsonl file"),
+        }
+    }
+
     /// Choose the file's playback mode before opening a tab. An incomplete
     /// timed capture must report its error instead of silently skipping its index.
     pub fn open_recording(path: PathBuf) -> Result<Self> {
@@ -547,9 +555,11 @@ impl Source {
         match self {
             Self::Local(shell) => shell.color_scheme,
             Self::Ssh(ssh) => ssh.color_scheme,
-            Self::Demo | Self::Replay(_) | Self::ViewRecording(_) | Self::TimedReplay(_) => {
-                ColorScheme::default()
-            }
+            Self::Demo
+            | Self::Replay(_)
+            | Self::ViewRecording(_)
+            | Self::TimedReplay(_)
+            | Self::PausedReplay(_) => ColorScheme::default(),
         }
     }
 
@@ -557,9 +567,11 @@ impl Source {
         match self {
             Self::Local(shell) => shell.scrollback_lines,
             Self::Ssh(ssh) => ssh.scrollback_lines,
-            Self::Demo | Self::Replay(_) | Self::ViewRecording(_) | Self::TimedReplay(_) => {
-                ScrollbackLines::default()
-            }
+            Self::Demo
+            | Self::Replay(_)
+            | Self::ViewRecording(_)
+            | Self::TimedReplay(_)
+            | Self::PausedReplay(_) => ScrollbackLines::default(),
         }
     }
 }
@@ -592,6 +604,7 @@ impl Options {
         let mut explicit_source = false;
         let mut profiles_path = default_profiles_path();
         let mut list_profiles = false;
+        let mut paused = false;
         let mut port = None;
         let mut authentication = None;
         let mut host_key = None;
@@ -609,7 +622,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -636,6 +649,7 @@ impl Options {
                 "--rows" => rows = Some(value(&mut args, &arg)?.parse::<usize>()?),
                 "--profiles" => profiles_path = value(&mut args, &arg)?.into(),
                 "--list-profiles" => list_profiles = true,
+                "--paused" => paused = true,
                 "--benchmark" => benchmark = true,
                 "--smoke-seconds" => smoke_seconds = Some(value(&mut args, &arg)?.parse()?),
                 "ssh" => {
@@ -703,6 +717,17 @@ impl Options {
             workspace_name.is_none() || !(explicit_source || list_profiles || benchmark),
             "--workspace cannot be combined with a terminal source, --tab, --list-profiles or --benchmark"
         );
+        ensure!(
+            !paused
+                || (!list_profiles
+                    && workspace_name.is_none()
+                    && matches!(&source, Source::TimedReplay(_))
+                    && profile.is_none()),
+            "--paused requires --replay-timed"
+        );
+        if paused {
+            source = source.start_paused()?;
+        }
         if list_profiles {
             let catalog = load_profiles(&profiles_path)?;
             for name in catalog.cli_order() {
@@ -762,7 +787,7 @@ impl Options {
                 "SSH options require ssh user@host or --profile NAME"
             );
         }
-        if let Source::TimedReplay(path) = &source {
+        if let Source::TimedReplay(path) | Source::PausedReplay(path) = &source {
             let size = crate::recorder::TimedReplay::read_initial_size(path)?;
             // The initial window may be smaller than the recorded terminal grid.
             cols.get_or_insert(size.cols.min(1000));
@@ -1129,6 +1154,21 @@ mod tests {
             .unwrap();
         let launch = parse(&["--replay-timed", file]).unwrap().unwrap();
         assert_eq!(launch.source, Source::TimedReplay(path.clone()));
+        for args in [
+            vec!["--replay-timed", file, "--paused"],
+            vec!["--paused", "--replay-timed", file],
+        ] {
+            let paused = parse(&args).unwrap().unwrap();
+            assert_eq!(paused.source, Source::PausedReplay(path.clone()));
+            assert_eq!((paused.cols, paused.rows), (Some(91), Some(37)));
+        }
+        for args in [
+            vec!["--paused"],
+            vec!["--demo", "--paused"],
+            vec!["--paused", "--replay", file],
+        ] {
+            assert!(parse(&args).is_err());
+        }
         assert_eq!((launch.cols, launch.rows), (Some(91), Some(37)));
         let launch = parse(&["--cols", "73", "--replay-timed", file])
             .unwrap()

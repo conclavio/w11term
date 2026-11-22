@@ -101,6 +101,17 @@ impl Presentation {
         status: &str,
         total: u64,
     ) {
+        self.advance_at(terminal, bytes, offset, status, total, Instant::now());
+    }
+    pub fn advance_at(
+        &mut self,
+        terminal: &mut Terminal,
+        bytes: impl AsRef<[u8]>,
+        offset: usize,
+        status: &str,
+        total: u64,
+        now: Instant,
+    ) {
         terminal.advance_bytes_with_sync(bytes, |state, enabled| {
             // Begin commits the preceding unsynchronized prefix. End commits the
             // completed update even when another begin follows in the same read.
@@ -116,7 +127,7 @@ impl Presentation {
                 status,
                 if enabled { committed_bytes } else { total },
             );
-            self.deadline = enabled.then(|| Instant::now() + SYNC_TIMEOUT);
+            self.deadline = enabled.then(|| now + SYNC_TIMEOUT);
         });
         self.dirty = true;
     }
@@ -124,6 +135,18 @@ impl Presentation {
         terminal.end_synchronized_output();
         self.deadline = None;
         self.dirty = true;
+    }
+    pub fn replay_time(&mut self, terminal: &mut Terminal, now: Instant) {
+        terminal.set_kitty_animation_time(Some(now.into_std()));
+        if self.deadline.is_some_and(|time| time <= now) {
+            self.expire(terminal);
+        }
+        if terminal
+            .kitty_animation_deadline()
+            .is_some_and(|time| time <= now.into_std())
+        {
+            self.dirty |= terminal.advance_kitty_animations(now.into_std());
+        }
     }
     pub fn publish(&mut self, terminal: &Terminal, offset: usize, metadata: Metadata<'_>) {
         let Metadata {

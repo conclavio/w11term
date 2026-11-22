@@ -97,6 +97,11 @@ pub enum Request {
     Inspect {
         pane: u64,
     },
+    Playback {
+        pane: u64,
+        #[serde(default)]
+        action: crate::session::ReplayAction,
+    },
     ListCommands {
         pane: u64,
     },
@@ -454,6 +459,21 @@ impl Registry {
                 id,
                 connection_generation,
             } => self.get_command(pane, id, connection_generation).await,
+            Request::Playback { pane, action } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::Replay { action, reply })
+                    .context("pane is closed")?;
+                let status = tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("playback control timed out")?
+                    .context("pane closed during playback control")?
+                    .map_err(anyhow::Error::msg)?;
+                let mut result = serde_json::to_value(status)?;
+                result["pane"] = pane.into();
+                Ok(result)
+            }
             Request::Inspect { pane } => {
                 let (reply, response) = oneshot::channel();
                 self.pane(pane)?

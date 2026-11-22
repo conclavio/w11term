@@ -31,6 +31,7 @@ mod test_worker;
 mod timed_replay;
 use launch::Phase;
 use presentation::Presentation;
+pub use timed_replay::{ReplayAction, ReplayState, ReplayStatus};
 
 #[derive(Debug)]
 pub struct ClaimedRestart(pub(crate) u64);
@@ -67,6 +68,10 @@ pub enum Command {
     Inspect(bool),
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<(u64, terminal::TerminalModes)>),
+    Replay {
+        action: ReplayAction,
+        reply: tokio::sync::oneshot::Sender<Result<ReplayStatus, String>>,
+    },
     Sftp(crate::sftp::Job),
     Key {
         key: KeyCode,
@@ -392,7 +397,10 @@ impl Session {
             source.scrollback_lines(),
             colors.effective(),
         );
-        let output_viewer = matches!(source, Source::TimedReplay(_) | Source::ViewRecording(_));
+        let output_viewer = matches!(
+            source,
+            Source::TimedReplay(_) | Source::PausedReplay(_) | Source::ViewRecording(_)
+        );
         let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard && !output_viewer));
         let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         match &source {
@@ -527,7 +535,8 @@ async fn run(
     let (output_tx, mut output) = mpsc::channel(32);
     let is_demo = matches!(source, Source::Demo);
     let is_ssh = matches!(source, Source::Ssh(_));
-    let is_timed_replay = matches!(source, Source::TimedReplay(_));
+    let is_timed_replay = matches!(source, Source::TimedReplay(_) | Source::PausedReplay(_));
+    let start_paused = matches!(source, Source::PausedReplay(_));
     let interactive = is_ssh || matches!(source, Source::Local(_));
     // A durable backend may reconstruct an old screen at any time. Its OSC
     // 133 bytes cannot be used to announce a newly completed command.
@@ -586,12 +595,10 @@ async fn run(
             // Keep consuming engine replies; replay has no peer to answer them.
             transports.spawn(async move { while transport_input.recv().await.is_some() {} });
         }
-        Source::TimedReplay(path) => {
-            status = format!("Timed replay · {}", path.display());
-            match timed_replay::Playback::open(path) {
-                Ok(reader) => playback = Some(reader),
-                Err(error) => status = format!("Timed replay: {error:#}"),
-            }
+        Source::TimedReplay(path) | Source::PausedReplay(path) => {
+            let reader = timed_replay::Playback::open(path, start_paused);
+            status = reader.label();
+            playback = Some(reader);
             transports.spawn(async move { while transport_input.recv().await.is_some() {} });
         }
         Source::Demo => {
@@ -608,6 +615,7 @@ async fn run(
     let mut connection_generation = 0;
     let mut recorder: Option<crate::recorder::Recorder> = None;
     let mut inspecting = false;
+    let mut replay_label = None;
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
@@ -669,17 +677,32 @@ async fn run(
                 }
             }));
         }
-        presentation.publish(
-            &terminal,
-            scroll_offset,
-            presentation::Metadata {
-                status: &status,
-                bytes: total_bytes,
-                search: &search,
-                prompt: prompts.current(),
-                connection: connection_generation,
-            },
-        );
+        if let Some(reader) = &playback
+            && !reader.in_group
+            && replay_label != Some(reader.label_key())
+        {
+            if replay_label.is_none_or(|(state, _)| state != reader.state) {
+                events.set_replay_state(reader.state);
+            }
+            replay_label = Some(reader.label_key());
+            status = reader.label();
+        }
+        if playback.as_ref().is_none_or(|reader| !reader.in_group) {
+            presentation.publish(
+                &terminal,
+                scroll_offset,
+                presentation::Metadata {
+                    status: &status,
+                    bytes: total_bytes,
+                    search: &search,
+                    prompt: prompts.current(),
+                    connection: connection_generation,
+                },
+            );
+            if let Some(reader) = &mut playback {
+                reader.published();
+            }
+        }
         if phase == Phase::PublishingExit {
             phase = Phase::Exited;
             if restartable {
@@ -690,34 +713,35 @@ async fn run(
             frames.set_inspection(Some(terminal::TerminalModes::read(&terminal)));
         }
         let animation_deadline = presentation.animation_deadline(&terminal);
+        let replay_deadline = animation_deadline
+            .into_iter()
+            .chain(presentation.deadline)
+            .min();
         tokio::select! {
-            step = async { playback.as_mut().unwrap().next().await }, if playback.is_some() => {
+            step = async { playback.as_mut().unwrap().next(replay_deadline).await }, if playback.is_some() => {
                 use crate::recorder::ReplayEvent;
+                use timed_replay::Update;
                 match step {
-                    Some(Ok(ReplayEvent::Output(bytes))) => {
+                    Update::Event(now, ReplayEvent::Output(bytes)) => {
+                        presentation.replay_time(&mut terminal, now);
                         let anchor = (scroll_offset > 0 && !terminal.is_alt_screen_active()).then(||
                             terminal.screen().visible_row_to_stable_row(0) - scroll_offset as isize);
                         total_bytes += bytes.len() as u64;
-                        presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                        presentation.advance_at(&mut terminal, bytes, scroll_offset, &status, total_bytes, now);
+                        presentation.replay_time(&mut terminal, now);
                         if let Some(anchor) = anchor && !terminal.is_alt_screen_active() {
                             scroll_offset = (terminal.screen().visible_row_to_stable_row(0) - anchor)
                                 .clamp(0, crate::search::max_offset(&terminal) as isize) as usize;
                         }
                     }
-                    Some(Ok(ReplayEvent::Resize(new_size))) => {
+                    Update::Event(now, ReplayEvent::Resize(new_size)) => {
+                        presentation.replay_time(&mut terminal, now);
                         size = new_size;
                         resize_model(&mut terminal, size, &mut scroll_offset);
                         presentation.dirty = true;
                     }
-                    Some(Err(error)) => {
-                        status = format!("Timed replay: {error:#}");
-                        playback = None;
-                    }
-                    None => {
-                        if let Some(reader) = playback.take() {
-                            status = format!("Timed replay complete · {}", reader.path.display());
-                        }
-                    }
+                    Update::Clock(now) => presentation.replay_time(&mut terminal, now),
+                    Update::State => {}
                 }
                 if search.open && !search_dirty {
                     search_dirty = true;
@@ -725,10 +749,10 @@ async fn run(
                 }
             }
             _ = colors.changed() => {},
-            _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if animation_deadline.is_some() => {
+            _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if !is_timed_replay && animation_deadline.is_some() => {
                 presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
             },
-            _=tokio::time::sleep_until(presentation.deadline.unwrap_or_else(||tokio::time::Instant::now()+std::time::Duration::from_secs(86400))),if presentation.deadline.is_some()=>{presentation.expire(&mut terminal);},
+            _=tokio::time::sleep_until(presentation.deadline.unwrap_or_else(||tokio::time::Instant::now()+std::time::Duration::from_secs(86400))),if !is_timed_replay && presentation.deadline.is_some()=>{presentation.expire(&mut terminal);},
             _=prompts.changed()=>{},
             Some(notice)=notices.recv()=>match notice {
                 crate::sound::Notice::Play(name)=>{if sounds.try_send(name).is_err(){events.push("sound-error",serde_json::json!({"reason":"audio queue full"}));}},
@@ -865,6 +889,14 @@ async fn run(
                         if !reply.is_closed() {
                             let _ = reply.send((connection_generation, terminal::TerminalModes::read(&terminal)));
                         }
+                        Ok(())
+                    }
+                    Some(Command::Replay { action, reply }) => {
+                        if let Some(reader) = &mut playback {
+                            if let Some(now) = reader.control(action, reply) {
+                                presentation.replay_time(&mut terminal, now);
+                            }
+                        } else { let _ = reply.send(Err("Playback controls require a timed replay pane".into())); }
                         Ok(())
                     }
                     Some(Command::Sftp(job)) => {
@@ -1143,9 +1175,11 @@ fn can_watch_commands(source: &Source) -> bool {
     match source {
         Source::Ssh(options) => !options.durable,
         Source::Local(_) => true,
-        Source::Replay(_) | Source::ViewRecording(_) | Source::TimedReplay(_) | Source::Demo => {
-            false
-        }
+        Source::Replay(_)
+        | Source::ViewRecording(_)
+        | Source::TimedReplay(_)
+        | Source::PausedReplay(_)
+        | Source::Demo => false,
     }
 }
 

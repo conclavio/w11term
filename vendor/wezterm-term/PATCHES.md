@@ -53,6 +53,9 @@ The original MIT license is preserved in `LICENSE.md`.
   The sister vendored escape parser at the same pinned revision preserves their
   control parameters. The projection uses the Unicode 6.0 diacritic indices
   published with kitty's graphics protocol. See `docs/graphics-audit.md`.
+  Timed replay supplies a per-terminal animation clock. Large jumps use the
+  current frame gaps and loop limit to find the displayed frame in time
+  proportional to the frame count. Live panes retain their wall-clock pacing.
 
 - Kitty visible deletion uses the live screen boundary for physical placements.
   The escape parser and image model support inclusive client ID ranges, including

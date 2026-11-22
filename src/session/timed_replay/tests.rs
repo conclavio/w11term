@@ -2,7 +2,7 @@ use crate::{
     options::{ColorScheme, Source},
     recorder::Recorder,
     session::{
-        Command, Session,
+        Command, ReplayAction, ReplayState, ReplayStatus, Session,
         colors::PaneColors,
         test_worker::{capture, with_worker},
     },
@@ -48,14 +48,227 @@ async fn wait_for(
 }
 
 fn pixel(frame: &Snapshot) -> Vec<u8> {
-    let cell = frame.rows[1].get_cell(0).unwrap();
+    image_pixel(frame, 1, 7)
+}
+fn image_pixel(frame: &Snapshot, row: usize, id: u32) -> Vec<u8> {
+    let cell = frame.rows[row].get_cell(0).unwrap();
     let tiles = cell.attrs().images().unwrap();
     assert_eq!(tiles.len(), 1);
-    assert_eq!(tiles[0].image_id(), Some(7));
+    assert_eq!(tiles[0].image_id(), Some(id));
     match frame.image_data(tiles[0].image_data()) {
         wezterm_term::image::ImageDataType::Rgba8 { data, .. } => data.clone(),
         _ => panic!("expected a decoded 1x1 kitty image"),
     }
+}
+
+async fn control(
+    input: &mpsc::UnboundedSender<Command>,
+    action: ReplayAction,
+) -> Result<ReplayStatus, String> {
+    let (reply, mut receive) = oneshot::channel();
+    input.send(Command::Replay { action, reply }).unwrap();
+    let limit = Instant::now() + Duration::from_secs(5);
+    loop {
+        match receive.try_recv() {
+            Ok(result) => return result,
+            Err(oneshot::error::TryRecvError::Closed) => panic!("worker closed during {action:?}"),
+            Err(oneshot::error::TryRecvError::Empty) => {
+                assert!(Instant::now() < limit, "worker did not finish {action:?}");
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_read_keeps_record_order_and_pause_acknowledges_the_due_group() {
+    use super::Update;
+    use crate::recorder::ReplayEvent;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("late.vt");
+    let mut record = Recorder::start_timed(&path, original_size()).unwrap();
+    for byte in b"ABC" {
+        advance(Duration::from_millis(20)).await;
+        record.write(&[*byte]).unwrap();
+    }
+    advance(Duration::from_millis(20)).await;
+    record.finish().unwrap();
+    let mut playback = super::Playback::open(path, false);
+    assert!(matches!(
+        playback.next(None).await,
+        Update::Event(_, ReplayEvent::Resize(_))
+    ));
+    // No event is serviced until three capture timestamps have elapsed.
+    advance(Duration::from_millis(70)).await;
+    let wall = tokio::time::Instant::now();
+    let Update::Event(first, ReplayEvent::Output(a)) = playback.next(None).await else {
+        panic!("expected first output")
+    };
+    assert_eq!(a, b"A");
+    assert_eq!(wall, tokio::time::Instant::now());
+    let (tx, mut result) = oneshot::channel();
+    playback.control(ReplayAction::Pause, tx);
+    playback.published();
+    assert!(matches!(
+        result.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    let Update::Event(second, ReplayEvent::Output(b)) = playback.next(None).await else {
+        panic!("expected second output")
+    };
+    assert_eq!(b, b"B");
+    assert_eq!(second - first, Duration::from_millis(20));
+    let Update::Event(third, ReplayEvent::Output(c)) = playback.next(None).await else {
+        panic!("expected third output")
+    };
+    assert_eq!(c, b"C");
+    assert_eq!(third - second, Duration::from_millis(20));
+    let Update::Clock(paused) = playback.next(None).await else {
+        panic!("expected pause in silence")
+    };
+    assert_eq!(paused - third, Duration::from_millis(10));
+    playback.published();
+    let status = result.await.unwrap().unwrap();
+    assert_eq!(
+        (status.state, status.position_us),
+        (ReplayState::Paused, 70_000)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn paused_launch_steps_whole_timestamps_then_freezes_sync_and_trailing_silence() {
+    use ReplayAction::*;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frames.vt");
+    let initial = original_size();
+    let resized = TerminalSize {
+        cols: 20,
+        pixel_width: 200,
+        ..initial
+    };
+    let mut record = Recorder::start_timed(&path, initial).unwrap();
+    record.write(b"A").unwrap();
+    record.resize(resized).unwrap();
+    record.write(b"B").unwrap();
+    advance(Duration::from_millis(20)).await;
+    record.write(b"\x1b[?2026hC").unwrap();
+    advance(Duration::from_millis(200)).await;
+    record.write(b"D").unwrap();
+    advance(Duration::from_millis(80)).await;
+    record.finish().unwrap();
+
+    with_worker(
+        Source::PausedReplay(path),
+        TerminalSize::default(),
+        PaneColors::new(ColorScheme::Default, crate::windows_appearance::subscribe),
+        None,
+        async |input, _| {
+            wait_for(&input, |f| f.status.starts_with("Timed replay paused")).await;
+            let initial_status = control(&input, Status).await.unwrap();
+            assert_eq!(initial_status.position_us, 0);
+            assert_eq!(initial_status.duration_us, Some(300_000));
+            assert_eq!(capture(&input).await.bytes_received, 0);
+            let stepped = control(&input, Step).await.unwrap();
+            assert_eq!(
+                (stepped.state, stepped.position_us),
+                (ReplayState::Paused, 0)
+            );
+            let first = capture(&input).await;
+            assert_eq!(first.rows[0].as_str().trim_end(), "AB");
+            assert_eq!(first.size, resized);
+            assert_eq!(control(&input, Step).await.unwrap().position_us, 20_000);
+            assert_eq!(capture(&input).await.rows[0].as_str().trim_end(), "AB");
+            advance(Duration::from_millis(500)).await;
+            assert_eq!(control(&input, Status).await.unwrap().position_us, 20_000);
+            assert_eq!(capture(&input).await.rows[0].as_str().trim_end(), "AB");
+            assert_eq!(
+                control(&input, Resume).await.unwrap().state,
+                ReplayState::Playing
+            );
+            advance(Duration::from_millis(100)).await;
+            assert_eq!(control(&input, Pause).await.unwrap().position_us, 120_000);
+            advance(Duration::from_millis(500)).await;
+            assert_eq!(capture(&input).await.rows[0].as_str().trim_end(), "AB");
+            assert_eq!(control(&input, Step).await.unwrap().position_us, 220_000);
+            // The 170 ms watchdog deadline precedes D's 220 ms output.
+            assert_eq!(capture(&input).await.rows[0].as_str().trim_end(), "ABCD");
+            let end = control(&input, Step).await.unwrap();
+            assert_eq!(
+                (end.state, end.position_us),
+                (ReplayState::Complete, 300_000)
+            );
+            for action in [Pause, Resume, Step] {
+                assert!(control(&input, action).await.is_err());
+            }
+            assert_eq!(control(&input, Status).await.unwrap(), end);
+        },
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn kitty_animations_follow_the_media_clock_and_freeze_on_the_footer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("animation.vt");
+    let mut record = Recorder::start_timed(&path, original_size()).unwrap();
+    record
+        .write(include_bytes!("../../../tests/fixtures/kitty/animation.vt"))
+        .unwrap();
+    advance(Duration::from_millis(30)).await;
+    record.write(b"\x1b[2;1Hsecond").unwrap();
+    advance(Duration::from_millis(45)).await;
+    record.finish().unwrap();
+    with_worker(
+        Source::PausedReplay(path),
+        TerminalSize::default(),
+        PaneColors::new(ColorScheme::Default, crate::windows_appearance::subscribe),
+        None,
+        async |input, _| {
+            wait_for(&input, |f| f.status.starts_with("Timed replay paused")).await;
+            let first = control(&input, ReplayAction::Step).await.unwrap();
+            assert_eq!(first.position_us, 0);
+            assert_eq!(image_pixel(&capture(&input).await, 0, 8), [255, 0, 0, 255]);
+            advance(Duration::from_millis(300)).await;
+            assert_eq!(image_pixel(&capture(&input).await, 0, 8), [255, 0, 0, 255]);
+            let second = control(&input, ReplayAction::Step).await.unwrap();
+            assert_eq!(second.position_us, 30_000);
+            assert_eq!(image_pixel(&capture(&input).await, 0, 8), [0, 255, 0, 255]);
+            let footer = control(&input, ReplayAction::Step).await.unwrap();
+            assert_eq!(footer.state, ReplayState::Complete);
+            assert_eq!(image_pixel(&capture(&input).await, 0, 8), [0, 0, 255, 255]);
+            advance(Duration::from_millis(300)).await;
+            assert_eq!(image_pixel(&capture(&input).await, 0, 8), [0, 0, 255, 255]);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn loading_controls_are_bounded_and_invalid_attachments_remain_inspectable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut reader = super::Playback::open(dir.path().join("missing.vt"), false);
+    let (reply, receive) = oneshot::channel();
+    reader.control(ReplayAction::Pause, reply);
+    reader.published();
+    let loading = receive.await.unwrap().unwrap();
+    assert_eq!(
+        (loading.state, loading.duration_us),
+        (ReplayState::Loading, None)
+    );
+    let (step_reply, step) = oneshot::channel();
+    reader.control(ReplayAction::Step, step_reply);
+    let (busy_reply, busy) = oneshot::channel();
+    reader.control(ReplayAction::Step, busy_reply);
+    assert!(busy.await.unwrap().is_err());
+    assert!(matches!(reader.next(None).await, super::Update::State));
+    assert!(step.await.unwrap().is_err());
+    let (reply, receive) = oneshot::channel();
+    reader.control(ReplayAction::Status, reply);
+    let failed = receive.await.unwrap().unwrap();
+    assert_eq!(failed.state, ReplayState::Failed);
+    assert!(failed.error.is_some());
+    let pane = Session::start(Source::Demo);
+    assert!(control(&pane.input, ReplayAction::Status).await.is_err());
 }
 
 #[tokio::test(start_paused = true)]

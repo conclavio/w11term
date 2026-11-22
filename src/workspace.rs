@@ -37,6 +37,7 @@ pub enum SavedSource {
     Replay(PathBuf),
     ViewRecording(PathBuf),
     TimedReplay(PathBuf),
+    PausedReplay(PathBuf),
     /// Connection options contain authentication methods and key paths; live
     /// passwords, private key material and authentication answers live elsewhere.
     Ssh(Box<SshOptions>),
@@ -117,13 +118,17 @@ impl SavedSource {
                 ensure!(!path.as_os_str().is_empty(), "Empty recording path");
                 Self::ViewRecording(std::path::absolute(path)?)
             }
-            (Source::Replay(path) | Source::TimedReplay(path), _) => {
+            (Source::Replay(path), _) => {
+                ensure!(!path.as_os_str().is_empty(), "Empty replay path");
+                Self::Replay(std::path::absolute(path)?)
+            }
+            (Source::TimedReplay(path) | Source::PausedReplay(path), _) => {
                 ensure!(!path.as_os_str().is_empty(), "Empty replay path");
                 let path = std::path::absolute(path)?;
-                if matches!(source, Source::TimedReplay(_)) {
-                    Self::TimedReplay(path)
+                if matches!(source, Source::PausedReplay(_)) {
+                    Self::PausedReplay(path)
                 } else {
-                    Self::Replay(path)
+                    Self::TimedReplay(path)
                 }
             }
             (Source::Ssh(_), Some(name)) => Self::SavedProfile(name.into()),
@@ -186,7 +191,10 @@ impl SavedSource {
                 shell.validate()?;
                 shell.validate_resolved_paths()?;
             }
-            Self::Replay(path) | Self::TimedReplay(path) | Self::ViewRecording(path) => {
+            Self::Replay(path)
+            | Self::TimedReplay(path)
+            | Self::PausedReplay(path)
+            | Self::ViewRecording(path) => {
                 ensure!(path.is_absolute(), "Expected an absolute replay path")
             }
             Self::Ssh(options) => {
@@ -263,15 +271,19 @@ impl SavedSource {
                 shell.check_launch_paths()?;
                 Source::Local(shell.clone())
             }
-            Self::Replay(path) | Self::TimedReplay(path) => {
+            Self::Replay(path) | Self::TimedReplay(path) | Self::PausedReplay(path) => {
                 ensure!(
                     path.is_file(),
                     "Workspace replay file is unavailable: {}",
                     path.display()
                 );
-                if matches!(self, Self::TimedReplay(_)) {
+                if matches!(self, Self::TimedReplay(_) | Self::PausedReplay(_)) {
                     crate::recorder::TimedReplay::read_initial_size(path)?;
-                    Source::TimedReplay(path.clone())
+                    if matches!(self, Self::PausedReplay(_)) {
+                        Source::PausedReplay(path.clone())
+                    } else {
+                        Source::TimedReplay(path.clone())
+                    }
                 } else {
                     Source::Replay(path.clone())
                 }
@@ -965,6 +977,12 @@ mod tests {
             .finish()
             .unwrap();
         let source = Source::TimedReplay(path.clone());
+        let paused = Source::PausedReplay(path.clone());
+        let paused_recipe = SavedSource::capture(&paused, None).unwrap();
+        let paused_json = serde_json::to_value(&paused_recipe).unwrap();
+        assert_eq!(paused_json["kind"], "paused_replay");
+        let reopened: SavedSource = serde_json::from_value(paused_json).unwrap();
+        assert_eq!(reopened.resolve(&BTreeMap::new()).unwrap(), paused);
         let saved = SavedSource::capture(&source, None).unwrap();
         let serialized = serde_json::to_value(&saved).unwrap();
         assert_eq!(serialized["kind"], "timed_replay");
