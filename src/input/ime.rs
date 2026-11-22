@@ -45,6 +45,7 @@ pub(super) struct WindowIme {
     composition: RefCell<Composition>,
     subclasses: RefCell<Vec<HWND>>,
     association: std::cell::Cell<Option<(HWND, HIMC)>>,
+    native_composition: std::cell::Cell<Option<HWND>>,
 }
 
 fn with_composition<R>(f: impl FnOnce(&Composition) -> R) -> R {
@@ -104,6 +105,14 @@ pub(crate) fn preedit(sender: &mpsc::UnboundedSender<Command>) -> Option<Preedit
 }
 pub(crate) fn active() -> bool {
     with_composition(|ime| ime.owner.is_some())
+}
+
+pub(super) fn native_composing(hwnd: HWND) -> bool {
+    super::window::with_ime(|ime| ime.native_composition.get() == Some(hwnd))
+        || (!hwnd.is_invalid()
+            && Context::get(hwnd).is_some_and(|c| unsafe {
+                ImmGetCompositionStringW(c.1, GCS_COMPSTR, None, 0) > 0
+            }))
 }
 pub(crate) fn client_height() -> Option<i32> {
     let hwnd = window()?;
@@ -191,6 +200,7 @@ fn eligible() -> bool {
                         && !s.search
                         && !s.modal
                         && !s.drawer_focused
+                        && s.session_search.is_none()
                         && !s.switcher
                         && s.picker.is_none()
                         && s.local_mode.is_none()
@@ -337,6 +347,16 @@ unsafe extern "system" fn proc(
 }
 fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
     let zero = Some(LRESULT(0));
+    if matches!(
+        msg,
+        WM_IME_ENDCOMPOSITION | WM_INPUTLANGCHANGE | WM_KILLFOCUS | WM_NCDESTROY
+    ) {
+        super::window::with_ime(|ime| {
+            if ime.native_composition.get() == Some(hwnd) {
+                ime.native_composition.set(None);
+            }
+        });
+    }
     if msg == WM_SETFOCUS {
         sync_context();
     }
@@ -372,6 +392,7 @@ fn handle(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
     if msg == WM_IME_STARTCOMPOSITION {
         with_composition_mut(|i| i.discarded = None);
         if !eligible() {
+            super::window::with_ime(|ime| ime.native_composition.set(Some(hwnd)));
             return None;
         }
         with_composition_mut(|i| {
@@ -540,6 +561,35 @@ pub(crate) mod smoke {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn remote_session_search_enter_commits_native_composition_before_submitting_a_query() {
+        let _window = WindowScope::default().enter();
+        let hwnd = HWND::default();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut state = State {
+            session_search: Some((1, 2, 3)),
+            session_search_focused: true,
+            ..State::new(move |s| seen.borrow_mut().push(s))
+        };
+        let key = |message| MSG {
+            hwnd,
+            message,
+            wParam: WPARAM(0x0d),
+            ..Default::default()
+        };
+        handle(hwnd, WM_IME_STARTCOMPOSITION, WPARAM(0), LPARAM(0));
+        assert!(!state.handle(&key(WM_KEYDOWN)));
+        handle(hwnd, WM_IME_ENDCOMPOSITION, WPARAM(0), LPARAM(0));
+        assert!(!state.handle(&key(WM_KEYUP)));
+        assert!(actions.borrow().is_empty());
+        assert!(state.handle(&key(WM_KEYDOWN)));
+        assert_eq!(
+            &*actions.borrow(),
+            &[Shortcut::SubmitSessionSearch(1, 2, 3)]
+        );
+    }
+
     #[test]
     fn updates_stay_local_until_a_utf16_result_and_cancel_cannot_retarget() {
         let (tx, mut rx) = mpsc::unbounded_channel();

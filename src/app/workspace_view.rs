@@ -317,7 +317,7 @@ impl TerminalApp {
             let Page::Terminal(live) = &tab.page else {
                 anyhow::bail!("Expected a terminal pane")
             };
-            let source = if live.discovery_page.is_some() {
+            let source = if live.discovery.is_some() {
                 let name = live
                     .profile_name
                     .clone()

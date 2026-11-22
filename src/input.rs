@@ -79,9 +79,11 @@ struct State {
     modal: bool,
     drawer_pane: Option<u64>,
     drawer_focused: bool,
-    // Native buttons can close their drawer before key-up or the translated WM_CHAR.
-    drawer_keys: HashSet<KeySlot>,
-    drawer_late_char: Option<KeySlot>,
+    session_search: Option<(u64, u64, u64)>, // pane, listing revision, query revision
+    session_search_focused: bool,
+    // A native button or search field can disappear before key-up or WM_CHAR.
+    native_keys: HashSet<KeySlot>,
+    native_late_char: Option<KeySlot>,
     game_mode: bool,
     close_handler: Option<Box<dyn Fn()>>,
 }
@@ -154,6 +156,7 @@ pub enum Shortcut {
     TaskbarCreated,
     CaretPresentationChanged,
     DrawerFocusChanged,
+    SubmitSessionSearch(u64, u64, u64),
     NextTab,
     PreviousTab,
     MoveTabLeft,
@@ -208,6 +211,7 @@ pub enum Shortcut {
 pub struct KeyboardBridge {
     scope: WindowScope,
     drawer_watch: RefCell<Option<drawer_focus::Watch>>,
+    session_search_watch: RefCell<Option<drawer_focus::Watch>>,
     bootstrap: String,
     _hooks: std::rc::Rc<ThreadHooks>,
 }
@@ -290,6 +294,7 @@ impl KeyboardBridge {
         Ok(Self {
             scope,
             drawer_watch: RefCell::default(),
+            session_search_watch: RefCell::default(),
             bootstrap: format!("w11term-window-{:032x}", rand::random::<u128>()),
             _hooks: window::install_hooks()?,
         })
@@ -528,11 +533,14 @@ impl KeyboardBridge {
         }
         self.drawer_watch.borrow_mut().take();
         if let (Some(pane), Some(hwnd)) = (pane, hwnd) {
-            match drawer_focus::Watch::new(pane, hwnd.0 as usize) {
+            let hwnd = hwnd.0 as usize;
+            match drawer_focus::Watch::new(format!("w11term-sftp-{pane}"), move |focused| {
+                notify_drawer_focus(hwnd, pane, focused)
+            }) {
                 Ok(watch) => *self.drawer_watch.borrow_mut() = Some(watch),
                 Err(error) => {
                     log::warn!("Tracking SFTP drawer focus: {error}");
-                    notify_drawer_focus(hwnd.0 as usize, pane, true);
+                    notify_drawer_focus(hwnd, pane, true);
                 }
             }
         }
@@ -543,6 +551,52 @@ impl KeyboardBridge {
         let _native = self.scope.enter();
         if with_input_mut(|s| s.as_mut().is_some_and(|s| s.set_drawer_focus(false))) {
             ime::sync_context();
+        }
+    }
+
+    pub fn session_search_tag(&self, pane: u64) -> String {
+        format!("{}-session-search-{pane}", self.bootstrap)
+    }
+
+    pub fn watch_session_search(&self, query: Option<(u64, u64, u64)>) {
+        let _native = self.scope.enter();
+        let hwnd = self.hwnd();
+        if query.is_some() && hwnd.is_none() {
+            return;
+        }
+        let pane_changed = with_input_mut(|input| {
+            let Some(state) = input else { return false };
+            let changed =
+                state.session_search.map(|(pane, ..)| pane) != query.map(|(pane, ..)| pane);
+            state.session_search = query;
+            if changed {
+                state.session_search_focused = false;
+            }
+            changed
+        });
+        if !pane_changed {
+            return;
+        }
+        self.session_search_watch.borrow_mut().take();
+        if let (Some((pane, ..)), Some(hwnd)) = (query, hwnd) {
+            let hwnd = hwnd.0 as usize;
+            let tag = self.session_search_tag(pane);
+            match drawer_focus::Watch::new(tag, move |focused| {
+                if let Some(scope) = WindowScope::for_window(HWND(hwnd as *mut _)) {
+                    let _guard = scope.enter();
+                    with_input(|state| {
+                        if let Ok(mut state) = state.try_borrow_mut()
+                            && let Some(state) = state.as_mut()
+                            && state.session_search.is_some_and(|(id, ..)| id == pane)
+                        {
+                            state.session_search_focused = focused;
+                        }
+                    });
+                }
+            }) {
+                Ok(watch) => *self.session_search_watch.borrow_mut() = Some(watch),
+                Err(error) => log::warn!("Tracking remote session search focus: {error}"),
+            }
         }
     }
 
@@ -611,7 +665,6 @@ impl KeyboardBridge {
             ) == LRESULT(1)
         }
     }
-    #[cfg(feature = "ui-smoke")]
     pub fn has_target(&self) -> bool {
         let _native = self.scope.enter();
         with_input(|input| {
@@ -627,6 +680,7 @@ impl Drop for KeyboardBridge {
     fn drop(&mut self) {
         let _guard = self.scope.enter();
         self.drawer_watch.get_mut().take();
+        self.session_search_watch.get_mut().take();
         ime::uninstall();
         if let Some(mut state) = with_input_mut(Option::take) {
             state.release_keys();
@@ -1095,8 +1149,10 @@ impl State {
             modal: false,
             drawer_pane: None,
             drawer_focused: false,
-            drawer_keys: HashSet::new(),
-            drawer_late_char: None,
+            session_search: None,
+            session_search_focused: false,
+            native_keys: HashSet::new(),
+            native_late_char: None,
             game_mode: false,
             close_handler: None,
         }
@@ -1148,6 +1204,7 @@ impl State {
         window::active()
             && !self.search
             && !self.drawer_focused
+            && self.session_search.is_none()
             && !self.modal
             && !self.switcher
             && self.picker.is_none()
@@ -1201,26 +1258,26 @@ impl State {
             (None, Some(position)) => KeySlot::PrintableScan(position),
             (None, None) => KeySlot::Virtual(vk),
         };
-        if !self.drawer_keys.is_empty() || self.drawer_late_char.is_some() {
+        if !self.native_keys.is_empty() || self.native_late_char.is_some() {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) == 0 => {
-                    self.drawer_late_char = None;
-                    self.drawer_keys.remove(&slot);
+                    self.native_late_char = None;
+                    self.native_keys.remove(&slot);
                 }
-                WM_KEYUP | WM_SYSKEYUP if self.drawer_keys.remove(&slot) => {
-                    self.drawer_late_char = matches!(vk, 0x09 | 0x0d | 0x20).then_some(slot);
+                WM_KEYUP | WM_SYSKEYUP if self.native_keys.remove(&slot) => {
+                    self.native_late_char = Some(slot);
                     return false;
                 }
-                WM_CHAR | WM_SYSCHAR if self.drawer_late_char == Some(slot) => {
-                    self.drawer_late_char = None;
+                WM_CHAR | WM_SYSCHAR if self.native_late_char == Some(slot) => {
+                    self.native_late_char = None;
                     return false;
                 }
                 WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR | WM_KEYDOWN
                 | WM_SYSKEYDOWN
-                    if self.drawer_keys.contains(&slot) =>
+                    if self.native_keys.contains(&slot) =>
                 {
                     // Deliver the native press, character, and release as one unit,
-                    // including when an activation closes the drawer on key-down.
+                    // including when an activation removes its control on key-down.
                     return false;
                 }
                 _ => {}
@@ -1264,6 +1321,9 @@ impl State {
                 WM_KEYUP | WM_SYSKEYUP => {
                     self.local_held.remove(&slot);
                     self.swallowed.remove(&slot);
+                    if vk == 0x0d {
+                        self.native_late_char = Some(slot);
+                    }
                     return true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
@@ -1434,8 +1494,24 @@ impl State {
         if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&slot) {
             return true;
         }
+        if let Some((pane, listing, query)) = self.session_search
+            && self.session_search_focused
+            && !self.search
+            && message.message == WM_KEYDOWN
+            && vk == 0x0d
+            && mods.is_empty()
+            && !ime::native_composing(message.hwnd)
+        {
+            self.local_held.insert(slot, false);
+            if message.lParam.0 & (1 << 30) == 0 {
+                (self.shortcut)(Shortcut::SubmitSessionSearch(pane, listing, query));
+            }
+            return true;
+        }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-            if (self.target.is_some() && !self.drawer_focused) || self.search {
+            if (self.target.is_some() && !self.drawer_focused && self.session_search.is_none())
+                || self.search
+            {
                 let find = if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x46
                 {
                     Some(Shortcut::Find)
@@ -1462,7 +1538,10 @@ impl State {
                 .resolve(
                     vk,
                     mods,
-                    self.target.is_some() && !self.search && !self.drawer_focused,
+                    self.target.is_some()
+                        && !self.search
+                        && !self.drawer_focused
+                        && self.session_search.is_none(),
                     right_alt,
                 )
                 .map(Shortcut::from);
@@ -1513,9 +1592,11 @@ impl State {
                 return true;
             }
         }
-        if self.drawer_focused && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL) {
+        if (self.drawer_focused || self.session_search.is_some())
+            && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL)
+        {
             if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-                self.drawer_keys.insert(slot);
+                self.native_keys.insert(slot);
             }
             return false;
         }
@@ -2556,6 +2637,56 @@ mod tests {
             }));
             assert!(matches!(pending.try_recv().unwrap(), Command::Text(s) if s == "x"));
         });
+    }
+
+    #[test]
+    fn remote_session_search_keeps_native_input_local_and_submits_only_from_its_text_field() {
+        let _window = WindowScope::default().enter();
+        window::activated(true);
+        let pane = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: pane.frames.clone(),
+            }),
+            session_search: Some((17, 3, 5)),
+            ..State::new(move |s| observed.borrow_mut().push(s))
+        };
+        let key = |message, vk, scan: u32, repeat: bool| MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(((scan << 16) | ((repeat as u32) << 30)) as isize),
+            ..Default::default()
+        };
+        // Enter on a native Attach or Refresh button belongs to the button.
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
+        assert!(actions.borrow().is_empty());
+        state.session_search_focused = true;
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x58, 0x2d, false)));
+        assert!(!state.handle(&key(WM_CHAR, 'x' as usize, 0x2d, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x58, 0x2d, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
+        // The application can attach and retarget its terminal before this key's repeat/release.
+        state.session_search = None;
+        state.session_search_focused = false;
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, true)));
+        assert!(state.handle(&key(WM_CHAR, 0x0d, 0x1c, false)));
+        assert!(state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
+        assert!(!state.handle(&key(WM_CHAR, 0x0d, 0x1c, false)));
+        assert_eq!(
+            &*actions.borrow(),
+            &[Shortcut::SubmitSessionSearch(17, 3, 5)]
+        );
+        assert!(input.try_recv().is_err());
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false))); // a fresh terminal Enter
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            Command::Key { down: true, .. }
+        ));
     }
 
     #[test]

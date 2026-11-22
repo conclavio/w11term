@@ -103,7 +103,7 @@ fn ownership(
     }
     let properties = properties.resolve()?;
     let tree = tree.resolve()?;
-    let in_drawer = |get: GetObject| -> Result<bool> {
+    let inside = |get: GetObject| -> Result<bool> {
         let mut element = object(|out| unsafe { get(args.as_raw(), out) })?;
         while let Some(current) = element {
             let mut id = HSTRING::new();
@@ -124,9 +124,9 @@ fn ownership(
         }
         Ok(false)
     };
-    if in_drawer(args.vtable().new)? {
+    if inside(args.vtable().new)? {
         Ok(Some(true))
-    } else if in_drawer(args.vtable().old)? {
+    } else if inside(args.vtable().old)? {
         Ok(Some(false))
     } else {
         // A different pane or island changed focus.
@@ -140,17 +140,17 @@ pub(super) struct Watch {
 }
 
 impl Watch {
-    pub(super) fn new(pane: u64, hwnd: usize) -> Result<Self> {
+    pub(super) fn new(tag: String, update: impl Fn(bool) + Send + 'static) -> Result<Self> {
         let manager = factory::<FocusManager, FocusManager>()?;
         let properties =
             AgileReference::new(&factory::<AutomationProperties, AutomationProperties>()?)?;
         let tree = AgileReference::new(&factory::<VisualTreeHelper, VisualTreeHelper>()?)?;
-        let tag = HSTRING::from(format!("w11term-sftp-{pane}"));
+        let tag = HSTRING::from(tag);
         let handler = EventHandler::<FocusArgs>::new(move |_, args| {
             if let Some(args) = args.as_ref()
                 && let Ok(Some(focused)) = ownership(args, &tag, &properties, &tree)
             {
-                super::notify_drawer_focus(hwnd, pane, focused);
+                update(focused);
             }
             Ok(())
         });
