@@ -6,19 +6,22 @@ mod document;
 mod ranges;
 #[cfg(test)]
 mod scroll_tests;
+#[cfg(test)]
+mod word_tests;
 use document::{Document, Selection};
 use ranges::{TextRange, interfaces};
 use std::{
     cell::RefCell,
     ops::Range,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use w11term::{
+    appearance::Appearance,
     session::{Command, RangeScroll},
     terminal::{FrameStore, Snapshot},
 };
@@ -50,8 +53,30 @@ pub struct Geometry {
 struct State {
     geometry: Geometry,
     selected: Option<Selection>,
-    cached: Option<(u64, Arc<Document>)>,
+    cached: Option<Arc<Document>>,
     requested: Option<SelectionRequest>,
+}
+impl State {
+    fn document(
+        &mut self,
+        frame: &Snapshot,
+        appearance: &RwLock<Appearance>,
+    ) -> Result<Arc<Document>> {
+        let word_delimiters = {
+            let appearance = appearance.read().map_err(|_| unavailable())?;
+            let delimiters = &appearance.interaction.word_delimiters;
+            if let Some(doc) = &self.cached
+                && doc.generation == frame.generation
+                && doc.word_delimiters == *delimiters
+            {
+                return Ok(doc.clone());
+            }
+            delimiters.clone()
+        };
+        let doc = Arc::new(Document::with_word_delimiters(frame, word_delimiters));
+        self.cached = Some(doc.clone());
+        Ok(doc)
+    }
 }
 #[derive(Clone, Copy)]
 pub struct SelectionRequest {
@@ -62,6 +87,7 @@ pub struct SelectionRequest {
 pub struct Pane<'a> {
     pub id: u64,
     pub label: &'a str,
+    pub appearance: &'a Arc<RwLock<Appearance>>,
     pub frames: &'a FrameStore,
     pub input: &'a UnboundedSender<Command>,
     pub geometry: Geometry,
@@ -71,6 +97,7 @@ struct Source {
     hwnd: usize,
     id: u64,
     name: String,
+    appearance: Arc<RwLock<Appearance>>,
     alive: Arc<AtomicBool>,
     frames: FrameStore,
     input: UnboundedSender<Command>,
@@ -86,16 +113,11 @@ impl Source {
     }
     fn document(&self) -> Result<Arc<Document>> {
         self.check()?;
-        let f = self.frames.load();
-        let mut state = self.state.lock().map_err(|_| unavailable())?;
-        if let Some((gen_id, doc)) = &state.cached
-            && *gen_id == f.generation
-        {
-            return Ok(doc.clone());
-        }
-        let doc = Arc::new(Document::from_frame(&f));
-        state.cached = Some((f.generation, doc.clone()));
-        Ok(doc)
+        let frame = self.frames.load();
+        self.state
+            .lock()
+            .map_err(|_| unavailable())?
+            .document(&frame, &self.appearance)
     }
     fn rect(&self) -> Result<(Geometry, RECT)> {
         self.check()?;
@@ -341,6 +363,7 @@ impl Bridge {
         let Pane {
             id: pane,
             label,
+            appearance,
             frames,
             input,
             geometry: g,
@@ -381,6 +404,7 @@ impl Bridge {
                 hwnd: hwnd.0 as usize,
                 id: pane,
                 name: format!("Terminal · {label}"),
+                appearance: appearance.clone(),
                 alive: Arc::new(AtomicBool::new(true)),
                 frames: frames.clone(),
                 input: input.clone(),

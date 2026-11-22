@@ -1,7 +1,7 @@
 use std::ops::{Range, RangeInclusive};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use w11term::{
-    interaction::Point,
+    interaction::{Point, WordClass, word_class},
     terminal::{RetainedRows, Snapshot},
     text_layout::CellMap,
 };
@@ -21,6 +21,8 @@ pub(super) struct Selection {
 
 pub(super) struct Document {
     text: String,
+    pub(super) word_delimiters: String,
+    word_starts: OnceLock<Vec<usize>>,
     // Grapheme/cell boundaries, including the exclusive end. Soft-wrapped lines
     // still retain individual screen rows for geometric and TextUnit_Line queries.
     offsets: Vec<usize>,
@@ -38,9 +40,19 @@ pub(super) struct Document {
 }
 
 impl Document {
+    #[cfg(test)]
     pub fn from_frame(frame: &Snapshot) -> Self {
+        Self::with_word_delimiters(
+            frame,
+            w11term::interaction::Interaction::default().word_delimiters,
+        )
+    }
+
+    pub fn with_word_delimiters(frame: &Snapshot, word_delimiters: String) -> Self {
         let mut d = Self {
             text: String::new(),
+            word_delimiters,
+            word_starts: OnceLock::new(),
             offsets: vec![0],
             cols: vec![],
             cell_maps: Arc::clone(frame.cell_maps()),
@@ -241,6 +253,34 @@ impl Document {
             .collect()
     }
 
+    fn word(&self, i: usize) -> Range<usize> {
+        let starts = self.word_starts.get_or_init(|| {
+            let mut starts = Vec::new();
+            let mut previous = None;
+            for index in 0..self.len() {
+                let cell = self.text(index..index + 1);
+                if cell == "\r\n" {
+                    starts.push(index);
+                    previous = None;
+                } else {
+                    let class = word_class(cell, &self.word_delimiters);
+                    // UIA includes trailing spaces in the preceding word or
+                    // punctuation unit. Indentation after a hard break stands alone.
+                    if previous.is_none()
+                        || (class != WordClass::Whitespace && previous != Some(class))
+                    {
+                        starts.push(index);
+                    }
+                    previous = Some(class);
+                }
+            }
+            starts.push(self.len());
+            starts
+        });
+        let next = starts.partition_point(|&start| start <= i);
+        starts[next - 1]..starts[next]
+    }
+
     pub fn unit(&self, i: usize, unit: TextUnit) -> Range<usize> {
         if self.len() == 0 {
             return 0..0;
@@ -250,17 +290,7 @@ impl Document {
             return i..i + 1;
         }
         if unit == TextUnit_Word {
-            let space = |j| self.text(j..j + 1).chars().all(char::is_whitespace);
-            let flag = space(i);
-            let mut a = i;
-            let mut b = i + 1;
-            while a > 0 && space(a - 1) == flag {
-                a -= 1;
-            }
-            while b < self.len() && space(b) == flag {
-                b += 1;
-            }
-            return a..b;
+            return self.word(i);
         }
         if unit == TextUnit_Paragraph {
             let p = self.paragraphs.partition_point(|&start| start <= i) - 1;

@@ -288,6 +288,8 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 
 Hold Shift to select or right-click paste when a remote TUI enables mouse reporting. Selection retains scrolled rows, joins soft-wrapped lines, and copies graphemes without font/color formatting. Native pointer capture lets dragging continue outside the canvas, with automatic scroll at its top/bottom edges.
 
+Use **Settings → Word selection delimiters…** to choose which punctuation separates words for double-click selection and screen-reader word navigation. For example, removing `/` keeps `/usr/bin` together. Leave the field empty to split on whitespace alone. **Save** updates existing panes. **Restore default delimiters** puts the original characters back in the editor so you can review them before saving.
+
 Find searches the current pane’s retained history and visible screen. It starts with a case-insensitive literal search using Unicode lowercase matching. Turn on **Regex** for patterns such as `error\s+[0-9]+`, or **Match case** to distinguish uppercase and lowercase. Matches can span a line wrapped by the terminal and stop at a hard newline. Enter and Shift+Enter move between highlighted matches. Escape closes Find and restores terminal input. Reopening Find restores that pane’s query and both options.
 
 Queries accept up to 4,096 UTF-8 bytes. The match count refreshes as output arrives, and `+` indicates more than 10,000 matches. If a pattern is invalid, the Find bar shows the reason as you edit. Regex search skips logical lines larger than 64 KiB and shows when the results are incomplete. Ordinary scrolling stays anchored to retained rows as new output arrives.

@@ -40,6 +40,17 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits word delimiters and verifies UIA words and double-click selection in a live SSH pane"]
+async fn native_word_delimiters_update_reader_and_pointer_selection_in_running_ssh() {
+    run_palette_fixture(
+        "word-delimiters-ui.ps1",
+        b"",
+        Some("\r\nscope/srv/alpha/bin:tail;\r\nword-fixture-ready\r\n"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reads OSC 133 captures from a read-only, inactive SSH pane across a live reconnect"]
 async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() {
     let accepted = Arc::new(AtomicUsize::new(0));

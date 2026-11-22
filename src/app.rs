@@ -46,6 +46,7 @@ mod folder_sharing_state;
 mod keyboard_settings;
 mod local_profile;
 mod pattern_settings;
+mod word_delimiters;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
@@ -291,6 +292,7 @@ pub enum InteractionField {
 enum SettingsEditor {
     Keyboard(keyboard_settings::KeyboardPage),
     Patterns(pattern_settings::PatternPage),
+    WordDelimiters(word_delimiters::Editor),
 }
 enum Page {
     SharedFolders(folder_shares::Panel),
@@ -806,6 +808,7 @@ pub enum Message {
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
+    WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
     Font(Option<usize>),
@@ -1727,6 +1730,11 @@ impl TerminalApp {
                 .into(),
         );
         children.push(TextBlock::new().text("Interaction").font_size(20.0).into());
+        children.push(
+            Button::new()
+                .on_click(context.callback(|_| Message::WordDelimiters(word_delimiters::Edit::Show)))
+                .content("Word selection delimiters…"),
+        );
         for (field, label, value) in [
             (
                 InteractionField::CopyOnSelect,
@@ -3647,7 +3655,8 @@ impl Component for TerminalApp {
                 if ssh.host == "127.0.0.1" && ssh.host_key.is_some() &&
                     ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
                          || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
-                         || std::env::var_os("W11TERM_FILE_SMOKE").is_some()))
+                         || std::env::var_os("W11TERM_FILE_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_WORD_SELECTION_SMOKE").is_some()))
                      || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())
                      || (ssh.user == "pilot" && std::env::var_os("W11TERM_DISCOVERY_SMOKE").is_some())
                      || (ssh.user == "bench" && std::env::var_os("W11TERM_PROFILE_SMOKE").is_some())));
@@ -4775,6 +4784,7 @@ impl Component for TerminalApp {
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
+            Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -5184,6 +5194,7 @@ impl Component for TerminalApp {
                 crate::accessibility::Pane {
                     id: tab.session.pane_id,
                     label,
+                    appearance: &self.appearance,
                     frames: &tab.session.frames,
                     input: &tab.session.input,
                     geometry: crate::accessibility::Geometry {
@@ -5238,6 +5249,9 @@ impl Component for TerminalApp {
                     _ => self.pane_view(id, tab, false, context),
                 },
                 Page::Settings(None) => self.settings_view(context),
+                Page::Settings(Some(SettingsEditor::WordDelimiters(editor))) => {
+                    word_delimiters::view(editor, context)
+                }
                 Page::Attention => self.attention_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),
@@ -5442,6 +5456,10 @@ impl TerminalApp {
         }
         if let Some(path) = std::env::var_os("W11TERM_UIA_SMOKE") {
             self.accessibility_smoke(step, std::path::Path::new(&path), context);
+            return;
+        }
+        if let Some(path) = std::env::var_os("W11TERM_WORD_SELECTION_SMOKE") {
+            self.word_selection_smoke(std::path::Path::new(&path), context);
             return;
         }
         if std::env::var_os("W11TERM_IME_SMOKE").is_some() {

@@ -372,6 +372,23 @@ fn append_text(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordClass {
+    Whitespace,
+    Delimiter,
+    Text,
+}
+
+pub fn word_class(grapheme: &str, delimiters: &str) -> WordClass {
+    if grapheme.chars().all(char::is_whitespace) {
+        WordClass::Whitespace
+    } else if grapheme.chars().any(|c| delimiters.contains(c)) {
+        WordClass::Delimiter
+    } else {
+        WordClass::Text
+    }
+}
+
 pub fn word_range(frame: &Snapshot, point: Point, delimiters: &str) -> Range<usize> {
     let Some(line) = usize::try_from(point.row - frame.first_stable_row)
         .ok()
@@ -386,15 +403,7 @@ pub fn word_range(frame: &Snapshot, point: Point, delimiters: &str) -> Range<usi
     else {
         return point.col..point.col + 1;
     };
-    let category = |s: &str| {
-        if s.chars().all(char::is_whitespace) {
-            0
-        } else if s.chars().any(|c| delimiters.contains(c)) {
-            1
-        } else {
-            2
-        }
-    };
+    let category = |s: &str| word_class(s, delimiters);
     let class = category(cells[index].str());
     let mut first = index;
     let mut last = index;

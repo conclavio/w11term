@@ -1,6 +1,51 @@
 use super::*;
 use std::path::Path;
 impl TerminalApp {
+    pub(super) fn word_selection_smoke(&mut self, state: &Path, context: &ComponentContext<Self>) {
+        let request = state.join("double-click");
+        if request.is_file() {
+            let needle = std::fs::read_to_string(&request).unwrap();
+            let id = self.tabs.active_id().unwrap();
+            let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
+                panic!("double-click requested outside fixture pane");
+            };
+            let frame = tab.session.frames.load();
+            let (row, col) = frame
+                .rows
+                .iter()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    // The fixture puts the ASCII path on its own row.
+                    line.as_str().find(&needle).map(|col| (row, col))
+                })
+                .expect("requested text on the fixture's SSH pane");
+            let metrics = tab.surface.metrics.get();
+            let event = |pressed| PointerEventInfo {
+                x: (PADDING + (col as f32 + 0.5) * metrics.cell_width) as f64,
+                y: (PADDING + (row as f32 + 0.5) * metrics.cell_height) as f64,
+                is_left_button_pressed: pressed,
+                ..Default::default()
+            };
+            // Use the same pane-local callback as native pointer input. No
+            // system cursor movement or input to another window is involved.
+            for _ in 0..2 {
+                self.update(
+                    Message::Pointer(id, event(true), MouseEventKind::Press),
+                    context,
+                );
+                self.update(
+                    Message::Pointer(id, event(false), MouseEventKind::Release),
+                    context,
+                );
+            }
+            std::fs::remove_file(request).unwrap();
+        }
+        context.spawn_background(move |_| {
+            std::thread::sleep(Duration::from_millis(80));
+            Message::Smoke(0)
+        });
+    }
+
     pub(super) fn accessibility_smoke(
         &mut self,
         step: u8,
