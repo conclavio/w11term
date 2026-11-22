@@ -37,7 +37,7 @@ impl fmt::Debug for Inbox {
     }
 }
 
-fn display_field(field: &str) -> String {
+pub(crate) fn display_field(field: &str) -> String {
     let prefix: String = field.chars().take(200).collect();
     prefix
         .split(|c: char| {
@@ -117,7 +117,7 @@ impl Inbox {
         self.wake_ui(state);
     }
 
-    pub(super) fn refresh(&self) {
+    pub(crate) fn refresh(&self) {
         self.wake_ui(self.state.lock().unwrap());
     }
 

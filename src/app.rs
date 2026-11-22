@@ -287,11 +287,12 @@ impl Find {
     }
 }
 struct TabSwitcher {
-    ids: Vec<TabId>,
+    groups: Vec<TabId>,
     index: usize,
 }
 #[derive(Clone, Copy)]
 pub enum InteractionField {
+    ApplicationTabTitles,
     CopyOnSelect,
     LargePasteWarning,
     TrimBlock,
@@ -1436,39 +1437,49 @@ impl TerminalApp {
             return;
         }
         if self.switcher.is_none() {
-            let mut ids: Vec<_> = self.tabs.headers().iter().map(|tab| tab.id).collect();
+            let mut groups: Vec<_> = self
+                .tabs
+                .headers()
+                .iter()
+                .map(|tab| tab.group_id())
+                .collect();
             if mode == TabSwitcherMode::Mru {
                 // A tab's focused pane can move to another tab. The group keeps its history.
-                ids.sort_by_cached_key(|&id| {
-                    self.tabs
-                        .group_id(id)
-                        .and_then(|group| self.mru_groups.iter().position(|&g| g == group))
+                groups.sort_by_cached_key(|group| {
+                    self.mru_groups
+                        .iter()
+                        .position(|g| g == group)
                         .unwrap_or(usize::MAX)
                 });
             }
-            let index = ids
+            let index = groups
                 .iter()
-                .position(|id| Some(*id) == self.tabs.active_id())
+                .position(|id| Some(*id) == self.tabs.active_group_id())
                 .unwrap_or(0);
-            self.switcher = Some(TabSwitcher { ids, index });
+            self.switcher = Some(TabSwitcher { groups, index });
         }
         if let Some(switcher) = &mut self.switcher
-            && !switcher.ids.is_empty()
+            && !switcher.groups.is_empty()
         {
-            switcher.index =
-                (switcher.index as isize + delta).rem_euclid(switcher.ids.len() as isize) as usize;
+            switcher.index = (switcher.index as isize + delta)
+                .rem_euclid(switcher.groups.len() as isize) as usize;
         }
         self.keyboard.set_switcher(true);
     }
     fn finish_switcher(&mut self, commit: bool, context: &ComponentContext<Self>) {
         if let Some(switcher) = self.switcher.take()
             && commit
-            && let Some(id) = switcher.ids.get(switcher.index)
+            && let Some(group) = switcher.groups.get(switcher.index)
         {
-            self.tabs.select(*id);
-            self.activate(context);
+            self.select_switched_group(*group, context);
         }
         self.keyboard.set_switcher(false);
+    }
+    fn select_switched_group(&mut self, group: TabId, context: &ComponentContext<Self>) {
+        if let Some(focused) = tab_title::switcher_leaf(&self.tabs.headers(), group) {
+            self.tabs.select(focused);
+            self.activate(context);
+        }
     }
     fn pointer(
         &mut self,
@@ -1953,6 +1964,11 @@ impl TerminalApp {
                 appearance.interaction.snap_to_grid_on_resize,
             ),
             (
+                InteractionField::ApplicationTabTitles,
+                "Use application titles for tabs",
+                appearance.interaction.application_tab_titles,
+            ),
+            (
                 InteractionField::ScrollZoom,
                 "Ctrl+scroll to zoom",
                 appearance.interaction.scroll_to_zoom,
@@ -2037,11 +2053,22 @@ impl TerminalApp {
         )
     }
     fn publish_panes(&self) {
+        let titles = tab_title::followed_headers(
+            &self.tabs,
+            self.appearance
+                .read()
+                .unwrap()
+                .interaction
+                .application_tab_titles,
+        );
         self.registry
             .replace(self.tabs.entries().iter().filter_map(|entry| {
                 let Page::Terminal(tab) = &entry.value.page else {
                     return None;
                 };
+                tab.session
+                    .frames
+                    .watch_application_title(titles.contains(&entry.id).then_some(&self.inbox));
                 tab.session.events.connect_inbox(
                     tab.session.pane_id,
                     &entry.value.label,
@@ -2877,7 +2904,7 @@ impl TerminalApp {
         on_click
     }
 
-    fn header_view(&self, context: &ViewContext<Self>) -> View {
+    fn header_view(&self, context: &ViewContext<Self>, application_titles: bool) -> View {
         let mut progress = BTreeMap::new();
         for entry in self.tabs.entries() {
             if let Page::Terminal(pane) = &entry.value.page {
@@ -2933,7 +2960,7 @@ impl TerminalApp {
                         self.tabs.group_id(tab.id).unwrap().to_string(),
                         TabViewItem::new()
                             .header(taskbar::tab_header(
-                                self.tab_label(tab.id),
+                                self.tab_label(tab.id, application_titles).as_ref(),
                                 progress.get(&tab.group_id()).copied().unwrap_or_default(),
                             ))
                             .tag(tab.id.to_string())
@@ -5393,6 +5420,9 @@ impl Component for TerminalApp {
             Message::Interaction(field, value) => {
                 let mut appearance = self.appearance.read().unwrap().clone();
                 let setting = match field {
+                    InteractionField::ApplicationTabTitles => {
+                        &mut appearance.interaction.application_tab_titles
+                    }
                     InteractionField::CopyOnSelect => &mut appearance.interaction.copy_on_select,
                     InteractionField::LargePasteWarning => {
                         &mut appearance.interaction.large_paste_warning
@@ -5407,6 +5437,9 @@ impl Component for TerminalApp {
                 if *setting != value {
                     *setting = value;
                     self.save_preferences(appearance);
+                    if matches!(field, InteractionField::ApplicationTabTitles) {
+                        self.publish_panes();
+                    }
                     self.invalidator.invalidate();
                 }
             }
@@ -5424,10 +5457,9 @@ impl Component for TerminalApp {
                 }
             }
             Message::TabMode(_) => {}
-            Message::PickTab(id) => {
+            Message::PickTab(group) => {
                 self.finish_switcher(false, context);
-                self.tabs.select(id);
-                self.activate(context);
+                self.select_switched_group(group, context);
             }
             Message::CaptureLost(id) => {
                 // Reactor releases capture before queuing PointerReleased. Defer cancellation
@@ -5794,10 +5826,16 @@ impl Component for TerminalApp {
         } else {
             self.accessible.clear();
         }
-        let title = self
-            .tabs
-            .active_id()
-            .map_or("Terminal", |id| self.tab_label(id));
+        let application_titles = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .application_tab_titles;
+        let title = self.tabs.active_id().map_or_else(
+            || std::borrow::Cow::Borrowed("Terminal"),
+            |id| self.tab_label(id, application_titles),
+        );
         if self.keyboard.hwnd().is_some() {
             context.window_title(format!("w11term · {title}"));
         } else {
@@ -5816,7 +5854,7 @@ impl Component for TerminalApp {
         context.on_window_size(context.callback(Message::WindowSize));
         let cached_header = self.header.borrow().clone();
         let header = cached_header.unwrap_or_else(|| {
-            let header = self.header_view(context);
+            let header = self.header_view(context, application_titles);
             *self.header.borrow_mut() = Some(header.clone());
             header
         });
@@ -5924,14 +5962,14 @@ impl Component for TerminalApp {
             views.push(KeyedView::new("find", self.find_view(id, tab, context)));
         }
         if let Some(switcher) = &self.switcher {
+            let headers = self.tabs.headers();
             let choices: Vec<_> = switcher
-                .ids
+                .groups
                 .iter()
                 .enumerate()
-                .filter_map(|(index, id)| {
-                    self.tabs
-                        .get(*id)
-                        .map(|_| (index, *id, self.tab_label(*id).to_owned()))
+                .filter_map(|(index, group)| {
+                    tab_title::switcher_leaf(&headers, *group)
+                        .map(|pane| (index, *group, self.tab_label(pane, application_titles)))
                 })
                 .map(|(index, id, label)| {
                     KeyedView::new(

@@ -696,6 +696,26 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "checks actual tab and window titles while native Settings, SSH and PowerShell change the active title"]
+async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manual_name() {
+    let input = concat!(
+        "\x1b]2;background-build\x07",
+        "\x1b[22;0t\x1b]2;editor: 雪.txt\x07",
+        "\x1b[23;0t",
+        "\x1b]2;unfocused-watch\x07",
+        "\x1b]2;renamed-build\x07",
+        "\x1b]2;\x07",
+        "ssh-title-controls-ok"
+    );
+    run_palette_fixture(
+        "application-tab-titles-ui.ps1",
+        input.as_bytes(),
+        Some("\x1b]2;ssh-seed\x07"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "verifies normal and raw clipboard paste decisions through WinUI and a reconnecting loopback peer"]
 async fn native_clipboard_paste_confirms_original_bytes_for_the_original_pane() {
     let accepted = Arc::new(AtomicUsize::new(0));

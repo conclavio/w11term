@@ -10,6 +10,7 @@ use std::{
 use tokio::sync::Notify;
 mod inbox;
 pub use inbox::Inbox;
+pub(crate) use inbox::display_field;
 
 const CAPACITY: usize = 4096;
 #[derive(Clone, Debug, Serialize)]

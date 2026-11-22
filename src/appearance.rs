@@ -159,15 +159,24 @@ mod tests {
     fn saving_preferences_roundtrips_and_preserves_future_settings() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
-        std::fs::write(&path, r#"{"font_family":"Consolas","other_setting":42}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"font_family":"Consolas","interaction":{"copyOnSelect":false},"other_setting":42}"#,
+        )
+        .unwrap();
         let mut appearance = Appearance::load(&path).unwrap();
         assert!(appearance.ligatures);
+        assert!(!appearance.interaction.application_tab_titles);
+        assert!(!appearance.interaction.copy_on_select);
         appearance.font_family = "Fira Code".into();
         appearance.ligatures = false;
+        appearance.interaction.application_tab_titles = true;
         appearance.save(&path).unwrap();
         let saved = Appearance::load(&path).unwrap();
         assert_eq!(saved.font_family, "Fira Code");
         assert!(!saved.ligatures);
+        assert!(saved.interaction.application_tab_titles);
+        assert!(!saved.interaction.copy_on_select);
         assert_eq!(saved.extra["other_setting"], 42);
     }
 }

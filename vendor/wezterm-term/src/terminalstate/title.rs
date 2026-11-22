@@ -1,8 +1,33 @@
 use super::{Alert, TerminalState};
 use std::io::Write;
+use std::sync::Arc;
 pub(super) use wezterm_escape_parser::csi::WindowTitleScope as Scope;
 
 const CAPACITY: usize = 10;
+
+#[derive(Clone)]
+pub(super) struct WindowTitle {
+    pub(super) raw: Arc<str>,
+    pub(super) from_application: bool,
+}
+
+impl WindowTitle {
+    pub(super) fn set_from_application(&mut self, raw: &str) {
+        if &*self.raw != raw {
+            self.raw = Arc::from(raw);
+        }
+        self.from_application = true;
+    }
+}
+
+impl Default for WindowTitle {
+    fn default() -> Self {
+        Self {
+            raw: Arc::from("wezterm"),
+            from_application: false,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct SavedIcon {
@@ -12,7 +37,7 @@ struct SavedIcon {
 
 #[derive(Default)]
 struct Titles {
-    window: Option<String>,
+    window: Option<WindowTitle>,
     icon: Option<SavedIcon>,
 }
 
@@ -94,18 +119,19 @@ impl TerminalState {
             .as_ref()
             .is_some_and(|icon| icon.label != self.get_title());
         if let Some(window) = titles.window {
-            if self.title != window {
-                self.title = window;
+            let changed = self.title.raw != window.raw;
+            self.title = window;
+            if changed {
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::WindowTitleChanged(self.title.clone()));
+                    handler.alert(Alert::WindowTitleChanged(self.title.raw.to_string()));
                 }
             }
         }
         if let Some(icon) = titles.icon {
             // An inherited icon follows future OSC 2 updates again when both
             // labels are restored. An icon-only restore can need a distinct label.
-            self.icon_title =
-                (!icon.follows_window || icon.label != self.title).then_some(icon.label);
+            self.icon_title = (!icon.follows_window || icon.label != self.title.raw.as_ref())
+                .then_some(icon.label);
             if icon_changed {
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::IconTitleChanged(self.icon_title.clone()));
@@ -131,7 +157,10 @@ mod tests {
 
     fn titles(window: Option<&str>, icon: Option<&str>) -> Titles {
         Titles {
-            window: window.map(str::to_owned),
+            window: window.map(|raw| WindowTitle {
+                raw: raw.into(),
+                from_application: true,
+            }),
             icon: icon.map(|label| SavedIcon {
                 label: label.into(),
                 follows_window: false,
@@ -146,7 +175,7 @@ mod tests {
         saved.save(None, titles(Some(""), None));
         saved.save(None, titles(None, Some("inner icon")));
         let both = saved.restore(Scope::Both, None).unwrap();
-        assert_eq!(both.window.as_deref(), Some(""));
+        assert_eq!(both.window.as_ref().map(|w| &*w.raw), Some(""));
         assert_eq!(both.icon.unwrap().label, "inner icon");
         let icon = saved.restore(Scope::Icon, None).unwrap();
         assert!(icon.window.is_none());
@@ -154,7 +183,7 @@ mod tests {
         assert!(saved.restore(Scope::Both, None).is_none());
         for _ in 0..2 {
             let direct = saved.restore(Scope::Both, Some(10)).unwrap();
-            assert_eq!(direct.window.as_deref(), Some("window"));
+            assert_eq!(direct.window.as_ref().map(|w| &*w.raw), Some("window"));
             assert_eq!(direct.icon.unwrap().label, "icon");
         }
         assert_eq!(saved.depth, 0);
@@ -172,12 +201,17 @@ mod tests {
                 .restore(Scope::Window, Some(1))
                 .unwrap()
                 .window
-                .as_deref(),
+                .as_ref()
+                .map(|w| &*w.raw),
             Some("11"),
         );
         for i in (3..=12).rev() {
             assert_eq!(
-                saved.restore(Scope::Window, None).unwrap().window,
+                saved
+                    .restore(Scope::Window, None)
+                    .unwrap()
+                    .window
+                    .map(|w| w.raw.to_string()),
                 Some(i.to_string()),
             );
         }

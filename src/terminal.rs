@@ -548,6 +548,7 @@ pub struct Snapshot {
     pub cols: usize,
     pub scroll_offset: usize,
     pub title: String,
+    application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
     pub reported_directory: Option<Arc<str>>,
     pub status: String,
@@ -579,7 +580,22 @@ struct FrozenImage {
     data: Arc<wezterm_term::image::ImageDataType>,
 }
 
+#[derive(Debug)]
+struct ApplicationTitle {
+    raw: Arc<str>,
+    caption: String,
+}
+
 impl Snapshot {
+    /// A bounded single-line caption from the application's window title.
+    /// A shell that has only set an icon title still uses its profile label.
+    pub fn application_title(&self) -> Option<&str> {
+        self.application_title
+            .as_ref()
+            .map(|title| title.caption.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn copy_output_unavailable(&self) -> Option<&'static str> {
         match self.command_history.back() {
             Some(command) => command.output.as_ref().err().copied(),
@@ -709,6 +725,18 @@ impl Snapshot {
             cols: screen.physical_cols,
             scroll_offset: offset,
             title: terminal.get_title().to_owned(),
+            application_title: terminal.application_window_title().map(|raw| {
+                previous
+                    .and_then(|s| s.application_title.as_ref())
+                    .filter(|old| Arc::ptr_eq(&old.raw, raw))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::new(ApplicationTitle {
+                            raw: raw.clone(),
+                            caption: crate::events::display_field(raw),
+                        })
+                    })
+            }),
             command_history: terminal.command_history().clone(),
             reported_directory: terminal.reported_current_dir().cloned(),
             status,
@@ -798,6 +826,7 @@ impl Snapshot {
             )
             && self.palette == old.palette
             && self.title == old.title
+            && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.reported_directory == old.reported_directory
             && self.status == old.status
@@ -830,6 +859,7 @@ pub struct FrameStore(Arc<(Mutex<ViewState>, Condvar, tokio::sync::Notify)>);
 struct ViewState {
     frame: Arc<Snapshot>,
     inspection: Option<TerminalModes>,
+    title_inbox: Option<crate::events::Inbox>,
 }
 
 impl FrameStore {
@@ -838,6 +868,7 @@ impl FrameStore {
             Mutex::new(ViewState {
                 frame: Arc::new(frame),
                 inspection: None,
+                title_inbox: None,
             }),
             Condvar::new(),
             tokio::sync::Notify::new(),
@@ -847,9 +878,25 @@ impl FrameStore {
         self.0.0.lock().unwrap().frame.clone()
     }
     pub fn publish(&self, frame: Snapshot) {
-        self.0.0.lock().unwrap().frame = Arc::new(frame);
+        let title_inbox = {
+            let mut state = self.0.0.lock().unwrap();
+            let inbox = state
+                .title_inbox
+                .as_ref()
+                .filter(|_| frame.application_title() != state.frame.application_title())
+                .cloned();
+            state.frame = Arc::new(frame);
+            inbox
+        };
         self.0.1.notify_all();
         self.0.2.notify_waiters();
+        if let Some(inbox) = title_inbox {
+            inbox.refresh();
+        }
+    }
+    /// Wake a window with inactive tabs only when a committed caption changes.
+    pub fn watch_application_title(&self, inbox: Option<&crate::events::Inbox>) {
+        self.0.0.lock().unwrap().title_inbox = inbox.cloned();
     }
     pub async fn changed(&self, generation: u64, deadline: tokio::time::Instant) -> bool {
         let changed = self.0.2.notified();
@@ -2155,6 +2202,107 @@ mod tests {
         assert_eq!(term.get_title(), "tools");
         term.advance_bytes(b"\x1b]1;\x07");
         assert_eq!(term.get_title(), "next command");
+    }
+
+    #[test]
+    fn application_title_distinguishes_initial_literal_restored_and_reset_window_titles() {
+        let (mut term, _) = engine();
+        let capture = |term: &Terminal| Snapshot::capture(term, None, 0, 0, String::new(), 0);
+        let initial = capture(&term);
+        assert_eq!(initial.title, "wezterm");
+        assert_eq!(initial.application_title(), None);
+        term.advance_bytes(b"\x1b[22;2;10t\x1b]2;wezterm\x07");
+        let explicit = capture(&term);
+        assert_eq!(explicit.application_title(), Some("wezterm"));
+        assert!(!explicit.same_presentation(&initial));
+        term.advance_bytes(b"\x1b[22;2t\x1b[23;2;10t");
+        assert_eq!(capture(&term).application_title(), None);
+        term.advance_bytes(b"\x1b[23;2t");
+        assert_eq!(capture(&term).application_title(), Some("wezterm"));
+
+        term.advance_bytes(b"\x1b]1;icon only\x07");
+        let icon = capture(&term);
+        assert_eq!(icon.title, "icon only");
+        assert_eq!(icon.application_title(), Some("wezterm"));
+        term.advance_bytes(b"\x1b]2;\x07");
+        let empty = capture(&term);
+        assert_eq!(empty.title, "icon only");
+        assert_eq!(empty.application_title(), None);
+        term.advance_bytes(b"\x1b]0;shell\x07\x1b[22;0t\x1bc\x1b[23;0t");
+        let reset = capture(&term);
+        assert_eq!(reset.title, "shell"); // Existing raw RIS title behavior.
+        assert_eq!(reset.application_title(), None);
+        term.advance_bytes(b"\x1b]0;new shell\x07");
+        assert_eq!(capture(&term).application_title(), Some("new shell"));
+        term.reset_connection();
+        assert_eq!(capture(&term).application_title(), None);
+    }
+
+    #[test]
+    fn application_title_reuses_a_bounded_single_line_without_changing_the_raw_title() {
+        let (mut term, _) = engine();
+        let raw = format!(
+            "  shell\u{2028}雪\u{2029}\u{202e}job\u{2066}  {}",
+            "é".repeat(500)
+        );
+        term.advance_bytes(format!("\x1b]2;{raw}\x07"));
+        let first = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(first.title, raw);
+        let caption = first.application_title().unwrap();
+        assert!(caption.starts_with("shell 雪 job é"));
+        assert!(caption.chars().count() <= 200);
+        assert!(!caption.contains(['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}']));
+        term.advance_bytes(b"ordinary output");
+        term.advance_bytes(format!("\x1b]2;{raw}\x07"));
+        let second = Snapshot::capture(&term, Some(&first), 2, 0, String::new(), 0);
+        assert!(Arc::ptr_eq(
+            first.application_title.as_ref().unwrap(),
+            second.application_title.as_ref().unwrap()
+        ));
+        term.advance_bytes("\x1b]0;\u{202e}\u{2066}\u{2028}  \x07");
+        assert_eq!(
+            Snapshot::capture(&term, None, 3, 0, String::new(), 0).application_title(),
+            None
+        );
+    }
+
+    #[test]
+    fn application_title_refreshes_only_the_subscribed_window_after_publication() {
+        let (mut term, _) = engine();
+        let frame = |term: &Terminal| Snapshot::capture(term, None, 0, 0, String::new(), 0);
+        let store = FrameStore::new(frame(&term));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observe = |name| {
+            let store = store.clone();
+            let observed = observed.clone();
+            crate::events::Inbox::new(move || {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((name, store.load().application_title().map(str::to_owned)));
+            })
+        };
+        let first = observe("first");
+        let second = observe("second");
+        store.watch_application_title(Some(&first));
+        term.advance_bytes(b"\x1b]1;background icon\x07");
+        store.publish(frame(&term));
+        assert!(observed.lock().unwrap().is_empty());
+        term.advance_bytes(b"\x1b]2;building\x07");
+        store.publish(frame(&term));
+        first.acknowledge_wake();
+        term.advance_bytes(b"more output\x1b]2;  building  \x07");
+        store.publish(frame(&term));
+        store.watch_application_title(Some(&second));
+        term.advance_bytes(b"\x1bc");
+        store.publish(frame(&term));
+        store.watch_application_title(None);
+        term.advance_bytes(b"\x1b]0;unwatched\x07");
+        store.publish(frame(&term));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [("first", Some("building".to_owned())), ("second", None)]
+        );
     }
 
     #[test]

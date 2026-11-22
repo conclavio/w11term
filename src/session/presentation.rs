@@ -289,6 +289,35 @@ mod tests {
     }
 
     #[test]
+    fn application_title_wake_waits_for_the_committed_synchronized_frame() {
+        let (mut terminal, mut p) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let inbox = crate::events::Inbox::new(move || tx.send(()).unwrap());
+        p.frames.watch_application_title(Some(&inbox));
+        publish(&mut p, &terminal, 0);
+        p.advance(
+            &mut terminal,
+            b"\x1b[?2026h\x1b]2;partial\x07",
+            0,
+            "test",
+            0,
+        );
+        publish(&mut p, &terminal, 0);
+        assert_eq!(p.frames.load().application_title(), None);
+        assert!(rx.try_recv().is_err());
+        p.advance(
+            &mut terminal,
+            b"\x1b]2;finished\x07\x1b[?2026l",
+            0,
+            "test",
+            0,
+        );
+        publish(&mut p, &terminal, 0);
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(p.frames.load().application_title(), Some("finished"));
+    }
+
+    #[test]
     fn synchronized_byte_counters_do_not_repaint_the_previous_frame() {
         let (mut terminal, mut p) = fixture();
         publish(&mut p, &terminal, 0);

@@ -117,3 +117,6 @@ The original MIT license is preserved in `LICENSE.md`.
   terminal. An application can push or pop selected labels, access a slot
   by index, and query stack depth. Restoring a changed window title emits
   the same window title alert as OSC 2. A full reset clears saved labels.
+  The model tracks whether an application supplied the window title, including
+  across title saves and restores. A full reset or reconnect clears that flag.
+  Consumers can read the application window title independently of the icon.
