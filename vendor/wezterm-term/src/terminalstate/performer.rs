@@ -780,6 +780,7 @@ impl<'a> Performer<'a> {
                 self.bracketed_paste = false;
                 self.focus_tracking = false;
                 self.report_color_scheme_changes = false;
+                self.clear_resize_subscription();
                 self.mouse_tracking = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;

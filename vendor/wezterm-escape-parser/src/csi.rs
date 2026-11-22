@@ -956,6 +956,9 @@ pub enum DecPrivateModeCode {
     /// <https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036>
     SynchronizedOutput = 2026,
 
+    /// In-band text area resize reports, in cells and pixels.
+    InBandResize = 2048,
+
     MinTTYApplicationEscapeKeyMode = 7727,
 
     /// xterm: adjust cursor positioning after emitting sixel

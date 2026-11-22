@@ -173,7 +173,7 @@ pub(crate) fn create_with_palette(
     scrollback_lines: ScrollbackLines,
     scheme: ResolvedColorScheme,
 ) -> Terminal {
-    Terminal::new(
+    Terminal::with_nonblocking_writer(
         size,
         Arc::new(Config::new(scrollback_lines, scheme)),
         "w11term",
@@ -197,7 +197,7 @@ pub(crate) fn replace_transport(
     terminal: &mut Terminal,
     writer: mpsc::UnboundedSender<TransportInput>,
 ) {
-    terminal.replace_writer(Box::new(ReplyWriter {
+    terminal.replace_nonblocking_writer(Box::new(ReplyWriter {
         sender: writer,
         message: TransportInput::Data,
     }));
@@ -2130,6 +2130,99 @@ mod tests {
             _ => panic!("unexpected resize"),
         }
     }
+    #[test]
+    fn in_band_resize_reports_committed_cells_and_pixels_when_subscribed() {
+        let (mut term, mut out) = engine();
+        let (mut neighbor, mut other_out) = engine();
+        term.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;2$y");
+        for _ in 0..2 {
+            term.advance_bytes(b"\x1b[?2048h");
+            assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+        }
+        let mut size = TerminalSize {
+            rows: 36,
+            cols: 120,
+            pixel_height: 864,
+            pixel_width: 1440,
+            dpi: 120,
+        };
+        term.advance_bytes(b"\x1b[?1049h");
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;36;120;864;1440t");
+        neighbor.resize(size);
+        neighbor.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut other_out), b"\x1b[?2048;2$y");
+
+        // Neither a repeated size nor a DPI change that keeps the text area
+        // identical should precede the query reply with another report.
+        term.resize(size);
+        size.dpi = 144;
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;1$y");
+
+        size.pixel_width = 0;
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;36;120;864;0t");
+        size.pixel_height = 0;
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;36;120;0;0t");
+        // Screen storage always has at least one cell, even if geometry isn't
+        // yet measurable. Report the committed grid rather than the raw request.
+        size.cols = 0;
+        size.rows = 0;
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;1;1;0;0t");
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?1049l\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;1$y");
+    }
+
+    #[test]
+    fn in_band_resize_subscription_obeys_disable_reset_and_disconnect() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[?2048h\x1b[!p\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+        // DECSTR resets a limited set of VT controls. Like focus and color
+        // subscriptions, this subscription lasts until DECRST, RIS or disconnect.
+        assert_eq!(receive(&mut out), b"\x1b[?2048;1$y");
+        term.advance_bytes(b"\x1b[?2048l");
+        let size = TerminalSize::default();
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;2$y");
+        for reset in [
+            |t: &mut Terminal| t.advance_bytes(b"\x1bc"),
+            |t: &mut Terminal| t.clear_resize_subscription(),
+            |t: &mut Terminal| t.reset_connection(),
+        ] {
+            term.advance_bytes(b"\x1b[?2048h");
+            assert_eq!(receive(&mut out), b"\x1b[48;24;80;0;0t");
+            reset(&mut term);
+            term.resize(TerminalSize { cols: 60, ..size });
+            term.resize(size);
+            term.advance_bytes(b"\x1b[?2048$p");
+            assert_eq!(receive(&mut out), b"\x1b[?2048;2$y");
+        }
+    }
+
+    #[test]
+    fn in_band_resize_uses_the_automatic_reply_channel_on_a_framed_viewer() {
+        let (mut term, _ordinary) = engine();
+        let (tx, mut viewer) = mpsc::unbounded_channel();
+        enter_herdr_viewer(&mut term, &tx, &crate::events::Events::default());
+        term.advance_bytes(b"\x1b[?2048h");
+        term.resize(TerminalSize::default());
+        for expected in [b"\x1b[48;24;80;480;800t".as_slice(), b"\x1b[48;24;80;0;0t"] {
+            match viewer.try_recv().unwrap() {
+                TransportInput::Automatic(bytes) => assert_eq!(bytes, expected),
+                _ => panic!("a size report was routed as user input"),
+            }
+        }
+        assert!(viewer.try_recv().is_err());
+    }
+
     #[test]
     fn reverse_screen_reports_state_across_screen_switches_and_resets() {
         let (mut terminal, mut replies) = engine();

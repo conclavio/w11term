@@ -803,6 +803,8 @@ async fn run(
                         if size != new_size || (is_demo && !demo_loaded) {
                             presentation.dirty=true;
                             size = new_size;
+                            // Apply the PTY resize before its in-band notification reaches the peer.
+                            let _ = writer.send(TransportInput::Resize(size));
                             terminal.resize(size);
                             if !terminal.is_alt_screen_active() {scroll_offset=scroll_offset.min(crate::search::max_offset(&terminal));}
                             if is_demo && !demo_loaded {
@@ -811,7 +813,6 @@ async fn run(
                                 presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes);
                                 demo_loaded = true;
                             }
-                            let _ = writer.send(TransportInput::Resize(size));
                         }
                         Ok(())
                     }
@@ -916,6 +917,7 @@ async fn run(
                     // All sender clones are gone and every final Data/Status was processed.
                     // A transient disconnect with a scheduled reconnect never closes this queue.
                     terminal.clear_color_scheme_subscription();
+                    terminal.clear_resize_subscription();
                     let joined = transports.join_next().await;
                     prompts.cancel();
                     events.command_stream(None);
@@ -950,6 +952,7 @@ async fn run(
                         }
                         ssh::Event::Disconnected => {
                             terminal.clear_color_scheme_subscription();
+                            terminal.clear_resize_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
                             events.command_stream(None);
                             events.set_progress(wezterm_term::Progress::None);
