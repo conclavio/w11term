@@ -945,6 +945,8 @@ fn live_tab_sized(
 ) -> AppTab {
     let session = if matches!(&source, Source::Ssh(ssh) if ssh.durable) {
         Session::start_durable(source.clone(), size, osc52, connection, saved)
+    } else if let Source::Replay(path) = &source {
+        Session::start_replay_pane(path.clone(), size, osc52)
     } else {
         Session::start_configured_with_connection(source.clone(), size, osc52, connection)
     };

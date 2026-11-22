@@ -275,6 +275,12 @@ cargo run -- --benchmark
 cargo run -- --demo --smoke-seconds 5
 ```
 
+You can open a raw VT file containing inline images directly with `--replay`.
+The GUI uses the pane's measured cell grid for captures without recording metadata.
+Use `--cols` and `--rows` to choose an initial grid for a particular capture.
+For a restored background replay pane with unknown dimensions, showing the pane
+or sizing it with `w11term-cli resize` starts playback.
+
 The benchmark measures **only VT parsing and scrollback**. It excludes snapshot creation, rendering, SSH, and input-to-screen latency. Debug-build results are not performance claims. Build with `cargo build --release` for performance work. The release GUI executable does not attach a console.
 
 ## Controls
