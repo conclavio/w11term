@@ -1,6 +1,42 @@
 use super::{Arc, Line, Snapshot};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use wezterm_term::Terminal;
+
+// Match the native accessible document’s text budget. Oversized rows still
+// support exact revision checks without hashing arbitrarily large cell text.
+const TEXT_BUDGET: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct RowRevision {
+    seqno: usize,
+    text_geometry: Option<u64>,
+}
+
+fn text_geometry(line: &Line, cols: usize, budget: &mut usize) -> Option<u64> {
+    let mut hash = DefaultHasher::new();
+    let (enabled, hint) = line.bidi_info();
+    enabled.hash(&mut hash);
+    std::mem::discriminant(&hint).hash(&mut hash);
+    for cell in line.visible_cells().take_while(|c| c.cell_index() < cols) {
+        *budget = budget.checked_sub(cell.str().len())?;
+        cell.cell_index().hash(&mut hash);
+        cell.width().hash(&mut hash);
+        cell.str().hash(&mut hash);
+    }
+    Some(hash.finish())
+}
+
+impl RowRevision {
+    fn matches(&self, row: &Line, cols: usize, budget: &mut usize) -> bool {
+        // Cursor motion and palette changes can dirty a row without changing
+        // the text or its screen geometry.
+        self.seqno == row.current_seqno()
+            || self
+                .text_geometry
+                .is_some_and(|old| text_geometry(row, cols, budget) == Some(old))
+    }
+}
 
 /// Stable coordinates and revisions of rows from an immutable screen snapshot.
 /// Slices share the revision array without retaining cells or image data.
@@ -9,7 +45,7 @@ pub struct RetainedRows {
     epoch: u64,
     connection: u64,
     first: isize,
-    revisions: Arc<[usize]>,
+    revisions: Arc<[RowRevision]>,
     indices: Range<usize>,
 }
 
@@ -21,11 +57,18 @@ impl Snapshot {
         if rows.is_empty() {
             return None;
         }
+        let mut budget = TEXT_BUDGET;
         Some(RetainedRows {
             epoch: self.row_epoch,
             connection: self.connection_generation,
             first,
-            revisions: rows.iter().map(|row| row.current_seqno()).collect(),
+            revisions: rows
+                .iter()
+                .map(|row| RowRevision {
+                    seqno: row.current_seqno(),
+                    text_geometry: text_geometry(row, self.cols, &mut budget),
+                })
+                .collect(),
             indices: 0..rows.len(),
         })
     }
@@ -60,10 +103,14 @@ impl RetainedRows {
         }
         let first = self.first.max(frame.first_stable_row);
         let end = (self.last() + 1).min(frame.first_stable_row + frame.rows.len() as isize);
+        let mut budget = TEXT_BUDGET;
         first < end
             && (first..end).all(|row| {
-                self.revisions[self.indices.start + (row - self.first) as usize]
-                    == frame.rows[(row - frame.first_stable_row) as usize].current_seqno()
+                self.revisions[self.indices.start + (row - self.first) as usize].matches(
+                    &frame.rows[(row - frame.first_stable_row) as usize],
+                    frame.cols,
+                    &mut budget,
+                )
             })
     }
 
@@ -82,12 +129,13 @@ impl RetainedRows {
         }
         let first = screen.stable_row_to_phys(self.first)?;
         let last = screen.stable_row_to_phys(self.last())?;
+        let mut budget = TEXT_BUDGET;
         if !screen
             .physical_lines()
             .skip(first)
             .take(last - first + 1)
-            .map(Line::current_seqno)
-            .eq(self.revisions[self.indices.clone()].iter().copied())
+            .zip(&self.revisions[self.indices.clone()])
+            .all(|(row, old)| old.matches(row, screen.physical_cols, &mut budget))
         {
             return None;
         }

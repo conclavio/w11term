@@ -50,7 +50,7 @@ fn retained_rows_validate_every_row_and_clamp_alignment_after_eviction() {
     assert_eq!(middle.scroll_offset(&t, 1, true), None);
 
     let current = live.retained_rows(5, 8).unwrap();
-    t.advance_bytes("\x1b[2;1Hf"); // Rewrite the same character in its interior.
+    t.advance_bytes("\x1b[2;1H!"); // Change an interior row, leaving both endpoints intact.
     assert_eq!(current.scroll_offset(&t, 0, true), None);
     assert!(
         current
