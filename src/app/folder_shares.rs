@@ -134,6 +134,7 @@ fn still_mounted(rows: &[FolderRow], name: &str, expected: &MountedFolder) -> bo
 impl TerminalApp {
     pub(super) fn folder_editor_target(&self, draft: &ProfileDraft) -> Option<u64> {
         let base = draft.origin.editing()?;
+        let alias = draft.host_key_alias();
         let mut sources = self.tabs.entries().iter().filter_map(|entry| {
             let pane = entry.value.pane_id()?;
             if entry.value.ssh_profile_name()? != base.name {
@@ -142,6 +143,7 @@ impl TerminalApp {
             let authority = self.folder_authority(pane)?;
             (authority.profile == draft.name
                 && authority.host.eq_ignore_ascii_case(&draft.host)
+                && authority.host_key_alias == alias
                 && authority.user == draft.user
                 && Some(authority.port) == draft.port.parse().ok())
             .then_some(pane)
@@ -503,6 +505,10 @@ impl TerminalApp {
     pub(super) fn folder_panel_view(&self, panel: &Panel, ctx: &ViewContext<Self>) -> View {
         let origin = panel.token;
         let a = &panel.authority;
+        let identity = match &a.host_key_alias {
+            Some(alias) => format!("Host key alias {alias}\n{}", a.fingerprint),
+            None => a.fingerprint.clone(),
+        };
         let heading: [View; 4] = [
             TextBlock::new()
                 .font_size(26.0)
@@ -512,7 +518,7 @@ impl TerminalApp {
                 .text(format!("{} · {}@{}:{}", a.profile, a.user, a.host, a.port))
                 .into(),
             TextBlock::new()
-                .text(&a.fingerprint)
+                .text(identity)
                 .text_wrapping(TextWrapping::Wrap)
                 .into(),
             Button::new()

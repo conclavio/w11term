@@ -234,6 +234,7 @@ impl Fixture {
                 port,
                 authentication: Authentication::None,
                 host_key: Some(pin),
+                host_key_alias: None,
                 proxy_jump: vec![],
                 local_forwards: vec![],
                 durable: false,

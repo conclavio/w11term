@@ -1,5 +1,5 @@
 //! Import a selected OpenSSH client configuration into editable native profiles.
-use crate::options::{Authentication, JumpHost, MAX_JUMPS, SshOptions};
+use crate::options::{Authentication, JumpHost, MAX_JUMPS, SshOptions, validate_host_key_alias};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -130,7 +130,7 @@ fn words(line: &str) -> Result<Vec<String>> {
     let mut started = false;
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
-        if quoted.is_none() && ch == '#' {
+        if quoted.is_none() && !started && ch == '#' {
             break;
         }
         if matches!(ch, '\'' | '"') && (quoted.is_none() || quoted == Some(ch)) {
@@ -139,7 +139,7 @@ fn words(line: &str) -> Result<Vec<String>> {
         } else if ch == '\\'
             && chars
                 .peek()
-                .is_some_and(|c| matches!(c, '"' | '\'' | '#') || c.is_whitespace())
+                .is_some_and(|&c| matches!(c, '"' | '\'' | '\\') || (quoted.is_none() && c == ' '))
         {
             word.push(chars.next().unwrap());
             started = true;
@@ -272,7 +272,6 @@ fn sensitive(key: &str) -> bool {
     matches!(
         key,
         "include"
-            | "hostkeyalias"
             | "userknownhostsfile"
             | "globalknownhostsfile"
             | "knownhostscommand"
@@ -382,6 +381,7 @@ impl Config<'_> {
                             || matches!(
                                 d.key.as_str(),
                                 "hostname"
+                                    | "hostkeyalias"
                                     | "user"
                                     | "port"
                                     | "identityfile"
@@ -401,7 +401,7 @@ impl Config<'_> {
             for d in &section.directives {
                 let key = d.key.as_str();
                 match key {
-                    "hostname" | "user" | "port" | "identitiesonly" => {
+                    "hostname" | "hostkeyalias" | "user" | "port" | "identitiesonly" => {
                         scalars.entry(key).or_insert(d);
                     }
                     "identityfile" => identities.push(d),
@@ -436,6 +436,16 @@ impl Config<'_> {
             valid_host(&host)?;
             Ok(host)
         })?;
+        // OpenSSH treats HostKeyAlias as a literal. In particular, %h is not expanded.
+        let host_key_alias = scalars
+            .get("hostkeyalias")
+            .map(|d| -> Result<_> {
+                let value = argument(d)?;
+                validate_host_key_alias(value)
+                    .with_context(|| format!("{}: HostKeyAlias", d.line))?;
+                Ok(value.to_ascii_lowercase())
+            })
+            .transpose()?;
         let user = configured(
             scalars.get("user").copied().filter(|_| spec.user.is_none()),
             spec.user.as_deref().unwrap_or(self.user),
@@ -484,7 +494,11 @@ impl Config<'_> {
             }
             let mut tokens = tokens.to_vec();
             let home = self.home.to_str().context("non-Unicode home path")?;
-            tokens.extend([('d', home), ('u', self.user)]);
+            tokens.extend([
+                ('d', home),
+                ('u', self.user),
+                ('k', host_key_alias.as_deref().unwrap_or(alias)),
+            ]);
             let path =
                 expand(value, &tokens).with_context(|| format!("{}: IdentityFile", d.line))?;
             let path =
@@ -532,6 +546,7 @@ impl Config<'_> {
                 port,
                 authentication,
                 host_key: None,
+                host_key_alias,
             },
             via,
         ))
@@ -605,6 +620,61 @@ mod tests {
             .iter()
             .find(|alias| alias.name == name)
             .unwrap()
+    }
+    #[test]
+    fn host_key_alias_is_literal_per_hop_and_available_as_identity_file_token() {
+        let report = parse_config(
+            r#"
+            Host dest
+                HostName 127.0.0.1
+                Port 2200
+                HostKeyAlias DEV-%h
+                ProxyJump gate
+                IdentityFile ~/keys/%k
+            Host gate
+                HostKeyAlias [BASTION]:22 # comment
+            Host plain
+                HostName real.example
+                IdentityFile ~/keys/%k
+            Host dest gate
+                HostKeyAlias ignored
+            Host bad
+                ProxyJump %k
+            Host punctuated
+                HostKeyAlias CLUSTER+slot=2@blue!node#3|old
+        "#,
+        );
+        let dest = alias(&report, "dest").options.as_ref().unwrap();
+        assert_eq!(dest.host_key_alias.as_deref(), Some("dev-%h"));
+        assert_eq!((dest.host.as_str(), dest.port), ("127.0.0.1", 2200));
+        let identity = |key: &str| Authentication::Identity {
+            identity: Path::new(r"C:\Users\pilot").join("keys").join(key),
+        };
+        assert_eq!(dest.authentication, identity("dev-%h"));
+        assert_eq!(
+            dest.proxy_jump[0].host_key_alias.as_deref(),
+            Some("[bastion]:22")
+        );
+        let plain = alias(&report, "plain").options.as_ref().unwrap();
+        assert!(plain.host_key_alias.is_none());
+        assert_eq!(plain.authentication, identity("plain"));
+        assert!(alias(&report, "bad").options.is_none());
+        assert_eq!(
+            alias(&report, "punctuated")
+                .options
+                .as_ref()
+                .unwrap()
+                .host_key_alias
+                .as_deref(),
+            Some("cluster+slot=2@blue!node#3|old")
+        );
+        for bad in ["a,b", "foo*bar", "two words", "\"line with whitespace\""] {
+            let report = parse_config(&format!("Host bad\n HostKeyAlias {bad}"));
+            assert!(alias(&report, "bad").options.is_none(), "{bad}");
+        }
+        let conditional =
+            parse_config("Host guarded\nMatch exec never-run\n HostKeyAlias conditional");
+        assert!(alias(&conditional, "guarded").options.is_none());
     }
     #[test]
     fn resolves_explicit_hosts_patterns_quotes_and_first_obtained_scalars() {

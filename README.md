@@ -215,6 +215,17 @@ individual host key. Durable sessions and folder grants retain their existing
 host-key binding. The supported host certificate and CA key types are Ed25519
 and ECDSA P-256, P-384 and P-521. [OpenSSH known_hosts format](https://man.openbsd.org/sshd.8#SSH_KNOWN_HOSTS_FILE_FORMAT)
 
+When you connect through a forwarded port, set **Host key alias** to the name
+on the remote server’s certificate or in your `known_hosts`. For example,
+`w11term ssh ops@127.0.0.1 --port 2202 --host-key-alias build01.example.net`
+dials loopback and verifies `build01.example.net`. The alias is the whole
+lookup name even on a custom port. The first-connect dialog shows both the
+address and the alias under which it will save the key.
+
+The OpenSSH importer reads `HostKeyAlias` independently for the destination
+and each jump. Profiles store it in the optional `host_key_alias` field.
+[OpenSSH HostKeyAlias](https://man.openbsd.org/ssh_config#HostKeyAlias)
+
 ## Forward a local port
 
 If a development server on the SSH host listens on `127.0.0.1:8000`, open the command palette in its SSH pane and choose **Forward a local port…**. Enter `8000` as the remote port. Leave the Windows port empty to have Windows assign one, or enter a specific port. Choose **Start forwarding**, then **Copy address** to use the Windows endpoint in your browser or TCP client. You can close the manager while the forward is running. For example, if Windows assigns port `54210`, visit `http://127.0.0.1:54210/` for an HTTP service.

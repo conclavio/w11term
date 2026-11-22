@@ -41,7 +41,7 @@ chown w11fixture:w11fixture "$auth/authorized_keys"
 
 ssh-keygen -q -t ed25519 -N '' -f /run/w11term-host-ed25519
 ssh-keygen -q -t ed25519 -N '' -f /run/w11term-host-ca
-ssh-keygen -q -s /run/w11term-host-ca -I w11term-fixture -h -n 127.0.0.1 \
+ssh-keygen -q -s /run/w11term-host-ca -I w11term-fixture -h -n 127.0.0.1,guest.w11term.test \
     -V -5m:+1h /run/w11term-host-ed25519.pub
 /usr/sbin/sshd -t -f /etc/ssh/w11term-fixture.conf
 /usr/sbin/sshd -D -e -f /etc/ssh/w11term-fixture.conf &

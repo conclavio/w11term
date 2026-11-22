@@ -41,6 +41,7 @@ impl FolderScope {
 pub struct Authority {
     pub profile: String,
     pub host: String,
+    pub host_key_alias: Option<String>,
     pub user: String,
     pub port: u16,
     pub fingerprint: String,
@@ -56,6 +57,7 @@ impl Authority {
     pub(crate) fn check_profile(&self, options: &SshOptions) -> Result<()> {
         ensure!(
             self.host.eq_ignore_ascii_case(&options.host)
+                && self.host_key_alias == options.host_key_alias
                 && self.user == options.user
                 && self.port == options.port
                 && options
@@ -518,6 +520,7 @@ impl Core {
             let mut auth = Authority {
                 profile: self.scope.profile.clone(),
                 host: host.to_ascii_lowercase(),
+                host_key_alias: link.options().host_key_alias.clone(),
                 user: user.into(),
                 port,
                 fingerprint: key.into(),

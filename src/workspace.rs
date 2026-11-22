@@ -571,6 +571,7 @@ mod tests {
             port: 22,
             authentication: Authentication::Agent,
             host_key: None,
+            host_key_alias: None,
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             durable: false,
@@ -606,6 +607,19 @@ mod tests {
     fn workspace_startup_remains_bound_to_its_ordinary_ssh_account() {
         let opts = ssh("dev.example");
         let launch = SshStartup::new(&opts, "/work".into(), "make".into()).unwrap();
+        assert!(
+            serde_json::to_value(&launch)
+                .unwrap()
+                .get("host_key_alias")
+                .is_none()
+        );
+        let mut aliased = opts.clone();
+        aliased.host_key_alias = Some("deployment".into());
+        let recipe = SshStartup::new(&aliased, "/work".into(), "make".into()).unwrap();
+        let recipe: SshStartup =
+            serde_json::from_value(serde_json::to_value(&recipe).unwrap()).unwrap();
+        assert!(recipe.check_target(&aliased).is_ok());
+        assert!(recipe.check_target(&opts).is_err());
         let source = SavedSource::Startup {
             connection: Box::new(SavedSource::SavedProfile("dev".into())),
             launch: launch.clone(),
@@ -620,6 +634,7 @@ mod tests {
         game.player.rustmush = true;
         for changed in [
             ssh("other.example"),
+            aliased,
             SshOptions {
                 port: 2222,
                 ..opts.clone()

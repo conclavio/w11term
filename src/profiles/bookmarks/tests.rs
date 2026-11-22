@@ -22,6 +22,7 @@ fn store(dir: &TempDir) -> ProfileStore {
 fn peer() -> BookmarkPeer {
     BookmarkPeer {
         host: "box.example".into(),
+        host_key_alias: None,
         user: "dev".into(),
         port: 22,
         fingerprint: "SHA256:first".into(),
@@ -94,6 +95,28 @@ fn bookmarks_round_trip_and_share_neither_fingerprints_profiles_nor_catalogs() {
 }
 
 #[test]
+fn an_alias_selects_its_own_bookmarks_for_the_same_verified_host_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let raw_peer = peer();
+    let (_, old) = store.inspect("work").unwrap();
+    store.add_bookmark("work", &raw_peer, "/raw").unwrap();
+    let mut options = old.options.clone();
+    options.host_key_alias = Some("isolated".into());
+    store.edit("work", "work", &options, &old.options).unwrap();
+    let aliased = BookmarkPeer {
+        host_key_alias: options.host_key_alias.clone(),
+        ..raw_peer.clone()
+    };
+    assert!(store.list_bookmarks("work", &raw_peer).is_err());
+    assert!(store.list_bookmarks("work", &aliased).unwrap().is_empty());
+    store.add_bookmark("work", &aliased, "/tenant").unwrap();
+    store.edit("work", "work", &old.options, &options).unwrap();
+    assert_eq!(store.list_bookmarks("work", &raw_peer).unwrap(), ["/raw"]);
+    assert!(store.list_bookmarks("work", &aliased).is_err());
+}
+
+#[test]
 fn bookmark_writes_validate_the_live_peer_and_fail_without_replacing_invalid_data() {
     let dir = tempfile::tempdir().unwrap();
     let s = store(&dir);
@@ -108,6 +131,10 @@ fn bookmark_writes_validate_the_live_peer_and_fail_without_replacing_invalid_dat
     for invalid in [
         BookmarkPeer {
             host: "other.example".into(),
+            ..key.clone()
+        },
+        BookmarkPeer {
+            host_key_alias: Some("other-tenant".into()),
             ..key.clone()
         },
         BookmarkPeer {
