@@ -3,59 +3,20 @@ use super::*;
 mod shared;
 use shared::run_gui;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "forwards Windows loopback clients over an existing SSH transport beside PowerShell"]
-async fn native_local_forward_stops_clients_and_expires_with_its_ssh_pane() {
+async fn serve_forward_http(
+    state: &std::path::Path,
+    root: &std::path::Path,
+    connections: usize,
+) -> (u16, tokio::task::JoinHandle<Vec<usize>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let (Source::Ssh(mut ssh), root, sessions, server) =
-        fixture_counting_accepts(false, 2, accepted.clone()).await
-    else {
-        unreachable!()
-    };
-    ssh.player.reconnect = false;
-    let state = tempfile::tempdir().unwrap();
-    let token = state
-        .path()
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let token = state.file_name().unwrap().to_str().unwrap().to_owned();
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let port = listener.local_addr().unwrap().port();
-    for file in [
-        "forward-trace",
-        "authenticated-users",
-        "keyboard-input.bin",
-        "disconnect-on-eot",
-    ] {
-        fs::write(root.path().join(file), []).unwrap();
-    }
-    fs::write(root.path().join("forward-port"), port.to_string()).unwrap();
-    fs::write(state.path().join("target-port"), port.to_string()).unwrap();
-    fs::write(state.path().join("token"), &token).unwrap();
-    let data = state.path().join("data");
-    fs::create_dir(&data).unwrap();
-    let workspace = json!({"active_tab":0,"tabs":[{"title":"Forwarded service","focused":1,
-        "layout":{"type":"leaf","slot":1,"source":{"kind":"startup","value":{
-            "connection":{"kind":"saved_profile","value":"palette-ssh"},
-            "launch":{"host":"127.0.0.1","port":ssh.port,"user":"test","command":"echo forward-workspace"}
-        }}}
-    }]});
-    fs::write(
-        data.join("workspaces.json"),
-        serde_json::to_vec(&json!({"version":1,"workspaces":{"forwarding":workspace}})).unwrap(),
-    )
-    .unwrap();
-    fs::write(root.path().join("workspace-exec.bin"), []).unwrap();
-    fs::write(
-        state.path().join("refuse-flag"),
-        root.path().join("forward-refuse").to_str().unwrap(),
-    )
-    .unwrap();
+    fs::write(root.join("forward-port"), port.to_string()).unwrap();
+    fs::write(state.join("target-port"), port.to_string()).unwrap();
+    fs::write(state.join("token"), &token).unwrap();
     // Accept only this fixture's small fixed HTTP request on each keep-alive connection.
     let service = tokio::spawn(async move {
         let mut clients = tokio::task::JoinSet::new();
@@ -64,7 +25,7 @@ async fn native_local_forward_stops_clients_and_expires_with_its_ssh_pane() {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{token}",
             token.len()
         );
-        for _ in 0..3 {
+        for _ in 0..connections {
             let (mut socket, address) = listener.accept().await.unwrap();
             assert!(address.ip().is_loopback());
             let (request, response) = (request.clone(), response.clone());
@@ -86,6 +47,112 @@ async fn native_local_forward_stops_clients_and_expires_with_its_ssh_pane() {
         counts.sort();
         counts
     });
+    (port, service)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "imports loopback SSH forward presets through WinUI and starts one only on explicit request"]
+async fn native_imported_forward_preset_remains_inactive_across_save_open_and_reconnect() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), root, sessions, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let (remote, service) = serve_forward_http(state.path(), root.path(), 1).await;
+    let reservation = || std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (supported, rejected) = (reservation(), reservation());
+    let (local, wildcard) = (
+        supported.local_addr().unwrap().port(),
+        rejected.local_addr().unwrap().port(),
+    );
+    fs::write(state.path().join("config"), format!(
+        "Host imported-loopback\n  HostName 127.0.0.1\n  User test\n  Port {}\n  LocalForward 127.0.0.1:{local} localhost:{remote}\n  LocalForward *:{wildcard} localhost:{remote}\n", ssh.port
+    )).unwrap();
+    fs::write(state.path().join("local-port"), local.to_string()).unwrap();
+    fs::write(state.path().join("wildcard-port"), wildcard.to_string()).unwrap();
+    let gate = root.path().join("keep-first-connection");
+    fs::write(&gate, []).unwrap();
+    fs::write(state.path().join("disconnect-gate"), gate.to_str().unwrap()).unwrap();
+    for log in ["authenticated-users", "keyboard-input.bin", "forward-trace"] {
+        fs::write(root.path().join(log), []).unwrap();
+    }
+    drop((supported, rejected));
+    drive_mixed_gui("import-forward-preset-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), service)
+            .await
+            .unwrap()
+            .unwrap(),
+        [1]
+    );
+    let origins = fs::read_to_string(state.path().join("client-ports")).unwrap();
+    let source_port: u16 = origins.trim().parse().unwrap();
+    let trace = fs::read_to_string(root.path().join("forward-trace")).unwrap();
+    assert_eq!(
+        trace.trim(),
+        format!("127.0.0.1:{remote} 127.0.0.1:{source_port}")
+    );
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "only the open and its reconnect logged in"
+    );
+    assert_eq!(
+        sessions.load(Ordering::Relaxed),
+        2,
+        "one shell per transport"
+    );
+    let users = fs::read_to_string(root.path().join("authenticated-users")).unwrap();
+    assert_eq!(users.lines().collect::<Vec<_>>(), ["test", "test"]);
+    assert!(
+        fs::read(root.path().join("keyboard-input.bin"))
+            .unwrap()
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "forwards Windows loopback clients over an existing SSH transport beside PowerShell"]
+async fn native_local_forward_stops_clients_and_expires_with_its_ssh_pane() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), root, sessions, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = false;
+    let state = tempfile::tempdir().unwrap();
+    let (port, service) = serve_forward_http(state.path(), root.path(), 3).await;
+    for file in [
+        "forward-trace",
+        "authenticated-users",
+        "keyboard-input.bin",
+        "disconnect-on-eot",
+    ] {
+        fs::write(root.path().join(file), []).unwrap();
+    }
+    let data = state.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let workspace = json!({"active_tab":0,"tabs":[{"title":"Forwarded service","focused":1,
+        "layout":{"type":"leaf","slot":1,"source":{"kind":"startup","value":{
+            "connection":{"kind":"saved_profile","value":"palette-ssh"},
+            "launch":{"host":"127.0.0.1","port":ssh.port,"user":"test","command":"echo forward-workspace"}
+        }}}
+    }]});
+    fs::write(
+        data.join("workspaces.json"),
+        serde_json::to_vec(&json!({"version":1,"workspaces":{"forwarding":workspace}})).unwrap(),
+    )
+    .unwrap();
+    fs::write(root.path().join("workspace-exec.bin"), []).unwrap();
+    fs::write(
+        state.path().join("refuse-flag"),
+        root.path().join("forward-refuse").to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("ssh-local-forward-ui.ps1", &ssh, state.path());
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), service)

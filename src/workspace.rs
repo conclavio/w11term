@@ -37,7 +37,7 @@ pub enum SavedSource {
     Replay(PathBuf),
     /// Connection options contain authentication methods and key paths; live
     /// passwords, private key material and authentication answers live elsewhere.
-    Ssh(SshOptions),
+    Ssh(Box<SshOptions>),
     Startup {
         connection: Box<SavedSource>,
         launch: SshStartup,
@@ -129,7 +129,7 @@ impl SavedSource {
                     ensure!(!path.as_os_str().is_empty(), "Empty device key path");
                     *path = std::path::absolute(&*path)?;
                 }
-                Self::Ssh(options)
+                Self::Ssh(Box::new(options))
             }
         };
         saved.validate()?;
@@ -253,7 +253,7 @@ impl SavedSource {
                 );
                 Source::Replay(path.clone())
             }
-            Self::Ssh(options) => Source::Ssh(options.clone()),
+            Self::Ssh(options) => Source::Ssh(options.as_ref().clone()),
         })
     }
 }
@@ -571,6 +571,7 @@ mod tests {
             authentication: Authentication::Agent,
             host_key: None,
             proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
             durable: false,
             player: Default::default(),
         }

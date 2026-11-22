@@ -381,6 +381,7 @@ struct ProfileDraft {
     folder_revoke: folder_revoke::Editor,
     confirm_delete: bool,
     proxy_jump: Vec<w11term::options::JumpHost>,
+    local_forwards: Vec<w11term::options::LocalForwardPreset>,
     durable: bool,
     saved: bool,
     name: String,
@@ -406,6 +407,7 @@ impl Default for ProfileDraft {
             folder_revoke: Default::default(),
             confirm_delete: false,
             proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
             durable: false,
             saved: false,
             name: String::new(),
@@ -446,6 +448,7 @@ impl ProfileDraft {
         };
         Self {
             proxy_jump: options.proxy_jump.clone(),
+            local_forwards: options.local_forwards.clone(),
             name,
             durable: options.durable,
             host: options.host.clone(),
@@ -2573,6 +2576,7 @@ impl TerminalApp {
                     .then(|| draft.fingerprint.trim().into()),
                 player: draft.player.clone(),
                 proxy_jump: draft.proxy_jump.clone(),
+                local_forwards: draft.local_forwards.clone(),
                 durable: draft.durable,
             };
             match &draft.origin {
@@ -6500,6 +6504,7 @@ mod profile_ui_tests {
                 authentication,
                 host_key: Some("SHA256:test".into()),
                 proxy_jump: Vec::new(),
+                local_forwards: Vec::new(),
                 durable: false,
                 player: w11term::options::PlayerOptions {
                     mute: true,

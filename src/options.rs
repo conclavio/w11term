@@ -162,6 +162,13 @@ impl TryFrom<String> for TerminalType {
     }
 }
 
+/// The two IPv4 loopback ports offered by a profile’s forward manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct LocalForwardPreset {
+    pub local_port: std::num::NonZeroU16,
+    pub remote_port: std::num::NonZeroU16,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SshOptions {
     pub host: String,
@@ -177,6 +184,8 @@ pub struct SshOptions {
     pub host_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_jump: Vec<JumpHost>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_forwards: Vec<LocalForwardPreset>,
     #[serde(default)]
     pub durable: bool,
     #[serde(default)]
@@ -207,6 +216,7 @@ impl From<JumpHost> for SshOptions {
             authentication: hop.authentication,
             host_key: hop.host_key,
             proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
             durable: false,
             player: PlayerOptions::default(),
         }
@@ -508,6 +518,7 @@ impl Options {
                         authentication: Authentication::Agent,
                         host_key: None,
                         proxy_jump: Vec::new(),
+                        local_forwards: Vec::new(),
                         durable: false,
                         player: Default::default(),
                     });

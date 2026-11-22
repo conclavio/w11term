@@ -21,6 +21,7 @@ pub struct ImportedAlias {
     pub warnings: Vec<String>,
 }
 
+mod forwards;
 mod includes;
 
 pub fn import_file(path: &Path) -> Result<ImportReport> {
@@ -44,7 +45,7 @@ impl fmt::Display for Location {
 enum Scope {
     Global,
     Hosts(Vec<String>),
-    Conditional(Location),
+    Conditional(Location, Vec<String>),
 }
 struct Section {
     scope: Scope,
@@ -74,6 +75,14 @@ struct Parsed {
 }
 impl Parsed {
     fn section(&mut self, section: Section) {
+        if let Scope::Conditional(line, _) = &section.scope
+            && section
+                .directives
+                .iter()
+                .any(|d| !forwards::is_directive(&d.key))
+        {
+            self.warnings.insert(format!("{line}: Match conditions for SSH connection settings are unsupported and were not evaluated."));
+        }
         if !section.directives.is_empty() {
             self.sections.push(section);
         }
@@ -151,7 +160,7 @@ fn words(line: &str) -> Result<Vec<String>> {
     Ok(result)
 }
 
-fn matches_patterns(patterns: &[String], host: &str) -> bool {
+fn matches_patterns<'a>(patterns: impl IntoIterator<Item = &'a str>, host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     let mut positive = false;
     for pattern in patterns {
@@ -309,6 +318,7 @@ impl Config<'_> {
         )?;
         let mut options = SshOptions::from(route.pop().unwrap());
         options.proxy_jump = route;
+        options.local_forwards = forwards::resolve(&self.sections, alias, &options.host, warnings);
         Ok(options)
     }
 
@@ -361,8 +371,12 @@ impl Config<'_> {
         let mut proxy = None;
         for section in &self.sections {
             match &section.scope {
-                Scope::Hosts(patterns) if !matches_patterns(patterns, &spec.alias) => continue,
-                Scope::Conditional(line) => {
+                Scope::Hosts(patterns)
+                    if !matches_patterns(patterns.iter().map(String::as_str), &spec.alias) =>
+                {
+                    continue;
+                }
+                Scope::Conditional(line, _) => {
                     if section.directives.iter().any(|d| {
                         sensitive(&d.key)
                             || matches!(
@@ -391,6 +405,13 @@ impl Config<'_> {
                         scalars.entry(key).or_insert(d);
                     }
                     "identityfile" => identities.push(d),
+                    "addressfamily" => warn(warnings, || {
+                        format!(
+                            "Host {}, {}: the SSH connection does not import AddressFamily. Local forward presets are checked separately.",
+                            spec.alias, d.line
+                        )
+                    }),
+                    key if forwards::is_directive(key) => {}
                     "proxyjump" | "proxycommand" => {
                         if expand_jump && proxy.is_none() {
                             proxy = Some(d);
@@ -400,18 +421,12 @@ impl Config<'_> {
                         "{}: unsupported {key} could change routing, authentication or trust",
                         d.line
                     ),
-                    key if warnings.len() < 64 => {
-                        warnings.insert(format!(
+                    key => warn(warnings, || {
+                        format!(
                             "Host {}, {}: unsupported {key} was ignored.",
                             spec.alias, d.line
-                        ));
-                    }
-                    _ if warnings.len() == 64 => {
-                        warnings.insert(
-                            "Additional unsupported directives omitted from this preview.".into(),
-                        );
-                    }
-                    _ => {}
+                        )
+                    }),
                 }
             }
         }
@@ -520,6 +535,14 @@ impl Config<'_> {
             },
             via,
         ))
+    }
+}
+
+fn warn(warnings: &mut BTreeSet<String>, message: impl FnOnce() -> String) {
+    if warnings.len() < 64 {
+        warnings.insert(message());
+    } else if warnings.len() == 64 {
+        warnings.insert("Additional unsupported directives omitted from this preview.".into());
     }
 }
 

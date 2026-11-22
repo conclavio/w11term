@@ -418,6 +418,8 @@ impl ProfileStore {
             }
             let keep_route =
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
+            let keep_forwards =
+                expected.is_some_and(|previous| previous.local_forwards == options.local_forwards);
             if options.terminal_type.is_default() {
                 object.remove("terminal_type");
             }
@@ -427,8 +429,14 @@ impl ProfileStore {
             if !keep_route && options.proxy_jump.is_empty() {
                 object.remove("proxy_jump");
             }
+            if !keep_forwards && options.local_forwards.is_empty() {
+                object.remove("local_forwards");
+            }
             for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
-                if (key == "identity" && keep_identity) || (key == "proxy_jump" && keep_route) {
+                if (key == "identity" && keep_identity)
+                    || (key == "proxy_jump" && keep_route)
+                    || (key == "local_forwards" && keep_forwards)
+                {
                     continue;
                 }
                 let mut value = value.clone();
@@ -558,6 +566,7 @@ mod tests {
             },
             host_key: None,
             proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
             durable: false,
             player: Default::default(),
         };
@@ -1019,5 +1028,33 @@ mod jump_tests {
             .edit("destination", "destination", &direct, &edited)
             .unwrap();
         assert_eq!(store.load().unwrap()["destination"], direct);
+    }
+
+    #[test]
+    fn forward_presets_survive_edit_and_duplicate_and_can_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let forwards =
+            serde_json::json!([{"local_port":8080, "remote_port":8000, "label":"preview"}]);
+        let doc = serde_json::json!({"profiles":{"dev":{
+            "host":"target", "user":"pilot", "auth":"agent", "local_forwards":forwards
+        }}});
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let (_, old) = store.inspect("dev").unwrap();
+        let mut edited = old.options.clone();
+        assert_eq!(edited.local_forwards[0].local_port.get(), 8080);
+        edited.port = 2222;
+        store.edit("dev", "renamed", &edited, &old.options).unwrap();
+        let (_, renamed) = store.inspect("renamed").unwrap();
+        assert_eq!(renamed.raw["local_forwards"], forwards);
+        store.duplicate(&renamed, "copy", &edited).unwrap();
+        let (_, copy) = store.inspect("copy").unwrap();
+        assert_eq!(copy.raw["local_forwards"], forwards);
+        edited.local_forwards.clear();
+        store.edit("copy", "copy", &edited, &copy.options).unwrap();
+        let (_, copy) = store.inspect("copy").unwrap();
+        assert!(copy.raw.get("local_forwards").is_none());
+        assert!(copy.options.local_forwards.is_empty());
     }
 }

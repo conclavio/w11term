@@ -1,10 +1,19 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
+use w11term::options::LocalForwardPreset;
 use w11term::ssh::LocalForward;
 
 pub(super) const LABEL: &str = "Forward a local port…";
 const TITLE: &str = "Local port forwards";
+const PRESET_BUTTON: &str = "Use saved forward…";
+
+pub(super) fn preset_label(preset: LocalForwardPreset) -> String {
+    format!(
+        "Windows {} → remote {}",
+        preset.local_port, preset.remote_port
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Origin {
@@ -82,8 +91,77 @@ impl Draft {
 pub(super) struct Panel {
     origin: Origin,
     endpoint: String,
+    presets: Vec<LocalForwardPreset>,
+    preset_button: RefCell<Option<View>>,
     draft: Draft,
     feedback: String,
+}
+
+impl Panel {
+    fn new(origin: Origin, connection: &SshOptions, launch: &Source) -> Self {
+        // A different profile may have opened the shared SSH connection.
+        let presets = match launch {
+            Source::Ssh(options) => options.local_forwards.clone(),
+            _ => Vec::new(),
+        };
+        Self {
+            origin,
+            endpoint: format!(
+                "{}@{}:{}",
+                connection.user, connection.host, connection.port
+            ),
+            presets,
+            preset_button: RefCell::default(),
+            draft: Draft::default(),
+            feedback: String::new(),
+        }
+    }
+
+    fn choose_preset(&mut self, preset: LocalForwardPreset) {
+        if self.presets.contains(&preset) {
+            self.draft.local = preset.local_port.to_string();
+            self.draft.remote = preset.remote_port.to_string();
+            self.feedback.clear();
+        }
+    }
+
+    fn preset_picker(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> Option<View> {
+        if self.presets.is_empty() {
+            return None;
+        }
+        // Keep the native flyout open across listener status updates in this manager.
+        let mut button = self.preset_button.borrow_mut();
+        Some(
+            button
+                .get_or_insert_with(|| {
+                    let origin = self.origin;
+                    let choices: Vec<_> =
+                        self.presets.iter().map(|&p| (preset_label(p), p)).collect();
+                    let items = choices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (label, _))| {
+                            MenuItem::item(format!("preset-{index}"), label.clone())
+                        })
+                        .collect::<Vec<_>>();
+                    Button::new()
+                        .automation_name(PRESET_BUTTON)
+                        .content(PRESET_BUTTON)
+                        .menu(Menu::new(
+                            items,
+                            ctx.callback(move |label: String| {
+                                choices
+                                    .iter()
+                                    .find(|(name, _)| *name == label)
+                                    .map_or(Message::ControlIdle, |(_, p)| {
+                                        edit(id, origin, Edit::Preset(*p))
+                                    })
+                            }),
+                        ))
+                })
+                .clone(),
+        )
+    }
 }
 
 pub enum Action {
@@ -94,6 +172,7 @@ pub enum Action {
 pub enum Edit {
     Remote(String),
     Local(String),
+    Preset(LocalForwardPreset),
     Start,
     Stop(u64),
     Copy(u64),
@@ -227,28 +306,21 @@ impl TerminalApp {
                 let Some(link) = tab.session.ssh_connection_at(origin.generation) else {
                     return;
                 };
-                let ssh = link.options();
-                let endpoint = format!("{}@{}:{}", ssh.user, ssh.host, ssh.port);
                 tab.forwards
                     .entries
                     .retain(|r| r.generation == origin.generation);
-                let fresh = || AppTab {
+                let fresh = AppTab {
                     label: TITLE.into(),
-                    page: Page::LocalForwards(Panel {
-                        origin,
-                        endpoint,
-                        draft: Draft::default(),
-                        feedback: String::new(),
-                    }),
+                    page: Page::LocalForwards(Panel::new(origin, link.options(), &tab.source)),
                 };
                 if let Some(existing) = existing {
                     let page = self.tabs.get_mut(existing).unwrap();
                     if !matches!(&page.page, Page::LocalForwards(p) if p.origin == origin) {
-                        *page = fresh();
+                        *page = fresh;
                     }
                     self.tabs.select(existing);
                 } else {
-                    self.tabs.insert(fresh());
+                    self.tabs.insert(fresh);
                 }
                 self.sync_selection(ctx);
                 self.activate(ctx);
@@ -292,6 +364,10 @@ impl TerminalApp {
             return;
         };
         match action {
+            Edit::Preset(preset) => {
+                panel.choose_preset(preset);
+                return;
+            }
             Edit::Remote(text) => {
                 panel.draft.remote = text;
                 return;
@@ -380,6 +456,9 @@ impl TerminalApp {
         if let Some(tab) = source {
             let draft = &panel.draft;
             let validation = draft.ports();
+            if let Some(picker) = panel.preset_picker(id, ctx) {
+                items.push(KeyedView::new("presets", picker));
+            }
             items.extend([
                 KeyedView::new(
                     "remote-label",
@@ -508,6 +587,45 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choosing_a_saved_pair_only_fills_the_draft_and_an_unoffered_pair_cannot_overwrite_manual_edits()
+     {
+        let preset = |local: u16, remote: u16| LocalForwardPreset {
+            local_port: local.try_into().unwrap(),
+            remote_port: remote.try_into().unwrap(),
+        };
+        let first = preset(15432, 5432);
+        let second = preset(15432, 8080);
+        let mut connection: SshOptions =
+            serde_json::from_value(serde_json::json!({"host":"host","user":"dev","auth":"none"}))
+                .unwrap();
+        let link_only = preset(6543, 443);
+        connection.local_forwards.push(link_only);
+        let launch = Source::Ssh(SshOptions {
+            local_forwards: vec![first, second],
+            ..connection.clone()
+        });
+        let mut panel = Panel::new(
+            Origin {
+                pane: 31,
+                generation: 2,
+            },
+            &connection,
+            &launch,
+        );
+        assert_eq!(panel.presets, [first, second]);
+        assert!(panel.draft.ports().is_err());
+        assert_eq!(preset_label(first), "Windows 15432 → remote 5432");
+        panel.choose_preset(first);
+        assert_eq!(panel.draft.ports(), Ok((15432, 5432)));
+        panel.draft.local.clear();
+        panel.draft.remote = "443".into();
+        panel.choose_preset(link_only);
+        assert_eq!(panel.draft.ports(), Ok((0, 443)));
+        panel.choose_preset(second);
+        assert_eq!(panel.draft.ports(), Ok((15432, 8080)));
+    }
 
     #[test]
     fn blank_windows_port_requests_assignment_and_supplied_ports_are_decimal_tcp_ports() {
