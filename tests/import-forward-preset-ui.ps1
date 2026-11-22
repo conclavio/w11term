@@ -35,6 +35,19 @@ function Elements($Type) {
     $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $Type)
     $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
+function Preview-Diagnostics {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $pathBox = Find-Element 'OpenSSH config path' $edit
+    $path = if ($pathBox) { $pathBox.GetCurrentPattern($valuePattern).Current.Value }
+    $preview = Find-Element 'Preview hosts' $button
+    $enabled = if ($preview) { $preview.Current.IsEnabled } else { 'absent' }
+    $aliasPicker = Find-Element 'Host alias' ([System.Windows.Automation.ControlType]::ComboBox)
+    $selection = if ($aliasPicker) {
+        $aliasPicker.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection() | ForEach-Object { $_.Current.Name }
+    }
+    $labels = @(Elements $text | ForEach-Object { $_.Current.Name } | Where-Object { $_ } | Select-Object -Last 24)
+    return ("Window {0}; config '{1}'; Preview hosts enabled: {2}; selected alias '{3}'; expected '{4}'; UI text: {5}" -f $root.Current.BoundingRectangle, $path, $enabled, ($selection -join ', '), $preset, ($labels -join ' | '))
+}
 function Field([string]$Name) {
     (Wait-Until $Name { Find-Element $Name $edit }).GetCurrentPattern($valuePattern)
 }
@@ -70,7 +83,7 @@ function Apply-Preset {
 
 for ($launch = 1; $launch -le 2; $launch++) {
     $source = if ($launch -eq 1) { @('--demo') } else { @('--profile',$aliasName) }
-    $argsForGui = @('--profiles',('"' + $profiles + '"'),'--cols','124','--rows','32') + $source
+    $argsForGui = @('--profiles',('"' + $profiles + '"'),'--cols','86','--rows','15') + $source
     $log = Join-Path $State 'gui.log'
     $app = Start-Process -FilePath $Gui -ArgumentList $argsForGui -WindowStyle Hidden -PassThru -RedirectStandardError $log
     try {
@@ -79,7 +92,20 @@ for ($launch = 1; $launch -le 2; $launch++) {
         if ($launch -eq 1) {
             Run-Palette 'Settings'
             Click ('Import OpenSSH config' + [char]0x2026)
-            (Field 'OpenSSH config path').SetValue((Join-Path $State 'config'))
+            $configPath = Join-Path $State 'config'
+            # Preview starts enabled for ~/.ssh/config. Observing it disable and
+            # re-enable proves the app processed the path change before invoking it.
+            (Field 'OpenSSH config path').SetValue('')
+            $null = Wait-Until 'empty path disables Preview hosts' {
+                $preview = Find-Element 'Preview hosts' $button
+                $preview -and !$preview.Current.IsEnabled
+            }
+            (Field 'OpenSSH config path').SetValue($configPath)
+            $null = Wait-Until 'fixture config path enables Preview hosts' {
+                $preview = Find-Element 'Preview hosts' $button
+                $box = Find-Element 'OpenSSH config path' $edit
+                $preview -and $preview.Current.IsEnabled -and $box -and $box.GetCurrentPattern($valuePattern).Current.Value -ceq $configPath
+            }
             Click 'Preview hosts'
             $null = Wait-Until 'supported endpoints in import preview' { Find-Element $preset $text }
             $null = Wait-Until 'warning identifies the unsupported wildcard bind' {
@@ -130,7 +156,12 @@ for ($launch = 1; $launch -le 2; $launch++) {
         Apply-Preset
         Assert-OnlySupportedPair
     } catch {
-        throw "$_ on launch $launch at $($_.ScriptStackTrace)"
+        $failure = "$_ on launch $launch at $($_.ScriptStackTrace)"
+        if ($launch -eq 1 -and !$app.HasExited) {
+            try { $failure += [Environment]::NewLine + (Preview-Diagnostics) }
+            catch { $failure += [Environment]::NewLine + "Preview diagnostics unavailable: $_" }
+        }
+        throw $failure
     } finally {
         if (!$app.HasExited) {
             $null = $app.CloseMainWindow()
