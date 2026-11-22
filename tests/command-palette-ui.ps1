@@ -48,7 +48,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$local",'--timeout','10','palette-local-42')
 
     $field = Open-Palette 'Rename tab'
-    $null = Search-Command $field 'rename' ('Rename tab' + [char]0x2026)
+    $null = Search-Command $field 'rename tab' ('Rename tab' + [char]0x2026)
     Press-Key 13
     $null = Wait-Until 'tab name dialog' { Find-Element 'Tab name' }
     Invoke-Button (Wait-Until 'cancel rename' { Find-Element 'Cancel' ([System.Windows.Automation.ControlType]::Button) })
