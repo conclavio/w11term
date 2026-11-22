@@ -14,6 +14,20 @@ $combo = [System.Windows.Automation.ControlType]::ComboBox
 $listItem = [System.Windows.Automation.ControlType]::ListItem
 $button = [System.Windows.Automation.ControlType]::Button
 $selection = [System.Windows.Automation.SelectionPattern]::Pattern
+$expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+
+function Editor-State {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+    $focusName = if ($focused -and $focused.Current.ProcessId -eq $app.Id) { $focused.Current.Name } else { '(outside fixture)' }
+    $field = Find-Element 'Terminal color scheme' $combo
+    $chosen = if ($field) {
+        $field.GetCurrentPattern($selection).Current.GetSelection() | ForEach-Object { $_.Current.Name }
+    }
+    $byText = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Text)
+    $visible = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$byText) | Where-Object { !$_.Current.IsOffscreen -and $_.Current.Name } | ForEach-Object { $_.Current.Name })
+    "Focus '$focusName', scheme '$chosen', editor offscreen '$($field.Current.IsOffscreen)', window $($root.Current.BoundingRectangle), visible text: $($visible -join ' | ')"
+}
 
 function Click([string]$Label) {
     Invoke-Button (Wait-Until "button '$Label'" {
@@ -28,25 +42,48 @@ function Saved-Scheme([string]$Name) {
     try { ($reader.ReadToEnd() | ConvertFrom-Json).profiles.$Name.color_scheme } finally { $reader.Dispose() }
 }
 function Edit-Scheme([string]$Name, [string]$EditLabel, [string]$Scheme, [string]$Save) {
-    Run-Palette 'Settings'
+    Click 'Tab menu'
+    Invoke-Button (Wait-Until 'Settings menu item' { Find-Element 'Settings' ([System.Windows.Automation.ControlType]::MenuItem) })
     Click "$EditLabel $Name"
-    $field = Wait-Until "default scheme selected for $Name" {
+    $field = Wait-Until "scheme editor for saved profile '$Name'" {
+        $profileName = Find-Element 'Profile name' ([System.Windows.Automation.ControlType]::Edit)
         $box = Find-Element 'Terminal color scheme' $combo
-        if ($box) {
+        if ($profileName -and $box -and $profileName.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq $Name) {
+            $box
+        }
+    }
+    # WinUI can expose the editor's controls outside the ScrollViewer viewport.
+    # Focus scrolls the selector into view before the native popup is opened.
+    $field.SetFocus()
+    $field = Wait-Until "visible scheme selector for '$Name' with its default selected" {
+        $box = Find-Element 'Terminal color scheme' $combo
+        if ($box -and !$box.Current.IsOffscreen) {
             $old = $box.GetCurrentPattern($selection).Current.GetSelection()
             if ($old.Count -eq 1 -and $old[0].Current.Name -ceq 'w11term (default)') { $box }
         }
     }
-    $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    (Wait-Until "scheme $Scheme" { Find-Element $Scheme $listItem }).GetCurrentPattern(
-        [System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    $null = Wait-Until "selected $Scheme in $Name editor" {
-        $selected = (Find-Element 'Terminal color scheme' $combo).GetCurrentPattern($selection).Current.GetSelection()
-        $selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Scheme
+    $field.GetCurrentPattern($expand).Expand()
+    $choice = Wait-Until "expanded choice '$Scheme' for '$Name'" {
+        $item = Find-Element $Scheme $listItem
+        if ($item -and $item.Current.IsEnabled -and !$item.Current.IsOffscreen) { $item }
     }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $field = Wait-Until "selected '$Scheme' in '$Name' editor" {
+        $box = Find-Element 'Terminal color scheme' $combo
+        if ($box) {
+            $selected = $box.GetCurrentPattern($selection).Current.GetSelection()
+            if ($selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Scheme) { $box }
+        }
+    }
+    $popup = $field.GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
     Click $Save
     $serialized = $Scheme.ToLowerInvariant().Replace(' ','-')
-    $null = Wait-Until "$Name saved as $serialized" { (Saved-Scheme $Name) -ceq $serialized }
+    $null = Wait-Until "$Name saved as $serialized and acknowledged by the editor" {
+        if ((Saved-Scheme $Name) -cne $serialized) { return $false }
+        if ($Save -eq 'Save profile changes') { return Find-Element 'Changes saved.' }
+        Find-Element "$EditLabel $Name" $button
+    }
 }
 function Send-To([int]$Pane, [string]$Text) {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($Text))
@@ -67,8 +104,9 @@ function Apply-Remote([int]$Pane, [string]$Sequence, [string]$Title) {
 }
 
 for ($launch=1; $launch -le 2; $launch++) {
+    $failure = $null
     $log = Join-Path $State "gui-$launch.log"
-    $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','100','--rows','20') -WindowStyle Hidden -PassThru -RedirectStandardError $log
+    $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','86','--rows','15') -WindowStyle Hidden -PassThru -RedirectStandardError $log
     try {
         $window = Wait-InputWindow
         $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
@@ -112,12 +150,17 @@ for ($launch=1; $launch -le 2; $launch++) {
         $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','--regex','palette-witness *\r?\nPS fixture>')
         Check-Pixels $local 'saved-local-dark' $dark
     } catch {
-        throw "Launch $launch failed at $($_.ScriptStackTrace): $_. GUI: $([IO.File]::ReadAllText($log))"
+        $failure = $_
+        try { $uiState = Editor-State } catch { $uiState = "UI diagnostics unavailable: $_" }
     } finally {
         if (!$app.HasExited) {
             $null = $app.CloseMainWindow()
             if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
         }
         $app.Dispose()
+    }
+    if ($failure) {
+        try { $details = [IO.File]::ReadAllText($log) } catch { $details = "GUI log unavailable: $_" }
+        throw "Launch $launch failed: $failure at $($failure.ScriptStackTrace). $uiState. GUI: $details"
     }
 }
