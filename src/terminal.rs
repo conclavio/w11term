@@ -1,5 +1,5 @@
 //! The terminal engine is independent of Reactor, rendering, and SSH.
-use crate::options::{ColorScheme, ScrollbackLines};
+use crate::options::{ColorScheme, ResolvedColorScheme, ScrollbackLines};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -64,11 +64,11 @@ pub fn scroll_wheel(
 struct Config {
     scrollback_lines: ScrollbackLines,
     palette: ColorPalette,
-    scheme: ColorScheme,
+    scheme: ResolvedColorScheme,
 }
 
 impl Config {
-    fn new(scrollback_lines: ScrollbackLines, scheme: ColorScheme) -> Self {
+    fn new(scrollback_lines: ScrollbackLines, scheme: ResolvedColorScheme) -> Self {
         Self {
             scrollback_lines,
             scheme,
@@ -90,7 +90,7 @@ impl TerminalConfiguration for Config {
     }
 
     fn prefers_light_colors(&self) -> bool {
-        self.scheme == ColorScheme::OneHalfLight
+        self.scheme == ResolvedColorScheme::OneHalfLight
     }
 
     fn scrollback_size(&self) -> usize {
@@ -163,6 +163,16 @@ pub fn create_with_profile(
     scrollback_lines: ScrollbackLines,
     scheme: ColorScheme,
 ) -> Terminal {
+    let resolved = scheme.resolve(|| *crate::windows_appearance::subscribe().borrow());
+    create_with_palette(size, writer, scrollback_lines, resolved)
+}
+
+pub(crate) fn create_with_palette(
+    size: TerminalSize,
+    writer: mpsc::UnboundedSender<TransportInput>,
+    scrollback_lines: ScrollbackLines,
+    scheme: ResolvedColorScheme,
+) -> Terminal {
     Terminal::new(
         size,
         Arc::new(Config::new(scrollback_lines, scheme)),
@@ -178,7 +188,7 @@ pub fn create_with_profile(
 pub(crate) fn set_color_scheme(
     terminal: &mut Terminal,
     scrollback_lines: ScrollbackLines,
-    scheme: ColorScheme,
+    scheme: ResolvedColorScheme,
 ) {
     terminal.set_config(Arc::new(Config::new(scrollback_lines, scheme)));
 }

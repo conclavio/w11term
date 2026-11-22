@@ -4,6 +4,28 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "checks persisted Follow Windows colors and reports against native UISettings"]
+async fn native_follow_windows_profile_matches_the_host_and_can_be_overridden_live() {
+    let (Source::Ssh(ssh), remote, shells, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::create_dir(remote.path().join("split-inputs")).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("follow-windows-colors-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        shells.load(Ordering::Relaxed),
+        2,
+        "one SSH shell per process"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "switches the base colors of a read-only SSH split with retained OSC overrides"]
 async fn native_live_pane_scheme_preserves_remote_colors_input_and_profile() {
     let accepted = Arc::new(AtomicUsize::new(0));
