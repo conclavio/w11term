@@ -85,7 +85,9 @@ History shows 0 for success and the native exit code when PowerShell supplies a 
 
 Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.
 
-On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** or drop local files onto the drawer to upload into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
+On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files, or drop files onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
+
+Choose **Cancel transfer** to stop the current upload or download and skip the rest of that batch. The drawer waits for the server to acknowledge an in-flight request. A cancelled download leaves an existing local file intact. If an upload has already opened the remote file, it can leave a partial file, including when replacing an existing file. The drawer reports the remote path and acknowledged byte count. The SSH shell and subsequent transfers remain available.
 
 Choose **Filter filenames…** and type part of a name to search the entire directory listing, including later pages. Matching ignores case and treats punctuation literally. Filtering uses the listing already in memory. **Done** returns keyboard input to the terminal and keeps the results visible. **Clear filter** brings back all entries. Refresh keeps your filter in the current directory, and opening another directory starts with its full listing.
 

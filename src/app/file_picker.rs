@@ -13,11 +13,11 @@ use windows::{
         System::Com::*,
         UI::Shell::*,
     },
-    core::{self as wincore, HRESULT, PCWSTR, Ref, implement, w},
+    core::{self as wincore, HRESULT, Interface, PCWSTR, Ref, implement, w},
 };
 
 pub(super) enum Purpose {
-    Open,
+    UploadFiles,
     SshConfig(PathBuf),
     Folder,
     Save(String),
@@ -121,6 +121,19 @@ impl IFileDialogEvents_Impl for Overwrite_Impl {
 }
 
 pub(super) fn pick(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
+    let mut selected = pick_items(owner, purpose)?;
+    anyhow::ensure!(selected.len() <= 1, "Expected a single selection");
+    Ok(selected.pop())
+}
+
+pub(super) fn pick_uploads(owner: usize) -> Result<Vec<PathBuf>> {
+    Ok(pick_items(owner, Purpose::UploadFiles)?
+        .into_iter()
+        .map(|item| item.path)
+        .collect())
+}
+
+fn pick_items(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
     // The modal dialog needs its own STA independently of the Reactor UI and worker threads.
     std::thread::Builder::new()
         .name("w11term file picker".into())
@@ -130,7 +143,7 @@ pub(super) fn pick(owner: usize, purpose: Purpose) -> Result<Option<Selection>> 
         .map_err(|_| anyhow!("File picker stopped"))?
 }
 
-fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
+fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         struct Apartment;
@@ -142,7 +155,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
         let _apartment = Apartment;
         let clsid = if matches!(
             purpose,
-            Purpose::Open | Purpose::SshConfig(_) | Purpose::Folder
+            Purpose::UploadFiles | Purpose::SshConfig(_) | Purpose::Folder
         ) {
             FileOpenDialog
         } else {
@@ -151,8 +164,17 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
         let dialog: IFileDialog = CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)?;
         let mut options = dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR;
         let confirmed = Rc::new(RefCell::new(None));
+        let multiple = matches!(purpose, Purpose::UploadFiles);
         let cookie = match purpose {
-            Purpose::Open => None,
+            Purpose::UploadFiles => {
+                dialog.SetTitle(w!("Choose files to upload"))?;
+                options |= FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST;
+                #[cfg(feature = "ui-smoke")]
+                if fixture_picker_folder(&dialog, "W11TERM_SFTP_PICKER_SMOKE_DIR")? {
+                    options |= FOS_DONTADDTORECENT;
+                }
+                None
+            }
             Purpose::SshConfig(current) => {
                 dialog.SetTitle(w!("Open OpenSSH config"))?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
@@ -168,6 +190,10 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
                 None
             }
             Purpose::Save(suggestion) => {
+                #[cfg(feature = "ui-smoke")]
+                if fixture_picker_folder(&dialog, "W11TERM_SFTP_PICKER_SMOKE_DIR")? {
+                    options |= FOS_DONTADDTORECENT;
+                }
                 let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
                 None
@@ -196,12 +222,23 @@ fn show(owner: usize, purpose: Purpose) -> Result<Option<Selection>> {
         }
         match shown {
             Err(error) if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             result => result?,
         }
+        if multiple {
+            let items = dialog.cast::<IFileOpenDialog>()?.GetResults()?;
+            return (0..items.GetCount()?)
+                .map(|index| {
+                    Ok(Selection {
+                        path: shell_path(&items.GetItemAt(index)?)?,
+                        overwrite: false,
+                    })
+                })
+                .collect();
+        }
         let path = shell_path(&dialog.GetResult()?)?;
         let overwrite = confirmed.borrow().as_ref() == Some(&path);
-        Ok(Some(Selection { path, overwrite }))
+        Ok(vec![Selection { path, overwrite }])
     }
 }

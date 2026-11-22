@@ -487,6 +487,87 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "cancels real SFTP transfers in a native SSH and PowerShell split"]
+async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let parent = remote.path().join("shell directory");
+    fs::create_dir(&picker).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let chunk = w11term::sftp::CHUNK;
+    let bytes: Vec<u8> = (0..(4 * chunk + 7)).map(|i| (i % 251) as u8).collect();
+    fs::write(picker.join("01-first-upload"), &bytes).unwrap();
+    fs::write(picker.join("02-queued-upload"), b"must stay local").unwrap();
+    fs::write(picker.join("retained-download"), b"keep these bytes").unwrap();
+    fs::write(parent.join("retained-download"), &bytes).unwrap();
+    fs::write(parent.join("verified-download"), b"same SFTP channel").unwrap();
+    for marker in [
+        "transfer-trace",
+        "keyboard-input.bin",
+        "hold-transfer-read",
+        "hold-transfer-write",
+    ] {
+        fs::write(remote.path().join(marker), []).unwrap();
+    }
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("cancel-sftp-transfer-ui.ps1", &ssh, state.path());
+
+    assert_eq!(
+        fs::read(parent.join("01-first-upload")).unwrap(),
+        &bytes[..2 * chunk]
+    );
+    assert!(!parent.join("02-queued-upload").exists());
+    assert_eq!(
+        fs::read(picker.join("retained-download")).unwrap(),
+        b"keep these bytes"
+    );
+    assert_eq!(
+        fs::read(picker.join("verified-download")).unwrap(),
+        b"same SFTP channel"
+    );
+    assert_eq!(
+        fs::read_dir(&picker).unwrap().count(),
+        4,
+        "partial download left a temporary file"
+    );
+    let trace = fs::read_to_string(remote.path().join("transfer-trace")).unwrap();
+    assert_eq!(
+        trace.lines().collect::<Vec<_>>(),
+        [
+            "OPEN /shell directory/01-first-upload",
+            "WRITE 0",
+            &format!("WRITE {chunk}"),
+            "CLOSE",
+            "OPEN /shell directory/retained-download",
+            "READ 0",
+            &format!("READ {chunk}"),
+            "CLOSE",
+            "OPEN /shell directory/verified-download",
+            "READ 0",
+            "READ 17",
+            "CLOSE",
+        ]
+    );
+    assert_eq!(
+        fs::read(remote.path().join("keyboard-input.bin")).unwrap(),
+        b"while-upload/after-cancel"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "filters a paginated SFTP listing while checking shell input and directory reads"]
 async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
