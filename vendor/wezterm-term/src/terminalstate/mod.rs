@@ -391,6 +391,7 @@ pub struct TerminalState {
     // to an empty host. The SSH client must validate the reported destination.
     current_dir: Option<(Url, Arc<str>)>,
     conemu_directory_reports: bool,
+    iterm_directory_peer: Option<iterm::DirectoryPeer>,
     command_history: Arc<VecDeque<Arc<CompletedCommand>>>,
     next_command_id: u64,
     capturing_shell_input: bool,
@@ -646,6 +647,7 @@ impl TerminalState {
             download_handler: None,
             current_dir: None,
             conemu_directory_reports: false,
+            iterm_directory_peer: None,
             command_history: Arc::default(),
             next_command_id: 1,
             capturing_shell_input: false,

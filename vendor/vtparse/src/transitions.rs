@@ -247,14 +247,14 @@ const fn osc_string(i: u8) -> u16 {
     use Action::*;
     use State::*;
     match i {
-        0x00..=0x06 => pack(Ignore, OscString),
+        0x00..=0x06 => pack(OscIgnore, OscString),
         // Using BEL in place of ST is a deviation from
         // https://vt100.net/emu/dec_ansi_parser and was
         // introduced AFAICT by xterm
         0x07 => pack(Ignore, Ground),
-        0x08..=0x17 => pack(Ignore, OscString),
-        0x19 => pack(Ignore, OscString),
-        0x1c..=0x1f => pack(Ignore, OscString),
+        0x08..=0x17 => pack(OscIgnore, OscString),
+        0x19 => pack(OscIgnore, OscString),
+        0x1c..=0x1f => pack(OscIgnore, OscString),
         0x20..=0x7f => pack(OscPut, OscString),
         // This extended range allows for UTF-8 characters
         // to be embedded in OSC parameters.  It is not
@@ -262,6 +262,7 @@ const fn osc_string(i: u8) -> u16 {
         0xc2..=0xdf => pack(Utf8, Utf8Sequence),
         0xe0..=0xef => pack(Utf8, Utf8Sequence),
         0xf0..=0xf4 => pack(Utf8, Utf8Sequence),
+        0xa0..=0xc1 | 0xf5..=0xff => pack(OscIgnore, OscString),
         _ => anywhere_or(i, OscString),
     }
 }
@@ -361,7 +362,7 @@ mod tests {
                 hash(&v, 5381, 33), // djb2
                 hash(&v, 0, 65599), // sdbm
             ),
-            (17385, 799944, 12647816782590382477, 3641575052870461598)
+            (17503, 806850, 7724798175718992007, 4492473502332985748)
         );
     }
 

@@ -22,6 +22,7 @@ pub enum Action {
     ApcStart = 16,
     ApcPut = 17,
     ApcEnd = 18,
+    OscIgnore = 19,
 }
 
 impl Action {
@@ -52,6 +53,7 @@ pub enum State {
     // Special states, always last (no tables for these)
     Anywhere = 15,
     Utf8Sequence = 16,
+    OscLiteralEscape = 17,
 }
 
 impl State {

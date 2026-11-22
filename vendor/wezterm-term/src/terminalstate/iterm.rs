@@ -3,10 +3,112 @@ use crate::TerminalState;
 use ::image::imageops::FilterType;
 use ::image::ImageFormat;
 use log::error;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use std::net::IpAddr;
+use std::sync::Arc;
+use url::Url;
 use wezterm_cell::image::ImageDataType;
 use wezterm_escape_parser::osc::ITermFileData;
 
+pub(super) struct DirectoryPeer {
+    user: String,
+    authority: String,
+    host_report_matched: bool,
+}
+
+// Only construct an authority from the configured peer. Normalize IP literals
+// and DNS spelling without consulting DNS or accepting URL syntax in a hostname.
+fn authority(host: &str) -> Option<String> {
+    if let Some(addr) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return Some(format!("[{}]", addr.parse::<std::net::Ipv6Addr>().ok()?));
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => return Some(addr.to_string()),
+        Ok(IpAddr::V6(addr)) => return Some(format!("[{addr}]")),
+        Err(_) => {}
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.split('.').any(|label| {
+        label.is_empty()
+            || !label
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    }) {
+        return None;
+    }
+    Some(host.to_ascii_lowercase())
+}
+
+fn directory_report(authority: &str, path: &str) -> Option<(Url, Arc<str>)> {
+    let components = path.strip_prefix('/')?;
+    if components.starts_with('/')
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || components.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    // Quote POSIX filenames before parsing a file URL. Otherwise a first
+    // segment "C|" can become the Windows drive "C:", changing the directory.
+    const PATH: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~')
+        .remove(b'/');
+    let raw: Arc<str> = format!("file://{authority}{}", utf8_percent_encode(path, PATH)).into();
+    // Keep the original authority even when Url normalizes localhost away.
+    let url = Url::parse(&raw).ok()?;
+    Some((url, raw))
+}
+
 impl TerminalState {
+    /// Accept iTerm2 shell integration's RemoteHost and CurrentDir for this
+    /// authenticated SSH user and destination. Reconnects require a new report.
+    pub fn enable_iterm_directory_reports(&mut self, user: &str, host: &str) {
+        self.iterm_directory_peer = authority(host).map(|authority| DirectoryPeer {
+            user: user.to_owned(),
+            authority,
+            host_report_matched: false,
+        });
+        if self.current_dir.is_some() {
+            self.set_reported_current_dir(None);
+        }
+    }
+
+    pub(super) fn forget_iterm_reported_host(&mut self) {
+        if let Some(peer) = &mut self.iterm_directory_peer {
+            peer.host_report_matched = false;
+        }
+    }
+
+    pub(super) fn iterm_remote_host(&mut self, report: &str) {
+        let Some(peer) = &mut self.iterm_directory_peer else {
+            return;
+        };
+        let matched = report.rsplit_once('@').is_some_and(|(user, host)| {
+            !user.is_empty()
+                && !user.chars().any(char::is_control)
+                && user == peer.user
+                && authority(host).as_ref() == Some(&peer.authority)
+        });
+        let keep_directory = matched && peer.host_report_matched;
+        peer.host_report_matched = matched;
+        if !keep_directory && self.current_dir.is_some() {
+            self.set_reported_current_dir(None);
+        }
+    }
+
+    pub(super) fn iterm_current_dir(&mut self, path: &str) {
+        if let Some(peer) = self
+            .iterm_directory_peer
+            .as_ref()
+            .filter(|peer| peer.host_report_matched)
+        {
+            self.set_reported_current_dir(directory_report(&peer.authority, path));
+        }
+    }
+
     pub(crate) fn set_image(&mut self, image: ITermFileData) {
         if !image.inline {
             if let Some(handler) = &self.download_handler {

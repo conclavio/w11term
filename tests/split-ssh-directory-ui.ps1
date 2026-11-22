@@ -32,10 +32,22 @@ try {
     Check-DirectoryActions $false
     Send-To $source 'report-current' 'current-reported'
     Check-DirectoryActions $true
-    Send-To $source 'report-foreign' 'foreign-reported'
-    Check-DirectoryActions $false
-    if (@((Control @('list')).sessions).Count -ne 1) { throw 'Missing or foreign CWD created a session' }
-    Send-To $source 'report-current-again' 'current-confirmed'
+    if ([IO.File]::Exists((Join-Path $State 'iterm2'))) {
+        Send-To $source 'nested-host' 'nested-host-seen'
+        Check-DirectoryActions $false
+        Send-To $source 'nested-dir' 'nested-dir-seen'
+        Check-DirectoryActions $false
+        Send-To $source 'other-login' 'other-login-seen'
+        Check-DirectoryActions $false
+        Send-To $source 'login-host' 'login-host-seen'
+        Check-DirectoryActions $false
+        Send-To $source 'literal-dir' 'literal-dir-seen'
+    } else {
+        Send-To $source 'report-foreign' 'foreign-reported'
+        Check-DirectoryActions $false
+        Send-To $source 'report-current-again' 'current-confirmed'
+    }
+    if (@((Control @('list')).sessions).Count -ne 1) { throw 'Directory reports unexpectedly created a session' }
     Check-DirectoryActions $true
     $original = (Control @('list')).sessions | Where-Object id -eq $source
     if ($destination -eq 'right') {

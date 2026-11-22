@@ -238,6 +238,11 @@ impl server::Handler for Peer {
                     b"report-foreign" => Some(b"\x1b]7;file://unrelated.invalid/srv/foreign\x1b\\\r\nforeign-reported\r\n"),
                     b"report-current" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-reported\r\n"),
                     b"report-current-again" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-confirmed\r\n"),
+                    b"nested-host" => Some(b"\x1b]1337;RemoteHost=test@nested.invalid\x07nested-host-seen\r\n"),
+                    b"nested-dir" => Some(b"\x1b]1337;CurrentDir=/tmp/nested-only\x07nested-dir-seen\r\n"),
+                    b"other-login" => Some(b"\x1b]1337;RemoteHost=other@127.0.0.1\x07\x1b]1337;CurrentDir=/home/other\x07other-login-seen\r\n"),
+                    b"login-host" => Some(b"\x1b]1337;RemoteHost=test@127.0.0.1\x1b\\login-host-seen\r\n"),
+                    b"literal-dir" => Some("\x1b]1337;CurrentDir=/srv/Pilot's 100%2F;#雪\x1b\\literal-dir-seen\r\n".as_bytes()),
                     _ => None,
                 };
                 if let Some(report) = report {

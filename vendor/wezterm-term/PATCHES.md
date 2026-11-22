@@ -95,4 +95,10 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - The embedding can enable ConEmu / Windows Terminal OSC 9;9 reports for
   local Windows panes. Reported drive paths feed the same current-directory
-  state as OSC 7. SSH panes continue to use their own OSC 7 host information.
+  state as OSC 7.
+
+- A direct SSH shell can enable iTerm2 OSC 1337 `RemoteHost` and `CurrentDir`.
+  A matching user and destination authorizes literal POSIX paths until the
+  peer reports another identity, sends OSC 7, or the terminal resets. A
+  foreign or malformed identity clears the previous directory. Other pane
+  types ignore both reports.
