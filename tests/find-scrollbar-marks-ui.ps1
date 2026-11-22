@@ -114,6 +114,9 @@ try {
     # Keep Find open while the remote application switches its active screen.
     Send-Bytes $ssh ([char]27 + '[?1049h' + [char]27 + '[Halt-screen-ready')
     $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','15','alt-screen-ready')
+    # Screen content commits before the debounced Find scan. Observe the alternate
+    # result so the wait after restoring primary cannot accept its previous count.
+    $null = Wait-Until 'Find scanned the alternate screen' { (Status) -ceq 'No matches' }
     Assert-Unmarked $ssh $false
     Send-Bytes $ssh ([char]27 + '[?1049l')
     $restored = [int](Wait-Until 'restored primary search results' {
