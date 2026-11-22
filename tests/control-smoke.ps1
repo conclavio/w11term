@@ -36,6 +36,16 @@ function Wait-ControlManifest {
         Start-Sleep -Milliseconds 50
     }
 }
+function Stop-TestWindow([Diagnostics.Process]$Process) {
+    if ($Process -and -not $Process.HasExited) {
+        $Process.Refresh()
+        $null = $Process.CloseMainWindow()
+        if (-not $Process.WaitForExit(5000)) {
+            $Process.Kill()
+            $Process.WaitForExit()
+        }
+    }
+}
 try {
     $peer = Start-Process -FilePath $echo -ArgumentList @('--port', $port, '--state-dir', ('"' + $state + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'peer.log') -RedirectStandardError (Join-Path $state 'peer.err')
     $ready = Join-Path $state 'server.json'
@@ -180,12 +190,34 @@ try {
     $null = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '5', 'TAPE')
     $replayed = Invoke-Control @('get-text', '--pane', '1')
     if ($replayed.cols -ne $live.cols -or $replayed.rows -ne $live.rows -or $replayed.text -cne $live.text) { throw 'Replay did not reproduce the recorded grid and screen contents' }
-    Write-Output "Control smoke passed. Verified loopback SSH, background PowerShell restart, window restore, and VT record/replay. Artifacts: $state"
+    Stop-TestWindow $terminal
+
+    # A raw VT capture has no sidecar with a suggested starting grid.
+    $rawCapture = Join-Path $state 'raw-image.vt'
+    $esc = [char]27
+    $red = '/wAA' * 64
+    $wire = "${esc}[?25l${esc}[2;4H${esc}_Ga=T,i=49,f=24,s=8,v=8,c=1,r=1,C=1,q=2;$red${esc}\${esc}[3;1HRAW-IMAGE-READY"
+    [IO.File]::WriteAllText($rawCapture, $wire, [Text.Encoding]::ASCII)
+    $terminal = Start-Process -FilePath $gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--replay', ('"' + $rawCapture + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $state 'raw-replay.err')
+    Wait-ControlManifest
+    $matched = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '8', 'RAW-IMAGE-READY')
+    if (-not $matched.matched) { throw 'Raw image replay did not reach its marker' }
+    $grid = Invoke-Control @('get-text', '--pane', '1')
+    $png = Join-Path $state 'raw-replay.png'
+    $null = Invoke-Control @('screenshot', '--pane', '1', $png)
+    Add-Type -AssemblyName System.Drawing
+    $bitmap = [Drawing.Bitmap]::FromFile($png)
+    try {
+        $x = [int][Math]::Floor(3.5 * $bitmap.Width / $grid.cols)
+        $y = [int][Math]::Floor(1.5 * $bitmap.Height / $grid.rows)
+        $color = $bitmap.GetPixel($x, $y)
+        if ($color.R -lt 224 -or $color.G -gt 31 -or $color.B -gt 31) {
+            throw "Raw replay dropped its image at cell (3,1): $color"
+        }
+    } finally { $bitmap.Dispose() }
+    Write-Output "Control smoke passed. Verified loopback SSH, background PowerShell restart, window restore, VT record/replay, and raw replay image pixels. Artifacts: $state"
 } finally {
-    if ($terminal -and -not $terminal.HasExited) {
-        $null = $terminal.CloseMainWindow()
-        if (-not $terminal.WaitForExit(5000)) { Stop-Process -Id $terminal.Id }
-    }
+    Stop-TestWindow $terminal
     if ($peer -and -not $peer.HasExited) { Stop-Process -Id $peer.Id }
     $env:W11TERM_DATA_DIR = $oldDataDir
     $env:W11TERM_SETTINGS_PATH = $oldSettingsPath

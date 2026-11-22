@@ -162,6 +162,14 @@ struct Services {
     notices: mpsc::Receiver<crate::sound::Notice>,
     live_frames: FrameStore,
     sharing: ssh::Sharing,
+    replay_ready: bool,
+}
+
+fn has_cell_pixels(size: TerminalSize) -> bool {
+    size.cols > 0
+        && size.rows > 0
+        && size.pixel_width >= size.cols
+        && size.pixel_height >= size.rows
 }
 
 impl Session {
@@ -222,7 +230,23 @@ impl Session {
         allow_clipboard: bool,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
-        Self::start_worker(source, size, allow_clipboard, connection, None, None)
+        Self::start_worker(source, Some(size), allow_clipboard, connection, None, None)
+    }
+
+    /// A GUI pane can be created before layout assigns it a grid and pixel size.
+    pub fn start_replay_pane(
+        path: std::path::PathBuf,
+        size: TerminalSize,
+        allow_clipboard: bool,
+    ) -> Self {
+        Self::start_worker(
+            Source::Replay(path),
+            has_cell_pixels(size).then_some(size),
+            allow_clipboard,
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn start_workspace_ssh(
@@ -243,7 +267,7 @@ impl Session {
     ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
-            size,
+            Some(size),
             allow_clipboard,
             connection,
             None,
@@ -260,7 +284,7 @@ impl Session {
     ) -> Self {
         Self::start_worker(
             source,
-            size,
+            Some(size),
             allow_clipboard,
             connection,
             Some(ssh::DurableStart::Attach(saved)),
@@ -277,7 +301,7 @@ impl Session {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
-            size,
+            Some(size),
             allow_clipboard,
             None,
             Some(ssh::DurableStart::Discover),
@@ -294,7 +318,7 @@ impl Session {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
-            size,
+            Some(size),
             allow_clipboard,
             None,
             Some(ssh::DurableStart::DiscoverHerdr),
@@ -315,7 +339,7 @@ impl Session {
 
     fn start_worker(
         source: Source,
-        size: TerminalSize,
+        initial_grid: Option<TerminalSize>,
         allow_clipboard: bool,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<ssh::DurableStart>,
@@ -335,7 +359,7 @@ impl Session {
         let colors =
             colors::PaneColors::new(source.color_scheme(), crate::windows_appearance::subscribe);
         let mut terminal = terminal::create_with_palette(
-            size,
+            initial_grid.unwrap_or_default(),
             writer.clone(),
             source.scrollback_lines(),
             colors.effective(),
@@ -398,6 +422,7 @@ impl Session {
                             notices: notice_rx,
                             live_frames,
                             sharing,
+                            replay_ready: initial_grid.is_some(),
                         },
                     ))
                 });
@@ -447,6 +472,7 @@ async fn run(
         mut notices,
         live_frames,
         sharing,
+        mut replay_ready,
     } = services;
     let mut size = terminal.get_size();
     let scrollback_lines = source.scrollback_lines();
@@ -499,7 +525,6 @@ async fn run(
         Source::Replay(path) => {
             match std::fs::read(&path) {
                 Ok(bytes) => {
-                    total_bytes = bytes.len() as u64;
                     replay = Some(bytes);
                     status = format!("Replay · {}", path.display());
                 }
@@ -515,9 +540,6 @@ async fn run(
         }
     };
     let mut presentation = Presentation::new(frames.clone(), live_frames.clone());
-    if let Some(bytes) = replay {
-        presentation.advance(&mut terminal, bytes, 0, &status, total_bytes);
-    }
     let mut search = crate::search::Search::default();
     let mut search_origin = Arc::new(());
     let mut search_dirty = false;
@@ -528,6 +550,10 @@ async fn run(
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
+        if replay_ready && let Some(bytes) = replay.take() {
+            total_bytes = bytes.len() as u64;
+            presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+        }
         if colors.effective() != applied_scheme {
             applied_scheme = colors.effective();
             terminal::set_color_scheme(&mut terminal, scrollback_lines, applied_scheme);
@@ -766,6 +792,7 @@ async fn run(
                         }
                     }
                     Some(Command::Resize(new_size)) => {
+                        replay_ready |= has_cell_pixels(new_size);
                         if size != new_size || (is_demo && !demo_loaded) {
                             presentation.dirty=true;
                             size = new_size;
