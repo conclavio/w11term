@@ -6,6 +6,7 @@ use ::image::{
 };
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::io::Write;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -28,6 +29,23 @@ struct PhysicalPlacement {
     created: wezterm_surface::SequenceNo,
     // A reconnected SSH session can reuse an ID still visible in frozen history.
     data: Weak<ImageData>,
+}
+
+#[derive(Clone, Copy)]
+struct PlacementCell {
+    x: usize,
+    y: usize,
+    z: Option<i32>,
+}
+
+impl PlacementCell {
+    fn from_wire(x: u32, y: u32, z: Option<i32>) -> Option<Self> {
+        Some(Self {
+            x: x.checked_sub(1)? as usize,
+            y: y.checked_sub(1)? as usize,
+            z,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -577,7 +595,7 @@ impl TerminalState {
         let (mut keys, mut free_ids): (HashSet<Key>, HashSet<u32>) = match what {
             KittyImageDelete::All { delete } => {
                 let (retained, mut visible) = self.kitty_img.physical_keys(self.screen());
-                self.visible_kitty_relatives(&mut visible);
+                self.find_visible_kitty_relatives(&mut visible, None);
                 let release = visible
                     .iter()
                     .map(|key| key.0)
@@ -637,6 +655,20 @@ impl TerminalState {
                 let release = delete.then_some(image_id).into_iter().collect();
                 (keys, release)
             }
+            KittyImageDelete::AtCursorPosition { delete } => {
+                let cell = usize::try_from(self.cursor.y).ok().map(|y| PlacementCell {
+                    x: self.cursor.x,
+                    y,
+                    z: None,
+                });
+                self.kitty_delete_at(cell, delete)
+            }
+            KittyImageDelete::DeleteAt { x, y, delete } => {
+                self.kitty_delete_at(PlacementCell::from_wire(x, y, None), delete)
+            }
+            KittyImageDelete::DeleteAtZ { x, y, z, delete } => {
+                self.kitty_delete_at(PlacementCell::from_wire(x, y, Some(z)), delete)
+            }
             _ => {
                 log::warn!("unhandled KittyImage::Delete {:?}", what);
                 return;
@@ -649,6 +681,52 @@ impl TerminalState {
         if self.kitty_img.release_unplaced_images(free_ids) {
             self.image_cache.clear();
         }
+    }
+
+    fn kitty_delete_at(
+        &self,
+        cell: Option<PlacementCell>,
+        delete: bool,
+    ) -> (HashSet<Key>, HashSet<u32>) {
+        let mut keys = HashSet::new();
+        let mut release = HashSet::new();
+        let screen = self.screen();
+        let Some(cell) = cell.filter(|p| p.x < screen.physical_cols && p.y < screen.physical_rows)
+        else {
+            return (keys, release);
+        };
+        let row = screen.phys_row(cell.y as crate::VisibleRowIndex);
+        if let Some(images) = screen
+            .physical_lines()
+            .nth(row)
+            .and_then(|line| line.get_cell(cell.x))
+            .and_then(|cell| cell.attrs().images())
+        {
+            keys.extend(
+                images
+                    .iter()
+                    .filter(|tile| cell.z.is_none_or(|z| z == tile.z_index()))
+                    .filter_map(|tile| self.kitty_img.tile_key(tile)),
+            );
+        }
+        self.find_visible_kitty_relatives(&mut keys, Some(cell));
+        if delete {
+            release.extend(keys.iter().map(|key| key.0).filter(|&id| id != 0));
+            // Erased cells can leave stale placement entries. Drop such entries
+            // for the selected images so only live or historical tiles pin data.
+            let siblings: Vec<_> = self
+                .kitty_img
+                .placements
+                .keys()
+                .filter(|key| release.contains(&key.0) && !keys.contains(key))
+                .copied()
+                .collect();
+            if !siblings.is_empty() {
+                let (retained, _) = self.kitty_img.physical_keys(screen);
+                keys.extend(siblings.into_iter().filter(|key| !retained.contains(key)));
+            }
+        }
+        (keys, release)
     }
 
     fn detach_kitty_cells(&mut self, keys: &HashSet<Key>) {
