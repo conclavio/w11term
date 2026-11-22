@@ -128,19 +128,33 @@ impl TerminalApp {
                 assert_eq!(self.tabs.active_id(), Some(focused));
                 2
             }
-            2 if state.join("append").exists() => {
-                std::fs::remove_file(state.join("append")).unwrap();
-                let Some(AppTab {
-                    page: Page::Terminal(tab),
-                    ..
-                }) = self.tabs.active()
-                else {
-                    panic!("missing test pane")
+            2 if state.join("append").exists() || state.join("append-neighbor").exists() => {
+                let active = self.tabs.active_id().unwrap();
+                let neighbor = state.join("append-neighbor");
+                let (path, pane) = if neighbor.is_file() {
+                    (
+                        neighbor,
+                        self.tabs
+                            .entries()
+                            .iter()
+                            .find(|entry| entry.id != active)
+                            .unwrap()
+                            .id,
+                    )
+                } else {
+                    (state.join("append"), active)
                 };
-                tab.session
-                    .input
-                    .send(Command::Text("new-output".into()))
-                    .unwrap();
+                let Page::Terminal(tab) = &self.tabs.get(pane).unwrap().page else {
+                    panic!("missing test pane");
+                };
+                let output = std::fs::read_to_string(&path).unwrap();
+                std::fs::remove_file(path).unwrap();
+                let command = if output.is_empty() {
+                    Command::Text("new-output".into())
+                } else {
+                    Command::Paste(output)
+                };
+                tab.session.input.send(command).unwrap();
                 2
             }
             _ => step,

@@ -4,6 +4,8 @@
 #![allow(non_upper_case_globals)]
 mod document;
 mod ranges;
+#[cfg(test)]
+mod scroll_tests;
 use document::{Document, Selection};
 use ranges::{TextRange, interfaces};
 use std::{
@@ -13,8 +15,13 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
-use w11term::terminal::{FrameStore, Snapshot};
+use tokio::sync::mpsc::UnboundedSender;
+use w11term::{
+    session::{Command, RangeScroll},
+    terminal::{FrameStore, Snapshot},
+};
 use windows::{
     Win32::{
         Foundation::*,
@@ -56,6 +63,7 @@ pub struct Pane<'a> {
     pub id: u64,
     pub label: &'a str,
     pub frames: &'a FrameStore,
+    pub input: &'a UnboundedSender<Command>,
     pub geometry: Geometry,
     pub selection: Option<&'a w11term::interaction::Selection>,
 }
@@ -63,8 +71,9 @@ struct Source {
     hwnd: usize,
     id: u64,
     name: String,
-    alive: AtomicBool,
+    alive: Arc<AtomicBool>,
     frames: FrameStore,
+    input: UnboundedSender<Command>,
     state: Mutex<State>,
 }
 impl Source {
@@ -114,6 +123,17 @@ impl Source {
                 WPARAM(0),
                 LPARAM(0),
             )
+        }
+    }
+    fn scroll(&self, doc: &Document, span: Range<usize>, align_top: bool) -> Result<()> {
+        self.check()?;
+        let rows = doc.retained_rows(&span).ok_or_else(unavailable)?;
+        let (command, result) = RangeScroll::request(rows, align_top, self.alive.clone());
+        self.input.send(command).map_err(|_| unavailable())?;
+        if result.wait(Duration::from_secs(1)) {
+            self.check()
+        } else {
+            Err(unavailable())
         }
     }
     fn focused(&self) -> bool {
@@ -322,6 +342,7 @@ impl Bridge {
             id: pane,
             label,
             frames,
+            input,
             geometry: g,
             selection,
         } = pane;
@@ -332,7 +353,10 @@ impl Bridge {
         });
         let mut slot = self.host.borrow_mut();
         let changed_pane = slot.as_ref().is_none_or(|h| {
-            h.source.id != pane || h.parent != parent || !h.source.alive.load(Ordering::Acquire)
+            h.source.id != pane
+                || h.parent != parent
+                || !h.source.input.same_channel(input)
+                || !h.source.alive.load(Ordering::Acquire)
         });
         if changed_pane {
             slot.take();
@@ -357,8 +381,9 @@ impl Bridge {
                 hwnd: hwnd.0 as usize,
                 id: pane,
                 name: format!("Terminal · {label}"),
-                alive: AtomicBool::new(true),
+                alive: Arc::new(AtomicBool::new(true)),
                 frames: frames.clone(),
+                input: input.clone(),
                 state: Mutex::new(State {
                     geometry: g,
                     selected,

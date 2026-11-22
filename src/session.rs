@@ -19,6 +19,8 @@ pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
 #[cfg(test)]
 mod pane_search_tests;
 mod presentation;
+mod range_scroll;
+pub use range_scroll::{RangeScroll, RangeScrollRequest};
 #[cfg(test)]
 mod synchronized_capture;
 #[cfg(test)]
@@ -72,6 +74,7 @@ pub enum Command {
     /// Discard only the offscreen rows of the primary buffer on this worker.
     ClearScrollback,
     ScrollTo(isize),
+    ScrollRange(RangeScrollRequest),
     CopyRange(
         crate::copy_mode::ScreenId,
         crate::interaction::Selection,
@@ -723,6 +726,22 @@ async fn run(
                     Some(Command::CopyRange(id, selection, reply)) => {
                         let _ = reply.send(crate::copy_mode::selected_text(&terminal, connection_generation, id, selection));
                         Ok(())
+                    }
+                    Some(Command::ScrollRange(request)) => {
+                        if request.available()
+                            && let Some(offset) = request.rows.scroll_offset(&terminal, connection_generation, request.align_top)
+                        {
+                            let view = (offset != scroll_offset).then(||
+                                presentation.scrolled_view(&terminal, offset, &search));
+                            request.commit(|| {
+                                if let Some(view) = view {
+                                    scroll_offset = offset;
+                                    presentation.publish_scroll(view);
+                                }
+                            });
+                        }
+                        // The viewport was already published before acknowledging UIA.
+                        continue;
                     }
                     Some(Command::ScrollTo(top)) => {
                         if !terminal.is_alt_screen_active() {
