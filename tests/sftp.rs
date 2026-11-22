@@ -21,6 +21,7 @@ use w11term::{
 
 struct Peer {
     channels: HashMap<ChannelId, Channel<server::Msg>>,
+    wire: Option<tokio::sync::mpsc::UnboundedSender<in_band_resize::Wire>>,
     forwarded: HashSet<ChannelId>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
@@ -117,17 +118,22 @@ impl server::Handler for Peer {
         s.channel_success(c)?;
         Ok(())
     }
-    #[cfg(feature = "ui-smoke")]
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
         cols: u32,
         rows: u32,
-        _: u32,
-        _: u32,
+        width: u32,
+        height: u32,
         session: &mut server::Session,
     ) -> anyhow::Result<()> {
-        if self.root.join("keyboard-input.bin").exists() {
+        if let Some(wire) = &self.wire {
+            let _ = wire.send(in_band_resize::Wire::Window(
+                channel,
+                [cols, rows, width, height],
+            ));
+        }
+        if cfg!(feature = "ui-smoke") && self.root.join("keyboard-input.bin").exists() {
             session.data(
                 channel,
                 format!("\r\nssh-grid-{cols}x{rows}\r\n").into_bytes(),
@@ -166,6 +172,9 @@ impl server::Handler for Peer {
     }
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
         s.channel_success(c)?;
+        if let Some(wire) = &self.wire {
+            let _ = wire.send(in_band_resize::Wire::Shell(c, s.handle()));
+        }
         s.data(c, b"ready\r\n".as_slice())?;
         #[cfg(feature = "ui-smoke")]
         if self.root.join("copy-history.vt").is_file() {
@@ -227,6 +236,10 @@ impl server::Handler for Peer {
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
         if self.channels.contains_key(&c) {
+            if let Some(wire) = &self.wire {
+                let _ = wire.send(in_band_resize::Wire::Input(c, data.to_vec()));
+                return Ok(());
+            }
             #[cfg(feature = "ui-smoke")]
             if self.root.join("split-inputs").is_dir() {
                 fs::OpenOptions::new()
@@ -827,6 +840,15 @@ async fn fixture_counting_accepts(
     connections: usize,
     accepted: Arc<AtomicUsize>,
 ) -> FixtureServer {
+    fixture_with_wire(reject, connections, accepted, None).await
+}
+
+async fn fixture_with_wire(
+    reject: bool,
+    connections: usize,
+    accepted: Arc<AtomicUsize>,
+    wire: Option<tokio::sync::mpsc::UnboundedSender<in_band_resize::Wire>>,
+) -> FixtureServer {
     use russh::keys::{Algorithm, HashAlg, PrivateKey};
     let root = tempfile::tempdir().unwrap();
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -849,6 +871,7 @@ async fn fixture_counting_accepts(
             let (stream, _) = listener.accept().await.unwrap();
             accepted.fetch_add(1, Ordering::Relaxed);
             let peer = Peer {
+                wire: wire.clone(),
                 channels: HashMap::new(),
                 forwarded: HashSet::new(),
                 root: root_path.clone(),
@@ -961,6 +984,8 @@ async fn guarded_job(
 mod cancellation;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
+#[path = "sftp/in_band_resize.rs"]
+mod in_band_resize;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
