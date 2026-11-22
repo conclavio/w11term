@@ -129,6 +129,8 @@ The **Inbox** button beside the tab menu shows how many bells and terminal notif
 
 Choose **caret → Panes → Open files here** to open the drawer at the directory the focused shell last reported with OSC 7. For example, `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s existing SSH connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. An absent, invalid or foreign-host report opens the usual SFTP working directory.
 
+To keep a remote directory for another session, open it in the SFTP drawer and choose **Bookmarks… → Bookmark this folder**. Select its path to reopen it over the current SSH connection, or choose **Remove** beside the path. Bookmarks belong to the saved profile, SSH account, host, port and verified host key. If a bookmarked directory has moved, the drawer shows the error and keeps the previous listing.
+
 Check **Follow shell directory** in the drawer to track later directory changes from that shell. The drawer waits for active transfers and file pickers to finish, then reads the latest reported directory when visible. It ignores invalid and foreign-host reports. Opening a folder manually or revealing a file turns following off for that pane.
 
 **Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.

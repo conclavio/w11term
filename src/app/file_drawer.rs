@@ -6,12 +6,15 @@ use tokio::sync::{oneshot, watch};
 use w11term::folder_grants::Authority;
 use w11term::sftp::{DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, TransferProgress};
 
+mod bookmarks;
+
 const PAGE_SIZE: usize = 32;
 
 #[derive(Clone)]
 pub enum FileAction {
     Toggle,
     OpenHere,
+    Bookmarks(u64, u64, bookmarks::Action),
     Follow(u64, u64, bool),
     Reveal(u64, u64, String, Option<String>),
     Close(u64),
@@ -42,6 +45,9 @@ pub(super) struct FileDrawer {
     pub(super) open: bool,
     generation: u64,
     directory: Option<String>,
+    bookmarks: Option<bookmarks::List>,
+    /// Pending bookmark navigation keeps the current listing until the target is readable.
+    opening_bookmark: Option<String>,
     following: bool,
     last_report: Option<Arc<str>>,
     entries: Vec<Entry>,
@@ -62,7 +68,7 @@ pub(super) struct FileDrawer {
     uploads: VecDeque<PathBuf>,
     transfer_serial: u64,
     status: String,
-    cached: RefCell<Option<View>>,
+    cached: RefCell<Option<(Option<String>, View)>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -563,6 +569,7 @@ impl FileDrawer {
     }
 
     fn accept_listing(&mut self, path: String, entries: Vec<Entry>) {
+        self.opening_bookmark = None;
         self.end_filter_edit();
         if self.directory.as_ref() != Some(&path) {
             self.filter.clear();
@@ -799,6 +806,7 @@ impl FileDrawer {
             || !self.following
             || self.busy()
             || self.filter_editing()
+            || self.bookmarks.is_some()
             || self.last_report == *report
         {
             return None;
@@ -808,9 +816,27 @@ impl FileDrawer {
             .filter(|path| Some(path) != self.directory.as_ref())
     }
 
-    fn panel(&self, pane: u64, ssh: &SshOptions, context: &ViewContext<TerminalApp>) -> View {
-        if let Some(view) = self.cached.borrow().as_ref() {
+    fn panel(
+        &self,
+        pane: u64,
+        ssh: &SshOptions,
+        profile: Option<&str>,
+        context: &ViewContext<TerminalApp>,
+    ) -> View {
+        if let Some((_, view)) = self
+            .cached
+            .borrow()
+            .as_ref()
+            .filter(|(saved, _)| saved.as_deref() == profile)
+        {
             return view.clone();
+        }
+        if let Some(list) = &self.bookmarks
+            && Some(list.profile.as_str()) == profile
+        {
+            let panel = list.panel(self, pane, context);
+            *self.cached.borrow_mut() = Some((profile.map(str::to_owned), panel.clone()));
+            return panel;
         }
         use FileAction::*;
         let button = |label: &str, enabled: bool, action: FileAction| {
@@ -862,6 +888,11 @@ impl FileDrawer {
                         ),
                     ),
                     button("Refresh", ready, Browse(pane, generation, folder.into())),
+                    button(
+                        "Bookmarks…",
+                        ready && profile.is_some(),
+                        Bookmarks(pane, generation, bookmarks::Action::Show),
+                    ),
                     button(
                         "Upload…",
                         writable,
@@ -1093,7 +1124,7 @@ impl FileDrawer {
                             .content(StackPanel::new().keyed_children(list)),
                     )),
             );
-        *self.cached.borrow_mut() = Some(panel.clone());
+        *self.cached.borrow_mut() = Some((profile.map(str::to_owned), panel.clone()));
         panel
     }
 
@@ -1164,6 +1195,8 @@ impl FileDrawer {
         path: String,
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
+        self.bookmarks = None;
+        self.opening_bookmark = None;
         self.end_filter_edit();
         self.status = "Reading directory…".into();
         self.reveal = None;
@@ -1443,6 +1476,8 @@ impl TerminalApp {
         )?;
         files.open = true;
         files.end_filter_edit();
+        files.bookmarks = None;
+        files.opening_bookmark = None;
         files.following = false;
         files.reveal = None;
         files.directory = None;
@@ -1512,6 +1547,16 @@ impl TerminalApp {
                     Border::new().grid_column(1).content(tab.files.panel(
                         tab.session.pane_id,
                         ssh,
+                        tab.profile_name.as_deref().filter(|name| {
+                            self.catalog.profiles.get(*name).is_some_and(|saved| {
+                                saved.host.eq_ignore_ascii_case(&ssh.host)
+                                    && saved.user == ssh.user
+                                    && saved.port == ssh.port
+                            }) && tab
+                                .session
+                                .ssh_connection_at(tab.files.generation)
+                                .is_some()
+                        }),
                         context,
                     )),
                 ),
@@ -1527,6 +1572,7 @@ impl TerminalApp {
                 None => return,
             },
             Close(id)
+            | Bookmarks(id, ..)
             | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
@@ -1604,9 +1650,23 @@ impl TerminalApp {
         }
         let result = (|| -> Result<()> {
             match action {
+                Bookmarks(_, generation, action)
+                    if files.open && generation == files.generation =>
+                {
+                    files.bookmark_action(
+                        pane,
+                        action,
+                        tab.profile_name.as_deref(),
+                        &self.store,
+                        session,
+                        context,
+                    )?;
+                }
+                Bookmarks(..) => {}
                 Toggle => {
                     files.open = !files.open;
                     if !files.open {
+                        files.bookmarks = None;
                         files.cancel_entry_dialog();
                         files.end_filter_edit();
                     }
@@ -1617,6 +1677,7 @@ impl TerminalApp {
                     }
                 }
                 OpenHere => {
+                    files.bookmarks = None;
                     files.open = true;
                     self.initial_grid.set(None);
                     crate::input::clear_grid();
@@ -1627,6 +1688,7 @@ impl TerminalApp {
                     }
                 }
                 Close(_) => {
+                    files.bookmarks = None;
                     files.cancel_entry_dialog();
                     files.end_filter_edit();
                     files.open = false;
@@ -1639,6 +1701,7 @@ impl TerminalApp {
                 }
                 Reveal(_, _, directory, name) => {
                     if !files.busy() {
+                        files.bookmarks = None;
                         files.open = true;
                         files.following = false;
                         self.initial_grid.set(None);
@@ -1904,8 +1967,9 @@ impl TerminalApp {
         })();
         if let Err(error) = result {
             files.uploads.clear();
-            files.status = match files.reveal.take() {
-                Some(RevealTarget::Changed(change)) => {
+            files.status = match (files.opening_bookmark.take(), files.reveal.take()) {
+                (Some(path), _) => format!("Could not open bookmark {path}: {error:#}"),
+                (_, Some(RevealTarget::Changed(change))) => {
                     format!(
                         "{}, but refreshing the directory failed: {error:#}",
                         change.completed()

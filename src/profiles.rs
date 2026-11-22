@@ -3,6 +3,8 @@ use crate::options::{Profiles, SshOptions, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
+mod bookmarks;
+pub use bookmarks::{BookmarkPeer, bookmark_directory};
 mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
 
@@ -383,6 +385,10 @@ impl ProfileStore {
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             let object = value.as_object_mut().context("profile must be an object")?;
+            if copy.is_some() {
+                // A different profile starts with its own remote places.
+                object.remove(bookmarks::FIELD);
+            }
             if original != Some(name)
                 || original
                     .and_then(|key| catalog.profiles.get(key))

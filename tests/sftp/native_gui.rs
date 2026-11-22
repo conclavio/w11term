@@ -652,6 +652,81 @@ async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "persists native SFTP bookmarks across launches and scopes them to the verified SSH profile"]
+async fn native_sftp_bookmarks_reopen_on_the_active_channel_and_preserve_the_old_listing_on_error()
+{
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 4, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let target = remote.path().join("Pilot's Work");
+    fs::create_dir_all(target.join("deeper")).unwrap();
+    fs::create_dir(remote.path().join("stable")).unwrap();
+    fs::write(target.join("bookmark-witness.txt"), b"target").unwrap();
+    fs::write(target.join("deeper/child-witness.txt"), b"child").unwrap();
+    fs::write(
+        remote.path().join("stable/stable-witness.txt"),
+        b"existing listing",
+    )
+    .unwrap();
+    for log in ["authenticated-users", "keyboard-input.bin", "listing-trace"] {
+        fs::write(remote.path().join(log), []).unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("sftp-directory-bookmarks-ui.ps1", &ssh, state.path());
+    let catalog: Value =
+        serde_json::from_slice(&fs::read(state.path().join("profiles.json")).unwrap()).unwrap();
+    assert!(
+        catalog["profiles"]["palette-ssh"]
+            .get("sftp_bookmarks")
+            .is_none()
+    );
+    let users = fs::read_to_string(remote.path().join("authenticated-users")).unwrap();
+    assert_eq!(
+        users.lines().collect::<Vec<_>>(),
+        ["test", "other-account", "test"]
+    );
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        3,
+        "only explicitly opened SSH profiles logged in"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        6,
+        "each original shell reused its one SFTP channel"
+    );
+    assert!(
+        fs::read(remote.path().join("keyboard-input.bin"))
+            .unwrap()
+            .is_empty()
+    );
+    let listings = fs::read_to_string(remote.path().join("listing-trace")).unwrap();
+    let directories: Vec<_> = listings
+        .lines()
+        .filter_map(|line| line.strip_prefix("OPENDIR "))
+        .collect();
+    assert_eq!(
+        directories,
+        [
+            "/",
+            "/Pilot's Work",
+            "/Pilot's Work/deeper",
+            "/Pilot's Work",
+            "/",
+            "/",
+            "/stable",
+            "/Pilot's Work",
+            "/Pilot's Work",
+        ]
+    );
+    assert!(target.join("bookmark-witness.txt").is_file());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "filters a paginated SFTP listing while checking shell input and directory reads"]
 async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
