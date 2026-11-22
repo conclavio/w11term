@@ -1244,6 +1244,61 @@ async fn native_pane_picker_routes_keys_across_tabs_and_restores_focus_on_escape
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a new PTY in a bookmarked SFTP directory through the native drawer"]
+async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_transport() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let target = remote.path().join("Pilot's Work");
+    fs::create_dir_all(target.join("deeper")).unwrap();
+    fs::write(target.join("bookmark-witness.txt"), []).unwrap();
+    fs::write(target.join("deeper/child-witness.txt"), []).unwrap();
+    let inputs = remote.path().join("split-inputs");
+    fs::create_dir(&inputs).unwrap();
+    for log in ["authenticated-users", "pty-trace", "workspace-exec.bin"] {
+        fs::write(remote.path().join(log), []).unwrap();
+    }
+    fs::write(remote.path().join("hold-opendir"), "/Pilot's Work/deeper").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("sftp-shell-here-ui.ps1", &ssh, state.path());
+    assert_eq!(accepted.load(Ordering::Relaxed), 1, "SSH transports");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        3,
+        "two PTYs and one SFTP subsystem"
+    );
+    let users = fs::read_to_string(remote.path().join("authenticated-users")).unwrap();
+    assert_eq!(users.lines().collect::<Vec<_>>(), ["test"]);
+    let exec = fs::read_to_string(remote.path().join("workspace-exec.bin")).unwrap();
+    assert_eq!(
+        exec,
+        r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/Pilot'\''s Work'"#
+    );
+    let trace = fs::read_to_string(remote.path().join("pty-trace")).unwrap();
+    let ptys: Vec<_> = trace.lines().collect();
+    assert_eq!(ptys.len(), 2);
+    assert_ne!(ptys[0], ptys[1]);
+    assert_eq!(fs::read_dir(&inputs).unwrap().count(), 2);
+    assert_eq!(
+        fs::read_to_string(inputs.join(ptys[0])).unwrap(),
+        "parent-live"
+    );
+    assert_eq!(
+        fs::read_to_string(inputs.join(ptys[1])).unwrap(),
+        "child-live"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens right and below splits from verified OSC 7 paths on real SSH channels"]
 async fn native_splits_open_the_reported_directory_on_the_original_ssh_transport() {
     for direction in ["right", "below"] {

@@ -6,6 +6,18 @@ pub struct Origin {
     pane: u64,
     generation: u64,
     directory: String,
+    listing_revision: Option<u64>,
+}
+
+impl Origin {
+    pub(super) fn listing(pane: u64, generation: u64, directory: &str, revision: u64) -> Self {
+        Self {
+            pane,
+            generation,
+            directory: directory.into(),
+            listing_revision: Some(revision),
+        }
+    }
 }
 
 pub(super) fn axis(shortcut: Shortcut) -> Option<Axis> {
@@ -47,6 +59,7 @@ impl LiveTab {
                 pane: self.session.pane_id,
                 generation,
                 directory,
+                listing_revision: None,
             },
             connection,
         ))
@@ -77,12 +90,19 @@ impl TerminalApp {
         else {
             return;
         };
-        let Some((current, connection)) = tab.directory_split() else {
+        let resolved = if target.listing_revision.is_some() {
+            if !self.drawer_shell_eligible(tab, target.generation) {
+                return;
+            }
+            tab.files
+                .shell_origin(tab.session.pane_id)
+                .zip(tab.session.ssh_connection_at(target.generation))
+        } else {
+            tab.directory_split()
+        };
+        let Some((current, connection)) = resolved.filter(|(current, _)| *current == target) else {
             return;
         };
-        if current != target {
-            return;
-        }
         let Source::Ssh(pane) = &tab.source else {
             return;
         };
@@ -157,6 +177,7 @@ mod tests {
             pane: 14,
             generation: 3,
             directory: "/srv/client v2".into(),
+            listing_revision: None,
         };
         for (label, expected) in [
             ("Split right in current directory    F7", Axis::Columns),

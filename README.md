@@ -131,6 +131,8 @@ Choose **caret → Panes → Open files here** to open the drawer at the directo
 
 To keep a remote directory for another session, open it in the SFTP drawer and choose **Bookmarks… → Bookmark this folder**. Select its path to reopen it over the current SSH connection, or choose **Remove** beside the path. Bookmarks belong to the saved profile, SSH account, host, port and verified host key. If a bookmarked directory has moved, the drawer shows the error and keeps the previous listing.
 
+On a direct SSH shell, **Open shell here** opens a right-hand split in the directory displayed by the SFTP drawer. You can browse to a folder or reopen a bookmark even when the running shell does not report its working directory. The new shell reuses the authenticated SSH connection, and the original pane keeps its running program and file selection. The server must allow SSH exec and expose the selected path to the shell.
+
 Check **Follow shell directory** in the drawer to track later directory changes from that shell. The drawer waits for active transfers and file pickers to finish, then reads the latest reported directory when visible. It ignores invalid and foreign-host reports. Opening a folder manually or revealing a file turns following off for that pane.
 
 **Replace existing files** starts off. Downloads publish the local destination after the transfer completes. An interrupted upload can leave a partial file on the server, and the drawer reports that outcome. A new SSH connection clears the previous directory and overwrite choice.

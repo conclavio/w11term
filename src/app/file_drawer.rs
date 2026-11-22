@@ -77,7 +77,13 @@ pub(super) struct FileDrawer {
     uploads: VecDeque<PathBuf>,
     transfer_serial: u64,
     status: String,
-    cached: RefCell<Option<(Option<String>, View)>>,
+    cached: RefCell<Option<CachedPanel>>,
+}
+
+struct CachedPanel {
+    profile: Option<String>,
+    shell_ready: bool,
+    view: View,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -564,6 +570,19 @@ impl FileDrawer {
                 .any(|e| e.name == entry.name && e.kind == entry.kind)
     }
 
+    pub(super) fn shell_origin(&self, pane: u64) -> Option<directory_split::Origin> {
+        if !self.open || self.busy() || self.bookmarks.is_some() {
+            return None;
+        }
+        let path = w11term::profiles::bookmark_directory(self.directory.as_deref()?)?;
+        Some(directory_split::Origin::listing(
+            pane,
+            self.generation,
+            path,
+            self.listing_revision,
+        ))
+    }
+
     fn check_selected(&self, entry: &ListedEntry) -> Result<()> {
         ensure!(
             self.selected.as_ref() == Some(&entry.name) && self.has_entry(entry),
@@ -830,22 +849,28 @@ impl FileDrawer {
         pane: u64,
         ssh: &SshOptions,
         profile: Option<&str>,
+        shell_ready: bool,
         context: &ViewContext<TerminalApp>,
     ) -> View {
-        if let Some((_, view)) = self
-            .cached
-            .borrow()
-            .as_ref()
-            .filter(|(saved, _)| saved.as_deref() == profile)
+        if let Some(cached) =
+            self.cached.borrow().as_ref().filter(|saved| {
+                saved.profile.as_deref() == profile && saved.shell_ready == shell_ready
+            })
         {
-            return view.clone();
+            return cached.view.clone();
         }
+        let cache = |view: View| {
+            *self.cached.borrow_mut() = Some(CachedPanel {
+                profile: profile.map(str::to_owned),
+                shell_ready,
+                view: view.clone(),
+            });
+            view
+        };
         if let Some(list) = &self.bookmarks
             && Some(list.profile.as_str()) == profile
         {
-            let panel = list.panel(self, pane, context);
-            *self.cached.borrow_mut() = Some((profile.map(str::to_owned), panel.clone()));
-            return panel;
+            return cache(list.panel(self, pane, context));
         }
         use FileAction::*;
         let button = |label: &str, enabled: bool, action: FileAction| {
@@ -862,6 +887,11 @@ impl FileDrawer {
             .page_entries()
             .find(|e| Some(&e.name) == self.selected.as_ref());
         let revision = self.listing_revision;
+        let shell = if shell_ready {
+            self.shell_origin(pane)
+        } else {
+            None
+        };
         let listed = |entry: Option<&Entry>| ListedEntry {
             revision,
             parent: folder.into(),
@@ -950,6 +980,13 @@ impl FileDrawer {
                                 .is_some_and(|e| e.kind != ListedKind::Known(EntryKind::Directory)),
                         Pick(pane, generation, folder.into(), Some(listed(selected))),
                     ),
+                    Button::new()
+                        .automation_name("Open shell here")
+                        .is_enabled(shell.is_some())
+                        .on_click(context.callback(move |_| {
+                            directory_split::message(Axis::Columns, shell.as_ref())
+                        }))
+                        .content("Open shell here"),
                 )),
             CheckBox::new()
                 .is_checked(self.following)
@@ -1133,8 +1170,7 @@ impl FileDrawer {
                             .content(StackPanel::new().keyed_children(list)),
                     )),
             );
-        *self.cached.borrow_mut() = Some((profile.map(str::to_owned), panel.clone()));
-        panel
+        cache(panel)
     }
 
     fn job(
@@ -1525,6 +1561,15 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn drawer_shell_eligible(&self, tab: &LiveTab, generation: u64) -> bool {
+        tab.session.is_direct_ssh_shell()
+            && tab.session.frames.load().connection_generation == generation
+            && !self
+                .outgoing
+                .as_ref()
+                .is_some_and(|transfer| self.tabs.active_group_id() == Some(transfer.group))
+    }
+
     pub(super) fn with_file_drawer(&self, content: View, context: &ViewContext<Self>) -> View {
         let Some(AppTab {
             page: Page::Terminal(tab),
@@ -1539,15 +1584,16 @@ impl TerminalApp {
         if !tab.files.open {
             return content;
         }
+        let connection = tab.session.ssh_connection_at(tab.files.generation);
         let bookmark_profile = tab.profile_name.as_deref().filter(|name| {
             self.catalog.profiles.get(*name).is_some_and(|saved| {
-                tab.session
-                    .ssh_connection_at(tab.files.generation)
-                    .is_some_and(|link| {
-                        w11term::profiles::BookmarkPeer::connection_matches_profile(&link, saved)
-                    })
+                connection.as_ref().is_some_and(|link| {
+                    w11term::profiles::BookmarkPeer::connection_matches_profile(link, saved)
+                })
             })
         });
+        let shell_ready =
+            connection.is_some() && self.drawer_shell_eligible(tab, tab.files.generation);
         let width = (self.width * 0.45).clamp(1.0, 360.0);
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
@@ -1559,6 +1605,7 @@ impl TerminalApp {
                         tab.session.pane_id,
                         ssh,
                         bookmark_profile,
+                        shell_ready,
                         context,
                     )),
                 ),
@@ -2238,6 +2285,55 @@ mod tests {
                 kind: ListedKind::Known(EntryKind::File),
             })
             .collect()
+    }
+
+    #[test]
+    fn shell_here_binds_to_the_displayed_listing_and_leaves_browsing_state_alone() {
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 3,
+            following: true,
+            ..Default::default()
+        };
+        assert!(drawer.shell_origin(17).is_none());
+        let path = "/ops/shell's $(release);雪";
+        drawer.accept_listing(path.into(), listing());
+        drawer.set_filter("plain".into());
+        drawer.set_page(1);
+        let selected = drawer.page_entries().next().unwrap().name.clone();
+        drawer.selected = Some(selected.clone());
+        let target = drawer.shell_origin(17).unwrap();
+        assert_eq!(
+            target,
+            directory_split::Origin::listing(17, 3, path, drawer.listing_revision)
+        );
+        assert_ne!(Some(&target), drawer.shell_origin(18).as_ref());
+        assert!(drawer.following);
+        assert_eq!(drawer.filter, "plain");
+        assert_eq!(drawer.page, 1);
+        assert_eq!(drawer.selected.as_ref(), Some(&selected));
+
+        drawer.parsing = true;
+        assert!(drawer.shell_origin(17).is_none());
+        drawer.parsing = false;
+        drawer.accept_listing(path.into(), vec![]);
+        assert_ne!(drawer.shell_origin(17).unwrap(), target);
+        drawer.open = false;
+        assert!(drawer.shell_origin(17).is_none());
+        drawer.open = true;
+        drawer.observe_connection(4);
+        assert!(drawer.shell_origin(17).is_none());
+        drawer.accept_listing(path.into(), vec![]);
+        assert_ne!(drawer.shell_origin(17).unwrap(), target);
+        for invalid in [
+            "relative",
+            "//host/folder",
+            "/tmp/../etc",
+            "/tmp/line\nbreak",
+        ] {
+            drawer.accept_listing(invalid.into(), vec![]);
+            assert!(drawer.shell_origin(17).is_none(), "{invalid:?}");
+        }
     }
 
     #[test]
