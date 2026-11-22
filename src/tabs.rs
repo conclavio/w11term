@@ -35,7 +35,7 @@ fn next_id() -> TabId {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A user-assigned display name owned by a tab group, independent of its panes.
+/// A user-assigned display name for a tab group or an individual pane.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct TabTitle(String);

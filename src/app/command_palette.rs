@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandId {
     Menu(String),
+    RenamePane(Option<(u64, TabId)>),
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
     Recording(Option<recordings::Choice>),
@@ -159,6 +160,11 @@ impl TerminalApp {
             &mut rows,
         );
         let origin = self.paste_origin();
+        let rename_target = self
+            .tabs
+            .active()
+            .and_then(AppTab::pane_id)
+            .zip(self.tabs.active_group_id());
         for row in &mut rows {
             if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
                 row.id = CommandId::Clipboard(origin, shortcut == Shortcut::PasteRaw);
@@ -167,6 +173,9 @@ impl TerminalApp {
                 && recordings::is_command(label)
             {
                 row.id = CommandId::Recording(recordings.target(label));
+            }
+            if matches!(&row.id, CommandId::Menu(label) if label == tab_title::RENAME_PANE) {
+                row.id = CommandId::RenamePane(rename_target);
             }
         }
         menu_rows(self.profile_items(), true, &mut rows);
@@ -338,6 +347,7 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::RenamePane(target) => tab_title::show_pane(target),
             CommandId::ReopenClosedTab(group) => Message::ReopenClosedTab(group),
             CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),

@@ -71,6 +71,7 @@ pub(in crate::app) struct ClosedTab {
 struct NewShell {
     source: Source,
     label: String,
+    pane_name: Option<TabTitle>,
     profile: Option<String>,
     size: TerminalSize,
     read_only: bool,
@@ -92,6 +93,7 @@ impl NewShell {
             source,
             profile: live.profile_name.clone(),
             label: tab.label.clone(),
+            pane_name: live.pane_name.clone(),
             size: live.last_size.get().unwrap_or_default(),
             read_only: live.read_only.get(),
             startup: live.startup.clone(),
@@ -114,7 +116,7 @@ impl NewShell {
     }
 
     fn launch(self, osc52: bool) -> AppTab {
-        let tab = if let (Some(startup), Source::Ssh(options)) = (self.startup, &self.source) {
+        let mut tab = if let (Some(startup), Source::Ssh(options)) = (self.startup, &self.source) {
             // A directory-only recipe opens an interactive shell. Its directory
             // was bound to this endpoint when the user saved it in w11term.
             let session =
@@ -128,7 +130,8 @@ impl NewShell {
             live_tab_sized(self.label, self.source, self.size, osc52, None, None)
         }
         .with_profile(self.profile);
-        if let Page::Terminal(live) = &tab.page {
+        if let Page::Terminal(live) = &mut tab.page {
+            live.pane_name = self.pane_name;
             KeyboardBridge::set_read_only(&live.session.input, &live.read_only, self.read_only);
         }
         tab
@@ -303,6 +306,46 @@ mod tests {
     }
 
     #[test]
+    fn duplicated_and_reopened_panes_keep_their_own_display_names() {
+        let mut tabs = Tabs::default();
+        let shell = local("powershell.exe", &["-NoProfile"]);
+        let original = tabs.insert(live_tab(source_label(&shell), shell, false));
+        let name: TabTitle = "Deploy 雪".to_owned().try_into().unwrap();
+        let Page::Terminal(pane) = &mut tabs.get_mut(original).unwrap().page else {
+            unreachable!()
+        };
+        pane.pane_name = Some(name.clone());
+        let group = tabs.group_id(original).unwrap();
+        let closed_recipe = tabs
+            .capture_group(group, NewShell::capture)
+            .unwrap()
+            .unwrap();
+        tabs.duplicate_active_group(
+            |tab| NewShell::capture(tab)?.prepare(None),
+            |recipe| recipe.launch(false),
+        )
+        .unwrap();
+        let duplicate = tabs.active_id().unwrap();
+        assert_ne!(original, duplicate);
+        let Page::Terminal(pane) = &mut tabs.get_mut(duplicate).unwrap().page else {
+            unreachable!()
+        };
+        assert_eq!(pane.pane_name.take().as_ref(), Some(&name));
+        assert_eq!(tabs.get(original).unwrap().pane_name(), Some(&name));
+        assert!(tabs.remove_group(original));
+        tabs.reopen_group(
+            &closed_recipe,
+            |recipe| recipe.clone().prepare(None),
+            |recipe| recipe.launch(false),
+        )
+        .unwrap();
+        let reopened = tabs.active_id().unwrap();
+        assert_ne!(reopened, original);
+        assert_eq!(tabs.get(reopened).unwrap().pane_name(), Some(&name));
+        assert!(tabs.get(duplicate).unwrap().pane_name().is_none());
+    }
+
+    #[test]
     fn reopen_checks_the_current_directory_without_retargeting_a_saved_shell() {
         let mut catalog = Profiles::default();
         let mut changed = ssh();
@@ -312,12 +355,15 @@ mod tests {
             source: Source::Ssh(ssh()),
             profile: Some("test".into()),
             label: "test".into(),
+            pane_name: Some("Deploy console".to_owned().try_into().unwrap()),
             size: TerminalSize::default(),
             read_only: true,
             startup: None,
         };
         let prepared = recipe.clone().prepare(Some(&catalog)).unwrap();
         assert!(prepared.profile.is_none());
+        assert_eq!(prepared.pane_name, recipe.pane_name);
+        assert_eq!(prepared.label, source_label(&prepared.source));
         assert!(matches!(prepared.source, Source::Ssh(ref options) if options == &ssh()));
         assert!(prepared.read_only);
 

@@ -316,6 +316,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                 id: 7,
                 tab_id: 2,
                 tab_title: None,
+                pane_name: None,
                 label: "loopback".into(),
                 active: false,
                 visible: false,

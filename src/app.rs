@@ -81,6 +81,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    pane_name: Option<w11term::tabs::TabTitle>,
     forwards: Box<local_forwards::Routes>,
     folder_sharing: Option<w11term::folder_grants::PaneShares>,
     read_only: Rc<Cell<bool>>,
@@ -349,6 +350,13 @@ struct AppTab {
 }
 
 impl AppTab {
+    fn pane_name(&self) -> Option<&w11term::tabs::TabTitle> {
+        match &self.page {
+            Page::Terminal(live) => live.pane_name.as_ref(),
+            _ => None,
+        }
+    }
+
     fn exited_pane(&self) -> Option<ExitedPane> {
         let Page::Terminal(live) = &self.page else {
             return None;
@@ -834,6 +842,7 @@ pub struct TerminalApp {
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
     title_editor: Option<tab_title::Editor>,
+    name_edit_serial: u64,
     clipboard: clipboard_paste::State,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
     copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
@@ -1021,6 +1030,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            pane_name: None,
             forwards: Box::new(local_forwards::Routes::new(&session)),
             folder_sharing: None,
             startup: None,
@@ -2155,6 +2165,7 @@ impl TerminalApp {
                 .unwrap()
                 .interaction
                 .application_tab_titles,
+            |tab| tab.pane_name().is_some(),
         );
         self.registry
             .replace(self.tabs.entries().iter().filter_map(|entry| {
@@ -2172,6 +2183,7 @@ impl TerminalApp {
                 Some(Pane {
                     id: tab.session.pane_id,
                     tab_id: self.tabs.group_id(entry.id)?,
+                    pane_name: tab.pane_name.as_ref().map(|name| name.as_str().to_owned()),
                     tab_title: self
                         .tabs
                         .title_for(entry.id)
@@ -2953,6 +2965,7 @@ impl TerminalApp {
                     Message::PaneColorScheme(id, scheme)
                 }),
             local_forwards::LABEL => local_forwards::open(forward),
+            tab_title::RENAME_PANE => tab_title::show_pane(pane.zip(group)),
             folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
                 Message::FolderShare(folder_shares::Action::Open(id))
             }),
@@ -3454,6 +3467,11 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            items.push(command_menu_item(
+                "rename-pane",
+                tab_title::RENAME_PANE,
+                self.move_source().is_some(),
+            ));
             if pane_colors::available(live) {
                 items.push(pane_colors::menu(live.color_scheme));
             }
@@ -4180,6 +4198,7 @@ impl Component for TerminalApp {
             switcher: None,
             picker: None,
             title_editor: None,
+            name_edit_serial: 0,
             clipboard,
             hints: Default::default(),
             copy_mode: Default::default(),
@@ -4252,7 +4271,7 @@ impl Component for TerminalApp {
                 | Message::FolderShare(folder_shares::Action::Panel(..))
                 | Message::LocalForward(local_forwards::Action::Panel(..))
                 | Message::WindowActivation(_)
-                | Message::TabTitle(tab_title::Action::Edit(..))
+                | Message::TabTitle(_)
                 | Message::Files(..)
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
                 | Message::Patterns(
@@ -5925,7 +5944,10 @@ impl Component for TerminalApp {
                 parent,
                 crate::accessibility::Pane {
                     id: tab.session.pane_id,
-                    label,
+                    label: tab
+                        .pane_name
+                        .as_ref()
+                        .map_or(label.as_str(), |n| n.as_str()),
                     appearance: &self.appearance,
                     frames: &tab.session.frames,
                     input: &tab.session.input,
@@ -6129,7 +6151,7 @@ impl Component for TerminalApp {
             views.push(KeyedView::new("pane-picker", picker.view(self, context)));
         }
         if let Some(editor) = &self.title_editor {
-            views.push(KeyedView::new("rename-tab", editor.view(context)));
+            views.push(KeyedView::new(editor.key(), editor.view(context)));
         }
         if let Some(dialog) = self.paste_dialog(context) {
             views.push(dialog);

@@ -468,6 +468,7 @@ mod tests {
             id,
             tab_id: id + 10,
             tab_title: None,
+            pane_name: None,
             label: "fixture".into(),
             active: true,
             visible: true,

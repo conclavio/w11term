@@ -197,7 +197,7 @@ function Wait-Focus([int]$Pane) {
         throw "$_ Current panes: $((Control @('list')).sessions | Select-Object id,label,title,active,visible | ConvertTo-Json -Compress)"
     }
 }
-function Picker-Query([string]$Query) {
+function Open-PickerQuery([string]$Query) {
     Write-Output "Searching for $Query"
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
     Invoke-Button (Wait-Until 'Find pane menu item' { Find-Element ('Find pane' + [char]0x2026 + '    Ctrl+Shift+P') })
@@ -206,13 +206,19 @@ function Picker-Query([string]$Query) {
         if ($field -and $field.Current.HasKeyboardFocus) { return $field }
     }
     $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+}
+function Get-PickerRows {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $buttons = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)
+    $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons) |
+        ForEach-Object { $_.Current.Name } | Where-Object { $_ -match 'Tab [0-9]+ / pane [0-9]+' }
+}
+function Picker-Query([string]$Query) {
+    Open-PickerQuery $Query
     $null = Wait-Until "a single rendered result matching '$Query'" {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-        $buttons = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Button)
-        $rows = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons) |
-            ForEach-Object { $_.Current.Name } | Where-Object { $_ -match 'Tab [0-9]+ / pane [0-9]+' })
+        $rows = @(Get-PickerRows)
         $rows.Count -eq 1 -and $rows[0].IndexOf($Query, [StringComparison]::OrdinalIgnoreCase) -ge 0
     }
 }

@@ -100,6 +100,7 @@ mod tests {
             id: 23,
             tab_id: 31,
             tab_title: None,
+            pane_name: None,
             label: "background pane".into(),
             read_only: true,
             active: false,

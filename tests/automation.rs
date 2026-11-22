@@ -17,6 +17,7 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
         id,
         tab_id: id + 100,
         tab_title: None,
+        pane_name: None,
         label: format!("pane {id}"),
         active: false,
         visible: false,
@@ -89,6 +90,7 @@ async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_ou
         id: 1,
         tab_id: 10,
         tab_title: None,
+        pane_name: None,
         label: "lab".into(),
         active: false,
         visible: false,
@@ -150,6 +152,7 @@ async fn saturated_long_polls_return_busy_without_blocking_input_or_capture() {
         id: 1,
         tab_id: 10,
         tab_title: None,
+        pane_name: None,
         label: "lab".into(),
         active: false,
         visible: false,
@@ -235,6 +238,7 @@ async fn list_keeps_closed_sessions_with_an_explicit_error() {
         id: 17,
         tab_id: 3,
         tab_title: None,
+        pane_name: Some("Deploy".into()),
         label: "failed".into(),
         active: false,
         visible: true,
@@ -247,6 +251,9 @@ async fn list_keeps_closed_sessions_with_an_explicit_error() {
         .unwrap();
     assert_eq!(result["sessions"][0]["id"], 17);
     assert_eq!(result["sessions"][0]["tab_id"], 3);
+    assert_eq!(result["sessions"][0]["pane_name"], "Deploy");
+    assert_eq!(result["sessions"][0]["label"], "failed");
+    assert!(result["sessions"][0].get("tab_title").is_none());
     assert_eq!(result["sessions"][0]["active"], false);
     assert_eq!(result["sessions"][0]["visible"], true);
     assert_eq!(result["sessions"][0]["status"], "unavailable");

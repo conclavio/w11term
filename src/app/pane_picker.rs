@@ -160,6 +160,7 @@ fn preview_summary(frame: &Snapshot) -> String {
 struct Choice {
     read_only: bool,
     pane: u64,
+    pane_name: Option<String>,
     tab_title: Option<String>,
     title: String,
     label: String,
@@ -176,6 +177,7 @@ impl Choice {
         }
         [&self.title, &self.label, &self.destination]
             .into_iter()
+            .chain(self.pane_name.iter())
             .chain(self.profile.iter())
             .chain(self.tab_title.iter())
             .filter_map(|field| {
@@ -198,13 +200,12 @@ impl Choice {
         } else {
             &self.title
         };
-        let mut fields = vec![title.as_str()];
+        let mut fields = vec![self.pane_name.as_deref().unwrap_or(title.as_str())];
         if self.read_only {
             fields.push("Read-only");
         }
-        for text in self
-            .tab_title
-            .iter()
+        for text in std::iter::once(title)
+            .chain(self.tab_title.iter())
             .chain(self.profile.iter())
             .chain(std::iter::once(&self.destination))
         {
@@ -369,9 +370,9 @@ impl Picker {
                     .element_ref(&self.input)
                     .text(&self.query)
                     .placeholder_text(if moving {
-                        "Find a destination by title, profile or user@host"
+                        "Find a destination by pane name, title, profile or user@host"
                     } else {
-                        "Search by title, profile or user@host"
+                        "Search by pane name, title, profile or user@host"
                     })
                     .automation_name(if moving {
                         "Find destination pane"
@@ -521,6 +522,7 @@ impl TerminalApp {
                     {
                         choices.push(Choice {
                             read_only: live.read_only.get(),
+                            pane_name: live.pane_name.as_ref().map(|n| n.as_str().to_owned()),
                             tab_title: self.tabs.title_for(leaf).map(|t| t.as_str().to_owned()),
                             pane: live.session.pane_id,
                             label: label.clone(),
@@ -888,6 +890,7 @@ mod tests {
         Choice {
             read_only: false,
             pane,
+            pane_name: None,
             tab_title: None,
             title: title.into(),
             label: label.into(),
@@ -925,5 +928,31 @@ mod tests {
         assert_eq!(choice.rank("incident response"), Some(0));
         assert_eq!(choice.rank("shell"), Some(0));
         assert!(choice.caption().contains("Incident response"));
+    }
+
+    #[test]
+    fn individual_names_distinguish_identical_shells_and_keep_the_remote_title_searchable() {
+        let mut first = row(7, "ops-shell", "prod", "user@host");
+        let mut second = row(8, "ops-shell", "prod", "user@host");
+        first.pane_name = Some("Déploy".into());
+        second.pane_name = Some("Logs".into());
+        for choice in [&mut first, &mut second] {
+            choice.tab_title = Some("Operations".into());
+        }
+        assert!(first.caption().starts_with("Déploy  ·  ops-shell"));
+        assert!(second.caption().starts_with("Logs  ·  ops-shell"));
+        for choice in [&first, &second] {
+            for query in ["ops-shell", "prod", "user@host", "operations"] {
+                assert_eq!(choice.rank(query), Some(0));
+            }
+        }
+        assert_eq!(Picker::filter(vec![second, first], "DÉPLOY")[0].pane, 7);
+
+        let mut choice = row(9, "Logs", "Logs", "user@host");
+        choice.pane_name = Some("Logs".into());
+        assert_eq!(choice.caption().matches("Logs").count(), 1);
+        choice.pane_name = None;
+        choice.title = "wezterm".into();
+        assert!(choice.caption().starts_with("Logs  ·  user@host"));
     }
 }
