@@ -144,6 +144,46 @@ fn native_reader_reads_a_terminal_selection_and_tracks_focus_between_split_panes
             "right viewport was {actual:?}"
         );
         assert!(!doc.GetText(-1)?.to_string().contains("left-reader"));
+        let seam = doc.FindText(&BSTR::from("seamless界"), false, false)?;
+        assert_eq!(seam.GetText(-1)?.to_string(), "seamless界");
+        let line = seam.Clone()?;
+        line.ExpandToEnclosingUnit(TextUnit_Line)?;
+        assert!(line.GetText(-1)?.to_string().ends_with("seam"));
+        assert_eq!(line.Move(TextUnit_Line, 1)?, 1);
+        let continued = line.GetText(-1)?.to_string();
+        assert_eq!(
+            continued
+                .strip_suffix("\r\n")
+                .unwrap()
+                .trim_end_matches(' '),
+            "less界"
+        );
+        line.ExpandToEnclosingUnit(TextUnit_Paragraph)?;
+        let paragraph = line.GetText(-1)?.to_string();
+        assert!(
+            paragraph
+                .strip_suffix("\r\n")
+                .unwrap()
+                .trim_end_matches(' ')
+                .ends_with("seamless界")
+        );
+        assert_eq!(line.Move(TextUnit_Paragraph, 1)?, 1);
+        assert!(line.GetText(-1)?.to_string().starts_with("hard-break"));
+        let pieces = range_rectangles(&seam)?;
+        assert_eq!(
+            pieces.len(),
+            2,
+            "wrapped text needs a rectangle on both rows"
+        );
+        assert!(pieces[0][2] > 0.0 && pieces[1][2] > 0.0 && pieces[1][1] > pieces[0][1]);
+        for (rect, first_cell) in pieces.iter().zip(["s", "l"]) {
+            let hit = right.RangeFromPoint(POINT {
+                x: rect[0].ceil() as i32 + 1,
+                y: (rect[1] + rect[3] / 2.0).round() as i32,
+            })?;
+            hit.ExpandToEnclosingUnit(TextUnit_Character)?;
+            assert_eq!(hit.GetText(-1)?.to_string(), first_cell);
+        }
         let selected = right.GetSelection()?.GetElement(0)?;
         assert_eq!(selected.GetText(-1)?.to_string(), "right");
         let mut active = BOOL::default();

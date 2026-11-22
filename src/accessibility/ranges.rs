@@ -191,13 +191,7 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
                 continue;
             }
             let start_x = self.doc.col(a);
-            let end_x = if b < end {
-                self.doc.col(b)
-            } else if self.doc.text(b - 1..b) == "\r\n" {
-                self.doc.col(b - 1)
-            } else {
-                self.doc.col(b)
-            };
+            let end_x = self.doc.end_col(row, b);
             let top = f64::from(r.top) + g.padding + visible as f64 * g.cell_height;
             let bottom = (top + g.cell_height).min(f64::from(r.bottom));
             for visual in self.doc.cell_maps[row].visual_ranges(start_x..end_x) {
