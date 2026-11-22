@@ -38,7 +38,7 @@ It draws the remaining negative-z images before glyphs and nonnegative-z images
 after glyphs. Each layer sorts placements by z-index and image ID. An overlap
 at equal z shows the higher numbered kitty image on top. [Kitty placement rules](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout)
 
-The engine's image table now counts replacement of id zero correctly, limits direct
+The engine's image table limits direct
 transmissions to 48 MiB encoded / 32 MiB inflated, limits decoded kitty frames to
 32 MiB, and rejects image-table growth past 64 MiB or 512 ids. Unreferenced images
 are pruned when the table exceeds 32 MiB. Remote SSH peers cannot request local
@@ -52,6 +52,20 @@ Both replies are tested as actual parser response bytes, alongside negotiated
 press/repeat/release encoding and transport-reset behavior.
 
 ## Animation and placement fixtures
+
+An application can transmit several thumbnails without choosing image IDs.
+Each thumbnail has its own placement. For an image with a client ID, each
+`a=p` with omitted `p` or explicit `p=0` adds another copy on the grid.
+Reusing an explicit nonzero image and placement ID moves that placement.
+Transmitting new pixels under the same client image ID removes its previous
+placements. [Kitty placement rules](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout)
+
+The `independent-placements.vt` fixture samples thumbnails at different
+positions and checks that the old position of a moved placement is empty.
+The resource test repeatedly fills and clears a row of anonymous images,
+then places a named image after 560 uploads.
+An upload that only stores data or defines a virtual placement needs an
+image ID or image number. w11term discards such uploads when both are absent.
 
 The session worker interprets kitty `a=a` for client-selected frames, loading
 and running modes, frame gaps and loop counts. It schedules the next visible
@@ -107,8 +121,7 @@ also checks GPU texture counts on successive draws (three, one, then zero
 after the range clear). Rust wire tests cover range deletion, which kitty
 introduced in 0.33 after the pinned 0.32.2 reference.
 
-Range selection addresses client image IDs. This engine still represents
-anonymous uploads with ID zero. On a width reduction, a row containing only
+Range selection addresses client image IDs. On a width reduction, a row containing only
 spaces and image tiles can clip horizontally under the existing text reflow
 rules. Deleting a placement checks its retained tiles after a resize.
 

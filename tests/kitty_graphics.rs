@@ -311,6 +311,37 @@ fn place(t: &mut Terminal, id: u32, placement: u32, row: usize, col: usize, heig
 }
 
 #[test]
+fn targeted_delete_preserves_unnamed_placements_until_named_image_retransmission() {
+    let (mut t, _) = engine();
+    transmit_red(&mut t, 41);
+    for (column, placement) in [(1, ""), (3, ",p=0"), (5, ",p=27")] {
+        t.advance_bytes(format!(
+            "\x1b[1;{column}H\x1b_Ga=p,i=41{placement},c=1,r=1,C=1,q=2\x1b\\"
+        ));
+    }
+    let initial = frame(&t, None, 0);
+    for x in [0, 2, 4] {
+        assert_eq!(pixel(&initial, x, 0, 41), RED);
+    }
+    t.advance_bytes(b"\x1b_Ga=d,d=I,i=41,p=27\x1b\\");
+    let deleted = frame(&t, Some(&initial), 0);
+    assert_eq!(pixel(&deleted, 0, 0, 41), RED);
+    assert_eq!(pixel(&deleted, 2, 0, 41), RED);
+    assert_eq!(pixel(&deleted, 4, 0, 41), None);
+
+    t.advance_bytes(b"\x1b_Ga=t,i=41,f=32,s=1,v=1,q=2;AAD//w==\x1b\\");
+    let replaced = frame(&t, Some(&deleted), 0);
+    for x in [0, 2, 4] {
+        assert_eq!(pixel(&replaced, x, 0, 41), None);
+    }
+    place(&mut t, 41, 27, 2, 6, 1);
+    assert_eq!(
+        pixel(&frame(&t, Some(&replaced), 0), 5, 1, 41),
+        Some([0, 0, 255, 255])
+    );
+}
+
+#[test]
 fn visible_delete_removes_intersecting_placements_and_preserves_historical_references() {
     for (delete, redisplay) in [("a=d", RED), ("a=d,d=a", RED), ("a=d,d=A", None)] {
         let (mut t, _) = engine();

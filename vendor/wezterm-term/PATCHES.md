@@ -15,7 +15,7 @@ Regression coverage is in the parent project's `terminal.rs` unit tests and the 
 
 - `src/terminal.rs` / `terminalstate/performer.rs`: forward only private OSC 440 through an application alert. The host validates the version, verb, names, and queue policy. No general unknown-OSC execution hook is added.
 - `src/terminal.rs` / `terminalstate/mod.rs`: reset parser and negotiated modes on a new SSH transport while retaining the primary screen/scrollback and discarding old kitty transmission state.
-- `src/terminalstate/kitty.rs`: bound direct transmission/inflate/image-table resources, reject local file/shared-memory transports for this SSH-only embedding, and account for replacement of image id zero. See the parent project's graphics audit for the exact scope and remaining limits.
+- `src/terminalstate/kitty.rs` bounds direct transmission, inflation and image-table resources and rejects local file and shared-memory transports. Each anonymous image and each placement without a client placement ID has its own lifetime. Named placements retain their client IDs for moves and targeted deletion. [Graphics audit](../../docs/graphics-audit.md)
 
 The original MIT license is preserved in `LICENSE.md`.
 

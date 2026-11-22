@@ -1922,6 +1922,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn independent_kitty_placements_match_reference_pixels() {
+        assert_kitty_reference_colors(
+            &[include_bytes!(
+                "../tests/fixtures/kitty/independent-placements.vt"
+            )],
+            include_bytes!("../tests/fixtures/kitty/independent-placements-samples.json"),
+        );
+    }
+
     const KITTY_CLEAR_SETUP: &[u8] = include_bytes!("../tests/fixtures/kitty/clear-setup.vt");
     const KITTY_CLEAR_VISIBLE: &[u8] = include_bytes!("../tests/fixtures/kitty/clear-visible.vt");
 

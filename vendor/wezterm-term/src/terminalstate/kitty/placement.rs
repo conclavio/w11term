@@ -6,7 +6,8 @@ use wezterm_surface::TextureCoordinate;
 
 mod diacritics;
 
-pub(super) type Key = (u32, Option<u32>);
+/// Wire image ID (zero for anonymous uploads), private placement occurrence.
+pub(super) type Key = (u32, u32);
 type Point = (i64, i64);
 const MAX_DEPTH: usize = 16;
 const MAX_PROJECTED_TILES: usize = 65536;
@@ -41,7 +42,11 @@ impl TerminalState {
             return Err("EINVAL");
         }
         let parent = match placement.parent_placement.filter(|&n| n != 0) {
-            Some(p) => (image, Some(p)),
+            Some(p) => *self
+                .kitty_img
+                .named_placements
+                .get(&(image, p))
+                .ok_or("ENOPARENT")?,
             None => self
                 .kitty_img
                 .placements
@@ -91,6 +96,9 @@ impl TerminalState {
         }
         Err("ETOODEEP")
     }
+}
+
+impl KittyImageState {
     pub(super) fn collect_kitty_dependents(
         &self,
         deleted: &mut HashSet<Key>,
@@ -98,7 +106,7 @@ impl TerminalState {
     ) {
         for _ in 0..MAX_DEPTH {
             let before = deleted.len();
-            for (&child, node) in &self.kitty_img.projected {
+            for (&child, node) in &self.projected {
                 if node.parent.is_some_and(|parent| deleted.contains(&parent)) {
                     deleted.insert(child);
                     free_ids.insert(child.0);
@@ -109,7 +117,9 @@ impl TerminalState {
             }
         }
     }
+}
 
+impl TerminalState {
     pub(super) fn visible_kitty_relatives(&self, keys: &mut HashSet<Key>) {
         if self
             .kitty_img
@@ -145,7 +155,12 @@ impl TerminalState {
         let mut geometry = BTreeMap::new();
         let mut default_virtual = HashMap::new();
         for (&key, node) in &self.kitty_img.projected {
-            if let Some(img) = self.kitty_img.id_to_data.get(&key.0) {
+            let data = if key.0 == 0 {
+                self.kitty_img.anonymous_data.get(&key)
+            } else {
+                self.kitty_img.id_to_data.get(&key.0)
+            };
+            if let Some(img) = data {
                 if let Some(grid) = Grid::new(key, &node.placement, img, cw, ch) {
                     geometry.insert(key, grid);
                     if node.placement.virtual_placement {
@@ -236,7 +251,10 @@ impl TerminalState {
                     let key = if ph.placement == 0 {
                         default_virtual.get(&id).copied()
                     } else {
-                        Some((id, Some(ph.placement)))
+                        self.kitty_img
+                            .named_placements
+                            .get(&(id, ph.placement))
+                            .copied()
                     };
                     if let Some((key, grid)) = key.and_then(|k| geometry.get(&k).map(|g| (k, g))) {
                         if !self.kitty_img.projected[&key].placement.virtual_placement {
@@ -504,7 +522,7 @@ impl<'a> Grid<'a> {
             r,
             b,
             Some(self.key.0),
-            self.key.1,
+            Some(self.key.1),
         ))
     }
 }

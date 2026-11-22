@@ -36,9 +36,13 @@ pub struct KittyImageState {
     max_image_id: u32,
     number_to_id: HashMap<u32, u32>,
     id_to_data: HashMap<u32, Arc<ImageData>>,
+    // An upload without a wire image ID belongs to its sole placement.
+    anonymous_data: HashMap<Key, Arc<ImageData>>,
+    // Cell attachments carry an occurrence token, independent of a client's p=.
+    named_placements: HashMap<(u32, u32), Key>,
     placements: HashMap<Key, PhysicalPlacement>,
     playback: HashMap<u32, Playback>,
-    projected: HashMap<(u32, Option<u32>), ProjectedPlacement>,
+    projected: HashMap<Key, ProjectedPlacement>,
     history_anchors: std::sync::Mutex<placement::HistoryAnchors>,
     used_memory: usize,
     accumulated_bytes: usize,
@@ -57,7 +61,7 @@ impl KittyImageState {
     }
 
     fn tile_key(&self, tile: &ImageCell) -> Option<Key> {
-        let key = (tile.image_id()?, tile.placement_id());
+        let key = (tile.image_id()?, tile.placement_id()?);
         (self.placements.get(&key)?.data.as_ptr() == Arc::as_ptr(tile.image_data())).then_some(key)
     }
 
@@ -65,13 +69,42 @@ impl KittyImageState {
         self.placements.len() + self.projected.len()
     }
 
-    fn record_id_to_data(
+    fn key_for_placement(&self, image_id: u32, placement_id: Option<u32>) -> Key {
+        if let Some(key) = placement_id.and_then(|p| self.named_placements.get(&(image_id, p))) {
+            return *key;
+        }
+        // A fresh token also distinguishes frozen tiles across reconnects. A
+        // wrapping process-wide counter cannot collide with a live placement.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        loop {
+            let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let key = (image_id, token);
+            if !self.placements.contains_key(&key) && !self.projected.contains_key(&key) {
+                return key;
+            }
+        }
+    }
+
+    fn image_count(&self) -> usize {
+        self.id_to_data.len() + self.anonymous_data.len()
+    }
+
+    fn refresh_memory(&mut self) {
+        self.used_memory = self
+            .id_to_data
+            .values()
+            .chain(self.anonymous_data.values())
+            .map(|data| data.len())
+            .sum();
+    }
+
+    fn check_image_capacity(
         &mut self,
         image_id: u32,
-        data: Arc<ImageData>,
+        data: &ImageData,
         inactive: &Self,
     ) -> anyhow::Result<()> {
-        self.used_memory = self.id_to_data.values().map(|data| data.len()).sum();
+        self.refresh_memory();
         self.prune_unreferenced();
         let old = self.id_to_data.get(&image_id).map_or(0, |data| data.len());
         anyhow::ensure!(
@@ -84,13 +117,81 @@ impl KittyImageState {
         );
         anyhow::ensure!(
             self.id_to_data.contains_key(&image_id)
-                || self.id_to_data.len() + inactive.id_to_data.len() < 512,
+                || self.image_count() + inactive.image_count() < 512,
             "kitty image table exceeds 512 ids"
         );
-        self.remove_data_for_id(image_id);
-        self.used_memory += data.len();
-        self.id_to_data.insert(image_id, data);
         Ok(())
+    }
+
+    fn discard_placements(&mut self, keys: &HashSet<Key>) {
+        self.named_placements.retain(|_, key| !keys.contains(key));
+        for key in keys {
+            self.placements.remove(key);
+            self.projected.remove(key);
+            if let Some(img) = self.anonymous_data.remove(key) {
+                self.used_memory = self.used_memory.saturating_sub(img.len());
+            }
+        }
+    }
+
+    fn physical_keys(&self, screen: &crate::Screen) -> (HashSet<Key>, HashSet<Key>) {
+        let mut retained = HashSet::new();
+        let mut visible = HashSet::new();
+        if let Some(oldest) = self.placements.values().map(|p| p.created).min() {
+            let first_live = screen.phys_row(0);
+            for (row, line) in screen.physical_lines().enumerate() {
+                if !line.changed_since(oldest.saturating_sub(1)) {
+                    continue;
+                }
+                for cell in line.visible_cells() {
+                    for tile in cell.attrs().images().into_iter().flatten() {
+                        if let Some(key) = self.tile_key(&tile) {
+                            retained.insert(key);
+                            if row >= first_live && cell.cell_index() < screen.physical_cols {
+                                visible.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (retained, visible)
+    }
+
+    fn reclaim_missing(&mut self, screen: &crate::Screen, placing: Option<u32>) {
+        let (retained, _) = self.physical_keys(screen);
+        let mut missing: HashSet<_> = self
+            .placements
+            .keys()
+            .filter(|key| !retained.contains(key))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            let mut free_ids = HashSet::new();
+            self.collect_kitty_dependents(&mut missing, &mut free_ids);
+            self.discard_placements(&missing);
+            if let Some(id) = placing {
+                free_ids.remove(&id);
+            }
+            self.release_unplaced_images(free_ids);
+        }
+    }
+
+    fn release_unplaced_images(&mut self, mut ids: HashSet<u32>) -> bool {
+        if ids.is_empty() {
+            return false;
+        }
+        for key in self.keys() {
+            ids.remove(&key.0);
+        }
+        if ids.is_empty() {
+            return false;
+        }
+        self.number_to_id.retain(|_, id| !ids.contains(id));
+        for id in ids {
+            self.remove_data_for_id(id);
+        }
+        true
     }
 
     fn prune_unreferenced(&mut self) {
@@ -127,6 +228,16 @@ impl KittyImageState {
 }
 
 impl TerminalState {
+    fn reclaim_missing_kitty_placements(&mut self, placing: u32) {
+        self.kitty_img.reclaim_missing(&self.screen, Some(placing));
+        let inactive = if self.screen.alt_screen_is_active {
+            &self.screen.screen
+        } else {
+            &self.screen.alt_screen
+        };
+        self.inactive_kitty_img.reclaim_missing(inactive, None);
+    }
+
     fn kitty_img_place(
         &mut self,
         image_id: Option<u32>,
@@ -134,7 +245,8 @@ impl TerminalState {
         placement: KittyImagePlacement,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
-        let image_id = match image_id {
+        let image_number = image_number.filter(|&n| n != 0);
+        let image_id = match image_id.filter(|&id| id != 0) {
             Some(id) => id,
             None => *self
                 .kitty_img
@@ -166,7 +278,33 @@ impl TerminalState {
             )
         })?);
 
-        let key = (image_id, placement.placement_id);
+        self.kitty_place_data(image_id, image_number, img, placement, verbosity)
+    }
+
+    fn kitty_place_data(
+        &mut self,
+        image_id: u32,
+        image_number: Option<u32>,
+        img: Arc<ImageData>,
+        mut placement: KittyImagePlacement,
+        verbosity: KittyImageVerbosity,
+    ) -> anyhow::Result<()> {
+        placement.placement_id = placement.placement_id.filter(|&p| image_id != 0 && p != 0);
+        let wire_placement = placement.placement_id;
+        // Only addressable requests have a reply, even for placement errors.
+        let verbosity = if image_id == 0 {
+            KittyImageVerbosity::Quiet
+        } else {
+            verbosity
+        };
+        let replacing = wire_placement
+            .is_some_and(|p| self.kitty_img.named_placements.contains_key(&(image_id, p)));
+        if !replacing
+            && self.kitty_img.placement_count() + self.inactive_kitty_img.placement_count() >= 1024
+        {
+            self.reclaim_missing_kitty_placements(image_id);
+        }
+        let key = self.kitty_img.key_for_placement(image_id, wire_placement);
         let parent = match self.validate_kitty_parent(key, &placement) {
             Ok(parent) => parent,
             Err(reason) => {
@@ -180,8 +318,7 @@ impl TerminalState {
                 return Ok(());
             }
         };
-        if !self.kitty_img.placements.contains_key(&key)
-            && !self.kitty_img.projected.contains_key(&key)
+        if !replacing
             && self.kitty_img.placement_count() + self.inactive_kitty_img.placement_count() >= 1024
         {
             self.kitty_send_response(
@@ -194,65 +331,56 @@ impl TerminalState {
             return Ok(());
         }
         // Repositioning an existing parent preserves its dependent placements.
-        if let Some(physical) = self.kitty_img.placements.get(&key) {
-            if physical.row_revision == self.screen().placement_row_revision {
-                self.kitty_remove_placement_from_model(
-                    image_id,
-                    placement.placement_id,
-                    physical.bounds,
-                );
-            } else {
-                self.detach_kitty_cells(&HashSet::from([key]));
-            }
-            self.kitty_img.placements.remove(&key);
+        if replacing {
+            let old = HashSet::from([key]);
+            self.detach_kitty_cells(&old);
+            self.kitty_img.discard_placements(&old);
         }
-        self.kitty_img.projected.remove(&key);
         if placement.virtual_placement || parent.is_some() {
             self.kitty_img
                 .projected
                 .insert(key, ProjectedPlacement { placement, parent });
-            return Ok(());
+        } else {
+            let (image_width, image_height) = img.data().dimensions()?;
+
+            let data = Arc::downgrade(&img);
+            let row_revision = self.screen().placement_row_revision;
+            let bounds = self.assign_image_to_cells(ImageAttachParams {
+                image_width,
+                image_height,
+                source_width: placement.w,
+                source_height: placement.h,
+                source_origin_x: placement.x.unwrap_or(0),
+                source_origin_y: placement.y.unwrap_or(0),
+                cell_padding_left: placement.x_offset.unwrap_or(0) as u16,
+                cell_padding_top: placement.y_offset.unwrap_or(0) as u16,
+                data: Arc::clone(&img),
+                style: ImageAttachStyle::Kitty,
+                z_index: placement.z_index.unwrap_or(0),
+                columns: placement.columns.map(|x| x as usize),
+                rows: placement.rows.map(|x| x as usize),
+                image_id: Some(image_id),
+                placement_id: Some(key.1),
+                do_not_move_cursor: placement.do_not_move_cursor,
+            })?;
+
+            self.kitty_img.placements.insert(
+                key,
+                PhysicalPlacement {
+                    bounds,
+                    row_revision,
+                    created: self.seqno,
+                    data,
+                },
+            );
         }
-
-        let (image_width, image_height) = img.data().dimensions()?;
-
-        let data = Arc::downgrade(&img);
-        let row_revision = self.screen().placement_row_revision;
-        let bounds = self.assign_image_to_cells(ImageAttachParams {
-            image_width,
-            image_height,
-            source_width: placement.w,
-            source_height: placement.h,
-            source_origin_x: placement.x.unwrap_or(0),
-            source_origin_y: placement.y.unwrap_or(0),
-            cell_padding_left: placement.x_offset.unwrap_or(0) as u16,
-            cell_padding_top: placement.y_offset.unwrap_or(0) as u16,
-            data: img,
-            style: ImageAttachStyle::Kitty,
-            z_index: placement.z_index.unwrap_or(0),
-            columns: placement.columns.map(|x| x as usize),
-            rows: placement.rows.map(|x| x as usize),
-            image_id: Some(image_id),
-            placement_id: placement.placement_id,
-            do_not_move_cursor: placement.do_not_move_cursor,
-        })?;
-
-        self.kitty_img.placements.insert(
-            key,
-            PhysicalPlacement {
-                bounds,
-                row_revision,
-                created: self.seqno,
-                data,
-            },
-        );
-        log::trace!(
-            "record placement for {} (image_number {:?}) {:?}",
-            image_id,
-            image_number,
-            placement.placement_id
-        );
-
+        if let Some(p) = wire_placement {
+            self.kitty_img.named_placements.insert((image_id, p), key);
+        }
+        if image_id == 0 {
+            self.kitty_img.used_memory += img.len();
+            self.kitty_img.anonymous_data.insert(key, img);
+        }
         Ok(())
     }
 
@@ -264,19 +392,14 @@ impl TerminalState {
             KittyImage::TransmitData {
                 transmit,
                 verbosity,
-            } => {
-                self.kitty_img_transmit(transmit, verbosity)?;
-                Ok(())
-            }
+            } => self.kitty_img_transmit(transmit, None, verbosity),
             KittyImage::TransmitDataAndDisplay {
                 transmit,
                 placement,
                 verbosity,
             } => {
                 log::trace!("TransmitDataAndDisplay {:#?} {:#?}", transmit, placement);
-                let image_number = transmit.image_number;
-                let image_id = self.kitty_img_transmit(transmit, verbosity)?;
-                self.kitty_img_place(Some(image_id), image_number, placement, verbosity)
+                self.kitty_img_transmit(transmit, Some(placement), verbosity)
             }
             KittyImage::TransmitFrame {
                 transmit,
@@ -383,8 +506,10 @@ impl TerminalState {
                 loops,
                 verbosity,
             } => {
-                let id =
-                    image_id.or_else(|| self.kitty_img.number_to_id.get(&image_number?).copied());
+                let image_number = image_number.filter(|&n| n != 0);
+                let id = image_id
+                    .filter(|&id| id != 0)
+                    .or_else(|| self.kitty_img.number_to_id.get(&image_number?).copied());
                 let control = playback::Control {
                     state,
                     edit_frame,
@@ -433,11 +558,9 @@ impl TerminalState {
     ) {
         let seqno = self.seqno;
         let screen = self.screen_mut();
-        let Some(start) = screen.stable_row_to_phys(info.first_row) else {
-            return;
-        };
-        let end = start
-            .saturating_add(info.rows)
+        let first = info.first_row - screen.phys_to_stable_row_index(0);
+        let start = first.max(0) as usize;
+        let end = (first.saturating_add(info.rows as isize).max(0) as usize)
             .min(screen.scrollback_rows());
         for idx in start..end {
             let line = screen.line_mut(idx);
@@ -452,33 +575,12 @@ impl TerminalState {
     fn kitty_delete(&mut self, what: KittyImageDelete) {
         let (mut keys, mut free_ids): (HashSet<Key>, HashSet<u32>) = match what {
             KittyImageDelete::All { delete } => {
-                let mut visible = HashSet::new();
-                let mut retained = HashSet::new();
-                if let Some(oldest) = self.kitty_img.placements.values().map(|p| p.created).min() {
-                    let screen = self.screen();
-                    let first_live = screen.phys_row(0);
-                    for (row, line) in screen.physical_lines().enumerate() {
-                        if !line.changed_since(oldest.saturating_sub(1)) {
-                            continue;
-                        }
-                        for cell in line.visible_cells() {
-                            for tile in cell.attrs().images().into_iter().flatten() {
-                                if let Some(key) = self.kitty_img.tile_key(&tile) {
-                                    retained.insert(key);
-                                    if row >= first_live && cell.cell_index() < screen.physical_cols
-                                    {
-                                        visible.insert(key);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let (retained, mut visible) = self.kitty_img.physical_keys(self.screen());
                 self.visible_kitty_relatives(&mut visible);
                 let release = visible
                     .iter()
                     .map(|key| key.0)
-                    .filter(|&id| delete || id == 0)
+                    .filter(|&id| delete && id != 0)
                     .collect();
                 // Cell erasure and history eviction can remove a physical placement
                 // independently. A stale entry must not pin its source data when
@@ -514,17 +616,24 @@ impl TerminalState {
                 placement_id,
                 delete,
             } => {
-                let keys = self
-                    .kitty_img
-                    .keys()
-                    .filter(|key| {
-                        key.0 == image_id && (placement_id.is_none() || key.1 == placement_id)
-                    })
-                    .collect();
-                let release = (delete || image_id == 0)
-                    .then_some(image_id)
-                    .into_iter()
-                    .collect();
+                if image_id == 0 {
+                    return;
+                }
+                let keys = match placement_id.filter(|&p| p != 0) {
+                    Some(p) => self
+                        .kitty_img
+                        .named_placements
+                        .get(&(image_id, p))
+                        .copied()
+                        .into_iter()
+                        .collect(),
+                    None => self
+                        .kitty_img
+                        .keys()
+                        .filter(|key| key.0 == image_id)
+                        .collect(),
+                };
+                let release = delete.then_some(image_id).into_iter().collect();
                 (keys, release)
             }
             _ => {
@@ -532,29 +641,30 @@ impl TerminalState {
                 return;
             }
         };
-        self.collect_kitty_dependents(&mut keys, &mut free_ids);
+        self.kitty_img
+            .collect_kitty_dependents(&mut keys, &mut free_ids);
         self.detach_kitty_cells(&keys);
-        self.kitty_img
-            .placements
-            .retain(|key, _| !keys.contains(key));
-        self.kitty_img
-            .projected
-            .retain(|key, _| !keys.contains(key));
-        for key in self.kitty_img.keys() {
-            free_ids.remove(&key.0);
-        }
-        if !free_ids.is_empty() {
-            self.kitty_img
-                .number_to_id
-                .retain(|_, id| !free_ids.contains(id));
-            for id in free_ids {
-                self.kitty_img.remove_data_for_id(id);
-            }
+        self.kitty_img.discard_placements(&keys);
+        if self.kitty_img.release_unplaced_images(free_ids) {
             self.image_cache.clear();
         }
     }
 
     fn detach_kitty_cells(&mut self, keys: &HashSet<Key>) {
+        // The cockpit replaces a single stationary image every frame. Touch
+        // only its insertion rows while the screen's geometry is unchanged.
+        if keys.len() == 1 {
+            let key = keys.iter().next().unwrap();
+            if let Some(placement) = self.kitty_img.placements.get(key) {
+                if placement.row_revision == self.screen().placement_row_revision {
+                    return self.kitty_remove_placement_from_model(
+                        key.0,
+                        Some(key.1),
+                        placement.bounds,
+                    );
+                }
+            }
+        }
         let state = &self.kitty_img;
         let Some(oldest) = keys
             .iter()
@@ -584,7 +694,9 @@ impl TerminalState {
             if !hits.is_empty() {
                 let cells = line.cells_mut_for_attr_changes_only();
                 for (x, (id, p)) in hits.drain(..) {
-                    cells[x].attrs_mut().detach_image_with_placement(id, p);
+                    cells[x]
+                        .attrs_mut()
+                        .detach_image_with_placement(id, Some(p));
                 }
                 line.update_last_change_seqno(seqno);
             }
@@ -643,7 +755,7 @@ impl TerminalState {
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
         self.image_cache.clear();
-        let image_id = match frame.image_number {
+        let image_id = match frame.image_number.filter(|&n| n != 0) {
             Some(no) => match self.kitty_img.number_to_id.get(&no) {
                 Some(id) => *id,
                 None => {
@@ -794,7 +906,7 @@ impl TerminalState {
         frame: KittyImageFrame,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
-        if let Some(no) = transmit.image_number.take() {
+        if let Some(no) = transmit.image_number.take().filter(|&n| n != 0) {
             match self.kitty_img.number_to_id.get(&no) {
                 Some(id) => {
                     transmit.image_id.replace(*id);
@@ -826,12 +938,7 @@ impl TerminalState {
             (background_pixel & 0xff) as u8,
         ]);
 
-        self.kitty_img.used_memory = self
-            .kitty_img
-            .id_to_data
-            .values()
-            .map(|data| data.len())
-            .sum();
+        self.kitty_img.refresh_memory();
         let anim = match self.kitty_img.id_to_data.get(&image_id) {
             Some(anim) => anim,
             None => {
@@ -1057,15 +1164,15 @@ impl TerminalState {
         transmit: KittyImageTransmit,
     ) -> anyhow::Result<(u32, Option<u32>, ImageDataType)> {
         log::trace!("transmit {:?}", transmit);
-        let (id, no) = match (transmit.image_id, transmit.image_number) {
+        let (id, no) = match (
+            transmit.image_id.filter(|&id| id != 0),
+            transmit.image_number.filter(|&n| n != 0),
+        ) {
             (Some(_), Some(_)) => {
                 // TODO: send an EINVAL error back here
                 anyhow::bail!("cannot use both i= and I= in the same request");
             }
-            (None, None) => {
-                // Assume image id 0
-                (0, None)
-            }
+            (None, None) => (0, None),
             (Some(id), None) => (id, None),
             (None, Some(no)) => {
                 let id = self
@@ -1157,16 +1264,42 @@ impl TerminalState {
     fn kitty_img_transmit(
         &mut self,
         transmit: KittyImageTransmit,
+        display: Option<KittyImagePlacement>,
         verbosity: KittyImageVerbosity,
-    ) -> anyhow::Result<u32> {
+    ) -> anyhow::Result<()> {
         let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
-        self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
+        if image_id == 0 && display.as_ref().is_none_or(|p| p.virtual_placement) {
+            // Neither a later put nor a Unicode placeholder has an image ID
+            // with which to retrieve these bytes.
+            return Ok(());
+        }
 
         // An image id owns its mutable animation frames. Equal initial pixels under
         // two ids may subsequently receive different frames and playback commands.
         let img = Arc::new(ImageData::with_data(img));
-        self.kitty_img
-            .record_id_to_data(image_id, img, &self.inactive_kitty_img)?;
+        let replacing = self.kitty_img.id_to_data.contains_key(&image_id);
+        if self
+            .kitty_img
+            .check_image_capacity(image_id, &img, &self.inactive_kitty_img)
+            .is_err()
+        {
+            self.reclaim_missing_kitty_placements(image_id);
+            self.kitty_img
+                .check_image_capacity(image_id, &img, &self.inactive_kitty_img)?;
+        }
+        if image_id != 0 {
+            if replacing {
+                self.kitty_delete(KittyImageDelete::ByImageId {
+                    image_id,
+                    placement_id: None,
+                    delete: false,
+                });
+                self.kitty_img.remove_data_for_id(image_id);
+            }
+            self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
+            self.kitty_img.used_memory += img.len();
+            self.kitty_img.id_to_data.insert(image_id, Arc::clone(&img));
+        }
         if let Some(number) = image_number {
             self.kitty_img.number_to_id.insert(number, image_id);
         }
@@ -1181,7 +1314,10 @@ impl TerminalState {
             );
         }
 
-        Ok(image_id)
+        if let Some(placement) = display {
+            self.kitty_place_data(image_id, image_number, img, placement, verbosity)?;
+        }
+        Ok(())
     }
 
     fn coalesce_kitty_accumulation(&mut self, img: KittyImage) -> anyhow::Result<KittyImage> {
