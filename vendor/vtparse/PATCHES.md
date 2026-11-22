@@ -5,3 +5,6 @@ Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27
 Workspace dependency versions are expanded. APC strings are limited to 48 MiB;
 overflow discards the complete string until its terminator, then parsing resumes.
 The upstream MIT license is preserved in LICENSE.md.
+
+After the two selectors in an OSC 9;9 directory report, the parser preserves
+the complete filename as one field, including literal semicolons.

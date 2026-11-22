@@ -326,7 +326,13 @@ struct OscState {
 
 impl OscState {
     fn put(&mut self, param: char) {
-        if param == ';' {
+        // OSC 9;9 has one literal Windows path after its two selectors.
+        // Keep filename semicolons in that field, including beyond MAX_OSC.
+        if param == ';'
+            && !(self.num_params == 3
+                && self.param_indices[..2] == [1, 2]
+                && self.buffer.starts_with(b"99"))
+        {
             match self.num_params {
                 MAX_OSC => {
                     self.full = true;
@@ -662,7 +668,8 @@ impl VTParser {
                     }
                 }
             }
-            Action::ApcEnd => {
+            Action::ApcEnd =>
+            {
                 #[cfg(any(feature = "std", feature = "alloc"))]
                 if !self.apc_overflow {
                     actor.apc_dispatch(core::mem::take(&mut self.apc_data));
