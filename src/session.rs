@@ -137,6 +137,7 @@ pub struct Session {
     pub frames: FrameStore,
     pub clipboard_enabled: Arc<AtomicBool>,
     ssh_connection: ssh::ShareSlot,
+    direct_ssh_shell: bool,
     durable: Option<ssh::DurableControl>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -171,6 +172,16 @@ impl Session {
     pub fn ssh_connection(&self) -> Option<ssh::ConnectionShare> {
         self.ssh_connection.current()
     }
+    /// Require the same authenticated transport generation as a pane snapshot.
+    pub fn ssh_connection_at(&self, generation: u64) -> Option<ssh::ConnectionShare> {
+        self.ssh_connection
+            .generation()
+            .and_then(|(current, link)| (current == generation).then_some(link))
+    }
+    /// The program launched in this remote PTY, independent of edits to its saved recipe.
+    pub fn is_direct_ssh_shell(&self) -> bool {
+        self.direct_ssh_shell && !self.player.read().unwrap().rustmush
+    }
 
     pub fn profile_folders(
         &self,
@@ -194,11 +205,21 @@ impl Session {
         allow_clipboard: bool,
         startup: crate::workspace::SshStartup,
     ) -> Self {
+        Self::start_ssh_with_startup(options, size, allow_clipboard, startup, None)
+    }
+
+    pub fn start_ssh_with_startup(
+        options: crate::options::SshOptions,
+        size: TerminalSize,
+        allow_clipboard: bool,
+        startup: crate::workspace::SshStartup,
+        connection: Option<ssh::ConnectionShare>,
+    ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
             size,
             allow_clipboard,
-            None,
+            connection,
             None,
             Some(startup),
         )
@@ -309,6 +330,7 @@ impl Session {
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
         let ssh_connection = ssh::ShareSlot::default();
+        let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         let (durable, lifecycle) = saved
             .filter(|_| matches!(source, Source::Ssh(_)))
             .map(ssh::DurableControl::new)
@@ -357,6 +379,7 @@ impl Session {
             frames,
             clipboard_enabled,
             ssh_connection,
+            direct_ssh_shell,
             durable,
             worker: Some(worker),
         }
@@ -901,6 +924,16 @@ fn can_restart(live_shell: bool, startup: Option<&crate::workspace::SshStartup>)
     live_shell && startup.is_none_or(|recipe| recipe.command.is_empty())
 }
 
+fn direct_ssh_shell(
+    source: &Source,
+    managed: bool,
+    startup: Option<&crate::workspace::SshStartup>,
+) -> bool {
+    !managed
+        && matches!(source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush)
+        && startup.is_none_or(|launch| launch.command.is_empty())
+}
+
 fn record_output(
     recorder: &mut Option<crate::recorder::Recorder>,
     bytes: &[u8],
@@ -963,6 +996,29 @@ pub fn benchmark() {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[test]
+    fn directory_splits_require_an_interactive_direct_ssh_launch() {
+        let mut ssh: crate::options::SshOptions = serde_json::from_value(
+            serde_json::json!({"user":"user","host":"localhost","auth":"none"}),
+        )
+        .unwrap();
+        let directory =
+            crate::workspace::SshStartup::new(&ssh, "/work".into(), String::new()).unwrap();
+        let command =
+            crate::workspace::SshStartup::new(&ssh, "/work".into(), "tail -f log".into()).unwrap();
+        let ordinary = Source::Ssh(ssh.clone());
+        assert!(direct_ssh_shell(&ordinary, false, None));
+        assert!(direct_ssh_shell(&ordinary, false, Some(&directory)));
+        assert!(!direct_ssh_shell(&ordinary, false, Some(&command)));
+        assert!(!direct_ssh_shell(&ordinary, true, None));
+        assert!(!direct_ssh_shell(&Source::Demo, false, None));
+        ssh.durable = true;
+        assert!(!direct_ssh_shell(&Source::Ssh(ssh.clone()), false, None));
+        ssh.durable = false;
+        ssh.player.rustmush = true;
+        assert!(!direct_ssh_shell(&Source::Ssh(ssh), false, None));
+    }
+
     #[test]
     fn command_watch_accepts_live_shells_and_excludes_reconstructed_streams() {
         let mut ssh: crate::options::SshOptions = serde_json::from_value(

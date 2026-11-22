@@ -51,6 +51,7 @@ use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
 mod command_palette;
+mod directory_split;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
@@ -81,6 +82,7 @@ struct LiveTab {
     discovery_page: Option<usize>,
     copy_output_unavailable: Option<&'static str>,
     can_clear_scrollback: bool,
+    split_directory_report: Option<Arc<str>>,
     confirm_end: bool,
     durable_phase: Option<w11term::ssh::DurablePhase>,
     source: Source,
@@ -543,6 +545,12 @@ fn tab_menu_message(label: String) -> Message {
         "Cancel command notification" => Message::Attention(attention::Action::WatchCommand(false)),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
+        "Split right in current directory" => {
+            Message::Shortcut(Shortcut::SplitRightInCurrentDirectory)
+        }
+        "Split below in current directory" => {
+            Message::Shortcut(Shortcut::SplitBelowInCurrentDirectory)
+        }
         "Focus left" => Message::PaneNeighbor(Direction::Left),
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
@@ -612,6 +620,7 @@ enum UiWork {
 }
 
 struct CaretMenuBinding {
+    directory_split: Option<directory_split::Origin>,
     pane: Option<u64>,
     paste: Option<clipboard_paste::Origin>,
     group: Option<TabId>,
@@ -751,6 +760,7 @@ pub enum Message {
     Files(FileAction),
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
+    SplitInDirectory(Axis, directory_split::Origin),
     PaneNeighbor(Direction),
     SwapPanes(PaneSwap),
     ZoomPane,
@@ -880,6 +890,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             discovery_page: None,
             copy_output_unavailable: Some("waiting for shell markers"),
             can_clear_scrollback: false,
+            split_directory_report: None,
             source,
             confirm_end: false,
             durable_phase: None,
@@ -2193,6 +2204,16 @@ impl TerminalApp {
             None,
         )
         .with_profile(profile_name);
+        self.insert_split(id, leaf, axis, context);
+    }
+
+    fn insert_split(
+        &mut self,
+        id: TabId,
+        leaf: AppTab,
+        axis: Axis,
+        context: &ComponentContext<Self>,
+    ) {
         if self.tabs.split(id, leaf, axis).is_some() {
             self.initial_grid.set(None);
             self.sync_selection(context);
@@ -2584,6 +2605,7 @@ impl TerminalApp {
         context: &ViewContext<Self>,
         exited: Option<ExitedPane>,
         swaps: PaneSwaps,
+        directory_split: Option<directory_split::Origin>,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let paste = self.paste_origin();
@@ -2594,12 +2616,14 @@ impl TerminalApp {
             && binding.paste == paste
             && binding.group == group
             && binding.swaps == swaps
+            && binding.directory_split == directory_split
             && binding.exited == exited
         {
             return binding.on_click.clone();
         }
         // Reactor replaces a flyout when its callback changes. Keep the same
         // callback while repainting the title bar for the same action target.
+        let split_target = directory_split.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
             folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
                 Message::FolderShare(folder_shares::Action::Open(id))
@@ -2612,6 +2636,9 @@ impl TerminalApp {
             }
             _ => match tab_menu_message(label) {
                 Message::Shortcut(Shortcut::SwapPane(direction)) => swaps.message(direction),
+                Message::Shortcut(shortcut) if let Some(axis) = directory_split::axis(shortcut) => {
+                    directory_split::message(axis, split_target.as_ref())
+                }
                 Message::Shortcut(Shortcut::ClearScrollback) => {
                     pane.map_or(Message::ControlIdle, Message::ClearScrollback)
                 }
@@ -2619,6 +2646,7 @@ impl TerminalApp {
             },
         });
         *cached = Some(CaretMenuBinding {
+            directory_split,
             pane,
             paste,
             group,
@@ -2698,6 +2726,7 @@ impl TerminalApp {
             ));
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let swaps = self.pane_swaps();
+        let directory_split = self.directory_split_origin();
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2705,8 +2734,8 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                self.caret_items(exited.is_some(), &swaps),
-                self.caret_menu_callback(context, exited, swaps),
+                self.caret_items(exited.is_some(), &swaps, directory_split.is_some()),
+                self.caret_menu_callback(context, exited, swaps, directory_split),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2758,7 +2787,12 @@ impl TerminalApp {
         menu
     }
 
-    fn caret_items(&self, can_restart: bool, swaps: &PaneSwaps) -> Vec<MenuItem> {
+    fn caret_items(
+        &self,
+        can_restart: bool,
+        swaps: &PaneSwaps,
+        can_split_directory: bool,
+    ) -> Vec<MenuItem> {
         let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
@@ -2786,7 +2820,7 @@ impl TerminalApp {
                 "Command palette…",
                 KeyAction::CommandPalette,
             ),
-            self.pane_menu(can_restart, swaps),
+            self.pane_menu(can_restart, swaps, can_split_directory),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.duplicate_tab_item(),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
@@ -2905,7 +2939,12 @@ impl TerminalApp {
         }
     }
 
-    fn pane_menu(&self, can_restart: bool, swaps: &PaneSwaps) -> MenuItem {
+    fn pane_menu(
+        &self,
+        can_restart: bool,
+        swaps: &PaneSwaps,
+        can_split_directory: bool,
+    ) -> MenuItem {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
             return MenuItem::disabled("panes", "Panes");
         }
@@ -2924,6 +2963,18 @@ impl TerminalApp {
         let mut items = vec![
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            self.binding_menu_enabled(
+                "split-right-here",
+                "Split right in current directory",
+                KeyAction::SplitRightInCurrentDirectory,
+                can_split_directory,
+            ),
+            self.binding_menu_enabled(
+                "split-below-here",
+                "Split below in current directory",
+                KeyAction::SplitBelowInCurrentDirectory,
+                can_split_directory,
+            ),
             command_menu_item("restart-exited", RESTART_EXITED_PANE, can_restart),
             move_item,
             if self.outgoing.is_none() && self.incoming.is_none() {
@@ -3408,6 +3459,13 @@ impl Component for TerminalApp {
                     .borrow()
                     .as_ref()
                     .map_or(Message::ControlIdle, |menu| menu.swaps.message(direction)),
+                shortcut if let Some(axis) = directory_split::axis(shortcut) => {
+                    let menu = shortcut_menu.borrow();
+                    directory_split::message(
+                        axis,
+                        menu.as_ref().and_then(|m| m.directory_split.as_ref()),
+                    )
+                }
                 _ => bind_tab_action(Message::Shortcut(shortcut), shortcut_group.get()),
             });
         })
@@ -4391,7 +4449,7 @@ impl Component for TerminalApp {
                 if self.tabs.visible(id) && self.watch_epoch == epoch {
                     self.frame_tasks.remove(&id);
                     let active = self.tabs.active_id() == Some(id);
-                    let mut clear_availability_changed = false;
+                    let mut pane_actions_changed = false;
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -4426,11 +4484,19 @@ impl Component for TerminalApp {
                         let can_clear = !frame.alternate
                             && (frame.scroll_offset > 0
                                 || frame.first_stable_row > frame.oldest_stable_row);
-                        if tab.can_clear_scrollback != can_clear {
+                        let report = frame.reported_directory.as_ref().filter(|_| {
+                            tab.session
+                                .ssh_connection_at(frame.connection_generation)
+                                .is_some()
+                        });
+                        if tab.can_clear_scrollback != can_clear
+                            || tab.split_directory_report.as_ref() != report
+                        {
                             tab.can_clear_scrollback = can_clear;
+                            tab.split_directory_report = report.cloned();
                             if active {
                                 self.header.borrow_mut().take();
-                                clear_availability_changed = true;
+                                pane_actions_changed = true;
                             }
                         }
                         if tab.copy_output_unavailable != unavailable {
@@ -4448,7 +4514,7 @@ impl Component for TerminalApp {
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
-                    if clear_availability_changed {
+                    if pane_actions_changed {
                         self.refresh_open_commands();
                     }
                     if let Some(AppTab {
@@ -4574,6 +4640,9 @@ impl Component for TerminalApp {
                 }
             }
             Message::SplitPane(axis, profile) => self.split_pane(axis, profile, context),
+            Message::SplitInDirectory(axis, origin) => {
+                self.split_in_directory(axis, origin, context)
+            }
             Message::SyncSelection(epoch) => {
                 if self.selection_epoch == epoch {
                     self.selection_pending = false;
@@ -4643,7 +4712,9 @@ impl Component for TerminalApp {
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
                 Shortcut::ResizePane(direction) => self.keyboard_resize(direction),
                 // The native shortcut and palette bind both panes before dispatch.
-                Shortcut::SwapPane(_) => {}
+                Shortcut::SwapPane(_)
+                | Shortcut::SplitRightInCurrentDirectory
+                | Shortcut::SplitBelowInCurrentDirectory => {}
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)

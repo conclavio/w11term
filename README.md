@@ -61,6 +61,10 @@ Builds, deployments, and other programs that emit **OSC 9;4** can report progres
 
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
 
+If you have an editor open in a remote checkout, choose **Panes → Split right in current directory** or **Split below in current directory** to start a second shell there. These actions use the working directory reported by the active SSH shell through OSC 7. They require an ordinary SSH connection to a host with a POSIX shell that accepts SSH exec requests. You can also find both actions in the command palette or assign them keys under **Settings → Keyboard**.
+
+Saving the workspace remembers the new pane’s starting directory. Its next launch opens a shell there. The original pane keeps its running program.
+
 Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.
 
 Choose **caret → Duplicate tab layout** to open a fresh copy beside the current tab. It keeps the tab name, pane arrangement, divider positions, focused pane, zoom and read-only input locks. Each SSH pane makes an independent login, and each local shell starts a new process. The original tab keeps its jobs and scrollback. A configured local or SSH starting directory carries over. You can assign **Duplicate tab layout** a shortcut in Settings.

@@ -1169,6 +1169,53 @@ async fn native_pane_picker_routes_keys_across_tabs_and_restores_focus_on_escape
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens right and below splits from verified OSC 7 paths on real SSH channels"]
+async fn native_splits_open_the_reported_directory_on_the_original_ssh_transport() {
+    for direction in ["right", "below"] {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (Source::Ssh(ssh), remote, opens, server) =
+            fixture_counting_accepts(false, 2, accepted.clone()).await
+        else {
+            unreachable!()
+        };
+        let state = tempfile::tempdir().unwrap();
+        fs::write(state.path().join("direction"), direction).unwrap();
+        let inputs = remote.path().join("split-inputs");
+        fs::create_dir(&inputs).unwrap();
+        let exec = remote.path().join("workspace-exec.bin");
+        fs::write(&exec, []).unwrap();
+        drive_mixed_gui("split-ssh-directory-ui.ps1", &ssh, state.path());
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            1,
+            "must retain original SSH connection"
+        );
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            2,
+            "exactly one new session channel"
+        );
+        assert_eq!(
+            fs::read_to_string(exec).unwrap(),
+            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s Work'"#,
+        );
+        let mut streams: Vec<_> = fs::read_dir(inputs)
+            .unwrap()
+            .map(|f| fs::read_to_string(f.unwrap().path()).unwrap())
+            .collect();
+        streams.sort();
+        assert_eq!(
+            streams,
+            [
+                "child-live",
+                "report-currentreport-foreignreport-current-againparent-live"
+            ]
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens an isolated native WinUI window"]
 async fn native_ssh_split() {
     let (source, _root, opens, server) = fixture_server(false).await;

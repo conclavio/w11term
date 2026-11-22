@@ -11,6 +11,7 @@ pub enum CommandId {
     Clipboard(Option<clipboard_paste::Origin>, bool),
     DuplicateTabLayout(Option<TabId>),
     SwapPanes(PaneSwap),
+    SplitInDirectory(Axis, Option<directory_split::Origin>),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -127,7 +128,12 @@ impl TerminalApp {
         let mut rows = vec![];
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let swaps = self.pane_swaps();
-        menu_rows(self.caret_items(exited.is_some(), &swaps), false, &mut rows);
+        let directory_split = self.directory_split_origin();
+        menu_rows(
+            self.caret_items(exited.is_some(), &swaps, directory_split.is_some()),
+            false,
+            &mut rows,
+        );
         let origin = self.paste_origin();
         for row in &mut rows {
             if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
@@ -194,6 +200,9 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                shortcut if let Some(axis) = directory_split::axis(shortcut) => {
+                    row.id = CommandId::SplitInDirectory(axis, directory_split.clone());
+                }
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
                 }
@@ -266,6 +275,9 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::SplitInDirectory(axis, target) => {
+                directory_split::message(axis, target.as_ref())
+            }
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
             }

@@ -163,6 +163,24 @@ impl server::Handler for Peer {
     ) -> anyhow::Result<()> {
         if self.channels.contains_key(&c) {
             #[cfg(feature = "ui-smoke")]
+            if self.root.join("split-inputs").is_dir() {
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.root.join("split-inputs").join(c.to_string()))?
+                    .write_all(data)?;
+                let report: Option<&[u8]> = match data {
+                    b"report-foreign" => Some(b"\x1b]7;file://unrelated.invalid/srv/foreign\x1b\\\r\nforeign-reported\r\n"),
+                    b"report-current" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-reported\r\n"),
+                    b"report-current-again" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-confirmed\r\n"),
+                    _ => None,
+                };
+                if let Some(report) = report {
+                    s.data(c, report)?;
+                    return Ok(());
+                }
+            }
+            #[cfg(feature = "ui-smoke")]
             if self.root.join("keyboard-input.bin").exists() {
                 fs::OpenOptions::new()
                     .append(true)

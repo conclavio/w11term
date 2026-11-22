@@ -63,7 +63,7 @@ impl ConnectionShare {
             runtime: runtime::Handle::current(),
         }))
     }
-    pub(super) fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
+    pub fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
         let connected = &self.0.options;
         !self.0.handle.is_closed()
             && !connected.player.rustmush
@@ -81,6 +81,9 @@ impl ConnectionShare {
     }
     pub(super) fn fingerprint(&self) -> &str {
         &self.0.fingerprint
+    }
+    pub fn options(&self) -> &SshOptions {
+        &self.0.options
     }
     pub(crate) fn verified_endpoint(&self) -> (&str, &str, u16, &str) {
         let options = &self.0.options;
