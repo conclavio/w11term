@@ -27,6 +27,24 @@ function Enter-Path([string]$Path, [string]$Action = 'Open') {
 function Listing([string]$Directory, [string]$Entry) {
     $null = Wait-Until "listing for $Directory" { (Find-Element $Directory) -and (Find-Element $Entry $button) }
 }
+function History-Buttons([bool]$CanGoBack, [bool]$CanGoForward) {
+    $null = Wait-Until "history controls Back=$CanGoBack, Forward=$CanGoForward" {
+        $back = Find-Element 'Back' $button
+        $forward = Find-Element 'Forward' $button
+        $back -and $forward -and ($back.Current.IsEnabled -eq $CanGoBack) -and ($forward.Current.IsEnabled -eq $CanGoForward)
+    }
+}
+function Wait-FolderError([string]$Path) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $null = Wait-Until "remote error for folder $Path" {
+        foreach ($element in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$text)) {
+            if ($element.Current.Name.StartsWith("Could not open folder ${Path}:")) { return $true }
+        }
+    }
+}
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -39,22 +57,41 @@ try {
     Run-Palette 'Open files here'
     Enter-Path $parent
     Listing $parent "$child/"
+    History-Buttons $false $false
     Enter-Path $child
     Listing "$parent/$child" 'witness.txt'
+    History-Buttons $true $false
     Click 'witness.txt'
     Enter-Path 'never-requested' 'Cancel'
     Enter-Path 'missing'
-    $null = Wait-Until 'remote error for the exact missing folder' {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-        $text = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Text)
-        foreach ($element in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$text)) {
-            if ($element.Current.Name.StartsWith('Could not open folder missing:')) { return $true }
-        }
-    }
+    Wait-FolderError 'missing'
     Listing "$parent/$child" 'witness.txt'
     if (!(Find-Element 'Copy selected path' $button).Current.IsEnabled) { throw 'Failed navigation cleared the selection' }
+    Click 'Back'
+    Listing $parent "$child/"
+    History-Buttons $false $true
+
+    # A previously visited destination can disappear. Restore it and retry the same history entry.
+    $null = Control @('sftp','--pane',"$pane",'rename',"$parent/$child",'/held-child')
+    Click 'Forward'
+    Wait-FolderError "$parent/$child"
+    Listing $parent "$child/"
+    History-Buttons $false $true
+    $null = Control @('sftp','--pane',"$pane",'rename','/held-child',"$parent/$child")
+    Click 'Forward'
+    Listing "$parent/$child" 'witness.txt'
+    History-Buttons $true $false
+
+    Click 'Back'
+    Listing $parent "$child/"
+    Enter-Path '/'
+    Listing '/' 'moved/'
+    History-Buttons $true $false
+    Click 'Back'
+    Listing $parent "$child/"
+    History-Buttons $false $true
+    Click 'Forward'
+    Listing '/' 'moved/'
     Run-Palette 'SFTP files'
     $null = Wait-Until 'drawer closed' { !(Find-Element $folderAction $button) }
     foreach ($c in 'after-navigation'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }

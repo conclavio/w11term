@@ -1239,7 +1239,7 @@ async fn native_sftp_file_rows_own_keyboard_focus_until_the_canvas_is_clicked() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens literal remote paths in the native SFTP drawer after an initial listing error"]
+#[ignore = "navigates literal remote paths and folder history through the native SFTP drawer"]
 async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
         unreachable!()
@@ -1261,13 +1261,22 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
         .lines()
         .filter_map(|line| line.strip_prefix("OPENDIR "))
         .collect();
+    let parent = "/Pilot's $Logs [2026]";
+    let child = "/Pilot's $Logs [2026]/year 1 雪";
     assert_eq!(
         opened,
         [
             "/shell directory",
-            "/Pilot's $Logs [2026]",
-            "/Pilot's $Logs [2026]/year 1 雪",
+            parent,
+            child,
             "/Pilot's $Logs [2026]/year 1 雪/missing",
+            parent,
+            child, // Forward while the destination is missing.
+            child, // Retry after the server restores it.
+            parent,
+            "/",
+            parent,
+            "/",
         ]
     );
     assert_eq!(fs::read(trace).unwrap(), b"after-navigation");

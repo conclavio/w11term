@@ -159,7 +159,7 @@ impl FileDrawer {
                 }
                 ensure!(found, "This bookmark was removed");
                 let description = format!("bookmark {path}");
-                return self.browse_named(pane, session, path, description, context);
+                return self.browse_named(pane, session, path, description, None, context);
             }
             Action::Back => unreachable!(),
         };
