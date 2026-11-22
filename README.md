@@ -73,6 +73,8 @@ Saving the workspace remembers the new pane’s starting directory. Its next lau
 
 Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.
 
+**Panes → Focus previous pane** returns to the last terminal pane you used in this window, including a pane in another tab. Invoke it again to switch back. For example, you can alternate between an SSH editor and a PowerShell build. From Settings, the action returns to the terminal you just left. Find it in the command palette or assign a shortcut under **Settings → Keyboard**.
+
 Choose **caret → Duplicate tab layout** to open a fresh copy beside the current tab. It keeps the tab name, pane arrangement, divider positions, focused pane, zoom and read-only input locks. Each SSH pane makes an independent login, and each local shell starts a new process. The original tab keeps its jobs and scrollback. A configured local or SSH starting directory carries over. You can assign **Duplicate tab layout** a shortcut in Settings.
 
 Duplication works with ordinary SSH and interactive local shell launches. The menu explains when a workspace startup command, durable viewer, RustMUSH player session or local command makes a tab ineligible. If a profile has been edited or removed, the duplicate still uses the original pane’s connection settings.
