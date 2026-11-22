@@ -82,11 +82,24 @@ try {
     }
     $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     if ($value.Current.Value -cne '10000') { throw "Expected default 10000, got '$($value.Current.Value)'" }
+    $field.SetFocus()
+    $null = Wait-Until 'scrollback limit focused' { $field.Current.HasKeyboardFocus }
     $value.SetValue('0')
+    (Find-Element 'Profile name' ([System.Windows.Automation.ControlType]::Edit)).SetFocus()
+    $null = Wait-Until 'zero retained in the scrollback editor after leaving the field' {
+        $edit = Find-Element 'Scrollback lines' ([System.Windows.Automation.ControlType]::Edit)
+        $edit -and !$edit.Current.HasKeyboardFocus -and
+            $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '0'
+    }
     Click 'Save profile'
-    $null = Wait-Until 'zero saved distinctly from an omitted limit' {
-        $profile = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.$localName
-        $profile.PSObject.Properties['scrollback_lines'] -and $profile.scrollback_lines -ceq 0
+    # The app returns to Settings only after its atomic catalog replacement succeeds.
+    $null = Wait-Until "saved local profile '$localName' returned to Settings" {
+        !(Find-Element 'Scrollback lines' ([System.Windows.Automation.ControlType]::Edit)) -and
+            (Find-Element "Edit local profile $localName" $button)
+    }
+    $profile = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.$localName
+    if (!$profile.PSObject.Properties['scrollback_lines'] -or $profile.scrollback_lines -cne 0) {
+        throw "Expected an explicit zero scrollback limit in saved profile '$localName': $($profile | ConvertTo-Json -Compress)"
     }
     $zero = Open-LocalHistory
     if ($zero -eq $original) { throw 'Expected a fresh local pane after editing the profile' }
