@@ -6,6 +6,7 @@ pub enum CommandId {
     Menu(String),
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
+    Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
     PaneColorScheme(u64, ColorScheme),
     SharedFolders(Option<u64>),
@@ -141,12 +142,14 @@ impl TerminalApp {
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
         let previous = previous_pane::target(&self.tabs);
+        let recordings = self.recording_choices();
         menu_rows(
             self.caret_items(
                 exited.is_some(),
                 &arrangement,
                 directory_split.is_some(),
                 previous,
+                recordings,
             ),
             false,
             &mut rows,
@@ -155,6 +158,14 @@ impl TerminalApp {
         for row in &mut rows {
             if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
                 row.id = CommandId::Clipboard(origin, shortcut == Shortcut::PasteRaw);
+            }
+            if let CommandId::Menu(label) = &row.id
+                && matches!(
+                    label.as_str(),
+                    recordings::START | recordings::STOP | recordings::OPEN
+                )
+            {
+                row.id = CommandId::Recording(recordings.target(label));
             }
         }
         menu_rows(self.profile_items(), true, &mut rows);
@@ -354,6 +365,7 @@ impl TerminalApp {
             }
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),
+            CommandId::Recording(choice) => recordings::invoke(choice),
             CommandId::Shortcut(shortcut) => Message::Shortcut(shortcut),
         };
         let tab_switch = matches!(

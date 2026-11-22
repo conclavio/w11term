@@ -30,9 +30,7 @@ struct Geometry {
 
 fn validate_size(size: TerminalSize) -> Result<()> {
     ensure!(
-        (1..=4096).contains(&size.cols)
-            && (1..=2048).contains(&size.rows)
-            && size.cols * size.rows <= 500_000
+        super::valid_grid(size.cols, size.rows)
             && size.pixel_width <= 65_535
             && size.pixel_height <= 65_535
             && size.dpi <= 65_535,

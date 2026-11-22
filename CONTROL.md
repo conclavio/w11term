@@ -236,6 +236,19 @@ if ($null -ne $state.restart_token) {
 
 ## VT recording
 
+The command palette and the tab menu’s **Recordings** submenu share the
+recorder with the control pipe. **Start timed recording…** selects a new
+destination for the current SSH or local shell pane. The capture stays with
+that pane if another one becomes active while the picker is open. Its recording
+indicator shows the active path, including a capture started from the CLI.
+**Stop recording** finishes that pane’s capture. If the recorder hits a size
+limit or a disk error, the window’s notification inbox shows the reason.
+
+**Open recording…** opens a `.vt` file in a new tab and selects timed
+playback when its `.vt.jsonl` index is present. A raw capture uses its saved
+initial grid when available, or the measured pane size. Both modes in this
+viewer suppress historical desktop clipboard, sound and notification requests.
+
 ```powershell
 & $ctl --pid 12345 record --pane $pane .\bug.vt
 # Reproduce the problem, or request a repaint from the remote application.

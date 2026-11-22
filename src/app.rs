@@ -67,6 +67,7 @@ mod pane_colors;
 mod pane_picker;
 mod pane_view;
 mod previous_pane;
+mod recordings;
 mod scrollback_bar;
 mod scrollback_export;
 mod session_browser;
@@ -683,6 +684,7 @@ enum UiWork {
 }
 
 struct CaretMenuBinding {
+    recordings: recordings::Choices,
     previous: Option<previous_pane::Target>,
     forward: Option<local_forwards::Origin>,
     directory_split: Option<directory_split::Origin>,
@@ -768,6 +770,7 @@ pub struct TerminalApp {
     native_bound: bool,
     window_error: Option<String>,
     export: scrollback_export::Export,
+    recordings: recordings::Recordings,
     registry: Registry,
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiWork>>>,
     control_task: Option<ComponentTask>,
@@ -822,6 +825,7 @@ pub enum Message {
     FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
     Export(scrollback_export::Action),
+    Recording(recordings::Action),
     ClearScrollback(u64),
     PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
@@ -963,6 +967,8 @@ fn live_tab_sized(
         Session::start_durable(source.clone(), size, osc52, connection, saved)
     } else if let Source::Replay(path) = &source {
         Session::start_replay_pane(path.clone(), size, osc52)
+    } else if let Source::ViewRecording(path) = &source {
+        Session::start_view_recording_pane(path.clone(), size)
     } else {
         Session::start_configured_with_connection(source.clone(), size, osc52, connection)
     };
@@ -1019,7 +1025,9 @@ fn source_label(source: &Source) -> String {
             .to_string_lossy()
             .into_owned(),
         Source::Demo => LAB.into(),
-        Source::Replay(path) => format!("Replay · {}", path.display()),
+        Source::Replay(path) | Source::ViewRecording(path) => {
+            format!("Replay · {}", path.display())
+        }
         Source::TimedReplay(path) => format!("Timed replay · {}", path.display()),
         Source::Ssh(ssh) => format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
     }
@@ -2752,6 +2760,7 @@ impl TerminalApp {
         arrangement: PaneArrangement,
         directory_split: Option<directory_split::Origin>,
         previous: Option<previous_pane::Target>,
+        recordings: recordings::Choices,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let paste = self.paste_origin();
@@ -2764,6 +2773,7 @@ impl TerminalApp {
             && binding.forward == forward
             && binding.pane == pane
             && binding.paste == paste
+            && binding.recordings == recordings
             && binding.group == group
             && binding.closed_group == closed_group
             && binding.arrangement == arrangement
@@ -2786,6 +2796,9 @@ impl TerminalApp {
                 Message::FolderShare(folder_shares::Action::Open(id))
             }),
             scrollback_export::LABEL => Message::Export(scrollback_export::Action::Start(pane)),
+            value @ (recordings::START | recordings::STOP | recordings::OPEN) => {
+                recordings::invoke(recordings.target(value))
+            }
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
             "Paste" => Message::Clipboard(clipboard_paste::Action::Start(paste, false)),
             "Paste raw (no bracketed paste)" => {
@@ -2810,6 +2823,7 @@ impl TerminalApp {
             },
         });
         *cached = Some(CaretMenuBinding {
+            recordings,
             previous,
             closed_group,
             forward,
@@ -2903,6 +2917,7 @@ impl TerminalApp {
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
         let previous = previous_pane::target(&self.tabs);
+        let recordings = self.recording_choices();
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2915,8 +2930,16 @@ impl TerminalApp {
                     &arrangement,
                     directory_split.is_some(),
                     previous,
+                    recordings,
                 ),
-                self.caret_menu_callback(context, exited, arrangement, directory_split, previous),
+                self.caret_menu_callback(
+                    context,
+                    exited,
+                    arrangement,
+                    directory_split,
+                    previous,
+                    recordings,
+                ),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2940,6 +2963,18 @@ impl TerminalApp {
                         Border::new()
                             .grid_column(3)
                             .content(self.inbox_button(context)),
+                        Border::new().grid_column(4).content(
+                            self.recording_indicator().map_or_else(
+                                || Border::new().into(),
+                                |message| -> View {
+                                    TextBlock::new()
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .automation_name(&message)
+                                        .text(message)
+                                        .into()
+                                },
+                            ),
+                        ),
                     )),
             )
     }
@@ -2974,6 +3009,7 @@ impl TerminalApp {
         arrangement: &PaneArrangement,
         can_split_directory: bool,
         previous: Option<previous_pane::Target>,
+        recordings: recordings::Choices,
     ) -> Vec<MenuItem> {
         let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
@@ -3035,6 +3071,7 @@ impl TerminalApp {
                 KeyAction::FindAllPanes,
             ),
             MenuItem::item("inbox", "Attention inbox"),
+            recordings.menu(),
             command_menu_item("paste", "Paste", can_paste),
             command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
             MenuItem::separator("paste-end"),
@@ -3927,6 +3964,7 @@ impl Component for TerminalApp {
             native_bound: false,
             window_error: None,
             export: Default::default(),
+            recordings: Default::default(),
             registry,
             control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
             control_task: None,
@@ -4109,6 +4147,10 @@ impl Component for TerminalApp {
             }
             Message::Export(action) => {
                 self.export_scrollback(action, context);
+                self.refresh_open_commands();
+            }
+            Message::Recording(action) => {
+                self.recording_action(action, context);
                 self.refresh_open_commands();
             }
             Message::ClearScrollback(pane) => {
@@ -5763,6 +5805,18 @@ impl Component for TerminalApp {
                     .on_click(
                         context.callback(|_| Message::Export(scrollback_export::Action::Dismiss)),
                     )
+                    .content(format!("{message}  ·  Dismiss")),
+            ));
+        }
+        if let Some(message) = &self.recordings.status {
+            views.push(KeyedView::new(
+                "recording-status",
+                Button::new()
+                    .grid_row(1)
+                    .automation_name(message)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .vertical_alignment(VerticalAlignment::Bottom)
+                    .on_click(context.callback(|_| Message::Recording(recordings::Action::Dismiss)))
                     .content(format!("{message}  ·  Dismiss")),
             ));
         }

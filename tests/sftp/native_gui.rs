@@ -1,4 +1,6 @@
 use super::*;
+#[path = "recording_ui.rs"]
+mod recording_ui;
 #[path = "../support/native_gui.rs"]
 mod shared;
 use shared::run_gui;

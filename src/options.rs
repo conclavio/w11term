@@ -521,17 +521,35 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
 pub enum Source {
     Demo,
     Replay(PathBuf),
+    /// A raw capture opened in the recording viewer, with desktop effects suppressed.
+    ViewRecording(PathBuf),
     TimedReplay(PathBuf),
     Local(LocalOptions),
     Ssh(SshOptions),
 }
 
 impl Source {
+    /// Choose the file's playback mode before opening a tab. An incomplete
+    /// timed capture must report its error instead of silently skipping its index.
+    pub fn open_recording(path: PathBuf) -> Result<Self> {
+        let path = std::path::absolute(path)?;
+        crate::recorder::check_raw_file(&path)?;
+        if path.with_extension("vt.jsonl").try_exists()? {
+            crate::recorder::TimedReplay::read_initial_size(&path)?;
+            Ok(Self::TimedReplay(path))
+        } else {
+            crate::recorder::raw_grid(&path)?;
+            Ok(Self::ViewRecording(path))
+        }
+    }
+
     pub fn color_scheme(&self) -> ColorScheme {
         match self {
             Self::Local(shell) => shell.color_scheme,
             Self::Ssh(ssh) => ssh.color_scheme,
-            Self::Demo | Self::Replay(_) | Self::TimedReplay(_) => ColorScheme::default(),
+            Self::Demo | Self::Replay(_) | Self::ViewRecording(_) | Self::TimedReplay(_) => {
+                ColorScheme::default()
+            }
         }
     }
 
@@ -539,7 +557,9 @@ impl Source {
         match self {
             Self::Local(shell) => shell.scrollback_lines,
             Self::Ssh(ssh) => ssh.scrollback_lines,
-            Self::Demo | Self::Replay(_) | Self::TimedReplay(_) => ScrollbackLines::default(),
+            Self::Demo | Self::Replay(_) | Self::ViewRecording(_) | Self::TimedReplay(_) => {
+                ScrollbackLines::default()
+            }
         }
     }
 }
