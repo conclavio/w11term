@@ -602,6 +602,7 @@ fn tab_menu_message(label: String) -> Message {
         "Split below in current directory" => {
             Message::Shortcut(Shortcut::SplitBelowInCurrentDirectory)
         }
+        "New tab in current directory" => Message::Shortcut(Shortcut::NewTabInCurrentDirectory),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
@@ -835,7 +836,7 @@ pub enum Message {
     Files(FileAction),
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
-    SplitInDirectory(Axis, directory_split::Origin),
+    OpenInDirectory(directory_split::Destination, directory_split::Origin),
     PaneNeighbor(Direction),
     FocusPreviousPane(previous_pane::Target),
     SwapPanes(PaneSwap),
@@ -2274,14 +2275,17 @@ impl TerminalApp {
         profile: Option<String>,
         context: &ComponentContext<Self>,
     ) {
-        self.tabs.insert(
-            live_tab(
-                label,
-                source,
-                self.appearance.read().unwrap().interaction.osc52,
-            )
-            .with_profile(profile),
-        );
+        let tab = live_tab(
+            label,
+            source,
+            self.appearance.read().unwrap().interaction.osc52,
+        )
+        .with_profile(profile);
+        self.insert_tab(tab, context);
+    }
+
+    fn insert_tab(&mut self, tab: AppTab, context: &ComponentContext<Self>) {
+        self.tabs.insert(tab);
         self.sync_selection(context);
         self.activate(context);
     }
@@ -2782,8 +2786,10 @@ impl TerminalApp {
                 Message::Shortcut(Shortcut::FocusPreviousPane) => previous_pane::message(previous),
                 Message::Shortcut(Shortcut::SwapPane(direction)) => offered.message(direction),
                 Message::Shortcut(Shortcut::RotateSplit) => offered.rotate(),
-                Message::Shortcut(shortcut) if let Some(axis) = directory_split::axis(shortcut) => {
-                    directory_split::message(axis, split_target.as_ref())
+                Message::Shortcut(shortcut)
+                    if let Some(destination) = directory_split::destination(shortcut) =>
+                {
+                    directory_split::message(destination, split_target.as_ref())
                 }
                 Message::Shortcut(Shortcut::ClearScrollback) => {
                     pane.map_or(Message::ControlIdle, Message::ClearScrollback)
@@ -3192,6 +3198,12 @@ impl TerminalApp {
                 "split-below-here",
                 "Split below in current directory",
                 KeyAction::SplitBelowInCurrentDirectory,
+                can_split_directory,
+            ),
+            self.binding_menu_enabled(
+                "new-tab-here",
+                "New tab in current directory",
+                KeyAction::NewTabInCurrentDirectory,
                 can_split_directory,
             ),
             command_menu_item("restart-exited", RESTART_EXITED_PANE, can_restart),
@@ -3702,10 +3714,10 @@ impl Component for TerminalApp {
                     .borrow()
                     .as_ref()
                     .map_or(Message::ControlIdle, |menu| menu.arrangement.rotate()),
-                shortcut if let Some(axis) = directory_split::axis(shortcut) => {
+                shortcut if let Some(destination) = directory_split::destination(shortcut) => {
                     let menu = shortcut_menu.borrow();
                     directory_split::message(
-                        axis,
+                        destination,
                         menu.as_ref().and_then(|m| m.directory_split.as_ref()),
                     )
                 }
@@ -4921,8 +4933,8 @@ impl Component for TerminalApp {
                 }
             }
             Message::SplitPane(axis, profile) => self.split_pane(axis, profile, context),
-            Message::SplitInDirectory(axis, origin) => {
-                self.split_in_directory(axis, origin, context)
+            Message::OpenInDirectory(destination, origin) => {
+                self.open_in_directory(destination, origin, context)
             }
             Message::SyncSelection(epoch) => {
                 if self.selection_epoch == epoch {
@@ -5002,7 +5014,8 @@ impl Component for TerminalApp {
                 Shortcut::SwapPane(_)
                 | Shortcut::RotateSplit
                 | Shortcut::SplitRightInCurrentDirectory
-                | Shortcut::SplitBelowInCurrentDirectory => {}
+                | Shortcut::SplitBelowInCurrentDirectory
+                | Shortcut::NewTabInCurrentDirectory => {}
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)

@@ -3,6 +3,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+. (Join-Path $PSScriptRoot 'support/directory-actions.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_SPLIT_CWD = Join-Path $State ('100% ; # [pilot] ' + [char]0x96ea)
@@ -43,34 +44,6 @@ function Confirm-Directory([int]$Pane, [string]$Token) {
     }
 }
 
-function Check-Actions([bool]$Enabled) {
-    $field = Open-Palette 'current directory'
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('current directory')
-    $null = Wait-Until "both local directory split actions enabled=$Enabled" {
-        $a = Find-Element $right $button
-        $b = Find-Element $below $button
-        $a -and $b -and $a.Current.IsEnabled -eq $Enabled -and $b.Current.IsEnabled -eq $Enabled
-    }
-    Press-Key 27
-    $null = Wait-Until 'command palette closed' { !(Find-Element 'Search commands') }
-}
-
-function Wait-Child($Origin, [int]$Count, [string]$Direction) {
-    Wait-Until "new active PowerShell pane split $Direction" {
-        $sessions = @((Control @('list')).sessions)
-        $parent = $sessions | Where-Object id -eq $Origin.id
-        $child = $sessions | Where-Object active
-        if ($sessions.Count -ne $Count -or !$parent.visible -or !$child.visible -or
-            $child.id -eq $parent.id -or $child.tab_id -ne $Origin.tab_id -or
-            $child.label -ne $Origin.label) { return }
-        if ($Direction -eq 'right') {
-            if ($parent.cols -lt 0.8 * $Origin.cols -and $child.cols -lt 0.8 * $Origin.cols -and
-                [Math]::Abs($child.rows - $parent.rows) -le 1) { $child }
-        } elseif ($parent.rows -lt 0.8 * $Origin.rows -and $child.rows -lt 0.8 * $Origin.rows -and
-            [Math]::Abs($child.cols - $parent.cols) -le 1) { $child }
-    }
-}
-
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','144','--rows','36') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -87,14 +60,14 @@ try {
     $change = 'Set-Location -LiteralPath $env:W11TERM_SPLIT_CWD'
     Send-Line $parent.id $change
     $parentPid = Confirm-Directory $parent.id 'first'
-    Check-Actions $true
+    Check-DirectoryActions $true
     Send-Line $parent.id 'Set-Location -LiteralPath Env:'
     $null = Control @('wait-for-text','--pane',"$($parent.id)",'--timeout','15','PS Env:')
-    Check-Actions $false
+    Check-DirectoryActions $false
     Send-Line $parent.id $change
     if ((Confirm-Directory $parent.id 'restored') -ne $parentPid) { throw 'Parent PowerShell changed' }
     Run-Palette $right
-    $child = Wait-Child $parent 3 'right'
+    $child = Wait-DirectoryChild $parent 3 'right'
     $null = Control @('wait-for-text','--pane',"$($child.id)",'--timeout','45','PS ')
     $childPid = Confirm-Directory $child.id 'right'
     if ($childPid -eq $parentPid) { throw 'Right split reused the parent PowerShell process' }
@@ -106,10 +79,16 @@ try {
         $item = Find-Element $below $menuItem
         if ($item -and $item.Current.IsEnabled) { $item }
     })
-    $lower = Wait-Child $child 4 'below'
+    $lower = Wait-DirectoryChild $child 4 'below'
     $null = Control @('wait-for-text','--pane',"$($lower.id)",'--timeout','45','PS ')
     $lowerPid = Confirm-Directory $lower.id 'below'
     if ($lowerPid -in $parentPid,$childPid) { throw 'Below split reused a PowerShell process' }
+    Run-Palette 'New tab in current directory'
+    $newTab = Wait-DirectoryChild $lower 5 'tab'
+    $null = Control @('wait-for-text','--pane',"$($newTab.id)",'--timeout','45','PS ')
+    $tabPid = Confirm-Directory $newTab.id 'tab'
+    if ($tabPid -in $parentPid,$childPid,$lowerPid) { throw 'New tab reused a PowerShell process' }
+    if ((Confirm-Directory $lower.id 'source') -ne $lowerPid) { throw 'The new tab replaced its source shell' }
     if ((Confirm-Directory $parent.id 'still') -ne $parentPid) { throw 'Original PowerShell was replaced' }
     $saved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'Palette PowerShell'
     if ($saved.cwd -cne $State) { throw 'A local split changed the saved profile working directory' }
@@ -119,22 +98,22 @@ try {
     $null = Control @('wait-for-text','--pane',"$custom",'--timeout','45','PS ')
     Send-Line $custom $change
     $customPid = Confirm-Directory $custom 'before'
-    Check-Actions $false
+    Check-DirectoryActions $false
     # Install the quoted OSC 9;9 PowerShell prompt in this test process only.
     $promptDefinition = @'
 function global:prompt { [string][char]27 + ']9;9;"' + $PWD.Path + '"' + [char]7 + 'custom-' + $PWD.Provider.Name + '> ' }
 '@
     Send-Line $custom $promptDefinition
     $null = Control @('wait-for-text','--pane',"$custom",'--timeout','15','custom-FileSystem>')
-    Check-Actions $true
+    Check-DirectoryActions $true
     Send-Line $custom 'Set-Location -LiteralPath Env:'
     $null = Control @('wait-for-text','--pane',"$custom",'--timeout','15','custom-Environment>')
-    Check-Actions $false
+    Check-DirectoryActions $false
     Send-Line $custom $change
     if ((Confirm-Directory $custom 'reported') -ne $customPid) { throw 'Custom-prompt shell changed' }
     $origin = (Control @('list')).sessions | Where-Object id -eq $custom
     Run-Palette $right
-    $peer = Wait-Child $origin 6 'right'
+    $peer = Wait-DirectoryChild $origin 7 'right'
     $null = Control @('wait-for-text','--pane',"$($peer.id)",'--timeout','45','PS ')
     if ((Confirm-Directory $peer.id 'custom') -eq $customPid) { throw 'OSC 9;9 split reused the reporting process' }
 

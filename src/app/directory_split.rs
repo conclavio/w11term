@@ -27,26 +27,38 @@ impl Origin {
     }
 }
 
-pub(super) fn axis(shortcut: Shortcut) -> Option<Axis> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Destination {
+    Tab,
+    Split(Axis),
+}
+
+pub(super) fn destination(shortcut: Shortcut) -> Option<Destination> {
     match shortcut {
-        Shortcut::SplitRightInCurrentDirectory => Some(Axis::Columns),
-        Shortcut::SplitBelowInCurrentDirectory => Some(Axis::Rows),
+        Shortcut::NewTabInCurrentDirectory => Some(Destination::Tab),
+        Shortcut::SplitRightInCurrentDirectory => Some(Destination::Split(Axis::Columns)),
+        Shortcut::SplitBelowInCurrentDirectory => Some(Destination::Split(Axis::Rows)),
         _ => None,
     }
 }
 
-pub(super) fn message(axis: Axis, target: Option<&Origin>) -> Message {
+pub(super) fn message(destination: Destination, target: Option<&Origin>) -> Message {
     target.cloned().map_or(Message::ControlIdle, |origin| {
-        Message::SplitInDirectory(axis, origin)
+        Message::OpenInDirectory(destination, origin)
     })
 }
 
-fn child_options(connection: &SshOptions, pane: &SshOptions, player: PlayerOptions) -> SshOptions {
+fn child_options(
+    connection: &SshOptions,
+    pane: &SshOptions,
+    color_scheme: ColorScheme,
+    player: PlayerOptions,
+) -> SshOptions {
     // PTYs sharing a transport keep their own terminal and presentation settings.
     SshOptions {
         terminal_type: pane.terminal_type.clone(),
         scrollback_lines: pane.scrollback_lines,
-        color_scheme: pane.color_scheme,
+        color_scheme,
         local_forwards: pane.local_forwards.clone(),
         player,
         ..connection.clone()
@@ -135,28 +147,38 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn split_in_directory(
+    pub(super) fn open_in_directory(
         &mut self,
-        axis: Axis,
+        destination: Destination,
         target: Origin,
         ctx: &ComponentContext<Self>,
     ) {
         let Some(id) = self.tabs.active_id() else {
             return;
         };
-        let Some(AppTab {
+        let Some(child) = self.directory_child(id, target) else {
+            return;
+        };
+        match destination {
+            Destination::Tab => self.insert_tab(child, ctx),
+            Destination::Split(axis) => self.insert_split(id, child, axis, ctx),
+        }
+    }
+
+    fn directory_child(&self, id: TabId, target: Origin) -> Option<AppTab> {
+        let AppTab {
             label,
             page: Page::Terminal(tab),
-        }) = self.tabs.get(id)
+        } = self.tabs.get(id)?
         else {
-            return;
+            return None;
         };
         if let Directory::Local(cwd) = &target.directory {
             let Source::Local(shell) = &tab.source else {
-                return;
+                return None;
             };
             if tab.local_directory_split().as_ref() != Some(&target) {
-                return;
+                return None;
             }
             let child = Source::Local(LocalOptions {
                 cwd: Some(cwd.clone()),
@@ -171,12 +193,11 @@ impl TerminalApp {
                 self.appearance.read().unwrap().interaction.osc52,
             )
             .with_profile(tab.profile_name.clone());
-            self.insert_split(id, child, axis, ctx);
-            return;
+            return Some(child);
         }
         let resolved = if target.listing_revision.is_some() {
             if !self.drawer_shell_eligible(tab, target.generation) {
-                return;
+                return None;
             }
             tab.files
                 .shell_origin(tab.session.pane_id)
@@ -184,23 +205,20 @@ impl TerminalApp {
         } else {
             tab.ssh_directory_split()
         };
-        let Some((current, connection)) = resolved.filter(|(current, _)| *current == target) else {
-            return;
-        };
+        let (current, connection) = resolved.filter(|(current, _)| *current == target)?;
         let Source::Ssh(pane) = &tab.source else {
-            return;
+            return None;
         };
         let options = child_options(
             connection.options(),
             pane,
+            tab.color_scheme,
             tab.session.player.read().unwrap().clone(),
         );
         let Directory::Ssh(directory) = current.directory else {
-            return;
+            return None;
         };
-        let Ok(startup) = SshStartup::new(&options, directory, String::new()) else {
-            return;
-        };
+        let startup = SshStartup::new(&options, directory, String::new()).ok()?;
         // A profile may have been edited to point elsewhere since this login.
         // Keep its name for workspace restore only if it still identifies this connection.
         let profile = tab
@@ -228,7 +246,7 @@ impl TerminalApp {
         if let Page::Terminal(live) = &mut child.page {
             live.startup = Some(Box::new(startup));
         }
-        self.insert_split(id, child, axis, ctx);
+        Some(child)
     }
 }
 
@@ -301,11 +319,16 @@ mod tests {
             mute: true,
             ..Default::default()
         };
-        let child = child_options(&connection, &pane, player.clone());
+        let child = child_options(
+            &connection,
+            &pane,
+            ColorScheme::OneHalfLight,
+            player.clone(),
+        );
         assert_eq!(child.authentication, connection.authentication);
         assert_eq!(child.terminal_type, pane.terminal_type);
         assert_eq!(child.scrollback_lines, pane.scrollback_lines);
-        assert_eq!(child.color_scheme, ColorScheme::OneHalfDark);
+        assert_eq!(child.color_scheme, ColorScheme::OneHalfLight);
         assert_eq!(child.local_forwards, pane.local_forwards);
         assert_eq!(child.player, player);
     }
@@ -319,17 +342,24 @@ mod tests {
             listing_revision: None,
         };
         for (label, expected) in [
-            ("Split right in current directory    F7", Axis::Columns),
-            ("Split below in current directory", Axis::Rows),
+            ("New tab in current directory    F9", Destination::Tab),
+            (
+                "Split right in current directory    F7",
+                Destination::Split(Axis::Columns),
+            ),
+            (
+                "Split below in current directory",
+                Destination::Split(Axis::Rows),
+            ),
         ] {
             let Message::Shortcut(key) = tab_menu_message(label.into()) else {
                 panic!("unrecognized directory action")
             };
-            let direction = axis(key).unwrap();
+            let direction = destination(key).unwrap();
             assert_eq!(direction, expected);
             assert!(matches!(message(direction, None), Message::ControlIdle));
             assert!(
-                matches!(message(direction, Some(&origin)), Message::SplitInDirectory(a, target) if a == expected && target == origin)
+                matches!(message(direction, Some(&origin)), Message::OpenInDirectory(a, target) if a == expected && target == origin)
             );
         }
     }
