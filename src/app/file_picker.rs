@@ -18,6 +18,7 @@ use windows::{
 
 pub(super) enum Purpose {
     UploadFiles,
+    UploadFolder,
     SshConfig(PathBuf),
     Folder,
     DownloadFolder,
@@ -129,8 +130,8 @@ pub(super) fn pick(owner: usize, purpose: Purpose) -> Result<Option<Selection>> 
     Ok(selected.pop())
 }
 
-pub(super) fn pick_uploads(owner: usize) -> Result<Vec<PathBuf>> {
-    Ok(pick_items(owner, Purpose::UploadFiles)?
+pub(super) fn pick_paths(owner: usize, purpose: Purpose) -> Result<Vec<PathBuf>> {
+    Ok(pick_items(owner, purpose)?
         .into_iter()
         .map(|item| item.path)
         .collect())
@@ -159,6 +160,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let clsid = if matches!(
             purpose,
             Purpose::UploadFiles
+                | Purpose::UploadFolder
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
                 | Purpose::Folder
@@ -219,21 +221,20 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 local_config_folder(&dialog, &current);
                 None
             }
-            Purpose::Folder | Purpose::DownloadFolder => {
-                let download = matches!(purpose, Purpose::DownloadFolder);
-                dialog.SetTitle(if download {
-                    w!("Choose a download destination folder")
-                } else {
-                    w!("Choose a folder to share")
+            Purpose::Folder | Purpose::DownloadFolder | Purpose::UploadFolder => {
+                dialog.SetTitle(match purpose {
+                    Purpose::DownloadFolder => w!("Choose a download destination folder"),
+                    Purpose::UploadFolder => w!("Choose a folder to upload"),
+                    _ => w!("Choose a folder to share"),
                 })?;
                 options |= FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 #[cfg(feature = "ui-smoke")]
                 fixture_picker_folder(
                     &dialog,
-                    if download {
-                        "W11TERM_SFTP_PICKER_SMOKE_DIR"
-                    } else {
+                    if matches!(purpose, Purpose::Folder) {
                         "W11TERM_FOLDER_SHARE_SMOKE_DIR"
+                    } else {
+                        "W11TERM_SFTP_PICKER_SMOKE_DIR"
                     },
                 )?;
                 None

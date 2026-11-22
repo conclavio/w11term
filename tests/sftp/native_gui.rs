@@ -12,6 +12,8 @@ mod select_all;
 mod shared;
 #[path = "sort_ui.rs"]
 mod sort_ui;
+#[path = "upload_folder_ui.rs"]
+mod upload_folder_ui;
 use shared::run_gui;
 #[path = "properties_ui.rs"]
 mod properties_ui;

@@ -495,6 +495,15 @@ impl russh_sftp::server::Handler for Files {
         attrs: FileAttributes,
     ) -> Result<Handle, StatusCode> {
         self.trace_transfer(format_args!("OPEN {path}"))?;
+        if fs::read_to_string(self.root.join("race-upload-path"))
+            .ok()
+            .as_deref()
+            == Some(&path)
+        {
+            fs::File::create_new(self.path(&path))
+                .and_then(|mut f| f.write_all(b"racing entry"))
+                .map_err(io)?;
+        }
         let file = fs::OpenOptions::from(flags)
             .open(self.path(&path))
             .map_err(io)?;
@@ -828,6 +837,8 @@ impl russh_sftp::server::Handler for Files {
             id,
             files: vec![russh_sftp::protocol::File::dummy(if path == "." {
                 "/".into()
+            } else if path == "alias" && self.root.join("canonical-parent").is_dir() {
+                "/canonical-parent".into()
             } else {
                 path
             })],
@@ -1019,6 +1030,8 @@ mod tab_windows;
 mod text_preview;
 #[path = "sftp/text_save.rs"]
 mod text_save;
+#[path = "sftp/upload_folder.rs"]
+mod upload_folder;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {
@@ -1334,7 +1347,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *partial,
         TransferProgress {
             bytes: CHUNK as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     drop(partial);
@@ -1345,7 +1359,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: size as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     assert_eq!(fs::read(&destination).unwrap(), bytes);
@@ -1357,7 +1372,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: size as u64,
-            total: None
+            total: None,
+            files: None,
         }
     );
 
@@ -1380,7 +1396,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: CHUNK as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     let uploaded = remote.path().join("upload");
@@ -1403,7 +1420,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: size as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     assert_eq!(fs::read(uploaded).unwrap(), bytes);
@@ -1743,6 +1761,26 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         assert_eq!(fs::read(destination.join("nested/日本.bin")).unwrap(), [0, 255, 19]);
         assert_eq!(fs::read(destination.join(".marker")).unwrap(), b"complete");
         assert!(destination.join("nested/empty").is_dir());
+        let caller_dir = local.path().to_owned();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+                .current_dir(caller_dir)
+                .args(["--pid", &std::process::id().to_string(), "sftp", "--pane", "1",
+                    "put-dir", "local bundle", "pushed 日本"])
+                .output().unwrap()
+        }).await.unwrap();
+        assert!(output.status.success(), "put-dir failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let uploaded: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let upload = &uploaded["result"]["sftp"];
+        assert_eq!(upload["remote"], "pushed 日本");
+        assert_eq!(upload["resolved_remote"], "/pushed 日本");
+        for field in ["files", "directories", "skipped", "bytes_transferred"] {
+            assert_eq!(upload[field], transfer[field], "{field}");
+        }
+        let pushed = root.path().join("pushed 日本");
+        assert_eq!(fs::read(pushed.join("nested/日本.bin")).unwrap(), [0, 255, 19]);
+        assert_eq!(fs::read(pushed.join(".marker")).unwrap(), b"complete");
+        assert!(pushed.join("nested/empty").is_dir());
         assert_eq!(opens.load(Ordering::Relaxed),2,"SFTP must reuse one sibling channel on the existing SSH connection");
         fs::write(root.path().join("slow"),b"slow").unwrap();
         let handle=ok(json!({"op":"open","path":"/slow","flags":["read"]})).await["handle"].as_u64().unwrap();

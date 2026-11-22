@@ -87,14 +87,8 @@ pub enum FileAction {
     FinishEdit(u64, u64, u64, ContentDialogResult),
     Page(u64, u64, u64, usize),
     Replace(u64, u64, bool),
-    Pick(u64, u64, String, Option<ListedEntry>),
-    Picked(
-        u64,
-        u64,
-        u64,
-        Option<ListedEntry>,
-        Result<Vec<PathBuf>, String>,
-    ),
+    Pick(u64, u64, u64, TransferPicker),
+    Picked(u64, u64, u64, TransferPicker, Result<Vec<PathBuf>, String>),
     Drop(u64, u64, String, Vec<PathBuf>),
     Listed(
         u64,
@@ -183,6 +177,41 @@ pub struct ListedEntry {
     revision: u64,
     name: String,
     kind: ListedKind,
+}
+
+#[derive(Clone)]
+pub enum TransferPicker {
+    UploadFiles(String),
+    UploadFolder(String),
+    Download(ListedEntry),
+}
+
+impl TransferPicker {
+    fn purpose(&self, files: &FileDrawer) -> Result<file_picker::Purpose> {
+        use file_picker::Purpose;
+        match self {
+            Self::UploadFiles(parent) | Self::UploadFolder(parent) => {
+                ensure!(
+                    files.directory.as_ref() == Some(parent),
+                    "The directory changed. Select the file operation again."
+                );
+                Ok(if matches!(self, Self::UploadFolder(_)) {
+                    Purpose::UploadFolder
+                } else {
+                    Purpose::UploadFiles
+                })
+            }
+            Self::Download(entry) => {
+                let remote = files.selected_path(entry)?;
+                if entry.kind == ListedKind::Known(EntryKind::Directory) {
+                    validate_download_name(&entry.name)?;
+                    Ok(Purpose::DownloadFolder)
+                } else {
+                    Ok(Purpose::Save(dialog_filename(&remote).into()))
+                }
+            }
+        }
+    }
 }
 
 enum RevealTarget {
@@ -296,8 +325,14 @@ enum Step {
 
 enum TransferFile {
     Upload { name: String, remote: String },
+    UploadFolder { remote: String },
     Download(String),
     DownloadFolder { remote: String, local: PathBuf },
+}
+
+fn counted(amount: u64, singular: &str) -> String {
+    let ending = if amount == 1 { "" } else { "s" };
+    format!("{amount} {singular}{ending}")
 }
 
 impl TransferFile {
@@ -324,6 +359,27 @@ impl TransferFile {
             (Self::DownloadFolder { remote, .. }, true) => format!(
                 "Cancelled download of {remote} ({bytes} bytes written to the temporary folder)."
             ),
+            (Self::UploadFolder { remote }, true) => {
+                let destination = reply["resolved_remote"].as_str().unwrap_or(remote);
+                let outcome = if reply["remote_may_be_partial"] == true {
+                    "The remote folder may be incomplete."
+                } else {
+                    "The remote folder was not created."
+                };
+                format!(
+                    "Cancelled upload of {destination} ({} completed, {} acknowledged). {outcome}",
+                    counted(reply["files"].as_u64().unwrap_or_default(), "file"),
+                    counted(bytes.as_u64().unwrap_or_default(), "byte"),
+                )
+            }
+            (Self::UploadFolder { remote }, false) => format!(
+                "Uploaded folder {} ({}, {}, {}, {} skipped).",
+                reply["resolved_remote"].as_str().unwrap_or(remote),
+                counted(reply["files"].as_u64().unwrap_or_default(), "file"),
+                counted(reply["directories"].as_u64().unwrap_or_default(), "folder"),
+                counted(bytes.as_u64().unwrap_or_default(), "byte"),
+                reply["skipped"],
+            ),
             (Self::Upload { name, .. }, false) => format!("Uploaded {name} ({bytes} bytes)"),
             (Self::Download(name), false) => format!("Downloaded {name} ({bytes} bytes)"),
             (Self::DownloadFolder { remote, local }, false) => format!(
@@ -339,6 +395,9 @@ impl TransferFile {
         match self {
             Self::Upload { remote, .. } => format!(
                 "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote file may be incomplete."
+            ),
+            Self::UploadFolder { remote } => format!(
+                "Upload of {remote} was interrupted with at least {bytes} bytes acknowledged. The remote folder may be incomplete."
             ),
             Self::Download(remote) => format!(
                 "Download of {remote} was interrupted with at least {bytes} bytes written to the temporary file. The outcome is unknown. Check the local destination."
@@ -360,6 +419,9 @@ impl TransferFile {
                 "{} SSH reconnected. Refresh to browse.",
                 self.outcome(&result)
             ),
+            Ok(Err(error)) if let Self::UploadFolder { remote } = self => {
+                format!("Could not upload folder {remote}: {error}")
+            }
             Ok(Err(error)) => error,
             Err(_) => format!(
                 "SSH reconnected. {} Refresh to browse.",
@@ -706,6 +768,33 @@ impl FileDrawer {
                 TransferFile::Download(remote),
             ))
         }
+    }
+
+    fn prepare_folder_upload(
+        &mut self,
+        parent: &str,
+        local: PathBuf,
+    ) -> Result<(Operation, TransferFile)> {
+        ensure!(
+            self.directory.as_deref() == Some(parent),
+            "The upload destination changed. Choose the folder again."
+        );
+        ensure!(local.is_absolute(), "Choose an absolute local folder");
+        let name = local
+            .file_name()
+            .context("Select a folder below the drive or share root")?;
+        let remote = entry_path(
+            parent,
+            name.to_str().context("SFTP requires a UTF-8 folder name")?,
+        )?;
+        self.status = format!("Uploading folder {remote}…");
+        Ok((
+            Operation::PutDir {
+                local,
+                remote: remote.clone(),
+            },
+            TransferFile::UploadFolder { remote },
+        ))
     }
 
     fn path_to_copy(&self, revision: u64, entry: Option<&ListedEntry>) -> Option<String> {
@@ -1173,7 +1262,11 @@ impl FileDrawer {
                     ),
                 )),
             StackPanel::new()
-                .orientation(Orientation::Horizontal)
+                .orientation(if layout.content_width() >= 320.0 {
+                    Orientation::Horizontal
+                } else {
+                    Orientation::Vertical
+                })
                 .spacing(6.0)
                 .children((
                     button(
@@ -1181,10 +1274,27 @@ impl FileDrawer {
                         ready && profile.is_some(),
                         Bookmarks(pane, generation, bookmarks::Action::Show),
                     ),
-                    button(
-                        "Upload…",
-                        writable,
-                        Pick(pane, generation, folder.into(), None),
+                    button_pair(
+                        button(
+                            "Upload…",
+                            writable,
+                            Pick(
+                                pane,
+                                generation,
+                                revision,
+                                TransferPicker::UploadFiles(folder.into()),
+                            ),
+                        ),
+                        button(
+                            "Upload folder…",
+                            writable,
+                            Pick(
+                                pane,
+                                generation,
+                                revision,
+                                TransferPicker::UploadFolder(folder.into()),
+                            ),
+                        ),
                     ),
                 )),
             StackPanel::new()
@@ -1229,7 +1339,12 @@ impl FileDrawer {
                             "Download…"
                         },
                         ready && selected.is_some(),
-                        Pick(pane, generation, folder.into(), Some(listed(selected))),
+                        Pick(
+                            pane,
+                            generation,
+                            revision,
+                            TransferPicker::Download(listed(selected)),
+                        ),
                     ),
                     Button::new()
                         .automation_name("Open shell here")
@@ -1380,7 +1495,15 @@ impl FileDrawer {
                 Some(total) => format!("{} / {total} bytes", p.bytes),
                 None => format!("{} bytes", p.bytes),
             };
-            controls.push(TextBlock::new().text(bytes).into());
+            let progress = match p.files {
+                Some(files) => format!(
+                    "{} completed, {} acknowledged",
+                    counted(files, "file"),
+                    counted(p.bytes, "byte")
+                ),
+                None => bytes,
+            };
+            controls.push(TextBlock::new().text(progress).into());
             controls.push(button(
                 "Cancel transfer",
                 !transfer.cancel.is_cancelled(),
@@ -1714,6 +1837,9 @@ impl FileDrawer {
                         local.display()
                     );
                 }
+                if let Step::Transfer(TransferFile::UploadFolder { remote }) = &step {
+                    bail!("Could not upload folder {remote}: {error}");
+                }
                 bail!("{error}");
             }
             (Step::IdentifyDelete(entry), Ok(reply)) => {
@@ -1766,7 +1892,11 @@ impl FileDrawer {
             }
             (Step::Transfer(file), Ok(reply)) => {
                 self.status = file.outcome(&reply);
-                if !matches!(file, TransferFile::Upload { .. }) || reply["cancelled"] == true {
+                if !matches!(
+                    file,
+                    TransferFile::Upload { .. } | TransferFile::UploadFolder { .. }
+                ) || reply["cancelled"] == true
+                {
                     return Ok(());
                 }
                 if self.uploads.is_empty() {
@@ -2197,7 +2327,7 @@ impl TerminalApp {
                     files.parsing = false;
                     files.accept_listing(direction, path, result.map_err(|e| anyhow!("{e}"))?);
                 }
-                Picked(_, _, serial, remote, result) => {
+                Picked(_, _, serial, picker, result) => {
                     if !files.finish_picker(serial) || !may_open_dialog {
                         return Ok(());
                     }
@@ -2205,16 +2335,43 @@ impl TerminalApp {
                     if paths.is_empty() {
                         return Ok(());
                     }
-                    if let Some(entry) = remote {
-                        let [local] = paths
-                            .try_into()
-                            .map_err(|_| anyhow!("Choose one download destination"))?;
-                        let (operation, transfer) = files.download_operation(&entry, local)?;
-                        files.status = format!("Downloading {}…", entry.name);
-                        files.job(pane, session, operation, Step::Transfer(transfer), context)?;
-                    } else {
-                        files.uploads.extend(paths);
-                        files.upload_next(pane, session, context)?;
+                    match picker {
+                        TransferPicker::UploadFiles(parent) => {
+                            ensure!(
+                                files.directory.as_ref() == Some(&parent),
+                                "The upload destination changed. Choose the files again."
+                            );
+                            files.uploads.extend(paths);
+                            files.upload_next(pane, session, context)?;
+                        }
+                        TransferPicker::UploadFolder(parent) => {
+                            let [local] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one folder to upload"))?;
+                            let (operation, transfer) =
+                                files.prepare_folder_upload(&parent, local)?;
+                            files.job(
+                                pane,
+                                session,
+                                operation,
+                                Step::Transfer(transfer),
+                                context,
+                            )?;
+                        }
+                        TransferPicker::Download(entry) => {
+                            let [local] = paths
+                                .try_into()
+                                .map_err(|_| anyhow!("Choose one download destination"))?;
+                            let (operation, transfer) = files.download_operation(&entry, local)?;
+                            files.status = format!("Downloading {}…", entry.name);
+                            files.job(
+                                pane,
+                                session,
+                                operation,
+                                Step::Transfer(transfer),
+                                context,
+                            )?;
+                        }
                     }
                 }
                 EditName(_, _, serial, name) => {
@@ -2448,28 +2605,14 @@ impl TerminalApp {
                     files.end_filter_edit();
                     files.upload_next(pane, session, context)?;
                 }
-                Pick(_, _, directory, entry) => {
-                    if !may_open_dialog {
+                Pick(_, _, revision, picker) => {
+                    if !may_open_dialog
+                        || revision != files.listing_revision
+                        || files.bookmarks.is_some()
+                    {
                         return Ok(());
                     }
-                    ensure!(
-                        files.directory.as_ref() == Some(&directory),
-                        "The directory changed. Select the file operation again."
-                    );
-                    let purpose = match &entry {
-                        Some(entry) => {
-                            let remote = files.selected_path(entry)?;
-                            if entry.kind == ListedKind::Known(EntryKind::Directory) {
-                                validate_download_name(&entry.name)?;
-                                Some(file_picker::Purpose::DownloadFolder)
-                            } else {
-                                Some(file_picker::Purpose::Save(
-                                    dialog_filename(&remote).to_owned(),
-                                ))
-                            }
-                        }
-                        None => None,
-                    };
+                    let purpose = picker.purpose(files)?;
                     let owner = crate::input::window().context("Window is not ready")?.0 as usize;
                     files.end_filter_edit();
                     let serial = files.start_picker();
@@ -2478,21 +2621,14 @@ impl TerminalApp {
                         pane,
                         generation,
                         serial,
-                        entry.clone(),
+                        picker.clone(),
                         Err("File picker unavailable".into()),
                     ));
                     context.spawn_background_with_rejection(
                         move |_| {
-                            let result = match purpose {
-                                Some(purpose) => {
-                                    file_picker::pick(owner, purpose).map(|selection| {
-                                        selection.into_iter().map(|file| file.path).collect()
-                                    })
-                                }
-                                None => file_picker::pick_uploads(owner),
-                            }
-                            .map_err(|error| format!("{error:#}"));
-                            Message::Files(Picked(pane, generation, serial, entry, result))
+                            let result = file_picker::pick_paths(owner, purpose)
+                                .map_err(|error| format!("{error:#}"));
+                            Message::Files(Picked(pane, generation, serial, picker, result))
                         },
                         reject,
                     );
@@ -2642,7 +2778,7 @@ impl TerminalApp {
                         pane,
                         generation,
                         serial,
-                        Some(entry),
+                        TransferPicker::Download(entry),
                         Ok(vec![local.join("download.bin")]),
                     ),
                     context,
@@ -3750,6 +3886,77 @@ mod tests {
             assert_eq!(dialog_filename(remote), "download");
         }
         assert_eq!(dialog_filename("/srv/reports/report 1.txt"), "report 1.txt");
+    }
+
+    #[test]
+    fn folder_upload_uses_the_selected_local_basename_and_original_remote_directory() {
+        let mut drawer = FileDrawer {
+            open: true,
+            directory: Some("/srv/logs".into()),
+            replace: true,
+            ..Default::default()
+        };
+        let picker = TransferPicker::UploadFolder("/srv/logs".into());
+        assert!(matches!(
+            picker.purpose(&drawer),
+            Ok(file_picker::Purpose::UploadFolder)
+        ));
+        let local = PathBuf::from(r"C:\archive\run 4 [雪]");
+        let (operation, transfer) = drawer
+            .prepare_folder_upload("/srv/logs", local.clone())
+            .unwrap();
+        assert_eq!(request_generation(&operation, 7), Some(7));
+        assert!(
+            matches!(operation, Operation::PutDir { local: source, remote }
+            if source == local && remote == "/srv/logs/run 4 [雪]")
+        );
+        assert_eq!(drawer.status, "Uploading folder /srv/logs/run 4 [雪]…");
+        assert_eq!(
+            transfer.outcome(&json!({"files":2,"directories":3,"bytes_transferred":7,"skipped":1})),
+            "Uploaded folder /srv/logs/run 4 [雪] (2 files, 3 folders, 7 bytes, 1 skipped)."
+        );
+        for invalid in [r"C:\", r"\\server\share", r"relative\dir", "C:\\bad\nname"] {
+            assert!(
+                drawer
+                    .prepare_folder_upload("/srv/logs", invalid.into())
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        drawer.directory = Some("/other".into());
+        assert!(picker.purpose(&drawer).is_err());
+        assert!(drawer.prepare_folder_upload("/srv/logs", local).is_err());
+    }
+
+    #[test]
+    fn folder_upload_reports_its_destination_and_distinguishes_partial_remote_trees() {
+        let folder = TransferFile::UploadFolder {
+            remote: "/reports/run".into(),
+        };
+        let partial =
+            json!({"cancelled":true,"remote_may_be_partial":true,"resolved_remote":"/archived/run","files":3,"bytes_transferred":42});
+        let message = folder.outcome(&partial);
+        assert!(message.contains(
+            "Cancelled upload of /archived/run (3 files completed, 42 bytes acknowledged)"
+        ));
+        assert!(message.contains("remote folder may be incomplete"));
+        let before_mkdir =
+            json!({"cancelled":true,"remote_may_be_partial":false,"files":0,"bytes_transferred":0});
+        assert!(
+            folder
+                .outcome(&before_mkdir)
+                .contains("remote folder was not created")
+        );
+        let (worker, mut reply) = oneshot::channel();
+        let interrupted = folder.reconnect_status(&mut reply, 42);
+        assert!(interrupted.contains("/reports/run"));
+        assert!(interrupted.contains("at least 42 bytes acknowledged"));
+        assert!(interrupted.contains("remote folder may be incomplete"));
+        worker.send(Err("Permission denied".into())).unwrap();
+        assert_eq!(
+            folder.reconnect_status(&mut reply, 0),
+            "Could not upload folder /reports/run: Permission denied"
+        );
     }
 
     #[test]

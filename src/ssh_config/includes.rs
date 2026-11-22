@@ -226,7 +226,7 @@ impl<'a> Reader<'a> {
         pattern.push_str(r"\z");
         let matcher = Regex::new(&pattern)?;
         let mut matches = Vec::new();
-        local::names(&dir, |units| {
+        crate::windows_dirs::names(&dir, |units| {
             self.entries += 1;
             ensure!(
                 self.entries <= MAX_DIRECTORY_ENTRIES,

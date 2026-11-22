@@ -5,7 +5,7 @@
 //! fallback is used if the volume does not provide TxF.
 //! See Microsoft's [transactional locking rules](https://learn.microsoft.com/windows/win32/fileio/txf-basic-concepts#transactional-locking).
 use super::*;
-use std::os::windows::fs::FileExt;
+use std::os::windows::{fs::FileExt, io::FromRawHandle};
 use windows::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_RENAME_INFORMATION, FileRenameInformation,
     NtSetInformationFile,

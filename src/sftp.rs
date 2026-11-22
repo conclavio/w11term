@@ -27,6 +27,7 @@ use tokio::{
 mod directory;
 mod editor;
 mod text_preview;
+mod upload_directory;
 pub(crate) use directory::valid_component;
 pub use directory::validate_download_name;
 
@@ -76,6 +77,10 @@ pub enum Operation {
     GetDir {
         remote: String,
         local: PathBuf,
+    },
+    PutDir {
+        local: PathBuf,
+        remote: String,
     },
     Put {
         local: PathBuf,
@@ -277,6 +282,8 @@ pub fn open_flags(flags: &[String]) -> Result<OpenFlags> {
 pub struct TransferProgress {
     pub bytes: u64,
     pub total: Option<u64>,
+    /// Complete files acknowledged through CLOSE during a directory upload.
+    pub files: Option<u64>,
 }
 
 /// Explicit user cancellation belongs to one transfer, independent of its reply
@@ -303,6 +310,7 @@ fn report(progress: Option<&watch::Sender<TransferProgress>>, bytes: u64, total:
         progress.send_replace(TransferProgress {
             bytes,
             total: total.filter(|size| *size >= bytes),
+            files: None,
         });
     }
 }
@@ -336,6 +344,7 @@ enum JobStage {
         staging: Option<tempfile::TempDir>,
         deadline: Instant,
     },
+    DirectoryUpload(upload_directory::UploadState),
     Upload,
     NativeUpload {
         remote: String,
@@ -362,6 +371,7 @@ impl JobStage {
         match self {
             Self::Ordinary => "SFTP operation interrupted; outcome may be unknown".into(),
             Self::DirectoryDownload { .. } => "Folder download interrupted before publication".into(),
+            Self::DirectoryUpload(state) => state.interrupted().into(),
             Self::Upload => {
                 "SFTP upload interrupted; remote destination may contain a partial file".into()
             }
@@ -470,6 +480,13 @@ pub(crate) async fn run(
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+            && let Operation::PutDir { local, remote } = &operation
+        {
+            let state = upload_directory::UploadState::new(remote.clone(), deadline);
+            let _ = reply.send(Ok(state.cancelled(local)));
+            continue;
+        }
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
             && let Operation::Put { local, remote, .. }
             | Operation::Get { local, remote, .. }
             | Operation::GetDir { local, remote } = &operation
@@ -496,6 +513,9 @@ pub(crate) async fn run(
         let mut reply = PendingReply {
             sender: Some(reply),
             stage: match &operation {
+                Operation::PutDir { remote, .. } => JobStage::DirectoryUpload(
+                    upload_directory::UploadState::new(remote.clone(), deadline),
+                ),
                 Operation::Put { remote, .. } if cancel.is_some() => JobStage::NativeUpload {
                     remote: remote.clone(),
                     open_dispatched: false,
@@ -542,6 +562,7 @@ pub(crate) async fn run(
                     engine = None;
                 }
                 if matches!(reply.stage, JobStage::Checking(_))
+                    || matches!(&reply.stage, JobStage::DirectoryUpload(state) if state.root_dispatched || lost)
                     || matches!(
                         reply.stage,
                         JobStage::NativeUpload {
@@ -571,6 +592,7 @@ pub(crate) async fn run(
                 if matches!(
                     reply.stage,
                     JobStage::DirectoryDownload { .. }
+                        | JobStage::DirectoryUpload(_)
                         | JobStage::EditorSave { .. }
                         | JobStage::Checking(_)
                         | JobStage::AwaitingStatus(_)
@@ -756,6 +778,12 @@ impl Engine {
                 };
                 self.get_dir(remote, local, progress, cancel, staging, *deadline)
                     .await?
+            }
+            PutDir { local, .. } => {
+                let JobStage::DirectoryUpload(state) = stage else {
+                    unreachable!("directory upload job stage");
+                };
+                self.put_directory(local, progress, cancel, state).await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
             EntryProperties { path } => {
