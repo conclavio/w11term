@@ -109,7 +109,7 @@ History shows 0 for success and the native exit code when PowerShell supplies a 
 
 Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.
 
-On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files, or drop files onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
+On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files. You can also drag files and folders together from Explorer onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
 
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
@@ -135,6 +135,15 @@ directory. Choosing `C:\Projects\cockpit` while viewing `/tmp` creates
 must be available. The drawer counts skipped junctions and other reparse
 points and shows confirmed progress. If you cancel or disconnect after the
 remote folder is created, inspect the partial tree at the reported path.
+
+An Explorer drop keeps the item order supplied by Windows. **Replace existing
+files** applies to individual files in that batch. Each dropped folder needs a
+new remote name. Dropping a junction or another reparse point as a top-level
+item stops the batch before it starts. w11term verifies each queued item before
+uploading it. On a volume that cannot identify files reliably, w11term keeps
+the selected item open until its turn. If w11term cannot verify an item, an
+upload fails, or you cancel, the batch stops. Earlier completed uploads stay
+in place.
 
 When a file row or drawer control has keyboard focus, use the keyboard to operate that control. For example, press **Space** on a file row to select it. Click the terminal pane, or choose **Done** in the filename filter, to resume typing into the shell while the drawer stays open.
 
