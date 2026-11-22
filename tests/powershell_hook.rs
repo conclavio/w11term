@@ -194,12 +194,14 @@ function global:prompt { "$state-prompt-$?> " }
             "{command}: {bytes:?}"
         );
         terminal.advance_bytes(bytes.as_bytes());
+        // A hosted runner can hand us an 8.3 TEMP path while PowerShell
+        // reports its long name. Compare the existing directories on disk.
+        let actual = terminal
+            .get_current_dir()
+            .and_then(|url| url.to_file_path().ok());
         ensure!(
-            terminal
-                .get_current_dir()
-                .and_then(|url| url.to_file_path().ok())
-                .as_deref()
-                == expected,
+            actual.as_deref().map(std::fs::canonicalize).transpose()?
+                == expected.map(std::fs::canonicalize).transpose()?,
             "{command}: expected {expected:?}, got {:?} in {bytes:?}",
             terminal.reported_current_dir(),
         );
