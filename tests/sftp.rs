@@ -788,6 +788,7 @@ async fn fixture_counting_accepts(
         authentication: Authentication::None,
         host_key: Some(pin),
         proxy_jump: Vec::new(),
+        local_forwards: Vec::new(),
         durable: false,
         player: Default::default(),
     });

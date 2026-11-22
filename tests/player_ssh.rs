@@ -270,6 +270,7 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
         authentication,
         host_key: pin,
         proxy_jump: Vec::new(),
+        local_forwards: Vec::new(),
         durable: false,
         player: Default::default(),
     }

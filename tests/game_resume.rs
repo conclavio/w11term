@@ -234,6 +234,7 @@ impl Fixture {
                 authentication: Authentication::None,
                 host_key: Some(pin),
                 proxy_jump: vec![],
+                local_forwards: vec![],
                 durable: false,
                 player: PlayerOptions {
                     rustmush: true,

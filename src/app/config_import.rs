@@ -378,6 +378,15 @@ impl TerminalApp {
                 if !options.proxy_jump.is_empty() {
                     fields.push(text("hops", jump_summary(&options.proxy_jump)));
                 }
+                if !options.local_forwards.is_empty() {
+                    fields.push(text("forwards", "Local forwarding presets".into()));
+                    for (index, &preset) in options.local_forwards.iter().enumerate() {
+                        fields.push(text(
+                            &format!("forward-{index}"),
+                            local_forwards::preset_label(preset),
+                        ));
+                    }
+                }
             } else {
                 fields.push(text("unsupported", format!("Cannot import {}", alias.name)));
             }
