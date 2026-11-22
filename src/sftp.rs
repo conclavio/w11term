@@ -351,7 +351,11 @@ impl JobStage {
             Self::NativeUpload { open_dispatched: false, .. } =>
                 "Upload interrupted before opening the remote destination; 0 confirmed bytes".into(),
             Self::EditorSave { temporary, publishing } => {
-                let state = if *publishing { "publication outcome unknown; check the destination" } else { "destination was not replaced" };
+                let state = if *publishing {
+                    "publication outcome unknown; refresh and check the destination"
+                } else {
+                    "destination was not replaced"
+                };
                 format!("Save interrupted; {state}. Temporary file may remain at {temporary}").into()
             }
             Self::Checking(message) | Self::AwaitingStatus(message) => (*message).into(),

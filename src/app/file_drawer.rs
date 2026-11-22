@@ -10,8 +10,10 @@ use w11term::sftp::{
 };
 
 mod bookmarks;
+mod editor;
 mod history;
 mod preview;
+mod text_draft;
 
 use history::{FolderHistory, HistoryDirection};
 
@@ -70,6 +72,9 @@ pub enum FileAction {
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     PreviewText(u64, u64, ListedEntry),
     ClosePreview(u64, u64, u64),
+    StartTextEditor(u64, u64, u64),
+    ResumeTextEditor(u64, u64),
+    TextEditor(u64, u64, editor::Action),
     Rename(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
@@ -118,6 +123,7 @@ pub(super) struct FileDrawer {
     reveal: Option<RevealTarget>,
     dialog: Option<EntryDialog>,
     preview: Option<preview::TextPreview>,
+    editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
     picking: Option<u64>,
@@ -276,6 +282,7 @@ enum Step {
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Preview(u64),
+    SaveText(editor::Save),
     Transfer(TransferFile),
     Change { parent: String, change: EntryChange },
 }
@@ -599,10 +606,16 @@ impl FileDrawer {
     }
 
     pub(super) fn entry_dialog_open(&self) -> bool {
-        self.dialog.is_some() || self.preview.is_some()
+        self.dialog.is_some()
+            || self.preview.is_some()
+            || self.editor.as_ref().is_some_and(editor::Editor::is_open)
     }
 
     pub(super) fn cancel_entry_dialog(&mut self) {
+        if let Some(editor) = self.editor.as_mut().filter(|e| e.is_open()) {
+            editor.stash();
+            self.cached.get_mut().take();
+        }
         self.cancel_preview();
         if self.identifying_delete() {
             self.pending.take();
@@ -853,8 +866,11 @@ impl FileDrawer {
         ssh: &SshOptions,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
+        if let Some(editor) = self.editor.as_ref().filter(|e| e.is_open()) {
+            return Some(editor.dialog(pane, self.generation, context));
+        }
         if let Some(preview) = &self.preview {
-            return Some(preview.dialog(pane, self.generation, context));
+            return Some(preview.dialog(pane, self.generation, self.editor.is_none(), context));
         }
         let dialog = self.dialog.as_ref()?;
         let serial = dialog.serial;
@@ -995,9 +1011,12 @@ impl FileDrawer {
                 _ => "SSH connected. Refresh to browse.".into(),
             },
         };
+        let editor = self.detach_editor();
         *self = Self {
             open: self.open,
             following: self.following,
+            dialog_serial: self.dialog_serial,
+            editor,
             generation,
             status,
             ..Self::default()
@@ -1249,6 +1268,13 @@ impl FileDrawer {
                 )
                 .content(TextBlock::new().text("Replace existing files")),
         ];
+        if let Some(editor) = &self.editor {
+            controls.push(button(
+                "Resume draft",
+                !self.entry_dialog_open(),
+                ResumeTextEditor(pane, editor.serial()),
+            ));
+        }
         let filter: View = if let Some(input) = &self.filter_input {
             Grid::new()
                 .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -1607,6 +1633,24 @@ impl FileDrawer {
         self.cached.borrow_mut().take();
         match (self.pending.take().unwrap().step, result) {
             (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (Step::SaveText(save), result) => {
+                if let Some((parent, name)) = self.finish_save(save, result) {
+                    self.reveal = Some(RevealTarget::Existing(name));
+                    if let Err(error) = self.job(
+                        id,
+                        session,
+                        Operation::Ls {
+                            path: parent.clone(),
+                        },
+                        Step::Listing(parent, None),
+                        context,
+                    ) {
+                        self.reveal = None;
+                        self.status
+                            .push_str(&format!(". Refresh to list the new file: {error:#}"));
+                    }
+                }
+            }
             (step, Err(error)) => {
                 if let Step::IdentifyDelete(entry) = &step {
                     bail!("Could not delete {}: {error}", entry.name);
@@ -1927,6 +1971,9 @@ impl TerminalApp {
             | CopyPath(id, ..)
             | PreviewText(id, ..)
             | ClosePreview(id, ..)
+            | StartTextEditor(id, ..)
+            | ResumeTextEditor(id, ..)
+            | TextEditor(id, ..)
             | Rename(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
@@ -1992,8 +2039,13 @@ impl TerminalApp {
         {
             return;
         }
-        let typing = matches!(&action, Filter(..) | ClearFilter(..) | FocusFilter(..));
-        if !matches!(action, Tick(_) | EditName(..) | FocusFilter(..)) {
+        let editor_typing = matches!(
+            &action,
+            TextEditor(_, _, editor::Action::Text(_) | editor::Action::Name(_))
+        );
+        let typing =
+            editor_typing || matches!(&action, Filter(..) | ClearFilter(..) | FocusFilter(..));
+        if !editor_typing && !matches!(action, Tick(_) | EditName(..) | FocusFilter(..)) {
             files.cached.borrow_mut().take();
         }
         let result = (|| -> Result<()> {
@@ -2036,6 +2088,26 @@ impl TerminalApp {
                 }
                 Close(_) => files.close(),
                 ClosePreview(_, _, serial) => files.close_preview(serial),
+                StartTextEditor(_, generation, serial) => {
+                    if may_open_dialog && files.generation == generation {
+                        files.start_editor(serial);
+                    }
+                }
+                ResumeTextEditor(_, serial) => {
+                    if may_open_dialog {
+                        files.resume_editor(serial);
+                    }
+                }
+                TextEditor(_, serial, action) => {
+                    if may_open_dialog
+                        && let Some((save, operation)) = files.editor_action(serial, action)
+                        && let Err(error) =
+                            files.job(pane, session, operation, Step::SaveText(save), context)
+                        && let Some(editor) = &mut files.editor
+                    {
+                        editor.failed(format!("{error:#}"));
+                    }
+                }
                 Follow(_, _, enabled) => {
                     if files.open && files.following != enabled {
                         files.following = enabled;

@@ -27,6 +27,7 @@ impl TextPreview {
         &self,
         pane: u64,
         generation: u64,
+        can_edit: bool,
         context: &ViewContext<TerminalApp>,
     ) -> View {
         self.view
@@ -59,6 +60,20 @@ impl TextPreview {
                     }
                 };
                 let serial = self.serial;
+                let mut fields = vec![KeyedView::new("document", body)];
+                if matches!(self.content, Contents::Ready(_)) && can_edit {
+                    fields.push(KeyedView::new(
+                        "edit",
+                        Button::new()
+                            .automation_name("Edit")
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::StartTextEditor(
+                                    pane, generation, serial,
+                                ))
+                            }))
+                            .content("Edit"),
+                    ));
+                }
                 ContentDialog::new()
                     .title(&self.entry.name)
                     .close_button_text("Close preview")
@@ -66,13 +81,34 @@ impl TextPreview {
                     .on_closed(context.callback(move |_| {
                         Message::Files(FileAction::ClosePreview(pane, generation, serial))
                     }))
-                    .content(StackPanel::new().min_width(280.0).children((body,)))
+                    .content(
+                        StackPanel::new()
+                            .min_width(280.0)
+                            .spacing(8.0)
+                            .keyed_children(fields),
+                    )
             })
             .clone()
     }
 }
 
 impl FileDrawer {
+    pub(super) fn take_preview_for_edit(&mut self, serial: u64) -> Option<(ListedEntry, String)> {
+        let preview = self.preview.as_ref()?;
+        if !self.open
+            || preview.serial != serial
+            || self.check_selected(&preview.entry).is_err()
+            || !matches!(preview.content, Contents::Ready(_))
+        {
+            return None;
+        }
+        let mut preview = self.preview.take()?;
+        let Contents::Ready(text) = std::mem::replace(&mut preview.content, Contents::Loading)
+        else {
+            unreachable!()
+        };
+        Some((preview.entry.clone(), text))
+    }
     pub(super) fn begin_preview(&mut self, entry: ListedEntry) -> Result<(u64, Operation)> {
         ensure!(
             self.open && self.generation != 0 && !self.busy() && self.bookmarks.is_none(),

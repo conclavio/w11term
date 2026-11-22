@@ -53,7 +53,7 @@ impl Engine {
             .write_editor_file(&handle, text, attributes.as_ref())
             .await;
         let closed = self.raw.close(handle).await;
-        let published = async {
+        let published: Result<()> = async {
             closed?;
             prepared?;
             if let (Some(original), Some(attributes)) = (original, attributes) {

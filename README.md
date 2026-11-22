@@ -109,6 +109,10 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
 
+Choose **Edit** in the preview to change the text. **Save** replaces the original file. **Save as…** creates a sibling file under a new name. Editing preserves the UTF-8 byte order mark and the line endings on unchanged lines. Each pane keeps one in-memory draft when you close its editor. Use **Resume draft** in the drawer to return to it or **Discard draft…** to remove it. After an SSH reconnect, copy any edits you need, discard the old draft, and reopen the remote file to edit against its current contents. Closing the pane ends its draft.
+
+Before replacing a file, w11term compares its contents to the version you opened. If another writer changed it, your draft stays available for **Save as…**. Replacement uses the server’s OpenSSH atomic rename extension and preserves the POSIX mode, owner and group when reported. The replacement gets a new inode, which matters for hard links, ACLs and extended attributes. SFTP has no atomic compare-and-swap, so another writer can still change the file between the last check and the rename. Servers with standard SFTP v3 support **Save as…**. If the connection drops during publication, refresh the directory and preview the destination to see which version reached the server.
+
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
 Choose **Download folder…** on a remote directory and select a Windows folder
