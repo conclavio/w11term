@@ -5185,6 +5185,7 @@ impl Component for TerminalApp {
                     id: tab.session.pane_id,
                     label,
                     frames: &tab.session.frames,
+                    input: &tab.session.input,
                     geometry: crate::accessibility::Geometry {
                         bounds,
                         cell_width: f64::from(metrics.cell_width * metrics.scale),

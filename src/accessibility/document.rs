@@ -1,6 +1,10 @@
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
-use w11term::{interaction::Point, terminal::Snapshot, text_layout::CellMap};
+use w11term::{
+    interaction::Point,
+    terminal::{RetainedRows, Snapshot},
+    text_layout::CellMap,
+};
 use windows::Win32::UI::Accessibility::*;
 
 // The terminal caps launch geometry to 1000×500. Limit an accessible snapshot
@@ -25,6 +29,7 @@ pub(super) struct Document {
     final_col: usize,
     pub(super) starts: Vec<usize>,
     pub(super) first: isize,
+    retained: Option<RetainedRows>,
     pub(super) generation: u64,
     pub(super) caret: usize,
 }
@@ -39,6 +44,12 @@ impl Document {
             final_col: 0,
             starts: vec![],
             first: frame.first_stable_row,
+            retained: frame.rows.len().checked_sub(1).and_then(|last| {
+                frame.retained_rows(
+                    frame.first_stable_row,
+                    frame.first_stable_row.checked_add(last as isize)?,
+                )
+            }),
             generation: frame.generation,
             caret: 0,
         };
@@ -118,6 +129,25 @@ impl Document {
         self.starts
             .partition_point(|&start| start <= offset)
             .saturating_sub(1)
+    }
+    pub fn covered_rows(&self, span: &Range<usize>) -> RangeInclusive<usize> {
+        // A nonempty range ends immediately before its exclusive endpoint.
+        // A caret at that same endpoint belongs to the next row, if present.
+        self.row(span.start)..=self.row(span.end.saturating_sub(1).max(span.start))
+    }
+
+    pub fn retained_rows(&self, span: &Range<usize>) -> Option<RetainedRows> {
+        let rows = self.covered_rows(span);
+        self.retained.as_ref()?.slice(
+            self.first.checked_add(*rows.start() as isize)?,
+            self.first.checked_add(*rows.end() as isize)?,
+        )
+    }
+
+    pub fn visible_row(&self, row: usize, frame: &Snapshot) -> Option<usize> {
+        let stable = self.first.checked_add(row as isize)?;
+        let visible = usize::try_from(stable.checked_sub(frame.first_stable_row)?).ok()?;
+        (visible < frame.rows.len()).then_some(visible)
     }
     pub fn end(&self, row: usize) -> usize {
         self.starts.get(row + 1).copied().unwrap_or(self.len())

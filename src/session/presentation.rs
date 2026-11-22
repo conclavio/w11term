@@ -47,6 +47,30 @@ impl Presentation {
         self.scrollback_clear_floor = Some(floor);
         self.dirty = true;
     }
+    /// Only the viewport changes. Prepare the potentially expensive snapshot
+    /// before claiming a synchronous reader's bounded request.
+    pub fn scrolled_view(&self, terminal: &Terminal, offset: usize, search: &Search) -> Snapshot {
+        let old = self.frames.load();
+        let mut view = Snapshot::capture(
+            terminal,
+            Some(&old),
+            0,
+            offset,
+            old.status.clone(),
+            old.bytes_received,
+        );
+        view.connection_generation = old.connection_generation;
+        view.prompt = old.prompt.clone();
+        view.scrollback_clear_generation = old.scrollback_clear_generation;
+        view.scrollback_clear_floor = old.scrollback_clear_floor;
+        view.search = search.snapshot(view.first_stable_row, view.rows.len(), view.alternate);
+        view
+    }
+    pub fn publish_scroll(&mut self, mut view: Snapshot) {
+        self.generation += 1;
+        view.generation = self.generation;
+        self.frames.publish(view);
+    }
     fn stage(&mut self, terminal: &TerminalState, offset: usize, status: &str, bytes: u64) {
         let previous = self.frames.load();
         let previous_live = self.live.load();

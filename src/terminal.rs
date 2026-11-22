@@ -14,6 +14,8 @@ use wezterm_term::{
 
 mod export;
 mod kitty;
+mod retained_rows;
+pub use retained_rows::RetainedRows;
 #[cfg(test)]
 mod scrollback_tests;
 pub(crate) use export::export_text;
@@ -507,6 +509,7 @@ pub struct Snapshot {
     pub bytes_received: u64,
     pub first_stable_row: isize,
     pub oldest_stable_row: isize,
+    row_epoch: u64,
     /// Most recent successful local history clear. The floor is the first row
     /// retained at the time of that clear, even if new output has since arrived.
     pub scrollback_clear_generation: u64,
@@ -562,7 +565,7 @@ impl Snapshot {
             .map(|(index, line)| {
                 let stable = first_stable_row + index as isize;
                 let old_row = previous
-                    .filter(|old| old.alternate == alternate)
+                    .filter(|old| old.row_epoch == screen.row_epoch())
                     .and_then(|old| {
                         usize::try_from(stable - old.first_stable_row)
                             .ok()
@@ -645,6 +648,7 @@ impl Snapshot {
             bytes_received,
             first_stable_row,
             oldest_stable_row: screen.phys_to_stable_row_index(0),
+            row_epoch: screen.row_epoch(),
             scrollback_clear_generation: 0,
             scrollback_clear_floor: None,
             alternate,
@@ -700,6 +704,7 @@ impl Snapshot {
 
     pub fn same_presentation(&self, old: &Self) -> bool {
         self.size == old.size
+            && self.row_epoch == old.row_epoch
             && self.first_stable_row == old.first_stable_row
             && self.oldest_stable_row == old.oldest_stable_row
             && self.scrollback_clear_generation == old.scrollback_clear_generation

@@ -166,9 +166,21 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
     }
     fn GetBoundingRectangles(&self) -> Result<*mut SAFEARRAY> {
         let span = self.span()?;
+        let frame = self.source.frames.load();
+        if span.is_empty()
+            || !self
+                .doc
+                .retained_rows(&span)
+                .is_some_and(|rows| rows.matches_visible(&frame))
+        {
+            return array(VT_R8, 0);
+        }
         let (g, r) = self.source.rect()?;
         let mut values = Vec::new();
-        for row in self.doc.row(span.start)..=self.doc.row(span.end) {
+        for row in self.doc.covered_rows(&span) {
+            let Some(visible) = self.doc.visible_row(row, &frame) else {
+                continue;
+            };
             let Some(&row_start) = self.doc.starts.get(row) else {
                 break;
             };
@@ -186,7 +198,7 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             } else {
                 self.doc.col(b)
             };
-            let top = f64::from(r.top) + g.padding + row as f64 * g.cell_height;
+            let top = f64::from(r.top) + g.padding + visible as f64 * g.cell_height;
             let bottom = (top + g.cell_height).min(f64::from(r.bottom));
             for visual in self.doc.cell_maps[row].visual_ranges(start_x..end_x) {
                 let left = f64::from(r.left) + g.padding + visual.start as f64 * g.cell_width;
@@ -275,8 +287,9 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
     fn RemoveFromSelection(&self) -> Result<()> {
         Err(unsupported())
     }
-    fn ScrollIntoView(&self, _: BOOL) -> Result<()> {
-        self.source.check()
+    fn ScrollIntoView(&self, align_to_top: BOOL) -> Result<()> {
+        self.source
+            .scroll(&self.doc, self.span()?, align_to_top.as_bool())
     }
     fn GetChildren(&self) -> Result<*mut SAFEARRAY> {
         self.source.check()?;
