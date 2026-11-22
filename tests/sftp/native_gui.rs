@@ -4,6 +4,18 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits SSH and local profile schemes in WinUI and checks their restarted terminal PNGs"]
+async fn native_profile_color_schemes_survive_restart_and_isolate_palette_resets() {
+    let (Source::Ssh(ssh), _remote, shells, server) = fixture_connections(false, 3).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("profile-color-schemes-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "renders DEC reverse-screen changes in control PNGs from two live SSH panes"]
 async fn native_reverse_screen_repaints_existing_text_and_isolates_ssh_panes() {
     let (Source::Ssh(ssh), _remote, channels, server) = fixture_server(false).await else {

@@ -7,6 +7,32 @@ use std::{
 mod local;
 pub use local::LocalOptions;
 
+/// Base colors for a new terminal pane. Applications can override them with OSC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColorScheme {
+    #[default]
+    Default,
+    OneHalfDark,
+    OneHalfLight,
+}
+
+impl ColorScheme {
+    pub const ALL: [Self; 3] = [Self::Default, Self::OneHalfDark, Self::OneHalfLight];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "w11term (default)",
+            Self::OneHalfDark => "One Half Dark",
+            Self::OneHalfLight => "One Half Light",
+        }
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
 /// Number of physical rows a pane retains above its primary screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "u32")]
@@ -179,6 +205,8 @@ pub struct SshOptions {
     pub terminal_type: TerminalType,
     #[serde(default, skip_serializing_if = "ScrollbackLines::is_default")]
     pub scrollback_lines: ScrollbackLines,
+    #[serde(default, skip_serializing_if = "ColorScheme::is_default")]
+    pub color_scheme: ColorScheme,
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
@@ -213,6 +241,7 @@ impl From<JumpHost> for SshOptions {
             port: hop.port,
             terminal_type: TerminalType::default(),
             scrollback_lines: ScrollbackLines::default(),
+            color_scheme: ColorScheme::default(),
             authentication: hop.authentication,
             host_key: hop.host_key,
             proxy_jump: Vec::new(),
@@ -420,6 +449,14 @@ pub enum Source {
 }
 
 impl Source {
+    pub fn color_scheme(&self) -> ColorScheme {
+        match self {
+            Self::Local(shell) => shell.color_scheme,
+            Self::Ssh(ssh) => ssh.color_scheme,
+            Self::Demo | Self::Replay(_) => ColorScheme::default(),
+        }
+    }
+
     pub fn scrollback_lines(&self) -> ScrollbackLines {
         match self {
             Self::Local(shell) => shell.scrollback_lines,
@@ -515,6 +552,7 @@ impl Options {
                         port: 22,
                         terminal_type: TerminalType::default(),
                         scrollback_lines: ScrollbackLines::default(),
+                        color_scheme: ColorScheme::default(),
                         authentication: Authentication::Agent,
                         host_key: None,
                         proxy_jump: Vec::new(),

@@ -1062,18 +1062,16 @@ impl<'a> Performer<'a> {
 
             OperatingSystemCommand::ResetColors(colors) => {
                 log::trace!("ResetColors: {:?}", colors);
-                if colors.is_empty() {
-                    // Reset all colors
-                    self.palette.take();
-                } else {
-                    // Reset individual colors
-                    if self.palette.is_none() {
-                        // Already at the defaults
+                if let Some(palette) = &mut self.state.palette {
+                    let base = self.state.config.color_palette();
+                    if colors.is_empty() {
+                        // OSC 104 resets the indexed table. Dynamic colors such as the
+                        // default background and cursor have their own OSC 110+ resets.
+                        palette.colors = base.colors;
                     } else {
-                        let base = self.config.color_palette();
                         for c in colors {
                             let c = c as usize;
-                            self.palette_mut().colors.0[c] = base.colors.0[c];
+                            palette.colors.0[c] = base.colors.0[c];
                         }
                     }
                 }

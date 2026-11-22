@@ -258,6 +258,7 @@ async fn fixture_with_channel_limit(
 fn options(port: u16, authentication: Authentication, pin: Option<String>) -> SshOptions {
     SshOptions {
         scrollback_lines: Default::default(),
+        color_scheme: Default::default(),
         terminal_type: Default::default(),
         host: "127.0.0.1".into(),
         user: if authentication == Authentication::None {

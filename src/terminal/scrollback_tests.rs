@@ -2,7 +2,7 @@ use super::*;
 
 fn terminal(cols: usize, rows: usize, limit: u32) -> Terminal {
     let (tx, _) = mpsc::unbounded_channel();
-    create_with_scrollback(
+    create_with_profile(
         TerminalSize {
             cols,
             rows,
@@ -10,6 +10,7 @@ fn terminal(cols: usize, rows: usize, limit: u32) -> Terminal {
         },
         tx,
         limit.try_into().unwrap(),
+        Default::default(),
     )
 }
 

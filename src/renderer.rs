@@ -1700,7 +1700,7 @@ mod tests {
         assert_eq!(renderer.tile_bytes, 0);
     }
     #[test]
-    fn preview_fits_the_entire_grid_and_renders_kitty_placements() {
+    fn preview_fits_the_entire_grid_and_renders_kitty_placements_in_the_pane_color_scheme() {
         let _com = Apartment::new();
         let mut renderer = Renderer::new().unwrap();
         let metrics = renderer.measure(800.0, 600.0, 1.0);
@@ -1712,9 +1712,14 @@ mod tests {
             pixel_height: 12 * metrics.cell_height as usize,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut term = w11term::terminal::create(size, tx);
+        let mut term = w11term::terminal::create_with_profile(
+            size,
+            tx,
+            Default::default(),
+            w11term::options::ColorScheme::OneHalfLight,
+        );
         term.advance_bytes(include_bytes!("../tests/fixtures/kitty/placements.vt"));
-        term.advance_bytes(b"\x1b[?25l\x1b[12;32H\x1b[48;2;255;0;255m ");
+        term.advance_bytes(b"\x1b[?25l\x1b[12;30H\x1b[0m \x1b[41m \x1b[48;2;255;0;255m ");
         let snapshot = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
         let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
         for (width, height) in [(160, 220), (320, 80)] {
@@ -1743,7 +1748,9 @@ mod tests {
                 red > 220 && green < 35 && blue < 35,
                 "kitty placement {red}/{green}/{blue}"
             );
-            assert_eq!(sample(31.5, 11.5), [255, 0, 255], "last cell");
+            assert_eq!(sample(29.5, 11.5), [250; 3], "profile background");
+            assert_eq!(sample(30.5, 11.5), [0xe4, 0x56, 0x49], "profile ANSI red");
+            assert_eq!(sample(31.5, 11.5), [255, 0, 255], "explicit RGB");
         }
     }
 

@@ -200,6 +200,7 @@ fn options() -> Result<SshOptions> {
         proxy_jump: vec![],
         local_forwards: vec![],
         scrollback_lines: Default::default(),
+        color_scheme: Default::default(),
         terminal_type: Default::default(),
         durable: false,
         player: crate::options::PlayerOptions {

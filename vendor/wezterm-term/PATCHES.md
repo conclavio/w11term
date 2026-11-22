@@ -19,6 +19,10 @@ The original MIT license is preserved in `LICENSE.md`.
 - DECRQM for DEC private mode 5 reports the current screen polarity so applications
   can restore the previous setting after using reverse-screen mode.
 
+- OSC 104 restores the requested indexed colors, or the full indexed table
+  when no indices are given, while preserving dynamic foreground, background
+  and cursor colors.
+
 - `src/terminal.rs`, `terminalstate/mod.rs`, `terminalstate/performer.rs`: implement
   synchronized-output mode 2026 and DECRQM state in the engine. The embedding can
   observe parsed begin/end boundaries, including multiple transitions within one
