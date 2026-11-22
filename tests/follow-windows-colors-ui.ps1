@@ -6,6 +6,12 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/profile-scheme-editor.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+# Keep the H strokes thick enough to sample opaque glyph pixels even at a
+# half-scale initial DPI before the hidden test window finishes layout.
+$appearance = [IO.File]::ReadAllText($env:W11TERM_SETTINGS_PATH) | ConvertFrom-Json
+$appearance | Add-Member NoteProperty font_family 'Consolas' -Force
+$appearance | Add-Member NoteProperty font_size 24 -Force
+[IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($appearance | ConvertTo-Json -Depth 12))
 $profiles = Join-Path $State 'profiles.json'
 $peer = [IO.File]::ReadAllText((Join-Path $State 'peer-root'))
 $outputFile = Join-Path $peer 'copy-history.vt'
@@ -26,7 +32,11 @@ function Wait-SchemeFrame([int]$Pane, $Before, [string]$Scheme) {
         $current = Control @('get-text','--pane',"$Pane")
         if ($current.generation -gt $Before.generation) { $current }
     }
-    if ($frame.text -cne $Before.text) { throw "Switching to $Scheme altered existing terminal text" }
+    # Opening the native palette can finish the initial window layout and
+    # change how many empty rows follow the sample. Compare the drawn text.
+    if ($frame.text.TrimEnd([char]10,[char]13) -cne $Before.text.TrimEnd([char]10,[char]13)) {
+        throw "Switching to $Scheme altered existing terminal text: before [$($Before.text)] after [$($frame.text)]"
+    }
 }
 function Use-Scheme([int]$Pane, [string]$Scheme) {
     $before = Control @('get-text','--pane',"$Pane")
@@ -110,7 +120,7 @@ for ($launch=1; $launch -le 2; $launch++) {
     [IO.File]::WriteAllText($outputFile,$wire)
     $log = Join-Path $State "gui-$launch.log"
     $reader = $null
-    $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','90','--rows','20') -WindowStyle Hidden -PassThru -RedirectStandardError $log
+    $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','68','--rows','16') -WindowStyle Hidden -PassThru -RedirectStandardError $log
     try {
         $window = Wait-InputWindow
         $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
@@ -160,6 +170,10 @@ for ($launch=1; $launch -le 2; $launch++) {
             try { $diagnostics = Editor-State } catch { $diagnostics = "UI diagnostics unavailable: $_" }
         } else {
             $diagnostics = "Original Windows dark preference: $windowsDark; trace: $channel"
+            try {
+                $frame = Control @('get-text','--pane',"$pane")
+                $diagnostics += ". $($frame.cols) by $($frame.rows) screen: $($frame.text)"
+            } catch { $diagnostics += ". Screen diagnostic unavailable: $_" }
         }
         throw "Launch $launch failed: $failure at $($failure.ScriptStackTrace). $diagnostics"
     } finally {
