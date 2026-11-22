@@ -86,11 +86,12 @@ pub enum Command {
         delimiters: String,
         reply: tokio::sync::oneshot::Sender<Option<crate::interaction::Point>>,
     },
-    CopyRange(
-        crate::copy_mode::ScreenId,
-        crate::interaction::Selection,
-        tokio::sync::oneshot::Sender<Result<String, &'static str>>,
-    ),
+    CopyRange {
+        screen: crate::copy_mode::ScreenId,
+        selection: crate::interaction::Selection,
+        trim_block: bool,
+        reply: tokio::sync::oneshot::Sender<Result<String, &'static str>>,
+    },
     ScrollEdge(bool),
     Prompt(isize),
     Search {
@@ -801,8 +802,8 @@ async fn run(
                         }
                         Ok(())
                     }
-                    Some(Command::CopyRange(id, selection, reply)) => {
-                        let _ = reply.send(crate::copy_mode::selected_text(&terminal, connection_generation, id, selection));
+                    Some(Command::CopyRange { screen, selection, trim_block, reply }) => {
+                        let _ = reply.send(crate::copy_mode::selected_text(&terminal, connection_generation, screen, selection, trim_block));
                         Ok(())
                     }
                     Some(Command::ScrollRange(request)) => {

@@ -69,7 +69,12 @@ async fn clear_scrollback_keeps_live_rows_cursor_commands_and_recomputes_dirty_f
         }
         let (reply, result) = oneshot::channel();
         input
-            .send(Command::CopyRange((&*scrolled).into(), selection, reply))
+            .send(Command::CopyRange {
+                screen: (&*scrolled).into(),
+                selection,
+                trim_block: true,
+                reply,
+            })
             .unwrap();
         assert_eq!(result.await.unwrap(), Err("Selected text left scrollback"));
         let (reply, result) = oneshot::channel();

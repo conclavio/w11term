@@ -24,6 +24,7 @@ pub enum CopyKey {
     Word(WordMotion),
     Character,
     Line,
+    Block,
     Copy,
     Cancel,
 }
@@ -41,6 +42,7 @@ impl CopyKey {
                 0x24 => Some(First),
                 0x23 => Some(Last),
                 0x43 if mods.contains(Mods::SHIFT) => Some(Copy),
+                0x56 if !mods.contains(Mods::SHIFT) => Some(Block),
                 _ => None,
             };
         }
@@ -62,6 +64,7 @@ impl CopyKey {
             0x45 if !shift => Word(WordMotion::NextEnd),
             0x56 if shift => Line,
             0x56 => Character,
+            0x52 if !shift => Block,
             0x0d | 0x59 => Copy,
             0x1b => Cancel,
             _ => return None,
@@ -70,7 +73,7 @@ impl CopyKey {
     pub fn repeats(self) -> bool {
         !matches!(
             self,
-            Self::Character | Self::Line | Self::Copy | Self::Cancel
+            Self::Character | Self::Line | Self::Block | Self::Copy | Self::Cancel
         )
     }
 }
@@ -109,13 +112,20 @@ impl ScreenId {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Shape {
+    Character,
+    Line,
+    Block,
+}
+
 pub struct CopyMode {
     pub screen: ScreenId,
     pub cursor: Point,
     /// Keep the viewport pinned as shell output arrives, including when starting at offset zero.
     pub top: isize,
     pub original_top: Option<isize>,
-    anchor: Option<(Point, bool)>,
+    anchor: Option<(Point, Shape)>,
 }
 
 impl CopyMode {
@@ -154,11 +164,24 @@ impl CopyMode {
     pub fn instructions(&self) -> &'static str {
         match self.anchor {
             None => {
-                "Copy mode · Arrows or hjkl move · w/b/e words · v select · Shift+V lines · Esc exit"
+                "Copy mode · Arrows or hjkl move · w/b/e words · v character · Shift+V line · Ctrl+V or r block · Esc exit"
             }
-            Some((_, false)) => "Copy mode · Character selection · y or Enter copy · Esc cancel",
-            Some((_, true)) => "Copy mode · Line selection · y or Enter copy · Esc cancel",
+            Some((_, Shape::Character)) => {
+                "Copy mode · Character selection · y or Enter copy · Esc cancel"
+            }
+            Some((_, Shape::Line)) => "Copy mode · Line selection · y or Enter copy · Esc cancel",
+            Some((_, Shape::Block)) => {
+                "Copy mode · Rectangular selection · y or Enter copy · Esc cancel"
+            }
         }
+    }
+
+    fn toggle_shape(&mut self, shape: Shape) {
+        self.anchor = match self.anchor {
+            Some((_, active)) if active == shape => None,
+            Some((anchor, _)) => Some((anchor, shape)),
+            None => Some((self.cursor, shape)),
+        };
     }
 
     pub fn navigate(&mut self, key: CopyKey, frame: &Snapshot) {
@@ -197,14 +220,9 @@ impl CopyMode {
             Last => self.cursor.row = last_row,
             Home => self.cursor.col = 0,
             End => self.cursor.col = last_col,
-            Character | Line => {
-                let lines = key == Line;
-                self.anchor = match self.anchor {
-                    Some((_, old)) if old == lines => None,
-                    Some((p, _)) => Some((p, lines)),
-                    None => Some((self.cursor, lines)),
-                }
-            }
+            Character => self.toggle_shape(Shape::Character),
+            Line => self.toggle_shape(Shape::Line),
+            Block => self.toggle_shape(Shape::Block),
             Word(_) | Copy | Cancel => return,
         }
         self.move_to(self.cursor, frame);
@@ -226,16 +244,16 @@ impl CopyMode {
     }
 
     pub fn selection(&self) -> Option<Selection> {
-        let (mut anchor, lines) = self.anchor?;
+        let (mut anchor, shape) = self.anchor?;
         let mut end = self.cursor;
-        if lines {
+        if shape == Shape::Line {
             if anchor.row > end.row {
                 std::mem::swap(&mut anchor, &mut end);
             }
             anchor.col = 0;
             end.col = self.screen.cols.saturating_sub(1);
         }
-        let mut selection = Selection::new(anchor, false, self.screen.alternate);
+        let mut selection = Selection::new(anchor, shape == Shape::Block, self.screen.alternate);
         selection.end = end;
         selection.active = true;
         selection.dragging = false;
@@ -250,6 +268,7 @@ pub fn selected_text(
     generation: u64,
     id: ScreenId,
     selection: Selection,
+    trim_block: bool,
 ) -> Result<String, &'static str> {
     let screen = terminal.screen();
     if !id.same_coordinates(terminal, generation) {
@@ -270,7 +289,7 @@ pub fn selected_text(
                 .iter()
                 .enumerate()
                 .map(|(i, line)| (first + i as isize, *line)),
-            true,
+            trim_block,
             crate::clipboard::MAX_TEXT,
         );
     });
@@ -311,7 +330,7 @@ mod tests {
         let selection = m.selection().unwrap();
         assert_eq!(selection.anchor, Point { row: m.top, col: 0 });
         assert_eq!(
-            selected_text(&t, 0, m.screen, selection),
+            selected_text(&t, 0, m.screen, selection, true),
             Ok("123456789\r\nblue\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven".into())
         );
         assert_eq!(m.top, frame.oldest_stable_row);
@@ -328,7 +347,7 @@ mod tests {
         }
         assert_eq!(m.cursor.col, 3);
         assert_eq!(
-            selected_text(&t, 0, m.screen, m.selection().unwrap()),
+            selected_text(&t, 0, m.screen, m.selection().unwrap(), true),
             Ok("界e\u{301}".into())
         );
         m.navigate(Left, &frame);
@@ -336,7 +355,75 @@ mod tests {
         let mut evicted = frame.clone();
         evicted.oldest_stable_row = m.cursor.row + 1;
         assert!(!m.valid(&evicted));
-        assert!(selected_text(&t, 1, m.screen, m.selection().unwrap()).is_err());
+        assert!(selected_text(&t, 1, m.screen, m.selection().unwrap(), true).is_err());
+    }
+
+    #[test]
+    fn block_copies_each_physical_row_with_the_configured_padding() {
+        let t = terminal("ab界e\u{301}XYZ123 L \r\nQ\r\n---Z");
+        let frame = view(&t, 0);
+        let first = Point { row: 0, col: 3 };
+        let last = Point { row: 3, col: 5 };
+        assert!(first.row < frame.first_stable_row);
+        for (anchor, end) in [(first, last), (last, first)] {
+            let mut mode = CopyMode::new(&frame);
+            mode.move_to(anchor, &frame);
+            mode.navigate(Block, &frame);
+            mode.move_to(end, &frame);
+            let block = mode.selection().unwrap();
+            assert!(block.block);
+            assert_eq!(block.anchor, anchor);
+            for row in first.row..=last.row {
+                assert_eq!(block.span(row, frame.cols), Some(3..6));
+            }
+            // The left edge intersects the second column of 界. The following
+            // row is soft-wrapped, and another row has no text in these columns.
+            assert_eq!(
+                selected_text(&t, 0, mode.screen, block.clone(), true).as_deref(),
+                Ok("界e\u{301}X\r\n L\r\n\r\nZ")
+            );
+            assert_eq!(
+                selected_text(&t, 0, mode.screen, block, false).as_deref(),
+                Ok("界e\u{301}X\r\n L \r\n   \r\nZ  ")
+            );
+        }
+    }
+
+    #[test]
+    fn changing_shape_keeps_the_original_anchor_and_toggling_it_off_releases_it() {
+        let t = terminal("123456\r\nABCDEF");
+        let frame = view(&t, 0);
+        let mut mode = CopyMode::new(&frame);
+        let anchor = Point { row: 1, col: 2 };
+        let end = Point { row: 0, col: 4 };
+        mode.move_to(anchor, &frame);
+        mode.navigate(Character, &frame);
+        mode.move_to(end, &frame);
+        mode.navigate(Block, &frame);
+        assert!(mode.instructions().contains("Rectangular selection"));
+        assert_eq!(mode.selection().unwrap().anchor, anchor);
+        mode.navigate(Line, &frame);
+        let lines = mode.selection().unwrap();
+        assert!(!lines.block);
+        assert_eq!(lines.span(0, frame.cols), Some(0..frame.cols));
+        mode.navigate(Block, &frame);
+        assert_eq!(mode.selection().unwrap().span(0, frame.cols), Some(2..5));
+        mode.navigate(Character, &frame);
+        let linear = mode.selection().unwrap();
+        assert!(!linear.block);
+        assert_eq!(linear.anchor, anchor);
+        assert_eq!(linear.end, end);
+        mode.navigate(Block, &frame);
+        mode.navigate(Block, &frame);
+        assert!(mode.selection().is_none());
+        mode.navigate(Block, &frame);
+        assert_eq!(mode.selection().unwrap().anchor, end);
+
+        assert_eq!(CopyKey::from_vk(0x52, Mods::NONE), Some(Block));
+        assert_eq!(CopyKey::from_vk(0x56, Mods::CTRL), Some(Block));
+        assert_eq!(CopyKey::from_vk(0x56, Mods::CTRL | Mods::SHIFT), None);
+        assert_eq!(CopyKey::from_vk(0x52, Mods::SHIFT), None);
+        assert!(!Block.repeats());
     }
     #[test]
     fn alternate_screen_has_no_history_and_historical_entry_keeps_original_viewport() {
@@ -361,7 +448,7 @@ mod tests {
         assert_eq!(m.top, alt.first_stable_row);
         assert_eq!(m.cursor.row, alt.first_stable_row);
         assert_eq!(CopyKey::from_vk(0x56, Mods::SHIFT), Some(Line));
-        assert_eq!(CopyKey::from_vk(0x56, Mods::CTRL), None);
+        assert_eq!(CopyKey::from_vk(0x56, Mods::CTRL), Some(Block));
     }
 
     #[test]
@@ -417,7 +504,7 @@ mod tests {
         mode.move_to(target(mode.cursor, NextEnd), &frame);
         assert_eq!(mode.top, 0);
         assert_eq!(
-            selected_text(&t, 0, mode.screen, mode.selection().unwrap()).as_deref(),
+            selected_text(&t, 0, mode.screen, mode.selection().unwrap(), true).as_deref(),
             Ok("twoABCDEFGHI")
         );
     }
