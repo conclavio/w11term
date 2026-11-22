@@ -92,7 +92,7 @@ function Check-Actions {
     $ellipsis = [char]0x2026
     foreach ($label in 'Close',"Go to folder$ellipsis",'Back','Forward','Up','Refresh',"Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Delete$ellipsis",
         'Open folder',"Download$ellipsis",'Open shell here','Copy directory path','Copy selected path','Follow shell directory',
-        'Replace existing files',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
+        'Replace existing files','Sort by name','Sort newest first',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
     $horizontal = if ($actionsScroll.Current.HorizontallyScrollable) { 0,100 } else { -1 }
     foreach ($percent in 0,20,40,60,80,100) {
         foreach ($across in $horizontal) {

@@ -189,6 +189,7 @@ mod tests {
             vec![Entry {
                 name: name.into(),
                 kind,
+                mtime: None,
             }],
         );
         files.set_filter("résumé".into());

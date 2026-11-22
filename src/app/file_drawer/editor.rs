@@ -389,6 +389,7 @@ mod tests {
             vec![Entry {
                 name: name.into(),
                 kind,
+                mtime: None,
             }],
         );
         files.selected = Some(name.into());

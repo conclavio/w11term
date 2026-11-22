@@ -13,9 +13,11 @@ mod bookmarks;
 mod editor;
 mod history;
 mod preview;
+mod sort;
 mod text_draft;
 
 use history::{FolderHistory, HistoryDirection};
+pub use sort::SortOrder;
 
 const PAGE_SIZE: usize = 32;
 const PANEL_PADDING: f64 = 10.0;
@@ -68,6 +70,7 @@ pub enum FileAction {
     FocusFilter(u64, u64, u64, u8),
     Filter(u64, u64, u64, String),
     ClearFilter(u64, u64, u64),
+    Sort(u64, u64, u64, SortOrder),
     Choose(u64, u64, ListedEntry),
     CopyPath(u64, u64, u64, Option<ListedEntry>),
     PreviewText(u64, u64, ListedEntry),
@@ -113,6 +116,7 @@ pub(super) struct FileDrawer {
     following: bool,
     last_report: Option<Arc<str>>,
     entries: Vec<Entry>,
+    sort_order: SortOrder,
     filter: String,
     filter_input: Option<ElementRef<TextBox>>,
     /// Indices into the sorted listing, used only when the query is nonempty.
@@ -146,6 +150,7 @@ struct CachedPanel {
 pub struct Entry {
     name: String,
     kind: ListedKind,
+    mtime: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -510,7 +515,7 @@ pub(super) fn shell_directory(report: Option<&str>, host: &str) -> Option<String
     }
 }
 
-fn directory_entries(reply: &Value) -> Result<Vec<Entry>> {
+fn directory_entries(reply: &Value, order: SortOrder) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     let mut names = std::collections::HashSet::new();
     for item in reply["entries"]
@@ -526,12 +531,12 @@ fn directory_entries(reply: &Value) -> Result<Vec<Entry>> {
         entries.push(Entry {
             name: name.to_owned(),
             kind: ListedKind::from_attrs(&item["attrs"]),
+            mtime: item["attrs"]["mtime"]
+                .as_u64()
+                .and_then(|time| time.try_into().ok()),
         });
     }
-    entries.sort_by(|a, b| {
-        (a.kind != ListedKind::Known(EntryKind::Directory), &a.name)
-            .cmp(&(b.kind != ListedKind::Known(EntryKind::Directory), &b.name))
-    });
+    order.sort(&mut entries);
     Ok(entries)
 }
 
@@ -1015,6 +1020,7 @@ impl FileDrawer {
         *self = Self {
             open: self.open,
             following: self.following,
+            sort_order: self.sort_order,
             dialog_serial: self.dialog_serial,
             editor,
             generation,
@@ -1275,6 +1281,34 @@ impl FileDrawer {
                 ResumeTextEditor(pane, editor.serial()),
             ));
         }
+        let sort_button = |order, label: &str, name: &str| {
+            RadioButton::new()
+                .group_name(format!("sftp-sort-{pane}"))
+                .automation_name(name)
+                .min_width(0.0)
+                .is_enabled(writable)
+                .is_checked(self.sort_order == order)
+                .on_checked(context.callback(move |checked| {
+                    if checked {
+                        Message::Files(Sort(pane, generation, revision, order))
+                    } else {
+                        Message::ControlIdle
+                    }
+                }))
+                .content(label)
+        };
+        controls.push(
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .children((
+                    TextBlock::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .text("Sort by"),
+                    sort_button(SortOrder::Name, "Name", "Sort by name"),
+                    sort_button(SortOrder::NewestFirst, "Newest first", "Sort newest first"),
+                )),
+        );
         let filter: View = if let Some(input) = &self.filter_input {
             Grid::new()
                 .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -1698,6 +1732,7 @@ impl FileDrawer {
             }
             (Step::Listing(path, direction), Ok(reply)) => {
                 let generation = self.generation;
+                let order = self.sort_order;
                 self.parsing = true;
                 let rejected = Message::Files(FileAction::Listed(
                     id,
@@ -1713,7 +1748,7 @@ impl FileDrawer {
                             generation,
                             path,
                             direction,
-                            directory_entries(&reply).map_err(|e| e.to_string()),
+                            directory_entries(&reply, order).map_err(|e| e.to_string()),
                         ))
                     },
                     rejected,
@@ -1967,6 +2002,7 @@ impl TerminalApp {
             | FocusFilter(id, ..)
             | Filter(id, ..)
             | ClearFilter(id, ..)
+            | Sort(id, ..)
             | Choose(id, ..)
             | CopyPath(id, ..)
             | PreviewText(id, ..)
@@ -2025,7 +2061,7 @@ impl TerminalApp {
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, PreviewText(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) if *g != files.generation)
+        if matches!(&action, PreviewText(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2035,7 +2071,17 @@ impl TerminalApp {
             }
             return;
         }
-        if matches!(&action, Filter(_, _, r, _) | ClearFilter(_, _, r) | FocusFilter(_, _, r, _) | EditFilter(_, _, r, _) | Page(_, _, r, _) if *r != files.listing_revision)
+        if matches!(&action, Filter(_, _, r, _) | ClearFilter(_, _, r) | FocusFilter(_, _, r, _) | EditFilter(_, _, r, _) | Page(_, _, r, _) | Sort(_, _, r, _) if *r != files.listing_revision)
+        {
+            return;
+        }
+        if let Sort(_, _, _, order) = &action
+            && (!may_open_dialog
+                || !files.open
+                || files.directory.is_none()
+                || files.bookmarks.is_some()
+                || files.busy()
+                || *order == files.sort_order)
         {
             return;
         }
@@ -2043,8 +2089,11 @@ impl TerminalApp {
             &action,
             TextEditor(_, _, editor::Action::Text(_) | editor::Action::Name(_))
         );
-        let typing =
-            editor_typing || matches!(&action, Filter(..) | ClearFilter(..) | FocusFilter(..));
+        let keep_directory = editor_typing
+            || matches!(
+                &action,
+                Filter(..) | ClearFilter(..) | FocusFilter(..) | Sort(..)
+            );
         if !editor_typing && !matches!(action, Tick(_) | EditName(..) | FocusFilter(..)) {
             files.cached.borrow_mut().take();
         }
@@ -2285,6 +2334,7 @@ impl TerminalApp {
                     }
                 }
                 ClearFilter(..) => files.set_filter(String::new()),
+                Sort(_, _, _, order) => files.set_sort_order(order),
                 History(_, generation, revision, direction) => {
                     if may_open_dialog
                         && let Some(path) = files
@@ -2457,7 +2507,7 @@ impl TerminalApp {
         }
         if visible {
             let return_to_terminal = finish_filter && !tab.files.filter_editing();
-            if !typing {
+            if !keep_directory {
                 tab.follow_shell_directory(&frame, context);
             }
             if drawer_was_open != tab.files.open
@@ -2710,6 +2760,7 @@ mod tests {
     fn listing() -> Vec<Entry> {
         (0..78)
             .map(|index| Entry {
+                mtime: None,
                 name: if index % 2 == 0 {
                     format!("{index:02} [Ångström] 雪")
                 } else {
@@ -2868,6 +2919,7 @@ mod tests {
             vec![Entry {
                 name: name.into(),
                 kind,
+                mtime: None,
             }],
         );
         let revision = drawer.listing_revision;
@@ -3084,7 +3136,7 @@ mod tests {
             {"filename":"link", "attrs":{"permissions": 0o120777}}, {"filename":".", "attrs":{}},
             {"filename":"folder", "attrs":{"permissions":0o040755}}, {"filename":"file", "attrs":{"permissions":0o100644}},
         ]});
-        let entries = directory_entries(&listing).unwrap();
+        let entries = directory_entries(&listing, SortOrder::Name).unwrap();
         assert_eq!(
             (&*entries[0].name, entries[0].kind),
             ("folder", ListedKind::Known(EntryKind::Directory))
@@ -3314,6 +3366,7 @@ mod tests {
             entries: vec![Entry {
                 name: source.name.clone(),
                 kind: source.kind,
+                mtime: None,
             }],
             selected: Some(source.name.clone()),
             ..Default::default()
@@ -3472,6 +3525,7 @@ mod tests {
             entries: vec![Entry {
                 name: entry.name.clone(),
                 kind: entry.kind,
+                mtime: None,
             }],
             ..Default::default()
         };
@@ -3553,6 +3607,7 @@ mod tests {
             vec![Entry {
                 name: "alias".into(),
                 kind: ListedKind::Known(EntryKind::File),
+                mtime: None,
             }],
         );
         assert_eq!(drawer.status, "Deleted alias");
@@ -3703,6 +3758,7 @@ mod tests {
                 vec![Entry {
                     name: name.into(),
                     kind,
+                    mtime: None,
                 }],
             );
             drawer.selected = Some(name.into());
@@ -3805,6 +3861,6 @@ mod tests {
     #[test]
     fn duplicate_listing_entries_fail_before_creating_native_item_keys() {
         let listing = json!({"entries":[{"filename":"twice"},{"filename":"twice"}]});
-        assert!(directory_entries(&listing).is_err());
+        assert!(directory_entries(&listing, SortOrder::Name).is_err());
     }
 }
