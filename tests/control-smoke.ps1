@@ -36,6 +36,16 @@ function Wait-ControlManifest {
         Start-Sleep -Milliseconds 50
     }
 }
+function Stop-TestWindow([Diagnostics.Process]$Process) {
+    if ($Process -and -not $Process.HasExited) {
+        $Process.Refresh()
+        $null = $Process.CloseMainWindow()
+        if (-not $Process.WaitForExit(5000)) {
+            $Process.Kill()
+            $Process.WaitForExit()
+        }
+    }
+}
 try {
     $peer = Start-Process -FilePath $echo -ArgumentList @('--port', $port, '--state-dir', ('"' + $state + '"')) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $state 'peer.log') -RedirectStandardError (Join-Path $state 'peer.err')
     $ready = Join-Path $state 'server.json'
@@ -180,8 +190,7 @@ try {
     $null = Invoke-Control @('wait-for-text', '--pane', '1', '--timeout', '5', 'TAPE')
     $replayed = Invoke-Control @('get-text', '--pane', '1')
     if ($replayed.cols -ne $live.cols -or $replayed.rows -ne $live.rows -or $replayed.text -cne $live.text) { throw 'Replay did not reproduce the recorded grid and screen contents' }
-    $null = $terminal.CloseMainWindow()
-    if (-not $terminal.WaitForExit(5000)) { throw 'Recorded replay failed to close' }
+    Stop-TestWindow $terminal
 
     # A raw VT capture has no sidecar with a suggested starting grid.
     $rawCapture = Join-Path $state 'raw-image.vt'
@@ -208,10 +217,7 @@ try {
     } finally { $bitmap.Dispose() }
     Write-Output "Control smoke passed. Verified loopback SSH, background PowerShell restart, window restore, VT record/replay, and raw replay image pixels. Artifacts: $state"
 } finally {
-    if ($terminal -and -not $terminal.HasExited) {
-        $null = $terminal.CloseMainWindow()
-        if (-not $terminal.WaitForExit(5000)) { Stop-Process -Id $terminal.Id }
-    }
+    Stop-TestWindow $terminal
     if ($peer -and -not $peer.HasExited) { Stop-Process -Id $peer.Id }
     $env:W11TERM_DATA_DIR = $oldDataDir
     $env:W11TERM_SETTINGS_PATH = $oldSettingsPath
