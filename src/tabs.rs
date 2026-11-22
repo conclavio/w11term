@@ -6,6 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type TabId = u64;
 
+/// The divider removed when closing one leaf of a split.
+#[derive(Debug)]
+pub struct ClosedPaneLocation {
+    group: TabId,
+    path: Vec<bool>,
+    sibling_panes: Vec<TabId>,
+    axis: Axis,
+    ratio: f64,
+    was_second: bool,
+}
+
 /// The exact split tree that was visible when the balance action was offered.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaneBalance {
@@ -594,6 +605,66 @@ impl<T> Tabs<T> {
     }
     pub fn remove(&mut self, id: TabId) -> Option<T> {
         self.take_entry(id).map(|entry| entry.value)
+    }
+
+    pub fn closed_pane_location(&self, pane: TabId) -> Option<ClosedPaneLocation> {
+        let group = self.group_id(pane)?;
+        let (path, parent) = self.layout_for(pane)?.parent_of(pane)?;
+        let Layout::Split {
+            first,
+            second,
+            axis,
+            ratio,
+        } = parent
+        else {
+            return None;
+        };
+        let was_second = matches!(second.as_ref(), Layout::Leaf(id) if *id == pane);
+        let sibling = if was_second { first } else { second };
+        Some(ClosedPaneLocation {
+            group,
+            path,
+            sibling_panes: sibling.leaves(),
+            axis: *axis,
+            ratio: *ratio,
+            was_second,
+        })
+    }
+
+    /// Restore the removed split if the surviving subtree is still there.
+    /// Open a separate tab if reopening would split an unrelated set of panes.
+    pub fn reopen_pane(&mut self, location: &ClosedPaneLocation, value: T) -> TabId {
+        let original = self.groups.iter_mut().find(|g| g.id == location.group);
+        if let Some(group) = original
+            && let Some(node) = group.layout.node_mut(&location.path)
+            && node.leaves() == location.sibling_panes
+        {
+            let id = next_id();
+            let old = Box::new(std::mem::replace(node, Layout::Leaf(id)));
+            let new = Box::new(Layout::Leaf(id));
+            let (first, second) = if location.was_second {
+                (old, new)
+            } else {
+                (new, old)
+            };
+            *node = Layout::Split {
+                axis: location.axis,
+                ratio: location.ratio,
+                first,
+                second,
+            };
+            self.entries.push(Tab {
+                id,
+                group: location.group,
+                value,
+                visit: None,
+            });
+            group.focused = id;
+            group.zoomed = false;
+            self.active_group = Some(location.group);
+            return id;
+        }
+        self.insert(value)
     }
 
     fn take_entry(&mut self, id: TabId) -> Option<Tab<T>> {
@@ -1398,6 +1469,53 @@ mod tests {
         assert_eq!(tabs.active_id(), Some(after));
         assert!(tabs.get(second).is_none() && tabs.get(third).is_none());
         assert_eq!(tabs.headers().len(), 1);
+    }
+
+    #[test]
+    fn reopening_one_pane_restores_its_divider_without_replacing_surviving_panes() {
+        let mut tabs = Tabs::default();
+        let closed = tabs.insert("local");
+        let ssh = tabs.split(closed, "ssh", Axis::Columns).unwrap();
+        let logs = tabs.split(ssh, "logs", Axis::Rows).unwrap();
+        tabs.set_ratio(&[], 0.375);
+        tabs.set_ratio(&[true], 0.62);
+        let location = tabs.closed_pane_location(closed).unwrap();
+        assert_eq!(tabs.remove(closed), Some("local"));
+        assert!(tabs.set_ratio(&[], 0.7));
+        let unrelated = tabs.insert("unrelated");
+
+        let reopened = tabs.reopen_pane(&location, "fresh local");
+        assert_ne!(reopened, closed);
+        assert_eq!(tabs.active_id(), Some(reopened));
+        assert_eq!(tabs.group_id(reopened), Some(closed));
+        assert_eq!(
+            tabs.active_layout().unwrap().leaves(),
+            [reopened, ssh, logs]
+        );
+        assert_eq!(tabs.get(ssh), Some(&"ssh"));
+        assert_eq!(tabs.get(logs), Some(&"logs"));
+        assert_eq!(tabs.get(unrelated), Some(&"unrelated"));
+        let Layout::Split { ratio, second, .. } = tabs.active_layout().unwrap() else {
+            panic!("original root divider was lost");
+        };
+        assert_eq!(*ratio, 0.375);
+        assert!(matches!(second.as_ref(), Layout::Split { ratio: 0.7, .. }));
+    }
+
+    #[test]
+    fn reopening_after_the_sibling_moved_creates_a_separate_tab() {
+        let mut tabs = Tabs::default();
+        let ssh = tabs.insert("ssh");
+        let closed = tabs.split(ssh, "local", Axis::Rows).unwrap();
+        let location = tabs.closed_pane_location(closed).unwrap();
+        tabs.remove(closed);
+        let other = tabs.insert("other");
+        assert!(tabs.move_to_existing_tab(ssh, other, Direction::Right));
+        let existing = tabs.active_layout().unwrap().clone();
+
+        let reopened = tabs.reopen_pane(&location, "fresh local");
+        assert_eq!(tabs.active_layout(), Some(&Layout::Leaf(reopened)));
+        assert_eq!(tabs.layout_for(other), Some(&existing));
     }
 
     #[test]

@@ -51,6 +51,7 @@ pub enum Action {
     NewTab,
     DuplicateTabLayout,
     ReopenClosedTab,
+    ReopenClosedPane,
     CloseTab,
     SelectTab(u8),
     Workspaces,
@@ -247,6 +248,13 @@ pub const BINDINGS: &[Binding] = &[
         ReopenClosedTab,
         "reopen_closed_tab",
         "Reopen last closed tab layout",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(
+        ReopenClosedPane,
+        "reopen_closed_pane",
+        "Reopen last closed pane",
         0,
         Mods::NONE,
     ),
@@ -623,6 +631,7 @@ mod tests {
         for (action, expected) in [
             (FocusPreviousPane, r#"{"focus_previous_pane":"F8"}"#),
             (ReopenClosedTab, r#"{"reopen_closed_tab":"F8"}"#),
+            (ReopenClosedPane, r#"{"reopen_closed_pane":"F8"}"#),
         ] {
             let mut shortcuts = Shortcuts::default();
             assert_eq!(shortcuts.get(action.binding()), None);

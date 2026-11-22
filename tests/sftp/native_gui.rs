@@ -896,6 +896,7 @@ async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
     check_mixed_tab_layout(
         "duplicate-tab-layout-ui.ps1",
         b"source-before/duplicate-background/duplicate-focused/source-after/",
+        2,
     )
     .await;
 }
@@ -906,11 +907,23 @@ async fn native_reopen_closed_tab_layout_restores_position_focus_and_input_lock(
     check_mixed_tab_layout(
         "reopen-tab-layout-ui.ps1",
         b"source-before/reopened-after-unlock/",
+        2,
     )
     .await;
 }
 
-async fn check_mixed_tab_layout(script: &str, expected_input: &[u8]) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "restores a single PowerShell pane beside a live SSH shell after closing the split"]
+async fn native_reopen_closed_pane_keeps_the_neighboring_ssh_session() {
+    check_mixed_tab_layout(
+        "reopen-pane-ui.ps1",
+        b"before-local-close/after-local-reopen/",
+        1,
+    )
+    .await;
+}
+
+async fn check_mixed_tab_layout(script: &str, expected_input: &[u8], ssh_logins: usize) {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, channels, server) =
         fixture_counting_accepts(false, 4, accepted.clone()).await
@@ -937,8 +950,12 @@ async fn check_mixed_tab_layout(script: &str, expected_input: &[u8]) {
     )
     .unwrap();
     drive_mixed_gui(script, &ssh, state.path());
-    assert_eq!(accepted.load(Ordering::Relaxed), 2, "SSH logins");
-    assert_eq!(channels.load(Ordering::Relaxed), 2, "SSH shell channels");
+    assert_eq!(accepted.load(Ordering::Relaxed), ssh_logins, "SSH logins");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        ssh_logins,
+        "SSH shell channels"
+    );
     assert_eq!(
         fs::read(trace).unwrap(),
         expected_input,

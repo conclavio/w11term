@@ -3,7 +3,7 @@ use w11term::tabs::TabTitle;
 use w11term::workspace::{SavedLayout, SavedSource, SshStartup, Workspace, WorkspaceStore};
 
 mod duplicate;
-pub(super) use duplicate::ClosedTab;
+pub(super) use duplicate::{ClosedPane, ClosedTab};
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {

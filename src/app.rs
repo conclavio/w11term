@@ -618,6 +618,7 @@ fn tab_menu_message(label: String) -> Message {
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
         "Duplicate tab layout" => Message::Shortcut(Shortcut::DuplicateTabLayout),
         "Reopen last closed tab layout" => Message::Shortcut(Shortcut::ReopenClosedTab),
+        "Reopen last closed pane" => Message::Shortcut(Shortcut::ReopenClosedPane),
         "Move tab left" => Message::Shortcut(Shortcut::MoveTabLeft),
         "Move tab right" => Message::Shortcut(Shortcut::MoveTabRight),
         "SFTP files" => Message::Files(FileAction::Toggle),
@@ -729,6 +730,7 @@ struct CaretMenuBinding {
     group: Option<TabId>,
     arrangement: PaneArrangement,
     closed_group: Option<TabId>,
+    closed_pane: Option<TabId>,
     exited: Option<ExitedPane>,
     on_click: Callback<String>,
 }
@@ -820,6 +822,7 @@ pub struct TerminalApp {
     control_task: Option<ComponentTask>,
     tabs: Tabs<AppTab>,
     closed_tab: Option<workspace_view::ClosedTab>,
+    closed_pane: Option<workspace_view::ClosedPane>,
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
     header: RefCell<Option<View>>,
@@ -902,6 +905,7 @@ pub enum Message {
     MoveTabToWindow,
     DuplicateTabLayout(TabId),
     ReopenClosedTab(Option<TabId>),
+    ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
     WindowTick,
     DismissWindowError,
@@ -2950,6 +2954,7 @@ impl TerminalApp {
         let group = self.tabs.active_group_id();
         let mut cached = self.caret_menu_binding.borrow_mut();
         let closed_group = self.closed_tab.as_ref().map(|closed| closed.group);
+        let closed_pane = self.closed_pane.as_ref().map(|closed| closed.id);
         let forward = self.forward_origin();
         if let Some(binding) = cached.as_ref()
             && binding.previous == previous
@@ -2959,6 +2964,7 @@ impl TerminalApp {
             && binding.recordings == recordings
             && binding.group == group
             && binding.closed_group == closed_group
+            && binding.closed_pane == closed_pane
             && binding.arrangement == arrangement
             && binding.directory_split == directory_split
             && binding.exited == exited
@@ -2990,6 +2996,9 @@ impl TerminalApp {
                 Message::Shortcut(Shortcut::ReopenClosedTab) => {
                     Message::ReopenClosedTab(closed_group)
                 }
+                Message::Shortcut(Shortcut::ReopenClosedPane) => {
+                    Message::ReopenClosedPane(closed_pane)
+                }
                 Message::Shortcut(Shortcut::FocusPreviousPane) => previous_pane::message(previous),
                 Message::Shortcut(Shortcut::SwapPane(direction)) => offered.message(direction),
                 Message::Shortcut(Shortcut::RotateSplit) => offered.rotate(),
@@ -3011,6 +3020,7 @@ impl TerminalApp {
             recordings,
             previous,
             closed_group,
+            closed_pane,
             forward,
             directory_split,
             pane,
@@ -3236,6 +3246,12 @@ impl TerminalApp {
                 KeyAction::ReopenClosedTab.binding().label,
                 KeyAction::ReopenClosedTab,
                 self.closed_tab.is_some(),
+            ),
+            self.binding_menu_enabled(
+                KeyAction::ReopenClosedPane.binding().id,
+                KeyAction::ReopenClosedPane.binding().label,
+                KeyAction::ReopenClosedPane,
+                self.closed_pane.is_some(),
             ),
             self.binding_menu_enabled(
                 "move-tab-left",
@@ -4181,6 +4197,7 @@ impl Component for TerminalApp {
             control_task: None,
             tabs,
             closed_tab: None,
+            closed_pane: None,
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
             header: RefCell::new(None),
@@ -4398,6 +4415,13 @@ impl Component for TerminalApp {
                     .map(|error| format!("Couldn’t reopen tab layout. {error:#}"));
             }
             Message::ReopenClosedTab(None) => {}
+            Message::ReopenClosedPane(Some(id)) => {
+                self.window_error = self
+                    .reopen_closed_pane(id, context)
+                    .err()
+                    .map(|error| format!("Couldn’t reopen pane. {error:#}"));
+            }
+            Message::ReopenClosedPane(None) => {}
             Message::MoveTab(group, direction) => {
                 if self.tabs.active_group_id() == Some(group)
                     && self.tabs.move_active_tab(direction)
@@ -5239,6 +5263,7 @@ impl Component for TerminalApp {
                     if self.tabs.active_layout().is_some_and(|layout| {
                         matches!(layout, w11term::pane_layout::Layout::Split { .. })
                     }) {
+                        self.remember_closed_pane(id);
                         self.keyboard.set_target(None);
                         self.tabs.remove(id);
                         self.sync_selection(context);
@@ -5429,6 +5454,10 @@ impl Component for TerminalApp {
                 Shortcut::ReopenClosedTab => {
                     let group = self.closed_tab.as_ref().map(|closed| closed.group);
                     self.update(Message::ReopenClosedTab(group), context);
+                }
+                Shortcut::ReopenClosedPane => {
+                    let id = self.closed_pane.as_ref().map(|closed| closed.id);
+                    self.update(Message::ReopenClosedPane(id), context);
                 }
                 Shortcut::Select(index) => {
                     if let Some(id) = self.tabs.headers().get(index).map(|t| t.id) {
