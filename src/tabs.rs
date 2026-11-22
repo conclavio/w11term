@@ -65,6 +65,14 @@ pub struct Tab<T> {
     pub id: TabId,
     pub value: T,
     group: TabId,
+    visit: Option<PaneVisit>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PaneVisit {
+    window: u64,
+    session: u64,
+    order: u64,
 }
 
 impl<T> Tab<T> {
@@ -85,14 +93,19 @@ pub struct Tabs<T> {
     entries: Vec<Tab<T>>,
     groups: Vec<Group>,
     active_group: Option<TabId>,
+    window: u64,
+    visit_order: u64,
 }
 
 impl<T> Default for Tabs<T> {
     fn default() -> Self {
+        static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
         Self {
             entries: vec![],
             groups: vec![],
             active_group: None,
+            window: NEXT_WINDOW.fetch_add(1, Ordering::Relaxed),
+            visit_order: 0,
         }
     }
 }
@@ -125,6 +138,51 @@ impl<T> Tabs<T> {
     }
     pub fn active_id(&self) -> Option<TabId> {
         Some(self.groups.get(self.active_index()?)?.focused)
+    }
+
+    /// Record a committed terminal focus, after any background launch or layout
+    /// restoration has finished choosing the active pane.
+    pub fn record_pane_focus(&mut self, pane: impl Fn(&T) -> Option<u64>) {
+        let Some(id) = self.active_id() else { return };
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        let Some(session) = pane(&entry.value) else {
+            return;
+        };
+        let last = PaneVisit {
+            window: self.window,
+            session,
+            order: self.visit_order,
+        };
+        if entry.visit == Some(last) {
+            return;
+        }
+        self.visit_order += 1;
+        entry.visit = Some(PaneVisit {
+            order: self.visit_order,
+            ..last
+        });
+    }
+
+    /// A utility page can return to the most recent terminal; a terminal skips
+    /// itself. Resolving a command or rendering its availability is read-only.
+    pub fn previous_pane(&self, pane: impl Fn(&T) -> Option<u64>) -> Option<TabId> {
+        let current = self.active_id();
+        self.entries
+            .iter()
+            .filter_map(|entry| {
+                let visit = entry.visit?;
+                // A transferred pane can return if its new window fails to open.
+                // Its original visit counts only in that window, and only while
+                // its session still occupies the same tab entry.
+                (Some(entry.id) != current
+                    && visit.window == self.window
+                    && pane(&entry.value) == Some(visit.session))
+                .then_some((visit.order, entry.id))
+            })
+            .max()
+            .map(|(_, id)| id)
     }
     pub fn title_for(&self, entry: TabId) -> Option<&TabTitle> {
         let group = self.group_id(entry)?;
@@ -264,7 +322,7 @@ impl<T> Tabs<T> {
     }
     pub fn insert(&mut self, value: T) -> TabId {
         let id = next_id();
-        self.insert_group(id, id, value);
+        self.insert_group(id, id, value, None);
         id
     }
 
@@ -299,6 +357,7 @@ impl<T> Tabs<T> {
                 id,
                 group,
                 value: create(recipes.next().expect("one recipe per leaf")),
+                visit: None,
             });
             id
         });
@@ -317,11 +376,12 @@ impl<T> Tabs<T> {
         Ok(Some(id))
     }
 
-    fn insert_group(&mut self, id: TabId, entry_id: TabId, value: T) {
+    fn insert_group(&mut self, id: TabId, entry_id: TabId, value: T, visit: Option<PaneVisit>) {
         self.entries.push(Tab {
             id: entry_id,
             group: id,
             value,
+            visit,
         });
         self.groups.push(Group {
             id,
@@ -338,8 +398,8 @@ impl<T> Tabs<T> {
             return false;
         }
         let id = self.active_id().expect("a split has a focused pane");
-        let value = self.remove(id).expect("focused pane exists");
-        self.insert_group(next_id(), id, value);
+        let entry = self.take_entry(id).expect("focused pane exists");
+        self.insert_group(next_id(), id, entry.value, entry.visit);
         true
     }
 
@@ -382,6 +442,7 @@ impl<T> Tabs<T> {
             id,
             group: group_id,
             value,
+            visit: None,
         });
         group.focused = id;
         group.zoomed = false;
@@ -416,10 +477,14 @@ impl<T> Tabs<T> {
         }
     }
     pub fn remove(&mut self, id: TabId) -> Option<T> {
+        self.take_entry(id).map(|entry| entry.value)
+    }
+
+    fn take_entry(&mut self, id: TabId) -> Option<Tab<T>> {
         let index = self.entries.iter().position(|t| t.id == id)?;
         let removed = self.entries.remove(index);
         self.remove_from_layout(removed.group, id);
-        Some(removed.value)
+        Some(removed)
     }
     fn remove_from_layout(&mut self, group_id: TabId, id: TabId) {
         let group_index = self
@@ -474,6 +539,7 @@ impl<T> Tabs<T> {
             entries,
             groups: vec![group],
             active_group: Some(group_id),
+            ..Self::default()
         })
     }
     /// Return an unclaimed transfer to its previous header position.
@@ -502,6 +568,7 @@ impl<T> Tabs<T> {
         self.remove_header(group);
         true
     }
+
     pub fn reorder(&mut self, order: &[TabId]) -> bool {
         if order.len() != self.groups.len() {
             return false;
@@ -523,6 +590,82 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previous_pane_toggles_committed_terminal_visits_across_tabs_and_splits() {
+        let mut tabs = Tabs::default();
+        let pane = |value: &Option<u64>| *value;
+        let ssh = tabs.insert(Some(101));
+        tabs.record_pane_focus(pane);
+        assert_eq!(tabs.previous_pane(pane), None);
+        let _unvisited = tabs.split(ssh, Some(102), Axis::Rows).unwrap();
+        let shell = tabs.insert(Some(103));
+        tabs.record_pane_focus(pane);
+        tabs.record_pane_focus(pane);
+        for expected in [ssh, shell, ssh] {
+            assert_eq!(tabs.previous_pane(pane), Some(expected));
+            assert!(tabs.select(expected));
+            tabs.record_pane_focus(pane);
+        }
+        let _settings = tabs.insert(None);
+        tabs.record_pane_focus(pane);
+        assert_eq!(tabs.previous_pane(pane), Some(ssh));
+        assert!(tabs.select(ssh));
+        tabs.record_pane_focus(pane);
+        assert_eq!(tabs.previous_pane(pane), Some(shell));
+        // A new session occupies the old entry but hasn't received focus.
+        *tabs.get_mut(shell).unwrap() = Some(104);
+        assert_eq!(tabs.previous_pane(pane), None);
+    }
+
+    #[test]
+    fn previous_pane_falls_back_in_visit_order_and_stays_in_its_window() {
+        let mut tabs = Tabs::default();
+        let pane = |value: &u64| Some(*value);
+        let a = tabs.insert(10);
+        tabs.record_pane_focus(pane);
+        let b = tabs.split(a, 20, Axis::Columns).unwrap();
+        tabs.record_pane_focus(pane);
+        let c = tabs.insert(30);
+        tabs.record_pane_focus(pane);
+        let d = tabs.split(c, 40, Axis::Rows).unwrap();
+        tabs.record_pane_focus(pane);
+        assert!(tabs.move_active_to_new_tab());
+        assert_eq!(tabs.previous_pane(pane), Some(c));
+        assert!(tabs.move_to_existing_tab(d, a, Direction::Right));
+        assert_eq!(tabs.previous_pane(pane), Some(c));
+        tabs.remove(c);
+        assert_eq!(tabs.previous_pane(pane), Some(b));
+        let mut moved = tabs.take_group(tabs.group_id(a).unwrap()).unwrap();
+        assert_eq!(tabs.previous_pane(pane), None);
+        assert_eq!(moved.previous_pane(pane), None);
+        moved.record_pane_focus(pane);
+        assert!(moved.select(a));
+        moved.record_pane_focus(pane);
+        assert_eq!(moved.previous_pane(pane), Some(d));
+        assert!(moved.remove_group(a));
+        assert_eq!(moved.previous_pane(pane), None);
+    }
+
+    #[test]
+    fn previous_pane_recovers_visits_after_an_unclaimed_window_transfer() {
+        let mut tabs = Tabs::default();
+        let pane = |value: &u64| Some(*value);
+        let a = tabs.insert(10);
+        tabs.record_pane_focus(pane);
+        let b = tabs.insert(20);
+        tabs.record_pane_focus(pane);
+        let c = tabs.insert(30);
+        tabs.record_pane_focus(pane);
+        let offered = tabs.take_group(tabs.group_id(b).unwrap()).unwrap();
+        assert_eq!(tabs.previous_pane(pane), Some(a));
+        assert!(tabs.select(a));
+        tabs.record_pane_focus(pane);
+        tabs.restore_group(offered, 1, false);
+        assert_eq!(tabs.previous_pane(pane), Some(c));
+        tabs.remove(c);
+        assert_eq!(tabs.previous_pane(pane), Some(b));
+    }
 
     #[test]
     fn rotate_only_the_nearest_split_preserves_sessions_focus_and_ratios() {

@@ -14,6 +14,7 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
+    FocusPreviousPane,
     ResizeLeft,
     ResizeRight,
     ResizeUp,
@@ -81,6 +82,13 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(FocusRight, "focus_right", "Focus right", 0x27, CTRL_ALT),
     Binding::new(FocusUp, "focus_up", "Focus above", 0x26, CTRL_ALT),
     Binding::new(FocusDown, "focus_down", "Focus below", 0x28, CTRL_ALT),
+    Binding::new(
+        FocusPreviousPane,
+        "focus_previous_pane",
+        "Focus previous pane",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(ResizeLeft, "resize_left", "Resize left", 0x25, ALT_SHIFT),
     Binding::new(ResizeRight, "resize_right", "Resize right", 0x27, ALT_SHIFT),
     Binding::new(ResizeUp, "resize_up", "Resize up", 0x26, ALT_SHIFT),
@@ -499,6 +507,27 @@ mod tests {
                 map.resolve(chord.key, chord.mods, in_terminal, false),
                 Some(FindAllPanes)
             );
+        }
+    }
+
+    #[test]
+    fn previous_pane_is_optional_and_can_return_from_a_utility_tab() {
+        let mut shortcuts = Shortcuts::default();
+        let chord: Chord = "F8".parse().unwrap();
+        assert_eq!(shortcuts.get(FocusPreviousPane.binding()), None);
+        shortcuts.set(FocusPreviousPane, Some(chord)).unwrap();
+        let json = serde_json::to_string(&shortcuts).unwrap();
+        assert_eq!(json, r#"{"focus_previous_pane":"F8"}"#);
+        let map = serde_json::from_str::<Shortcuts>(&json)
+            .unwrap()
+            .keymap()
+            .unwrap();
+        for terminal in [true, false] {
+            assert_eq!(
+                map.resolve(chord.key, chord.mods, terminal, false),
+                Some(FocusPreviousPane)
+            );
+            assert_eq!(map.resolve(chord.key, chord.mods, terminal, true), None);
         }
     }
 

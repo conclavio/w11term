@@ -65,6 +65,7 @@ mod local_smoke;
 mod pane_colors;
 mod pane_picker;
 mod pane_view;
+mod previous_pane;
 mod scrollback_bar;
 mod scrollback_export;
 mod session_browser;
@@ -360,6 +361,13 @@ impl AppTab {
             _ => None,
         }
     }
+
+    fn visited_terminal(&self) -> Option<u64> {
+        match &self.page {
+            Page::Terminal(tab) if !tab.browsing_sessions() => Some(tab.session.pane_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -588,6 +596,7 @@ fn tab_menu_message(label: String) -> Message {
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
         "Focus below" => Message::PaneNeighbor(Direction::Down),
+        "Focus previous pane" => Message::Shortcut(Shortcut::FocusPreviousPane),
         "Resize left" => Message::Shortcut(Shortcut::ResizePane(Direction::Left)),
         "Resize right" => Message::Shortcut(Shortcut::ResizePane(Direction::Right)),
         "Resize up" => Message::Shortcut(Shortcut::ResizePane(Direction::Up)),
@@ -654,6 +663,7 @@ enum UiWork {
 }
 
 struct CaretMenuBinding {
+    previous: Option<previous_pane::Target>,
     forward: Option<local_forwards::Origin>,
     directory_split: Option<directory_split::Origin>,
     pane: Option<u64>,
@@ -810,6 +820,7 @@ pub enum Message {
     SplitPane(Axis, Option<String>),
     SplitInDirectory(Axis, directory_split::Origin),
     PaneNeighbor(Direction),
+    FocusPreviousPane(previous_pane::Target),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
     ZoomPane,
@@ -2032,6 +2043,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.tabs.record_pane_focus(AppTab::visited_terminal);
         self.clipboard.input_origin.set(self.paste_origin());
         self.discard_inactive_paste();
         self.bind_folder_shares();
@@ -2225,6 +2237,8 @@ impl TerminalApp {
             self.sync_selection(context);
             if active {
                 self.activate(context);
+            } else {
+                self.refresh_open_commands();
             }
         }
     }
@@ -2701,6 +2715,7 @@ impl TerminalApp {
         exited: Option<ExitedPane>,
         arrangement: PaneArrangement,
         directory_split: Option<directory_split::Origin>,
+        previous: Option<previous_pane::Target>,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let paste = self.paste_origin();
@@ -2708,6 +2723,7 @@ impl TerminalApp {
         let mut cached = self.caret_menu_binding.borrow_mut();
         let forward = self.forward_origin();
         if let Some(binding) = cached.as_ref()
+            && binding.previous == previous
             && binding.forward == forward
             && binding.pane == pane
             && binding.paste == paste
@@ -2738,6 +2754,7 @@ impl TerminalApp {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
             }
             _ => match tab_menu_message(label) {
+                Message::Shortcut(Shortcut::FocusPreviousPane) => previous_pane::message(previous),
                 Message::Shortcut(Shortcut::SwapPane(direction)) => offered.message(direction),
                 Message::Shortcut(Shortcut::RotateSplit) => offered.rotate(),
                 Message::Shortcut(shortcut) if let Some(axis) = directory_split::axis(shortcut) => {
@@ -2750,6 +2767,7 @@ impl TerminalApp {
             },
         });
         *cached = Some(CaretMenuBinding {
+            previous,
             forward,
             directory_split,
             pane,
@@ -2832,6 +2850,7 @@ impl TerminalApp {
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
+        let previous = previous_pane::target(&self.tabs);
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2839,8 +2858,13 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                self.caret_items(exited.is_some(), &arrangement, directory_split.is_some()),
-                self.caret_menu_callback(context, exited, arrangement, directory_split),
+                self.caret_items(
+                    exited.is_some(),
+                    &arrangement,
+                    directory_split.is_some(),
+                    previous,
+                ),
+                self.caret_menu_callback(context, exited, arrangement, directory_split, previous),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2897,6 +2921,7 @@ impl TerminalApp {
         can_restart: bool,
         arrangement: &PaneArrangement,
         can_split_directory: bool,
+        previous: Option<previous_pane::Target>,
     ) -> Vec<MenuItem> {
         let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
@@ -2925,7 +2950,12 @@ impl TerminalApp {
                 "Command palette…",
                 KeyAction::CommandPalette,
             ),
-            self.pane_menu(can_restart, arrangement, can_split_directory),
+            self.pane_menu(
+                can_restart,
+                arrangement,
+                can_split_directory,
+                previous.is_some(),
+            ),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.duplicate_tab_item(),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
@@ -3076,9 +3106,21 @@ impl TerminalApp {
         can_restart: bool,
         arrangement: &PaneArrangement,
         can_split_directory: bool,
+        can_focus_previous: bool,
     ) -> MenuItem {
+        let binding = KeyAction::FocusPreviousPane.binding();
+        let previous_item = self.binding_menu_enabled(
+            binding.id,
+            binding.label,
+            binding.action,
+            can_focus_previous,
+        );
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
-            return MenuItem::disabled("panes", "Panes");
+            return if can_focus_previous {
+                MenuItem::submenu("panes", "Panes", [previous_item])
+            } else {
+                MenuItem::disabled("panes", "Panes")
+            };
         }
         let action = KeyAction::MovePaneToExistingTab;
         let binding = action.binding();
@@ -3204,6 +3246,7 @@ impl TerminalApp {
             KeyAction::RotateSplit,
             arrangement.rotation.is_some(),
         ));
+        items.push(previous_item);
         if self
             .tabs
             .active_layout()
@@ -4614,6 +4657,7 @@ impl Component for TerminalApp {
                     self.frame_tasks.remove(&id);
                     let active = self.tabs.active_id() == Some(id);
                     let mut pane_actions_changed = false;
+                    let mut discovery_changed = false;
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -4671,6 +4715,7 @@ impl Component for TerminalApp {
                         }
                         let phase = tab.session.durable_state().map(|s| s.phase);
                         if tab.durable_phase != phase {
+                            discovery_changed = tab.discovery_page.is_some();
                             tab.durable_phase = phase;
                             tab.confirm_end = false;
                             self.header.borrow_mut().take();
@@ -4678,10 +4723,14 @@ impl Component for TerminalApp {
                         }
                     }
                     if active {
+                        // A durable session browser can become the live shell in place.
+                        if discovery_changed {
+                            self.tabs.record_pane_focus(AppTab::visited_terminal);
+                        }
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
-                    if pane_actions_changed {
+                    if pane_actions_changed || discovery_changed {
                         self.refresh_open_commands();
                     }
                     if let Some(AppTab {
@@ -4724,6 +4773,11 @@ impl Component for TerminalApp {
                 let _ = context.window().request_close();
             }
             Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::FocusPreviousPane(target) => {
+                if previous_pane::target(&self.tabs) == Some(target) {
+                    self.focus_previous_pane(target, context);
+                }
+            }
             Message::SetPaneReadOnly(enabled) => {
                 if let Some(id) = self.tabs.active_id()
                     && let Some(AppTab {
@@ -4889,6 +4943,11 @@ impl Component for TerminalApp {
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)
+                }
+                Shortcut::FocusPreviousPane => {
+                    if let Some(target) = previous_pane::target(&self.tabs) {
+                        self.focus_previous_pane(target, context);
+                    }
                 }
                 Shortcut::ZoomPane => self.update(Message::ZoomPane, context),
                 Shortcut::ClosePane => self.update(Message::ClosePane, context),

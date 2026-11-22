@@ -1202,6 +1202,21 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "toggles the previously focused live SSH or PowerShell pane across splits, tabs and Settings"]
+async fn native_previous_pane_reuses_live_shells_across_tabs_and_skips_closed_panes() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let keyboard = remote.path().join("keyboard-input.bin");
+    fs::write(&keyboard, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("focus-previous-pane-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(keyboard).unwrap(), b"ssh-split;ssh-restored");
+    assert_eq!(channels.load(Ordering::Relaxed), 1, "one SSH shell");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "keeps native drawer activation keys out of SSH and restores typing when the terminal canvas is clicked"]
 async fn native_sftp_file_rows_own_keyboard_focus_until_the_canvas_is_clicked() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

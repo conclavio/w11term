@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandId {
     Menu(String),
+    FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
     ClearScrollback(Option<u64>),
     PaneColorScheme(u64, ColorScheme),
@@ -135,8 +136,14 @@ impl TerminalApp {
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
+        let previous = previous_pane::target(&self.tabs);
         menu_rows(
-            self.caret_items(exited.is_some(), &arrangement, directory_split.is_some()),
+            self.caret_items(
+                exited.is_some(),
+                &arrangement,
+                directory_split.is_some(),
+                previous,
+            ),
             false,
             &mut rows,
         );
@@ -223,6 +230,10 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                Shortcut::FocusPreviousPane => {
+                    row.enabled = previous.is_some();
+                    row.id = CommandId::FocusPreviousPane(previous);
+                }
                 shortcut if let Some(axis) = directory_split::axis(shortcut) => {
                     row.id = CommandId::SplitInDirectory(axis, directory_split.clone());
                 }
@@ -305,6 +316,7 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
             CommandId::LocalForward(origin) => local_forwards::open(origin),
             CommandId::SplitInDirectory(axis, target) => {
