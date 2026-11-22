@@ -1,5 +1,8 @@
 # Local modifications
 
+- The Contour color-scheme query reports the embedding's configured light or
+  dark preference. Private mode 2031 subscribes the connection to user palette changes.
+
 - Framed terminal viewers can install separate nonblocking writers for user input and parser replies. The default writer remains threaded. The embedding can also detach its clipboard handler when a stream may repaint earlier output.
 
 Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term
@@ -15,6 +18,16 @@ Regression coverage is in the parent project's `terminal.rs` unit tests and the 
 - `src/terminalstate/kitty.rs`: bound direct transmission/inflate/image-table resources, reject local file/shared-memory transports for this SSH-only embedding, and account for replacement of image id zero. See the parent project's graphics audit for the exact scope and remaining limits.
 
 The original MIT license is preserved in `LICENSE.md`.
+
+- DECRQM for DEC private mode 5 reports the current screen polarity so applications
+  can restore the previous setting after using reverse-screen mode.
+
+- OSC 104 restores the requested indexed colors, or the full indexed table
+  when no indices are given, while preserving dynamic foreground, background
+  and cursor colors.
+  A change of configured palette updates inherited colors and preserves each
+  explicit OSC color assignment until the application resets it. Color queries
+  read the effective palette without marking rows dirty.
 
 - `src/terminal.rs`, `terminalstate/mod.rs`, `terminalstate/performer.rs`: implement
   synchronized-output mode 2026 and DECRQM state in the engine. The embedding can
@@ -60,6 +73,10 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - `Screen::physical_lines` provides a borrowed, double-ended iterator over
   retained rows for plain-text exports without cloning scrollback.
+
+- `Screen::history_clear_count` distinguishes explicit erasure of scrollback
+  from eviction as new output arrives. This lets the UI discard an old
+  scrollbar gesture after either a local clear or a remote CSI 3 J.
 
 - Screen storage grows as output arrives. Resizing and rewrapping enforce
   the physical row limit supplied by the profile, including a limit of zero.

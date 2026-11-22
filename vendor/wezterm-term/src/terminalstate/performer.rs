@@ -1,4 +1,5 @@
 use crate::terminal::{Alert, Progress};
+use crate::terminalstate::palette::Slot;
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
@@ -18,7 +19,7 @@ use wezterm_cell::{
     grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
 use wezterm_escape_parser::csi::{
-    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
+    CharacterPath, CsiParam, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
 };
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -642,6 +643,14 @@ impl<'a> Performer<'a> {
                 // This is a response to QueryKittySupport and it is invalid for us
                 // to receive it. Just ignore it.
             }
+            CSI::Unspecified(unspec)
+                if unspec.control == 'n'
+                    && !unspec.parameters_truncated
+                    && unspec.params == [CsiParam::P(b'?'), CsiParam::Integer(996)] =>
+            {
+                let light = self.config.prefers_light_colors();
+                TerminalState::write_color_scheme_report(&mut self.writer, light);
+            }
             CSI::Unspecified(unspec) => {
                 if self.config.log_unknown_escape_sequences() {
                     log::warn!("unknown unspecified CSI: {:?}", format!("{}", unspec));
@@ -770,6 +779,7 @@ impl<'a> Performer<'a> {
                 self.application_keypad = false;
                 self.bracketed_paste = false;
                 self.focus_tracking = false;
+                self.report_color_scheme_changes = false;
                 self.mouse_tracking = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;
@@ -784,7 +794,7 @@ impl<'a> Performer<'a> {
                 self.shift_out = false;
                 self.newline_mode = false;
                 self.tabs = TabStop::new(self.screen().physical_cols, 8);
-                self.palette.take();
+                self.palette = Default::default();
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as VisibleRowIndex;
                 self.left_and_right_margins = 0..self.screen().physical_cols;
                 self.left_and_right_margin_mode = false;
@@ -1038,6 +1048,7 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::ChangeColorNumber(specs) => {
                 log::trace!("ChangeColorNumber: {:?}", specs);
+                let mut wrote = false;
                 for pair in specs {
                     match pair.color {
                         ColorOrQuery::Query => {
@@ -1051,126 +1062,68 @@ impl<'a> Performer<'a> {
                             write!(self.writer, "{}", response).ok();
                             self.writer.flush().ok();
                         }
-                        ColorOrQuery::Color(c) => {
-                            self.palette_mut().colors.0[pair.palette_index as usize] = c;
+                        ColorOrQuery::Color(color) => {
+                            self.set_palette_slot(Slot::Indexed(pair.palette_index), color);
+                            wrote = true;
                         }
                     }
                 }
-                self.implicit_palette_reset_if_same_as_configured();
-                self.palette_did_change();
+                if wrote {
+                    self.palette_did_change();
+                }
             }
 
             OperatingSystemCommand::ResetColors(colors) => {
-                log::trace!("ResetColors: {:?}", colors);
                 if colors.is_empty() {
-                    // Reset all colors
-                    self.palette.take();
+                    self.reset_palette_slots((0..=u8::MAX).map(Slot::Indexed));
                 } else {
-                    // Reset individual colors
-                    if self.palette.is_none() {
-                        // Already at the defaults
-                    } else {
-                        let base = self.config.color_palette();
-                        for c in colors {
-                            let c = c as usize;
-                            self.palette_mut().colors.0[c] = base.colors.0[c];
-                        }
-                    }
+                    self.reset_palette_slots(colors.into_iter().map(Slot::Indexed));
                 }
-                self.implicit_palette_reset_if_same_as_configured();
-                self.palette_did_change();
             }
 
             OperatingSystemCommand::ChangeDynamicColors(first_color, colors) => {
-                log::trace!("ChangeDynamicColors: {:?} {:?}", first_color, colors);
                 use wezterm_escape_parser::osc::DynamicColorNumber;
-                let mut idx: u8 = first_color as u8;
-                for color in colors {
-                    let which_color: Option<DynamicColorNumber> = FromPrimitive::from_u8(idx);
-                    log::trace!("ChangeDynamicColors item: {:?}", which_color);
-                    if let Some(which_color) = which_color {
-                        macro_rules! set_or_query {
-                            ($name:ident) => {
-                                match color {
-                                    ColorOrQuery::Query => {
-                                        let response = OperatingSystemCommand::ChangeDynamicColors(
-                                            which_color,
-                                            vec![ColorOrQuery::Color(self.palette().$name.into())],
-                                        );
-                                        log::trace!("Color Query response {:?}", response);
-                                        write!(self.writer, "{}", response).ok();
-                                        self.writer.flush().ok();
-                                    }
-                                    ColorOrQuery::Color(c) => self.palette_mut().$name = c.into(),
-                                }
-                            };
+                let mut wrote = false;
+                let numbers = first_color as u8..=u8::MAX;
+                for (idx, color) in numbers.zip(colors) {
+                    let Some(number) = DynamicColorNumber::from_u8(idx) else {
+                        continue;
+                    };
+                    let Some(slot) = Slot::dynamic(number) else {
+                        continue;
+                    };
+                    match color {
+                        ColorOrQuery::Query => {
+                            let value = *slot.field(&mut self.palette());
+                            let response = OperatingSystemCommand::ChangeDynamicColors(
+                                number,
+                                vec![ColorOrQuery::Color(value)],
+                            );
+                            write!(self.writer, "{}", response).ok();
+                            self.writer.flush().ok();
                         }
-                        match which_color {
-                            DynamicColorNumber::TextForegroundColor => set_or_query!(foreground),
-                            DynamicColorNumber::TextBackgroundColor => set_or_query!(background),
-                            DynamicColorNumber::TextCursorColor => {
-                                if let ColorOrQuery::Color(c) = color {
-                                    // We set the border to the background color; we don't
-                                    // have an escape that sets that independently, and this
-                                    // way just looks better.
-                                    self.palette_mut().cursor_border = c.into();
-                                }
-                                set_or_query!(cursor_bg)
+                        ColorOrQuery::Color(value) => {
+                            self.set_palette_slot(slot, value);
+                            if slot == Slot::CursorBackground {
+                                self.set_palette_slot(Slot::CursorBorder, value);
                             }
-                            DynamicColorNumber::HighlightForegroundColor => {
-                                set_or_query!(selection_fg)
-                            }
-                            DynamicColorNumber::HighlightBackgroundColor => {
-                                set_or_query!(selection_bg)
-                            }
-                            DynamicColorNumber::MouseForegroundColor
-                            | DynamicColorNumber::MouseBackgroundColor
-                            | DynamicColorNumber::TektronixForegroundColor
-                            | DynamicColorNumber::TektronixBackgroundColor
-                            | DynamicColorNumber::TektronixCursorColor => {}
+                            wrote = true;
                         }
                     }
-                    idx += 1;
                 }
-                self.implicit_palette_reset_if_same_as_configured();
-                self.palette_did_change();
+                if wrote {
+                    self.palette_did_change();
+                }
             }
 
-            OperatingSystemCommand::ResetDynamicColor(color) => {
-                log::trace!("ResetDynamicColor: {:?}", color);
+            OperatingSystemCommand::ResetDynamicColor(number) => {
                 use wezterm_escape_parser::osc::DynamicColorNumber;
-                let which_color: Option<DynamicColorNumber> = FromPrimitive::from_u8(color as u8);
-                if let Some(which_color) = which_color {
-                    macro_rules! reset {
-                        ($name:ident) => {
-                            if self.palette.is_none() {
-                                // Already at the defaults
-                            } else {
-                                let base = self.config.color_palette();
-                                self.palette_mut().$name = base.$name;
-                            }
-                        };
-                    }
-                    match which_color {
-                        DynamicColorNumber::TextForegroundColor => reset!(foreground),
-                        DynamicColorNumber::TextBackgroundColor => reset!(background),
-                        DynamicColorNumber::TextCursorColor => {
-                            reset!(cursor_bg);
-                            // Since we set the border to the bg, we consider it reset
-                            // by resetting the bg too!
-                            reset!(cursor_border);
-                        }
-                        DynamicColorNumber::HighlightForegroundColor => reset!(selection_fg),
-                        DynamicColorNumber::HighlightBackgroundColor => reset!(selection_bg),
-                        DynamicColorNumber::MouseForegroundColor
-                        | DynamicColorNumber::MouseBackgroundColor
-                        | DynamicColorNumber::TektronixForegroundColor
-                        | DynamicColorNumber::TektronixBackgroundColor
-                        | DynamicColorNumber::TektronixCursorColor => {}
-                    }
+                if let Some(slot) =
+                    DynamicColorNumber::from_u8(number as u8).and_then(Slot::dynamic)
+                {
+                    let border = (slot == Slot::CursorBackground).then_some(Slot::CursorBorder);
+                    self.reset_palette_slots(std::iter::once(slot).chain(border));
                 }
-                self.implicit_palette_reset_if_same_as_configured();
-                self.palette_did_change();
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
                 use wezterm_escape_parser::osc::Progress as TProg;

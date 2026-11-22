@@ -14,17 +14,22 @@ pub(super) struct PaneGeometry {
 
 impl PaneGeometry {
     fn rect(&self, client_height: i32) -> Option<(i32, i32, i32, i32)> {
+        self.rect_for(self.focused, client_height)
+    }
+
+    fn rect_for(&self, pane: TabId, client_height: i32) -> Option<(i32, i32, i32, i32)> {
         let decorated = matches!(self.layout, Layout::Split { .. });
         let border = if decorated { 1.0 } else { 0.0 };
         fn measure(
             node: &Layout,
             data: &PaneGeometry,
             border: f32,
+            pane: TabId,
             target: &mut Option<(f32, f32)>,
         ) -> Option<(f32, f32)> {
             match node {
                 Layout::Leaf(id) => {
-                    if *id == data.focused {
+                    if *id == pane {
                         *target = Some((border, border));
                     }
                     let (w, h, _) = data.areas.get(id)?.get()?;
@@ -36,9 +41,9 @@ impl PaneGeometry {
                     second,
                     ..
                 } => {
-                    let a = measure(first, data, border, target)?;
+                    let a = measure(first, data, border, pane, target)?;
                     let mut second_origin = None;
-                    let b = measure(second, data, border, &mut second_origin)?;
+                    let b = measure(second, data, border, pane, &mut second_origin)?;
                     if let Some((x, y)) = second_origin {
                         *target = Some(match axis {
                             Axis::Columns => (a.0 + DIVIDER as f32 + x, y),
@@ -53,29 +58,118 @@ impl PaneGeometry {
             }
         }
         let mut origin = None;
-        let (_, total_h) = measure(&self.layout, self, border, &mut origin)?;
+        let (_, total_h) = measure(&self.layout, self, border, pane, &mut origin)?;
         let (x, y) = origin?;
-        let (w, h, scale) = self.areas.get(&self.focused)?.get()?;
+        let (w, h, scale) = self.areas.get(&pane)?.get()?;
         let px = |v: f32| (v * scale).round() as i32;
         Some((px(x), client_height - px(total_h - y), px(w), px(h)))
     }
+
+    fn contains(&self, pane: TabId, point: (i32, i32), client_height: i32) -> bool {
+        self.rect_for(pane, client_height)
+            .is_some_and(|(x, y, w, h)| {
+                (x..x + w).contains(&point.0) && (y..y + h).contains(&point.1)
+            })
+    }
 }
 
-pub(super) struct DividerDrag {
-    epoch: u64,
+/// A stationary pointer may receive no native enter/move when its pane changes shape.
+/// Keep only a previous, positive canvas hit until all the affected leaves are remeasured.
+pub(super) struct RotationHover {
+    point: (i32, i32),
+    before: BTreeMap<TabId, (f32, f32, f32)>,
+}
+
+impl RotationHover {
+    fn capture(
+        geometry: &PaneGeometry,
+        panes: &[TabId],
+        hovered: TabId,
+        point: (i32, i32),
+        client_height: i32,
+    ) -> Option<Self> {
+        if !panes.contains(&hovered) || !geometry.contains(hovered, point, client_height) {
+            return None;
+        }
+        let before = panes
+            .iter()
+            .map(|id| Some((*id, geometry.areas.get(id)?.get()?)))
+            .collect::<Option<_>>()?;
+        Some(Self { point, before })
+    }
+
+    fn measured(&self, geometry: &PaneGeometry) -> bool {
+        self.before.iter().all(|(id, old)| {
+            geometry
+                .areas
+                .get(id)
+                .and_then(|area| area.get())
+                .is_some_and(|new| (new.0, new.1) != (old.0, old.1))
+        })
+    }
+
+    fn hit(
+        &self,
+        geometry: &PaneGeometry,
+        cursor: Option<(i32, i32)>,
+        height: i32,
+    ) -> Option<TabId> {
+        if cursor != Some(self.point) {
+            return None;
+        }
+        self.before
+            .keys()
+            .copied()
+            .find(|id| geometry.contains(*id, self.point, height))
+    }
+}
+
+struct DividerDrag {
     path: Vec<bool>,
     origin: f64,
     extent: f64,
 }
 
 impl DividerDrag {
-    fn matches(&self, epoch: u64, path: &[bool]) -> bool {
-        self.epoch == epoch && self.path == path
-    }
-
     fn ratio(&self, position: f64) -> f64 {
         let min = (40.0 / self.extent).min(0.5);
         ((position - self.origin) / self.extent).clamp(min, 1.0 - min)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct DividerState {
+    epoch: u64,
+    drag: Option<DividerDrag>,
+}
+
+impl DividerState {
+    // In-place rotations reuse the same divider path with a different coordinate axis.
+    pub(super) fn invalidate(&mut self) {
+        self.epoch += 1;
+        self.drag = None;
+    }
+
+    fn begin(&mut self, epoch: u64, drag: impl FnOnce() -> Option<DividerDrag>) {
+        if self.epoch == epoch {
+            self.drag = drag();
+        }
+    }
+
+    fn active(&self, epoch: u64, path: &[bool]) -> Option<&DividerDrag> {
+        self.drag
+            .as_ref()
+            .filter(|drag| self.epoch == epoch && drag.path == path)
+    }
+
+    pub(super) fn dragging(&self, epoch: u64, path: &[bool]) -> bool {
+        self.active(epoch, path).is_some()
+    }
+
+    pub(super) fn end(&mut self, epoch: u64, path: &[bool]) {
+        if self.dragging(epoch, path) {
+            self.drag = None;
+        }
     }
 }
 
@@ -93,6 +187,7 @@ pub(super) struct PaneSurface {
     pub(super) paint_count: Rc<Cell<u64>>,
     pub(super) metrics: Rc<Cell<Metrics>>,
     pub(super) invalidator: Invalidator,
+    pub(super) scrollbar: Rc<scrollback_bar::ScrollBar>,
     cursor_blink: Rc<RefCell<crate::cursor_blink::CursorBlink>>,
     pub(super) area: Rc<Cell<Option<(f32, f32, f32)>>>,
     window_grid: Rc<Cell<WindowGrid>>,
@@ -108,13 +203,14 @@ impl PaneSurface {
 
     pub(super) fn release(&self) {
         self.pause_cursor();
+        self.scrollbar.set_enabled(false);
         self.canvas.borrow_mut().take();
     }
 
     pub(super) fn pause_cursor(&self) {
         self.cursor_blink
             .borrow_mut()
-            .set_interval(None, &self.invalidator);
+            .set_focus(false, None, &self.invalidator);
     }
 
     pub(super) fn remeasure(&self, renderer: &mut Renderer) -> Option<TerminalSize> {
@@ -135,7 +231,80 @@ fn terminal_size(metrics: Metrics) -> TerminalSize {
     }
 }
 
+fn minimum_canvas(metrics: Metrics, axis: Axis) -> f64 {
+    f64::from(
+        2.0 * PADDING
+            + match axis {
+                Axis::Columns => metrics.cell_width,
+                Axis::Rows => STATUS_HEIGHT + metrics.cell_height,
+            },
+    )
+}
+
+fn rotation_extent(
+    area: (f32, f32, f32),
+    metrics: Metrics,
+    axis: Axis,
+    scale: f32,
+) -> Option<(f64, f64)> {
+    let (width, height, canvas_scale) = area;
+    if canvas_scale != scale || metrics.scale != scale || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let extent = match axis {
+        Axis::Columns => width,
+        Axis::Rows => height,
+    };
+    if !extent.is_finite() || extent <= 0.0 {
+        return None;
+    }
+    let scale = f64::from(scale);
+    // All split panes have a one-DIP border on each side of the measured canvas.
+    // Allow for either neighboring device pixel when layout rounds that border.
+    Some((
+        (f64::from(extent) * scale).round() + 2.0 * scale.floor(),
+        (minimum_canvas(metrics, axis) * scale).ceil() + 2.0 * scale.ceil(),
+    ))
+}
+
 impl TerminalApp {
+    pub(super) fn capture_rotation_hover(&self, panes: &[TabId]) -> Option<RotationHover> {
+        RotationHover::capture(
+            self.measured_layout.as_ref()?,
+            panes,
+            self.keyboard.hovered_pane()?,
+            crate::input::cursor_client()?,
+            crate::input::ime::client_height()?,
+        )
+    }
+
+    pub(super) fn restore_rotation_hover(&mut self) {
+        let Some(pending) = &self.rotation_hover else {
+            return;
+        };
+        let Some(geometry) = &self.measured_layout else {
+            return;
+        };
+        if !pending.measured(geometry) {
+            return;
+        }
+        let pending = self.rotation_hover.take().unwrap();
+        if self.keyboard.hovered_pane().is_some()
+            || self.hints.borrow().is_some()
+            || self.copy_mode.borrow().is_some()
+        {
+            return;
+        }
+        let Some(height) = crate::input::ime::client_height() else {
+            return;
+        };
+        if let Some(id) = pending.hit(geometry, crate::input::cursor_client(), height)
+            && matches!(self.tabs.get(id).map(|tab| &tab.page), Some(Page::Terminal(live))
+                if live.error.is_none() && !live.browsing_sessions())
+        {
+            self.keyboard.hover_pane(id);
+        }
+    }
     fn pane_geometry(&self) -> Option<PaneGeometry> {
         let focused = self.tabs.active_id()?;
         let layout = if self.tabs.zoomed() {
@@ -228,6 +397,8 @@ impl TerminalApp {
         let area = surface.area.clone();
         let selection = tab.selection.clone();
         let read_only = tab.read_only.clone();
+        let scrollbar = surface.scrollbar.clone();
+        let scrollbar_brush = RefCell::new(None);
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
         let copy_mode = self.copy_mode.clone();
@@ -260,8 +431,17 @@ impl TerminalApp {
             if let Some(hints) = hints {
                 renderer.draw_hint_labels(ctx, &frame, hints.visible_labels())?;
             }
-            metrics.set(measured);
-            area.set(Some((ctx.width, ctx.height, measured.scale)));
+            scrollbar.draw(ctx, &frame, measured, &mut scrollbar_brush.borrow_mut())?;
+            let previous_metrics = metrics.replace(measured);
+            let bounds = (ctx.width, ctx.height, measured.scale);
+            let previous_area = area.replace(Some(bounds));
+            if matches!(window_grid.get(), WindowGrid::Off)
+                && (previous_area != Some(bounds)
+                    || previous_metrics.cell_width != measured.cell_width
+                    || previous_metrics.cell_height != measured.cell_height)
+            {
+                geometry_sender.send(Message::PaneMeasured(id));
+            }
             if let Some(preedit) = crate::input::ime::preedit(&sender) {
                 let offset = renderer.draw_preedit(ctx, &frame, &preedit.text, preedit.cursor)?;
                 crate::input::ime::position_after_draw(offset, measured.scale);
@@ -318,13 +498,23 @@ impl TerminalApp {
         decorate: bool,
         context: &ViewContext<Self>,
     ) -> View {
-        let interval = self
-            .caret_interval
-            .filter(|_| tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input));
-        tab.surface
-            .cursor_blink
-            .borrow_mut()
-            .set_interval(interval, &tab.surface.invalidator);
+        let show_scrollbar = tab.error.is_none()
+            && !tab.browsing_sessions()
+            && !self.hints.borrow().as_ref().is_some_and(|h| h.pane == id)
+            && !self
+                .copy_mode
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| m.pane == id);
+        if tab.surface.scrollbar.set_enabled(show_scrollbar) {
+            tab.surface.invalidator.invalidate();
+        }
+        let focused = tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input);
+        tab.surface.cursor_blink.borrow_mut().set_focus(
+            focused,
+            self.caret_interval,
+            &tab.surface.invalidator,
+        );
         tab.surface
             .window_grid
             .set(match self.tabs.active_layout() {
@@ -459,13 +649,13 @@ impl TerminalApp {
                     }
                 };
                 let axis = *axis;
-                let epoch = self.watch_epoch;
+                let epoch = self.dividers.borrow().epoch;
                 let start_path = path.clone();
                 let drag_path = path.clone();
                 let release_path = path.clone();
                 let lost_path = path.clone();
                 let sender = context.sender();
-                let drag = self.divider_drag.clone();
+                let dividers = self.dividers.clone();
                 let divider = Border::new()
                     .background(Color::rgb(72, 73, 75))
                     .capture_pointer_on_press(true)
@@ -477,8 +667,7 @@ impl TerminalApp {
                         }
                     }))
                     .on_pointer_moved(move |p: PointerEventInfo| {
-                        if let Some(drag) = drag.borrow().as_ref()
-                            && drag.matches(epoch, &drag_path)
+                        if let Some(drag) = dividers.borrow().active(epoch, &drag_path)
                             && p.is_left_button_pressed
                         {
                             sender.send(Message::PaneRatio(
@@ -545,6 +734,39 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn rotation_fits(&self) -> bool {
+        let Some(AppTab {
+            page: Page::Terminal(focused),
+            ..
+        }) = self.tabs.active()
+        else {
+            return false;
+        };
+        let Some((_, _, scale)) = focused.surface.area.get() else {
+            return false;
+        };
+        let Some(layout) = self.tabs.active_layout() else {
+            return false;
+        };
+        let Some(id) = self.tabs.active_id() else {
+            return false;
+        };
+        if self.tabs.zoomed() {
+            return false;
+        }
+        layout.rotation_fits(id, DIVIDER * f64::from(scale), |pane, axis| {
+            let Page::Terminal(tab) = &self.tabs.get(pane)?.page else {
+                return None;
+            };
+            rotation_extent(
+                tab.surface.area.get()?,
+                tab.surface.metrics.get(),
+                axis,
+                scale,
+            )
+        })
+    }
+
     pub(super) fn keyboard_resize(&mut self, direction: Direction) {
         if self.tabs.zoomed() {
             return;
@@ -564,14 +786,7 @@ impl TerminalApp {
         };
         let metrics = tab.surface.metrics.get();
         // Each split leaf also has a one-DIP border on both sides of its canvas.
-        let minimum = 2.0
-            + f64::from(
-                2.0 * PADDING
-                    + match direction.axis() {
-                        Axis::Columns => metrics.cell_width,
-                        Axis::Rows => STATUS_HEIGHT + metrics.cell_height,
-                    },
-            );
+        let minimum = 2.0 + minimum_canvas(metrics, direction.axis());
         let edit = layout.keyboard_resize(id, direction, minimum, DIVIDER, |node| {
             let (w, h) = self.layout_size(node)?;
             Some(match direction.axis() {
@@ -584,43 +799,95 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn begin_divider(&self, path: &[bool], position: f64) {
-        self.divider_drag.borrow_mut().take();
-        let Some(mut node) = self.tabs.active_layout() else {
-            return;
-        };
-        for &side in path {
-            let Layout::Split { first, second, .. } = node else {
-                return;
-            };
-            node = if side { second } else { first };
-        }
-        if let Layout::Split { axis, ratio, .. } = node
-            && let Some((w, h)) = self.layout_size(node)
-        {
-            let extent = if *axis == Axis::Columns { w } else { h } - DIVIDER;
-            if extent > 0.0 {
-                *self.divider_drag.borrow_mut() = Some(DividerDrag {
-                    epoch: self.watch_epoch,
-                    path: path.to_vec(),
-                    origin: position - extent * ratio,
-                    extent,
-                });
+    pub(super) fn begin_divider(&self, epoch: u64, path: &[bool], position: f64) {
+        self.dividers.borrow_mut().begin(epoch, || {
+            let mut node = self.tabs.active_layout()?;
+            for &side in path {
+                let Layout::Split { first, second, .. } = node else {
+                    return None;
+                };
+                node = if side { second } else { first };
             }
-        }
-    }
-
-    pub(super) fn dragging_divider(&self, epoch: u64, path: &[bool]) -> bool {
-        self.divider_drag
-            .borrow()
-            .as_ref()
-            .is_some_and(|drag| drag.matches(epoch, path))
+            let Layout::Split { axis, ratio, .. } = node else {
+                return None;
+            };
+            let (w, h) = self.layout_size(node)?;
+            let extent = if *axis == Axis::Columns { w } else { h } - DIVIDER;
+            (extent > 0.0).then(|| DividerDrag {
+                path: path.to_vec(),
+                origin: position - extent * ratio,
+                extent,
+            })
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stationary_cursor_uses_final_canvas_bounds_after_every_rotated_leaf_is_measured() {
+        let left = Rc::new(Cell::new(Some((98.0, 98.0, 2.0))));
+        let right = Rc::new(Cell::new(left.get()));
+        let mut geometry = PaneGeometry {
+            layout: Layout::Split {
+                axis: Axis::Columns,
+                ratio: 0.5,
+                first: Box::new(Layout::Leaf(1)),
+                second: Box::new(Layout::Leaf(2)),
+            },
+            focused: 1,
+            areas: BTreeMap::from([(1, left.clone()), (2, right.clone())]),
+        };
+        let point = (150, 200);
+        let height = 260;
+        assert!(RotationHover::capture(&geometry, &[1, 2], 2, point, height).is_none());
+        let pending = RotationHover::capture(&geometry, &[1, 2], 1, point, height).unwrap();
+        let same_point = (150, 100);
+        let same_pane = RotationHover::capture(&geometry, &[1, 2], 1, same_point, height).unwrap();
+        let Layout::Split { axis, .. } = &mut geometry.layout else {
+            unreachable!()
+        };
+        *axis = Axis::Rows;
+        left.set(Some((204.0, 45.0, 2.0)));
+        assert!(!pending.measured(&geometry));
+        right.set(left.get());
+        assert!(pending.measured(&geometry));
+        assert_eq!(pending.hit(&geometry, Some(point), height), Some(2));
+        assert_eq!(same_pane.hit(&geometry, Some(same_point), height), Some(1));
+        assert_eq!(pending.hit(&geometry, Some(same_point), height), None);
+        assert_eq!(pending.hit(&geometry, None, height), None);
+        for outside in [(150, 35), (150, 158), (420, 200)] {
+            assert!(
+                !geometry.contains(1, outside, height) && !geometry.contains(2, outside, height)
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_size_uses_cell_padding_footer_and_decorations_in_device_pixels() {
+        let area = (160.0, 120.0, 1.25);
+        let metrics = Metrics {
+            cell_width: 12.0,
+            cell_height: 20.0,
+            scale: 1.25,
+            ..Default::default()
+        };
+        assert_eq!(
+            rotation_extent(area, metrics, Axis::Columns, 1.25),
+            Some((202.0, 49.0))
+        );
+        assert_eq!(
+            rotation_extent(area, metrics, Axis::Rows, 1.25),
+            Some((152.0, 92.0))
+        );
+        assert_eq!(rotation_extent(area, metrics, Axis::Rows, 1.5), None);
+        assert_eq!(
+            rotation_extent((160.0, 0.0, 1.25), metrics, Axis::Rows, 1.25),
+            None
+        );
+    }
 
     #[test]
     fn a_new_transport_ignores_an_old_drag_until_a_fresh_press() {
@@ -655,7 +922,6 @@ mod tests {
     #[test]
     fn dragging_uses_window_coordinates_and_requires_same_view_and_divider() {
         let drag = DividerDrag {
-            epoch: 7,
             path: vec![true],
             origin: 200.0,
             extent: 400.0,
@@ -663,8 +929,38 @@ mod tests {
         assert_eq!(drag.ratio(450.0), 0.625);
         assert_eq!(drag.ratio(120.0), 0.1);
         assert_eq!(drag.ratio(999.0), 0.9);
-        assert!(drag.matches(7, &[true]));
-        assert!(!drag.matches(8, &[true]));
-        assert!(!drag.matches(7, &[false]));
+        let state = DividerState {
+            epoch: 7,
+            drag: Some(drag),
+        };
+        assert!(state.dragging(7, &[true]));
+        assert!(!state.dragging(8, &[true]));
+        assert!(!state.dragging(7, &[false]));
+    }
+
+    #[test]
+    fn rotation_rejects_old_press_ratio_and_capture_loss_at_the_same_divider_path() {
+        let mut state = DividerState::default();
+        let path = [false];
+        let make_drag = || {
+            Some(DividerDrag {
+                path: path.to_vec(),
+                origin: 20.0,
+                extent: 120.0,
+            })
+        };
+        let old = state.epoch;
+        state.begin(old, make_drag);
+        state.invalidate();
+        state.begin(old, || panic!("old axis used to measure a new drag"));
+        assert!(!state.dragging(old, &path));
+        let new = state.epoch;
+        state.begin(new, make_drag);
+        state.begin(old, || panic!("old press replaced the new drag"));
+        state.end(old, &path);
+        assert!(!state.dragging(old, &path));
+        assert_eq!(state.active(new, &path).unwrap().ratio(80.0), 0.5);
+        state.end(new, &path);
+        assert!(!state.dragging(new, &path));
     }
 }

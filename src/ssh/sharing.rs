@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::{
     runtime,
-    sync::{oneshot, watch},
+    sync::{Semaphore, oneshot, watch},
 };
 
 // A socket and its russh driver must outlive whichever terminal opened it.
@@ -30,6 +30,7 @@ struct Link {
     options: SshOptions,
     known_hosts: Option<PathBuf>,
     runtime: runtime::Handle,
+    forward_channels: Arc<Semaphore>,
 }
 
 impl Drop for Link {
@@ -61,9 +62,10 @@ impl ConnectionShare {
             options,
             known_hosts: prompts.and_then(Prompts::known_hosts).map(PathBuf::from),
             runtime: runtime::Handle::current(),
+            forward_channels: Arc::new(Semaphore::new(super::local_forward::MAX_CHANNELS_PER_LINK)),
         }))
     }
-    pub(super) fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
+    pub fn matches(&self, options: &SshOptions, prompts: Option<&Prompts>) -> bool {
         let connected = &self.0.options;
         !self.0.handle.is_closed()
             && !connected.player.rustmush
@@ -79,8 +81,14 @@ impl ConnectionShare {
     pub(super) fn handle(&self) -> Arc<client::Handle<Handler>> {
         self.0.handle.clone()
     }
+    pub(super) fn forward_channels(&self) -> &Arc<Semaphore> {
+        &self.0.forward_channels
+    }
     pub(super) fn fingerprint(&self) -> &str {
         &self.0.fingerprint
+    }
+    pub fn options(&self) -> &SshOptions {
+        &self.0.options
     }
     pub(crate) fn verified_endpoint(&self) -> (&str, &str, u16, &str) {
         let options = &self.0.options;
@@ -169,10 +177,23 @@ struct Publication {
     current: Weak<ConnectionShare>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ShareSlot {
     publication: Arc<Mutex<Publication>>,
     changed: watch::Sender<()>,
+    pub(super) forward_listeners: Arc<Semaphore>,
+}
+
+impl Default for ShareSlot {
+    fn default() -> Self {
+        Self {
+            publication: Default::default(),
+            changed: Default::default(),
+            forward_listeners: Arc::new(Semaphore::new(
+                super::local_forward::MAX_LISTENERS_PER_PANE,
+            )),
+        }
+    }
 }
 
 pub(super) struct PublishedShell {
@@ -191,6 +212,17 @@ impl Drop for PublishedShell {
 }
 
 impl ShareSlot {
+    /// Sample the published shell and subscribe under the publication lock: the
+    /// next notification retires this authority, even if a sibling retains the transport.
+    pub(super) fn forward_lease(
+        &self,
+        generation: u64,
+    ) -> Option<(ConnectionShare, watch::Receiver<()>)> {
+        let state = self.publication.lock().unwrap();
+        let link = state.current.upgrade()?;
+        (state.generation == generation && !link.0.handle.is_closed())
+            .then(|| ((*link).clone(), self.changed.subscribe()))
+    }
     pub(crate) fn current(&self) -> Option<ConnectionShare> {
         self.generation().map(|(_, link)| link)
     }

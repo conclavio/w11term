@@ -28,11 +28,27 @@ function Edit-Delimiters {
     Click 'Settings' $menu
     Click $action
     $field = Wait-Until 'delimiter editor' { Find-Element 'Delimiter characters' ([System.Windows.Automation.ControlType]::Edit) }
+    $field.SetFocus()
+    $null = Wait-Until 'delimiter textbox focused' { $field.Current.HasKeyboardFocus }
     return $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
 }
-function Close-Editor([string]$Choice) {
-    Click $Choice
-    $null = Wait-Until 'return to Settings' { Find-Element $action $button }
+function Close-Editor([string]$Choice, [string]$ExpectedDraft) {
+    # The UIA text assignment and the app's draft update are separate events.
+    # Check the complete native value after leaving the field, before invoking Save/Cancel.
+    $commit = Wait-Until "enabled '$Choice' in delimiter editor" {
+        $entry = Find-Element $Choice $button
+        if ($entry -and $entry.Current.IsEnabled) { $entry }
+    }
+    $commit.SetFocus()
+    $null = Wait-Until "delimiter draft retained on leaving the field for '$Choice'" {
+        $field = Find-Element 'Delimiter characters' ([System.Windows.Automation.ControlType]::Edit)
+        $field -and !$field.Current.HasKeyboardFocus -and
+            $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq $ExpectedDraft
+    }
+    Invoke-Button $commit
+    $null = Wait-Until 'return from the delimiter editor to Settings' {
+        !(Find-Element 'Delimiter characters' ([System.Windows.Automation.ControlType]::Edit)) -and (Find-Element $action $button)
+    }
     Picker-Query 'palette-ssh'
     Press-Key 13
     Wait-Focus $pane
@@ -41,14 +57,18 @@ function Saved-Delimiters {
     return ([IO.File]::ReadAllText($env:W11TERM_SETTINGS_PATH) | ConvertFrom-Json).interaction.wordDelimiters
 }
 function Check-Word([string]$Needle, [string]$Expected) {
-    $document = Wait-Until 'native SSH terminal text provider' {
-        Find-Element ('Terminal ' + [char]0xb7 + ' palette-ssh') ([System.Windows.Automation.ControlType]::Document)
+    # An existing UIA range keeps its original delimiters. Acquire the current
+    # document on each attempt until the running pane exposes the new boundary.
+    $text = Wait-Until "native SSH word '$Needle' expands to '$Expected'" {
+        $document = Find-Element ('Terminal ' + [char]0xb7 + ' palette-ssh') ([System.Windows.Automation.ControlType]::Document)
+        if (!$document) { return }
+        $provider = $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+        $word = $provider.DocumentRange.FindText($Needle, $false, $false)
+        if ($word) {
+            $word.ExpandToEnclosingUnit([System.Windows.Automation.Text.TextUnit]::Word)
+            if ($word.GetText(-1) -ceq $Expected) { $provider }
+        }
     }
-    $text = $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
-    $word = $text.DocumentRange.FindText($Needle, $false, $false)
-    if (!$word) { throw "Fixture text '$Needle' missing from the terminal" }
-    $word.ExpandToEnclosingUnit([System.Windows.Automation.Text.TextUnit]::Word)
-    if ($word.GetText(-1) -cne $Expected) { throw "UIA Word gave '$($word.GetText(-1))', expected '$Expected'" }
     $request = Join-Path $State 'double-click'
     $pending = Join-Path $State 'pending-click'
     [IO.File]::WriteAllText($pending, $Needle, $utf8)
@@ -74,14 +94,15 @@ try {
     if (!$default.Contains('/') -or !$default.Contains(':')) { throw 'Fixture needs slash and colon in the factory settings' }
     $custom = $default.Replace('/','')
     $editor.SetValue($custom)
-    Close-Editor 'Save'
-    $null = Wait-Until 'saved slash removal on disk' { (Saved-Delimiters) -ceq $custom }
+    Close-Editor 'Save' $custom
     Check-Word 'lpha' 'scope/srv/alpha/bin'
+    $saved = Saved-Delimiters
+    if ($saved -cne $custom) { throw "Saved delimiters '$saved' differ from the edited value '$custom'" }
 
     $editor = Edit-Delimiters
     if ($editor.Current.Value -cne $custom) { throw 'Editor lost the saved delimiters' }
     $editor.SetValue('!')
-    Close-Editor 'Cancel'
+    Close-Editor 'Cancel' '!'
     if ((Saved-Delimiters) -cne $custom) { throw 'Cancelled edit changed settings on disk' }
     Check-Word 'pha' 'scope/srv/alpha/bin'
 
@@ -89,9 +110,10 @@ try {
     Click 'Restore default delimiters'
     $null = Wait-Until 'default draft in text box' { $editor.Current.Value -ceq $default }
     if ((Saved-Delimiters) -cne $custom) { throw 'Restoring the draft persisted it before Save' }
-    Close-Editor 'Save'
-    $null = Wait-Until 'restored default saved on disk' { (Saved-Delimiters) -ceq $default }
+    Close-Editor 'Save' $default
     Check-Word 'ha' 'alpha'
+    $saved = Saved-Delimiters
+    if ($saved -cne $default) { throw "Saved delimiters '$saved' differ from restored default '$default'" }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

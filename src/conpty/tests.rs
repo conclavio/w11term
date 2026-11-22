@@ -122,6 +122,7 @@ impl Fixture {
             args: child_args("native_child"),
             cwd: Some(cwd.path().into()),
             scrollback_lines: Default::default(),
+            color_scheme: Default::default(),
             powershell_integration: false,
         };
         let (input, rx) = mpsc::unbounded_channel();
@@ -266,6 +267,7 @@ async fn missing_executable_returns_a_launch_error_and_releases_endpoints() -> R
         args: vec![],
         cwd: None,
         scrollback_lines: Default::default(),
+        color_scheme: Default::default(),
         powershell_integration: false,
     };
     let (_input, rx) = mpsc::unbounded_channel();
@@ -285,6 +287,7 @@ async fn failed_local_launch_offers_one_fresh_restart_per_termination() -> Resul
         args: vec![],
         cwd: None,
         scrollback_lines: Default::default(),
+        color_scheme: Default::default(),
         powershell_integration: false,
     };
     let pane = crate::session::Session::start(crate::options::Source::Local(options));

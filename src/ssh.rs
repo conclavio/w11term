@@ -6,6 +6,7 @@ mod folder_share;
 mod game_resume;
 mod herdr;
 mod known_hosts;
+mod local_forward;
 mod sharing;
 mod transport;
 pub(crate) use durability::DurableControl;
@@ -14,6 +15,7 @@ pub use durability::{DurableAction, DurablePhase, DurableState};
 pub use folder_share::{
     FolderMount, FolderMountStatus, FolderRoot, MountedFolder, valid_mount_name,
 };
+pub use local_forward::{LocalForward, LocalForwardStatus};
 pub use sharing::ConnectionShare;
 pub(crate) use sharing::{NETWORK, ShareSlot, Sharing};
 pub use transport::{Event, run, run_configured};

@@ -5,6 +5,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type TabId = u64;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneRotation {
+    group: TabId,
+    focus: TabId,
+    axis: Axis,
+    path: Vec<bool>,
+    panes: Vec<TabId>,
+}
+
 /// A directional swap offered for a specific pair of visible panes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneSwap {
@@ -171,6 +180,40 @@ impl<T> Tabs<T> {
             neighbor: group.layout.neighbor(group.focused, direction)?,
             direction,
         })
+    }
+
+    pub fn pane_rotation(&self) -> Option<PaneRotation> {
+        let group = self.groups.get(self.active_index()?)?;
+        if group.zoomed {
+            return None;
+        }
+        let (path, parent) = group.layout.parent_of(group.focused)?;
+        let Layout::Split { axis, .. } = parent else {
+            return None;
+        };
+        Some(PaneRotation {
+            group: group.id,
+            focus: group.focused,
+            axis: *axis,
+            path,
+            panes: parent.leaves(),
+        })
+    }
+
+    /// Keep both child trees and their divider ratio. Return the panes whose geometry changed.
+    pub fn rotate_split(&mut self, expected: PaneRotation) -> Option<Vec<TabId>> {
+        if self.pane_rotation().as_ref() != Some(&expected) {
+            return None;
+        }
+        let index = self.active_index()?;
+        let Layout::Split { axis, .. } = self.groups[index].layout.node_mut(&expected.path)? else {
+            return None;
+        };
+        *axis = match *axis {
+            Axis::Columns => Axis::Rows,
+            Axis::Rows => Axis::Columns,
+        };
+        Some(expected.panes)
     }
 
     pub fn swap_panes(&mut self, target: PaneSwap) -> bool {
@@ -480,6 +523,70 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotate_only_the_nearest_split_preserves_sessions_focus_and_ratios() {
+        let mut tabs = Tabs::default();
+        let left = tabs.insert("SSH");
+        let upper = tabs.split(left, "log", Axis::Columns).unwrap();
+        let lower = tabs.split(upper, "PowerShell", Axis::Rows).unwrap();
+        tabs.set_ratio(&[], 0.6);
+        tabs.set_ratio(&[true], 0.3);
+        let original = tabs.active_layout().unwrap().clone();
+        let target = tabs.pane_rotation().unwrap();
+        assert_eq!(tabs.rotate_split(target.clone()), Some(vec![upper, lower]));
+        assert_eq!(tabs.active_id(), Some(lower));
+        let layout = tabs.active_layout().unwrap();
+        assert_eq!(layout.bounds(left), original.bounds(left));
+        assert_eq!(layout.neighbor(lower, Direction::Left), Some(upper));
+        assert_eq!(layout.neighbor(lower, Direction::Up), None);
+        assert_eq!(tabs.rotate_split(target), None, "stale pre-rotation action");
+        assert!(tabs.rotate_split(tabs.pane_rotation().unwrap()).is_some());
+        assert_eq!(tabs.active_layout(), Some(&original));
+
+        // Rotating from the outer leaf carries its entire sibling subtree intact.
+        tabs.select(left);
+        let outer = tabs.pane_rotation().unwrap();
+        assert_eq!(tabs.rotate_split(outer), Some(vec![left, upper, lower]));
+        let Layout::Split {
+            axis,
+            ratio,
+            second,
+            ..
+        } = tabs.active_layout().unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!((*axis, *ratio), (Axis::Rows, 0.6));
+        let Layout::Split {
+            second: original_subtree,
+            ..
+        } = &original
+        else {
+            unreachable!()
+        };
+        assert_eq!(second, original_subtree);
+    }
+
+    #[test]
+    fn rotate_rejects_stale_focus_zoom_and_sibling_membership() {
+        let mut tabs = Tabs::default();
+        let a = tabs.insert(0);
+        assert!(tabs.pane_rotation().is_none());
+        let b = tabs.split(a, 1, Axis::Columns).unwrap();
+        tabs.select(a);
+        let pending = tabs.pane_rotation().unwrap();
+        tabs.select(b);
+        assert!(tabs.rotate_split(pending.clone()).is_none());
+        tabs.select(a);
+        tabs.toggle_zoom();
+        assert!(tabs.pane_rotation().is_none());
+        assert!(tabs.rotate_split(pending.clone()).is_none());
+        tabs.toggle_zoom();
+        tabs.split(b, 2, Axis::Rows);
+        tabs.select(a);
+        assert!(tabs.rotate_split(pending).is_none());
+    }
 
     #[test]
     fn swap_exchanges_only_neighboring_rectangles_and_keeps_the_focused_session() {

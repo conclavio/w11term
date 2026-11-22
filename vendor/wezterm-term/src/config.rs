@@ -160,6 +160,11 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// defines the initial palette.
     fn color_palette(&self) -> ColorPalette;
 
+    /// The user's preferred appearance for this terminal, independent of remote OSC colors.
+    fn prefers_light_colors(&self) -> bool {
+        false
+    }
+
     fn canonicalize_pasted_newlines(&self) -> NewlineCanon {
         NewlineCanon::default()
     }

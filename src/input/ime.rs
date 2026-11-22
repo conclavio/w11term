@@ -230,6 +230,10 @@ pub(crate) fn position_after_draw(offset: f32, scale: f32) {
     with_composition_mut(|ime| ime.offset = (offset * scale).round() as i32);
     position(false);
 }
+
+pub(crate) fn position_after_layout() {
+    position(false);
+}
 fn position(force: bool) {
     let update = with_composition_mut(|ime| {
         let hwnd = ime.owner?;

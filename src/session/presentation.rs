@@ -239,6 +239,33 @@ mod tests {
         assert!(!terminal.synchronized_output());
     }
     #[test]
+    fn reverse_screen_commits_once_and_reuses_unchanged_rows() {
+        let (mut terminal, mut p) = fixture();
+        p.advance(&mut terminal, b"steady", 0, "test", 0);
+        publish(&mut p, &terminal, 0);
+        let normal = p.frames.load();
+        p.advance(&mut terminal, b"\x1b[?2026h\x1b[?5h", 0, "test", 0);
+        publish(&mut p, &terminal, 0);
+        assert_eq!(p.frames.load().generation, normal.generation);
+        assert_eq!(p.live.load().palette, normal.palette);
+        p.advance(&mut terminal, b"\x1b[?2026l", 0, "test", 0);
+        publish(&mut p, &terminal, 0);
+        let reverse = p.frames.load();
+        assert_eq!(reverse.generation, normal.generation + 1);
+        assert_eq!(reverse.palette.foreground, normal.palette.background);
+        assert_eq!(reverse.palette.background, normal.palette.foreground);
+        assert_eq!(p.live.load().palette, reverse.palette);
+        assert!(std::sync::Arc::ptr_eq(&normal.rows[0], &reverse.rows[0]));
+        p.advance(&mut terminal, b"\x1b[?5h\x1b[?5$p", 0, "test", 0);
+        publish(&mut p, &terminal, 0);
+        assert_eq!(p.frames.load().generation, reverse.generation);
+        p.advance(&mut terminal, b"\x1b[?5l", 0, "test", 0);
+        publish(&mut p, &terminal, 0);
+        assert_eq!(p.frames.load().generation, reverse.generation + 1);
+        assert_eq!(p.live.load().palette, normal.palette);
+    }
+
+    #[test]
     fn synchronized_byte_counters_do_not_repaint_the_previous_frame() {
         let (mut terminal, mut p) = fixture();
         publish(&mut p, &terminal, 0);

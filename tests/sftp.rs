@@ -3,7 +3,7 @@ use russh::{Channel, ChannelId, server};
 use russh_sftp::protocol::*;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -21,6 +21,7 @@ use w11term::{
 
 struct Peer {
     channels: HashMap<ChannelId, Channel<server::Msg>>,
+    forwarded: HashSet<ChannelId>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
     reject: bool,
@@ -50,6 +51,49 @@ impl server::Handler for Peer {
         reply.accept().await;
         Ok(())
     }
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<server::Msg>,
+        host: &str,
+        port: u32,
+        origin: &str,
+        origin_port: u32,
+        reply: server::ChannelOpenHandle,
+        _: &mut server::Session,
+    ) -> anyhow::Result<()> {
+        let trace = self.root.join("forward-trace");
+        if trace.is_file() {
+            writeln!(
+                fs::OpenOptions::new().append(true).open(trace)?,
+                "{host}:{port} {origin}:{origin_port}"
+            )?;
+        }
+        let allowed = fs::read_to_string(self.root.join("forward-port"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok());
+        let Some(target) = allowed.filter(|p| {
+            host == "127.0.0.1"
+                && u32::from(*p) == port
+                && !self.root.join("forward-refuse").is_file()
+        }) else {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        let Ok(mut socket) =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, target)).await
+        else {
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        self.forwarded.insert(channel.id());
+        reply.accept().await;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut channel.into_stream(), &mut socket).await;
+        });
+        Ok(())
+    }
     async fn pty_request(
         &mut self,
         c: ChannelId,
@@ -61,6 +105,15 @@ impl server::Handler for Peer {
         _: &[(russh::Pty, u32)],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("pty-trace").is_file() {
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.root.join("pty-trace"))?,
+                "{c}"
+            )?;
+        }
         s.channel_success(c)?;
         Ok(())
     }
@@ -119,6 +172,18 @@ impl server::Handler for Peer {
             s.data(c, fs::read(self.root.join("copy-history.vt"))?)?;
         }
         #[cfg(feature = "ui-smoke")]
+        if self.root.join("hold-shell-output").is_file() {
+            let gate = self.root.join("hold-shell-output");
+            let bytes = fs::read(self.root.join("deferred-output.vt"))?;
+            let peer = s.handle();
+            tokio::spawn(async move {
+                while gate.is_file() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let _ = peer.data(c, bytes).await;
+            });
+        }
+        #[cfg(feature = "ui-smoke")]
         {
             // Let a read-only, background pane lose its connection from the server side.
             let gate = self.root.join("keep-first-connection");
@@ -163,6 +228,24 @@ impl server::Handler for Peer {
     ) -> anyhow::Result<()> {
         if self.channels.contains_key(&c) {
             #[cfg(feature = "ui-smoke")]
+            if self.root.join("split-inputs").is_dir() {
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.root.join("split-inputs").join(c.to_string()))?
+                    .write_all(data)?;
+                let report: Option<&[u8]> = match data {
+                    b"report-foreign" => Some(b"\x1b]7;file://unrelated.invalid/srv/foreign\x1b\\\r\nforeign-reported\r\n"),
+                    b"report-current" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-reported\r\n"),
+                    b"report-current-again" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-confirmed\r\n"),
+                    _ => None,
+                };
+                if let Some(report) = report {
+                    s.data(c, report)?;
+                    return Ok(());
+                }
+            }
+            #[cfg(feature = "ui-smoke")]
             if self.root.join("keyboard-input.bin").exists() {
                 fs::OpenOptions::new()
                     .append(true)
@@ -190,7 +273,14 @@ impl server::Handler for Peer {
         Ok(())
     }
     async fn channel_eof(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
-        s.close(c)?;
+        // A forwarded TCP client may still read a reply after shutting down its write half.
+        if !self.forwarded.contains(&c) {
+            s.close(c)?;
+        }
+        Ok(())
+    }
+    async fn channel_close(&mut self, c: ChannelId, _: &mut server::Session) -> anyhow::Result<()> {
+        self.forwarded.remove(&c);
         Ok(())
     }
     async fn subsystem_request(
@@ -262,7 +352,7 @@ impl Files {
         Ok(())
     }
 
-    async fn hold_transfer_response(&self, marker: &str) {
+    async fn hold_response(&self, marker: &str) {
         let gate = self.root.join(marker);
         while gate.is_file() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -384,7 +474,7 @@ impl russh_sftp::server::Handler for Files {
     async fn close(&mut self, id: u32, h: String) -> Result<Status, StatusCode> {
         if matches!(self.handles.get(&h), Some(Opened::File(_))) {
             self.trace_transfer("CLOSE")?;
-            self.hold_transfer_response("hold-transfer-close").await;
+            self.hold_response("hold-transfer-close").await;
         }
         self.handles.remove(&h).ok_or(StatusCode::Failure)?;
         Ok(status(id))
@@ -398,7 +488,7 @@ impl russh_sftp::server::Handler for Files {
     ) -> Result<Data, StatusCode> {
         self.trace_transfer(format_args!("READ {offset}"))?;
         if offset > 0 {
-            self.hold_transfer_response("hold-transfer-read").await;
+            self.hold_response("hold-transfer-read").await;
         }
         if self.root.join("small-reads").exists() && len > 512 {
             return Err(StatusCode::Failure);
@@ -432,7 +522,7 @@ impl russh_sftp::server::Handler for Files {
     ) -> Result<Status, StatusCode> {
         self.trace_transfer(format_args!("WRITE {offset}"))?;
         if offset > 0 {
-            self.hold_transfer_response("hold-transfer-write").await;
+            self.hold_response("hold-transfer-write").await;
         }
         if offset > 0 && self.root.join("disconnect-next-write").exists() {
             let _ = self
@@ -518,7 +608,17 @@ impl russh_sftp::server::Handler for Files {
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
         #[cfg(feature = "ui-smoke")]
-        self.trace_listing(&format!("OPENDIR {path}"))?;
+        {
+            self.trace_listing(&format!("OPENDIR {path}"))?;
+            if fs::read_to_string(self.root.join("hold-opendir"))
+                .ok()
+                .as_deref()
+                == Some(&path)
+            {
+                fs::write(self.root.join("opendir-paused"), &path).map_err(io)?;
+                self.hold_response("hold-opendir").await;
+            }
+        }
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
@@ -662,6 +762,7 @@ async fn fixture_counting_accepts(
             accepted.fetch_add(1, Ordering::Relaxed);
             let peer = Peer {
                 channels: HashMap::new(),
+                forwarded: HashSet::new(),
                 root: root_path.clone(),
                 opens: opens_for_server.clone(),
                 reject,
@@ -680,6 +781,7 @@ async fn fixture_counting_accepts(
     });
     let source = Source::Ssh(SshOptions {
         scrollback_lines: Default::default(),
+        color_scheme: Default::default(),
         terminal_type: Default::default(),
         host: "127.0.0.1".into(),
         user: "test".into(),
@@ -687,6 +789,7 @@ async fn fixture_counting_accepts(
         authentication: Authentication::None,
         host_key: Some(pin),
         proxy_jump: Vec::new(),
+        local_forwards: Vec::new(),
         durable: false,
         player: Default::default(),
     });
@@ -770,6 +873,8 @@ mod cancellation;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
+#[path = "sftp/local_forward.rs"]
+mod local_forward;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;

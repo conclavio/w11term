@@ -154,10 +154,13 @@ pub enum Shortcut {
     CloseTab,
     SplitRight,
     SplitBelow,
+    SplitRightInCurrentDirectory,
+    SplitBelowInCurrentDirectory,
     FocusPane(Direction),
     ResizePane(Direction),
     SwapPane(Direction),
     ZoomPane,
+    RotateSplit,
     ClosePane,
     Select(usize),
     Copy,
@@ -340,6 +343,10 @@ impl KeyboardBridge {
                 state.wheel_panes.hovered = Some(id);
             }
         });
+    }
+    pub fn hovered_pane(&self) -> Option<u64> {
+        let _native = self.scope.enter();
+        with_input(|input| input.borrow().as_ref()?.wheel_panes.hovered)
     }
     pub fn panes_swapped(&self, pair: [u64; 2]) {
         let _native = self.scope.enter();
@@ -644,6 +651,21 @@ unsafe extern "system" fn hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRE
 
 fn is_terminal(hwnd: HWND) -> bool {
     window().is_some_and(|root| unsafe { GetAncestor(hwnd, GA_ROOT) } == root)
+}
+
+/// Current physical client pixel, provided that this window is actually under the cursor.
+pub(crate) fn cursor_client() -> Option<(i32, i32)> {
+    let hwnd = window()?;
+    let mut point = POINT::default();
+    unsafe {
+        GetCursorPos(&mut point).ok()?;
+        if !is_terminal(WindowFromPoint(point))
+            || !windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point).as_bool()
+        {
+            return None;
+        }
+    }
+    Some((point.x, point.y))
 }
 
 #[derive(Clone, Copy)]
@@ -1607,7 +1629,10 @@ impl From<Action> for Shortcut {
             Action::SwapPaneDown => Self::SwapPane(Direction::Down),
             Action::SplitRight => Self::SplitRight,
             Action::SplitBelow => Self::SplitBelow,
+            Action::SplitRightInCurrentDirectory => Self::SplitRightInCurrentDirectory,
+            Action::SplitBelowInCurrentDirectory => Self::SplitBelowInCurrentDirectory,
             Action::ZoomPane => Self::ZoomPane,
+            Action::RotateSplit => Self::RotateSplit,
             Action::ClosePane => Self::ClosePane,
             Action::MovePane => Self::MovePane,
             Action::MovePaneToExistingTab => Self::MovePaneToExistingTab,

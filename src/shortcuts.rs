@@ -24,7 +24,10 @@ pub enum Action {
     SwapPaneDown,
     SplitRight,
     SplitBelow,
+    SplitRightInCurrentDirectory,
+    SplitBelowInCurrentDirectory,
     ZoomPane,
+    RotateSplit,
     ClosePane,
     MovePane,
     MovePaneToExistingTab,
@@ -106,7 +109,22 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(SplitRight, "split_right", "Split right", 0x27, PANE),
     Binding::new(SplitBelow, "split_below", "Split below", 0x28, PANE),
+    Binding::new(
+        SplitRightInCurrentDirectory,
+        "split_right_in_current_directory",
+        "Split right in current directory",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(
+        SplitBelowInCurrentDirectory,
+        "split_below_in_current_directory",
+        "Split below in current directory",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(ZoomPane, "zoom_pane", "Zoom pane", 0x5a, PANE),
+    Binding::new(RotateSplit, "rotate_split", "Rotate split", 0, Mods::NONE),
     Binding::new(ClosePane, "close_pane", "Close pane", 0x57, PANE),
     Binding::new(MovePane, "move_pane", "Move pane to new tab", 0, Mods::NONE),
     Binding::new(
@@ -205,7 +223,10 @@ impl Action {
                 | SwapPaneDown
                 | SplitRight
                 | SplitBelow
+                | SplitRightInCurrentDirectory
+                | SplitBelowInCurrentDirectory
                 | ZoomPane
+                | RotateSplit
                 | ClosePane
                 | MovePane
                 | MovePaneToExistingTab
@@ -499,8 +520,16 @@ mod tests {
     }
 
     #[test]
-    fn pane_swaps_are_individually_remappable_and_require_a_terminal() {
-        let actions = [SwapPaneLeft, SwapPaneRight, SwapPaneUp, SwapPaneDown];
+    fn pane_arrangement_and_directory_splits_are_individually_remappable_and_require_a_terminal() {
+        let actions = [
+            SwapPaneLeft,
+            SwapPaneRight,
+            SwapPaneUp,
+            SwapPaneDown,
+            RotateSplit,
+            SplitRightInCurrentDirectory,
+            SplitBelowInCurrentDirectory,
+        ];
         let mut shortcuts = Shortcuts::default();
         let chord: Chord = "F8".parse().unwrap();
         for action in actions {

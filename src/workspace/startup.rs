@@ -2,7 +2,8 @@ use crate::options::SshOptions;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
-/// Only a locally authored workspace recipe can request remote execution.
+/// Only a locally authored workspace recipe can supply a command. A directory
+/// split supplies a working directory and starts the interactive shell there.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshStartup {

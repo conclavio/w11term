@@ -31,6 +31,7 @@ mod iterm;
 mod keyboard;
 mod kitty;
 mod mouse;
+mod palette;
 pub(crate) mod performer;
 mod sixel;
 use crate::terminalstate::image::*;
@@ -346,6 +347,7 @@ pub struct TerminalState {
     /// Movement events enabled
     any_event_mouse: bool,
     focus_tracking: bool,
+    report_color_scheme_changes: bool,
     /// X10 (legacy), SGR, and SGR-Pixels style mouse tracking and
     /// reporting is enabled
     mouse_encoding: MouseEncoding,
@@ -374,7 +376,7 @@ pub struct TerminalState {
     // OSC 9;4 preserves the previous value while the bar is indeterminate.
     progress_value: u8,
 
-    palette: Option<ColorPalette>,
+    palette: palette::PaletteOverrides,
 
     pixel_width: usize,
     pixel_height: usize,
@@ -614,6 +616,7 @@ impl TerminalState {
             application_keypad: false,
             bracketed_paste: false,
             focus_tracking: false,
+            report_color_scheme_changes: false,
             mouse_encoding: MouseEncoding::X10,
             keyboard_encoding: KeyboardEncoding::Xterm,
             sixel_scrolls_right: false,
@@ -630,7 +633,7 @@ impl TerminalState {
             tabs: TabStop::new(size.cols, 8),
             title: "wezterm".to_string(),
             icon_title: None,
-            palette: None,
+            palette: Default::default(),
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,
             dpi: size.dpi,
@@ -689,8 +692,37 @@ impl TerminalState {
         self.seqno += 1;
     }
 
+    /// The program that requested notifications no longer owns this connection.
+    pub fn clear_color_scheme_subscription(&mut self) {
+        self.report_color_scheme_changes = false;
+    }
+
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
+        let notify = self.report_color_scheme_changes
+            && (self.config.prefers_light_colors() != config.prefers_light_colors()
+                || self.config.color_palette() != config.color_palette());
+        self.collect_palette_edits();
         self.config = config;
+        self.rebuild_palette();
+        if notify {
+            // Config changes run outside parser dispatch. A framed viewer has a
+            // distinct reply channel so this notification cannot become a keystroke.
+            let reply = self
+                .parser_reply_writer
+                .as_mut()
+                .unwrap_or(&mut self.writer);
+            Self::write_color_scheme_report(reply, self.config.prefers_light_colors());
+        }
+    }
+
+    fn write_color_scheme_report(writer: &mut impl std::io::Write, light: bool) {
+        let report = if light {
+            b"\x1b[?997;2n"
+        } else {
+            b"\x1b[?997;1n"
+        };
+        writer.write_all(report).ok();
+        writer.flush().ok();
     }
 
     pub fn get_config(&self) -> Arc<dyn TerminalConfiguration> {
@@ -875,33 +907,25 @@ impl TerminalState {
     /// so that we can start tracking those changes.
     pub fn palette(&self) -> ColorPalette {
         self.palette
+            .effective
             .as_ref()
             .cloned()
             .unwrap_or_else(|| self.config.color_palette())
     }
 
-    /// Called in response to dynamic color scheme escape sequences.
-    /// Will make a copy of the palette from the config file if this
-    /// is the first of these escapes we've seen.
+    /// Edit the effective palette directly. Changes made through this reference
+    /// are reconciled before a subsequent scheme change or OSC mutation.
     pub fn palette_mut(&mut self) -> &mut ColorPalette {
-        if self.palette.is_none() {
-            self.palette.replace(self.config.color_palette());
-        }
-        self.palette.as_mut().unwrap()
+        self.palette.borrowed_mutably = true;
+        self.materialize_palette()
     }
 
-    /// If the current overridden palette is effectively the same as
-    /// the configured palette, remove the override and treat it as
-    /// being the same as the configured state.
-    /// This allows runtime changes to the configuration to take effect.
+    /// Release a directly edited palette after restoring the configured colors.
+    /// Explicit OSC assignments still belong to the application until it resets them.
     pub fn implicit_palette_reset_if_same_as_configured(&mut self) {
-        if self
-            .palette
-            .as_ref()
-            .map(|p| *p == self.config.color_palette())
-            .unwrap_or(false)
-        {
-            self.palette.take();
+        self.collect_palette_edits();
+        if self.palette.assigned.is_empty() {
+            self.palette.effective = None;
         }
     }
 
@@ -1733,18 +1757,12 @@ impl TerminalState {
         self.writer.flush().ok();
     }
 
-    fn decqrm_response(&mut self, mode: Mode, mut recognized: bool, enabled: bool) {
+    fn decqrm_response(&mut self, mode: Mode, recognized: bool, enabled: bool) {
         let (is_dec, number) = match &mode {
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(code)) => (true, code.to_u16().unwrap()),
-            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => {
-                recognized = false;
-                (true, *code)
-            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => (true, *code),
             Mode::QueryMode(TerminalMode::Code(code)) => (false, code.to_u16().unwrap()),
-            Mode::QueryMode(TerminalMode::Unspecified(code)) => {
-                recognized = false;
-                (false, *code)
-            }
+            Mode::QueryMode(TerminalMode::Unspecified(code)) => (false, *code),
             _ => unreachable!(),
         };
 
@@ -1767,6 +1785,15 @@ impl TerminalState {
 
     fn perform_csi_mode(&mut self, mode: Mode) {
         match mode {
+            Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
+                self.report_color_scheme_changes = true;
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
+                self.report_color_scheme_changes = false;
+            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
+                self.decqrm_response(mode, true, self.report_color_scheme_changes);
+            }
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::StartBlinkingCursor,
             ))
@@ -1949,6 +1976,10 @@ impl TerminalState {
                 // Turn off reverse video for all of the lines on the
                 // display.
                 self.reverse_video_mode = false;
+            }
+
+            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::ReverseVideo)) => {
+                self.decqrm_response(mode, true, self.reverse_video_mode);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::Select132Columns))

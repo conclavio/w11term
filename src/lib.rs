@@ -29,4 +29,5 @@ pub mod terminal;
 pub mod text_layout;
 pub mod transcript;
 pub mod wav;
+pub mod windows_appearance;
 pub mod workspace;

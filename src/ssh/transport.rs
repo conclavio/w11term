@@ -375,7 +375,7 @@ async fn connect(
     upstream.context("missing SSH destination")
 }
 
-async fn handshake(
+pub(super) async fn handshake(
     options: &SshOptions,
     prompts: Option<&Prompts>,
     password: &mut Option<Zeroizing<String>>,

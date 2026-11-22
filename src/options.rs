@@ -7,6 +7,63 @@ use std::{
 mod local;
 pub use local::LocalOptions;
 
+/// Base colors for a new terminal pane. Applications can override them with OSC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColorScheme {
+    #[default]
+    Default,
+    OneHalfDark,
+    OneHalfLight,
+    FollowWindows,
+}
+
+impl ColorScheme {
+    pub const ALL: [Self; 4] = [
+        Self::Default,
+        Self::OneHalfDark,
+        Self::OneHalfLight,
+        Self::FollowWindows,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "w11term (default)",
+            Self::OneHalfDark => "One Half Dark",
+            Self::OneHalfLight => "One Half Light",
+            Self::FollowWindows => "Follow Windows",
+        }
+    }
+
+    pub(crate) fn resolve(
+        self,
+        appearance: impl FnOnce() -> crate::windows_appearance::WindowsAppearance,
+    ) -> ResolvedColorScheme {
+        use crate::windows_appearance::WindowsAppearance;
+        match self {
+            Self::Default => ResolvedColorScheme::Default,
+            Self::OneHalfDark => ResolvedColorScheme::OneHalfDark,
+            Self::OneHalfLight => ResolvedColorScheme::OneHalfLight,
+            Self::FollowWindows => match appearance() {
+                WindowsAppearance::Light => ResolvedColorScheme::OneHalfLight,
+                WindowsAppearance::Dark => ResolvedColorScheme::OneHalfDark,
+            },
+        }
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
+/// Only concrete palettes enter a terminal's configuration and snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedColorScheme {
+    Default,
+    OneHalfDark,
+    OneHalfLight,
+}
+
 /// Number of physical rows a pane retains above its primary screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(try_from = "u32")]
@@ -162,6 +219,13 @@ impl TryFrom<String> for TerminalType {
     }
 }
 
+/// The two IPv4 loopback ports offered by a profile’s forward manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct LocalForwardPreset {
+    pub local_port: std::num::NonZeroU16,
+    pub remote_port: std::num::NonZeroU16,
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SshOptions {
     pub host: String,
@@ -172,11 +236,15 @@ pub struct SshOptions {
     pub terminal_type: TerminalType,
     #[serde(default, skip_serializing_if = "ScrollbackLines::is_default")]
     pub scrollback_lines: ScrollbackLines,
+    #[serde(default, skip_serializing_if = "ColorScheme::is_default")]
+    pub color_scheme: ColorScheme,
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_jump: Vec<JumpHost>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_forwards: Vec<LocalForwardPreset>,
     #[serde(default)]
     pub durable: bool,
     #[serde(default)]
@@ -204,9 +272,11 @@ impl From<JumpHost> for SshOptions {
             port: hop.port,
             terminal_type: TerminalType::default(),
             scrollback_lines: ScrollbackLines::default(),
+            color_scheme: ColorScheme::default(),
             authentication: hop.authentication,
             host_key: hop.host_key,
             proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
             durable: false,
             player: PlayerOptions::default(),
         }
@@ -410,6 +480,14 @@ pub enum Source {
 }
 
 impl Source {
+    pub fn color_scheme(&self) -> ColorScheme {
+        match self {
+            Self::Local(shell) => shell.color_scheme,
+            Self::Ssh(ssh) => ssh.color_scheme,
+            Self::Demo | Self::Replay(_) => ColorScheme::default(),
+        }
+    }
+
     pub fn scrollback_lines(&self) -> ScrollbackLines {
         match self {
             Self::Local(shell) => shell.scrollback_lines,
@@ -505,9 +583,11 @@ impl Options {
                         port: 22,
                         terminal_type: TerminalType::default(),
                         scrollback_lines: ScrollbackLines::default(),
+                        color_scheme: ColorScheme::default(),
                         authentication: Authentication::Agent,
                         host_key: None,
                         proxy_jump: Vec::new(),
+                        local_forwards: Vec::new(),
                         durable: false,
                         player: Default::default(),
                     });

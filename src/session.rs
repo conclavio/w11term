@@ -1,6 +1,6 @@
 use crate::{
     demo,
-    options::Source,
+    options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
 };
@@ -14,6 +14,7 @@ use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 #[cfg(test)]
 mod clear_scrollback_tests;
 mod clipboard;
+mod colors;
 mod launch;
 pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
 #[cfg(test)]
@@ -37,6 +38,8 @@ pub enum Command {
     RestartExited(ClaimedRestart),
     /// Ordered with both native input and control-pipe writes on this pane.
     SetReadOnly(bool),
+    /// Change the local display defaults without sending input to the transport.
+    SetColorScheme(ColorScheme),
     /// Input method committed text has no corresponding physical key presses.
     Composed(String),
     Observe(tokio::sync::oneshot::Sender<tokio::sync::broadcast::Receiver<Vec<u8>>>),
@@ -74,6 +77,7 @@ pub enum Command {
     /// Discard only the offscreen rows of the primary buffer on this worker.
     ClearScrollback,
     ScrollTo(isize),
+    ScrollViewport(crate::terminal::ScrollbackTarget),
     ScrollRange(RangeScrollRequest),
     CopyRange(
         crate::copy_mode::ScreenId,
@@ -137,11 +141,13 @@ pub struct Session {
     pub frames: FrameStore,
     pub clipboard_enabled: Arc<AtomicBool>,
     ssh_connection: ssh::ShareSlot,
+    direct_ssh_shell: bool,
     durable: Option<ssh::DurableControl>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 struct Services {
+    colors: colors::PaneColors,
     prompts: crate::prompts::Prompts,
     events: crate::events::Events,
     player: Arc<std::sync::RwLock<crate::options::PlayerOptions>>,
@@ -171,6 +177,29 @@ impl Session {
     pub fn ssh_connection(&self) -> Option<ssh::ConnectionShare> {
         self.ssh_connection.current()
     }
+    /// Require the same authenticated transport generation as a pane snapshot.
+    pub fn ssh_connection_at(&self, generation: u64) -> Option<ssh::ConnectionShare> {
+        self.ssh_connection
+            .generation()
+            .and_then(|(current, link)| (current == generation).then_some(link))
+    }
+    pub fn ssh_connection_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.ssh_connection.subscribe()
+    }
+
+    /// Bind the local listener to this pane's current authenticated SSH shell lifetime.
+    pub fn start_local_forward(
+        &self,
+        generation: u64,
+        local_port: u16,
+        remote_port: u16,
+    ) -> anyhow::Result<ssh::LocalForward> {
+        ssh::LocalForward::start(&self.ssh_connection, generation, local_port, remote_port)
+    }
+    /// The program launched in this remote PTY, independent of edits to its saved recipe.
+    pub fn is_direct_ssh_shell(&self) -> bool {
+        self.direct_ssh_shell && !self.player.read().unwrap().rustmush
+    }
 
     pub fn profile_folders(
         &self,
@@ -194,11 +223,21 @@ impl Session {
         allow_clipboard: bool,
         startup: crate::workspace::SshStartup,
     ) -> Self {
+        Self::start_ssh_with_startup(options, size, allow_clipboard, startup, None)
+    }
+
+    pub fn start_ssh_with_startup(
+        options: crate::options::SshOptions,
+        size: TerminalSize,
+        allow_clipboard: bool,
+        startup: crate::workspace::SshStartup,
+        connection: Option<ssh::ConnectionShare>,
+    ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
             size,
             allow_clipboard,
-            None,
+            connection,
             None,
             Some(startup),
         )
@@ -285,8 +324,14 @@ impl Session {
         let worker_player = player.clone();
         let (notice_tx, notice_rx) = mpsc::channel(64);
         let (writer, transport_input) = mpsc::unbounded_channel();
-        let mut terminal =
-            terminal::create_with_scrollback(size, writer.clone(), source.scrollback_lines());
+        let colors =
+            colors::PaneColors::new(source.color_scheme(), crate::windows_appearance::subscribe);
+        let mut terminal = terminal::create_with_palette(
+            size,
+            writer.clone(),
+            source.scrollback_lines(),
+            colors.effective(),
+        );
         let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard));
         let clipboard: Arc<dyn wezterm_term::Clipboard> =
             Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
@@ -309,6 +354,7 @@ impl Session {
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
         let ssh_connection = ssh::ShareSlot::default();
+        let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         let (durable, lifecycle) = saved
             .filter(|_| matches!(source, Source::Ssh(_)))
             .map(ssh::DurableControl::new)
@@ -337,6 +383,7 @@ impl Session {
                         transport_input,
                         worker_frames,
                         Services {
+                            colors,
                             prompts: worker_prompts,
                             events: worker_events,
                             player: worker_player,
@@ -357,6 +404,7 @@ impl Session {
             frames,
             clipboard_enabled,
             ssh_connection,
+            direct_ssh_shell,
             durable,
             worker: Some(worker),
         }
@@ -384,6 +432,7 @@ async fn run(
     services: Services,
 ) {
     let Services {
+        mut colors,
         prompts,
         events,
         player,
@@ -392,6 +441,11 @@ async fn run(
         sharing,
     } = services;
     let mut size = terminal.get_size();
+    let scrollback_lines = source.scrollback_lines();
+    let mut applied_scheme = colors.effective();
+    // A theme change between capturing the initial frame and starting this worker
+    // must be reflected before we parse a peer's first color-scheme query.
+    colors.sample();
     let (output_tx, mut output) = mpsc::channel(32);
     let is_demo = matches!(source, Source::Demo);
     let is_ssh = matches!(source, Source::Ssh(_));
@@ -466,6 +520,11 @@ async fn run(
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
+        if colors.effective() != applied_scheme {
+            applied_scheme = colors.effective();
+            terminal::set_color_scheme(&mut terminal, scrollback_lines, applied_scheme);
+            presentation.dirty = true;
+        }
         if let Some(version) = pending_pack.next(
             asset_task.is_some(),
             is_ssh && player.read().unwrap().sync_assets_enabled(),
@@ -519,6 +578,7 @@ async fn run(
         }
         let animation_deadline = presentation.animation_deadline(&terminal);
         tokio::select! {
+            _ = colors.changed() => {},
             _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if animation_deadline.is_some() => {
                 presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
             },
@@ -613,6 +673,10 @@ async fn run(
                         Ok(())
                     }
                     Some(Command::Shutdown) | None => break,
+                    Some(Command::SetColorScheme(scheme)) => {
+                        colors.choose(scheme);
+                        Ok(())
+                    }
                     Some(Command::SetReadOnly(enabled)) => {
                         read_only = enabled;
                         if enabled && matches!(last_mouse.button, wezterm_term::MouseButton::Left | wezterm_term::MouseButton::Middle | wezterm_term::MouseButton::Right)
@@ -729,7 +793,7 @@ async fn run(
                     }
                     Some(Command::ScrollRange(request)) => {
                         if request.available()
-                            && let Some(offset) = request.rows.scroll_offset(&terminal, connection_generation, request.align_top)
+                            && let Some(offset) = request.offset(&terminal, connection_generation, scroll_offset)
                         {
                             let view = (offset != scroll_offset).then(||
                                 presentation.scrolled_view(&terminal, offset, &search));
@@ -742,6 +806,12 @@ async fn run(
                         }
                         // The viewport was already published before acknowledging UIA.
                         continue;
+                    }
+                    Some(Command::ScrollViewport(target)) => {
+                        if let Some(offset) = target.offset(&terminal, connection_generation) {
+                            scroll_offset = offset;
+                        }
+                        Ok(())
                     }
                     Some(Command::ScrollTo(top)) => {
                         if !terminal.is_alt_screen_active() {
@@ -796,6 +866,7 @@ async fn run(
                 let Some(event) = event else {
                     // All sender clones are gone and every final Data/Status was processed.
                     // A transient disconnect with a scheduled reconnect never closes this queue.
+                    terminal.clear_color_scheme_subscription();
                     let joined = transports.join_next().await;
                     prompts.cancel();
                     events.command_stream(false);
@@ -829,6 +900,7 @@ async fn run(
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
                         ssh::Event::Disconnected => {
+                            terminal.clear_color_scheme_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
                             events.command_stream(false);
                             events.set_progress(wezterm_term::Progress::None);
@@ -901,6 +973,16 @@ fn can_restart(live_shell: bool, startup: Option<&crate::workspace::SshStartup>)
     live_shell && startup.is_none_or(|recipe| recipe.command.is_empty())
 }
 
+fn direct_ssh_shell(
+    source: &Source,
+    managed: bool,
+    startup: Option<&crate::workspace::SshStartup>,
+) -> bool {
+    !managed
+        && matches!(source, Source::Ssh(ssh) if !ssh.durable && !ssh.player.rustmush)
+        && startup.is_none_or(|launch| launch.command.is_empty())
+}
+
 fn record_output(
     recorder: &mut Option<crate::recorder::Recorder>,
     bytes: &[u8],
@@ -964,6 +1046,29 @@ pub fn benchmark() {
 mod failure_tests {
     use super::*;
     #[test]
+    fn directory_splits_require_an_interactive_direct_ssh_launch() {
+        let mut ssh: crate::options::SshOptions = serde_json::from_value(
+            serde_json::json!({"user":"user","host":"localhost","auth":"none"}),
+        )
+        .unwrap();
+        let directory =
+            crate::workspace::SshStartup::new(&ssh, "/work".into(), String::new()).unwrap();
+        let command =
+            crate::workspace::SshStartup::new(&ssh, "/work".into(), "tail -f log".into()).unwrap();
+        let ordinary = Source::Ssh(ssh.clone());
+        assert!(direct_ssh_shell(&ordinary, false, None));
+        assert!(direct_ssh_shell(&ordinary, false, Some(&directory)));
+        assert!(!direct_ssh_shell(&ordinary, false, Some(&command)));
+        assert!(!direct_ssh_shell(&ordinary, true, None));
+        assert!(!direct_ssh_shell(&Source::Demo, false, None));
+        ssh.durable = true;
+        assert!(!direct_ssh_shell(&Source::Ssh(ssh.clone()), false, None));
+        ssh.durable = false;
+        ssh.player.rustmush = true;
+        assert!(!direct_ssh_shell(&Source::Ssh(ssh), false, None));
+    }
+
+    #[test]
     fn command_watch_accepts_live_shells_and_excludes_reconstructed_streams() {
         let mut ssh: crate::options::SshOptions = serde_json::from_value(
             serde_json::json!({"user":"user","host":"localhost","auth":"none"}),
@@ -985,6 +1090,7 @@ mod failure_tests {
                 cwd: None,
                 powershell_integration: false,
                 scrollback_lines: Default::default(),
+                color_scheme: Default::default(),
             }
         )));
         assert!(!can_watch_commands(&Source::Demo));

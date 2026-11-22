@@ -6,11 +6,15 @@ pub enum CommandId {
     Menu(String),
     SaveScrollback(Option<u64>),
     ClearScrollback(Option<u64>),
+    PaneColorScheme(u64, ColorScheme),
     SharedFolders(Option<u64>),
+    LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     DuplicateTabLayout(Option<TabId>),
     SwapPanes(PaneSwap),
+    RotateSplit(PaneRotation),
+    SplitInDirectory(Axis, Option<directory_split::Origin>),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -43,6 +47,8 @@ fn menu_shortcut(message: Message) -> Option<Shortcut> {
 fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
     for item in items {
         match item {
+            // Color choices are bound below to the native pane ID and get a searchable verb.
+            MenuItem::Submenu { key, .. } if !profiles && key == pane_colors::MENU_KEY.into() => {}
             MenuItem::Submenu { items, .. } => menu_rows(items, profiles, rows),
             MenuItem::Separator { .. } => {}
             MenuItem::Item {
@@ -54,7 +60,8 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                     || (!profiles
                         && (key == "save-scrollback".into()
                             || key == "restart-exited".into()
-                            || key == "shared-folders".into()))
+                            || key == "shared-folders".into()
+                            || key == "local-forward".into()))
                 {
                     continue;
                 }
@@ -126,8 +133,13 @@ impl TerminalApp {
     pub(super) fn command_rows(&self, query: &str) -> Vec<Row> {
         let mut rows = vec![];
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
-        let swaps = self.pane_swaps();
-        menu_rows(self.caret_items(exited.is_some(), &swaps), false, &mut rows);
+        let arrangement = self.pane_arrangement();
+        let directory_split = self.directory_split_origin();
+        menu_rows(
+            self.caret_items(exited.is_some(), &arrangement, directory_split.is_some()),
+            false,
+            &mut rows,
+        );
         let origin = self.paste_origin();
         for row in &mut rows {
             if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
@@ -141,6 +153,23 @@ impl TerminalApp {
         });
         let tab_count = self.tabs.headers().len();
         let pane = live.map(|tab| tab.session.pane_id);
+        if let Some(live) = live.filter(|tab| pane_colors::available(tab)) {
+            rows.extend(
+                pane_colors::choices(live.color_scheme).map(|(scheme, label)| Row {
+                    id: CommandId::PaneColorScheme(live.session.pane_id, scheme),
+                    label: format!("Set pane color scheme to {label}"),
+                    chord: String::new(),
+                    enabled: true,
+                }),
+            );
+        }
+        let forward = self.forward_origin();
+        rows.push(Row {
+            id: CommandId::LocalForward(forward),
+            label: local_forwards::LABEL.into(),
+            chord: String::new(),
+            enabled: forward.is_some(),
+        });
         rows.push(Row {
             id: CommandId::SharedFolders(pane),
             label: folder_shares::LABEL.into(),
@@ -194,6 +223,9 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                shortcut if let Some(axis) = directory_split::axis(shortcut) => {
+                    row.id = CommandId::SplitInDirectory(axis, directory_split.clone());
+                }
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
                 }
@@ -203,8 +235,15 @@ impl TerminalApp {
                     row.id = CommandId::DuplicateTabLayout(self.tabs.active_group_id());
                 }
                 Shortcut::SwapPane(direction) => {
-                    if let Some(target) = swaps.get(direction) {
+                    if let Some(target) = arrangement.get(direction) {
                         row.id = CommandId::SwapPanes(target);
+                    }
+                }
+                Shortcut::RotateSplit => {
+                    if let Some(target) = &arrangement.rotation {
+                        row.id = CommandId::RotateSplit(target.clone());
+                    } else {
+                        row.enabled = false;
                     }
                 }
                 Shortcut::FocusPane(dir) => {
@@ -266,6 +305,11 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
+            CommandId::LocalForward(origin) => local_forwards::open(origin),
+            CommandId::SplitInDirectory(axis, target) => {
+                directory_split::message(axis, target.as_ref())
+            }
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
             }
@@ -273,6 +317,7 @@ impl TerminalApp {
                 bind_tab_action(Message::Shortcut(Shortcut::DuplicateTabLayout), group)
             }
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
+            CommandId::RotateSplit(target) => Message::RotateSplit(target),
             CommandId::SharedFolders(Some(pane)) => {
                 Message::FolderShare(folder_shares::Action::Open(pane))
             }

@@ -1,4 +1,4 @@
-use super::ScrollbackLines;
+use super::{ColorScheme, ScrollbackLines};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,6 +17,8 @@ pub struct LocalOptions {
     pub powershell_integration: bool,
     #[serde(default, skip_serializing_if = "ScrollbackLines::is_default")]
     pub scrollback_lines: ScrollbackLines,
+    #[serde(default, skip_serializing_if = "ColorScheme::is_default")]
+    pub color_scheme: ColorScheme,
 }
 
 impl LocalOptions {
@@ -121,6 +123,7 @@ impl LocalOptions {
                     args: vec![],
                     cwd: None,
                     scrollback_lines: Default::default(),
+                    color_scheme: ColorScheme::default(),
                     powershell_integration: false,
                 });
             }
@@ -250,6 +253,7 @@ mod tests {
             args: vec!["".into(), "windows path with spaces".into()],
             cwd: Some("working".into()),
             scrollback_lines: Default::default(),
+            color_scheme: ColorScheme::default(),
             powershell_integration: false,
         };
         assert!(store.save_local(None, "ssh", &shell).is_err());

@@ -1,5 +1,5 @@
 //! The terminal engine is independent of Reactor, rendering, and SSH.
-use crate::options::ScrollbackLines;
+use crate::options::{ColorScheme, ResolvedColorScheme, ScrollbackLines};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -12,10 +12,13 @@ use wezterm_term::{
     CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
 };
 
+mod color_scheme;
 mod export;
 mod kitty;
 mod retained_rows;
 pub use retained_rows::RetainedRows;
+mod scrollback_view;
+pub use scrollback_view::{ScrollbackTarget, ScrollbackView};
 #[cfg(test)]
 mod scrollback_tests;
 pub(crate) use export::export_text;
@@ -60,6 +63,18 @@ pub fn scroll_wheel(
 #[derive(Debug)]
 struct Config {
     scrollback_lines: ScrollbackLines,
+    palette: ColorPalette,
+    scheme: ResolvedColorScheme,
+}
+
+impl Config {
+    fn new(scrollback_lines: ScrollbackLines, scheme: ResolvedColorScheme) -> Self {
+        Self {
+            scrollback_lines,
+            scheme,
+            palette: color_scheme::palette(scheme),
+        }
+    }
 }
 
 impl TerminalConfiguration for Config {
@@ -71,12 +86,11 @@ impl TerminalConfiguration for Config {
     }
 
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette {
-            foreground: SrgbaTuple(0.86, 0.88, 0.91, 1.0),
-            background: SrgbaTuple(0.055, 0.063, 0.078, 1.0),
-            cursor_bg: SrgbaTuple(0.48, 0.79, 0.98, 1.0),
-            ..ColorPalette::default()
-        }
+        self.palette.clone()
+    }
+
+    fn prefers_light_colors(&self) -> bool {
+        self.scheme == ResolvedColorScheme::OneHalfLight
     }
 
     fn scrollback_size(&self) -> usize {
@@ -135,17 +149,33 @@ impl Write for ReplyWriter {
 }
 
 pub fn create(size: TerminalSize, writer: mpsc::UnboundedSender<TransportInput>) -> Terminal {
-    create_with_scrollback(size, writer, ScrollbackLines::default())
+    create_with_profile(
+        size,
+        writer,
+        ScrollbackLines::default(),
+        ColorScheme::Default,
+    )
 }
 
-pub(crate) fn create_with_scrollback(
+pub fn create_with_profile(
     size: TerminalSize,
     writer: mpsc::UnboundedSender<TransportInput>,
     scrollback_lines: ScrollbackLines,
+    scheme: ColorScheme,
+) -> Terminal {
+    let resolved = scheme.resolve(|| *crate::windows_appearance::subscribe().borrow());
+    create_with_palette(size, writer, scrollback_lines, resolved)
+}
+
+pub(crate) fn create_with_palette(
+    size: TerminalSize,
+    writer: mpsc::UnboundedSender<TransportInput>,
+    scrollback_lines: ScrollbackLines,
+    scheme: ResolvedColorScheme,
 ) -> Terminal {
     Terminal::new(
         size,
-        Arc::new(Config { scrollback_lines }),
+        Arc::new(Config::new(scrollback_lines, scheme)),
         "w11term",
         env!("CARGO_PKG_VERSION"),
         Box::new(ReplyWriter {
@@ -153,6 +183,14 @@ pub(crate) fn create_with_scrollback(
             message: TransportInput::Data,
         }),
     )
+}
+
+pub(crate) fn set_color_scheme(
+    terminal: &mut Terminal,
+    scrollback_lines: ScrollbackLines,
+    scheme: ResolvedColorScheme,
+) {
+    terminal.set_config(Arc::new(Config::new(scrollback_lines, scheme)));
 }
 
 pub(crate) fn replace_transport(
@@ -512,6 +550,7 @@ pub struct Snapshot {
     pub first_stable_row: isize,
     pub oldest_stable_row: isize,
     row_epoch: u64,
+    history_clear_count: u64,
     /// Most recent successful local history clear. The floor is the first row
     /// retained at the time of that clear, even if new output has since arrived.
     pub scrollback_clear_generation: u64,
@@ -648,11 +687,17 @@ impl Snapshot {
             });
         }
         let cursor = terminal.cursor_pos();
+        // DECSCNM exchanges the display defaults. Leave the underlying OSC colors
+        // and indexed palette intact so queries and later resets see the originals.
+        let mut palette = terminal.palette();
+        if terminal.get_reverse_video() {
+            std::mem::swap(&mut palette.foreground, &mut palette.background);
+        }
         Self {
             generation,
             rows,
             row_wraps,
-            palette: terminal.palette(),
+            palette,
             cursor,
             cursor_visible: offset == 0
                 && cursor.visibility == termwiz::surface::CursorVisibility::Visible,
@@ -666,6 +711,7 @@ impl Snapshot {
             first_stable_row,
             oldest_stable_row: screen.phys_to_stable_row_index(0),
             row_epoch: screen.row_epoch(),
+            history_clear_count: screen.history_clear_count(),
             scrollback_clear_generation: 0,
             scrollback_clear_floor: None,
             alternate,
@@ -726,6 +772,7 @@ impl Snapshot {
     pub fn same_presentation(&self, old: &Self) -> bool {
         self.size == old.size
             && self.row_epoch == old.row_epoch
+            && self.history_clear_count == old.history_clear_count
             && self.first_stable_row == old.first_stable_row
             && self.oldest_stable_row == old.oldest_stable_row
             && self.scrollback_clear_generation == old.scrollback_clear_generation
@@ -1948,7 +1995,7 @@ mod tests {
             rx,
         )
     }
-    fn receive(rx: &mut mpsc::UnboundedReceiver<TransportInput>) -> Vec<u8> {
+    pub(super) fn receive(rx: &mut mpsc::UnboundedReceiver<TransportInput>) -> Vec<u8> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -1963,6 +2010,50 @@ mod tests {
             _ => panic!("unexpected resize"),
         }
     }
+    #[test]
+    fn reverse_screen_reports_state_across_screen_switches_and_resets() {
+        let (mut terminal, mut replies) = engine();
+        for (request, answer) in [
+            ("", 2),
+            ("\x1b[?5h", 1),
+            ("\x1b[?5h", 1),
+            ("\x1b[?1049h", 1),
+            ("\x1b[?1049l", 1),
+            ("\x1b[?5l", 2),
+            ("\x1b[?5h\x1bc", 2),
+        ] {
+            terminal.advance_bytes(request.as_bytes());
+            terminal.advance_bytes(b"\x1b[?5$p");
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1b[?5;{answer}$y").as_bytes()
+            );
+        }
+        terminal.advance_bytes(b"\x1b[?5h");
+        terminal.reset_connection();
+        terminal.advance_bytes(b"\x1b[?5$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?5;2$y");
+    }
+
+    #[test]
+    fn reverse_screen_preserves_the_dynamic_colors_reported_to_applications() {
+        let (mut terminal, mut replies) = engine();
+        let query = b"\x1b]10;?\x07";
+        terminal.advance_bytes(b"\x1b]10;#13579b\x07\x1b]11;#421735\x07");
+        terminal.advance_bytes(query);
+        let normal_reply = receive(&mut replies);
+        terminal.advance_bytes(b"\x1b[?5h");
+        terminal.advance_bytes(query);
+        assert_eq!(receive(&mut replies), normal_reply);
+        terminal.advance_bytes(b"\x1b]10;#eeddaa\x07");
+        let palette = terminal.palette();
+        let capture = |term: &Terminal| Snapshot::capture(term, None, 0, 0, String::new(), 0);
+        assert_eq!(capture(&terminal).palette.background, palette.foreground);
+        assert_eq!(capture(&terminal).palette.foreground, palette.background);
+        terminal.advance_bytes(b"\x1b[?5l");
+        assert_eq!(capture(&terminal).palette, palette);
+    }
+
     #[test]
     fn cursor_blink_mode_preserves_shape_and_reports_the_latest_request() {
         use termwiz::surface::CursorShape::*;

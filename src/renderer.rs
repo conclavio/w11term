@@ -4,6 +4,7 @@ use crate::{
 };
 use std::collections::{HashMap, HashSet};
 use std::{cell::RefCell, rc::Rc, time::Instant};
+use termwiz::surface::CursorShape;
 use w11term::terminal::{Snapshot, colors, rgba};
 use wezterm_term::{
     Intensity, Underline,
@@ -116,6 +117,19 @@ struct TextRun<'a> {
     shape: bool,
 }
 
+#[derive(Clone, Copy)]
+struct VisibleCursor {
+    row: usize,
+    col: usize,
+    shape: CursorShape,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CursorDisplay {
+    Live,
+    Static,
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum RunKind {
     Ascii,
@@ -185,6 +199,19 @@ fn run_extent(
         count += 1;
     }
     (count, Some(kind))
+}
+
+fn draw_strikethrough(ctx: &DrawingSession<'_>, brush: &Brush, cell: Rect, scale: f32) {
+    let top = ((cell.top + (cell.bottom - cell.top) * 0.5) * scale).round() / scale;
+    ctx.fill_rect(
+        &Rect::from_xywh(
+            cell.left,
+            top,
+            cell.right - cell.left,
+            scale.round().max(1.0) / scale,
+        ),
+        brush,
+    );
 }
 
 fn draw_underline(
@@ -290,7 +317,11 @@ impl Renderer {
         })
     }
 
-    fn text(&mut self, native: &NativeDrawing, run: TextRun<'_>) -> windows_canvas::Result<()> {
+    fn text(
+        &mut self,
+        native: &NativeDrawing,
+        run: TextRun<'_>,
+    ) -> windows_canvas::Result<Option<(&TextLayout, f32)>> {
         let TextRun {
             text,
             style,
@@ -301,7 +332,7 @@ impl Renderer {
             shape,
         } = run;
         if text.trim_end_matches(' ').is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let key = (text.to_owned(), style);
         if !self.layouts.contains_key(&key) {
@@ -332,7 +363,8 @@ impl Renderer {
         } else {
             1.0
         };
-        native.text(&cached.layout, x, y, fg, scale)
+        native.text(&cached.layout, x, y, fg, scale)?;
+        Ok(Some((&cached.layout, scale)))
     }
 
     pub fn draw(
@@ -340,7 +372,14 @@ impl Renderer {
         ctx: &DrawContext<'_>,
         frame: &Snapshot,
     ) -> windows_canvas::Result<Metrics> {
-        self.draw_surface(ctx, ctx.width, ctx.height, ctx.device_changed(), frame)
+        self.paint(
+            ctx,
+            ctx.width,
+            ctx.height,
+            ctx.device_changed(),
+            frame,
+            CursorDisplay::Live,
+        )
     }
 
     /// Draw the committed grid at its original geometry, then fit it into the thumbnail.
@@ -538,6 +577,50 @@ impl Renderer {
         self.metrics
     }
 
+    fn visible_cursor(&self, frame: &Snapshot, display: CursorDisplay) -> Option<VisibleCursor> {
+        let (row, col, visible, shape) = self.copy_cursor.map_or_else(
+            || {
+                (
+                    frame.cursor.y as isize,
+                    frame.visual_cursor_column(),
+                    frame.cursor_visible,
+                    frame.cursor.shape,
+                )
+            },
+            |point| {
+                let row = point.row - frame.first_stable_row;
+                let col = usize::try_from(row)
+                    .ok()
+                    .and_then(|r| frame.cell_map(r))
+                    .map_or(point.col, |map| map.visual(point.col));
+                (row, col, true, CursorShape::SteadyBlock)
+            },
+        );
+        let row = usize::try_from(row)
+            .ok()
+            .filter(|&r| visible && r < self.metrics.rows && col < self.metrics.cols);
+        if display == CursorDisplay::Live
+            && let Some(blink) = &self.live_cursor
+        {
+            let cell = row.filter(|_| shape.is_blinking()).map(|row| CursorCell {
+                col,
+                row,
+                shape,
+                stable_row: frame.first_stable_row.saturating_add(row as isize),
+                alternate: frame.alternate,
+                connection: frame.connection_generation,
+            });
+            if !blink.borrow_mut().visible(cell, Instant::now()) {
+                return None;
+            }
+        }
+        Some(VisibleCursor {
+            row: row?,
+            col,
+            shape,
+        })
+    }
+
     fn draw_surface(
         &mut self,
         ctx: &DrawingSession<'_>,
@@ -545,6 +628,25 @@ impl Renderer {
         height: f32,
         device_changed: bool,
         frame: &Snapshot,
+    ) -> windows_canvas::Result<Metrics> {
+        self.paint(
+            ctx,
+            width,
+            height,
+            device_changed,
+            frame,
+            CursorDisplay::Static,
+        )
+    }
+
+    fn paint(
+        &mut self,
+        ctx: &DrawingSession<'_>,
+        width: f32,
+        height: f32,
+        device_changed: bool,
+        frame: &Snapshot,
+        display: CursorDisplay,
     ) -> windows_canvas::Result<Metrics> {
         let native = NativeDrawing::new(ctx)?;
         if device_changed {
@@ -627,13 +729,46 @@ impl Renderer {
             }
         }
         self.draw_images(&native, frame, &tiles[under_background..under_text])?;
+        let cursor = self.visible_cursor(frame, display);
+        let block = cursor.filter(|cursor| {
+            self.copy_cursor.is_none()
+                && display == CursorDisplay::Live
+                && self
+                    .live_cursor
+                    .as_ref()
+                    .is_some_and(|blink| blink.borrow().is_focused())
+                && matches!(
+                    cursor.shape,
+                    CursorShape::Default | CursorShape::SteadyBlock | CursorShape::BlinkingBlock
+                )
+        });
+        let mut block_extent = block.map(|cursor| (cursor.col, 1));
+        let mut block_decorations = (Underline::None, false);
+        let mut cursor_ink = None;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
+            let block_col = block
+                .filter(|cursor| cursor.row == y)
+                .map(|cursor| cursor.col);
             let cells: Vec<_> = line
                 .visible_cells()
                 .take_while(|c| c.cell_index() < frame.cols)
                 .filter(|c| map.visual(c.cell_index()) < self.metrics.cols)
                 .collect();
+            if let Some(col) = block_col {
+                // visible_cells omits the continuation of a wide grapheme.
+                let logical = map.logical(col);
+                let end = cells.partition_point(|cell| cell.cell_index() <= logical);
+                if let Some(cell) = cells[..end].last()
+                    && logical < cell.cell_index() + cell.width()
+                {
+                    block_extent = Some((map.visual(cell.cell_index()), cell.width()));
+                    if !cell.attrs().invisible() {
+                        block_decorations =
+                            (cell.attrs().underline(), cell.attrs().strikethrough());
+                    }
+                }
+            }
             let y = PADDING + y as f32 * ch;
             let mut next_run = 0;
             for (index, cell) in cells.iter().enumerate() {
@@ -670,7 +805,8 @@ impl Renderer {
                     } else {
                         text
                     };
-                    self.text(
+                    let origin = (PADDING + left as f32 * cw, y);
+                    let layout = self.text(
                         &native,
                         TextRun {
                             text,
@@ -679,13 +815,20 @@ impl Renderer {
                                 italic: attrs.italic(),
                                 rtl,
                             },
-                            x: PADDING + left as f32 * cw,
+                            x: origin.0,
                             y,
                             cols,
                             fg,
                             shape: kind.is_some(),
                         },
                     )?;
+                    if block_col.is_some_and(|col| (left..left + cols).contains(&col))
+                        && let Some((layout, scale)) = layout
+                    {
+                        // Keep the complete shaped run at its original origin. Drawing the
+                        // cursor cell alone would break ligatures and joining scripts.
+                        cursor_ink = Some((layout.clone(), origin, scale));
+                    }
                 }
                 if attrs.underline() != Underline::None {
                     let underline = if attrs.underline_color()
@@ -706,70 +849,46 @@ impl Renderer {
                 }
                 if attrs.strikethrough() {
                     brush.set_color(color(fg));
-                    let scale = self.metrics.scale;
-                    let top = ((y + ch * 0.5) * scale).round() / scale;
-                    ctx.fill_rect(
-                        &Rect::from_xywh(
-                            x,
-                            top,
-                            cw * cell.width() as f32,
-                            scale.round().max(1.0) / scale,
-                        ),
+                    draw_strikethrough(
+                        ctx,
                         &brush,
+                        Rect::from_xywh(x, y, cw * cell.width() as f32, ch),
+                        self.metrics.scale,
                     );
                 }
             }
         }
         self.draw_images(&native, frame, &tiles[under_text..])?;
-        let (row, col, visible) = self.copy_cursor.map_or_else(
-            || {
-                (
-                    frame.cursor.y as isize,
-                    frame.visual_cursor_column(),
-                    frame.cursor_visible,
-                )
-            },
-            |point| {
-                let row = point.row - frame.first_stable_row;
-                let col = usize::try_from(row)
-                    .ok()
-                    .and_then(|r| frame.cell_map(r))
-                    .map_or(point.col, |map| map.visual(point.col));
-                (row, col, true)
-            },
-        );
-        let row = usize::try_from(row)
-            .ok()
-            .filter(|&r| visible && r < self.metrics.rows && col < self.metrics.cols);
-        use termwiz::surface::CursorShape;
-        let shape = if self.copy_cursor.is_some() {
-            CursorShape::SteadyBlock
-        } else {
-            frame.cursor.shape
-        };
-        let show_cursor = self.live_cursor.as_ref().is_none_or(|blink| {
-            let cell = row.filter(|_| shape.is_blinking()).map(|row| CursorCell {
-                col,
-                row,
-                shape,
-                stable_row: frame.first_stable_row.saturating_add(row as isize),
-                alternate: frame.alternate,
-                connection: frame.connection_generation,
-            });
-            blink.borrow_mut().visible(cell, Instant::now())
-        });
-        if let Some(row) = row
-            && show_cursor
-        {
-            let x = PADDING + col as f32 * cw;
-            let y = PADDING + row as f32 * ch;
+        if let Some(cursor) = cursor {
+            let x = PADDING + cursor.col as f32 * cw;
+            let y = PADDING + cursor.row as f32 * ch;
             brush.set_color(color(rgba(frame.palette.cursor_bg)));
-            match shape {
+            match cursor.shape {
                 CursorShape::SteadyBar | CursorShape::BlinkingBar => {
                     ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, ch), &brush)
                 }
                 CursorShape::SteadyUnderline | CursorShape::BlinkingUnderline => {
                     ctx.fill_rect(&Rect::from_xywh(x, y + ch - 2.0, cw, 2.0), &brush)
+                }
+                _ if let Some((left, cols)) = block_extent => {
+                    let cols = cols.min(self.metrics.cols - left);
+                    let rect = Rect::from_xywh(PADDING + left as f32 * cw, y, cols as f32 * cw, ch);
+                    ctx.fill_rect(&rect, &brush);
+                    let ink = block_ink(frame);
+                    native.with_clip(rect, || -> windows_canvas::Result<()> {
+                        if let Some((layout, origin, scale)) = cursor_ink {
+                            native.cursor_text(&layout, origin, ink, scale)?;
+                        }
+                        let (underline, strike) = block_decorations;
+                        if underline != Underline::None || strike {
+                            brush.set_color(color(ink));
+                            draw_underline(ctx, &brush, underline, rect, self.metrics.scale);
+                            if strike {
+                                draw_strikethrough(ctx, &brush, rect, self.metrics.scale);
+                            }
+                        }
+                        Ok(())
+                    })?;
                 }
                 _ => ctx.draw_rect(&Rect::from_xywh(x, y, cw, ch), &brush, 1.0),
             }
@@ -967,6 +1086,22 @@ impl Renderer {
     }
 }
 
+fn block_ink(frame: &Snapshot) -> [f32; 4] {
+    let ink = rgba(frame.palette.cursor_fg);
+    let pixel = |rgba: [f32; 4]| rgba.map(|v| (v * 255.0).round() as u8);
+    if pixel(ink) != pixel(rgba(frame.palette.cursor_bg)) {
+        return ink;
+    }
+    // OSC 12 can choose the same displayed color as the ink. Keep its fill and
+    // use whichever of black or white has the higher contrast ratio.
+    let light = if frame.palette.cursor_bg.to_linear().relative_luminance() < 0.179 {
+        1.0
+    } else {
+        0.0
+    };
+    [light, light, light, 1.0]
+}
+
 fn color(c: [f32; 4]) -> ColorF {
     ColorF::new(c[0], c[1], c[2], c[3])
 }
@@ -1080,13 +1215,121 @@ mod tests {
     }
 
     #[test]
+    fn focused_block_recolors_the_original_shaped_run_only_inside_the_cursor() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::with_size("Cascadia Code", true, 18.0).unwrap();
+        let blink = Rc::new(RefCell::new(CursorBlink::default()));
+        let surface = windows_canvas::Invalidator::new();
+        renderer.live_cursor = Some(blink.clone());
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let (width, height) = (320_u32, 160_u32);
+        let target = device.create_render_target(width, height).unwrap();
+        let metrics = renderer.measure(width as f32, height as f32, 1.0);
+        let (cw, ch) = (metrics.cell_width as usize, metrics.cell_height as usize);
+        let render = |renderer: &mut Renderer, frame: &Snapshot, display| {
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(96.0);
+                    renderer.paint(ctx, width as f32, height as f32, false, frame, display)?;
+                    Ok(())
+                })
+                .unwrap();
+            target.read_pixels().unwrap()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(wezterm_term::TerminalSize::default(), tx);
+        terminal.advance_bytes("A->B界X\x1b[4;9m \x1b[0m\r\nسلام");
+        for (request, left, cells, paper) in [
+            ("\x1b]12;#ff0000\x1b\\\x1b[1;3H", 2, 1, [0, 0, 255, 255]),
+            (
+                "\x1b]12;#0000ff\x1b\\\x1b[2 q\x1b[1;6H",
+                4,
+                2,
+                [255, 0, 0, 255],
+            ),
+            ("\x1b[1 q\x1b[1;9H", 8, 1, [255, 0, 0, 255]),
+            ("\x1b[1;8H", 7, 1, [255, 0, 0, 255]),
+            ("\x1b[2;1H", 3, 1, [255, 0, 0, 255]),
+            (
+                "\x1b]11;#ffffff\x1b\\\x1b]12;rgb:0001/0000/0000\x1b\\\x1b[1;1H",
+                0,
+                1,
+                [0, 0, 0, 255],
+            ),
+        ] {
+            terminal.advance_bytes(request);
+            let mut frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+            if paper != [0, 0, 0, 255] {
+                frame.palette.cursor_fg = frame
+                    .palette
+                    .resolve_fg(wezterm_term::color::ColorAttribute::PaletteIndex(10));
+            }
+            let mut reference = frame.clone();
+            reference.cursor_visible = false;
+            let normal = render(&mut renderer, &reference, CursorDisplay::Static);
+            // Paint the complete original text with the cursor colors. A clipped
+            // cursor must sample exactly this glyph mask, including its neighbors'
+            // influence on the arrow's shaping and on the wide character's metrics.
+            reference.palette.background = frame.palette.cursor_bg;
+            reference.palette.foreground = if paper == [0, 0, 0, 255] {
+                // Black OSC 12 on a white theme collides with the default black cursor ink.
+                frame.palette.background
+            } else {
+                frame.palette.cursor_fg
+            };
+            let recolored = render(&mut renderer, &reference, CursorDisplay::Static);
+            blink.borrow_mut().set_focus(true, None, &surface);
+            let focused = render(&mut renderer, &frame, CursorDisplay::Live);
+            let mut ink = 0;
+            for y in 0..2 * ch {
+                for x in 0..10 * cw {
+                    let i = ((PADDING as usize + y) * width as usize + PADDING as usize + x) * 4;
+                    let inside = y / ch == frame.cursor.y as usize
+                        && (left * cw..(left + cells) * cw).contains(&x);
+                    let expected = if inside { &recolored } else { &normal };
+                    assert_eq!(
+                        &focused[i..i + 4],
+                        &expected[i..i + 4],
+                        "pixel {x},{y} at {request:?}"
+                    );
+                    if inside && focused[i..i + 4] != paper {
+                        ink += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                ink > 0,
+                left != 8,
+                "ink on text, solid fill on a blank cell"
+            );
+
+            let capture = render(&mut renderer, &frame, CursorDisplay::Static);
+            assert!(focused != capture, "live block and static outline");
+            renderer.copy_cursor = Some(w11term::interaction::Point {
+                col: frame.cursor.x,
+                row: frame.first_stable_row + frame.cursor.y as isize,
+            });
+            assert!(
+                render(&mut renderer, &frame, CursorDisplay::Live) == capture,
+                "copy cursor"
+            );
+            renderer.copy_cursor = None;
+            blink.borrow_mut().set_focus(false, None, &surface);
+            assert!(
+                render(&mut renderer, &frame, CursorDisplay::Live) == capture,
+                "inactive cursor"
+            );
+        }
+    }
+
+    #[test]
     fn cursor_timer_only_runs_for_a_blinking_application_caret_in_the_painted_grid() {
         let _com = Apartment::new();
         let mut renderer = Renderer::new().unwrap();
         let blink = Rc::new(RefCell::new(CursorBlink::default()));
         blink
             .borrow_mut()
-            .set_interval(Some(200), &windows_canvas::Invalidator::new());
+            .set_focus(true, Some(200), &windows_canvas::Invalidator::new());
         renderer.live_cursor = Some(blink.clone());
         let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
         let target = device.create_render_target(260, 180).unwrap();
@@ -1109,7 +1352,7 @@ mod tests {
             });
             target
                 .draw(|ctx| {
-                    renderer.draw_surface(ctx, 260.0, 180.0, false, &frame)?;
+                    renderer.paint(ctx, 260.0, 180.0, false, &frame, CursorDisplay::Live)?;
                     Ok(())
                 })
                 .unwrap();
@@ -1457,7 +1700,7 @@ mod tests {
         assert_eq!(renderer.tile_bytes, 0);
     }
     #[test]
-    fn preview_fits_the_entire_grid_and_renders_kitty_placements() {
+    fn preview_fits_the_entire_grid_and_renders_kitty_placements_in_the_pane_color_scheme() {
         let _com = Apartment::new();
         let mut renderer = Renderer::new().unwrap();
         let metrics = renderer.measure(800.0, 600.0, 1.0);
@@ -1469,9 +1712,14 @@ mod tests {
             pixel_height: 12 * metrics.cell_height as usize,
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut term = w11term::terminal::create(size, tx);
+        let mut term = w11term::terminal::create_with_profile(
+            size,
+            tx,
+            Default::default(),
+            w11term::options::ColorScheme::OneHalfLight,
+        );
         term.advance_bytes(include_bytes!("../tests/fixtures/kitty/placements.vt"));
-        term.advance_bytes(b"\x1b[?25l\x1b[12;32H\x1b[48;2;255;0;255m ");
+        term.advance_bytes(b"\x1b[?25l\x1b[12;30H\x1b[0m \x1b[41m \x1b[48;2;255;0;255m ");
         let snapshot = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
         let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
         for (width, height) in [(160, 220), (320, 80)] {
@@ -1500,7 +1748,94 @@ mod tests {
                 red > 220 && green < 35 && blue < 35,
                 "kitty placement {red}/{green}/{blue}"
             );
-            assert_eq!(sample(31.5, 11.5), [255, 0, 255], "last cell");
+            assert_eq!(sample(29.5, 11.5), [250; 3], "profile background");
+            assert_eq!(sample(30.5, 11.5), [0xe4, 0x56, 0x49], "profile ANSI red");
+            assert_eq!(sample(31.5, 11.5), [255, 0, 255], "explicit RGB");
+        }
+    }
+
+    #[test]
+    fn offscreen_reverse_screen_recolors_existing_default_ink_and_paper() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::new().unwrap();
+        let metrics = renderer.measure(320.0, 200.0, 1.0);
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 2,
+            pixel_width: (8.0 * metrics.cell_width).round() as usize,
+            pixel_height: (2.0 * metrics.cell_height).round() as usize,
+            dpi: 96,
+        };
+        let width = size.pixel_width as u32 + 2 * PADDING as u32;
+        let height = size.pixel_height as u32 + (2.0 * PADDING + STATUS_HEIGHT) as u32;
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(width, height).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        // Struck spaces provide a solid pixel of foreground ink without font rasterization.
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]10;#ff0000\x1b\\\x1b]11;#0000ff\x1b\\",
+            "\x1b]4;17;#00ffff;18;#ff00ff\x1b\\",
+            "\x1b[9m \x1b[7m ",
+            "\x1b[27;38;5;17;48;5;18m ",
+            "\x1b[38;2;0;255;0;48;2;255;255;0m \x1b[7m ",
+            "\x1b[27;39m \x1b[38;5;17;49m \x1b[0m",
+            "\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1,q=2;/////w==\x1b\\",
+        ));
+        let red = [255, 0, 0];
+        let blue = [0, 0, 255];
+        let green = [0, 255, 0];
+        let yellow = [255, 255, 0];
+        let cyan = [0, 255, 255];
+        let magenta = [255, 0, 255];
+        let mut previous = None;
+        // DECSCNM swaps the current default pair before SGR 7 resolves each cell.
+        // The pen, palette indices, explicit RGB values and image remain intact.
+        for (sequence, fg, bg) in [
+            ("", red, blue),
+            ("\x1b[?5h", blue, red),
+            ("\x1b]10;#00ff00\x1b\\\x1b]11;#ffff00\x1b\\", yellow, green),
+            ("\x1b[?5l", green, yellow),
+        ] {
+            terminal.advance_bytes(sequence);
+            let frame = Snapshot::capture(&terminal, previous.as_ref(), 1, 0, String::new(), 0);
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(96.0);
+                    renderer.draw_surface(ctx, width as f32, height as f32, false, &frame)?;
+                    Ok(())
+                })
+                .unwrap();
+            let pixels = target.read_pixels().unwrap();
+            let rgb = |x: usize, y: usize| {
+                let offset = (y * width as usize + x) * 4;
+                [pixels[offset + 2], pixels[offset + 1], pixels[offset]]
+            };
+            assert_eq!(rgb(1, 1), bg, "canvas clear after {sequence:?}");
+            let paper_y = (PADDING + renderer.metrics.cell_height * 0.25) as usize;
+            let ink_y = (PADDING + renderer.metrics.cell_height * 0.5).round() as usize;
+            for (col, (ink, paper)) in [
+                (fg, bg),
+                (bg, fg),
+                (cyan, magenta),
+                (green, yellow),
+                (yellow, green),
+                (fg, yellow),
+                (cyan, bg),
+                ([255; 3], [255; 3]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let x = (PADDING + (col as f32 + 0.5) * renderer.metrics.cell_width) as usize;
+                assert_eq!(
+                    rgb(x, paper_y),
+                    paper,
+                    "cell {col} paper after {sequence:?}"
+                );
+                assert_eq!(rgb(x, ink_y), ink, "cell {col} ink after {sequence:?}");
+            }
+            previous = Some(frame);
         }
     }
 

@@ -18,13 +18,14 @@ use w11term::{
         word_range,
     },
     options::{
-        Authentication, LocalOptions, Profiles, ScrollbackLines, Source, SshOptions, TerminalType,
+        Authentication, ColorScheme, LocalOptions, Profiles, ScrollbackLines, Source, SshOptions,
+        TerminalType,
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
     shortcuts::Action as KeyAction,
-    tabs::{PaneSwap, TabId, Tabs},
+    tabs::{PaneRotation, PaneSwap, TabId, Tabs},
 };
 use wezterm_term::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 use windows_canvas::{Canvas, Invalidator};
@@ -44,6 +45,7 @@ mod folder_revoke;
 mod folder_shares;
 mod folder_sharing_state;
 mod keyboard_settings;
+mod local_forwards;
 mod local_profile;
 mod pattern_settings;
 mod word_delimiters;
@@ -51,6 +53,7 @@ use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
 mod command_palette;
+mod directory_split;
 mod durable_view;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
@@ -59,8 +62,10 @@ mod keyboard_copy;
 mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod pane_colors;
 mod pane_picker;
 mod pane_view;
+mod scrollback_bar;
 mod scrollback_export;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
@@ -73,6 +78,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    forwards: Box<local_forwards::Routes>,
     folder_sharing: Option<w11term::folder_grants::PaneShares>,
     read_only: Rc<Cell<bool>>,
     startup: Option<Box<w11term::workspace::SshStartup>>,
@@ -81,8 +87,10 @@ struct LiveTab {
     discovery_page: Option<usize>,
     copy_output_unavailable: Option<&'static str>,
     can_clear_scrollback: bool,
+    split_directory_report: Option<Arc<str>>,
     confirm_end: bool,
     durable_phase: Option<w11term::ssh::DurablePhase>,
+    color_scheme: ColorScheme,
     source: Source,
     profile_name: Option<String>,
     surface: PaneSurface,
@@ -141,6 +149,7 @@ impl LiveTab {
     }
 
     fn end_pointer_gesture(&mut self) {
+        self.surface.scrollbar.cancel();
         if let Some(release) = self.remote_mouse.release() {
             let _ = self.session.input.send(Command::Mouse(release));
         }
@@ -295,6 +304,7 @@ enum SettingsEditor {
     WordDelimiters(word_delimiters::Editor),
 }
 enum Page {
+    LocalForwards(local_forwards::Panel),
     SharedFolders(folder_shares::Panel),
     Attention,
     CommandHistory(command_history::HistoryPage),
@@ -374,12 +384,14 @@ struct ProfileDraft {
     folder_revoke: folder_revoke::Editor,
     confirm_delete: bool,
     proxy_jump: Vec<w11term::options::JumpHost>,
+    local_forwards: Vec<w11term::options::LocalForwardPreset>,
     durable: bool,
     saved: bool,
     name: String,
     host: String,
     user: String,
     port: String,
+    color_scheme: ColorScheme,
     scrollback_lines: String,
     terminal_preset: usize,
     custom_terminal: String,
@@ -399,12 +411,14 @@ impl Default for ProfileDraft {
             folder_revoke: Default::default(),
             confirm_delete: false,
             proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
             durable: false,
             saved: false,
             name: String::new(),
             host: String::new(),
             user: String::new(),
             port: "22".into(),
+            color_scheme: ColorScheme::default(),
             scrollback_lines: ScrollbackLines::default().to_string(),
             terminal_preset: 0,
             custom_terminal: String::new(),
@@ -439,11 +453,13 @@ impl ProfileDraft {
         };
         Self {
             proxy_jump: options.proxy_jump.clone(),
+            local_forwards: options.local_forwards.clone(),
             name,
             durable: options.durable,
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
+            color_scheme: options.color_scheme,
             scrollback_lines: options.scrollback_lines.to_string(),
             terminal_preset: match options.terminal_type.as_str() {
                 TerminalType::DEFAULT => 0,
@@ -458,6 +474,25 @@ impl ProfileDraft {
             ..Default::default()
         }
     }
+}
+
+fn color_scheme_editor(id: TabId, scheme: ColorScheme, context: &ViewContext<TerminalApp>) -> View {
+    let schemes = ColorScheme::ALL;
+    StackPanel::new().spacing(5.0).children((
+        TextBlock::new().text("Terminal color scheme"),
+        ComboBox::new()
+            .automation_name("Terminal color scheme")
+            .items_source(schemes.map(ColorScheme::label))
+            .selected_index(schemes.iter().position(|s| *s == scheme))
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .on_selection_changed(context.callback(move |index: Option<usize>| {
+                index
+                    .and_then(|i| schemes.get(i))
+                    .map_or(Message::ControlIdle, |&scheme| {
+                        Message::ProfileColorScheme(id, scheme)
+                    })
+            })),
+    ))
 }
 
 fn scrollback_editor(value: &str, on_change: Callback<String>) -> View {
@@ -543,6 +578,12 @@ fn tab_menu_message(label: String) -> Message {
         "Cancel command notification" => Message::Attention(attention::Action::WatchCommand(false)),
         "Split right" => Message::SplitPane(Axis::Columns, None),
         "Split below" => Message::SplitPane(Axis::Rows, None),
+        "Split right in current directory" => {
+            Message::Shortcut(Shortcut::SplitRightInCurrentDirectory)
+        }
+        "Split below in current directory" => {
+            Message::Shortcut(Shortcut::SplitBelowInCurrentDirectory)
+        }
         "Focus left" => Message::PaneNeighbor(Direction::Left),
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
@@ -556,6 +597,7 @@ fn tab_menu_message(label: String) -> Message {
         "Swap pane up" => Message::Shortcut(Shortcut::SwapPane(Direction::Up)),
         "Swap pane down" => Message::Shortcut(Shortcut::SwapPane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
+        "Rotate split" => Message::Shortcut(Shortcut::RotateSplit),
         "Close pane" => Message::ClosePane,
         "Enable read-only pane input" => Message::SetPaneReadOnly(true),
         "Disable read-only pane input" => Message::SetPaneReadOnly(false),
@@ -612,24 +654,27 @@ enum UiWork {
 }
 
 struct CaretMenuBinding {
+    forward: Option<local_forwards::Origin>,
+    directory_split: Option<directory_split::Origin>,
     pane: Option<u64>,
     paste: Option<clipboard_paste::Origin>,
     group: Option<TabId>,
-    swaps: PaneSwaps,
+    arrangement: PaneArrangement,
     exited: Option<ExitedPane>,
     on_click: Callback<String>,
 }
 
-/// The neighboring leaves offered while this menu is visible.
-#[derive(Clone, Copy, Default, Eq, PartialEq)]
-struct PaneSwaps {
+/// Pane layout actions offered while this menu is visible.
+#[derive(Clone, Default, Eq, PartialEq)]
+struct PaneArrangement {
+    rotation: Option<PaneRotation>,
     left: Option<PaneSwap>,
     right: Option<PaneSwap>,
     up: Option<PaneSwap>,
     down: Option<PaneSwap>,
 }
 
-impl PaneSwaps {
+impl PaneArrangement {
     fn for_tab<T>(tabs: &Tabs<T>) -> Self {
         if !matches!(
             tabs.active_layout(),
@@ -639,6 +684,7 @@ impl PaneSwaps {
         }
         Self {
             left: tabs.pane_swap(Direction::Left),
+            rotation: tabs.pane_rotation(),
             right: tabs.pane_swap(Direction::Right),
             up: tabs.pane_swap(Direction::Up),
             down: tabs.pane_swap(Direction::Down),
@@ -654,6 +700,12 @@ impl PaneSwaps {
         }
     }
 
+    fn rotate(&self) -> Message {
+        self.rotation
+            .clone()
+            .map_or(Message::ControlIdle, Message::RotateSplit)
+    }
+
     fn message(&self, direction: Direction) -> Message {
         self.get(direction)
             .map_or(Message::ControlIdle, Message::SwapPanes)
@@ -664,6 +716,7 @@ pub struct TerminalApp {
     caret_interval: Option<u32>,
     folder_wake: Arc<dyn Fn() + Send + Sync>,
     folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
+    forward_watch: Option<crate::ui_timer::RetryTimer>,
     taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
     show_inspector: bool,
@@ -711,8 +764,10 @@ pub struct TerminalApp {
     appearance: Arc<RwLock<Appearance>>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
-    divider_drag: Rc<RefCell<Option<pane_view::DividerDrag>>>,
+    dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
+    rotation_hover: Option<pane_view::RotationHover>,
+    overlay_visible: Cell<bool>,
     mru_groups: Vec<TabId>,
     switcher: Option<TabSwitcher>,
     picker: Option<pane_picker::Picker>,
@@ -729,12 +784,14 @@ pub struct ExitedPane {
 }
 
 pub enum Message {
+    LocalForward(local_forwards::Action),
     FolderAuthority,
     FolderShare(folder_shares::Action),
     FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
     Export(scrollback_export::Action),
     ClearScrollback(u64),
+    PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
@@ -751,8 +808,10 @@ pub enum Message {
     Files(FileAction),
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
+    SplitInDirectory(Axis, directory_split::Origin),
     PaneNeighbor(Direction),
     SwapPanes(PaneSwap),
+    RotateSplit(PaneRotation),
     ZoomPane,
     ClosePane,
     MovePaneToTab,
@@ -831,6 +890,7 @@ pub enum Message {
     Edit(TabId, Field, String),
     Auth(TabId, Option<usize>),
     TerminalPreset(TabId, Option<usize>),
+    ProfileColorScheme(TabId, ColorScheme),
     SaveProfile(TabId),
     SaveProfileOnly(TabId),
     EditProfile(String),
@@ -840,6 +900,7 @@ pub enum Message {
     ConfirmDeleteProfile(TabId, bool),
     WindowSize(WindowSize),
     Geometry(f64, f64, u64, bool),
+    PaneMeasured(TabId),
     GridFallback(u64),
     FindEdit(TabId, String),
     FindOption(TabId, FindOption, bool),
@@ -873,6 +934,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            forwards: Box::new(local_forwards::Routes::new(&session)),
             folder_sharing: None,
             startup: None,
             observed_frame: 0,
@@ -880,6 +942,8 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             discovery_page: None,
             copy_output_unavailable: Some("waiting for shell markers"),
             can_clear_scrollback: false,
+            split_directory_report: None,
+            color_scheme: source.color_scheme(),
             source,
             confirm_end: false,
             durable_phase: None,
@@ -1326,6 +1390,44 @@ impl TerminalApp {
         if !self.tabs.visible(id) {
             return;
         }
+        let keyboard_navigation = self
+            .copy_mode
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.pane == id)
+            || self.hints.borrow().as_ref().is_some_and(|h| h.pane == id);
+        // Scrolling a background pane preserves the active pane's keyboard route and editors.
+        if !keyboard_navigation
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+            && tab.remote_mouse.held.is_none()
+            && tab.clicked_link.is_none()
+            && !tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
+            && tab.surface.scrollbar.pointer(
+                pointer,
+                kind,
+                || tab.session.frames.load().scrollback_view(),
+                |view, row| {
+                    let _ = tab.session.input.send(view.scroll_to(row));
+                },
+            )
+        {
+            if kind == MouseEventKind::Press {
+                tab.gesture += 1;
+            }
+            if tab.hover.borrow_mut().take().is_some() {
+                tab.surface.invalidator.invalidate();
+            }
+            if let Some(inspector) = &mut self.inspection {
+                inspector.clear_pointer();
+            }
+            return;
+        }
+        if kind != MouseEventKind::Move {
+            self.header.borrow_mut().take();
+        }
         if kind == MouseEventKind::Press
             && let Some(active) = self.tabs.active_id()
             && let Some(AppTab {
@@ -1337,13 +1439,7 @@ impl TerminalApp {
             tab.files.end_filter_edit();
             self.connection_ui(active);
         }
-        if self
-            .copy_mode
-            .borrow()
-            .as_ref()
-            .is_some_and(|m| m.pane == id)
-            || self.hints.borrow().as_ref().is_some_and(|h| h.pane == id)
-        {
+        if keyboard_navigation {
             return;
         }
         if kind == MouseEventKind::Press && self.tabs.active_id() != Some(id) {
@@ -1893,6 +1989,8 @@ impl TerminalApp {
     }
     fn cancel_frame_tasks(&mut self) {
         self.watch_epoch += 1;
+        self.rotation_hover = None;
+        self.dividers.borrow_mut().invalidate();
         for (_, task) in std::mem::take(&mut self.frame_tasks) {
             task.cancel();
         }
@@ -1933,6 +2031,7 @@ impl TerminalApp {
         self.discard_inactive_paste();
         self.bind_folder_shares();
         self.activate_folder_panel(context);
+        self.watch_forward_panel(context);
         self.title_editor = None;
         self.cancel_inactive_entry_dialog();
         self.close_copy_mode();
@@ -1988,7 +2087,6 @@ impl TerminalApp {
             self.mru_groups.insert(0, group);
         }
         self.cancel_frame_tasks();
-        self.divider_drag.borrow_mut().take();
         if !single
             || !matches!(
                 self.tabs.active(),
@@ -2193,6 +2291,16 @@ impl TerminalApp {
             None,
         )
         .with_profile(profile_name);
+        self.insert_split(id, leaf, axis, context);
+    }
+
+    fn insert_split(
+        &mut self,
+        id: TabId,
+        leaf: AppTab,
+        axis: Axis,
+        context: &ComponentContext<Self>,
+    ) {
         if self.tabs.split(id, leaf, axis).is_some() {
             self.initial_grid.set(None);
             self.sync_selection(context);
@@ -2484,6 +2592,7 @@ impl TerminalApp {
             let options = SshOptions {
                 host: host.into(),
                 terminal_type: draft.terminal_type()?,
+                color_scheme: draft.color_scheme,
                 scrollback_lines: draft.scrollback_lines.parse()?,
                 user: user.into(),
                 port: draft
@@ -2496,6 +2605,7 @@ impl TerminalApp {
                     .then(|| draft.fingerprint.trim().into()),
                 player: draft.player.clone(),
                 proxy_jump: draft.proxy_jump.clone(),
+                local_forwards: draft.local_forwards.clone(),
                 durable: draft.durable,
             };
             match &draft.origin {
@@ -2583,24 +2693,35 @@ impl TerminalApp {
         &self,
         context: &ViewContext<Self>,
         exited: Option<ExitedPane>,
-        swaps: PaneSwaps,
+        arrangement: PaneArrangement,
+        directory_split: Option<directory_split::Origin>,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let paste = self.paste_origin();
         let group = self.tabs.active_group_id();
         let mut cached = self.caret_menu_binding.borrow_mut();
+        let forward = self.forward_origin();
         if let Some(binding) = cached.as_ref()
+            && binding.forward == forward
             && binding.pane == pane
             && binding.paste == paste
             && binding.group == group
-            && binding.swaps == swaps
+            && binding.arrangement == arrangement
+            && binding.directory_split == directory_split
             && binding.exited == exited
         {
             return binding.on_click.clone();
         }
         // Reactor replaces a flyout when its callback changes. Keep the same
         // callback while repainting the title bar for the same action target.
+        let split_target = directory_split.clone();
+        let offered = arrangement.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
+            label if let Some(scheme) = pane_colors::from_menu(label) => pane
+                .map_or(Message::ControlIdle, |id| {
+                    Message::PaneColorScheme(id, scheme)
+                }),
+            local_forwards::LABEL => local_forwards::open(forward),
             folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
                 Message::FolderShare(folder_shares::Action::Open(id))
             }),
@@ -2611,7 +2732,11 @@ impl TerminalApp {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
             }
             _ => match tab_menu_message(label) {
-                Message::Shortcut(Shortcut::SwapPane(direction)) => swaps.message(direction),
+                Message::Shortcut(Shortcut::SwapPane(direction)) => offered.message(direction),
+                Message::Shortcut(Shortcut::RotateSplit) => offered.rotate(),
+                Message::Shortcut(shortcut) if let Some(axis) = directory_split::axis(shortcut) => {
+                    directory_split::message(axis, split_target.as_ref())
+                }
                 Message::Shortcut(Shortcut::ClearScrollback) => {
                     pane.map_or(Message::ControlIdle, Message::ClearScrollback)
                 }
@@ -2619,10 +2744,12 @@ impl TerminalApp {
             },
         });
         *cached = Some(CaretMenuBinding {
+            forward,
+            directory_split,
             pane,
             paste,
             group,
-            swaps,
+            arrangement,
             exited,
             on_click: on_click.clone(),
         });
@@ -2697,7 +2824,8 @@ impl TerminalApp {
                 context.callback(Message::ProfileMenu),
             ));
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
-        let swaps = self.pane_swaps();
+        let arrangement = self.pane_arrangement();
+        let directory_split = self.directory_split_origin();
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2705,8 +2833,8 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                self.caret_items(exited.is_some(), &swaps),
-                self.caret_menu_callback(context, exited, swaps),
+                self.caret_items(exited.is_some(), &arrangement, directory_split.is_some()),
+                self.caret_menu_callback(context, exited, arrangement, directory_split),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2758,7 +2886,12 @@ impl TerminalApp {
         menu
     }
 
-    fn caret_items(&self, can_restart: bool, swaps: &PaneSwaps) -> Vec<MenuItem> {
+    fn caret_items(
+        &self,
+        can_restart: bool,
+        arrangement: &PaneArrangement,
+        can_split_directory: bool,
+    ) -> Vec<MenuItem> {
         let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live.session.player.read().unwrap().clone()),
@@ -2786,7 +2919,7 @@ impl TerminalApp {
                 "Command palette…",
                 KeyAction::CommandPalette,
             ),
-            self.pane_menu(can_restart, swaps),
+            self.pane_menu(can_restart, arrangement, can_split_directory),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.duplicate_tab_item(),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
@@ -2838,6 +2971,11 @@ impl TerminalApp {
                 player.as_ref().map(|p| p.sync_assets_enabled()),
             ),
             MenuItem::separator("profile-actions"),
+            command_menu_item(
+                "local-forward",
+                local_forwards::LABEL,
+                self.forward_origin().is_some(),
+            ),
             command_menu_item(
                 "shared-folders",
                 folder_shares::LABEL,
@@ -2897,15 +3035,42 @@ impl TerminalApp {
             Err(reason) => MenuItem::disabled(binding.id, format!("{}: {reason}", binding.label)),
         }
     }
-    fn pane_swaps(&self) -> PaneSwaps {
+    fn panes_rearranged(&mut self, panes: impl IntoIterator<Item = TabId>) {
+        for id in panes {
+            if let Some(AppTab {
+                page: Page::Terminal(live),
+                ..
+            }) = self.tabs.get_mut(id)
+            {
+                live.end_pointer_gesture();
+                live.last_click = None;
+                live.hover.borrow_mut().take();
+                live.surface.invalidator.invalidate();
+            }
+        }
+        self.dividers.borrow_mut().invalidate();
+        self.sync_ime_surface();
+        self.publish_panes();
+    }
+
+    fn pane_arrangement(&self) -> PaneArrangement {
         if self.incoming.is_some() || self.outgoing.is_some() {
-            PaneSwaps::default()
+            PaneArrangement::default()
         } else {
-            PaneSwaps::for_tab(&self.tabs)
+            let mut arrangement = PaneArrangement::for_tab(&self.tabs);
+            if arrangement.rotation.is_some() && !self.rotation_fits() {
+                arrangement.rotation = None;
+            }
+            arrangement
         }
     }
 
-    fn pane_menu(&self, can_restart: bool, swaps: &PaneSwaps) -> MenuItem {
+    fn pane_menu(
+        &self,
+        can_restart: bool,
+        arrangement: &PaneArrangement,
+        can_split_directory: bool,
+    ) -> MenuItem {
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
             return MenuItem::disabled("panes", "Panes");
         }
@@ -2924,6 +3089,18 @@ impl TerminalApp {
         let mut items = vec![
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
+            self.binding_menu_enabled(
+                "split-right-here",
+                "Split right in current directory",
+                KeyAction::SplitRightInCurrentDirectory,
+                can_split_directory,
+            ),
+            self.binding_menu_enabled(
+                "split-below-here",
+                "Split below in current directory",
+                KeyAction::SplitBelowInCurrentDirectory,
+                can_split_directory,
+            ),
             command_menu_item("restart-exited", RESTART_EXITED_PANE, can_restart),
             move_item,
             if self.outgoing.is_none() && self.incoming.is_none() {
@@ -2944,6 +3121,9 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if pane_colors::available(live) {
+                items.push(pane_colors::menu(live.color_scheme));
+            }
             if matches!(live.source, Source::Ssh(_) | Source::Local(_)) {
                 items.push(MenuItem::item(
                     "pane-read-only",
@@ -2999,10 +3179,10 @@ impl TerminalApp {
             }
         }
         for (action, target) in [
-            (KeyAction::SwapPaneLeft, swaps.left),
-            (KeyAction::SwapPaneRight, swaps.right),
-            (KeyAction::SwapPaneUp, swaps.up),
-            (KeyAction::SwapPaneDown, swaps.down),
+            (KeyAction::SwapPaneLeft, arrangement.left),
+            (KeyAction::SwapPaneRight, arrangement.right),
+            (KeyAction::SwapPaneUp, arrangement.up),
+            (KeyAction::SwapPaneDown, arrangement.down),
         ] {
             let binding = action.binding();
             items.push(if target.is_some() {
@@ -3011,6 +3191,13 @@ impl TerminalApp {
                 MenuItem::disabled(binding.id, binding.label)
             });
         }
+        let rotate = KeyAction::RotateSplit.binding();
+        items.push(self.binding_menu_enabled(
+            rotate.id,
+            rotate.label,
+            KeyAction::RotateSplit,
+            arrangement.rotation.is_some(),
+        ));
         if self
             .tabs
             .active_layout()
@@ -3129,6 +3316,7 @@ impl TerminalApp {
             &draft.scrollback_lines,
             context.callback(move |v| Message::Edit(id, Field::ScrollbackLines, v)),
         ));
+        fields.push(color_scheme_editor(id, draft.color_scheme, context));
         fields.push(
             StackPanel::new().spacing(5.0).children((
                 TextBlock::new().text("SSH terminal type (TERM)"),
@@ -3407,7 +3595,20 @@ impl Component for TerminalApp {
                 Shortcut::SwapPane(direction) => shortcut_menu
                     .borrow()
                     .as_ref()
-                    .map_or(Message::ControlIdle, |menu| menu.swaps.message(direction)),
+                    .map_or(Message::ControlIdle, |menu| {
+                        menu.arrangement.message(direction)
+                    }),
+                Shortcut::RotateSplit => shortcut_menu
+                    .borrow()
+                    .as_ref()
+                    .map_or(Message::ControlIdle, |menu| menu.arrangement.rotate()),
+                shortcut if let Some(axis) = directory_split::axis(shortcut) => {
+                    let menu = shortcut_menu.borrow();
+                    directory_split::message(
+                        axis,
+                        menu.as_ref().and_then(|m| m.directory_split.as_ref()),
+                    )
+                }
                 _ => bind_tab_action(Message::Shortcut(shortcut), shortcut_group.get()),
             });
         })
@@ -3604,6 +3805,7 @@ impl Component for TerminalApp {
             header: RefCell::new(None),
             caret_menu_binding,
             folder_panel_timer: None,
+            forward_watch: None,
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
             inspection: None,
@@ -3623,8 +3825,10 @@ impl Component for TerminalApp {
             appearance,
             fonts,
             appearance_error,
-            divider_drag: Rc::new(RefCell::new(None)),
+            dividers: Rc::default(),
             measured_layout: None,
+            rotation_hover: None,
+            overlay_visible: Cell::new(false),
             mru_groups: Vec::new(),
             switcher: None,
             picker: None,
@@ -3658,6 +3862,7 @@ impl Component for TerminalApp {
                     ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
                          || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
                          || std::env::var_os("W11TERM_FILE_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_SCROLLBAR_SMOKE").is_some()
                          || std::env::var_os("W11TERM_WORD_SELECTION_SMOKE").is_some()))
                      || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())
                      || (ssh.user == "pilot" && std::env::var_os("W11TERM_DISCOVERY_SMOKE").is_some())
@@ -3698,6 +3903,7 @@ impl Component for TerminalApp {
             &message,
             Message::FrameReady(..)
                 | Message::FolderShare(folder_shares::Action::Panel(..))
+                | Message::LocalForward(local_forwards::Action::Panel(..))
                 | Message::WindowActivation(_)
                 | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
@@ -3711,11 +3917,14 @@ impl Component for TerminalApp {
                 | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
                 | Message::PaneRatio(..)
+                | Message::PaneMeasured(_)
                 | Message::DividerPress(..)
                 | Message::DividerEnd(..)
                 | Message::HoverPane(..)
                 | Message::PointerExit(..)
-                | Message::Pointer(_, _, MouseEventKind::Move)
+                | Message::Pointer(..)
+                | Message::CaptureLost(..)
+                | Message::FinalizeCapture(..)
         ) {
             self.header.borrow_mut().take();
         }
@@ -3739,6 +3948,7 @@ impl Component for TerminalApp {
             other => other,
         };
         match message {
+            Message::LocalForward(action) => self.forward_action(action, context),
             Message::FolderShare(action) => self.folder_action(action, context),
             Message::FolderRevoke(id, ticket, action) => {
                 self.folder_revoke(id, ticket, action, context)
@@ -3776,6 +3986,12 @@ impl Component for TerminalApp {
                 }) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id))
                 {
                     let _ = tab.session.input.send(Command::ClearScrollback);
+                }
+            }
+            Message::PaneColorScheme(pane, scheme) => {
+                let active = self.tabs.active_id().and_then(|id| self.tabs.get_mut(id));
+                if pane_colors::apply(active, pane, scheme) {
+                    self.refresh_open_commands();
                 }
             }
             Message::DismissWindowError => self.window_error = None,
@@ -4391,7 +4607,7 @@ impl Component for TerminalApp {
                 if self.tabs.visible(id) && self.watch_epoch == epoch {
                     self.frame_tasks.remove(&id);
                     let active = self.tabs.active_id() == Some(id);
-                    let mut clear_availability_changed = false;
+                    let mut pane_actions_changed = false;
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -4426,11 +4642,21 @@ impl Component for TerminalApp {
                         let can_clear = !frame.alternate
                             && (frame.scroll_offset > 0
                                 || frame.first_stable_row > frame.oldest_stable_row);
-                        if tab.can_clear_scrollback != can_clear {
+                        let report = frame.reported_directory.as_ref().filter(|_| {
+                            tab.session
+                                .ssh_connection_at(frame.connection_generation)
+                                .is_some()
+                        });
+                        if tab.forwards.connection_changed()
+                            || (active && tab.connection_generation != frame.connection_generation)
+                            || tab.can_clear_scrollback != can_clear
+                            || tab.split_directory_report.as_ref() != report
+                        {
                             tab.can_clear_scrollback = can_clear;
+                            tab.split_directory_report = report.cloned();
                             if active {
                                 self.header.borrow_mut().take();
-                                clear_availability_changed = true;
+                                pane_actions_changed = true;
                             }
                         }
                         if tab.copy_output_unavailable != unavailable {
@@ -4442,13 +4668,14 @@ impl Component for TerminalApp {
                             tab.durable_phase = phase;
                             tab.confirm_end = false;
                             self.header.borrow_mut().take();
+                            pane_actions_changed |= active;
                         }
                     }
                     if active {
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
-                    if clear_availability_changed {
+                    if pane_actions_changed {
                         self.refresh_open_commands();
                     }
                     if let Some(AppTab {
@@ -4506,14 +4733,13 @@ impl Component for TerminalApp {
                 }
             }
             Message::PaneRatio(epoch, path, ratio) => {
-                if epoch == self.watch_epoch
-                    && self.dragging_divider(epoch, &path)
+                if self.dividers.borrow().dragging(epoch, &path)
                     && self.tabs.set_ratio(&path, ratio)
                     && self
                         .caret_menu_binding
                         .borrow()
                         .as_ref()
-                        .is_some_and(|menu| menu.swaps != self.pane_swaps())
+                        .is_some_and(|menu| menu.arrangement != self.pane_arrangement())
                 {
                     // A drag can change which leaf has the longest shared edge.
                     self.header.borrow_mut().take();
@@ -4530,22 +4756,26 @@ impl Component for TerminalApp {
                     && self.tabs.swap_panes(target)
                 {
                     let panes = target.panes();
+                    self.rotation_hover = None;
                     self.keyboard.panes_swapped(panes);
-                    for id in panes {
-                        if let Some(AppTab {
-                            page: Page::Terminal(live),
-                            ..
-                        }) = self.tabs.get_mut(id)
-                        {
-                            live.end_pointer_gesture();
-                            live.last_click = None;
-                            live.hover.borrow_mut().take();
-                            live.surface.invalidator.invalidate();
-                        }
+                    self.panes_rearranged(panes);
+                }
+            }
+            Message::RotateSplit(target) => {
+                if self.incoming.is_none()
+                    && self.outgoing.is_none()
+                    && self.rotation_fits()
+                    && let Some(panes) = self.tabs.rotate_split(target)
+                {
+                    self.rotation_hover = if self.overlay_visible.get() {
+                        None
+                    } else {
+                        self.capture_rotation_hover(&panes)
+                    };
+                    for &id in &panes {
+                        self.keyboard.leave_pane(id);
                     }
-                    self.divider_drag.borrow_mut().take();
-                    self.sync_ime_surface();
-                    self.publish_panes();
+                    self.panes_rearranged(panes);
                 }
             }
             Message::ZoomPane => {
@@ -4574,6 +4804,9 @@ impl Component for TerminalApp {
                 }
             }
             Message::SplitPane(axis, profile) => self.split_pane(axis, profile, context),
+            Message::SplitInDirectory(axis, origin) => {
+                self.split_in_directory(axis, origin, context)
+            }
             Message::SyncSelection(epoch) => {
                 if self.selection_epoch == epoch {
                     self.selection_pending = false;
@@ -4643,7 +4876,10 @@ impl Component for TerminalApp {
                 Shortcut::SplitRight => self.split_pane(Axis::Columns, None, context),
                 Shortcut::ResizePane(direction) => self.keyboard_resize(direction),
                 // The native shortcut and palette bind both panes before dispatch.
-                Shortcut::SwapPane(_) => {}
+                Shortcut::SwapPane(_)
+                | Shortcut::RotateSplit
+                | Shortcut::SplitRightInCurrentDirectory
+                | Shortcut::SplitBelowInCurrentDirectory => {}
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)
@@ -4909,14 +5145,10 @@ impl Component for TerminalApp {
                 }
             }
             Message::DividerPress(epoch, path, coordinate) => {
-                if epoch == self.watch_epoch {
-                    self.begin_divider(&path, coordinate);
-                }
+                self.begin_divider(epoch, &path, coordinate);
             }
             Message::DividerEnd(epoch, path) => {
-                if self.dragging_divider(epoch, &path) {
-                    self.divider_drag.borrow_mut().take();
-                }
+                self.dividers.borrow_mut().end(epoch, &path);
             }
             Message::HoverPane(id) => {
                 self.keyboard.hover_pane(id);
@@ -4992,6 +5224,27 @@ impl Component for TerminalApp {
                         std::thread::sleep(Duration::from_millis(200));
                         Message::RestoreWindow
                     });
+                }
+            }
+            Message::PaneMeasured(id) => {
+                if self.tabs.visible(id) && !self.tabs.zoomed() {
+                    crate::input::ime::position_after_layout();
+                    if self.overlay_visible.get() {
+                        self.rotation_hover = None;
+                    } else {
+                        self.restore_rotation_hover();
+                    }
+                    let fits =
+                        self.incoming.is_none() && self.outgoing.is_none() && self.rotation_fits();
+                    let changed = self
+                        .caret_menu_binding
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|cached| cached.arrangement.rotation.is_some() != fits);
+                    if changed {
+                        self.header.borrow_mut().take();
+                        self.refresh_open_commands();
+                    }
                 }
             }
             Message::Geometry(width, height, epoch, first) => {
@@ -5071,6 +5324,17 @@ impl Component for TerminalApp {
                 }
             }
             Message::Auth(_, None) => {}
+            Message::ProfileColorScheme(id, scheme) => {
+                match self.tabs.get_mut(id).map(|tab| &mut tab.page) {
+                    Some(Page::NewProfile(draft)) if draft.color_scheme != scheme => {
+                        draft.color_scheme = scheme;
+                        draft.saved = false;
+                        draft.error = None;
+                    }
+                    Some(Page::LocalProfile(draft)) => draft.set_color_scheme(scheme),
+                    _ => {}
+                }
+            }
             Message::TerminalPreset(id, selected) => {
                 if let Some(AppTab {
                     page: Page::NewProfile(draft),
@@ -5257,6 +5521,7 @@ impl Component for TerminalApp {
                 Page::Attention => self.attention_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),
+                Page::LocalForwards(page) => self.forward_view(id, page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,
@@ -5289,6 +5554,7 @@ impl Component for TerminalApp {
             ),
             KeyedView::new("content", Border::new().grid_row(1).content(content)),
         ];
+        let base_layers = views.len();
         if let Some(message) = &self.window_error {
             views.push(KeyedView::new(
                 "window-error",
@@ -5426,6 +5692,7 @@ impl Component for TerminalApp {
                     ),
             ));
         }
+        self.overlay_visible.set(views.len() > base_layers);
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .background(Color::rgb(14, 16, 20))
@@ -5462,6 +5729,10 @@ impl TerminalApp {
         }
         if let Some(path) = std::env::var_os("W11TERM_WORD_SELECTION_SMOKE") {
             self.word_selection_smoke(std::path::Path::new(&path), context);
+            return;
+        }
+        if let Some(path) = std::env::var_os("W11TERM_SCROLLBAR_SMOKE") {
+            self.scrollbar_pointer_smoke(std::path::Path::new(&path), context);
             return;
         }
         if std::env::var_os("W11TERM_IME_SMOKE").is_some() {
@@ -5712,6 +5983,7 @@ impl TerminalApp {
                 };
                 assert_eq!(draft.name, "typo");
                 assert_eq!(draft.host, "127.0.0.1");
+                assert_eq!(draft.color_scheme, ColorScheme::Default);
                 assert_eq!(
                     draft.terminal_type().unwrap().as_str(),
                     TerminalType::DEFAULT
@@ -5729,6 +6001,10 @@ impl TerminalApp {
                 self.update(Message::Edit(id, Field::Name, "corrected".into()), context);
                 self.update(Message::Auth(id, Some(2)), context);
                 self.update(Message::TerminalPreset(id, Some(1)), context);
+                self.update(
+                    Message::ProfileColorScheme(id, ColorScheme::OneHalfDark),
+                    context,
+                );
                 self.update(
                     Message::Edit(
                         id,
@@ -5782,9 +6058,14 @@ impl TerminalApp {
                 assert!(matches!(draft.origin, DraftOrigin::Copy(_)));
                 assert_eq!(draft.name, "corrected copy");
                 assert_eq!(draft.terminal_type().unwrap().as_str(), TerminalType::SIXEL);
+                assert_eq!(draft.color_scheme, ColorScheme::OneHalfDark);
                 assert_eq!(draft.authentication, 2);
                 self.update(Message::Edit(copy, Field::Name, "second".into()), context);
                 self.update(Message::TerminalPreset(copy, Some(2)), context);
+                self.update(
+                    Message::ProfileColorScheme(copy, ColorScheme::OneHalfLight),
+                    context,
+                );
                 self.update(
                     Message::Edit(copy, Field::CustomTerminal, "vt220".into()),
                     context,
@@ -5794,10 +6075,10 @@ impl TerminalApp {
                     self.catalog.profiles.contains_key("corrected")
                         && self.catalog.profiles.contains_key("second")
                 );
-                assert_eq!(
-                    self.store.load().unwrap()["second"].terminal_type.as_str(),
-                    "vt220"
-                );
+                let profiles = self.store.load().unwrap();
+                assert_eq!(profiles["second"].terminal_type.as_str(), "vt220");
+                assert_eq!(profiles["second"].color_scheme, ColorScheme::OneHalfLight);
+                assert_eq!(profiles["corrected"].color_scheme, ColorScheme::OneHalfDark);
                 self.update(Message::DeleteProfile(copy), context);
             }
             31 => {
@@ -6179,7 +6460,7 @@ mod profile_ui_tests {
         let second = tabs.split(first, (), Axis::Columns).unwrap();
         let third = tabs.split(second, (), Axis::Rows).unwrap();
         tabs.select(second);
-        let swaps = PaneSwaps::for_tab(&tabs);
+        let arrangement = PaneArrangement::for_tab(&tabs);
         for (action, direction, available) in [
             (KeyAction::SwapPaneLeft, Direction::Left, true),
             (KeyAction::SwapPaneRight, Direction::Right, false),
@@ -6193,11 +6474,11 @@ mod profile_ui_tests {
             };
             assert_eq!(parsed, direction);
             assert_eq!(
-                matches!(swaps.message(parsed), Message::SwapPanes(_)),
+                matches!(arrangement.message(parsed), Message::SwapPanes(_)),
                 available
             );
         }
-        let Message::SwapPanes(pending) = swaps.message(Direction::Left) else {
+        let Message::SwapPanes(pending) = arrangement.message(Direction::Left) else {
             unreachable!()
         };
         tabs.select(third);
@@ -6282,12 +6563,14 @@ mod profile_ui_tests {
             let options = SshOptions {
                 host: "test.invalid".into(),
                 terminal_type: Default::default(),
+                color_scheme: ColorScheme::OneHalfLight,
                 scrollback_lines: "0".parse().unwrap(),
                 user: "pilot+character".into(),
                 port: 6792,
                 authentication,
                 host_key: Some("SHA256:test".into()),
                 proxy_jump: Vec::new(),
+                local_forwards: Vec::new(),
                 durable: false,
                 player: w11term::options::PlayerOptions {
                     mute: true,
@@ -6299,6 +6582,7 @@ mod profile_ui_tests {
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
             assert_eq!(draft.scrollback_lines, "0");
+            assert_eq!(draft.color_scheme, ColorScheme::OneHalfLight);
             assert_eq!(draft.fingerprint, "SHA256:test");
             assert!(draft.player.mute && draft.player.game_mode);
             assert_eq!(draft.name, "existing");

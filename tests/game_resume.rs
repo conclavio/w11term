@@ -227,6 +227,7 @@ impl Fixture {
         Ok(Self {
             source: Source::Ssh(SshOptions {
                 scrollback_lines: Default::default(),
+                color_scheme: Default::default(),
                 terminal_type: Default::default(),
                 host: "127.0.0.1".into(),
                 user: "play".into(),
@@ -234,6 +235,7 @@ impl Fixture {
                 authentication: Authentication::None,
                 host_key: Some(pin),
                 proxy_jump: vec![],
+                local_forwards: vec![],
                 durable: false,
                 player: PlayerOptions {
                     rustmush: true,

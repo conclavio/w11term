@@ -3,6 +3,8 @@ use crate::options::{Profiles, SshOptions, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
+mod bookmarks;
+pub use bookmarks::{BookmarkPeer, bookmark_directory};
 mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
 
@@ -233,6 +235,14 @@ impl ProfileStore {
                 );
             }
             fields.insert("args".into(), serde_json::to_value(&shell.args)?);
+            if shell.color_scheme.is_default() {
+                fields.remove("color_scheme");
+            } else {
+                fields.insert(
+                    "color_scheme".into(),
+                    serde_json::to_value(shell.color_scheme)?,
+                );
+            }
             if shell.scrollback_lines.is_default() {
                 fields.remove("scrollback_lines");
             } else {
@@ -383,6 +393,10 @@ impl ProfileStore {
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             let object = value.as_object_mut().context("profile must be an object")?;
+            if copy.is_some() {
+                // A different profile starts with its own remote places.
+                object.remove(bookmarks::FIELD);
+            }
             if original != Some(name)
                 || original
                     .and_then(|key| catalog.profiles.get(key))
@@ -412,8 +426,13 @@ impl ProfileStore {
             }
             let keep_route =
                 expected.is_some_and(|previous| previous.proxy_jump == options.proxy_jump);
+            let keep_forwards =
+                expected.is_some_and(|previous| previous.local_forwards == options.local_forwards);
             if options.terminal_type.is_default() {
                 object.remove("terminal_type");
+            }
+            if options.color_scheme.is_default() {
+                object.remove("color_scheme");
             }
             if options.scrollback_lines.is_default() {
                 object.remove("scrollback_lines");
@@ -421,8 +440,14 @@ impl ProfileStore {
             if !keep_route && options.proxy_jump.is_empty() {
                 object.remove("proxy_jump");
             }
+            if !keep_forwards && options.local_forwards.is_empty() {
+                object.remove("local_forwards");
+            }
             for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
-                if (key == "identity" && keep_identity) || (key == "proxy_jump" && keep_route) {
+                if (key == "identity" && keep_identity)
+                    || (key == "proxy_jump" && keep_route)
+                    || (key == "local_forwards" && keep_forwards)
+                {
                     continue;
                 }
                 let mut value = value.clone();
@@ -544,6 +569,7 @@ mod tests {
         let options = SshOptions {
             host: "new.test".into(),
             scrollback_lines: Default::default(),
+            color_scheme: Default::default(),
             terminal_type: Default::default(),
             user: "root".into(),
             port: 22,
@@ -552,6 +578,7 @@ mod tests {
             },
             host_key: None,
             proxy_jump: Vec::new(),
+            local_forwards: Vec::new(),
             durable: false,
             player: Default::default(),
         };
@@ -682,6 +709,55 @@ mod order_tests {
         assert_eq!(restored.local[&name], defaults);
         assert!(disk(&store)["profiles"].get(&name).is_none());
         assert!(store.remove_local(&base).is_err());
+    }
+
+    #[test]
+    fn schemes_survive_profile_copies_and_allow_independent_resets() {
+        use crate::options::ColorScheme::{Default, OneHalfDark, OneHalfLight};
+        let (_dir, store) = fixture();
+        let catalog = store.catalog().unwrap();
+        assert_eq!(catalog.source("Alpha").unwrap().color_scheme(), Default);
+        assert_eq!(catalog.source("Lima").unwrap().color_scheme(), Default);
+
+        let mut ssh = catalog.profiles["Alpha"].clone();
+        ssh.color_scheme = OneHalfLight;
+        store
+            .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
+            .unwrap();
+        let base = store.inspect("Alpha").unwrap().1;
+        store.duplicate(&base, "SSH copy", &base.options).unwrap();
+        let mut shell = catalog.local["Lima"].clone();
+        shell.color_scheme = OneHalfDark;
+        store
+            .save_local(Some(&store.inspect_local("Lima").unwrap()), "Lima", &shell)
+            .unwrap();
+        let base = store.inspect_local("Lima").unwrap();
+        store
+            .duplicate_local(&base, "Local copy", &base.options)
+            .unwrap();
+
+        let catalog = store.catalog().unwrap();
+        assert_eq!(
+            catalog.source("SSH copy").unwrap().color_scheme(),
+            OneHalfLight
+        );
+        assert_eq!(
+            catalog.source("Local copy").unwrap().color_scheme(),
+            OneHalfDark
+        );
+        ssh.color_scheme = Default;
+        store
+            .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
+            .unwrap();
+        shell.color_scheme = Default;
+        store.save_local(Some(&base), "Lima", &shell).unwrap();
+        let entries = &disk(&store)["profiles"];
+        assert!(entries["Alpha"].get("color_scheme").is_none());
+        assert!(entries["Lima"].get("color_scheme").is_none());
+        assert_eq!(entries["SSH copy"]["color_scheme"], "one-half-light");
+        assert_eq!(entries["Local copy"]["color_scheme"], "one-half-dark");
+        assert_eq!(entries["SSH copy"]["extra"], 7);
+        assert_eq!(entries["Local copy"]["extra"], "local");
     }
 
     #[test]
@@ -1013,5 +1089,33 @@ mod jump_tests {
             .edit("destination", "destination", &direct, &edited)
             .unwrap();
         assert_eq!(store.load().unwrap()["destination"], direct);
+    }
+
+    #[test]
+    fn forward_presets_survive_edit_and_duplicate_and_can_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let forwards =
+            serde_json::json!([{"local_port":8080, "remote_port":8000, "label":"preview"}]);
+        let doc = serde_json::json!({"profiles":{"dev":{
+            "host":"target", "user":"pilot", "auth":"agent", "local_forwards":forwards
+        }}});
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let (_, old) = store.inspect("dev").unwrap();
+        let mut edited = old.options.clone();
+        assert_eq!(edited.local_forwards[0].local_port.get(), 8080);
+        edited.port = 2222;
+        store.edit("dev", "renamed", &edited, &old.options).unwrap();
+        let (_, renamed) = store.inspect("renamed").unwrap();
+        assert_eq!(renamed.raw["local_forwards"], forwards);
+        store.duplicate(&renamed, "copy", &edited).unwrap();
+        let (_, copy) = store.inspect("copy").unwrap();
+        assert_eq!(copy.raw["local_forwards"], forwards);
+        edited.local_forwards.clear();
+        store.edit("copy", "copy", &edited, &copy.options).unwrap();
+        let (_, copy) = store.inspect("copy").unwrap();
+        assert!(copy.raw.get("local_forwards").is_none());
+        assert!(copy.options.local_forwards.is_empty());
     }
 }

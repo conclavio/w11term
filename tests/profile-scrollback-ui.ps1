@@ -82,11 +82,24 @@ try {
     }
     $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
     if ($value.Current.Value -cne '10000') { throw "Expected default 10000, got '$($value.Current.Value)'" }
+    $field.SetFocus()
+    $null = Wait-Until 'scrollback limit focused' { $field.Current.HasKeyboardFocus }
     $value.SetValue('0')
+    (Find-Element 'Profile name' ([System.Windows.Automation.ControlType]::Edit)).SetFocus()
+    $null = Wait-Until 'zero retained in the scrollback editor after leaving the field' {
+        $edit = Find-Element 'Scrollback lines' ([System.Windows.Automation.ControlType]::Edit)
+        $edit -and !$edit.Current.HasKeyboardFocus -and
+            $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq '0'
+    }
     Click 'Save profile'
-    $null = Wait-Until 'zero saved distinctly from an omitted limit' {
-        $profile = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.$localName
-        $profile.PSObject.Properties['scrollback_lines'] -and $profile.scrollback_lines -ceq 0
+    # The app returns to Settings only after its atomic catalog replacement succeeds.
+    $null = Wait-Until "saved local profile '$localName' returned to Settings" {
+        !(Find-Element 'Scrollback lines' ([System.Windows.Automation.ControlType]::Edit)) -and
+            (Find-Element "Edit local profile $localName" $button)
+    }
+    $profile = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.$localName
+    if (!$profile.PSObject.Properties['scrollback_lines'] -or $profile.scrollback_lines -cne 0) {
+        throw "Expected an explicit zero scrollback limit in saved profile '$localName': $($profile | ConvertTo-Json -Compress)"
     }
     $zero = Open-LocalHistory
     if ($zero -eq $original) { throw 'Expected a fresh local pane after editing the profile' }
@@ -102,12 +115,27 @@ try {
 
     Press-Key 0x77 # F8 selects the SSH tab in the fixture's keymap.
     Wait-Focus $sshPane
+    Run-Palette 'Find in scrollback    Ctrl+Shift+F'
+    $field = Wait-Until 'focused SSH scrollback search' {
+        $edit = Find-Element 'Find in scrollback' ([System.Windows.Automation.ControlType]::Edit)
+        if ($edit -and $edit.Current.HasKeyboardFocus) { $edit }
+    }
+    # The peer prints two more lines on every PTY resize. A delayed measurement
+    # on tab activation can evict the oldest row even after the tab gains focus.
+    # Wait for a fresh grid acknowledgement before taking the history baseline.
+    $grid = (Control @('list')).sessions | Where-Object id -eq $sshPane
+    $shown = (Control @('get-text','--pane',"$sshPane")).text
+    $cols = $grid.cols
+    do {
+        $cols--
+        $ack = "ssh-grid-${cols}x$($grid.rows)"
+    } while ($shown.Contains($ack))
+    $null = Control @('resize','--pane',"$sshPane",'--cols',"$cols",'--rows',"$($grid.rows)")
+    $null = Control @('wait-for-text','--pane',"$sshPane",'--timeout','15',$ack)
     $beforeScroll = Join-Path $State 'before-scroll.txt'
     $null = Control @('save-text','--pane',"$sshPane",$beforeScroll)
     $before = [IO.File]::ReadAllText($beforeScroll)
     $oldest = 'ssh-row-{0:D3}' -f (@(Row-Numbers $before 'ssh')[0])
-    Run-Palette 'Find in scrollback    Ctrl+Shift+F'
-    $field = Wait-Until 'SSH scrollback search' { Find-Element 'Find in scrollback' ([System.Windows.Automation.ControlType]::Edit) }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($oldest)
     $statusId = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'find-status')
@@ -135,9 +163,14 @@ try {
     if ($sshPane -and $statusId) {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $status = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $statusId)
-        $doc = Find-Element ('Terminal ' + [char]0xb7 + ' palette-ssh')
-        if ($doc) { $shown = $doc.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1) }
-        throw "$failure. Find status '$($status.Current.Name)'. Visible SSH text: '$shown'."
+        # The accessible terminal document is unmounted while native Find owns input.
+        $edit = Find-Element 'Find in scrollback' ([System.Windows.Automation.ControlType]::Edit)
+        if ($edit) { $query = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value }
+        $now = Join-Path $State 'failed-history.txt'
+        $null = Control @('save-text','--pane',"$sshPane",$now)
+        $nowText = [IO.File]::ReadAllText($now)
+        $current = (Control @('list')).sessions | Where-Object id -eq $sshPane
+        throw "$failure. Pane $sshPane active=$($current.active), $($current.cols)x$($current.rows). Find query '$query', status '$($status.Current.Name)'. Original SSH history: '$before'. Current SSH history: '$nowText'."
     }
     throw
 } finally {

@@ -90,6 +90,116 @@ pub enum Layout {
 }
 
 impl Layout {
+    /// Path and immediate parent of the leaf. Ancestor dividers are unaffected by rotation.
+    pub(crate) fn parent_of(&self, pane: u64) -> Option<(Vec<bool>, &Layout)> {
+        let Self::Split { first, second, .. } = self else {
+            return None;
+        };
+        if matches!(first.as_ref(), Self::Leaf(id) if *id == pane)
+            || matches!(second.as_ref(), Self::Leaf(id) if *id == pane)
+        {
+            return Some((Vec::new(), self));
+        }
+        for (side, child) in [(false, first), (true, second)] {
+            if let Some((mut path, parent)) = child.parent_of(pane) {
+                path.insert(0, side);
+                return Some((path, parent));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn node_mut(&mut self, path: &[bool]) -> Option<&mut Self> {
+        let mut node = self;
+        for &second_child in path {
+            let Self::Split { first, second, .. } = node else {
+                return None;
+            };
+            node = if second_child { second } else { first };
+        }
+        Some(node)
+    }
+
+    /// Check the proposed axis of the focused leaf's immediate split. Measurements are
+    /// physical pixels: each leaf supplies its current outer extent and its one-cell minimum
+    /// on that axis. The existing ratios are applied without adjusting any nested divider.
+    pub fn rotation_fits(
+        &self,
+        pane: u64,
+        divider: f64,
+        mut measure: impl FnMut(u64, Axis) -> Option<(f64, f64)>,
+    ) -> bool {
+        let Some((
+            _,
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            },
+        )) = self.parent_of(pane)
+        else {
+            return false;
+        };
+        if !divider.is_finite() || divider < 0.0 {
+            return false;
+        }
+        let across = match axis {
+            Axis::Columns => Axis::Rows,
+            Axis::Rows => Axis::Columns,
+        };
+
+        // Each star-sized child can round down to a whole display pixel. Round its required
+        // parent span up before applying the next ancestor's ratio.
+        fn divided_minimum(a: f64, b: f64, ratio: f64, divider: f64) -> f64 {
+            if ratio > 0.0 && ratio < 1.0 {
+                (a / ratio).max(b / (1.0 - ratio)).ceil() + divider.ceil()
+            } else {
+                f64::INFINITY
+            }
+        }
+        fn extents(
+            node: &Layout,
+            across: Axis,
+            divider: f64,
+            measure: &mut impl FnMut(u64, Axis) -> Option<(f64, f64)>,
+        ) -> Option<(f64, f64)> {
+            match node {
+                Layout::Leaf(id) => {
+                    let (current, minimum) = measure(*id, across)?;
+                    (current.is_finite() && current > 0.0 && minimum.is_finite() && minimum > 0.0)
+                        .then_some((current.floor(), minimum.ceil()))
+                }
+                Layout::Split {
+                    axis,
+                    ratio,
+                    first,
+                    second,
+                } => {
+                    let (a, min_a) = extents(first, across, divider, measure)?;
+                    let (b, min_b) = extents(second, across, divider, measure)?;
+                    Some(if *axis == across {
+                        (
+                            a + divider.floor() + b,
+                            divided_minimum(min_a, min_b, *ratio, divider),
+                        )
+                    } else {
+                        // These extents normally match. Prefer the smaller one if the two
+                        // canvases have reported different stages of a window resize.
+                        (a.min(b), min_a.max(min_b))
+                    })
+                }
+            }
+        }
+        let Some((a, min_a)) = extents(first, across, divider, &mut measure) else {
+            return false;
+        };
+        let Some((b, min_b)) = extents(second, across, divider, &mut measure) else {
+            return false;
+        };
+        divided_minimum(min_a, min_b, *ratio, divider) <= a.min(b)
+    }
+
     /// Closest divider that changes this leaf's extent on the given axis.
     /// The last flag tells whether the leaf belongs to its second child.
     pub fn divider_for(&self, id: u64, axis: Axis) -> Option<(Vec<bool>, &Layout, bool)> {
@@ -278,14 +388,7 @@ impl Layout {
         if !(value > 0.0 && value < 1.0) {
             return false;
         }
-        let mut node = self;
-        for &take_second in path {
-            let Self::Split { first, second, .. } = node else {
-                return false;
-            };
-            node = if take_second { second } else { first };
-        }
-        let Self::Split { ratio, .. } = node else {
+        let Some(Self::Split { ratio, .. }) = self.node_mut(path) else {
             return false;
         };
         *ratio = value;
@@ -313,6 +416,68 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_size_preserves_an_asymmetric_ratio_and_checks_both_measured_extents() {
+        let mut layout = Layout::Leaf(1);
+        layout.split(1, 2, Axis::Rows);
+        layout.set_ratio(&[], 0.25);
+        let before = layout.clone();
+        let fits = |width_second: f64| {
+            layout.rotation_fits(2, 6.0, |pane, axis| {
+                assert_eq!(axis, Axis::Columns);
+                Some(if pane == 1 {
+                    (306.0, 75.0)
+                } else {
+                    (width_second, 60.0)
+                })
+            })
+        };
+        assert!(fits(306.0));
+        // Redistributing one pixel would make this fit, but rotation preserves 25:75.
+        assert!(!fits(305.0));
+        assert_eq!(before, layout);
+    }
+
+    #[test]
+    fn rotation_size_checks_nested_dividers_and_each_leafs_own_cell_only_in_the_affected_subtree() {
+        let mut layout = Layout::Leaf(9);
+        layout.split(9, 1, Axis::Rows);
+        layout.split(1, 2, Axis::Columns);
+        layout.split(2, 3, Axis::Rows);
+        layout.set_ratio(&[true, true], 0.25);
+        layout.split(3, 4, Axis::Columns);
+        let fits = |row_minimum| {
+            layout.rotation_fits(1, 6.0, |pane, axis| {
+                assert_eq!(axis, Axis::Rows);
+                Some(match pane {
+                    1 => (506.0, 75.0),
+                    2 => (125.0, row_minimum),
+                    3 => (375.0, 60.0),
+                    4 => (375.0, 90.0),
+                    _ => panic!("measured a pane outside the rotating parent"),
+                })
+            })
+        };
+        // After rotation: each branch has 250 px; nested pane 2 gets 25% of (250 - 6).
+        assert!(fits(61.0));
+        assert!(!fits(62.0));
+    }
+
+    #[test]
+    fn rotation_size_accounts_for_pixel_rounding_and_requires_valid_measurements() {
+        let mut layout = Layout::Leaf(1);
+        assert!(!layout.rotation_fits(1, 7.5, |_, _| panic!()));
+        layout.split(1, 2, Axis::Columns);
+        // At 125% scale, a 6-DIP divider can occupy 8 px, and each child needs 35 px.
+        assert!(layout.rotation_fits(1, 7.5, |_, _| Some((78.0, 34.5))));
+        assert!(!layout.rotation_fits(1, 7.5, |_, _| Some((77.9, 34.5))));
+        assert!(!layout.rotation_fits(1, 7.5, |pane, _| (pane == 1).then_some((100.0, 34.5))));
+        for invalid in [0.0, f64::NAN, f64::INFINITY] {
+            assert!(!layout.rotation_fits(1, 7.5, |_, _| Some((invalid, 34.5))));
+            assert!(!layout.rotation_fits(1, 7.5, |_, _| Some((100.0, invalid))));
+        }
+    }
 
     #[test]
     fn arrow_moves_the_closest_matching_divider_from_either_side() {

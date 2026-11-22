@@ -204,6 +204,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
         let session = Session::start_sized(
             Source::Ssh(SshOptions {
                 scrollback_lines: Default::default(),
+                color_scheme: Default::default(),
                 terminal_type: terminal_type
                     .map(|name| name.to_owned().try_into().unwrap())
                     .unwrap_or_default(),
@@ -219,6 +220,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                 },
                 host_key: Some(pin),
                 proxy_jump: Vec::new(),
+                local_forwards: Vec::new(),
                 durable: false,
                 player: Default::default(),
             }),

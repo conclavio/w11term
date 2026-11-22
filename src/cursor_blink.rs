@@ -75,7 +75,9 @@ impl BlinkClock {
 
 #[derive(Default)]
 pub(crate) struct CursorBlink {
-    focused: Option<(u32, Invalidator)>,
+    // A focused pane still owns the application caret when Windows disables blinking.
+    focused: bool,
+    cadence: Option<(u32, Invalidator)>,
     cycle: Option<Cycle>,
 }
 
@@ -85,16 +87,25 @@ impl CursorBlink {
         self.cycle.is_some()
     }
 
-    pub fn set_interval(&mut self, ms: Option<u32>, surface: &Invalidator) {
-        if self.focused.as_ref().map(|(old, _)| *old) != ms {
-            self.cycle = None;
-            self.focused = ms.map(|ms| (ms, surface.clone()));
-            surface.invalidate();
+    pub fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Repaint on focus changes even when neither pane has a blink timer.
+    pub fn set_focus(&mut self, focused: bool, ms: Option<u32>, surface: &Invalidator) -> bool {
+        let cadence = ms.filter(|_| focused);
+        if self.focused == focused && self.cadence.as_ref().map(|(old, _)| *old) == cadence {
+            return false;
         }
+        self.cycle = None;
+        self.focused = focused;
+        self.cadence = cadence.map(|interval| (interval, surface.clone()));
+        surface.invalidate();
+        true
     }
 
     pub fn visible(&mut self, cursor: Option<CursorCell>, now: Instant) -> bool {
-        let Some((cursor, (ms, surface))) = cursor.zip(self.focused.as_ref()) else {
+        let Some((cursor, (ms, surface))) = cursor.zip(self.cadence.as_ref()) else {
             self.cycle = None;
             return true;
         };
@@ -135,7 +146,7 @@ mod tests {
     fn tick(blink: &CursorBlink, now: Instant) -> (bool, u32) {
         let clock = &blink.cycle.as_ref().unwrap().clock;
         let mut state = clock.get();
-        let result = state.tick(now, blink.focused.as_ref().unwrap().0);
+        let result = state.tick(now, blink.cadence.as_ref().unwrap().0);
         clock.set(state);
         result
     }
@@ -145,6 +156,34 @@ mod tests {
         assert_eq!(interval(0), None);
         assert_eq!(interval(u32::MAX), None);
         assert_eq!(interval(550), Some(550));
+    }
+
+    #[test]
+    fn focus_moves_repaint_both_steady_cursors_without_arming_a_timer() {
+        let surface_a = Invalidator::new();
+        let surface_b = Invalidator::new();
+        for interval in [None, Some(200)] {
+            let mut a = CursorBlink::default();
+            let mut b = CursorBlink::default();
+            assert!(a.set_focus(true, interval, &surface_a));
+            assert!(!a.set_focus(true, interval, &surface_a));
+            assert!(!b.set_focus(false, interval, &surface_b));
+            assert!(a.is_focused());
+            assert!(!b.is_focused());
+
+            assert!(a.set_focus(false, interval, &surface_a));
+            assert!(b.set_focus(true, interval, &surface_b));
+            assert!(!a.is_focused());
+            assert!(b.is_focused());
+            // The renderer supplies no blinking cell for a steady block.
+            let now = Instant::now();
+            assert!(a.visible(None, now));
+            assert!(b.visible(None, now));
+            assert!(!a.is_running() && !b.is_running());
+
+            assert!(b.set_focus(false, None, &surface_b));
+            assert!(!b.set_focus(false, Some(500), &surface_b));
+        }
     }
 
     #[test]
@@ -162,14 +201,14 @@ mod tests {
         };
         assert!(blink.visible(Some(cell), start));
         assert!(blink.cycle.is_none());
-        blink.set_interval(Some(200), &surface);
+        blink.set_focus(true, Some(200), &surface);
         assert!(blink.visible(Some(cell), start));
         let at = |ms| start + Duration::from_millis(ms);
         assert_eq!(tick(&blink, at(199)), (false, 1));
         assert!(blink.visible(Some(cell), at(199)));
         assert_eq!(tick(&blink, at(200)), (true, 200));
         assert!(!blink.visible(Some(cell), at(200)));
-        blink.set_interval(Some(200), &surface);
+        blink.set_focus(true, Some(200), &surface);
         assert!(!blink.visible(Some(cell), at(399)));
         assert_eq!(tick(&blink, at(400)), (true, 200));
         assert!(blink.visible(Some(cell), at(400)));
@@ -183,24 +222,28 @@ mod tests {
         assert!(blink.visible(Some(cell), at(1090)));
         cell.connection += 1;
         assert!(blink.visible(Some(cell), at(1290)));
-        blink.set_interval(Some(300), &surface);
+        blink.set_focus(true, Some(300), &surface);
         assert!(blink.visible(Some(cell), at(1490)));
         assert_eq!(tick(&blink, at(1790)), (true, 300));
         assert!(!blink.visible(Some(cell), at(1790)));
         assert!(blink.visible(None, at(1800)));
         assert!(blink.cycle.is_none());
         assert!(blink.visible(Some(cell), at(1820)));
-        blink.set_interval(None, &surface);
+        assert!(blink.set_focus(true, None, &surface));
+        assert!(blink.is_focused());
+        assert!(blink.visible(Some(cell), at(1830)));
+        assert!(!blink.is_running());
+        blink.set_focus(false, None, &surface);
         assert!(blink.cycle.is_none());
         assert!(blink.visible(Some(cell), at(2230)));
-        blink.set_interval(Some(300), &surface);
+        blink.set_focus(true, Some(300), &surface);
         assert!(blink.visible(Some(cell), at(2290)));
     }
 
     #[test]
     fn output_defers_blinking_without_replacing_the_timer_or_requesting_extra_paints() {
         let mut blink = CursorBlink::default();
-        blink.set_interval(Some(200), &Invalidator::new());
+        blink.set_focus(true, Some(200), &Invalidator::new());
         let start = Instant::now();
         let mut cell = CursorCell {
             col: 0,

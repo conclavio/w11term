@@ -147,12 +147,9 @@ impl<'a> Reader<'a> {
                     };
                 }
                 "match" => {
-                    self.parsed.warnings.insert(format!(
-                        "{here}: Match conditions are unsupported and were not evaluated."
-                    ));
                     self.parsed.section(section);
                     section = Section {
-                        scope: Scope::Conditional(here),
+                        scope: Scope::Conditional(here, args),
                         directives: Vec::new(),
                     };
                 }
