@@ -138,6 +138,16 @@ pub(super) async fn with_demo_colors(
     viewer: Option<mpsc::UnboundedSender<TransportInput>>,
     exercise: impl AsyncFnOnce(mpsc::UnboundedSender<Command>, FrameStore),
 ) {
+    with_worker(Source::Demo, size, colors, viewer, exercise).await;
+}
+
+pub(super) async fn with_worker(
+    source: Source,
+    size: TerminalSize,
+    colors: colors::PaneColors,
+    viewer: Option<mpsc::UnboundedSender<TransportInput>>,
+    exercise: impl AsyncFnOnce(mpsc::UnboundedSender<Command>, FrameStore),
+) {
     let (input, commands) = mpsc::unbounded_channel();
     let (writer, transport) = mpsc::unbounded_channel();
     let mut terminal =
@@ -149,7 +159,7 @@ pub(super) async fn with_demo_colors(
     let frames = FrameStore::new(initial.clone());
     let (_notices, notices) = mpsc::channel(1);
     let worker = run(
-        Source::Demo,
+        source,
         terminal,
         commands,
         writer,

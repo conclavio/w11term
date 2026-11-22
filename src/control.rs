@@ -41,6 +41,8 @@ pub enum Request {
     Record {
         pane: u64,
         path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        timed: bool,
     },
     Restart {
         pane: u64,
@@ -215,7 +217,11 @@ impl Registry {
     }
     pub async fn execute(&self, request: Request, capture_png: CapturePng) -> Result<Value> {
         match request {
-            Request::Record { pane, path } => {
+            Request::Record { pane, path, timed } => {
+                ensure!(
+                    !timed || path.is_some(),
+                    "timed recording requires a destination path"
+                );
                 ensure!(
                     path.as_ref().is_none_or(|p| p.is_absolute()),
                     "recording path must be absolute"
@@ -223,7 +229,7 @@ impl Registry {
                 let (reply, response) = oneshot::channel();
                 self.pane(pane)?
                     .input
-                    .send(Command::Record { path, reply })
+                    .send(Command::Record { path, timed, reply })
                     .context("pane is closed")?;
                 tokio::time::timeout(TIMEOUT, response)
                     .await??

@@ -1020,6 +1020,7 @@ fn source_label(source: &Source) -> String {
             .into_owned(),
         Source::Demo => LAB.into(),
         Source::Replay(path) => format!("Replay · {}", path.display()),
+        Source::TimedReplay(path) => format!("Timed replay · {}", path.display()),
         Source::Ssh(ssh) => format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
     }
 }
@@ -4525,6 +4526,14 @@ impl Component for TerminalApp {
                     let _ = reply.send(Err(format!("unknown terminal pane {pane}")));
                     return;
                 };
+                if matches!(self.tabs.get(tab_id).map(|tab| &tab.page),
+                    Some(Page::Terminal(tab)) if matches!(tab.source, Source::TimedReplay(_)))
+                {
+                    let _ = reply.send(Err(
+                        "The recording controls this pane’s grid during timed replay".into(),
+                    ));
+                    return;
+                }
                 let split = self.tabs.visible(tab_id)
                     && matches!(
                         self.tabs.active_layout(),

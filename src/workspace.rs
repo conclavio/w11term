@@ -35,6 +35,7 @@ pub enum SavedSource {
     },
     Demo,
     Replay(PathBuf),
+    TimedReplay(PathBuf),
     /// Connection options contain authentication methods and key paths; live
     /// passwords, private key material and authentication answers live elsewhere.
     Ssh(Box<SshOptions>),
@@ -111,9 +112,14 @@ impl SavedSource {
                 }
             }
             (Source::Demo, _) => Self::Demo,
-            (Source::Replay(path), _) => {
+            (Source::Replay(path) | Source::TimedReplay(path), _) => {
                 ensure!(!path.as_os_str().is_empty(), "Empty replay path");
-                Self::Replay(std::path::absolute(path)?)
+                let path = std::path::absolute(path)?;
+                if matches!(source, Source::TimedReplay(_)) {
+                    Self::TimedReplay(path)
+                } else {
+                    Self::Replay(path)
+                }
             }
             (Source::Ssh(_), Some(name)) => Self::SavedProfile(name.into()),
             (Source::Ssh(options), None) => {
@@ -175,7 +181,9 @@ impl SavedSource {
                 shell.validate()?;
                 shell.validate_resolved_paths()?;
             }
-            Self::Replay(path) => ensure!(path.is_absolute(), "Expected an absolute replay path"),
+            Self::Replay(path) | Self::TimedReplay(path) => {
+                ensure!(path.is_absolute(), "Expected an absolute replay path")
+            }
             Self::Ssh(options) => {
                 options.validate_route()?;
                 ensure!(
@@ -245,13 +253,18 @@ impl SavedSource {
                 shell.check_launch_paths()?;
                 Source::Local(shell.clone())
             }
-            Self::Replay(path) => {
+            Self::Replay(path) | Self::TimedReplay(path) => {
                 ensure!(
                     path.is_file(),
                     "Workspace replay file is unavailable: {}",
                     path.display()
                 );
-                Source::Replay(path.clone())
+                if matches!(self, Self::TimedReplay(_)) {
+                    crate::recorder::TimedReplay::read_initial_size(path)?;
+                    Source::TimedReplay(path.clone())
+                } else {
+                    Source::Replay(path.clone())
+                }
             }
             Self::Ssh(options) => Source::Ssh(options.as_ref().clone()),
         })
@@ -931,6 +944,30 @@ mod tests {
         assert!(store.save("   ", &demo()).is_err());
         store.save("ops", &demo()).unwrap();
         assert_eq!(store.load().unwrap()["ops"], demo());
+    }
+
+    #[test]
+    fn workspace_round_trips_timed_replay_and_detects_a_missing_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cockpit.vt");
+        crate::recorder::Recorder::start_timed(&path, wezterm_term::TerminalSize::default())
+            .unwrap()
+            .finish()
+            .unwrap();
+        let source = Source::TimedReplay(path.clone());
+        let saved = SavedSource::capture(&source, None).unwrap();
+        let serialized = serde_json::to_value(&saved).unwrap();
+        assert_eq!(serialized["kind"], "timed_replay");
+        let restored: SavedSource = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.resolve(&BTreeMap::new()).unwrap(), source);
+        std::fs::remove_file(path.with_extension("vt.jsonl")).unwrap();
+        assert!(restored.resolve(&BTreeMap::new()).is_err());
+        assert_eq!(
+            SavedSource::Replay(path.clone())
+                .resolve(&BTreeMap::new())
+                .unwrap(),
+            Source::Replay(path)
+        );
     }
 
     #[test]

@@ -243,23 +243,47 @@ if ($null -ne $state.restart_token) {
 .\target\release\w11term.exe --replay .\bug.vt
 ```
 
-Recordings contain exact incoming terminal-output bytes, including graphics and
-escape sequences, from the moment recording begins. Input and SSH authentication
-answers are excluded, but a server may echo typed text or display sensitive output;
-review captures before sharing. Starting mid-session does not capture previous
-terminal state or an escape sequence's already-received prefix. Trigger a remote
-full repaint when capturing a TUI bug. Timing, reconnection resets, and out-of-band
-SSH resize events are not stored; this is an output stream, not a timed video.
+Recordings contain the incoming terminal output, including image data and escape
+sequences, starting at the moment the recorder opens. A server may echo typed
+text or display sensitive information. Review the output before sharing it.
+When starting mid-session, request a full repaint from the application. The
+capture begins with a fresh parser on replay, and SSH reconnects do not
+reconstruct a previous session's state.
 
-Start creates a new file and a `<stem>.vt.json` sidecar with initial columns/rows;
-existing files are never overwritten. Replay reads that geometry unless explicit
-`--cols`/`--rows` override it. The parent must exist. Stop flushes and syncs the file,
-and returns its path and byte count. Closing the pane flushes it too. A disk error
-or 256 MiB limit stops recording and emits `recording-error`. Abrupt process death
-can lose buffered tail bytes. Keep the sidecar with the `.vt` file.
+Use a timed recording for a bug involving animation, synchronized output, or a
+window resize.
+
+```powershell
+& $ctl --pid 12345 record --pane $pane --timed .\cockpit.vt
+# Reproduce the bug, including any pane resizes.
+& $ctl --pid 12345 record --pane $pane --stop
+.\target\release\w11term.exe --replay-timed .\cockpit.vt
+```
+
+| File | Contents |
+|---|---|
+| `cockpit.vt` | Exact output bytes for either replay mode. Keyboard input and SSH authentication answers are excluded. |
+| `cockpit.vt.json` | Initial columns and rows for ordinary `--replay`. |
+| `cockpit.vt.jsonl` | The timed recording's initial geometry, output byte counts and resize events at elapsed microseconds, and a completion record with the raw file's SHA-256. |
+
+Keep the three files together when attaching a timed capture. Ordinary
+`--replay` renders the raw output in one pass. Timed replay verifies the raw
+file and timing index, then reproduces the recorded grid, pixel dimensions and
+DPI at each resize. `--cols` and `--rows` choose the initial viewing window.
+Changing that window leaves the recorded grid intact. Titles remain available
+to the pane picker and event journal. Recorded clipboard writes, desktop
+notifications and sounds are suppressed during timed playback.
+
+The destination directory must exist. Recording creates new files exclusively.
+Stopping flushes them to disk and returns the raw path and byte count. Closing
+the pane also finishes the recording. A disk error or the 256 MiB raw limit
+stops recording and emits `recording-error`. The timing index is limited to
+64 MiB and one million events. After an interrupted recording, a partial raw
+stream can still be opened with `--replay`.
 
 ```json
 {"verb":"record","pane":1,"path":"C:\\tests\\bug.vt"}
+{"verb":"record","pane":1,"path":"C:\\tests\\cockpit.vt","timed":true}
 {"verb":"record","pane":1,"path":null}
 ```
 

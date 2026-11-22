@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::Request;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID [--stop | PATH]\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -18,6 +18,7 @@ pub fn parse(
     let mut since = None;
     let mut text = None;
     let mut stop = false;
+    let mut timed = false;
     let mut overwrite = false;
     let mut exit_token = None;
     let mut command_id = None;
@@ -45,6 +46,7 @@ pub fn parse(
             }
             "--since" if verb == "events" => since = Some(value(&mut args)?.parse()?),
             "--stop" if verb == "record" => stop = true,
+            "--timed" if verb == "record" => timed = true,
             "--overwrite" if verb == "save-text" => overwrite = true,
             "--exit-token" if verb == "restart" => exit_token = Some(value(&mut args)?.parse()?),
             "--id" if verb == "get-command" => command_id = Some(value(&mut args)?.parse()?),
@@ -132,9 +134,11 @@ pub fn parse(
         },
         "record" => {
             ensure!(stop != text.is_some(), "provide PATH or --stop");
+            ensure!(!timed || !stop, "--timed requires a recording path");
             Request::Record {
                 pane: pane.context("--pane is required")?,
                 path: text.map(std::path::absolute).transpose()?,
+                timed,
             }
         }
         _ => bail!("unknown automation command"),
@@ -144,6 +148,26 @@ pub fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timed_recording_is_opt_in_and_old_record_requests_round_trip() {
+        let record =
+            |args: &[&str]| parse("record", args.iter().map(|s| s.to_string()), None, Some(7));
+        let (_, timed) = record(&["--timed", "my capture.vt"]).unwrap();
+        assert!(
+            matches!(timed, Request::Record { pane: 7, timed: true, path: Some(path) } if path.is_absolute())
+        );
+        assert!(record(&["--timed", "--stop"]).is_err());
+        assert!(record(&["--timed"]).is_err());
+        let stop = serde_json::json!({"verb":"record","pane":7,"path":null});
+        let decoded: Request = serde_json::from_value(stop.clone()).unwrap();
+        assert!(matches!(decoded, Request::Record { timed: false, .. }));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), stop);
+        assert_eq!(
+            serde_json::to_value(record(&["--stop"]).unwrap().1).unwrap(),
+            stop
+        );
+    }
+
     #[test]
     fn rejects_cross_command_flags_and_missing_values() {
         let p = |v, a: &[&str]| parse(v, a.iter().map(|s| s.to_string()), None, None);
