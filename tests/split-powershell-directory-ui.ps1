@@ -7,6 +7,8 @@ $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_SPLIT_CWD = Join-Path $State ('100% ; # [pilot] ' + [char]0x96ea)
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_SPLIT_CWD)
+$env:W11TERM_CWD_PROOF = '.w11term-' + [guid]::NewGuid().ToString('N')
+[IO.File]::WriteAllText((Join-Path $env:W11TERM_SPLIT_CWD $env:W11TERM_CWD_PROOF), 'expected folder')
 $profiles = Join-Path $State 'profiles.json'
 $catalog = [IO.File]::ReadAllText($profiles) | ConvertFrom-Json
 $localProfile = $catalog.profiles.'Palette PowerShell'
@@ -29,13 +31,15 @@ function Send-Line([int]$Pane, [string]$Line) {
 
 function Confirm-Directory([int]$Pane, [string]$Token) {
     # Keep the result short enough to fit a split. Only executed output contains the marker.
-    Send-Line $Pane ('if ($PWD.ProviderPath -ceq $env:W11TERM_SPLIT_CWD) { "cwd-" + "' + $Token + '" + "-" + $PID } else { "wrong cwd: " + $PWD.Path }')
+    # A hosted runner can reach its temp folder using its short or long name.
+    # Only the intended literal folder contains this unique relative filename.
+    Send-Line $Pane ('if ($PWD.Provider.Name -eq "FileSystem" -and (Test-Path -LiteralPath $env:W11TERM_CWD_PROOF -PathType Leaf)) { "cwd-" + "' + $Token + '" + "-" + $PID } else { "wrong cwd: " + $PWD.ProviderPath }')
     $pattern = "cwd-$Token-([0-9]+)"
     try {
         $frame = Control @('wait-for-text','--pane',"$Pane",'--timeout','20','--regex',$pattern)
         return [int]([regex]::Match($frame.text, $pattern).Groups[1].Value)
     } catch {
-        throw "$_ PowerShell pane $Pane showed: $((Control @('get-text','--pane',"$Pane")).text)"
+        throw "$_ Expected directory $env:W11TERM_SPLIT_CWD. PowerShell pane $Pane showed: $((Control @('get-text','--pane',"$Pane")).text)"
     }
 }
 
