@@ -13,10 +13,12 @@ mod bookmarks;
 mod editor;
 mod history;
 mod preview;
+mod properties;
 mod sort;
 mod text_draft;
 
 use history::{FolderHistory, HistoryDirection};
+pub use preview::PreviewKind;
 pub use sort::SortOrder;
 
 const PAGE_SIZE: usize = 32;
@@ -73,7 +75,7 @@ pub enum FileAction {
     Sort(u64, u64, u64, SortOrder),
     Choose(u64, u64, ListedEntry),
     CopyPath(u64, u64, u64, Option<ListedEntry>),
-    PreviewText(u64, u64, ListedEntry),
+    Preview(u64, u64, ListedEntry, PreviewKind),
     ClosePreview(u64, u64, u64),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
@@ -126,7 +128,7 @@ pub(super) struct FileDrawer {
     selected: Option<String>,
     reveal: Option<RevealTarget>,
     dialog: Option<EntryDialog>,
-    preview: Option<preview::TextPreview>,
+    preview: Option<preview::EntryPreview>,
     editor: Option<editor::Editor>,
     dialog_serial: u64,
     replace: bool,
@@ -1255,10 +1257,18 @@ impl FileDrawer {
                         CopyPath(pane, generation, revision, Some(listed(selected))),
                     ),
                 )),
-            button(
-                "Preview text…",
-                writable && selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File)),
-                PreviewText(pane, generation, listed(selected)),
+            button_pair(
+                button(
+                    "Preview text…",
+                    writable
+                        && selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File)),
+                    Preview(pane, generation, listed(selected), PreviewKind::Text),
+                ),
+                button(
+                    "Properties…",
+                    writable && selected.is_some(),
+                    Preview(pane, generation, listed(selected), PreviewKind::Properties),
+                ),
             ),
             CheckBox::new()
                 .is_checked(self.following)
@@ -2005,7 +2015,7 @@ impl TerminalApp {
             | Sort(id, ..)
             | Choose(id, ..)
             | CopyPath(id, ..)
-            | PreviewText(id, ..)
+            | Preview(id, ..)
             | ClosePreview(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
@@ -2061,7 +2071,7 @@ impl TerminalApp {
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, PreviewText(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2285,9 +2295,9 @@ impl TerminalApp {
                     }
                 }
                 _ if files.busy() || !files.open => {}
-                PreviewText(_, _, entry) => {
+                Preview(_, _, entry, kind) => {
                     if may_open_dialog {
-                        let (serial, operation) = files.begin_preview(entry)?;
+                        let (serial, operation) = files.begin_preview(entry, kind)?;
                         if let Err(error) =
                             files.job(pane, session, operation, Step::Preview(serial), context)
                         {

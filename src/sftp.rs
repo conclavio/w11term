@@ -91,6 +91,10 @@ pub enum Operation {
     PreviewText {
         path: String,
     },
+    #[serde(skip)]
+    EntryProperties {
+        path: String,
+    },
     /// The absolute path verified by SSHFS can only be opened on the source pane.
     #[serde(skip)]
     ListMountedFolder {
@@ -203,6 +207,18 @@ pub struct Attributes {
     pub permissions: Option<u32>,
     pub atime: Option<u32>,
     pub mtime: Option<u32>,
+}
+impl From<FileAttributes> for Attributes {
+    fn from(attrs: FileAttributes) -> Self {
+        Self {
+            size: attrs.size,
+            uid: attrs.uid,
+            gid: attrs.gid,
+            permissions: attrs.permissions,
+            atime: attrs.atime,
+            mtime: attrs.mtime,
+        }
+    }
 }
 impl Attributes {
     fn protocol(&self) -> Result<FileAttributes> {
@@ -422,6 +438,9 @@ pub(crate) async fn run(
                     Some("Missing SSH connection for this mounted folder")
                 }
                 Operation::PreviewText { .. } => Some("Missing SSH connection for text preview"),
+                Operation::EntryProperties { .. } => {
+                    Some("Missing SSH connection for file properties")
+                }
                 _ => None,
             };
             if let Some(message) = missing {
@@ -438,10 +457,16 @@ pub(crate) async fn run(
         if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
             continue;
         }
-        if matches!(operation, Operation::PreviewText { .. })
-            && cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+        if matches!(
+            operation,
+            Operation::PreviewText { .. } | Operation::EntryProperties { .. }
+        ) && cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
         {
-            let _ = reply.send(Err("Text preview cancelled".into()));
+            let message = match operation {
+                Operation::EntryProperties { .. } => "File properties cancelled",
+                _ => "Text preview cancelled",
+            };
+            let _ = reply.send(Err(message.into()));
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
@@ -733,6 +758,30 @@ impl Engine {
                     .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            EntryProperties { path } => {
+                let attrs = Attributes::from(self.raw.lstat(&path).await?.attrs);
+                let mut result = json!({ "attrs": attrs });
+                if EntryKind::from_permissions(attrs.permissions) == Some(EntryKind::Symlink) {
+                    ensure!(
+                        !cancel.is_some_and(TransferCancel::is_cancelled),
+                        "File properties cancelled"
+                    );
+                    match self.raw.readlink(&path).await {
+                        Ok(names) => match names.files.as_slice() {
+                            [name] if !name.filename.is_empty() => {
+                                result["target"] = json!(name.filename)
+                            }
+                            _ => {
+                                result["target_error"] =
+                                    json!("The server returned no single link target")
+                            }
+                        },
+                        Err(e) if transport_error(&e) => return Err(e.into()),
+                        Err(e) => result["target_error"] = json!(e.to_string()),
+                    }
+                }
+                result
+            }
             Put {
                 local,
                 remote,

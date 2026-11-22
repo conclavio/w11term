@@ -399,7 +399,7 @@ mod tests {
             kind,
             revision: files.listing_revision,
         };
-        let (preview, _) = files.begin_preview(entry).unwrap();
+        let (preview, _) = files.begin_preview(entry, PreviewKind::Text).unwrap();
         files.finish_preview(preview, Ok(json!({"text":ORIGINAL})));
         files.start_editor(preview);
         let serial = files.editor.as_ref().unwrap().serial;

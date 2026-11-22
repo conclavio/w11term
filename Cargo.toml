@@ -12,6 +12,7 @@ default-run = "w11term"
 ui-smoke = []
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 bytes = "1"
 anyhow = "1"
 log = "0.4"
