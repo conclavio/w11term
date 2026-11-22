@@ -3,6 +3,8 @@ use crate::terminal::Snapshot;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::{collections::BTreeMap, sync::Arc};
+mod find;
+pub use find::FindSelection;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +135,7 @@ pub struct Selection {
     pub cols: usize,
     lines: BTreeMap<isize, Arc<wezterm_term::Line>>,
     clear_generation: Option<u64>,
+    observed_screen: Option<crate::copy_mode::ScreenId>,
 }
 impl Selection {
     pub fn new(point: Point, block: bool, alternate: bool) -> Self {
@@ -147,6 +150,7 @@ impl Selection {
             cols: 0,
             lines: BTreeMap::new(),
             clear_generation: None,
+            observed_screen: None,
         }
     }
     pub fn survives_scrollback_clear(&self, frame: &Snapshot) -> bool {
@@ -176,6 +180,7 @@ impl Selection {
     }
 
     pub fn observe(&mut self, frame: &Snapshot) {
+        self.observed_screen.get_or_insert_with(|| frame.into());
         if !self.reconcile_scrollback_clear(frame) {
             return;
         }

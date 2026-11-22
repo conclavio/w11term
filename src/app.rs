@@ -131,6 +131,14 @@ pub enum FindOption {
     Regex,
 }
 impl LiveTab {
+    fn find_available(&self) -> bool {
+        !self.device_busy
+            && !self.browsing_sessions()
+            && self.prompt_id.is_none()
+            && self.session.frames.load().prompt.is_none()
+            && self.session.prompts.current().is_none()
+    }
+
     fn reconcile_selection(&mut self, frame: &w11term::terminal::Snapshot) -> bool {
         let mut selection = self.selection.borrow_mut();
         if selection.as_mut().is_some_and(|s| {
@@ -225,6 +233,22 @@ impl Default for Find {
     }
 }
 impl Find {
+    fn same_origin(
+        requested: Option<clipboard_paste::Origin>,
+        current: Option<clipboard_paste::Origin>,
+    ) -> bool {
+        requested.is_some() && requested == current
+    }
+
+    fn accept_selection(&mut self, epoch: u64, seed: String) -> bool {
+        if !self.open || self.epoch != epoch {
+            return false;
+        }
+        self.query = seed;
+        self.regex = false;
+        true
+    }
+
     fn matches(&self, result: &w11term::search::SearchSnapshot) -> bool {
         result.query == self.query
             && result.sensitive == self.sensitive
@@ -928,6 +952,7 @@ pub enum Message {
     Clipboard(clipboard_paste::Action),
     CopyResult(TabId, u64, Result<(), String>),
     SelectAll(Option<clipboard_paste::Origin>),
+    PaneFind(Option<clipboard_paste::Origin>, Shortcut),
     CopySelection(Option<clipboard_paste::Origin>),
     SelectAllResult(
         TabId,
@@ -954,6 +979,13 @@ pub enum Message {
     PaneMeasured(TabId),
     GridFallback(u64),
     FindEdit(TabId, String),
+    FindSeed(
+        TabId,
+        u64,
+        u64,
+        Arc<w11term::interaction::FindSelection>,
+        String,
+    ),
     FindOption(TabId, FindOption, bool),
     FindApply(TabId, u64),
     FindFocus(TabId, u64, u8),
@@ -1233,6 +1265,35 @@ impl TerminalApp {
             )
     }
     fn find(&mut self, close: bool, direction: Option<isize>, context: &ComponentContext<Self>) {
+        let opening = !close
+            && direction.is_none()
+            && matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if !tab.find.open);
+        if opening && self.request_copy_mode_find(context) {
+            return;
+        }
+        let selection = if opening {
+            self.tabs.active().and_then(|entry| {
+                let Page::Terminal(tab) = &entry.page else {
+                    return None;
+                };
+                tab.selection
+                    .borrow()
+                    .as_ref()?
+                    .find_target(&tab.session.frames.load())
+            })
+        } else {
+            None
+        };
+        self.show_find(close, direction, selection, context);
+    }
+
+    fn show_find(
+        &mut self,
+        close: bool,
+        direction: Option<isize>,
+        selection: Option<w11term::interaction::FindSelection>,
+        context: &ComponentContext<Self>,
+    ) {
         self.close_copy_mode();
         let Some(id) = self.tabs.active_id() else {
             return;
@@ -1244,6 +1305,10 @@ impl TerminalApp {
         else {
             return;
         };
+        if !close && !tab.find_available() {
+            self.keyboard.set_search(false);
+            return;
+        }
         let configure = !tab.find.open
             || tab.find.pending
             || tab
@@ -1262,6 +1327,27 @@ impl TerminalApp {
         if close {
             let _ = tab.session.input.send(Command::SearchClose);
         } else {
+            if let Some(selection) = selection {
+                let target = Arc::new(selection);
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                if tab
+                    .session
+                    .input
+                    .send(Command::FindSelection(target.clone(), reply))
+                    .is_ok()
+                {
+                    let epoch = tab.find.epoch;
+                    let view = self.watch_epoch;
+                    context.spawn_background(move |_| {
+                        rx.blocking_recv()
+                            .ok()
+                            .flatten()
+                            .map_or(Message::ControlIdle, |seed| {
+                                Message::FindSeed(id, epoch, view, target, seed)
+                            })
+                    });
+                }
+            }
             if configure {
                 tab.find.apply(&tab.session);
             }
@@ -1289,6 +1375,7 @@ impl TerminalApp {
     }
     fn find_view(&self, id: TabId, tab: &LiveTab, context: &ViewContext<Self>) -> View {
         let frame = tab.session.frames.load();
+        let origin = self.paste_origin();
         let status = tab.find.status(frame.search.as_ref());
         Border::new()
             .grid_row(1)
@@ -1322,21 +1409,29 @@ impl TerminalApp {
                             .grid_column(1)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Previous match (Shift+Enter)")
-                            .on_click(
-                                context.callback(|_| Message::Shortcut(Shortcut::FindPrevious)),
-                            )
+                            .on_click(context.callback(move |_| {
+                                Message::PaneFind(origin, Shortcut::FindPrevious)
+                            }))
                             .content(TextBlock::new().text("↑")),
                         Button::new()
                             .grid_column(2)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Next match (Enter)")
-                            .on_click(context.callback(|_| Message::Shortcut(Shortcut::FindNext)))
+                            .on_click(
+                                context.callback(move |_| {
+                                    Message::PaneFind(origin, Shortcut::FindNext)
+                                }),
+                            )
                             .content(TextBlock::new().text("↓")),
                         Button::new()
                             .grid_column(3)
                             .style(ButtonStyle::Subtle)
                             .automation_name("Close find (Escape)")
-                            .on_click(context.callback(|_| Message::Shortcut(Shortcut::FindClose)))
+                            .on_click(
+                                context.callback(move |_| {
+                                    Message::PaneFind(origin, Shortcut::FindClose)
+                                }),
+                            )
                             .content(TextBlock::new().text("×")),
                         Grid::new()
                             .grid_row(1)
@@ -3831,6 +3926,10 @@ impl Component for TerminalApp {
         let shortcut_menu = caret_menu_binding.clone();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(match shortcut {
+                Shortcut::Find
+                | Shortcut::FindNext
+                | Shortcut::FindPrevious
+                | Shortcut::FindClose => Message::PaneFind(paste_origin.get(), shortcut),
                 Shortcut::SelectAll => Message::SelectAll(paste_origin.get()),
                 Shortcut::Paste | Shortcut::PasteRaw => {
                     Message::Clipboard(clipboard_paste::Action::Start(
@@ -5389,7 +5488,14 @@ impl Component for TerminalApp {
             Message::Paste => self.paste(false, context),
             Message::PasteRaw => self.paste(true, context),
             Message::CopyResult(pane, request, result) => {
-                self.finish_keyboard_copy(pane, request, result)
+                self.finish_keyboard_copy(pane, request, result, context)
+            }
+            Message::PaneFind(origin, shortcut) => {
+                if Find::same_origin(origin, self.paste_origin()) {
+                    self.update(Message::Shortcut(shortcut), context);
+                } else {
+                    self.keyboard.set_search(matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if tab.find.open && tab.find_available()));
+                }
             }
             Message::SelectAll(origin) => self.select_all(origin, context),
             Message::CopySelection(origin) => {
@@ -5694,6 +5800,20 @@ impl Component for TerminalApp {
             Message::SaveProfile(id) => self.save_profile(id, context),
             Message::SaveProfileOnly(id) => self.save_profile_action(id, false, context),
             Message::Pointer(id, pointer, kind) => self.pointer(id, pointer, kind, context),
+            Message::FindSeed(id, epoch, view, target, seed) => {
+                if self.watch_epoch == view
+                    && self.tabs.active_id() == Some(id)
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.get_mut(id)
+                    && tab.find_available()
+                    && target.current(&tab.session.frames.load())
+                    && tab.find.accept_selection(epoch, seed)
+                {
+                    tab.find.apply(&tab.session);
+                }
+            }
             Message::FindEdit(id, mut text) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -5748,6 +5868,7 @@ impl Component for TerminalApp {
                     }) = self.tabs.get(id)
                     && tab.find.open
                     && tab.find.epoch == epoch
+                    && tab.find_available()
                     && !tab.find.input.request_focus_result(move |result| {
                         sender.send(Message::FindFocusResult(id, epoch, result.unwrap_or(false)));
                     })
@@ -6765,6 +6886,48 @@ impl TerminalApp {
 mod find_tests {
     use super::Find;
     use w11term::search::{MAX_QUERY_BYTES, SearchSnapshot};
+
+    #[test]
+    fn find_selected_text_never_opens_a_queued_gesture_in_a_retargeted_pane_or_login() {
+        use super::clipboard_paste::Origin;
+        let origin = Origin {
+            pane: 3,
+            group: 4,
+            connection: 5,
+        };
+        assert!(Find::same_origin(Some(origin), Some(origin)));
+        for current in [
+            None,
+            Some(Origin { pane: 6, ..origin }),
+            Some(Origin { group: 6, ..origin }),
+            Some(Origin {
+                connection: 6,
+                ..origin
+            }),
+        ] {
+            assert!(!Find::same_origin(Some(origin), current));
+        }
+        assert!(!Find::same_origin(None, None));
+    }
+
+    #[test]
+    fn find_selected_text_only_seeds_the_original_open_search_and_keeps_match_case() {
+        let mut find = Find {
+            query: "old.*".into(),
+            regex: true,
+            sensitive: true,
+            epoch: 5,
+            ..Default::default()
+        };
+        assert!(!find.accept_selection(5, "after close".into()));
+        find.open = true;
+        assert!(!find.accept_selection(4, "prior opening".into()));
+        assert!(find.regex && find.sensitive);
+        assert_eq!(find.query, "old.*");
+        assert!(find.accept_selection(5, "雪[.]".into()));
+        assert!(!find.regex && find.sensitive);
+        assert_eq!(find.query, "雪[.]");
+    }
 
     #[test]
     fn oversized_regex_retains_one_complete_overflowing_character() {

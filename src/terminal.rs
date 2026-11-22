@@ -556,6 +556,7 @@ pub struct Snapshot {
     pub first_stable_row: isize,
     pub oldest_stable_row: isize,
     pub(crate) row_epoch: u64,
+    pub(crate) seqno: usize,
     pub(crate) history_clear_count: u64,
     /// Most recent successful local history clear. The floor is the first row
     /// retained at the time of that clear, even if new output has since arrived.
@@ -744,6 +745,7 @@ impl Snapshot {
             first_stable_row,
             oldest_stable_row: screen.phys_to_stable_row_index(0),
             row_epoch: screen.row_epoch(),
+            seqno: terminal.current_seqno(),
             history_clear_count: screen.history_clear_count(),
             scrollback_clear_generation: 0,
             scrollback_clear_floor: None,

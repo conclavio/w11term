@@ -103,6 +103,11 @@ impl From<&Snapshot> for ScreenId {
 }
 
 impl ScreenId {
+    pub(crate) fn matches(self, terminal: &TerminalState, generation: u64) -> bool {
+        self.same_coordinates(terminal, generation)
+            && self.history_clear_count == terminal.screen().history_clear_count()
+    }
+
     fn same_coordinates(self, terminal: &TerminalState, generation: u64) -> bool {
         let screen = terminal.screen();
         self.generation == generation

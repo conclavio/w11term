@@ -667,6 +667,23 @@ async fn native_regex_find_in_mixed_panes_keeps_search_input_off_the_wire() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens real Find from an accessible or keyboard selection in a mixed SSH and PowerShell window"]
+async fn native_find_from_selected_text_uses_a_literal_and_keeps_input_on_the_original_pane() {
+    let tail = "n".repeat(100);
+    let needle = format!("Issue.[雪]+/{tail}/end!");
+    let history = format!(
+        "\x1b[H\x1b[2J\x1b[3JKEY[42]\r\nprevious token\r\npreviews token\r\nhard-line-first\r\nhard-line-second\r\n\
+        {needle}\r\n{needle}\r\nissue.[雪]+/{tail}/end!\r\nIssueX雪雪/{tail}/end!\r\nselect-find-ready\r\n"
+    );
+    run_palette_fixture(
+        "find-selected-text-ui.ps1",
+        b"selected-find-shell-ok",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "finds offscreen text across SSH and PowerShell tabs and checks both viewports and local Find state"]
 async fn native_find_in_all_panes_preserves_views_and_reveals_the_chosen_ssh_match() {
     let mut history = String::new();

@@ -20,10 +20,16 @@ pub(super) struct ActiveCopy {
     pub state: CopyMode,
     pending: Option<Pending>,
     queued: VecDeque<CopyKey>,
+    find_origin: Option<clipboard_paste::Origin>,
     error: Option<String>,
 }
 
 impl ActiveCopy {
+    fn begin_clipboard(&mut self, request: u64) {
+        self.pending = Some(Pending::Clipboard(request));
+        self.queued.clear();
+    }
+
     pub fn instructions(&self) -> &str {
         self.error
             .as_deref()
@@ -31,6 +37,9 @@ impl ActiveCopy {
     }
 
     fn enqueue(&mut self, key: CopyKey) -> bool {
+        if self.find_origin.is_some() {
+            return false;
+        }
         if matches!(self.pending, Some(Pending::Clipboard(_) | Pending::Stopped)) {
             return false;
         }
@@ -47,16 +56,38 @@ impl ActiveCopy {
 }
 
 impl TerminalApp {
+    pub(super) fn request_copy_mode_find(&mut self, ctx: &ComponentContext<Self>) -> bool {
+        let mut active = self.copy_mode.borrow_mut();
+        let Some(mode) = active.as_mut() else {
+            return false;
+        };
+        if Some(mode.pane) != self.tabs.active_id() {
+            return false;
+        }
+        if mode.find_origin.is_some() {
+            return true;
+        }
+        // Finish the motions already accepted before opening Find. Preserve the
+        // intent across an earlier explicit Copy, which consumes the key queue.
+        mode.find_origin = self.paste_origin();
+        let pane = mode.pane;
+        if mode.pending == Some(Pending::Stopped) {
+            drop(active);
+            self.finish_copy_or_find(pane, None, ctx);
+        } else if mode.pending.is_none() {
+            drop(active);
+            self.drain_copy_keys(ctx);
+        }
+        true
+    }
+
     pub(super) fn copy_mode_target(&self) -> Option<(TabId, &LiveTab)> {
         let id = self.tabs.active_id()?;
         let Page::Terminal(tab) = &self.tabs.get(id)?.page else {
             return None;
         };
         (!tab.find.open
-            && !tab.browsing_sessions()
-            && !tab.device_busy
-            && tab.session.frames.load().prompt.is_none()
-            && tab.session.prompts.current().is_none()
+            && tab.find_available()
             && !tab.files.entry_dialog_open()
             && !tab.files.filter_editing()
             && self.title_editor.is_none()
@@ -84,6 +115,7 @@ impl TerminalApp {
             state: CopyMode::new(&frame),
             pending: None,
             queued: VecDeque::new(),
+            find_origin: None,
             error: None,
         });
         self.keyboard.set_copy_mode(true);
@@ -116,10 +148,12 @@ impl TerminalApp {
         else {
             return;
         };
-        if matches!(
-            mode.pending,
-            Some(Pending::Clipboard(_) | Pending::SelectAll(_))
-        ) {
+        if mode.find_origin.is_some()
+            || matches!(
+                mode.pending,
+                Some(Pending::Clipboard(_) | Pending::SelectAll(_))
+            )
+        {
             return;
         }
         let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
@@ -173,7 +207,7 @@ impl TerminalApp {
             || mode.state.screen != (&*frame).into()
         {
             drop(active);
-            self.close_copy_mode();
+            self.finish_copy_or_find(id, None, ctx);
             return;
         }
         match result {
@@ -186,16 +220,22 @@ impl TerminalApp {
                 mode.pending = None;
             }
             outcome => {
+                let requested_find = mode.find_origin.is_some();
                 mode.pending = Some(Pending::Stopped);
                 mode.queued.clear();
                 let reason = outcome
                     .err()
                     .unwrap_or("The terminal changed while selecting");
                 mode.error = Some(format!("Copy mode · {reason} · Esc cancel"));
+                if requested_find {
+                    drop(active);
+                    self.finish_copy_or_find(id, None, ctx);
+                    return;
+                }
             }
         }
         tab.surface.invalidator.invalidate();
-        if !mode.queued.is_empty() {
+        if mode.find_origin.is_some() || !mode.queued.is_empty() {
             drop(active);
             self.drain_copy_keys(ctx);
         }
@@ -223,6 +263,27 @@ impl TerminalApp {
         self.keyboard.set_copy_mode(false);
     }
 
+    fn finish_copy_or_find(
+        &mut self,
+        pane: TabId,
+        selection: Option<w11term::interaction::FindSelection>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let origin = self
+            .copy_mode
+            .borrow()
+            .as_ref()
+            .filter(|m| m.pane == pane)
+            .and_then(|m| m.find_origin);
+        if Find::same_origin(origin, self.paste_origin())
+            && self.copy_mode_target().is_some_and(|(id, _)| id == pane)
+        {
+            self.show_find(false, None, selection, ctx);
+        } else {
+            self.close_copy_mode();
+        }
+    }
+
     pub(super) fn refresh_copy_mode(&mut self, id: TabId, ctx: &ComponentContext<Self>) {
         let active = self.copy_mode.borrow();
         let Some(mode) = active.as_ref().filter(|m| m.pane == id) else {
@@ -245,14 +306,16 @@ impl TerminalApp {
             let top = mode.state.top.max(frame.oldest_stable_row);
             if top != frame.first_stable_row {
                 let _ = tab.session.input.send(Command::ScrollTo(top));
-            } else if mode.pending.is_none() && !mode.queued.is_empty() {
+            } else if mode.pending.is_none()
+                && (mode.find_origin.is_some() || !mode.queued.is_empty())
+            {
                 drop(active);
                 self.drain_copy_keys(ctx);
             }
             return;
         }
         drop(active);
-        self.close_copy_mode();
+        self.finish_copy_or_find(id, None, ctx);
     }
 
     pub(super) fn copy_key(&mut self, key: CopyKey, ctx: &ComponentContext<Self>) {
@@ -282,8 +345,9 @@ impl TerminalApp {
         };
         let frame = tab.session.frames.load();
         if frame.prompt.is_some() || !mode.state.valid(&frame) {
+            let pane = mode.pane;
             drop(active);
-            self.close_copy_mode();
+            self.finish_copy_or_find(pane, None, ctx);
             return;
         }
         mode.error = None;
@@ -325,8 +389,7 @@ impl TerminalApp {
                         continue;
                     };
                     let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-                    mode.pending = Some(Pending::Clipboard(request));
-                    mode.queued.clear();
+                    mode.begin_clipboard(request);
                     let (reply, rx) = tokio::sync::oneshot::channel();
                     let _ = tab.session.input.send(Command::CopyRange {
                         screen: mode.state.screen,
@@ -370,6 +433,12 @@ impl TerminalApp {
                 _ => mode.state.navigate(key, &frame),
             }
         }
+        if mode.find_origin.is_some() && mode.pending.is_none() && mode.queued.is_empty() {
+            let selection = mode.state.selection().and_then(|s| s.find_target(&frame));
+            drop(active);
+            self.finish_copy_or_find(pane, selection, ctx);
+            return;
+        }
         if mode.state.top != previous {
             let _ = tab.session.input.send(Command::ScrollTo(mode.state.top));
         }
@@ -402,10 +471,15 @@ impl TerminalApp {
         let Some(point) = point.filter(|p| {
             frame.prompt.is_none() && mode.state.valid(&frame) && p.row >= frame.oldest_stable_row
         }) else {
+            let requested_find = mode.find_origin.is_some();
             mode.queued.clear();
             mode.pending = Some(Pending::Stopped);
             mode.error =
                 Some("Copy mode · Could not locate the word in this screen · Esc to exit".into());
+            if requested_find {
+                drop(active);
+                self.finish_copy_or_find(pane, None, ctx);
+            }
             return;
         };
         // The worker can have read output that WinUI has yet to paint. Wait for
@@ -423,7 +497,7 @@ impl TerminalApp {
             let _ = tab.session.input.send(Command::ScrollTo(mode.state.top));
         }
         tab.surface.invalidator.invalidate();
-        if !mode.queued.is_empty() {
+        if mode.find_origin.is_some() || !mode.queued.is_empty() {
             drop(active);
             self.drain_copy_keys(ctx);
         }
@@ -434,6 +508,7 @@ impl TerminalApp {
         pane: TabId,
         request: u64,
         result: Result<(), String>,
+        ctx: &ComponentContext<Self>,
     ) {
         let mut active = self.copy_mode.borrow_mut();
         let Some(mode) = active
@@ -443,7 +518,10 @@ impl TerminalApp {
             return;
         };
         mode.pending = None;
-        if let Err(e) = result {
+        if mode.find_origin.is_some() {
+            drop(active);
+            self.finish_copy_or_find(pane, None, ctx);
+        } else if let Err(e) = result {
             mode.error = Some(format!("Copy mode · {e} · Esc cancel"));
         } else {
             drop(active);
@@ -458,6 +536,35 @@ mod tests {
     use w11term::terminal::Snapshot;
 
     #[test]
+    fn find_selected_text_after_a_word_and_copy_remembers_the_original_pane() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let terminal = w11term::terminal::create(TerminalSize::default(), tx);
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let mut mode = ActiveCopy {
+            pane: 2,
+            state: CopyMode::new(&frame),
+            pending: Some(Pending::Word(7)),
+            queued: VecDeque::new(),
+            find_origin: None,
+            error: None,
+        };
+        assert!(!mode.enqueue(CopyKey::Right));
+        assert!(!mode.enqueue(CopyKey::Copy));
+        let origin = clipboard_paste::Origin {
+            pane: 2,
+            group: 4,
+            connection: 6,
+        };
+        mode.find_origin = Some(origin);
+        assert!(!mode.enqueue(CopyKey::Left));
+        assert_eq!(mode.queued.pop_front(), Some(CopyKey::Right));
+        assert_eq!(mode.queued.pop_front(), Some(CopyKey::Copy));
+        mode.begin_clipboard(8);
+        assert_eq!(mode.find_origin, Some(origin));
+        assert!(mode.queued.is_empty());
+    }
+
+    #[test]
     fn overflowing_pending_word_keys_cannot_copy_a_partial_selection() {
         let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let terminal = w11term::terminal::create(TerminalSize::default(), tx);
@@ -467,6 +574,7 @@ mod tests {
             state: CopyMode::new(&frame),
             pending: Some(Pending::Word(17)),
             queued: VecDeque::new(),
+            find_origin: None,
             error: None,
         };
         for _ in 0..MAX_QUEUED_KEYS {
