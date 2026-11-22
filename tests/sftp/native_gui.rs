@@ -3,6 +3,57 @@ use super::*;
 mod shared;
 use shared::run_gui;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "renders DEC reverse-screen changes in control PNGs from two live SSH panes"]
+async fn native_reverse_screen_repaints_existing_text_and_isolates_ssh_panes() {
+    let (Source::Ssh(ssh), _remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("dec-reverse-screen-ui.ps1", &ssh, state.path());
+    let sizes: Value =
+        serde_json::from_slice(&fs::read(state.path().join("sizes.json")).unwrap()).unwrap();
+    let range = |index: u32, pixels: u32, cells: u32| index * pixels / cells;
+    for (name, size, fg, bg) in [
+        ("normal", "source", [255, 255, 0], [0, 0, 255]),
+        ("reverse", "source", [0, 0, 255], [255, 255, 0]),
+        ("restored", "source", [255, 255, 0], [0, 0, 255]),
+        ("neighbor-before", "neighbor", [0, 255, 0], [255, 0, 0]),
+        ("neighbor-during", "neighbor", [0, 255, 0], [255, 0, 0]),
+        ("neighbor-after", "neighbor", [0, 255, 0], [255, 0, 0]),
+    ] {
+        let png = image::open(state.path().join(format!("{name}.png")))
+            .unwrap()
+            .into_rgb8();
+        let (width, height) = png.dimensions();
+        let cols = sizes[size]["cols"].as_u64().unwrap() as u32;
+        let rows = sizes[size]["rows"].as_u64().unwrap() as u32;
+        let sample = |col: u32, row: u32| {
+            png.get_pixel(
+                range(2 * col + 1, width, 2 * cols),
+                range(2 * row + 1, height, 2 * rows),
+            )
+            .0
+        };
+        assert_eq!(sample(2, 4), bg, "{name} empty default cell");
+        assert_eq!(sample(2, 1), fg, "{name} blank SGR 7 cell");
+        assert_eq!(sample(2, 2), [255, 0, 255], "{name} explicit background");
+        // The first eight existing H glyphs must still paint in the effective foreground.
+        let ink = (0..range(1, height, rows)).any(|y| {
+            (0..range(8, width, cols)).any(|x| {
+                png.get_pixel(x, y)
+                    .0
+                    .iter()
+                    .zip(fg)
+                    .all(|(&a, b)| a.abs_diff(b) < 48)
+            })
+        });
+        assert!(ink, "{name} unchanged glyphs did not redraw in {fg:?}");
+    }
+    assert_eq!(channels.load(Ordering::Relaxed), 2, "one shell per pane");
+    server.abort();
+}
+
 async fn serve_forward_http(
     state: &std::path::Path,
     root: &std::path::Path,

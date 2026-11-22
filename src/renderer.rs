@@ -1505,6 +1505,91 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_reverse_screen_recolors_existing_default_ink_and_paper() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::new().unwrap();
+        let metrics = renderer.measure(320.0, 200.0, 1.0);
+        let size = wezterm_term::TerminalSize {
+            cols: 8,
+            rows: 2,
+            pixel_width: (8.0 * metrics.cell_width).round() as usize,
+            pixel_height: (2.0 * metrics.cell_height).round() as usize,
+            dpi: 96,
+        };
+        let width = size.pixel_width as u32 + 2 * PADDING as u32;
+        let height = size.pixel_height as u32 + (2.0 * PADDING + STATUS_HEIGHT) as u32;
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(width, height).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        // Struck spaces provide a solid pixel of foreground ink without font rasterization.
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]10;#ff0000\x1b\\\x1b]11;#0000ff\x1b\\",
+            "\x1b]4;17;#00ffff;18;#ff00ff\x1b\\",
+            "\x1b[9m \x1b[7m ",
+            "\x1b[27;38;5;17;48;5;18m ",
+            "\x1b[38;2;0;255;0;48;2;255;255;0m \x1b[7m ",
+            "\x1b[27;39m \x1b[38;5;17;49m \x1b[0m",
+            "\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1,q=2;/////w==\x1b\\",
+        ));
+        let red = [255, 0, 0];
+        let blue = [0, 0, 255];
+        let green = [0, 255, 0];
+        let yellow = [255, 255, 0];
+        let cyan = [0, 255, 255];
+        let magenta = [255, 0, 255];
+        let mut previous = None;
+        // DECSCNM swaps the current default pair before SGR 7 resolves each cell.
+        // The pen, palette indices, explicit RGB values and image remain intact.
+        for (sequence, fg, bg) in [
+            ("", red, blue),
+            ("\x1b[?5h", blue, red),
+            ("\x1b]10;#00ff00\x1b\\\x1b]11;#ffff00\x1b\\", yellow, green),
+            ("\x1b[?5l", green, yellow),
+        ] {
+            terminal.advance_bytes(sequence);
+            let frame = Snapshot::capture(&terminal, previous.as_ref(), 1, 0, String::new(), 0);
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(96.0);
+                    renderer.draw_surface(ctx, width as f32, height as f32, false, &frame)?;
+                    Ok(())
+                })
+                .unwrap();
+            let pixels = target.read_pixels().unwrap();
+            let rgb = |x: usize, y: usize| {
+                let offset = (y * width as usize + x) * 4;
+                [pixels[offset + 2], pixels[offset + 1], pixels[offset]]
+            };
+            assert_eq!(rgb(1, 1), bg, "canvas clear after {sequence:?}");
+            let paper_y = (PADDING + renderer.metrics.cell_height * 0.25) as usize;
+            let ink_y = (PADDING + renderer.metrics.cell_height * 0.5).round() as usize;
+            for (col, (ink, paper)) in [
+                (fg, bg),
+                (bg, fg),
+                (cyan, magenta),
+                (green, yellow),
+                (yellow, green),
+                (fg, yellow),
+                (cyan, bg),
+                ([255; 3], [255; 3]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let x = (PADDING + (col as f32 + 0.5) * renderer.metrics.cell_width) as usize;
+                assert_eq!(
+                    rgb(x, paper_y),
+                    paper,
+                    "cell {col} paper after {sequence:?}"
+                );
+                assert_eq!(rgb(x, ink_y), ink, "cell {col} ink after {sequence:?}");
+            }
+            previous = Some(frame);
+        }
+    }
+
+    #[test]
     fn offscreen_explicit_default_rgb_covers_a_below_background_image() {
         let size = wezterm_term::TerminalSize {
             cols: 3,

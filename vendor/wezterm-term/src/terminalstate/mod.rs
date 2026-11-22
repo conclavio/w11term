@@ -1951,6 +1951,10 @@ impl TerminalState {
                 self.reverse_video_mode = false;
             }
 
+            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::ReverseVideo)) => {
+                self.decqrm_response(mode, true, self.reverse_video_mode);
+            }
+
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::Select132Columns))
             | Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::Select132Columns,
