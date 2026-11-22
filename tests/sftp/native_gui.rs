@@ -40,6 +40,41 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scrolls a live SSH pane via Windows UI Automation and its pointer rail beside PowerShell"]
+async fn native_pane_scrollbar_tracks_async_ssh_output_without_moving_its_neighbor() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let numbered: Vec<_> = (0..200).map(|i| format!("wire-{i:03}")).collect();
+    let initial = format!("\x1b[2J\x1b[H\x1b[3J{}", numbered.join("\r\n"));
+    fs::write(remote.path().join("copy-history.vt"), initial).unwrap();
+    fs::write(
+        remote.path().join("deferred-output.vt"),
+        b"\r\nwire-200\r\nwire-201\r\nwire-202",
+    )
+    .unwrap();
+    let gate = remote.path().join("hold-shell-output");
+    fs::write(&gate, []).unwrap();
+    fs::write(state.path().join("output-gate"), gate.to_str().unwrap()).unwrap();
+    fs::write(remote.path().join("kept.txt"), []).unwrap();
+    fs::write(remote.path().join("knot.txt"), []).unwrap();
+    let input = remote.path().join("keyboard-input.bin");
+    fs::write(&input, []).unwrap();
+    drive_mixed_gui("pane-scrollbar-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and one SFTP subsystem"
+    );
+    assert_eq!(
+        fs::read(input).unwrap(),
+        b"\x1b[?1049h\x1b[Halternate-proof\x1b[?1049l"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits word delimiters and verifies UIA words and double-click selection in a live SSH pane"]
 async fn native_word_delimiters_update_reader_and_pointer_selection_in_running_ssh() {
     run_palette_fixture(

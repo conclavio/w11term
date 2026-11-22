@@ -61,6 +61,10 @@ The original MIT license is preserved in `LICENSE.md`.
 - `Screen::physical_lines` provides a borrowed, double-ended iterator over
   retained rows for plain-text exports without cloning scrollback.
 
+- `Screen::history_clear_count` distinguishes explicit erasure of scrollback
+  from eviction as new output arrives. This lets the UI discard an old
+  scrollbar gesture after either a local clear or a remote CSI 3 J.
+
 - Screen storage grows as output arrives. Resizing and rewrapping enforce
   the physical row limit supplied by the profile, including a limit of zero.
   Dropping primary rows advances their stable row indices so Find and export

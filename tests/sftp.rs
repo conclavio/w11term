@@ -128,6 +128,18 @@ impl server::Handler for Peer {
             s.data(c, fs::read(self.root.join("copy-history.vt"))?)?;
         }
         #[cfg(feature = "ui-smoke")]
+        if self.root.join("hold-shell-output").is_file() {
+            let gate = self.root.join("hold-shell-output");
+            let bytes = fs::read(self.root.join("deferred-output.vt"))?;
+            let peer = s.handle();
+            tokio::spawn(async move {
+                while gate.is_file() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let _ = peer.data(c, bytes).await;
+            });
+        }
+        #[cfg(feature = "ui-smoke")]
         {
             // Let a read-only, background pane lose its connection from the server side.
             let gate = self.root.join("keep-first-connection");
