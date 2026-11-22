@@ -76,10 +76,11 @@ impl TerminalApp {
                             "labelled\x1b]8;;\x1b\\",
                             "\r\nhttps://text.example/path "
                         );
+                        let before_seam = "x".repeat(frame.cols.saturating_sub(4));
                         tab.session
                             .input
                             .send(Command::Paste(format!(
-                                "\x1b[2J\x1b[H{marker} Aאב12ג{links}"
+                                "\x1b[2J\x1b[H{marker} Aאב12ג{links}\r\n{before_seam}seamless界\r\nhard-break"
                             )))
                             .unwrap();
                     }

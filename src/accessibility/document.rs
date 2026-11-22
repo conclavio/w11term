@@ -26,7 +26,10 @@ pub(super) struct Document {
     offsets: Vec<usize>,
     cols: Vec<usize>,
     pub(super) cell_maps: Arc<[CellMap]>,
-    final_col: usize,
+    // A wrap shares one text offset between the end of this row and column zero
+    // of the next. Keep each exclusive right edge for hit-testing and rectangles.
+    row_end_cols: Vec<usize>,
+    paragraphs: Vec<usize>,
     pub(super) starts: Vec<usize>,
     pub(super) first: isize,
     retained: Option<RetainedRows>,
@@ -41,7 +44,8 @@ impl Document {
             offsets: vec![0],
             cols: vec![],
             cell_maps: Arc::clone(frame.cell_maps()),
-            final_col: 0,
+            row_end_cols: Vec::new(),
+            paragraphs: Vec::new(),
             starts: vec![],
             first: frame.first_stable_row,
             retained: frame.rows.len().checked_sub(1).and_then(|last| {
@@ -55,7 +59,10 @@ impl Document {
         };
         for (row, line) in frame.rows.iter().enumerate() {
             d.starts.push(d.len());
-            d.final_col = 0;
+            d.row_end_cols.push(0);
+            if row == 0 || !frame.rows[row - 1].last_cell_was_wrapped() {
+                d.paragraphs.push(d.len());
+            }
             let mut col = 0;
             for cell in line.visible_cells() {
                 if cell.cell_index() >= frame.cols {
@@ -82,7 +89,10 @@ impl Document {
                     col += 1;
                 }
             }
-            if row + 1 < frame.rows.len() && !d.push(col, 0, "\r\n") {
+            if row + 1 < frame.rows.len()
+                && !line.last_cell_was_wrapped()
+                && !d.push(col, 0, "\r\n")
+            {
                 break;
             }
         }
@@ -95,7 +105,10 @@ impl Document {
         }
         self.text.push_str(text);
         self.cols.push(col);
-        self.final_col = col.saturating_add(width);
+        *self
+            .row_end_cols
+            .last_mut()
+            .expect("a cell belongs to a row") = col.saturating_add(width);
         self.offsets.push(self.text.len());
         true
     }
@@ -153,7 +166,18 @@ impl Document {
         self.starts.get(row + 1).copied().unwrap_or(self.len())
     }
     pub fn col(&self, i: usize) -> usize {
-        self.cols.get(i).copied().unwrap_or(self.final_col)
+        self.cols
+            .get(i)
+            .or_else(|| self.row_end_cols.last())
+            .copied()
+            .unwrap_or(0)
+    }
+    pub fn end_col(&self, row: usize, end: usize) -> usize {
+        if end == self.end(row) {
+            self.row_end_cols[row]
+        } else {
+            self.col(end)
+        }
     }
     pub fn position(&self, row: usize, col: usize) -> usize {
         let Some(&start) = self.starts.get(row) else {
@@ -241,7 +265,11 @@ impl Document {
             }
             return a..b;
         }
-        if matches!(unit, TextUnit_Format | TextUnit_Line | TextUnit_Paragraph) {
+        if unit == TextUnit_Paragraph {
+            let p = self.paragraphs.partition_point(|&start| start <= i) - 1;
+            return self.paragraphs[p]..self.paragraphs.get(p + 1).copied().unwrap_or(self.len());
+        }
+        if matches!(unit, TextUnit_Format | TextUnit_Line) {
             let r = self.row(i);
             return self.starts.get(r).copied().unwrap_or(0)..self.end(r);
         }
@@ -304,5 +332,44 @@ impl Document {
             .offsets
             .partition_point(|&off| off < base + found.end());
         Some(start..end.min(range.end))
+    }
+}
+
+#[cfg(test)]
+mod wrapped_text_tests {
+    use super::*;
+
+    #[test]
+    fn a_soft_wrap_shares_a_text_offset_but_keeps_both_screen_rows() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = w11term::terminal::create(
+            wezterm_term::TerminalSize {
+                rows: 4,
+                cols: 8,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes("12界34XYcd\r\nnext".as_bytes());
+        let doc = Document::from_frame(&Snapshot::capture(&term, None, 1, 0, String::new(), 0));
+        let seam = doc.find(0..doc.len(), "xycd", true, false).unwrap();
+        assert_eq!(doc.text(seam.clone()), "XYcd");
+        let row = doc.unit(seam.start, TextUnit_Line);
+        assert_eq!(doc.text(row.clone()), "12界34XY");
+        assert_eq!(doc.end_col(0, row.end), 8);
+        assert_eq!(doc.col(row.end), 0);
+        assert_eq!(doc.point(row.end).row, doc.first + 1);
+        assert_eq!(doc.text(doc.unit(row.end, TextUnit_Line)), "cd\r\n");
+        assert_eq!(
+            doc.text(doc.unit(row.end, TextUnit_Paragraph)),
+            "12界34XYcd\r\n"
+        );
+        assert!(doc.find(0..doc.len(), "cdnext", false, false).is_none());
+        let (next, moved) = doc.advance(row.start, TextUnit_Paragraph, 1);
+        assert_eq!(moved, 1);
+        assert!(
+            doc.text(doc.unit(next, TextUnit_Paragraph))
+                .starts_with("next")
+        );
     }
 }
