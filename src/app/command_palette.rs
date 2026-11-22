@@ -12,6 +12,7 @@ pub enum CommandId {
     Clipboard(Option<clipboard_paste::Origin>, bool),
     DuplicateTabLayout(Option<TabId>),
     SwapPanes(PaneSwap),
+    RotateSplit(PaneRotation),
     SplitInDirectory(Axis, Option<directory_split::Origin>),
     Profile(String),
     Shortcut(Shortcut),
@@ -129,10 +130,10 @@ impl TerminalApp {
     pub(super) fn command_rows(&self, query: &str) -> Vec<Row> {
         let mut rows = vec![];
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
-        let swaps = self.pane_swaps();
+        let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
         menu_rows(
-            self.caret_items(exited.is_some(), &swaps, directory_split.is_some()),
+            self.caret_items(exited.is_some(), &arrangement, directory_split.is_some()),
             false,
             &mut rows,
         );
@@ -221,8 +222,15 @@ impl TerminalApp {
                     row.id = CommandId::DuplicateTabLayout(self.tabs.active_group_id());
                 }
                 Shortcut::SwapPane(direction) => {
-                    if let Some(target) = swaps.get(direction) {
+                    if let Some(target) = arrangement.get(direction) {
                         row.id = CommandId::SwapPanes(target);
+                    }
+                }
+                Shortcut::RotateSplit => {
+                    if let Some(target) = &arrangement.rotation {
+                        row.id = CommandId::RotateSplit(target.clone());
+                    } else {
+                        row.enabled = false;
                     }
                 }
                 Shortcut::FocusPane(dir) => {
@@ -295,6 +303,7 @@ impl TerminalApp {
                 bind_tab_action(Message::Shortcut(Shortcut::DuplicateTabLayout), group)
             }
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
+            CommandId::RotateSplit(target) => Message::RotateSplit(target),
             CommandId::SharedFolders(Some(pane)) => {
                 Message::FolderShare(folder_shares::Action::Open(pane))
             }

@@ -593,6 +593,51 @@ async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "rotates the nearest live SSH/PowerShell split and verifies the saved workspace geometry"]
+async fn native_rotate_split_keeps_shells_and_persists_only_its_parent_axis() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let data = state.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let input = remote.path().join("keyboard-input.bin");
+    fs::write(&input, []).unwrap();
+    let local = |slot, name| {
+        json!({"type":"leaf","slot":slot,"source":{"kind":"local","value":{
+            "name":name,"shell":{"executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}
+        }}})
+    };
+    let workspace = json!({"active_tab":0,"tabs":[{"title":"Operations","focused":2,"layout":{
+        "type":"split","axis":"columns","ratio":0.375,"first":local(1,"Outer PowerShell"),
+        "second":{"type":"split","axis":"rows","ratio":0.3125,
+          "first":{"type":"leaf","slot":2,"source":{"kind":"saved_profile","value":"palette-ssh"}},
+          "second":local(3,"Inner PowerShell")}
+    }}]});
+    fs::write(
+        data.join("workspaces.json"),
+        serde_json::to_vec(&json!({"version":1,"workspaces":{"original":workspace}})).unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("rotate-split-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "rotation did not authenticate again"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        1,
+        "one SSH shell throughout"
+    );
+    assert_eq!(fs::read(input).unwrap(), b"before/rotated/restored/");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "swaps live SSH and PowerShell neighbors in a nested native workspace and reopens the saved layout"]
 async fn native_swap_neighbors_keeps_shells_and_persists_their_new_positions() {
     let accepted = Arc::new(AtomicUsize::new(0));
