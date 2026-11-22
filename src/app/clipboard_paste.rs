@@ -135,6 +135,7 @@ impl TerminalApp {
             && frame.prompt.is_none()
             && !tab.read_only.get()
             && !tab.files.awaiting_native_result()
+            && !tab.files.filter_editing()
             && !tab.device_busy
             && !tab.browsing_sessions())
         .then_some(tab)
@@ -164,7 +165,7 @@ impl TerminalApp {
         self.clipboard.clear();
         if was_open {
             let other_modal = self.title_editor.is_some() || self.tabs.active().is_some_and(|tab| matches!(
-                &tab.page, Page::Terminal(live) if live.session.frames.load().prompt.is_some() || live.files.entry_dialog_open()));
+                &tab.page, Page::Terminal(live) if live.session.frames.load().prompt.is_some() || live.files.entry_dialog_open() || live.files.filter_editing()));
             self.keyboard.set_modal(other_modal);
         }
     }

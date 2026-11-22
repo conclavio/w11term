@@ -233,6 +233,16 @@ fn entry_attrs(path: &std::path::Path) -> Result<FileAttributes, StatusCode> {
     Ok(attrs)
 }
 impl Files {
+    #[cfg(feature = "ui-smoke")]
+    fn trace_listing(&self, request: &str) -> Result<(), StatusCode> {
+        let path = self.root.join("listing-trace");
+        if path.is_file() {
+            let mut trace = fs::OpenOptions::new().append(true).open(path).map_err(io)?;
+            writeln!(trace, "{request}").map_err(io)?;
+        }
+        Ok(())
+    }
+
     fn path(&self, path: &str) -> PathBuf {
         assert!(!path.contains("..") && !path.contains(':'));
         self.root.join(path.trim_start_matches('/'))
@@ -458,6 +468,8 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
+        #[cfg(feature = "ui-smoke")]
+        self.trace_listing(&format!("OPENDIR {path}"))?;
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
@@ -475,6 +487,8 @@ impl russh_sftp::server::Handler for Files {
         Ok(self.add(id, Opened::Dir(entries)))
     }
     async fn readdir(&mut self, id: u32, h: String) -> Result<Name, StatusCode> {
+        #[cfg(feature = "ui-smoke")]
+        self.trace_listing("READDIR")?;
         match self.handles.get_mut(&h) {
             Some(Opened::Dir(entries)) if !entries.is_empty() => Ok(Name {
                 id,

@@ -1,0 +1,155 @@
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
+      [Parameter(Mandatory)][string]$State)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class FilterKeyboard {
+    [StructLayout(LayoutKind.Sequential)]
+    struct GuiThreadInfo {
+        public int Size, Flags;
+        public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+        public int Left, Top, Right, Bottom;
+    }
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+    public static IntPtr FocusedWindow(IntPtr root, uint expectedPid) {
+        uint pid;
+        uint thread = GetWindowThreadProcessId(root, out pid);
+        var info = new GuiThreadInfo { Size = Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        if (pid != expectedPid || !GetGUIThreadInfo(thread, ref info) || info.Focus == IntPtr.Zero)
+            return IntPtr.Zero;
+        GetWindowThreadProcessId(info.Focus, out pid);
+        return pid == expectedPid ? info.Focus : IntPtr.Zero;
+    }
+}
+'@
+$env:W11TERM_DATA_DIR = Join-Path $State 'data'
+$env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$profiles = Join-Path $State 'profiles.json'
+$parent = '/shell directory'
+# Windows PowerShell 5.1 also reads this fixture on non-UTF-8 code pages.
+$word = ([char]0xc5).ToString() + 'ngstr' + [char]0xf6 + 'm'
+$query = '[' + [char]0xe5 + 'NGSTR' + [char]0xd6 + 'M]'
+$target = "zz-[$word].txt"
+$decoy = "zz-$word.txt"
+$added = "zz-[$word]-updated.txt"
+$download = 'Download' + [char]0x2026
+$rename = 'Rename' + [char]0x2026
+$filterAction = 'Filter filenames' + [char]0x2026
+
+function Button([string]$Name) {
+    Find-Element $Name ([System.Windows.Automation.ControlType]::Button)
+}
+function Click([string]$Name) {
+    Invoke-Button (Wait-Until "enabled '$Name'" {
+        $b = Button $Name
+        if ($b -and $b.Current.IsEnabled) { $b }
+    })
+}
+function Filter-Edit {
+    Find-Element 'Filter filenames' ([System.Windows.Automation.ControlType]::Edit)
+}
+function Filter-Value {
+    (Filter-Edit).GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+}
+function Open-Filter {
+    $existing = Filter-Edit
+    if (!$existing) { Click $filterAction }
+    elseif (!$existing.Current.HasKeyboardFocus) { $existing.SetFocus() }
+    Wait-Until 'focused filename editor' {
+        $field = Filter-Edit
+        if ($field -and $field.Current.HasKeyboardFocus) { $field }
+    }
+}
+function Set-Filter([string]$Text) {
+    (Open-Filter).GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
+}
+
+$app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+try {
+    $window = Wait-InputWindow
+    $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','src/trace.rs')
+    Run-Palette 'Open files here'
+    $null = Wait-Until 'first page of the shell directory' { (Find-Element $parent) -and (Button 'build-00.log') -and (Find-Element '1 / 2') }
+    if (Button $target) { throw 'The Unicode target must begin outside page one' }
+    Click 'Next'
+    Click $target
+    $null = Wait-Until 'file selected on page two' { (Find-Element '2 / 2') -and (Button $download).Current.IsEnabled }
+
+    $null = Open-Filter
+    $inputHwnd = Wait-Until 'focused input HWND owned by the fixture' {
+        $hwnd = [FilterKeyboard]::FocusedWindow($window, $app.Id)
+        if ($hwnd -ne [IntPtr]::Zero) { $hwnd }
+    }
+    # WinUI routes text through its focused child HWND. Keep both messages in this process.
+    foreach ($message in 0x100,0x101) {
+        if (![FixtureMessages]::PostKey($inputHwnd, $message, 0x54)) { throw 'Could not post T to the filter editor' }
+    }
+    try {
+        $null = Wait-Until 'typed T reaches the focused native filter' { (Filter-Value) -ieq 't' }
+    } catch {
+        $screen = (Control @('get-text','--pane',"$remote")).text
+        throw "$_ Input HWND $inputHwnd, owner $window, editor value '$(Filter-Value)', shell: $screen"
+    }
+    Set-Filter $query
+    $null = Wait-Until 'case-insensitive literal Unicode match from page two' {
+        (Find-Element '1 match') -and (Button $target) -and !(Button $decoy) -and (Button $download).Current.IsEnabled
+    }
+    Click 'Done'
+    $null = Wait-Until 'Done retains the filtered rows and returns keyboard input to SSH' {
+        !(Filter-Edit) -and (Find-Element '1 match') -and (Button $target)
+    }
+    foreach ($c in 'after-filter-done'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-filter-done')
+    Set-Filter 'nothing-matches-this'
+    $null = Wait-Until 'no matches and no actions on the old selected file' {
+        (Find-Element 'No matching files or folders') -and !(Button $target) -and
+            !(Button $download).Current.IsEnabled -and !(Button $rename).Current.IsEnabled
+    }
+    Click 'Clear filter'
+    $null = Wait-Until 'unfiltered first page without a selection' {
+        (Button 'build-00.log') -and (Find-Element '1 / 2') -and !(Button $download).Current.IsEnabled
+    }
+    Set-Filter 'build-'
+    $null = Wait-Until 'all 38 matching rows counted' { Find-Element '38 matches' }
+    Click 'Next'
+    $null = Wait-Until 'second page of filtered results' { (Find-Element '2 / 2') -and (Button 'build-37.log') -and !(Button 'build-00.log') }
+    Set-Filter $query
+    $null = Wait-Until 'new query starts on its first page' { (Find-Element '1 match') -and (Button $target) }
+
+    # Another actor adds a matching file. Its arrival in the UI proves the
+    # refresh completed before we assert the same-directory filtering policy.
+    $upload = Join-Path $State 'updated.txt'
+    [IO.File]::WriteAllBytes($upload, [byte[]](23))
+    $null = Control @('sftp','--pane',"$remote",'put',$upload,"$parent/$added")
+    Click 'Refresh'
+    $null = Wait-Until 'refreshed listing still uses the same query' {
+        (Find-Element '2 matches') -and (Button $added) -and !(Button $decoy)
+    }
+    $null = Open-Filter
+    if ((Filter-Value) -cne $query) { throw 'Refresh changed the query' }
+    Set-Filter 'nested'
+    Click 'nested/'
+    Click 'Open folder'
+    $null = Wait-Until 'child directory begins unfiltered' {
+        (Find-Element "$parent/nested") -and (Button 'inside.txt') -and !(Button 'Open folder').Current.IsEnabled
+    }
+    $null = Open-Filter
+    if ((Filter-Value) -cne '') { throw 'Child directory retained a filter from its parent' }
+    Click 'Done'
+    Run-Palette 'SFTP files'
+    $null = Wait-Until 'drawer closed' { !(Button $filterAction) }
+    foreach ($c in 'filter-ssh-ready'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','filter-ssh-ready')
+} finally {
+    if (!$app.HasExited) {
+        $null = $app.CloseMainWindow()
+        if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
+    }
+    $app.Dispose()
+}
