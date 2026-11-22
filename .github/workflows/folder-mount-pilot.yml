@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/folder-mount-pilot.yml
       - tests/folder-sharing/**
+      - tests/player_ssh.rs
       - tests/support/native-ui.ps1
       - tests/support/clipboard.ps1
       - tests/support/save-dialog.cs
@@ -86,14 +87,16 @@ jobs:
             ~/.cargo/git/db
       - name: Build the native SSH fixture
         run: |
-          $messages = cargo test --locked --lib --no-run --message-format=json-render-diagnostics
+          $messages = cargo test --locked --lib --test player_ssh --no-run --message-format=json-render-diagnostics
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $binary = @($messages | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.profile.test -and
-            $_.target.name -eq 'w11term' -and $_.executable
+          $binaries = @($messages | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.executable
           })
-          if ($binary.Count -ne 1) { throw 'Expected one w11term library test executable' }
-          "MOUNT_TEST_EXE=$($binary[0].executable)" >> $env:GITHUB_ENV
+          $mount = @($binaries | Where-Object { $_.target.kind -contains 'lib' -and $_.target.name -eq 'w11term' })
+          $cert = @($binaries | Where-Object { $_.target.kind -contains 'test' -and $_.target.name -eq 'player_ssh' })
+          if ($mount.Count -ne 1 -or $cert.Count -ne 1) { throw 'Expected the w11term library and player_ssh test executables' }
+          "MOUNT_TEST_EXE=$($mount[0].executable)" >> $env:GITHUB_ENV
+          "HOST_CERT_TEST_EXE=$($cert[0].executable)" >> $env:GITHUB_ENV
       - name: Stage the native GUI and CLI for mounted-folder actions
         run: cargo build --locked --features ui-smoke --bins
       - name: Install QEMU for the disposable runner
@@ -111,8 +114,9 @@ jobs:
         run: |
           ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-noble" `
             -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE -LegacyFuse
-      - name: Verify real SSHFS mounts and the native Files and clipboard actions on Ubuntu 26.04
+      - name: Verify OpenSSH host certificates, SSHFS mounts and native Files actions on Ubuntu 26.04
         run: |
           ./tests/folder-sharing/run-windows.ps1 -GuestDirectory "$env:RUNNER_TEMP/sshfs-guests/sshfs-guest-resolute" `
             -QemuExecutable $env:MOUNT_TEST_QEMU -TestExecutable $env:MOUNT_TEST_EXE `
+            -HostCertificateTestExecutable $env:HOST_CERT_TEST_EXE `
             -GuiExecutable target/debug/w11term.exe -CliExecutable target/debug/w11term-cli.exe -CheckClipboard

@@ -761,7 +761,6 @@ impl<'a> Performer<'a> {
                 self.capturing_shell_input = false;
                 self.command_label = None;
                 self.current_dir = None;
-                let seqno = self.seqno;
                 self.pen = Default::default();
                 self.cursor = Default::default();
                 self.wrap_next = false;
@@ -809,9 +808,12 @@ impl<'a> Performer<'a> {
                 self.progress_value = 0;
 
                 self.screen.full_reset();
-                self.screen.activate_alt_screen(seqno);
+                self.activate_screen(true);
+                self.kitty_img = Default::default();
                 self.erase_in_display(EraseInDisplay::EraseDisplay);
-                self.screen.activate_primary_screen(seqno);
+                self.activate_screen(false);
+                self.kitty_img = Default::default();
+                self.image_cache.clear();
                 self.erase_in_display(EraseInDisplay::EraseScrollback);
                 self.erase_in_display(EraseInDisplay::EraseDisplay);
                 self.palette_did_change();

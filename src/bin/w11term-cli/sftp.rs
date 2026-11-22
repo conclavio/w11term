@@ -9,6 +9,7 @@ use w11term::{
 pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
   get REMOTE LOCAL [--overwrite] [--max-bytes N] | put LOCAL REMOTE [--overwrite]\n\
+  get-dir REMOTE NEW_LOCAL_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -81,6 +82,10 @@ pub fn parse(
     let mut paths = positional.into_iter();
     let mut path = || paths.next().context("missing path argument");
     match command.as_str() {
+        "get-dir" => {
+            fields.insert("remote".into(), json!(path()?));
+            fields.insert("local".into(), json!(std::path::absolute(path()?)?));
+        }
         "get" | "put" => {
             let first = path()?;
             let second = path()?;
@@ -235,6 +240,21 @@ mod tests {
         assert!(local.is_absolute());
         assert_eq!(remote, "/tmp/a b");
         assert!(overwrite);
+        let (
+            _,
+            Request::Sftp {
+                pane,
+                operation: Operation::GetDir { local, remote },
+                ..
+            },
+        ) = p(&["get_dir", "--pane", "7", "/var/log", "saved logs"]).unwrap()
+        else {
+            panic!("expected a directory download");
+        };
+        assert_eq!(pane, 7);
+        assert_eq!(remote, "/var/log");
+        assert_eq!(local, std::path::absolute("saved logs").unwrap());
+        assert!(p(&["get-dir", "--pane", "7", "/var/log", ".", "--overwrite"]).is_err());
         assert!(matches!(
             p(&["remove_file", "--pane", "2", "/tmp/a"]).unwrap().1,
             Request::Sftp {

@@ -101,6 +101,17 @@ function Control([string[]]$Command) {
     if ($LASTEXITCODE -ne 0 -or -not $reply.ok) { throw "Control request failed: $Command $($reply.error)" }
     return $reply.result
 }
+function Copy-ModeOpen {
+    $dot = ' ' + [char]0xb7 + ' '
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    foreach ($label in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text)) {
+        if ($label.Current.Name.StartsWith("Copy mode$dot")) { return $true }
+    }
+    return $false
+}
 function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Type) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)

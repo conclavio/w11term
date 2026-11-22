@@ -32,6 +32,8 @@ pub struct Screen {
     /// Identifies one interpretation of stable row coordinates. Ordinary output
     /// and natural history eviction preserve it.
     row_epoch: u64,
+    /// Insertion rectangles are valid until a row is moved, reflowed or discarded.
+    pub(crate) placement_row_revision: u64,
     /// Identifies an explicit history erasure, which preserves surviving row coordinates.
     history_clear_count: u64,
     /// Start of the primary shell's current OSC 133 C/D output range.
@@ -84,6 +86,7 @@ impl Screen {
             physical_cols,
             stable_row_index_offset: 0,
             row_epoch: Self::next_row_epoch(),
+            placement_row_revision: 0,
             history_clear_count: 0,
             command_start: None,
             dpi: size.dpi,
@@ -105,6 +108,11 @@ impl Screen {
 
     pub(crate) fn invalidate_row_coordinates(&mut self) {
         self.row_epoch = Self::next_row_epoch();
+        self.placement_rows_changed();
+    }
+
+    pub(crate) fn placement_rows_changed(&mut self) {
+        self.placement_row_revision = self.placement_row_revision.wrapping_add(1);
     }
 
     pub fn row_epoch(&self) -> u64 {
@@ -708,6 +716,7 @@ impl Screen {
             return self.scroll_up(scroll_region, num_rows, seqno, blank_attr, bidi_mode);
         }
 
+        self.placement_rows_changed();
         // Need to do the slower, more complex left and right bounded scroll
         let phys_scroll = self.phys_range(scroll_region);
 
@@ -795,6 +804,7 @@ impl Screen {
     ) {
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
+        self.placement_rows_changed();
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
         let insert_at_end = scroll_region.end as usize == self.physical_rows;
 
@@ -906,6 +916,7 @@ impl Screen {
         let len = self.lines.len();
         let to_clear = len - self.physical_rows;
         if to_clear > 0 {
+            self.placement_rows_changed();
             self.history_clear_count = self.history_clear_count.wrapping_add(1);
         }
         for _ in 0..to_clear {
@@ -936,6 +947,7 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        self.placement_rows_changed();
         debug!("scroll_down {:?} {}", scroll_region, num_rows);
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
@@ -981,6 +993,7 @@ impl Screen {
             return self.scroll_down(scroll_region, num_rows, seqno, blank_attr, bidi_mode);
         }
 
+        self.placement_rows_changed();
         // Need to do the slower, more complex left and right bounded scroll
         let phys_scroll = self.phys_range(scroll_region);
 

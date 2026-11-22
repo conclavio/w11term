@@ -696,6 +696,8 @@ pub enum KittyImageDelete {
         placement_id: Option<u32>,
         delete: bool,
     },
+    /// d='r' or d='R'. Match nonzero client IDs between x and y, inclusive.
+    ByImageIdRange { first: u32, last: u32, delete: bool },
     /// d='n' or d='N'
     /// Delete newest image with specified image number.
     /// If placement_id is specified, then placement_id
@@ -758,6 +760,22 @@ impl KittyImageDelete {
                 placement_id: geti(keys, "p"),
                 delete,
             }),
+            'r' | 'R' => {
+                let bound = |key| {
+                    // An omitted bound defaults to zero. Reject a malformed value
+                    // instead of broadening a deletion to start at zero.
+                    let value = get(keys, key).unwrap_or("0");
+                    if value.len() > 10 || !value.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    value.parse::<u32>().ok()
+                };
+                Some(Self::ByImageIdRange {
+                    first: bound("x")?,
+                    last: bound("y")?,
+                    delete,
+                })
+            }
             'n' | 'N' => Some(Self::ByImageNumber {
                 image_number: geti(keys, "I")?,
                 placement_id: geti(keys, "p"),
@@ -811,6 +829,19 @@ impl KittyImageDelete {
                     keys.insert("p", p.to_string());
                 }
                 keys.insert("i", image_id.to_string());
+            }
+            Self::ByImageIdRange {
+                first,
+                last,
+                delete,
+            } => {
+                keys.insert("d", d('r', delete));
+                if *first != 0 {
+                    keys.insert("x", first.to_string());
+                }
+                if *last != 0 {
+                    keys.insert("y", last.to_string());
+                }
             }
             Self::ByImageNumber {
                 image_number,

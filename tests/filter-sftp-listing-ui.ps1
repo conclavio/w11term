@@ -94,10 +94,10 @@ try {
     $null = Wait-Until 'Done retains the filtered rows and returns keyboard input to SSH' {
         !(Filter-Edit) -and (Find-Element '1 match') -and (Button $target)
     }
-    Check-PathCopy 'Copy selected path' "$parent/$target"
-    Check-PathCopy 'Copy directory path' $parent
     foreach ($c in 'after-filter-done'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-filter-done')
+    Check-PathCopy 'Copy selected path' "$parent/$target"
+    Check-PathCopy 'Copy directory path' $parent
     Set-Filter 'nothing-matches-this'
     $null = Wait-Until 'no matches and no actions on the old selected file' {
         (Find-Element 'No matching files or folders') -and !(Button $target) -and

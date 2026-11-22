@@ -3,7 +3,10 @@
 use anyhow::Result;
 use russh::{
     Channel, ChannelId, ChannelOpenFailure, Pty,
-    keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding},
+    keys::{
+        Algorithm, EcdsaCurve, HashAlg, PrivateKey, PublicKey,
+        ssh_key::{LineEnding, certificate},
+    },
     server,
 };
 use std::{
@@ -144,22 +147,57 @@ struct Fixture {
 }
 impl Fixture {
     async fn start() -> Result<Self> {
+        Self::start_with_aliases(None).await
+    }
+    async fn start_with_aliases(aliases: Option<[&str; 3]>) -> Result<Self> {
         let keys = tempfile::tempdir()?;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut endpoints = Vec::new();
         let mut servers = Vec::new();
         let mut known_hosts = String::new();
+        let ca = PrivateKey::random(
+            &mut rand::rng(),
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP384,
+            },
+        )?;
+        let host_algorithms = [
+            Algorithm::Ed25519,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP521,
+            },
+        ];
         let mut next = None;
         for index in (0..HOSTS.len()).rev() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
             let address = listener.local_addr()?;
-            let host = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+            let host = PrivateKey::random(&mut rand::rng(), host_algorithms[index].clone())?;
+            // All three peers offer both forms. Only the two private names trust
+            // the CA. The public jump has a conventional known_hosts entry.
+            let mut cert = certificate::Builder::new_with_random_nonce(
+                &mut rand::rng(),
+                host.public_key().key_data().clone(),
+                0,
+                u64::MAX,
+            )?;
+            cert.cert_type(certificate::CertType::Host)?;
+            let alias = aliases.map(|names| names[index]);
+            cert.valid_principal(alias.unwrap_or(HOSTS[index]))?;
+            let (marker, trusted_key) = if index == 0 {
+                ("", host.public_key())
+            } else {
+                ("@cert-authority ", ca.public_key())
+            };
+            let trust_name = alias
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("[{}]:{}", HOSTS[index], address.port()));
             writeln!(
                 known_hosts,
-                "[{}]:{} {}",
-                HOSTS[index],
-                address.port(),
-                host.public_key().to_openssh()?
+                "{marker}{trust_name} {}",
+                trusted_key.to_openssh()?
             )?;
             let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
             let path = keys.path().join(format!("id-{index}"));
@@ -170,8 +208,10 @@ impl Fixture {
                 user: USERS[index].into(),
                 authentication: Authentication::Identity { identity: path },
                 host_key: Some(host.public_key().fingerprint(HashAlg::Sha256).to_string()),
+                host_key_alias: alias.map(str::to_owned),
             });
             let config = Arc::new(server::Config {
+                certificates: vec![cert.sign(&ca)?],
                 keys: vec![host],
                 auth_rejection_time: Duration::ZERO,
                 ..Default::default()
@@ -222,6 +262,15 @@ impl Fixture {
                 ports[i],
                 identity.display()
             );
+            let trust_alias = self
+                .options
+                .proxy_jump
+                .get(i)
+                .map(|hop| &hop.host_key_alias)
+                .unwrap_or(&self.options.host_key_alias);
+            if let Some(name) = trust_alias {
+                writeln!(section, " HostKeyAlias {name}")?;
+            }
             if i == 2 {
                 section.push_str(" ProxyJump outer,inner\n");
             }
@@ -291,8 +340,17 @@ impl Drop for Fixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_config_fragments_connect_through_both_trusted_jumps_and_close_with_the_terminal()
 {
+    assert_imported_route(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_hop_trust_aliases_validate_certificates_without_changing_forwarding_addresses() {
+    assert_imported_route(Some(["public-jump.keys", "inner-jump.keys", "shell.keys"])).await;
+}
+
+async fn assert_imported_route(aliases: Option<[&str; 3]>) {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let mut fixture = Fixture::start().await?;
+        let mut fixture = Fixture::start_with_aliases(aliases).await?;
         fixture.import_saved_route()?;
         let (input, mut output, task) = fixture.connect();
         let mut echo = Vec::new();

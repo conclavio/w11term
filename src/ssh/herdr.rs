@@ -109,6 +109,7 @@ pub(super) async fn discover(
             reference: DurableReference {
                 backend: Backend::Herdr,
                 host: options.host.clone(),
+                host_key_alias: options.host_key_alias.clone(),
                 port: options.port,
                 user: options.user.clone(),
                 host_key: link.fingerprint().into(),

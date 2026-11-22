@@ -14,6 +14,7 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
+    FocusPreviousPane,
     ResizeLeft,
     ResizeRight,
     ResizeUp,
@@ -39,6 +40,8 @@ pub enum Action {
     ClearScrollback,
     NextTab,
     PreviousTab,
+    MoveTabLeft,
+    MoveTabRight,
     NewTab,
     DuplicateTabLayout,
     CloseTab,
@@ -81,6 +84,13 @@ pub const BINDINGS: &[Binding] = &[
     Binding::new(FocusRight, "focus_right", "Focus right", 0x27, CTRL_ALT),
     Binding::new(FocusUp, "focus_up", "Focus above", 0x26, CTRL_ALT),
     Binding::new(FocusDown, "focus_down", "Focus below", 0x28, CTRL_ALT),
+    Binding::new(
+        FocusPreviousPane,
+        "focus_previous_pane",
+        "Focus previous pane",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(ResizeLeft, "resize_left", "Resize left", 0x25, ALT_SHIFT),
     Binding::new(ResizeRight, "resize_right", "Resize right", 0x27, ALT_SHIFT),
     Binding::new(ResizeUp, "resize_up", "Resize up", 0x26, ALT_SHIFT),
@@ -178,6 +188,14 @@ pub const BINDINGS: &[Binding] = &[
         "Previous tab",
         0x09,
         CTRL_SHIFT,
+    ),
+    Binding::new(MoveTabLeft, "move_tab_left", "Move tab left", 0, Mods::NONE),
+    Binding::new(
+        MoveTabRight,
+        "move_tab_right",
+        "Move tab right",
+        0,
+        Mods::NONE,
     ),
     Binding::new(NewTab, "new_tab", "New tab", 0x54, CTRL_SHIFT),
     Binding::new(
@@ -485,6 +503,29 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_tab_is_remappable_in_terminal_and_utility_tabs() {
+        let mut shortcuts = Shortcuts::default();
+        let bindings = [(MoveTabLeft, "F7"), (MoveTabRight, "F8")];
+        for (action, name) in bindings {
+            assert_eq!(shortcuts.get(action.binding()), None);
+            shortcuts.set(action, Some(name.parse().unwrap())).unwrap();
+        }
+        let json = serde_json::to_string(&shortcuts).unwrap();
+        assert_eq!(json, r#"{"move_tab_left":"F7","move_tab_right":"F8"}"#);
+        let restored: Shortcuts = serde_json::from_str(&json).unwrap();
+        let map = restored.keymap().unwrap();
+        for (action, name) in bindings {
+            let chord: Chord = name.parse().unwrap();
+            for terminal in [true, false] {
+                assert_eq!(
+                    map.resolve(chord.key, chord.mods, terminal, false),
+                    Some(action)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn find_all_panes_can_be_bound_from_a_terminal_or_a_utility_tab() {
         let mut shortcuts = Shortcuts::default();
         assert_eq!(shortcuts.get(FindAllPanes.binding()), None);
@@ -499,6 +540,27 @@ mod tests {
                 map.resolve(chord.key, chord.mods, in_terminal, false),
                 Some(FindAllPanes)
             );
+        }
+    }
+
+    #[test]
+    fn previous_pane_is_optional_and_can_return_from_a_utility_tab() {
+        let mut shortcuts = Shortcuts::default();
+        let chord: Chord = "F8".parse().unwrap();
+        assert_eq!(shortcuts.get(FocusPreviousPane.binding()), None);
+        shortcuts.set(FocusPreviousPane, Some(chord)).unwrap();
+        let json = serde_json::to_string(&shortcuts).unwrap();
+        assert_eq!(json, r#"{"focus_previous_pane":"F8"}"#);
+        let map = serde_json::from_str::<Shortcuts>(&json)
+            .unwrap()
+            .keymap()
+            .unwrap();
+        for terminal in [true, false] {
+            assert_eq!(
+                map.resolve(chord.key, chord.mods, terminal, false),
+                Some(FocusPreviousPane)
+            );
+            assert_eq!(map.resolve(chord.key, chord.mods, terminal, true), None);
         }
     }
 

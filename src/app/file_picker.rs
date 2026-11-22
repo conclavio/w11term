@@ -20,6 +20,7 @@ pub(super) enum Purpose {
     UploadFiles,
     SshConfig(PathBuf),
     Folder,
+    DownloadFolder,
     Save(String),
     Scrollback,
 }
@@ -155,7 +156,10 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let _apartment = Apartment;
         let clsid = if matches!(
             purpose,
-            Purpose::UploadFiles | Purpose::SshConfig(_) | Purpose::Folder
+            Purpose::UploadFiles
+                | Purpose::SshConfig(_)
+                | Purpose::Folder
+                | Purpose::DownloadFolder
         ) {
             FileOpenDialog
         } else {
@@ -182,11 +186,23 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 local_config_folder(&dialog, &current);
                 None
             }
-            Purpose::Folder => {
-                dialog.SetTitle(w!("Choose a folder to share"))?;
+            Purpose::Folder | Purpose::DownloadFolder => {
+                let download = matches!(purpose, Purpose::DownloadFolder);
+                dialog.SetTitle(if download {
+                    w!("Choose a download destination folder")
+                } else {
+                    w!("Choose a folder to share")
+                })?;
                 options |= FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 #[cfg(feature = "ui-smoke")]
-                fixture_picker_folder(&dialog, "W11TERM_FOLDER_SHARE_SMOKE_DIR")?;
+                fixture_picker_folder(
+                    &dialog,
+                    if download {
+                        "W11TERM_SFTP_PICKER_SMOKE_DIR"
+                    } else {
+                        "W11TERM_FOLDER_SHARE_SMOKE_DIR"
+                    },
+                )?;
                 None
             }
             Purpose::Save(suggestion) => {

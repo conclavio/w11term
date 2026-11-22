@@ -26,6 +26,12 @@ pub struct DurableReference {
     #[serde(default, skip_serializing_if = "Backend::is_zmx")]
     pub backend: Backend,
     pub host: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::options::deserialize_host_key_alias",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub host_key_alias: Option<String>,
     pub port: u16,
     pub user: String,
     pub host_key: String,
@@ -38,6 +44,7 @@ impl DurableReference {
         Self {
             backend: Backend::Zmx,
             host: options.host.clone(),
+            host_key_alias: options.host_key_alias.clone(),
             port: options.port,
             user: options.user.clone(),
             host_key: host_key.to_owned(),
@@ -47,6 +54,9 @@ impl DurableReference {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(alias) = &self.host_key_alias {
+            crate::options::validate_host_key_alias(alias)?;
+        }
         ensure!(
             match self.backend {
                 Backend::Zmx => valid_identity(&self.name, &self.generation),
@@ -71,6 +81,7 @@ impl DurableReference {
 
     pub fn matches_endpoint(&self, options: &SshOptions) -> bool {
         self.host.eq_ignore_ascii_case(&options.host)
+            && self.host_key_alias == options.host_key_alias
             && self.port == options.port
             && self.user == options.user
             && options
@@ -161,6 +172,7 @@ pub(crate) fn parse_listing(
             reference: DurableReference {
                 backend: Backend::Zmx,
                 host: options.host.clone(),
+                host_key_alias: options.host_key_alias.clone(),
                 port: options.port,
                 user: options.user.clone(),
                 host_key: peer.into(),
@@ -219,6 +231,21 @@ mod tests {
         let pin = format!("SHA256:{}", STANDARD_NO_PAD.encode([3u8; 32]));
         let first = DurableReference::new(&options, &pin);
         assert!(first.validate().is_ok() && first.matches_endpoint(&options));
+        assert!(
+            serde_json::to_value(&first)
+                .unwrap()
+                .get("host_key_alias")
+                .is_none()
+        );
+        options.host_key_alias = Some("private-alias".into());
+        let aliased = DurableReference::new(&options, &pin);
+        assert!(!first.matches_endpoint(&options));
+        assert_eq!(aliased.host, first.host);
+        let saved: DurableReference =
+            serde_json::from_value(serde_json::to_value(&aliased).unwrap()).unwrap();
+        assert!(saved.validate().is_ok() && saved.matches_endpoint(&options));
+        options.host_key_alias = None;
+        assert!(!saved.matches_endpoint(&options));
         assert_ne!(first, DurableReference::new(&options, &pin));
         options.user = "other".into();
         assert!(!first.matches_endpoint(&options));

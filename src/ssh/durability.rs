@@ -602,6 +602,7 @@ async fn discover_tmux(
             reference: DurableReference {
                 backend: Backend::Tmux,
                 host: options.host.clone(),
+                host_key_alias: options.host_key_alias.clone(),
                 port: options.port,
                 user: options.user.clone(),
                 host_key: link.fingerprint().into(),

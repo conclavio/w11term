@@ -75,6 +75,7 @@ impl ConnectionShare {
             && connected.user == options.user
             && connected.authentication == options.authentication
             && connected.host_key == options.host_key
+            && connected.host_key_alias == options.host_key_alias
             && connected.proxy_jump == options.proxy_jump
             && self.0.known_hosts.as_deref() == prompts.and_then(Prompts::known_hosts)
     }

@@ -21,6 +21,8 @@ jobs:
           mkdir -p artifacts
           dpkg-query -W kitty xvfb libgl1-mesa-dri > artifacts/versions.txt
           xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts
+          xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/clear-visible --scene clear-visible
+          xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/independent-placements --scene independent-placements
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

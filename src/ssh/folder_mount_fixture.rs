@@ -197,6 +197,7 @@ fn options() -> Result<SshOptions> {
                 .into(),
         },
         host_key: Some(fingerprint),
+        host_key_alias: None,
         proxy_jump: vec![],
         local_forwards: vec![],
         scrollback_lines: Default::default(),

@@ -42,50 +42,47 @@ fn stop(message: impl Into<String>) -> anyhow::Error {
 pub(crate) struct Handler {
     options: SshOptions,
     prompts: Option<Prompts>,
+    known_hosts: std::path::PathBuf,
     fingerprint: Arc<std::sync::OnceLock<String>>,
     durable_peer: Option<String>,
 }
+
+// OpenSSH uses a host-key alias verbatim, even for a connection on another
+// port. Port 22 tells the known_hosts reader and writer to use the bare name.
+fn host_key_target(options: &SshOptions) -> (&str, u16) {
+    match options.host_key_alias.as_deref() {
+        Some(alias) => (alias, 22),
+        None => (&options.host, options.port),
+    }
+}
+
 impl Handler {
-    fn known(&self, key: &russh::keys::PublicKey) -> Result<bool> {
-        let path = self
-            .prompts
-            .as_ref()
-            .and_then(Prompts::known_hosts)
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
-            .context("cannot locate known_hosts")?;
+    fn known(&self, key: &PublicKeyOrCertificate) -> Result<bool> {
+        let (name, port) = host_key_target(&self.options);
         super::known_hosts::verify(
-            &path,
-            &self.options.host,
-            self.options.port,
+            &self.known_hosts,
+            name,
+            port,
             key,
             self.options.host_key.as_deref(),
         )
     }
 
     fn learn(&self, key: &russh::keys::PublicKey) -> Result<()> {
-        use russh::keys::known_hosts;
-        if let Some(path) = self.prompts.as_ref().and_then(Prompts::known_hosts) {
-            known_hosts::learn_known_hosts_path(
-                &self.options.host.to_ascii_lowercase(),
-                self.options.port,
-                key,
-                path,
-            )?;
-        } else {
-            known_hosts::learn_known_hosts(
-                &self.options.host.to_ascii_lowercase(),
-                self.options.port,
-                key,
-            )?;
-        }
+        let (name, port) = host_key_target(&self.options);
+        russh::keys::known_hosts::learn_known_hosts_path(
+            &name.to_ascii_lowercase(),
+            port,
+            key,
+            &self.known_hosts,
+        )?;
         Ok(())
     }
 }
 impl client::Handler for Handler {
     type Error = anyhow::Error;
-    async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
-        let key = key.public_key();
+    async fn check_server_key(&mut self, presented: &PublicKeyOrCertificate) -> Result<bool> {
+        let key = presented.public_key();
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         if self
             .durable_peer
@@ -98,7 +95,7 @@ impl client::Handler for Handler {
             self.fingerprint.get_or_init(|| fingerprint.clone()) == &fingerprint,
             Permanent("SSH peer changed its host key during this connection".into())
         );
-        match self.known(&key) {
+        match self.known(presented) {
             Ok(true) => return Ok(true),
             Ok(false) => {}
             Err(e) => {
@@ -107,11 +104,20 @@ impl client::Handler for Handler {
                 )));
             }
         }
-        let prompts=self.prompts.as_ref().ok_or_else(||stop(format!("unknown host key for {}:{}: {fingerprint}. Verify it, then supply --host-key {fingerprint} or connect in the GUI",self.options.host,self.options.port)))?;
+        let prompts = self.prompts.as_ref().ok_or_else(|| {
+            let alias = self.options.host_key_alias.as_deref()
+                .map(|name| format!(" (host key alias {name})"))
+                .unwrap_or_default();
+            stop(format!(
+                "unknown host key for {}:{}{alias}: {fingerprint}. Verify it, then supply --host-key {fingerprint} or connect in the GUI",
+                self.options.host, self.options.port
+            ))
+        })?;
         let answer = prompts
             .ask(Question::HostKey {
                 host: self.options.host.clone(),
                 port: self.options.port,
+                host_key_alias: self.options.host_key_alias.clone(),
                 algorithm: key.algorithm().to_string(),
                 fingerprint,
             })
@@ -121,7 +127,7 @@ impl client::Handler for Handler {
             matches!(answer, Answer::Trust(true)),
             Permanent("host key was not accepted".into())
         );
-        match self.known(&key) {
+        match self.known(presented) {
             Ok(true) => {}
             Ok(false) => self
                 .learn(&key)
@@ -382,7 +388,16 @@ pub(super) async fn handshake(
     durable_peer: Option<&str>,
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
 ) -> Result<(client::Handle<Handler>, String)> {
+    let known_hosts = prompts
+        .and_then(Prompts::known_hosts)
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
+        .ok_or_else(|| stop("cannot locate known_hosts"))?;
+    let (name, port) = host_key_target(options);
+    let trust_host_ca = super::known_hosts::has_authority(&known_hosts, name, port)
+        .map_err(|error| stop(format!("reading host certificate authorities: {error:#}")))?;
     let config = Arc::new(client::Config {
+        preferred: super::negotiation::preferred(trust_host_ca),
         nodelay: true,
         keepalive_interval: Some(Duration::from_secs(5)),
         keepalive_max: 2,
@@ -397,6 +412,7 @@ pub(super) async fn handshake(
             Handler {
                 options: options.clone(),
                 prompts: prompts.cloned(),
+                known_hosts,
                 fingerprint: fingerprint.clone(),
                 durable_peer: durable_peer.map(str::to_owned),
             },

@@ -65,6 +65,7 @@ mod local_smoke;
 mod pane_colors;
 mod pane_picker;
 mod pane_view;
+mod previous_pane;
 mod scrollback_bar;
 mod scrollback_export;
 mod session_browser;
@@ -360,6 +361,13 @@ impl AppTab {
             _ => None,
         }
     }
+
+    fn visited_terminal(&self) -> Option<u64> {
+        match &self.page {
+            Page::Terminal(tab) if !tab.browsing_sessions() => Some(tab.session.pane_id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -397,6 +405,7 @@ struct ProfileDraft {
     custom_terminal: String,
     identity: String,
     fingerprint: String,
+    host_key_alias: String,
     authentication: usize,
     error: Option<String>,
     player: w11term::options::PlayerOptions,
@@ -424,6 +433,7 @@ impl Default for ProfileDraft {
             custom_terminal: String::new(),
             identity: String::new(),
             fingerprint: String::new(),
+            host_key_alias: String::new(),
             authentication: 0,
             error: None,
             player: Default::default(),
@@ -434,6 +444,11 @@ impl Default for ProfileDraft {
 }
 
 impl ProfileDraft {
+    fn host_key_alias(&self) -> Option<String> {
+        let alias = self.host_key_alias.trim();
+        (!alias.is_empty()).then(|| alias.to_ascii_lowercase())
+    }
+
     fn terminal_type(&self) -> anyhow::Result<TerminalType> {
         let name = match self.terminal_preset {
             0 => TerminalType::DEFAULT,
@@ -469,6 +484,7 @@ impl ProfileDraft {
             custom_terminal: options.terminal_type.as_str().into(),
             identity,
             fingerprint: options.host_key.clone().unwrap_or_default(),
+            host_key_alias: options.host_key_alias.clone().unwrap_or_default(),
             authentication,
             player: options.player.clone(),
             ..Default::default()
@@ -566,6 +582,8 @@ fn tab_menu_message(label: String) -> Message {
         "Attention inbox" => Message::Attention(attention::Action::Open),
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
         "Duplicate tab layout" => Message::Shortcut(Shortcut::DuplicateTabLayout),
+        "Move tab left" => Message::Shortcut(Shortcut::MoveTabLeft),
+        "Move tab right" => Message::Shortcut(Shortcut::MoveTabRight),
         "SFTP files" => Message::Files(FileAction::Toggle),
         "Workspace startup…" => {
             Message::Workspace(workspace_view::WorkspaceAction::ConfigureStartup)
@@ -588,6 +606,7 @@ fn tab_menu_message(label: String) -> Message {
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
         "Focus below" => Message::PaneNeighbor(Direction::Down),
+        "Focus previous pane" => Message::Shortcut(Shortcut::FocusPreviousPane),
         "Resize left" => Message::Shortcut(Shortcut::ResizePane(Direction::Left)),
         "Resize right" => Message::Shortcut(Shortcut::ResizePane(Direction::Right)),
         "Resize up" => Message::Shortcut(Shortcut::ResizePane(Direction::Up)),
@@ -631,6 +650,12 @@ fn bind_tab_action(message: Message, group: Option<TabId>) -> Message {
         Message::Shortcut(Shortcut::DuplicateTabLayout) => {
             group.map_or(Message::ControlIdle, Message::DuplicateTabLayout)
         }
+        Message::Shortcut(Shortcut::MoveTabLeft) => group.map_or(Message::ControlIdle, |id| {
+            Message::MoveTab(id, Direction::Left)
+        }),
+        Message::Shortcut(Shortcut::MoveTabRight) => group.map_or(Message::ControlIdle, |id| {
+            Message::MoveTab(id, Direction::Right)
+        }),
         message => message,
     }
 }
@@ -645,6 +670,7 @@ pub enum Field {
     CustomTerminal,
     Identity,
     Fingerprint,
+    HostKeyAlias,
 }
 
 enum UiWork {
@@ -654,6 +680,7 @@ enum UiWork {
 }
 
 struct CaretMenuBinding {
+    previous: Option<previous_pane::Target>,
     forward: Option<local_forwards::Origin>,
     directory_split: Option<directory_split::Origin>,
     pane: Option<u64>,
@@ -810,6 +837,7 @@ pub enum Message {
     SplitPane(Axis, Option<String>),
     SplitInDirectory(Axis, directory_split::Origin),
     PaneNeighbor(Direction),
+    FocusPreviousPane(previous_pane::Target),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
     ZoomPane,
@@ -817,6 +845,7 @@ pub enum Message {
     MovePaneToTab,
     MoveTabToWindow,
     DuplicateTabLayout(TabId),
+    MoveTab(TabId, Direction),
     WindowTick,
     DismissWindowError,
     TransferReady(u64),
@@ -858,7 +887,7 @@ pub enum Message {
     CloseWindow,
     Select(Option<usize>, u64, bool),
     CloseTab(String),
-    Reorder(Vec<String>, Option<TabId>),
+    Reorder(Vec<String>, Option<TabId>, u64),
     SyncSelection(u64),
     Shortcut(Shortcut),
     ProfileMenu(String),
@@ -884,6 +913,7 @@ pub enum Message {
     Paste,
     Clipboard(clipboard_paste::Action),
     CopyResult(TabId, u64, Result<(), String>),
+    CopyWordResult(TabId, u64, Option<Point>),
     Pointer(TabId, PointerEventInfo, MouseEventKind),
     RenderError(TabId, String),
     RetryRender(TabId),
@@ -924,6 +954,8 @@ fn live_tab_sized(
 ) -> AppTab {
     let session = if matches!(&source, Source::Ssh(ssh) if ssh.durable) {
         Session::start_durable(source.clone(), size, osc52, connection, saved)
+    } else if let Source::Replay(path) = &source {
+        Session::start_replay_pane(path.clone(), size, osc52)
     } else {
         Session::start_configured_with_connection(source.clone(), size, osc52, connection)
     };
@@ -1071,6 +1103,8 @@ impl TerminalApp {
             tab.files.end_filter_edit();
         }
         let editing_files = tab.files.entry_dialog_open() || tab.files.filter_editing();
+        self.keyboard
+            .watch_file_drawer(tab.files.open.then_some(tab.session.pane_id));
         self.clipboard.connection_changed(
             tab.session.pane_id,
             frame.connection_generation,
@@ -1110,8 +1144,11 @@ impl TerminalApp {
         use w11term::prompts::Question;
         let prompt_id = prompt.id;
         let (title,primary,children):(String,&str,Vec<View>)=match &prompt.question {
-            Question::HostKey{host,port,algorithm,fingerprint}=>("Trust this SSH host?".into(),"Accept and save",vec![
-                TextBlock::new().text(format!("First connection to {host}:{port}")).text_wrapping(TextWrapping::Wrap).into(),
+            Question::HostKey{host,port,host_key_alias,algorithm,fingerprint}=>("Trust this SSH host?".into(),"Accept and save",vec![
+                TextBlock::new().text(match host_key_alias {
+                    Some(alias) => format!("Connecting to {host}:{port}\nSave the host key as {alias}"),
+                    None => format!("First connection to {host}:{port}"),
+                }).text_wrapping(TextWrapping::Wrap).into(),
                 TextBlock::new().text(format!("{algorithm}\n{fingerprint}")).text_wrapping(TextWrapping::Wrap).into(),
                 TextBlock::new().text("Verify this fingerprint with the server owner. Accepting saves it in your OpenSSH known_hosts file.").text_wrapping(TextWrapping::Wrap).into(),
             ]),
@@ -1427,6 +1464,9 @@ impl TerminalApp {
         }
         if kind != MouseEventKind::Move {
             self.header.borrow_mut().take();
+        }
+        if kind == MouseEventKind::Press {
+            self.keyboard.return_from_drawer();
         }
         if kind == MouseEventKind::Press
             && let Some(active) = self.tabs.active_id()
@@ -2027,6 +2067,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.tabs.record_pane_focus(AppTab::visited_terminal);
         self.clipboard.input_origin.set(self.paste_origin());
         self.discard_inactive_paste();
         self.bind_folder_shares();
@@ -2127,6 +2168,7 @@ impl TerminalApp {
         };
         if target.is_none() {
             self.keyboard.set_modal(false);
+            self.keyboard.watch_file_drawer(None);
         }
         self.keyboard.set_target(target);
         self.sync_ime_surface();
@@ -2219,6 +2261,8 @@ impl TerminalApp {
             self.sync_selection(context);
             if active {
                 self.activate(context);
+            } else {
+                self.refresh_open_commands();
             }
         }
     }
@@ -2603,6 +2647,7 @@ impl TerminalApp {
                 authentication,
                 host_key: (!draft.fingerprint.trim().is_empty())
                     .then(|| draft.fingerprint.trim().into()),
+                host_key_alias: draft.host_key_alias(),
                 player: draft.player.clone(),
                 proxy_jump: draft.proxy_jump.clone(),
                 local_forwards: draft.local_forwards.clone(),
@@ -2695,6 +2740,7 @@ impl TerminalApp {
         exited: Option<ExitedPane>,
         arrangement: PaneArrangement,
         directory_split: Option<directory_split::Origin>,
+        previous: Option<previous_pane::Target>,
     ) -> Callback<String> {
         let pane = self.tabs.active().and_then(AppTab::pane_id);
         let paste = self.paste_origin();
@@ -2702,6 +2748,7 @@ impl TerminalApp {
         let mut cached = self.caret_menu_binding.borrow_mut();
         let forward = self.forward_origin();
         if let Some(binding) = cached.as_ref()
+            && binding.previous == previous
             && binding.forward == forward
             && binding.pane == pane
             && binding.paste == paste
@@ -2732,6 +2779,7 @@ impl TerminalApp {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
             }
             _ => match tab_menu_message(label) {
+                Message::Shortcut(Shortcut::FocusPreviousPane) => previous_pane::message(previous),
                 Message::Shortcut(Shortcut::SwapPane(direction)) => offered.message(direction),
                 Message::Shortcut(Shortcut::RotateSplit) => offered.rotate(),
                 Message::Shortcut(shortcut) if let Some(axis) = directory_split::axis(shortcut) => {
@@ -2744,6 +2792,7 @@ impl TerminalApp {
             },
         });
         *cached = Some(CaretMenuBinding {
+            previous,
             forward,
             directory_split,
             pane,
@@ -2795,7 +2844,15 @@ impl TerminalApp {
             .on_close_requested(context.callback(Message::CloseTab))
             .on_reordered({
                 let selected = self.tabs.active_id();
-                context.callback(move |order| Message::Reorder(order, selected))
+                let epoch = self.selection_epoch;
+                let pending = self.selection_pending;
+                context.callback(move |order| {
+                    if pending {
+                        Message::ControlIdle
+                    } else {
+                        Message::Reorder(order, selected, epoch)
+                    }
+                })
             })
             .collection_slot(
                 TabViewSlot::TabItems,
@@ -2826,6 +2883,7 @@ impl TerminalApp {
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
+        let previous = previous_pane::target(&self.tabs);
         let caret = Button::new()
             .style(ButtonStyle::Subtle)
             .width(44.0)
@@ -2833,8 +2891,13 @@ impl TerminalApp {
             .automation_name("Tab menu")
             .content(FontIcon::new().glyph("\u{e70d}"))
             .menu(Menu::new(
-                self.caret_items(exited.is_some(), &arrangement, directory_split.is_some()),
-                self.caret_menu_callback(context, exited, arrangement, directory_split),
+                self.caret_items(
+                    exited.is_some(),
+                    &arrangement,
+                    directory_split.is_some(),
+                    previous,
+                ),
+                self.caret_menu_callback(context, exited, arrangement, directory_split, previous),
             ));
         TitleBar::new()
             .preferred_height(WindowTitleBarHeight::Tall)
@@ -2891,6 +2954,7 @@ impl TerminalApp {
         can_restart: bool,
         arrangement: &PaneArrangement,
         can_split_directory: bool,
+        previous: Option<previous_pane::Target>,
     ) -> Vec<MenuItem> {
         let can_paste = matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live)) if !live.read_only.get());
         let player = self.tabs.active().and_then(|tab| match &tab.page {
@@ -2919,9 +2983,26 @@ impl TerminalApp {
                 "Command palette…",
                 KeyAction::CommandPalette,
             ),
-            self.pane_menu(can_restart, arrangement, can_split_directory),
+            self.pane_menu(
+                can_restart,
+                arrangement,
+                can_split_directory,
+                previous.is_some(),
+            ),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.duplicate_tab_item(),
+            self.binding_menu_enabled(
+                "move-tab-left",
+                "Move tab left",
+                KeyAction::MoveTabLeft,
+                self.tabs.can_move_active_tab(Direction::Left),
+            ),
+            self.binding_menu_enabled(
+                "move-tab-right",
+                "Move tab right",
+                KeyAction::MoveTabRight,
+                self.tabs.can_move_active_tab(Direction::Right),
+            ),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             self.binding_menu(
                 "find-all-panes",
@@ -3070,9 +3151,21 @@ impl TerminalApp {
         can_restart: bool,
         arrangement: &PaneArrangement,
         can_split_directory: bool,
+        can_focus_previous: bool,
     ) -> MenuItem {
+        let binding = KeyAction::FocusPreviousPane.binding();
+        let previous_item = self.binding_menu_enabled(
+            binding.id,
+            binding.label,
+            binding.action,
+            can_focus_previous,
+        );
         if self.tabs.active().and_then(AppTab::pane_id).is_none() {
-            return MenuItem::disabled("panes", "Panes");
+            return if can_focus_previous {
+                MenuItem::submenu("panes", "Panes", [previous_item])
+            } else {
+                MenuItem::disabled("panes", "Panes")
+            };
         }
         let action = KeyAction::MovePaneToExistingTab;
         let binding = action.binding();
@@ -3198,6 +3291,7 @@ impl TerminalApp {
             KeyAction::RotateSplit,
             arrangement.rotation.is_some(),
         ));
+        items.push(previous_item);
         if self
             .tabs
             .active_layout()
@@ -3300,6 +3394,12 @@ impl TerminalApp {
             (Field::Host, "Host", &draft.host, "example.com"),
             (Field::User, "User", &draft.user, "root"),
             (Field::Port, "Port", &draft.port, "22"),
+            (
+                Field::HostKeyAlias,
+                "Host key alias (optional)",
+                &draft.host_key_alias,
+                "Name used to verify this server in known_hosts",
+            ),
         ] {
             fields.push(
                 StackPanel::new().spacing(5.0).children((
@@ -4002,6 +4102,14 @@ impl Component for TerminalApp {
                     .err()
                     .map(|error| format!("Couldn’t duplicate tab layout. {error:#}"));
             }
+            Message::MoveTab(group, direction) => {
+                if self.tabs.active_group_id() == Some(group)
+                    && self.tabs.move_active_tab(direction)
+                {
+                    self.sync_selection(context);
+                    self.refresh_open_commands();
+                }
+            }
             Message::WindowTick => self.window_tick(context),
             Message::TransferReady(id) => self.offer_group(id, context),
             Message::TransferClaim(id) => self.claim_group(id, context),
@@ -4608,6 +4716,7 @@ impl Component for TerminalApp {
                     self.frame_tasks.remove(&id);
                     let active = self.tabs.active_id() == Some(id);
                     let mut pane_actions_changed = false;
+                    let mut discovery_changed = false;
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -4665,6 +4774,7 @@ impl Component for TerminalApp {
                         }
                         let phase = tab.session.durable_state().map(|s| s.phase);
                         if tab.durable_phase != phase {
+                            discovery_changed = tab.discovery_page.is_some();
                             tab.durable_phase = phase;
                             tab.confirm_end = false;
                             self.header.borrow_mut().take();
@@ -4672,10 +4782,14 @@ impl Component for TerminalApp {
                         }
                     }
                     if active {
-                        self.refresh_copy_mode(id);
+                        // A durable session browser can become the live shell in place.
+                        if discovery_changed {
+                            self.tabs.record_pane_focus(AppTab::visited_terminal);
+                        }
+                        self.refresh_copy_mode(id, context);
                         self.connection_ui(id);
                     }
-                    if pane_actions_changed {
+                    if pane_actions_changed || discovery_changed {
                         self.refresh_open_commands();
                     }
                     if let Some(AppTab {
@@ -4718,6 +4832,11 @@ impl Component for TerminalApp {
                 let _ = context.window().request_close();
             }
             Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::FocusPreviousPane(target) => {
+                if previous_pane::target(&self.tabs) == Some(target) {
+                    self.focus_previous_pane(target, context);
+                }
+            }
             Message::SetPaneReadOnly(enabled) => {
                 if let Some(id) = self.tabs.active_id()
                     && let Some(AppTab {
@@ -4829,7 +4948,11 @@ impl Component for TerminalApp {
                     self.close_tab(id, context);
                 }
             }
-            Message::Reorder(order, selected) => {
+            Message::Reorder(order, selected, epoch) => {
+                // A delayed drag event belongs to the header order it was rendered with.
+                if self.selection_pending || epoch != self.selection_epoch {
+                    return;
+                }
                 if let Some(ids) = order
                     .iter()
                     .map(|id| id.parse().ok())
@@ -4843,6 +4966,8 @@ impl Component for TerminalApp {
                     self.sync_selection(context);
                     if changed {
                         self.activate(context);
+                    } else {
+                        self.refresh_open_commands();
                     }
                 }
             }
@@ -4884,6 +5009,11 @@ impl Component for TerminalApp {
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)
                 }
+                Shortcut::FocusPreviousPane => {
+                    if let Some(target) = previous_pane::target(&self.tabs) {
+                        self.focus_previous_pane(target, context);
+                    }
+                }
                 Shortcut::ZoomPane => self.update(Message::ZoomPane, context),
                 Shortcut::ClosePane => self.update(Message::ClosePane, context),
                 Shortcut::MovePane => self.update(Message::MovePaneToTab, context),
@@ -4906,6 +5036,7 @@ impl Component for TerminalApp {
                 Shortcut::CaretPresentationChanged => {
                     self.caret_interval = crate::cursor_blink::system_interval();
                 }
+                Shortcut::DrawerFocusChanged => {}
                 Shortcut::RememberWindow => {
                     if let Some(name) = &self.window_profile {
                         let _ = self.windows.borrow_mut().remember(name);
@@ -4950,10 +5081,11 @@ impl Component for TerminalApp {
                     self.default_profile.clone(),
                     context,
                 ),
-                Shortcut::DuplicateTabLayout => {
-                    if let Some(group) = self.tabs.active_group_id() {
-                        self.update(Message::DuplicateTabLayout(group), context);
-                    }
+                Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
+                    self.update(
+                        bind_tab_action(Message::Shortcut(shortcut), self.tabs.active_group_id()),
+                        context,
+                    );
                 }
                 Shortcut::CloseTab => {
                     if let Some(id) = self.tabs.active_id() {
@@ -5069,6 +5201,9 @@ impl Component for TerminalApp {
             Message::PasteRaw => self.paste(true, context),
             Message::CopyResult(pane, request, result) => {
                 self.finish_keyboard_copy(pane, request, result)
+            }
+            Message::CopyWordResult(pane, request, point) => {
+                self.finish_copy_word(pane, request, point, context)
             }
             Message::Clipboard(action) => self.clipboard_action(action, context),
             Message::MultilinePasteWarning(mode, checked) => {
@@ -5302,6 +5437,7 @@ impl Component for TerminalApp {
                         Field::CustomTerminal => &mut draft.custom_terminal,
                         Field::Identity => &mut draft.identity,
                         Field::Fingerprint => &mut draft.fingerprint,
+                        Field::HostKeyAlias => &mut draft.host_key_alias,
                     };
                     let changed = *target != text;
                     *target = text;
@@ -6166,7 +6302,7 @@ impl TerminalApp {
                     panic!()
                 };
                 let prompts = tab.session.prompts.clone();
-                context.spawn_background(move |_|{let question=if step==0{Question::HostKey{host:"loopback.test".into(),port:22,algorithm:"ssh-ed25519".into(),fingerprint:"SHA256:test-fingerprint".into()}}else{Question::Authentication{name:"MFA test".into(),instructions:"Isolated native prompt test".into(),challenges:vec![Challenge{label:"Account".into(),echo:true},Challenge{label:"Password".into(),echo:false}]}};
+                context.spawn_background(move |_|{let question=if step==0{Question::HostKey{host:"loopback.test".into(),port:22,host_key_alias:None,algorithm:"ssh-ed25519".into(),fingerprint:"SHA256:test-fingerprint".into()}}else{Question::Authentication{name:"MFA test".into(),instructions:"Isolated native prompt test".into(),challenges:vec![Challenge{label:"Account".into(),echo:true},Challenge{label:"Password".into(),echo:false}]}};
                     let answer=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(prompts.ask(question)).unwrap();
                     if step==0{assert!(matches!(answer,Answer::Trust(true)));}else{assert!(matches!(answer,Answer::Authentication(ref v)if v.len()==2&&v[0].as_str()=="pilot"&&v[1].as_str()=="secret"));}Message::Smoke(step+2)
                 });
@@ -6506,6 +6642,24 @@ mod profile_ui_tests {
             Message::ControlIdle
         ));
     }
+
+    #[test]
+    fn move_tab_commands_keep_the_group_of_the_invoking_menu_or_key() {
+        for (action, direction) in [
+            (KeyAction::MoveTabLeft, Direction::Left),
+            (KeyAction::MoveTabRight, Direction::Right),
+        ] {
+            let label = format!("{}    F8", action.binding().label);
+            for event in [tab_menu_message(label), Message::Shortcut(action.into())] {
+                assert!(matches!(bind_tab_action(event, Some(42)),
+                    Message::MoveTab(42, dir) if dir == direction));
+            }
+            assert!(matches!(
+                bind_tab_action(Message::Shortcut(action.into()), None),
+                Message::ControlIdle
+            ));
+        }
+    }
     #[test]
     fn pane_menu_dispatch_preserves_profile_names_and_ignores_shortcut_labels() {
         for label in [
@@ -6548,6 +6702,10 @@ mod profile_ui_tests {
     }
     #[test]
     fn existing_profiles_prefill_all_authentication_modes_and_preferences() {
+        let mut fresh = ProfileDraft::default();
+        assert!(fresh.host_key_alias().is_none());
+        fresh.host_key_alias = "  TeSt.Example  ".into();
+        assert_eq!(fresh.host_key_alias().as_deref(), Some("test.example"));
         for (expected, authentication) in [
             (0, Authentication::Agent),
             (
@@ -6569,6 +6727,7 @@ mod profile_ui_tests {
                 port: 6792,
                 authentication,
                 host_key: Some("SHA256:test".into()),
+                host_key_alias: Some("cockpit.example".into()),
                 proxy_jump: Vec::new(),
                 local_forwards: Vec::new(),
                 durable: false,
@@ -6584,6 +6743,8 @@ mod profile_ui_tests {
             assert_eq!(draft.scrollback_lines, "0");
             assert_eq!(draft.color_scheme, ColorScheme::OneHalfLight);
             assert_eq!(draft.fingerprint, "SHA256:test");
+            assert_eq!(draft.host, "test.invalid");
+            assert_eq!(draft.host_key_alias, "cockpit.example");
             assert!(draft.player.mute && draft.player.game_mode);
             assert_eq!(draft.name, "existing");
         }

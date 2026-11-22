@@ -72,7 +72,7 @@ impl Store {
         epoch: &FolderEpoch,
         token: String,
     ) -> Result<Self> {
-        let binding = serde_json::to_vec(&(
+        let peer = (
             epoch.catalog(),
             &auth.profile,
             &auth.host,
@@ -80,7 +80,12 @@ impl Store {
             auth.port,
             &auth.fingerprint,
             &token,
-        ))?;
+        );
+        // Keep the exact on-disk lookup key for existing profiles without aliases.
+        let binding = match &auth.host_key_alias {
+            Some(alias) => serde_json::to_vec(&(peer, alias))?,
+            None => serde_json::to_vec(&peer)?,
+        };
         let hash = bytes::Bytes::copy_from_slice(&Sha256::digest(binding));
         Ok(Self {
             path: scope
@@ -249,6 +254,7 @@ mod tests {
             Authority {
                 profile: "test".into(),
                 host: "example.test".into(),
+                host_key_alias: None,
                 user: "pilot".into(),
                 port: 22,
                 fingerprint: "SHA256:test".into(),
@@ -449,6 +455,66 @@ mod tests {
         let (_, profile) = catalog.inspect_catalog(&scope.profile)?;
         catalog.revoke_folder_permissions(&profile, &scope.store_dir)?;
         assert!(store.set_auto_mount(&replacement, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn host_key_alias_edits_require_new_folder_consent_on_the_same_verified_endpoint() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let (scope, auth) = fixture(dir.path());
+        let store = Store::for_profile(&scope, &auth, true)?.unwrap();
+        let first = grant(dir.path().join("sprites"), 1);
+        store.add(first.clone())?;
+        let catalog = ProfileStore::new(scope.catalog.clone())?;
+        let read_catalog = || -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&std::fs::read(&scope.catalog)?)?)
+        };
+        let (_, before) = catalog.inspect("test")?;
+        let mut options = before.options.clone();
+        options.host_key_alias = Some("tenant-a".into());
+        catalog.edit("test", "test", &options, &before.options)?;
+        let (_, saved) = catalog.inspect("test")?;
+        assert_eq!(saved.options, options);
+        let raw = read_catalog()?;
+        assert_eq!(raw["profiles"]["test"]["custom"], 3);
+        assert!(raw["profiles"]["test"].get("folder_share_id").is_none());
+        assert!(store.set_auto_mount(&first, false).is_err());
+        assert!(Store::for_profile(&scope, &auth, true).is_err());
+        let tenant_a = Authority {
+            host_key_alias: options.host_key_alias.clone(),
+            ..auth.clone()
+        };
+        assert!(Store::for_profile(&scope, &tenant_a, false)?.is_none());
+        let allowed = Store::for_profile(&scope, &tenant_a, true)?.unwrap();
+        allowed.add(first.clone())?;
+
+        // A hand edit can keep the token. The persisted grant still belongs only to tenant-a.
+        let mut raw = read_catalog()?;
+        raw["profiles"]["test"]["host_key_alias"] = "tenant-b".into();
+        std::fs::write(&scope.catalog, serde_json::to_vec(&raw)?)?;
+        let tenant_b = Authority {
+            host_key_alias: Some("tenant-b".into()),
+            ..auth.clone()
+        };
+        assert!(
+            Store::for_profile(&scope, &tenant_b, false)?
+                .unwrap()
+                .read()?
+                .is_empty()
+        );
+        assert!(allowed.remove(&first).is_err());
+
+        let (_, edited) = catalog.inspect("test")?;
+        catalog.edit("test", "test", &before.options, &edited.options)?;
+        let (_, cleared) = catalog.inspect("test")?;
+        assert_eq!(cleared.options, before.options);
+        assert!(
+            read_catalog()?["profiles"]["test"]
+                .get("host_key_alias")
+                .is_none()
+        );
+        assert!(Store::for_profile(&scope, &auth, false)?.is_none());
         Ok(())
     }
 

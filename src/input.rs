@@ -11,6 +11,7 @@ use w11term::{
     terminal::{FrameStore, KeyDetails, KeypadKey},
 };
 use wezterm_term::{KeyCode, KeyModifiers};
+mod drawer_focus;
 pub(crate) mod ime;
 use windows::Win32::{
     Foundation::*,
@@ -76,6 +77,11 @@ struct State {
     wheel_remainder: i32,
     zoom_remainder: i32,
     modal: bool,
+    drawer_pane: Option<u64>,
+    drawer_focused: bool,
+    // Native buttons can close their drawer before key-up or the translated WM_CHAR.
+    drawer_keys: HashSet<KeySlot>,
+    drawer_late_char: Option<KeySlot>,
     game_mode: bool,
     close_handler: Option<Box<dyn Fn()>>,
 }
@@ -147,8 +153,11 @@ pub enum Shortcut {
     BeginResize,
     TaskbarCreated,
     CaretPresentationChanged,
+    DrawerFocusChanged,
     NextTab,
     PreviousTab,
+    MoveTabLeft,
+    MoveTabRight,
     NewTab,
     DuplicateTabLayout,
     CloseTab,
@@ -157,6 +166,7 @@ pub enum Shortcut {
     SplitRightInCurrentDirectory,
     SplitBelowInCurrentDirectory,
     FocusPane(Direction),
+    FocusPreviousPane,
     ResizePane(Direction),
     SwapPane(Direction),
     ZoomPane,
@@ -194,6 +204,7 @@ pub enum Shortcut {
 
 pub struct KeyboardBridge {
     scope: WindowScope,
+    drawer_watch: RefCell<Option<drawer_focus::Watch>>,
     bootstrap: String,
     _hooks: std::rc::Rc<ThreadHooks>,
 }
@@ -275,6 +286,7 @@ impl KeyboardBridge {
         with_input_mut(|input| *input = Some(State::new(shortcut)));
         Ok(Self {
             scope,
+            drawer_watch: RefCell::default(),
             bootstrap: format!("w11term-window-{:032x}", rand::random::<u128>()),
             _hooks: window::install_hooks()?,
         })
@@ -492,6 +504,57 @@ impl KeyboardBridge {
             ime::sync_context();
         }
     }
+
+    pub fn watch_file_drawer(&self, pane: Option<u64>) {
+        let _native = self.scope.enter();
+        let hwnd = self.hwnd();
+        if pane.is_some() && hwnd.is_none() {
+            return;
+        }
+        let changed = with_input_mut(|s| {
+            let Some(s) = s else { return false };
+            if s.drawer_pane == pane {
+                return false;
+            }
+            s.drawer_pane = pane;
+            s.set_drawer_focus(false);
+            true
+        });
+        if !changed {
+            return;
+        }
+        self.drawer_watch.borrow_mut().take();
+        if let (Some(pane), Some(hwnd)) = (pane, hwnd) {
+            match drawer_focus::Watch::new(pane, hwnd.0 as usize) {
+                Ok(watch) => *self.drawer_watch.borrow_mut() = Some(watch),
+                Err(error) => {
+                    log::warn!("Tracking SFTP drawer focus: {error}");
+                    notify_drawer_focus(hwnd.0 as usize, pane, true);
+                }
+            }
+        }
+        ime::sync_context();
+    }
+
+    pub fn return_from_drawer(&self) {
+        let _native = self.scope.enter();
+        if with_input_mut(|s| s.as_mut().is_some_and(|s| s.set_drawer_focus(false))) {
+            ime::sync_context();
+        }
+    }
+
+    pub fn finish_drawer_edit(&self) {
+        // The terminal canvas receives keyboard input on its window, outside
+        // XAML's tab order. Move focus there before removing the focused edit;
+        // otherwise WinUI automatically focuses the next drawer control.
+        if let Some(hwnd) = self.hwnd() {
+            let child = unsafe { GetFocus() };
+            if child != hwnd && unsafe { GetAncestor(child, GA_ROOT) } == hwnd {
+                let _ = unsafe { SetFocus(Some(hwnd)) };
+            }
+        }
+        self.return_from_drawer();
+    }
     pub fn on_close(&self, handler: impl Fn() + 'static) {
         let _native = self.scope.enter();
         with_input(|state| {
@@ -560,11 +623,29 @@ impl KeyboardBridge {
 impl Drop for KeyboardBridge {
     fn drop(&mut self) {
         let _guard = self.scope.enter();
+        self.drawer_watch.get_mut().take();
         ime::uninstall();
         if let Some(mut state) = with_input_mut(Option::take) {
             state.release_keys();
         }
         self.scope.remove();
+    }
+}
+
+fn notify_drawer_focus(hwnd: usize, pane: u64, focused: bool) {
+    let Some(scope) = WindowScope::for_window(HWND(hwnd as *mut _)) else {
+        return;
+    };
+    let _native = scope.enter();
+    let changed = with_input(|input| {
+        input.try_borrow_mut().ok().is_some_and(|mut input| {
+            input
+                .as_mut()
+                .is_some_and(|s| s.drawer_pane == Some(pane) && s.set_drawer_focus(focused))
+        })
+    });
+    if changed {
+        ime::sync_context();
     }
 }
 
@@ -1009,6 +1090,10 @@ impl State {
             wheel_remainder: 0,
             zoom_remainder: 0,
             modal: false,
+            drawer_pane: None,
+            drawer_focused: false,
+            drawer_keys: HashSet::new(),
+            drawer_late_char: None,
             game_mode: false,
             close_handler: None,
         }
@@ -1059,10 +1144,27 @@ impl State {
     fn terminal_focused(&self) -> bool {
         window::active()
             && !self.search
+            && !self.drawer_focused
             && !self.modal
             && !self.switcher
             && self.picker.is_none()
             && self.local_mode.is_none()
+    }
+
+    fn set_drawer_focus(&mut self, focused: bool) -> bool {
+        if self.drawer_focused == focused {
+            return false;
+        }
+        self.drawer_focused = focused;
+        if focused {
+            ime::cancel();
+            self.local_held
+                .extend(self.pressed.keys().map(|&slot| (slot, false)));
+            self.release_keys();
+        }
+        self.report_focus();
+        (self.shortcut)(Shortcut::DrawerFocusChanged);
+        true
     }
     fn report_focus(&self) {
         if let Some(target) = &self.target {
@@ -1096,6 +1198,31 @@ impl State {
             (None, Some(position)) => KeySlot::PrintableScan(position),
             (None, None) => KeySlot::Virtual(vk),
         };
+        if !self.drawer_keys.is_empty() || self.drawer_late_char.is_some() {
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) == 0 => {
+                    self.drawer_late_char = None;
+                    self.drawer_keys.remove(&slot);
+                }
+                WM_KEYUP | WM_SYSKEYUP if self.drawer_keys.remove(&slot) => {
+                    self.drawer_late_char = matches!(vk, 0x09 | 0x0d | 0x20).then_some(slot);
+                    return false;
+                }
+                WM_CHAR | WM_SYSCHAR if self.drawer_late_char == Some(slot) => {
+                    self.drawer_late_char = None;
+                    return false;
+                }
+                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR | WM_KEYDOWN
+                | WM_SYSKEYDOWN
+                    if self.drawer_keys.contains(&slot) =>
+                {
+                    // Deliver the native press, character, and release as one unit,
+                    // including when an activation closes the drawer on key-down.
+                    return false;
+                }
+                _ => {}
+            }
+        }
         if let Some(held) = self.held_resize
             && held.key == slot
         {
@@ -1104,6 +1231,7 @@ impl State {
                     if let Some((required, direction)) = held.repeat
                         && self.target.is_some()
                         && !self.modal
+                        && !self.drawer_focused
                         && self.local_mode.is_none()
                         && self.picker.is_none()
                         && !self.switcher
@@ -1297,7 +1425,7 @@ impl State {
             return true;
         }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-            if self.target.is_some() || self.search {
+            if (self.target.is_some() && !self.drawer_focused) || self.search {
                 let find = if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x46
                 {
                     Some(Shortcut::Find)
@@ -1321,7 +1449,12 @@ impl State {
             let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
             let shortcut = self
                 .keymap
-                .resolve(vk, mods, self.target.is_some() && !self.search, right_alt)
+                .resolve(
+                    vk,
+                    mods,
+                    self.target.is_some() && !self.search && !self.drawer_focused,
+                    right_alt,
+                )
                 .map(Shortcut::from);
             if let Some(shortcut) = shortcut {
                 if matches!(shortcut, Shortcut::NextTab | Shortcut::PreviousTab)
@@ -1368,6 +1501,12 @@ impl State {
                 }
                 return true;
             }
+        }
+        if self.drawer_focused && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL) {
+            if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                self.drawer_keys.insert(slot);
+            }
+            return false;
         }
         if self.search && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL) {
             return false;
@@ -1566,7 +1705,12 @@ impl State {
         }
     }
     fn wheel(&mut self, delta: i16, mods: KeyModifiers) -> bool {
-        if self.modal || self.switcher || self.picker.is_some() || self.local_mode.is_some() {
+        if self.modal
+            || self.switcher
+            || self.picker.is_some()
+            || self.local_mode.is_some()
+            || (self.drawer_pane.is_some() && self.wheel_panes.hovered.is_none())
+        {
             return false;
         }
         let Some(target) = &self.target else {
@@ -1619,6 +1763,7 @@ impl From<Action> for Shortcut {
             Action::FocusRight => Self::FocusPane(Direction::Right),
             Action::FocusUp => Self::FocusPane(Direction::Up),
             Action::FocusDown => Self::FocusPane(Direction::Down),
+            Action::FocusPreviousPane => Self::FocusPreviousPane,
             Action::ResizeLeft => Self::ResizePane(Direction::Left),
             Action::ResizeRight => Self::ResizePane(Direction::Right),
             Action::ResizeUp => Self::ResizePane(Direction::Up),
@@ -1645,6 +1790,8 @@ impl From<Action> for Shortcut {
             Action::ClearScrollback => Self::ClearScrollback,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
+            Action::MoveTabLeft => Self::MoveTabLeft,
+            Action::MoveTabRight => Self::MoveTabRight,
             Action::NewTab => Self::NewTab,
             Action::DuplicateTabLayout => Self::DuplicateTabLayout,
             Action::CloseTab => Self::CloseTab,
@@ -2083,6 +2230,45 @@ mod tests {
     }
 
     #[test]
+    fn held_tab_reorder_chords_move_once_and_stay_out_of_the_terminal() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::MoveTabLeft, Some("F7".parse().unwrap()))
+            .unwrap();
+        bindings
+            .set(Action::MoveTabRight, Some("F8".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            keymap: bindings.keymap().unwrap(),
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        for vk in [0x76, 0x77] {
+            for (message, repeat) in [(WM_KEYDOWN, false), (WM_KEYDOWN, true), (WM_KEYUP, false)] {
+                assert!(state.handle(&MSG {
+                    message,
+                    wParam: WPARAM(vk),
+                    lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+                    ..Default::default()
+                }));
+            }
+            state.target = None; // The second key is dispatched from a utility tab.
+        }
+        assert_eq!(
+            *actions.borrow(),
+            [Shortcut::MoveTabLeft, Shortcut::MoveTabRight]
+        );
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
     fn remapped_palette_owns_navigation_before_the_overlay_mounts_and_after_accept() {
         let lab = Session::start(Source::Demo);
         let (sender, mut input) = mpsc::unbounded_channel();
@@ -2294,6 +2480,65 @@ mod tests {
             }));
             assert!(matches!(pending.try_recv().unwrap(), Command::Text(s) if s == "x"));
         });
+    }
+
+    #[test]
+    fn drawer_focus_keeps_native_activation_local_and_preserves_global_shortcuts() {
+        let _guard = WindowScope::default().enter();
+        window::activated(true);
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut shortcuts = Shortcuts::default();
+        shortcuts
+            .set(Action::CommandPalette, Some("F7".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            keymap: shortcuts.keymap().unwrap(),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        let key = |message, vk, scan: usize| MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM((scan << 16) as isize),
+            ..Default::default()
+        };
+        assert!(state.handle(&key(WM_KEYDOWN, 0x25, 0)));
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            Command::Key { down: true, .. }
+        ));
+        assert!(state.set_drawer_focus(true));
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            Command::Key { down: false, .. }
+        ));
+        assert!(matches!(input.try_recv().unwrap(), Command::Focus(false)));
+        assert!(state.handle(&key(WM_KEYUP, 0x25, 0)));
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x20, 0x39)));
+        assert!(state.set_drawer_focus(false));
+        assert!(matches!(input.try_recv().unwrap(), Command::Focus(true)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x20, 0x39)));
+        assert!(!state.handle(&key(WM_CHAR, 0x20, 0x39)));
+        assert!(input.try_recv().is_err());
+        assert!(state.handle(&key(WM_KEYDOWN, 0x20, 0x39)));
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            Command::Key { down: true, .. }
+        ));
+        assert!(state.handle(&key(WM_KEYUP, 0x20, 0x39)));
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            Command::Key { down: false, .. }
+        ));
+        assert!(state.set_drawer_focus(true));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x76, 0)));
+        assert!(actions.borrow().contains(&Shortcut::CommandPalette));
     }
 
     #[test]

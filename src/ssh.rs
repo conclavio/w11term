@@ -7,6 +7,7 @@ mod game_resume;
 mod herdr;
 mod known_hosts;
 mod local_forward;
+mod negotiation;
 mod sharing;
 mod transport;
 pub(crate) use durability::DurableControl;

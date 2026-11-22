@@ -241,6 +241,12 @@ pub struct SshOptions {
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_host_key_alias"
+    )]
+    pub host_key_alias: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_jump: Vec<JumpHost>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -262,6 +268,12 @@ pub struct JumpHost {
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_host_key_alias"
+    )]
+    pub host_key_alias: Option<String>,
 }
 
 impl From<JumpHost> for SshOptions {
@@ -275,6 +287,7 @@ impl From<JumpHost> for SshOptions {
             color_scheme: ColorScheme::default(),
             authentication: hop.authentication,
             host_key: hop.host_key,
+            host_key_alias: hop.host_key_alias,
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             durable: false,
@@ -283,13 +296,46 @@ impl From<JumpHost> for SshOptions {
     }
 }
 
+/// A single literal lookup name that is safe to write to an OpenSSH known_hosts file.
+pub fn validate_host_key_alias(alias: &str) -> Result<()> {
+    // OpenSSH host patterns recognize only * and ? as wildcards. Brackets,
+    // colons and internal punctuation remain literal, including in [host]:port.
+    ensure!(
+        !alias.is_empty()
+            && !alias.starts_with(['!', '@', '#', '|'])
+            && !alias
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || "*,?".contains(c)),
+        "HostKeyAlias must be a single literal known_hosts name"
+    );
+    Ok(())
+}
+
+pub(crate) fn deserialize_host_key_alias<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let mut alias = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &mut alias {
+        validate_host_key_alias(value).map_err(serde::de::Error::custom)?;
+        value.make_ascii_lowercase();
+    }
+    Ok(alias)
+}
+
 impl SshOptions {
     pub(crate) fn validate_route(&self) -> Result<()> {
         ensure!(
             self.proxy_jump.len() <= MAX_JUMPS,
             "at most {MAX_JUMPS} SSH jump hosts are supported"
         );
+        if let Some(alias) = &self.host_key_alias {
+            validate_host_key_alias(alias)?;
+        }
         for hop in &self.proxy_jump {
+            if let Some(alias) = &hop.host_key_alias {
+                validate_host_key_alias(alias)
+                    .with_context(|| format!("jump host {}", hop.host))?;
+            }
             ensure!(
                 !hop.host.trim().is_empty() && !hop.user.trim().is_empty() && hop.port != 0,
                 "an SSH jump host requires a host, user and port"
@@ -528,6 +574,7 @@ impl Options {
         let mut port = None;
         let mut authentication = None;
         let mut host_key = None;
+        let mut host_key_alias = None;
         let mut benchmark = false;
         let mut smoke_seconds = None;
         let mut extra_profiles = Vec::new();
@@ -541,7 +588,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -586,6 +633,7 @@ impl Options {
                         color_scheme: ColorScheme::default(),
                         authentication: Authentication::Agent,
                         host_key: None,
+                        host_key_alias: None,
                         proxy_jump: Vec::new(),
                         local_forwards: Vec::new(),
                         durable: false,
@@ -618,6 +666,11 @@ impl Options {
                     });
                 }
                 "--host-key" => host_key = Some(value(&mut args, &arg)?),
+                "--host-key-alias" => {
+                    let alias = value(&mut args, &arg)?;
+                    validate_host_key_alias(&alias)?;
+                    host_key_alias = Some(alias.to_ascii_lowercase());
+                }
                 _ => bail!("unknown argument: {arg}; use --help"),
             }
         }
@@ -648,9 +701,11 @@ impl Options {
             }
             return Ok(None);
         }
-        let initial_profile = profile
-            .clone()
-            .filter(|_| port.is_none() && authentication.is_none() && host_key.is_none());
+        let ssh_override = port.is_some()
+            || authentication.is_some()
+            || host_key.is_some()
+            || host_key_alias.is_some();
+        let initial_profile = profile.clone().filter(|_| !ssh_override);
         if !extra_profiles.is_empty() {
             let profiles = load_profiles(&profiles_path)?;
             for name in &extra_profiles {
@@ -672,10 +727,13 @@ impl Options {
             if let Some(host_key) = host_key {
                 ssh.host_key = Some(host_key);
             }
+            if let Some(alias) = host_key_alias {
+                ssh.host_key_alias = Some(alias);
+            }
             ensure!(ssh.port != 0, "SSH port must be nonzero");
         } else {
             ensure!(
-                port.is_none() && authentication.is_none() && host_key.is_none(),
+                !ssh_override,
                 "SSH options require ssh user@host or --profile NAME"
             );
         }
@@ -736,6 +794,117 @@ fn value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_key_alias_is_one_literal_identity_on_the_destination_or_each_hop() {
+        for valid in [
+            "router",
+            "MiXeD.example.",
+            "127.0.0.1",
+            "fe80::1%12",
+            "[2001:db8::1]:2222",
+            "[host]:22",
+            "[::1]",
+            "route+name=3",
+            "cluster@blue!node#3|old",
+            "[legacy]:blue",
+            "%h-%p",
+            "none",
+        ] {
+            assert!(validate_host_key_alias(valid).is_ok(), "{valid:?}");
+        }
+        for bad in [
+            "",
+            "prefix,suffix",
+            "@revoked",
+            "#comment",
+            "|1|hash",
+            "!inverse",
+            "wild*card",
+            "wild?",
+            "a b",
+            "a\nb",
+            "a\0b",
+        ] {
+            assert!(validate_host_key_alias(bad).is_err(), "{bad:?}");
+        }
+        let ssh = serde_json::json!({"host":"127.0.0.1","user":"pilot","auth":"none"});
+        let parse = |value: serde_json::Value| {
+            parse_profiles(
+                &serde_json::to_vec(&serde_json::json!({"profiles":{"test":value}})).unwrap(),
+                Path::new("profiles.json"),
+            )
+        };
+        let old = parse(ssh.clone()).unwrap();
+        assert!(old.profiles["test"].host_key_alias.is_none());
+        assert!(
+            serde_json::to_value(&old.profiles["test"])
+                .unwrap()
+                .get("host_key_alias")
+                .is_none()
+        );
+        let mut dest = ssh.clone();
+        dest["host_key_alias"] = "Cockpit".into();
+        let mut hop = ssh;
+        hop["host_key_alias"] = "[GATE]:2202".into();
+        dest["proxy_jump"] = serde_json::json!([hop]);
+        let document = parse(dest.clone()).unwrap();
+        let options = &document.profiles["test"];
+        assert_eq!(options.host_key_alias.as_deref(), Some("cockpit"));
+        assert_eq!(
+            SshOptions::from(options.proxy_jump[0].clone())
+                .host_key_alias
+                .as_deref(),
+            Some("[gate]:2202")
+        );
+        dest["proxy_jump"][0]["host_key_alias"] = "*.example.com".into();
+        assert!(parse(dest.clone()).is_err());
+        dest["proxy_jump"] = serde_json::json!([]);
+        dest["host_key_alias"] = "!host".into();
+        assert!(parse(dest).is_err());
+    }
+
+    #[test]
+    fn host_key_alias_cli_preserves_endpoint_and_makes_profile_override_ad_hoc() {
+        let parse = |args: &[&str]| Options::parse_from(args.iter().map(|s| s.to_string()));
+        let launch = parse(&[
+            "ssh",
+            "pilot@localhost",
+            "--port",
+            "2200",
+            "--host-key-alias",
+            "DEV",
+        ])
+        .unwrap()
+        .unwrap();
+        let Source::Ssh(ssh) = launch.source else {
+            panic!("expected SSH")
+        };
+        assert_eq!(
+            (ssh.host.as_str(), ssh.port, ssh.host_key_alias.as_deref()),
+            ("localhost", 2200, Some("dev"))
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profiles.json");
+        std::fs::write(&path, r#"{"profiles":{"pilot":{"host":"localhost","user":"pilot","auth":"none","host_key_alias":"old"}}}"#).unwrap();
+        let launch = parse(&[
+            "--profiles",
+            path.to_str().unwrap(),
+            "--profile",
+            "pilot",
+            "--host-key-alias",
+            "[work]:2233",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(launch.initial_profile.is_none());
+        let Source::Ssh(ssh) = launch.source else {
+            panic!("expected SSH")
+        };
+        assert_eq!(ssh.host_key_alias.as_deref(), Some("[work]:2233"));
+        assert!(parse(&["ssh", "pilot@localhost", "--host-key-alias", "*"]).is_err());
+        assert!(parse(&["--demo", "--host-key-alias", "work"]).is_err());
+    }
 
     #[test]
     fn normalized_menu_and_cli_orders_preserve_their_defaults_without_an_explicit_order() {

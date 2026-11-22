@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandId {
     Menu(String),
+    FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
     ClearScrollback(Option<u64>),
     PaneColorScheme(u64, ColorScheme),
@@ -11,7 +12,7 @@ pub enum CommandId {
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
-    DuplicateTabLayout(Option<TabId>),
+    TabAction(Shortcut, Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
     SplitInDirectory(Axis, Option<directory_split::Origin>),
@@ -135,8 +136,14 @@ impl TerminalApp {
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
+        let previous = previous_pane::target(&self.tabs);
         menu_rows(
-            self.caret_items(exited.is_some(), &arrangement, directory_split.is_some()),
+            self.caret_items(
+                exited.is_some(),
+                &arrangement,
+                directory_split.is_some(),
+                previous,
+            ),
             false,
             &mut rows,
         );
@@ -223,16 +230,20 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                Shortcut::FocusPreviousPane => {
+                    row.enabled = previous.is_some();
+                    row.id = CommandId::FocusPreviousPane(previous);
+                }
                 shortcut if let Some(axis) = directory_split::axis(shortcut) => {
                     row.id = CommandId::SplitInDirectory(axis, directory_split.clone());
                 }
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
                 }
-                Shortcut::DuplicateTabLayout => {
+                Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
                     // A click queued on this row must keep its original tab even
                     // when a control client switches tabs before we receive it.
-                    row.id = CommandId::DuplicateTabLayout(self.tabs.active_group_id());
+                    row.id = CommandId::TabAction(shortcut, self.tabs.active_group_id());
                 }
                 Shortcut::SwapPane(direction) => {
                     if let Some(target) = arrangement.get(direction) {
@@ -305,6 +316,7 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
             CommandId::LocalForward(origin) => local_forwards::open(origin),
             CommandId::SplitInDirectory(axis, target) => {
@@ -313,8 +325,8 @@ impl TerminalApp {
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
             }
-            CommandId::DuplicateTabLayout(group) => {
-                bind_tab_action(Message::Shortcut(Shortcut::DuplicateTabLayout), group)
+            CommandId::TabAction(shortcut, group) => {
+                bind_tab_action(Message::Shortcut(shortcut), group)
             }
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
             CommandId::RotateSplit(target) => Message::RotateSplit(target),

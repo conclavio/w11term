@@ -282,6 +282,7 @@ fn options(port: u16, authentication: Authentication, pin: Option<String>) -> Ss
         port,
         authentication,
         host_key: pin,
+        host_key_alias: None,
         proxy_jump: Vec::new(),
         local_forwards: Vec::new(),
         durable: false,
@@ -587,6 +588,38 @@ async fn refused_split_channel_authenticates_independently_without_closing_origi
         2
     );
     drop((original, child));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_with_a_different_host_key_alias_logs_in_again_at_the_same_address() {
+    let actual = key();
+    let pin = actual.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (port, mut seen, server) = fixture(vec![actual]).await;
+    let mut target = options(port, Authentication::Password, Some(pin));
+    target.host_key_alias = Some("first-tenant.invalid".into());
+    let original = Session::start(Source::Ssh(target.clone()));
+    enter_password(&original).await;
+    let link = connection(&original).await;
+    assert!(link.matches(&target, None));
+    target.host_key_alias = Some("second-tenant.invalid".into());
+    let child = Session::start_configured_with_connection(
+        Source::Ssh(target),
+        Default::default(),
+        false,
+        Some(link),
+    );
+    enter_password(&child).await;
+    drop(connection(&child).await);
+    expect_echo(&child, "second-tenant").await;
+    expect_echo(&original, "first-tenant").await;
+    assert_eq!(
+        std::iter::from_fn(|| seen.try_recv().ok())
+            .filter(|e| *e == Seen::Password)
+            .count(),
+        2
+    );
+    drop((child, original));
     server.abort();
 }
 
@@ -984,6 +1017,164 @@ async fn first_trust_is_saved_known_host_skips_prompt_and_changed_key_fails() {
     assert!(prompts.current().is_none());
     assert_eq!(std::fs::read(path).unwrap(), saved);
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_trust_saves_the_literal_alias_and_reuses_it_on_a_different_port() {
+    let host_key = key();
+    let public = host_key.public_key().key_data().clone();
+    let (first_port, _first_seen, first_server) = fixture(vec![host_key.clone()]).await;
+    let (second_port, _second_seen, second_server) = fixture(vec![host_key]).await;
+    assert_ne!(first_port, second_port);
+    let directory = tempfile::tempdir().unwrap();
+    let known_hosts = directory.path().join("known_hosts");
+    let connect = |port| {
+        let mut target = options(port, Authentication::None, None);
+        target.host_key_alias = Some("FiXtUrE.example".into());
+        let prompts = Prompts::with_known_hosts(known_hosts.clone());
+        (start(target, prompts.clone()), prompts)
+    };
+    let (mut first, prompts) = connect(first_port);
+    let trust = prompt(&prompts).await;
+    assert!(
+        matches!(trust.question, Question::HostKey { host, port, host_key_alias: Some(alias), .. }
+        if host == "127.0.0.1" && port == first_port && alias.eq_ignore_ascii_case("fixture.example"))
+    );
+    prompts.answer(trust.id, Answer::Trust(true)).unwrap();
+    connected(&mut first, 1).await;
+    first
+        .input
+        .send(TransportInput::Data(b"drop".to_vec()))
+        .unwrap();
+    connected(&mut first, 2).await;
+    assert!(prompts.current().is_none());
+    first.task.abort();
+
+    let saved = std::fs::read_to_string(&known_hosts).unwrap();
+    let mut entries = saved.lines().filter(|line| !line.is_empty());
+    let (name, key) = entries.next().unwrap().split_once(' ').unwrap();
+    assert_eq!(name, "fixture.example");
+    assert_eq!(
+        russh::keys::PublicKey::from_openssh(key)
+            .unwrap()
+            .key_data(),
+        &public
+    );
+    assert!(entries.next().is_none());
+    let (mut second, prompts) = connect(second_port);
+    connected(&mut second, 1).await;
+    assert!(prompts.current().is_none());
+    assert_eq!(std::fs::read_to_string(&known_hosts).unwrap(), saved);
+    second.task.abort();
+    first_server.abort();
+    second_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the disposable stock OpenSSH guest in tests/folder-sharing"]
+async fn stock_openssh_host_certificate() -> Result<()> {
+    let port = std::env::var("W11TERM_CERT_TEST_PORT")?.parse()?;
+    let authority = std::env::var("W11TERM_CERT_TEST_CA")?;
+    let identity =
+        std::env::var_os("W11TERM_CERT_TEST_IDENTITY").expect("missing fixture identity");
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("known_hosts");
+    let record = |host: &str, alias: Option<&str>, ca: &str| {
+        let name = alias
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| format!("[{host}]:{port}"));
+        format!("@cert-authority {name} {ca}\n")
+    };
+    let connect = |host: &str, alias: Option<&str>, authentication| {
+        let mut target = options(port, authentication, None);
+        target.host = host.into();
+        target.host_key_alias = alias.map(str::to_owned);
+        target.user = "w11fixture".into();
+        target.player.reconnect = false;
+        let prompts = Prompts::with_known_hosts(path.clone());
+        (start(target, prompts.clone()), prompts)
+    };
+
+    // Stock sshd offers both the leaf and its certificate. Only the signing CA is trusted.
+    // localhost is a reachable address, but the guest certificate does not sign it.
+    for (host, alias) in [
+        ("127.0.0.1", None),
+        ("localhost", Some("Guest.W11Term.Test")),
+    ] {
+        let valid = record(host, alias, &authority);
+        std::fs::write(&path, &valid)?;
+        let (mut client, prompts) = connect(
+            host,
+            alias,
+            Authentication::Identity {
+                identity: identity.clone().into(),
+            },
+        );
+        let mut transcript = Vec::new();
+        tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                tokio::select! {
+                    _ = prompts.changed() => anyhow::bail!("unexpected prompt during certificate login: {:?}", prompts.current()),
+                    event = client.output.recv() => match event {
+                        Some(Event::Connected(1)) => {
+                            // The echoed command does not contain the expected response as a literal.
+                            client.input.send(TransportInput::Data(b"printf '\\nw11term-cert-%s\\n' \"$(id -un)\"; exit\r".to_vec()))
+                                .map_err(|_| anyhow::anyhow!("SSH input closed before the login probe"))?;
+                        }
+                        Some(Event::Data(bytes)) => transcript.extend_from_slice(&bytes),
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            client.task.await?
+        }).await??;
+        let transcript = String::from_utf8_lossy(&transcript);
+        assert!(
+            transcript
+                .lines()
+                .any(|line| line == "w11term-cert-w11fixture"),
+            "unexpected shell response: {transcript:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path)?, valid);
+    }
+
+    let other_ca = key().public_key().to_openssh()?;
+    for (host, alias, ca, expected) in [
+        (
+            "localhost",
+            None,
+            authority.as_str(),
+            "no matching principal",
+        ),
+        (
+            "127.0.0.1",
+            Some("wrong.w11term.test"),
+            authority.as_str(),
+            "no matching principal",
+        ),
+        (
+            "127.0.0.1",
+            None,
+            other_ca.as_str(),
+            "untrusted SSH host certificate",
+        ),
+    ] {
+        let saved = record(host, alias, ca);
+        std::fs::write(&path, &saved)?;
+        // A password prompt here would prove we started authentication before validating the certificate.
+        let (mut client, prompts) = connect(host, alias, Authentication::Password);
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = &mut client.task => result,
+                _ = prompts.changed() => panic!("unexpected prompt for {host}: {:?}", prompts.current()),
+            }
+        }).await??;
+        let error = result.expect_err("untrusted connection accepted");
+        assert!(format!("{error:#}").contains(expected), "{host}: {error:#}");
+        assert_eq!(std::fs::read_to_string(&path)?, saved);
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -990,6 +990,93 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
+async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let received = picker.join("receive here");
+    let conflict = picker.join("already exists");
+    fs::create_dir_all(&received).unwrap();
+    fs::create_dir_all(conflict.join("snapshot")).unwrap();
+    fs::write(received.join("neighbor.bin"), b"untouched sibling").unwrap();
+    fs::write(conflict.join("snapshot/.manifest"), b"local manifest").unwrap();
+
+    let parent = remote.path().join("shell directory");
+    let source = parent.join("snapshot");
+    fs::create_dir_all(source.join("data 雪/empty")).unwrap();
+    let data = [0, 255, 10, 13, 128, 42, 0];
+    fs::write(source.join("data 雪/trace 例.bin"), data).unwrap();
+    fs::write(source.join(".manifest"), b"remote manifest\n").unwrap();
+    let interrupted = parent.join("interrupted/nested");
+    fs::create_dir_all(&interrupted).unwrap();
+    fs::write(
+        interrupted.join("payload.bin"),
+        vec![42; 3 * w11term::sftp::CHUNK],
+    )
+    .unwrap();
+    for marker in ["transfer-trace", "hold-transfer-read", "keyboard-input.bin"] {
+        fs::write(remote.path().join(marker), []).unwrap();
+    }
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+
+    drive_mixed_gui("download-sftp-folder-ui.ps1", &ssh, state.path());
+
+    let downloaded = received.join("snapshot");
+    assert_eq!(
+        fs::read(downloaded.join(".manifest")).unwrap(),
+        b"remote manifest\n"
+    );
+    assert_eq!(
+        fs::read(downloaded.join("data 雪/trace 例.bin")).unwrap(),
+        data
+    );
+    assert_eq!(
+        fs::read_dir(downloaded.join("data 雪/empty"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(fs::read_dir(downloaded.join("data 雪")).unwrap().count(), 2);
+    assert_eq!(fs::read_dir(&downloaded).unwrap().count(), 2);
+    assert_eq!(
+        fs::read(received.join("neighbor.bin")).unwrap(),
+        b"untouched sibling"
+    );
+    assert_eq!(
+        fs::read_dir(&received).unwrap().count(),
+        2,
+        "interrupted transfer left a tree or staging directory"
+    );
+    assert_eq!(
+        fs::read(conflict.join("snapshot/.manifest")).unwrap(),
+        b"local manifest"
+    );
+    assert_eq!(
+        fs::read_dir(conflict.join("snapshot")).unwrap().count(),
+        1,
+        "existing directory was merged"
+    );
+    assert_eq!(fs::read_dir(&conflict).unwrap().count(), 1);
+    assert_eq!(
+        fs::read(remote.path().join("keyboard-input.bin")).unwrap(),
+        b"folder-download-live"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "cancels real SFTP transfers in a native SSH and PowerShell split"]
 async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
@@ -1202,7 +1289,55 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens literal remote paths in the native SFTP drawer after an initial listing error"]
+#[ignore = "moves a mixed SSH/PowerShell tab and Settings with keyboard shortcuts in a real window"]
+async fn native_keyboard_tab_reorder_preserves_focused_pane_and_live_sessions() {
+    run_palette_fixture(
+        "keyboard-tab-reorder-ui.ps1",
+        b"before;after-right;after-select",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "toggles the previously focused live SSH or PowerShell pane across splits, tabs and Settings"]
+async fn native_previous_pane_reuses_live_shells_across_tabs_and_skips_closed_panes() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let keyboard = remote.path().join("keyboard-input.bin");
+    fs::write(&keyboard, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("focus-previous-pane-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(keyboard).unwrap(), b"ssh-split;ssh-restored");
+    assert_eq!(channels.load(Ordering::Relaxed), 1, "one SSH shell");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "keeps native drawer activation keys out of SSH and restores typing when the terminal canvas is clicked"]
+async fn native_sftp_file_rows_own_keyboard_focus_until_the_canvas_is_clicked() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    fs::create_dir(remote.path().join("projects")).unwrap();
+    fs::write(remote.path().join("note.txt"), []).unwrap();
+    let keyboard = remote.path().join("keyboard-input.bin");
+    fs::write(&keyboard, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("drawer-key-trace"),
+        keyboard.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("sftp-drawer-focus-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(keyboard).unwrap(), b"canvas-typed");
+    assert_eq!(channels.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "navigates literal remote paths and folder history through the native SFTP drawer"]
 async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
         unreachable!()
@@ -1224,13 +1359,22 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
         .lines()
         .filter_map(|line| line.strip_prefix("OPENDIR "))
         .collect();
+    let parent = "/Pilot's $Logs [2026]";
+    let child = "/Pilot's $Logs [2026]/year 1 雪";
     assert_eq!(
         opened,
         [
             "/shell directory",
-            "/Pilot's $Logs [2026]",
-            "/Pilot's $Logs [2026]/year 1 雪",
+            parent,
+            child,
             "/Pilot's $Logs [2026]/year 1 雪/missing",
+            parent,
+            child, // Forward while the destination is missing.
+            child, // Retry after the server restores it.
+            parent,
+            "/",
+            parent,
+            "/",
         ]
     );
     assert_eq!(fs::read(trace).unwrap(), b"after-navigation");
@@ -1512,7 +1656,10 @@ async fn native_keyboard_copy_reads_scrollback_and_keeps_mode_keys_off_the_wire(
     let state = tempfile::tempdir().unwrap();
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
-    let mut history = String::from("\x1b[2J\x1b[3J\x1b[H\x1b[32mhistory-start\x1b[0m\r\n");
+    let mut history = String::from(
+        "\x1b[2J\x1b[3J\x1b[H\x1b[32mhistory-start\x1b[0m /srv/game/zone:pilot end\r\n",
+    );
+    history.push_str("01  731  running\r\n02  42   ready\r\n03  8    stopped\r\n");
     for row in 0..180 {
         history.push_str(&format!("fixture line {row}\r\n"));
     }
@@ -1525,7 +1672,7 @@ async fn native_keyboard_copy_reads_scrollback_and_keeps_mode_keys_off_the_wire(
     .unwrap();
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"copy_mode":"F8"}}"#,
+        br#"{"shortcuts":{"copy_mode":"F8"},"interaction":{"wordDelimiters":":","trimBlockSelection":false}}"#,
     )
     .unwrap();
     let result = std::process::Command::new("powershell.exe")

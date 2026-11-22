@@ -29,7 +29,7 @@ function Ssh-Reference([string]$Alias) {
     if ($LASTEXITCODE -ne 0) { throw "ssh.exe -G failed for fixture alias $Alias ($LASTEXITCODE)" }
     $endpoint = @{}
     foreach ($line in $lines) {
-        if ($line -cmatch '^(hostname|user|port|proxyjump) (.*)$') { $endpoint[$Matches[1]] = $Matches[2] }
+        if ($line -cmatch '^(hostname|user|port|proxyjump|hostkeyalias) (.*)$') { $endpoint[$Matches[1]] = $Matches[2] }
     }
     return $endpoint
 }
@@ -46,10 +46,12 @@ Host via
     Port 2222
     ProxyJump gateway
     ServerAliveInterval 15
+    HostKeyAlias Build.Key.Test
 '@
     Write-Config (Join-Path $fragments '20-gateway.conf') @'
 Host gateway
     HostName gateway.test
+    HostKeyAlias Bastion.Key.Test
     User jump
     Port 2201
 '@
@@ -99,12 +101,14 @@ Host blocked
     }
     $hop = $via.proxy_jump[0]
     if ($hop.host -cne 'gateway.test' -or $hop.user -cne 'jump' -or $hop.port -ne 2201) { throw "Unexpected saved included gateway. See $profiles" }
+    if ($via.host_key_alias -cne 'build.key.test' -or $hop.host_key_alias -cne 'bastion.key.test') { throw "Host key aliases were lost during import or edit. See $profiles" }
     $sshExe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
     if (Test-Path -LiteralPath $sshExe -PathType Leaf) {
         $expected = Ssh-Reference 'via'
         $gateway = Ssh-Reference 'gateway'
         if ($expected.proxyjump -cne 'gateway' -or $expected.hostname -cne $via.host -or $expected.user -cne $via.user -or [int]$expected.port -ne $via.port -or
-            $gateway.hostname -cne $hop.host -or $gateway.user -cne $hop.user -or [int]$gateway.port -ne $hop.port) {
+            $gateway.hostname -cne $hop.host -or $gateway.user -cne $hop.user -or [int]$gateway.port -ne $hop.port -or
+            $expected.hostkeyalias -cne $via.host_key_alias -or $gateway.hostkeyalias -cne $hop.host_key_alias) {
             throw "Saved profile differs from Windows OpenSSH -G. See $profiles"
         }
         Write-Output 'Windows OpenSSH -G independently confirmed the destination and gateway.'

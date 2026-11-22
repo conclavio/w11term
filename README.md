@@ -61,7 +61,7 @@ Choose **caret → Find in all panes…** to search terminal text across this wi
 
 Results show the text present when you searched. Use **Refresh** to include later output. Matching ignores case, accepts up to 4,096 UTF-8 bytes, and shows `10,000+` when a pane contains additional matches.
 
-The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
+The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. To reorder the selected tab, drag it or use **Move tab left** or **Move tab right** in the caret menu or command palette. Both actions can be assigned shortcuts under **Settings → Keyboard**. Moving a tab keeps the same pane focused. Numbered tab shortcuts follow the new order. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Builds, deployments, and other programs that emit **OSC 9;4** can report progress in the tab header and on the window’s Windows taskbar button. The header shows a percentage, **Paused**, **Error**, or **In progress**. When several panes report at once, an error takes priority, followed by paused, normal, and indeterminate progress. Within the same state the least complete operation wins. Clearing a pane’s progress reveals the next one. [Windows Terminal progress sequences](https://learn.microsoft.com/en-us/windows/terminal/tutorials/progress-bar-sequences)
 
@@ -72,6 +72,8 @@ If you have an editor open in a remote checkout, choose **Panes → Split right 
 Saving the workspace remembers the new pane’s starting directory. Its next launch opens a shell there. The original pane keeps its running program.
 
 Click a pane to focus it, drag a divider to resize, or zoom one pane and restore the layout when finished. `Alt+Shift+Arrow` moves the nearest divider on that axis by five percent of its span. Hold the chord to keep moving it. The same resize actions appear under **Panes**, and saving a workspace keeps its divider positions. The control CLI keeps targeting the same pane as focus and layout change.
+
+**Panes → Focus previous pane** returns to the last terminal pane you used in this window, including a pane in another tab. Invoke it again to switch back. For example, you can alternate between an SSH editor and a PowerShell build. From Settings, the action returns to the terminal you just left. Find it in the command palette or assign a shortcut under **Settings → Keyboard**.
 
 Choose **caret → Duplicate tab layout** to open a fresh copy beside the current tab. It keeps the tab name, pane arrangement, divider positions, focused pane, zoom and read-only input locks. Each SSH pane makes an independent login, and each local shell starts a new process. The original tab keeps its jobs and scrollback. A configured local or SSH starting directory carries over. You can assign **Duplicate tab layout** a shortcut in Settings.
 
@@ -101,7 +103,19 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
+Choose **Download folder…** on a remote directory and select a Windows folder
+to receive it. For example, choosing `Downloads` for `/tmp/diagnostics`
+creates `Downloads\diagnostics`. The transfer preserves regular files, dotfiles
+and empty directories, and reports skipped symbolic links and special entries.
+It stages the tree beside the destination and publishes it after the download
+finishes. An existing destination or a name Windows cannot represent stops
+the download. Use **Cancel transfer** in the drawer to stop it.
+
+When a file row or drawer control has keyboard focus, use the keyboard to operate that control. For example, press **Space** on a file row to select it. Click the terminal pane, or choose **Done** in the filename filter, to resume typing into the shell while the drawer stays open.
+
 Choose **Go to folder…** to enter a remote directory directly. An absolute path such as `/var/log` works even if the starting directory could not be listed. Relative paths start in the displayed directory. The SFTP server resolves `.`, `..` and symbolic links. Enter spaces, quotes and dollar signs literally. If the folder cannot be opened, the drawer keeps the previous listing and selection.
+
+Use **Back** and **Forward** to revisit folders opened in the current SSH pane, including folders visited while following the shell. For example, after jumping from a project to `/var/log`, choose **Back** to return to the project. Opening a different folder from there starts a new history branch. Refreshing the listing or trying a path the server cannot open preserves your place. Reconnecting starts a fresh history.
 
 Choose **Cancel transfer** to stop the current upload or download and skip the rest of that batch. The drawer waits for the server to acknowledge an in-flight request. A cancelled download leaves an existing local file intact. If an upload has already opened the remote file, it can leave a partial file, including when replacing an existing file. The drawer reports the remote path and acknowledged byte count. The SSH shell and subsequent transfers remain available.
 
@@ -195,6 +209,31 @@ SSH supports OpenSSH private keys supplied with `--identity`, protected w11term 
 
 The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`. Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog.
 
+To trust a fleet’s SSH host CA, add its public key to `%USERPROFILE%\.ssh\known_hosts`.
+For example, a line beginning with `@cert-authority *.example.net ssh-ed25519`
+followed by the CA’s base64 key covers that domain on port 22. For port 2222 use
+`[*.example.net]:2222` as the host pattern. Each ProxyJump hop uses its own
+hostname, port and trust entries.
+
+For a matching CA entry, w11term requests an OpenSSH host certificate and
+checks its signature, host principal, validity interval, critical options and
+revocations. A valid certificate from the trusted CA can authorize a rotated
+host key without a first-connect prompt. A profile fingerprint still pins the
+individual host key. Durable sessions and folder grants retain their existing
+host-key binding. The supported host certificate and CA key types are Ed25519
+and ECDSA P-256, P-384 and P-521. [OpenSSH known_hosts format](https://man.openbsd.org/sshd.8#SSH_KNOWN_HOSTS_FILE_FORMAT)
+
+When you connect through a forwarded port, set **Host key alias** to the name
+on the remote server’s certificate or in your `known_hosts`. For example,
+`w11term ssh ops@127.0.0.1 --port 2202 --host-key-alias build01.example.net`
+dials loopback and verifies `build01.example.net`. The alias is the whole
+lookup name even on a custom port. The first-connect dialog shows both the
+address and the alias under which it will save the key.
+
+The OpenSSH importer reads `HostKeyAlias` independently for the destination
+and each jump. Profiles store it in the optional `host_key_alias` field.
+[OpenSSH HostKeyAlias](https://man.openbsd.org/ssh_config#HostKeyAlias)
+
 ## Forward a local port
 
 If a development server on the SSH host listens on `127.0.0.1:8000`, open the command palette in its SSH pane and choose **Forward a local port…**. Enter `8000` as the remote port. Leave the Windows port empty to have Windows assign one, or enter a specific port. Choose **Start forwarding**, then **Copy address** to use the Windows endpoint in your browser or TCP client. You can close the manager while the forward is running. For example, if Windows assigns port `54210`, visit `http://127.0.0.1:54210/` for an HTTP service.
@@ -269,11 +308,21 @@ cargo run -- --benchmark
 cargo run -- --demo --smoke-seconds 5
 ```
 
+You can open a raw VT file containing inline images directly with `--replay`.
+The GUI uses the pane's measured cell grid for captures without recording metadata.
+Use `--cols` and `--rows` to choose an initial grid for a particular capture.
+For a restored background replay pane with unknown dimensions, showing the pane
+or sizing it with `w11term-cli resize` starts playback.
+
 The benchmark measures **only VT parsing and scrollback**. It excludes snapshot creation, rendering, SSH, and input-to-screen latency. Debug-build results are not performance claims. Build with `cargo build --release` for performance work. The release GUI executable does not attach a console.
 
 ## Controls
 
-**Ctrl+Shift+X** or **caret → Panes → Keyboard copy mode** lets you select text in the focused pane while its session continues running. Move with the arrow keys or **h/j/k/l**, page with **Page Up/Down**, use **Home/End** or **0/$** for the edges of a row, and **g/G** or **Ctrl+Home/End** for the ends of retained history. Press **v** for character selection or **Shift+V** for whole rows, then **y** or **Enter** to copy plain text. Soft-wrapped rows join on copy. **Esc** cancels and restores your previous viewport. Inside an alternate screen the current grid is available. Remap the activation shortcut under **Settings → Keyboard**.
+**Ctrl+Shift+X** or **caret → Panes → Keyboard copy mode** lets you select text in the focused pane while its session continues running. Move with the arrow keys or **h/j/k/l**, page with **Page Up/Down**, use **Home/End** or **0/$** for the edges of a row, and **g/G** or **Ctrl+Home/End** for the ends of retained history. Press **v** for character selection or **Shift+V** for whole rows, then **y** or **Enter** to copy plain text. Soft-wrapped rows join in character and line selections. **Esc** cancels and restores your previous viewport. Inside an alternate screen the current grid is available. Remap the activation shortcut under **Settings → Keyboard**.
+
+To copy columns from a table, move to one corner, press **Ctrl+V** or **r** in copy mode, move to the opposite corner, then press **y** or **Enter**. A rectangular selection copies each displayed row on its own line, including across a soft wrap. **Settings → Remove trailing whitespace in block selections** controls whether short rows are trimmed or padded to the selected width. Press the same selection key again to clear the selection, or switch between character, line and rectangular selection while keeping the original anchor.
+
+In copy mode, **w** or **Ctrl+Right** moves to the next word start, **b** or **Ctrl+Left** moves to the previous word start, and **e** moves to the next word end. To copy a path, move to its first character, press **v**, then **e** and **y**. The **Word selection delimiters** setting controls where punctuation splits a word. For example, removing `/` from the delimiters lets you select `/srv/game/zone` as one word. Motions skip whitespace and continue through soft wraps and retained scrollback.
 
 **Ctrl+Shift+H** or **caret → Panes → Keyboard hints** freezes the focused viewport and labels its URLs and file paths. Type the letters shown beside a target. **Enter** opens a URL or copies a path, **C** copies either, **Backspace** edits the label, and **Esc** returns to the live pane. URLs use the same link rules as Ctrl+click, including OSC 8 hyperlinks. Paths can include quoted spaces, soft wraps, and compiler-style line and column suffixes.
 
@@ -393,8 +442,9 @@ from an administrator terminal; ordinary tests exercise medium/low isolation.
 This is a runnable foundation, not complete terminal conformance or a kitty/Ghostty performance result.
 
 - ANSI/DEC behavior, primary/alternate screens, scrollback/reflow, 256/true color, wide and combining text, basic mouse reporting, bracketed paste, and negotiated kitty key encoding are connected.
-- The terminal displays kitty, sixel and iTerm images. Kitty supports timed or client-selected animation frames, Unicode placeholders and relative placements. The [graphics audit](docs/graphics-audit.md) documents reference fixtures, GPU cache eviction, transfer budgets and protocol coverage.
+- The terminal displays kitty, sixel and iTerm images. Kitty supports timed or client-selected animation frames, Unicode placeholders and relative placements. `kitten icat --clear` clears visible images, and `kitten icat --clear-all` also clears named images from scrollback on the active screen. The [graphics audit](docs/graphics-audit.md) documents reference fixtures, GPU cache eviction, transfer budgets and protocol coverage.
 - DirectWrite shapes text runs with matching attributes and supports italic, color emoji and five underline styles with independent decoration color. Bidirectional ordering uses the terminal's row direction with a left-to-right default. Selection, search highlights, URL hit testing and cursor placement share the displayed cell map. Copy and control-pipe text retain logical order. Each physical row resolves independently, including soft-wrapped rows. The replay fixture exercises mixed Hebrew and digits, Arabic joining, a Devanagari conjunct, italic and underline styles. [Replay fixture](tests/fixtures/complex-text.vt)
+- Applications can overline text and spaces with SGR 53 and clear the overline with SGR 55. The stroke follows the foreground across the full width of each grapheme. Underlines can use their own color at the same time. [ECMA-48, §8.3.117](https://ecma-international.org/publications-and-standards/standards/ecma-48/)
 - Applications can swap the pane's default foreground and background with DEC reverse-screen mode (`CSI ? 5 h`), restore them with `CSI ? 5 l`, and query the current mode with `CSI ? 5 $ p`. Explicit RGB and indexed colors keep their values. SGR 7 still swaps the colors of an individual cell. Pane previews and PNG captures use the same colors as the window. [Xterm control sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)
 - Applications can select a blinking or steady block, underline, or bar with DECSCUSR, or toggle blinking on the current shape with `CSI ? 12 h` and `CSI ? 12 l`. An editor can query the current style with DECRQSS and restore it on exit. A focused pane fills the application block cursor and draws the character in the cursor's text color. Other panes show the block as an outline, so you can see which split has keyboard focus. A blinking cursor in the focused terminal follows the Windows caret interval. Disabling caret blinking in Windows keeps it steady. Pane previews and control-pipe PNGs use the outlined block throughout its blink cycle. [Cursor-style sequences](https://ghostty.org/docs/vt/csi/decscusr) · [Windows caret timing](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getcaretblinktime)
 - Remote programs can query the current text attributes with the DECRQSS rendition request (`DCS $ q m ST`). The reply describes the style that newly printed text would receive at that point. For example, Vim sets a curly underline, queries the rendition, and resets it in a single write. w11term returns `0;4:3m` for that query. [Vim’s undercurl probe](https://github.com/vim/vim/blob/master/src/term.c#L5184-L5191) · [xterm control sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)

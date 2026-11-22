@@ -12,6 +12,12 @@ pub(super) const FIELD: &str = "sftp_bookmarks";
 #[serde(deny_unknown_fields)]
 pub struct BookmarkPeer {
     host: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::options::deserialize_host_key_alias",
+        skip_serializing_if = "Option::is_none"
+    )]
+    host_key_alias: Option<String>,
     user: String,
     port: u16,
     fingerprint: String,
@@ -22,6 +28,7 @@ impl BookmarkPeer {
         let (host, user, port, fingerprint) = link.verified_endpoint();
         Self {
             host: host.to_ascii_lowercase(),
+            host_key_alias: link.options().host_key_alias.clone(),
             user: user.into(),
             port,
             fingerprint: fingerprint.into(),
@@ -29,16 +36,21 @@ impl BookmarkPeer {
     }
 
     pub fn connection_matches_profile(link: &ConnectionShare, options: &SshOptions) -> bool {
-        matches_profile(link.verified_endpoint(), options)
+        matches_profile(
+            link.verified_endpoint(),
+            link.options().host_key_alias.as_deref(),
+            options,
+        )
     }
 
     fn check_profile(&self, options: &SshOptions) -> Result<()> {
         ensure!(
             matches_profile(
                 (&self.host, &self.user, self.port, &self.fingerprint),
+                self.host_key_alias.as_deref(),
                 options
             ),
-            "The SSH profile no longer matches this connection's host, user, port or host key"
+            "The SSH profile no longer matches this connection's host, user, port, host key or host key alias"
         );
         Ok(())
     }
@@ -46,9 +58,11 @@ impl BookmarkPeer {
 
 fn matches_profile(
     (host, user, port, fingerprint): (&str, &str, u16, &str),
+    alias: Option<&str>,
     options: &SshOptions,
 ) -> bool {
     host.eq_ignore_ascii_case(&options.host)
+        && alias == options.host_key_alias.as_deref()
         && user == options.user
         && port == options.port
         && options
