@@ -4752,9 +4752,7 @@ impl Component for TerminalApp {
                             && (frame.scroll_offset > 0
                                 || frame.first_stable_row > frame.oldest_stable_row);
                         let report = frame.reported_directory.as_ref().filter(|_| {
-                            tab.session
-                                .ssh_connection_at(frame.connection_generation)
-                                .is_some()
+                            tab.can_report_split_directory(frame.connection_generation)
                         });
                         if tab.forwards.connection_changed()
                             || (active && tab.connection_generation != frame.connection_generation)

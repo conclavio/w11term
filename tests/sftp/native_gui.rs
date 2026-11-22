@@ -1929,6 +1929,17 @@ async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_t
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens local PowerShell splits from a real filesystem prompt beside a live SSH shell"]
+async fn native_powershell_directory_splits_inherit_cwd_and_preserve_the_mixed_window() {
+    run_palette_fixture(
+        "split-powershell-directory-ui.ps1",
+        b"directory-split-ssh-live",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens right and below splits from verified OSC 7 paths on real SSH channels"]
 async fn native_splits_open_the_reported_directory_on_the_original_ssh_transport() {
     for direction in ["right", "below"] {

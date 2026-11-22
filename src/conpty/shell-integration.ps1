@@ -1,6 +1,18 @@
 # Loaded only for an explicitly enabled, interactive local PowerShell profile.
 # All changes are confined to this ConsoleHost process.
+param([switch]$RestoreLiteralDirectory)
 & {
+    if ($RestoreLiteralDirectory) {
+        # Windows PowerShell wildcard-expands its inherited cwd. Preserve a
+        # profile's choice of another location. See the hook-off path in process.rs.
+        try {
+            $private:initial = [Environment]::CurrentDirectory
+            if ($PWD.Provider.Name -eq 'FileSystem' -and $PWD.ProviderPath -ne $initial -and
+                ($PWD.ProviderPath -eq $PSHOME -or $PWD.ProviderPath -like $initial)) {
+                Microsoft.PowerShell.Management\Set-Location -LiteralPath $initial -ErrorAction Ignore
+            }
+        } catch {}
+    }
     if ($Host.Name -ne 'ConsoleHost' -or $ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage' -or
         (Test-Path Variable:global:__W11TermSemanticPrompt)) { return }
 
@@ -42,7 +54,20 @@
                 }
                 [Console]::Write($state.Prefix + 'D;' + $code.ToString([cultureinfo]::InvariantCulture) + [char]7)
             }
-            [Console]::Write($state.Prefix + 'A' + [char]7)
+            # Use the native filesystem path even when the shell is on a
+            # custom PSDrive. Empty OSC 7 clears the last usable directory.
+            $private:directoryUri = ''
+            try {
+                $private:location = $ExecutionContext.SessionState.Path.CurrentLocation
+                if ($location.Provider.Name -eq 'FileSystem') {
+                    $private:path = $location.ProviderPath
+                    if ([regex]::IsMatch($path, '\A[A-Za-z]:\\')) {
+                        $private:tail = [Uri]::EscapeDataString($path.Substring(3)).Replace('%5C', '/')
+                        $directoryUri = 'file:///' + $path.Substring(0, 2) + '/' + $tail
+                    }
+                }
+            } catch { $directoryUri = '' }
+            [Console]::Write([string][char]27 + ']7;' + $directoryUri + [char]7 + $state.Prefix + 'A' + [char]7)
             $state.AwaitingInput = $true
         }
         # Preserve the success bit visible to an existing status-aware prompt.

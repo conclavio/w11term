@@ -359,12 +359,18 @@ impl TerminalApp {
         if draft.supports_integration() {
             fields.push(
                 CheckBox::new()
-                    .automation_name("Enable command history and completion alerts in PowerShell")
+                    .automation_name("Enable PowerShell integration")
                     .is_checked(draft.powershell_integration)
                     .on_is_checked_changed(context.callback(move |enabled| {
                         Message::LocalProfile(Action::PowerShellIntegration(id, enabled))
                     }))
-                    .content("Enable command history and completion alerts in PowerShell"),
+                    .content("Enable PowerShell integration"),
+            );
+            fields.push(
+                TextBlock::new()
+                    .text("Split in the current folder, keep command history and receive completion alerts.")
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
             );
         }
         fields.push(

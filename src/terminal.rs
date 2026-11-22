@@ -218,7 +218,7 @@ pub(crate) fn enter_herdr_viewer(
             }
         }
     }
-    events.command_stream(false);
+    events.command_stream(None);
     terminal.clear_clipboard();
     terminal.set_notification_handler(Box::new(ViewerAlerts(events.clone())));
     terminal.set_nonblocking_viewer_writers(
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn command_watch_fires_once_for_the_first_paired_primary_command_in_a_batch() {
         let (mut term, events) = watched_terminal();
-        events.command_stream(true);
+        events.command_stream(Some(1));
         assert!(events.set_command_watch(true));
         term.advance_bytes(b"\x1b]133;B\x07cancelled\x1b]133;A\x07\x1b]133;D;1\x07\x1b[?1049h\x1b]133;C\x07\x1b]133;D;2\x07\x1b[?1049l");
         assert_eq!(events.command_watch(), Some(true));
@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn command_watch_tracks_current_command_across_capture_loss_and_nested_markers() {
         let (mut term, events) = watched_terminal();
-        events.command_stream(true);
+        events.command_stream(Some(1));
         term.advance_bytes(b"\x1b]133;C;aid=shell\x07private output\x1b[3J");
         assert!(events.set_command_watch(true));
         for b in b"\x1b]133;C;aid=shell\x07\x1b]133;C;aid=nested\x07\x1b]133;D;5;aid=nested\x1b\\\x1b]133;A;aid=nested\x07\x1b[?1049h\x1b]133;D;9;aid=shell\x07\x1b[?1049l\x1b]133;N;aid=shell\x1b\\\x1b]133;D;8;aid=shell\x07" {
@@ -980,9 +980,10 @@ mod tests {
     #[test]
     fn command_watch_cancels_on_reset_disconnect_and_viewer_transition() {
         let (mut term, events) = watched_terminal();
+        assert_eq!(events.shell_generation(), None);
         assert!(!events.set_command_watch(true));
         term.advance_bytes(b"\x1b]133;C\x07historical output");
-        events.command_stream(true);
+        events.command_stream(Some(1));
         assert!(events.set_command_watch(true));
         term.advance_bytes(b"\x1b]133;D;11\x07");
         assert_eq!(events.command_watch(), Some(true));
@@ -991,20 +992,24 @@ mod tests {
             term.advance_bytes(b"\x1b]133;C\x07");
             term.advance_bytes(reset);
             assert_eq!(events.command_watch(), Some(false));
+            assert_eq!(events.shell_generation(), Some(1));
             term.advance_bytes(b"\x1b]133;D;42\x07");
         }
         events.set_command_watch(true);
         term.advance_bytes(b"\x1b]133;C\x07");
-        events.command_stream(false);
+        events.command_stream(None);
+        assert_eq!(events.shell_generation(), None);
         assert_eq!(events.command_watch(), None);
         term.reset_connection();
-        events.command_stream(true);
+        events.command_stream(Some(2));
+        assert_eq!(events.shell_generation(), Some(2));
         term.advance_bytes(b"\x1b]133;D;2\x07\x1b]133;C\x07");
         assert!(events.set_command_watch(true));
         assert!(events.set_command_watch(false));
         term.advance_bytes(b"\x1b]133;D;4\x07");
         assert!(events.set_command_watch(true));
         enter_herdr_viewer(&mut term, &mpsc::unbounded_channel().0, &events);
+        assert_eq!(events.shell_generation(), None);
         assert!(!events.set_command_watch(true));
         term.advance_bytes(b"\x1b]133;C\x07old bytes\x1b]133;D;99\x07");
         assert!(completions(&events).is_empty());
@@ -1156,7 +1161,7 @@ mod tests {
     #[test]
     fn partial_command_output_is_unavailable_after_history_is_cleared() {
         let (mut term, events) = watched_terminal();
-        events.command_stream(true);
+        events.command_stream(Some(1));
         term.resize(TerminalSize {
             cols: 16,
             rows: 2,

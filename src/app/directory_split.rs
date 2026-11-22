@@ -1,11 +1,18 @@
 use super::*;
+use std::path::PathBuf;
 use w11term::{options::PlayerOptions, ssh::ConnectionShare, workspace::SshStartup};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Directory {
+    Ssh(String),
+    Local(PathBuf),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Origin {
     pane: u64,
     generation: u64,
-    directory: String,
+    directory: Directory,
     listing_revision: Option<u64>,
 }
 
@@ -14,7 +21,7 @@ impl Origin {
         Self {
             pane,
             generation,
-            directory: directory.into(),
+            directory: Directory::Ssh(directory.into()),
             listing_revision: Some(revision),
         }
     }
@@ -46,8 +53,32 @@ fn child_options(connection: &SshOptions, pane: &SshOptions, player: PlayerOptio
     }
 }
 
+fn local_directory(report: &str, computer: Option<&str>) -> Option<PathBuf> {
+    // Reuse the SSH file-URI decoder for strict percent escapes and authority
+    // matching. Build only a Windows drive-letter path, never a UNC/device path.
+    let (authority, _) = report.split_once("://")?.1.split_once('/')?;
+    let host = if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+        "localhost"
+    } else {
+        computer.filter(|name| !name.is_empty())?
+    };
+    let path = file_drawer::shell_directory(Some(report), host)?;
+    let (drive, tail) = path.strip_prefix('/')?.split_once('/')?;
+    if !matches!(drive.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic()) {
+        return None;
+    }
+    let mut cwd = PathBuf::from(format!("{drive}\\"));
+    if !tail.is_empty() {
+        for name in tail.strip_suffix('/').unwrap_or(tail).split('/') {
+            w11term::sftp::validate_download_name(name).ok()?;
+            cwd.push(name);
+        }
+    }
+    Some(cwd)
+}
+
 impl LiveTab {
-    fn directory_split(&self) -> Option<(Origin, ConnectionShare)> {
+    fn ssh_directory_split(&self) -> Option<(Origin, ConnectionShare)> {
         if !self.session.is_direct_ssh_shell() {
             return None;
         }
@@ -60,11 +91,36 @@ impl LiveTab {
             Origin {
                 pane: self.session.pane_id,
                 generation,
-                directory,
+                directory: Directory::Ssh(directory),
                 listing_revision: None,
             },
             connection,
         ))
+    }
+
+    fn local_directory_split(&self) -> Option<Origin> {
+        let frame = self.session.frames.load();
+        if !self.can_report_split_directory(frame.connection_generation) {
+            return None;
+        }
+        let report = frame.reported_directory.as_deref()?;
+        let computer = std::env::var("COMPUTERNAME").ok();
+        Some(Origin {
+            pane: self.session.pane_id,
+            generation: frame.connection_generation,
+            directory: Directory::Local(local_directory(report, computer.as_deref())?),
+            listing_revision: None,
+        })
+    }
+
+    pub(super) fn can_report_split_directory(&self, generation: u64) -> bool {
+        match &self.source {
+            Source::Local(shell) => {
+                LocalOptions::supports_powershell_integration(&shell.executable, &shell.args)
+                    && self.session.events.shell_generation() == Some(generation)
+            }
+            _ => self.session.ssh_connection_at(generation).is_some(),
+        }
     }
 }
 
@@ -73,7 +129,10 @@ impl TerminalApp {
         let Page::Terminal(tab) = &self.tabs.active()?.page else {
             return None;
         };
-        tab.directory_split().map(|(origin, _)| origin)
+        match tab.source {
+            Source::Local(_) => tab.local_directory_split(),
+            _ => tab.ssh_directory_split().map(|(origin, _)| origin),
+        }
     }
 
     pub(super) fn split_in_directory(
@@ -92,6 +151,29 @@ impl TerminalApp {
         else {
             return;
         };
+        if let Directory::Local(cwd) = &target.directory {
+            let Source::Local(shell) = &tab.source else {
+                return;
+            };
+            if tab.local_directory_split().as_ref() != Some(&target) {
+                return;
+            }
+            let child = Source::Local(LocalOptions {
+                cwd: Some(cwd.clone()),
+                color_scheme: tab.color_scheme,
+                ..shell.clone()
+            });
+            // Saved local panes carry their full launch settings as well as
+            // their profile name. Keep the new directory out of the catalog.
+            let child = live_tab(
+                label.clone(),
+                child,
+                self.appearance.read().unwrap().interaction.osc52,
+            )
+            .with_profile(tab.profile_name.clone());
+            self.insert_split(id, child, axis, ctx);
+            return;
+        }
         let resolved = if target.listing_revision.is_some() {
             if !self.drawer_shell_eligible(tab, target.generation) {
                 return;
@@ -100,7 +182,7 @@ impl TerminalApp {
                 .shell_origin(tab.session.pane_id)
                 .zip(tab.session.ssh_connection_at(target.generation))
         } else {
-            tab.directory_split()
+            tab.ssh_directory_split()
         };
         let Some((current, connection)) = resolved.filter(|(current, _)| *current == target) else {
             return;
@@ -113,7 +195,10 @@ impl TerminalApp {
             pane,
             tab.session.player.read().unwrap().clone(),
         );
-        let Ok(startup) = SshStartup::new(&options, current.directory, String::new()) else {
+        let Directory::Ssh(directory) = current.directory else {
+            return;
+        };
+        let Ok(startup) = SshStartup::new(&options, directory, String::new()) else {
             return;
         };
         // A profile may have been edited to point elsewhere since this login.
@@ -152,6 +237,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_file_reports_decode_drive_paths_without_filesystem_probes() {
+        for (uri, expected) in [
+            ("file:///C:/", r"C:\"),
+            (
+                "file://localhost/C:/work%20dir/100%25%20%23%20%E6%96%87/",
+                r"C:\work dir\100% # 文",
+            ),
+            ("FiLe://DEsK/z:/checkout", r"z:\checkout"),
+            ("file:///Z:/literal%252F", r"Z:\literal%2F"),
+        ] {
+            assert_eq!(
+                local_directory(uri, Some("desk")),
+                Some(expected.into()),
+                "{uri}"
+            );
+        }
+        for invalid in [
+            "",
+            "file:///C:",
+            "file:///C:relative",
+            "file://alien/C:/dir",
+            "file://host@desk/C:/dir",
+            "file://desk:80/C:/dir",
+            "file://./C:/dir",
+            "file:////server/share",
+            "file:////?/C:/a",
+            "file:///C:/../a",
+            "file:///C:/a//b",
+            "file:///C:/a/%2e%2e/b",
+            "file:///C:/a%5Cb",
+            "file:///C:/a%2Fb",
+            "file:///C:/dir?query",
+            "file:///C:/dir#fragment",
+            "file:///C:/%zz",
+            "file:///C:/a:%24DATA",
+            "file:///C:/NUL.txt",
+            "file:///C:/foo%00bar",
+            "file:///C:/%fe",
+            "file:///C:/ends.",
+            "file:///Env:/path",
+        ] {
+            assert!(
+                local_directory(invalid, Some("desk")).is_none(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
     fn child_inherits_the_originating_ptys_settings_on_a_shared_transport() {
         let connection: SshOptions = serde_json::from_value(serde_json::json!({
             "host":"example.test", "user":"login", "auth":"identity", "identity":"active-key"
@@ -181,7 +315,7 @@ mod tests {
         let origin = Origin {
             pane: 14,
             generation: 3,
-            directory: "/srv/client v2".into(),
+            directory: Directory::Ssh("/srv/client v2".into()),
             listing_revision: None,
         };
         for (label, expected) in [

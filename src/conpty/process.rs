@@ -118,11 +118,20 @@ fn command_line(options: &LocalOptions, host_exe: Option<&Path>) -> Result<Vec<u
     for arg in &options.args {
         append(OsStr::new(arg));
     }
-    if options.powershell_integration
-        && LocalOptions::supports_powershell_integration(&options.executable, &options.args)
-    {
+    if LocalOptions::supports_powershell_integration(&options.executable, &options.args) {
+        // Windows PowerShell 5.1 wildcard-expands the OS cwd before the
+        // first prompt. PowerShell 7 opens it literally.
+        let restore_directory = options.executable.file_name().is_some_and(|name| {
+            name.eq_ignore_ascii_case("powershell.exe") || name.eq_ignore_ascii_case("powershell")
+        }) && options.cwd.as_ref().is_some_and(|cwd| {
+            cwd.as_os_str()
+                .encode_wide()
+                .any(|unit| unit == u16::from(b'['))
+        });
         let script = host_exe.map(|exe| exe.with_file_name("shell-integration.ps1"));
-        if let Some(script) = script.filter(|path| path.is_absolute() && path.is_file()) {
+        let script = script
+            .filter(|path| options.powershell_integration && path.is_absolute() && path.is_file());
+        if script.is_some() || restore_directory {
             if !options
                 .args
                 .iter()
@@ -130,11 +139,30 @@ fn command_line(options: &LocalOptions, host_exe: Option<&Path>) -> Result<Vec<u
             {
                 append(OsStr::new("-NoExit"));
             }
-            // A literal file argument leaves signing and zone checks to PowerShell
-            // and never interprets characters in the install path as commands.
-            append(OsStr::new("-File"));
-            append(script.as_os_str());
-        } else {
+            if let Some(script) = script.as_ref() {
+                // A literal file argument leaves signing and zone checks to PowerShell.
+                append(OsStr::new("-File"));
+                append(script.as_os_str());
+                if restore_directory {
+                    append(OsStr::new("-RestoreLiteralDirectory"));
+                }
+            } else {
+                // Only a built-in cmdlet; neither path nor profile text is
+                // interpreted as code. Keep the guard in shell-integration.ps1 in sync.
+                const RESTORE: &str = r"& {
+    try {
+        $initial = [Environment]::CurrentDirectory
+        if ($PWD.Provider.Name -eq 'FileSystem' -and $PWD.ProviderPath -ne $initial -and
+            ($PWD.ProviderPath -eq $PSHOME -or $PWD.ProviderPath -like $initial)) {
+            Microsoft.PowerShell.Management\Set-Location -LiteralPath $initial -ErrorAction Ignore
+        }
+    } catch {}
+}";
+                append(OsStr::new("-Command"));
+                append(OsStr::new(RESTORE));
+            }
+        }
+        if options.powershell_integration && script.is_none() {
             log::warn!(
                 "PowerShell integration script missing beside w11term; starting the ordinary shell"
             );
