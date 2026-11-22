@@ -1814,8 +1814,9 @@ impl TerminalApp {
             && !self.clipboard.is_open();
         let dialog_was_open = files.entry_dialog_open();
         let drawer_was_open = files.open;
-        let return_to_terminal = matches!(action, EditFilter(_, _, _, false));
         let was_editing = files.filter_editing();
+        let finish_filter =
+            may_open_dialog && was_editing && matches!(action, EditFilter(_, _, _, false));
         files.observe_connection(frame.connection_generation);
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
@@ -2197,6 +2198,7 @@ impl TerminalApp {
             files.cached.borrow_mut().take();
         }
         if visible {
+            let return_to_terminal = finish_filter && !tab.files.filter_editing();
             if !typing {
                 tab.follow_shell_directory(&frame, context);
             }
@@ -2207,7 +2209,7 @@ impl TerminalApp {
                 self.connection_ui(id);
             }
             if return_to_terminal {
-                self.keyboard.return_from_drawer();
+                self.keyboard.finish_drawer_edit();
             }
         }
     }

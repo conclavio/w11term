@@ -81,6 +81,7 @@ struct State {
     drawer_focused: bool,
     // Native buttons can close their drawer before key-up or the translated WM_CHAR.
     drawer_keys: HashSet<KeySlot>,
+    drawer_late_char: Option<KeySlot>,
     game_mode: bool,
     close_handler: Option<Box<dyn Fn()>>,
 }
@@ -537,6 +538,19 @@ impl KeyboardBridge {
         if with_input_mut(|s| s.as_mut().is_some_and(|s| s.set_drawer_focus(false))) {
             ime::sync_context();
         }
+    }
+
+    pub fn finish_drawer_edit(&self) {
+        // The terminal canvas receives keyboard input on its window, outside
+        // XAML's tab order. Move focus there before removing the focused edit;
+        // otherwise WinUI automatically focuses the next drawer control.
+        if let Some(hwnd) = self.hwnd() {
+            let child = unsafe { GetFocus() };
+            if child != hwnd && unsafe { GetAncestor(child, GA_ROOT) } == hwnd {
+                let _ = unsafe { SetFocus(Some(hwnd)) };
+            }
+        }
+        self.return_from_drawer();
     }
     pub fn on_close(&self, handler: impl Fn() + 'static) {
         let _native = self.scope.enter();
@@ -1076,6 +1090,7 @@ impl State {
             drawer_pane: None,
             drawer_focused: false,
             drawer_keys: HashSet::new(),
+            drawer_late_char: None,
             game_mode: false,
             close_handler: None,
         }
@@ -1180,13 +1195,22 @@ impl State {
             (None, Some(position)) => KeySlot::PrintableScan(position),
             (None, None) => KeySlot::Virtual(vk),
         };
-        if !self.drawer_keys.is_empty() {
+        if !self.drawer_keys.is_empty() || self.drawer_late_char.is_some() {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) == 0 => {
+                    self.drawer_late_char = None;
                     self.drawer_keys.remove(&slot);
                 }
+                WM_KEYUP | WM_SYSKEYUP if self.drawer_keys.remove(&slot) => {
+                    self.drawer_late_char = matches!(vk, 0x09 | 0x0d | 0x20).then_some(slot);
+                    return false;
+                }
+                WM_CHAR | WM_SYSCHAR if self.drawer_late_char == Some(slot) => {
+                    self.drawer_late_char = None;
+                    return false;
+                }
                 WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR | WM_KEYDOWN
-                | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+                | WM_SYSKEYDOWN
                     if self.drawer_keys.contains(&slot) =>
                 {
                     // Deliver the native press, character, and release as one unit,
