@@ -179,6 +179,19 @@ impl Session {
             .generation()
             .and_then(|(current, link)| (current == generation).then_some(link))
     }
+    pub fn ssh_connection_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.ssh_connection.subscribe()
+    }
+
+    /// Bind the local listener to this pane's current authenticated SSH shell lifetime.
+    pub fn start_local_forward(
+        &self,
+        generation: u64,
+        local_port: u16,
+        remote_port: u16,
+    ) -> anyhow::Result<ssh::LocalForward> {
+        ssh::LocalForward::start(&self.ssh_connection, generation, local_port, remote_port)
+    }
     /// The program launched in this remote PTY, independent of edits to its saved recipe.
     pub fn is_direct_ssh_shell(&self) -> bool {
         self.direct_ssh_shell && !self.player.read().unwrap().rustmush

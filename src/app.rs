@@ -44,6 +44,7 @@ mod folder_revoke;
 mod folder_shares;
 mod folder_sharing_state;
 mod keyboard_settings;
+mod local_forwards;
 mod local_profile;
 mod pattern_settings;
 mod word_delimiters;
@@ -75,6 +76,7 @@ mod workspace_view;
 use pane_view::PaneSurface;
 
 struct LiveTab {
+    forwards: Box<local_forwards::Routes>,
     folder_sharing: Option<w11term::folder_grants::PaneShares>,
     read_only: Rc<Cell<bool>>,
     startup: Option<Box<w11term::workspace::SshStartup>>,
@@ -299,6 +301,7 @@ enum SettingsEditor {
     WordDelimiters(word_delimiters::Editor),
 }
 enum Page {
+    LocalForwards(local_forwards::Panel),
     SharedFolders(folder_shares::Panel),
     Attention,
     CommandHistory(command_history::HistoryPage),
@@ -622,6 +625,7 @@ enum UiWork {
 }
 
 struct CaretMenuBinding {
+    forward: Option<local_forwards::Origin>,
     directory_split: Option<directory_split::Origin>,
     pane: Option<u64>,
     paste: Option<clipboard_paste::Origin>,
@@ -675,6 +679,7 @@ pub struct TerminalApp {
     caret_interval: Option<u32>,
     folder_wake: Arc<dyn Fn() + Send + Sync>,
     folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
+    forward_watch: Option<crate::ui_timer::RetryTimer>,
     taskbar: RefCell<taskbar::Taskbar>,
     inbox: w11term::events::Inbox,
     show_inspector: bool,
@@ -740,6 +745,7 @@ pub struct ExitedPane {
 }
 
 pub enum Message {
+    LocalForward(local_forwards::Action),
     FolderAuthority,
     FolderShare(folder_shares::Action),
     FolderRevoke(TabId, u64, folder_revoke::Action),
@@ -885,6 +891,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
     AppTab {
         label,
         page: Page::Terminal(LiveTab {
+            forwards: Box::new(local_forwards::Routes::new(&session)),
             folder_sharing: None,
             startup: None,
             observed_frame: 0,
@@ -1978,6 +1985,7 @@ impl TerminalApp {
         self.discard_inactive_paste();
         self.bind_folder_shares();
         self.activate_folder_panel(context);
+        self.watch_forward_panel(context);
         self.title_editor = None;
         self.cancel_inactive_entry_dialog();
         self.close_copy_mode();
@@ -2645,7 +2653,9 @@ impl TerminalApp {
         let paste = self.paste_origin();
         let group = self.tabs.active_group_id();
         let mut cached = self.caret_menu_binding.borrow_mut();
+        let forward = self.forward_origin();
         if let Some(binding) = cached.as_ref()
+            && binding.forward == forward
             && binding.pane == pane
             && binding.paste == paste
             && binding.group == group
@@ -2659,6 +2669,7 @@ impl TerminalApp {
         // callback while repainting the title bar for the same action target.
         let split_target = directory_split.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
+            local_forwards::LABEL => local_forwards::open(forward),
             folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
                 Message::FolderShare(folder_shares::Action::Open(id))
             }),
@@ -2680,6 +2691,7 @@ impl TerminalApp {
             },
         });
         *cached = Some(CaretMenuBinding {
+            forward,
             directory_split,
             pane,
             paste,
@@ -2906,6 +2918,11 @@ impl TerminalApp {
                 player.as_ref().map(|p| p.sync_assets_enabled()),
             ),
             MenuItem::separator("profile-actions"),
+            command_menu_item(
+                "local-forward",
+                local_forwards::LABEL,
+                self.forward_origin().is_some(),
+            ),
             command_menu_item(
                 "shared-folders",
                 folder_shares::LABEL,
@@ -3696,6 +3713,7 @@ impl Component for TerminalApp {
             header: RefCell::new(None),
             caret_menu_binding,
             folder_panel_timer: None,
+            forward_watch: None,
             frame_tasks: BTreeMap::new(),
             show_inspector: false,
             inspection: None,
@@ -3791,6 +3809,7 @@ impl Component for TerminalApp {
             &message,
             Message::FrameReady(..)
                 | Message::FolderShare(folder_shares::Action::Panel(..))
+                | Message::LocalForward(local_forwards::Action::Panel(..))
                 | Message::WindowActivation(_)
                 | Message::TabTitle(tab_title::Action::Edit(..))
                 | Message::Files(..)
@@ -3834,6 +3853,7 @@ impl Component for TerminalApp {
             other => other,
         };
         match message {
+            Message::LocalForward(action) => self.forward_action(action, context),
             Message::FolderShare(action) => self.folder_action(action, context),
             Message::FolderRevoke(id, ticket, action) => {
                 self.folder_revoke(id, ticket, action, context)
@@ -4526,7 +4546,9 @@ impl Component for TerminalApp {
                                 .ssh_connection_at(frame.connection_generation)
                                 .is_some()
                         });
-                        if tab.can_clear_scrollback != can_clear
+                        if tab.forwards.connection_changed()
+                            || (active && tab.connection_generation != frame.connection_generation)
+                            || tab.can_clear_scrollback != can_clear
                             || tab.split_directory_report.as_ref() != report
                         {
                             tab.can_clear_scrollback = can_clear;
@@ -5365,6 +5387,7 @@ impl Component for TerminalApp {
                 Page::Attention => self.attention_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),
+                Page::LocalForwards(page) => self.forward_view(id, page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
                     keyboard_settings::keyboard_view(
                         page,

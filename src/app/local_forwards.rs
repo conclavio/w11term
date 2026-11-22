@@ -1,0 +1,559 @@
+use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::watch;
+use w11term::ssh::LocalForward;
+
+pub(super) const LABEL: &str = "Forward a local port…";
+const TITLE: &str = "Local port forwards";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Origin {
+    pane: u64,
+    generation: u64,
+}
+
+impl Origin {
+    fn from_tab(tab: &LiveTab) -> Option<Self> {
+        let session = &tab.session;
+        let generation = session.frames.load().connection_generation;
+        session.ssh_connection_at(generation).map(|_| Self {
+            pane: session.pane_id,
+            generation,
+        })
+    }
+}
+
+struct Route {
+    id: u64,
+    generation: u64,
+    handle: LocalForward,
+    stopping: bool,
+}
+
+// Owned by the terminal pane. A manager can be opened and closed independently.
+pub(super) struct Routes {
+    entries: Vec<Route>,
+    connection: watch::Receiver<()>,
+}
+
+impl Routes {
+    pub(super) fn new(session: &Session) -> Self {
+        Self {
+            entries: Vec::new(),
+            connection: session.ssh_connection_changes(),
+        }
+    }
+
+    pub(super) fn connection_changed(&mut self) -> bool {
+        if matches!(self.connection.has_changed(), Ok(true)) {
+            self.connection.borrow_and_update();
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Default)]
+struct Draft {
+    remote: String,
+    local: String,
+}
+
+impl Draft {
+    fn ports(&self) -> Result<(u16, u16), &'static str> {
+        fn port(value: &str) -> Option<u16> {
+            let value = value.trim();
+            if !value.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            value.parse::<u16>().ok().filter(|p| *p != 0)
+        }
+        let remote = port(&self.remote).ok_or("Enter a remote TCP port between 1 and 65535.")?;
+        let local = if self.local.trim().is_empty() {
+            0
+        } else {
+            port(&self.local)
+                .ok_or("Enter a Windows TCP port between 1 and 65535, or leave it blank.")?
+        };
+        Ok((local, remote))
+    }
+}
+
+pub(super) struct Panel {
+    origin: Origin,
+    endpoint: String,
+    draft: Draft,
+    feedback: String,
+}
+
+pub enum Action {
+    Open(Origin),
+    Panel(TabId, Origin, Edit),
+}
+
+pub enum Edit {
+    Remote(String),
+    Local(String),
+    Start,
+    Stop(u64),
+    Copy(u64),
+    Refresh,
+    Back,
+}
+
+pub(super) fn open(origin: Option<Origin>) -> Message {
+    origin.map_or(Message::ControlIdle, |origin| {
+        Message::LocalForward(Action::Open(origin))
+    })
+}
+
+fn edit(id: TabId, origin: Origin, edit: Edit) -> Message {
+    Message::LocalForward(Action::Panel(id, origin, edit))
+}
+
+fn windows_address(port: u16) -> String {
+    format!("127.0.0.1:{port}")
+}
+
+// A receiver can close immediately after publishing its final status. Report that
+// change once, so the view also sees the final state of a stopped listener.
+fn changed<T>(watches: &mut Vec<watch::Receiver<T>>) -> bool {
+    let mut changed = false;
+    watches.retain_mut(|watch| match watch.has_changed() {
+        Ok(false) => true,
+        Ok(true) => {
+            watch.borrow_and_update();
+            changed = true;
+            true
+        }
+        Err(_) => {
+            changed = true;
+            false
+        }
+    });
+    changed
+}
+
+impl TerminalApp {
+    pub(super) fn forward_origin(&self) -> Option<Origin> {
+        let Page::Terminal(tab) = &self.tabs.active()?.page else {
+            return None;
+        };
+        Origin::from_tab(tab)
+    }
+
+    fn forward_source(&self, origin: Origin) -> Option<TabId> {
+        let id = self.tab_for_pane(origin.pane)?;
+        let Page::Terminal(tab) = &self.tabs.get(id)?.page else {
+            return None;
+        };
+        (Origin::from_tab(tab) == Some(origin)).then_some(id)
+    }
+
+    pub(super) fn watch_forward_panel(&mut self, ctx: &ComponentContext<Self>) {
+        self.forward_watch.take();
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let Some(AppTab {
+            page: Page::LocalForwards(panel),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let origin = panel.origin;
+        let Some(source) = self.forward_source(origin) else {
+            return;
+        };
+        let Page::Terminal(tab) = &self.tabs.get(source).unwrap().page else {
+            return;
+        };
+        let mut connection = vec![tab.session.ssh_connection_changes()];
+        let mut listeners = Vec::new();
+        for route in &tab.forwards.entries {
+            let watch = route.handle.subscribe();
+            let running = watch.borrow().running;
+            if running {
+                listeners.push(watch);
+            }
+        }
+        self.finish_stopped_forwards(id, source);
+        let sender = ctx.sender();
+        const INTERVAL: u32 = 250;
+        self.forward_watch = crate::ui_timer::RetryTimer::with_next_delay(INTERVAL, move || {
+            let connection_changed = changed(&mut connection);
+            if changed(&mut listeners) || connection_changed {
+                sender.send(edit(id, origin, Edit::Refresh));
+            }
+            INTERVAL
+        })
+        .ok();
+    }
+
+    fn finish_stopped_forwards(&mut self, panel_id: TabId, source: TabId) {
+        let Page::Terminal(tab) = &mut self.tabs.get_mut(source).unwrap().page else {
+            return;
+        };
+        let mut stopped = None;
+        tab.forwards.entries.retain(|route| {
+            if route.stopping && !route.handle.status().running {
+                stopped = Some(route.handle.local_port());
+                return false;
+            }
+            true
+        });
+        if let Some(port) = stopped
+            && let Page::LocalForwards(panel) = &mut self.tabs.get_mut(panel_id).unwrap().page
+        {
+            panel.feedback = format!("Stopped forwarding port {port}.");
+        }
+    }
+
+    pub(super) fn forward_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        let (id, origin, action) = match action {
+            Action::Open(origin) => {
+                if self.forward_origin() != Some(origin) {
+                    return;
+                }
+                let existing = self.tabs.entries().iter().find_map(|entry| {
+                    matches!(&entry.value.page, Page::LocalForwards(p) if p.origin.pane == origin.pane)
+                        .then_some(entry.id)
+                });
+                let active = self.tabs.active_id().unwrap();
+                let Page::Terminal(tab) = &mut self.tabs.get_mut(active).unwrap().page else {
+                    return;
+                };
+                let Some(link) = tab.session.ssh_connection_at(origin.generation) else {
+                    return;
+                };
+                let ssh = link.options();
+                let endpoint = format!("{}@{}:{}", ssh.user, ssh.host, ssh.port);
+                tab.forwards
+                    .entries
+                    .retain(|r| r.generation == origin.generation);
+                let fresh = || AppTab {
+                    label: TITLE.into(),
+                    page: Page::LocalForwards(Panel {
+                        origin,
+                        endpoint,
+                        draft: Draft::default(),
+                        feedback: String::new(),
+                    }),
+                };
+                if let Some(existing) = existing {
+                    let page = self.tabs.get_mut(existing).unwrap();
+                    if !matches!(&page.page, Page::LocalForwards(p) if p.origin == origin) {
+                        *page = fresh();
+                    }
+                    self.tabs.select(existing);
+                } else {
+                    self.tabs.insert(fresh());
+                }
+                self.sync_selection(ctx);
+                self.activate(ctx);
+                return;
+            }
+            Action::Panel(id, origin, action) => (id, origin, action),
+        };
+        if self.tabs.active_id() != Some(id) {
+            return;
+        }
+        let Some(AppTab {
+            page: Page::LocalForwards(panel),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        if panel.origin != origin {
+            return;
+        }
+        if matches!(action, Edit::Back) {
+            if let Some(source) = self.tab_for_pane(origin.pane) {
+                self.tabs.select(source);
+                self.sync_selection(ctx);
+                self.activate(ctx);
+            }
+            return;
+        }
+        if matches!(action, Edit::Refresh) {
+            if let Some(source) = self.forward_source(origin) {
+                self.finish_stopped_forwards(id, source);
+            } else {
+                self.forward_watch.take();
+            }
+            return;
+        }
+        let Some(source) = self.forward_source(origin) else {
+            return;
+        };
+        let Page::LocalForwards(panel) = &mut self.tabs.get_mut(id).unwrap().page else {
+            return;
+        };
+        match action {
+            Edit::Remote(text) => {
+                panel.draft.remote = text;
+                return;
+            }
+            Edit::Local(text) => {
+                panel.draft.local = text;
+                return;
+            }
+            _ => {}
+        }
+        let ports = panel.draft.ports();
+        let Page::Terminal(tab) = &mut self.tabs.get_mut(source).unwrap().page else {
+            return;
+        };
+        let feedback =
+            match action {
+                Edit::Start => {
+                    let Ok((local, remote)) = ports else { return };
+                    match tab
+                        .session
+                        .start_local_forward(origin.generation, local, remote)
+                    {
+                        Ok(handle) => {
+                            static NEXT_ROUTE: AtomicU64 = AtomicU64::new(1);
+                            tab.forwards.entries.push(Route {
+                                id: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
+                                generation: origin.generation,
+                                handle,
+                                stopping: false,
+                            });
+                            String::new()
+                        }
+                        Err(error) => format!("Could not start forwarding · {error:#}"),
+                    }
+                }
+                Edit::Copy(route) | Edit::Stop(route) => {
+                    let Some(route) = tab.forwards.entries.iter_mut().find(|r| {
+                        r.id == route && r.generation == origin.generation && !r.stopping
+                    }) else {
+                        return;
+                    };
+                    let port = route.handle.local_port();
+                    if matches!(action, Edit::Copy(_)) {
+                        if !route.handle.status().running {
+                            return;
+                        }
+                        match w11term::clipboard::write(&windows_address(port)) {
+                            Ok(()) => format!("Copied Windows address {}.", windows_address(port)),
+                            Err(error) => format!("Could not copy address · {error:#}"),
+                        }
+                    } else {
+                        route.stopping = true;
+                        route.handle.stop();
+                        format!("Stopping forwarding port {port}…")
+                    }
+                }
+                _ => return,
+            };
+        let Page::LocalForwards(panel) = &mut self.tabs.get_mut(id).unwrap().page else {
+            return;
+        };
+        panel.feedback = feedback;
+        self.watch_forward_panel(ctx);
+    }
+
+    pub(super) fn forward_view(&self, id: TabId, panel: &Panel, ctx: &ViewContext<Self>) -> View {
+        let origin = panel.origin;
+        let source =
+            self.forward_source(origin)
+                .and_then(|source| match &self.tabs.get(source)?.page {
+                    Page::Terminal(tab) => Some(tab),
+                    _ => None,
+                });
+        let action = move |e| edit(id, origin, e);
+        let mut items = vec![
+            KeyedView::new("title", TextBlock::new().font_size(26.0).text(TITLE)),
+            KeyedView::new("endpoint", TextBlock::new().text(&panel.endpoint)),
+            KeyedView::new(
+                "back",
+                Button::new()
+                    .is_enabled(self.tab_for_pane(origin.pane).is_some())
+                    .on_click(ctx.callback(move |_| action(Edit::Back)))
+                    .content("Back to terminal"),
+            ),
+        ];
+        if let Some(tab) = source {
+            let draft = &panel.draft;
+            let validation = draft.ports();
+            items.extend([
+                KeyedView::new(
+                    "remote-label",
+                    TextBlock::new().text("Remote localhost port"),
+                ),
+                KeyedView::new(
+                    "remote",
+                    TextBox::new()
+                        .automation_name("Remote localhost port")
+                        .text(&draft.remote)
+                        .on_text_changed(ctx.callback(move |s| action(Edit::Remote(s)))),
+                ),
+                KeyedView::new(
+                    "local-label",
+                    TextBlock::new().text("Windows local port (blank assigns an available port)"),
+                ),
+                KeyedView::new(
+                    "local",
+                    TextBox::new()
+                        .automation_name("Windows local port")
+                        .text(&draft.local)
+                        .on_text_changed(ctx.callback(move |s| action(Edit::Local(s)))),
+                ),
+                KeyedView::new(
+                    "start",
+                    Button::new()
+                        .style(ButtonStyle::Accent)
+                        .is_enabled(validation.is_ok())
+                        .on_click(ctx.callback(move |_| action(Edit::Start)))
+                        .content("Start forwarding"),
+                ),
+            ]);
+            if !draft.remote.is_empty()
+                && let Err(error) = validation
+            {
+                items.push(KeyedView::new("validation", TextBlock::new().text(error)));
+            }
+            if !tab.forwards.entries.is_empty() {
+                items.push(KeyedView::new(
+                    "route-heading",
+                    TextBlock::new().text("Windows address → remote localhost"),
+                ));
+            }
+            for route in tab
+                .forwards
+                .entries
+                .iter()
+                .filter(|r| r.generation == origin.generation)
+            {
+                let key = route.id;
+                let local = route.handle.local_port();
+                let remote = route.handle.remote_port();
+                let status = route.handle.status();
+                let state = if route.stopping {
+                    "Stopping…".to_owned()
+                } else if status.running {
+                    let count = status.active_clients;
+                    format!(
+                        "Listening · {count} active connection{}",
+                        if count == 1 { "" } else { "s" }
+                    )
+                } else {
+                    "Stopped".to_owned()
+                };
+                let mut details = vec![
+                    KeyedView::new(
+                        "address",
+                        TextBlock::new()
+                            .text(format!("{} → 127.0.0.1:{remote}", windows_address(local))),
+                    ),
+                    KeyedView::new("status", TextBlock::new().text(state)),
+                ];
+                if let Some(reason) = status.last_error {
+                    details.push(KeyedView::new(
+                        "error",
+                        TextBlock::new()
+                            .text(reason)
+                            .text_wrapping(TextWrapping::Wrap),
+                    ));
+                }
+                details.push(KeyedView::new(
+                    "actions",
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .automation_name(format!("Copy Windows address for port {local}"))
+                                .is_enabled(status.running && !route.stopping)
+                                .on_click(ctx.callback(move |_| action(Edit::Copy(key))))
+                                .content("Copy address"),
+                            Button::new()
+                                .automation_name(format!("Stop forwarding port {local}"))
+                                .is_enabled(!route.stopping)
+                                .on_click(ctx.callback(move |_| action(Edit::Stop(key))))
+                                .content(if status.running { "Stop" } else { "Remove" }),
+                        )),
+                ));
+                items.push(KeyedView::new(
+                    format!("route/{key}"),
+                    StackPanel::new().spacing(4.0).keyed_children(details),
+                ));
+            }
+            if !panel.feedback.is_empty() {
+                items.push(KeyedView::new(
+                    "feedback",
+                    TextBlock::new()
+                        .text(&panel.feedback)
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+        } else {
+            items.push(KeyedView::new("expired", TextBlock::new()
+                .text("This SSH connection is no longer available in this window. Open Forward a local port… from a connected SSH pane.")
+                .text_wrapping(TextWrapping::Wrap)));
+        }
+        ScrollViewer::new().content(
+            StackPanel::new()
+                .margin(16.0)
+                .spacing(8.0)
+                .keyed_children(items),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_windows_port_requests_assignment_and_supplied_ports_are_decimal_tcp_ports() {
+        let mut form = Draft {
+            remote: " 65535 ".into(),
+            local: String::new(),
+        };
+        assert_eq!(form.ports(), Ok((0, 65535)));
+        form.local = " 00001 ".into();
+        assert_eq!(form.ports(), Ok((1, 65535)));
+        for bad in [
+            "0",
+            "65536",
+            "-5",
+            "+7",
+            "0x50",
+            "localhost:80",
+            "８０",
+            "8 0",
+        ] {
+            form.local = bad.into();
+            assert!(form.ports().unwrap_err().contains("Windows"), "{bad}");
+            form.local.clear();
+            form.remote = bad.into();
+            assert!(form.ports().unwrap_err().contains("remote"), "{bad}");
+            form.remote = "42".into();
+        }
+        assert!(Draft::default().ports().is_err());
+        assert_eq!(windows_address(50432), "127.0.0.1:50432");
+    }
+
+    #[test]
+    fn watcher_updates_on_status_change_or_close_and_sleeps_between_changes() {
+        let (first, rx1) = watch::channel(0);
+        let (second, rx2) = watch::channel(4);
+        let mut watches = vec![rx1, rx2];
+        assert!(!changed(&mut watches));
+        first.send_replace(1);
+        first.send_replace(2);
+        assert!(changed(&mut watches));
+        assert_eq!(*watches[0].borrow(), 2);
+        assert!(!changed(&mut watches));
+        second.send_replace(0);
+        drop(second);
+        assert!(changed(&mut watches));
+        assert_eq!(watches.len(), 1);
+        assert!(!changed(&mut watches));
+    }
+}
