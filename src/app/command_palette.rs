@@ -15,7 +15,10 @@ pub enum CommandId {
     TabAction(Shortcut, Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
-    SplitInDirectory(Axis, Option<directory_split::Origin>),
+    OpenInDirectory(
+        directory_split::Destination,
+        Option<directory_split::Origin>,
+    ),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -234,8 +237,8 @@ impl TerminalApp {
                     row.enabled = previous.is_some();
                     row.id = CommandId::FocusPreviousPane(previous);
                 }
-                shortcut if let Some(axis) = directory_split::axis(shortcut) => {
-                    row.id = CommandId::SplitInDirectory(axis, directory_split.clone());
+                shortcut if let Some(destination) = directory_split::destination(shortcut) => {
+                    row.id = CommandId::OpenInDirectory(destination, directory_split.clone());
                 }
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
@@ -319,8 +322,8 @@ impl TerminalApp {
             CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
             CommandId::LocalForward(origin) => local_forwards::open(origin),
-            CommandId::SplitInDirectory(axis, target) => {
-                directory_split::message(axis, target.as_ref())
+            CommandId::OpenInDirectory(destination, target) => {
+                directory_split::message(destination, target.as_ref())
             }
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))

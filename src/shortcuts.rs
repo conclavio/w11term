@@ -27,6 +27,7 @@ pub enum Action {
     SplitBelow,
     SplitRightInCurrentDirectory,
     SplitBelowInCurrentDirectory,
+    NewTabInCurrentDirectory,
     ZoomPane,
     RotateSplit,
     ClosePane,
@@ -130,6 +131,13 @@ pub const BINDINGS: &[Binding] = &[
         SplitBelowInCurrentDirectory,
         "split_below_in_current_directory",
         "Split below in current directory",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(
+        NewTabInCurrentDirectory,
+        "new_tab_in_current_directory",
+        "New tab in current directory",
         0,
         Mods::NONE,
     ),
@@ -243,6 +251,7 @@ impl Action {
                 | SplitBelow
                 | SplitRightInCurrentDirectory
                 | SplitBelowInCurrentDirectory
+                | NewTabInCurrentDirectory
                 | ZoomPane
                 | RotateSplit
                 | ClosePane
@@ -591,6 +600,7 @@ mod tests {
             RotateSplit,
             SplitRightInCurrentDirectory,
             SplitBelowInCurrentDirectory,
+            NewTabInCurrentDirectory,
         ];
         let mut shortcuts = Shortcuts::default();
         let chord: Chord = "F8".parse().unwrap();
