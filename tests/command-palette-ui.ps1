@@ -53,6 +53,11 @@ try {
     $null = Wait-Until 'tab name dialog' { Find-Element 'Tab name' }
     Invoke-Button (Wait-Until 'cancel rename' { Find-Element 'Cancel' ([System.Windows.Automation.ControlType]::Button) })
     $null = Wait-Until 'tab name dialog to close' { !(Find-Element 'Tab name') }
+    # WinUI hides the edit before the dialog finishes returning input to the terminal.
+    $null = Wait-Until 'PowerShell pane ready for F7 after Cancel' {
+        $doc = Find-Element ('Terminal ' + [char]0xb7 + ' Palette PowerShell') ([System.Windows.Automation.ControlType]::Document)
+        $doc -and $doc.Current.AutomationId -ceq "w11term-pane-$local"
+    }
     $field = Open-Palette 'Settings'
     $null = Search-Command $field 'settings' 'Settings'
     Press-Key 13
