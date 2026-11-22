@@ -54,6 +54,21 @@ function Wait-DisabledPreview {
         $b -and !$b.Current.IsEnabled
     }
 }
+function Close-Drawer {
+    # The window caption also has a Close button. Find the one in the nearest
+    # common WinUI container with the file actions.
+    $scope = Find-Element $preview $button
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Close'),
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button))
+    while ($scope -and $scope.Current.ProcessId -eq $app.Id) {
+        $options = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if ($options.Count -eq 1) { Invoke-Button $options[0]; return }
+        if ($options.Count -gt 1) { break }
+        $scope = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($scope)
+    }
+    throw 'Could not locate the drawer Close button independently of the window caption'
+}
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -79,13 +94,13 @@ try {
     Click $name
     Click $preview
     $text = Wait-Preview $outer
-    $range = $text.DocumentRange.FindText($needle, $false, $false)
-    if (!$range) { throw "Preview text range did not contain '$needle'" }
-    $range.Select()
-    $null = Wait-Until 'native preview selection contains only the selected text' {
+    $text.DocumentRange.Select()
+    $null = Wait-Until 'native preview selection contains the displayed text' {
         $ranges = @($text.GetSelection())
-        $ranges.Count -eq 1 -and $ranges[0].GetText(-1) -ceq $needle
+        $ranges.Count -eq 1 -and (Preview-Text $ranges[0]) -ceq $outer
     }
+    $null = Press-FocusedKey 0x4b
+    $null = Wait-Preview $outer
     Close-Preview
     # A second preview without clicking a row proves the drawer kept its selection.
     Click $preview
@@ -108,7 +123,7 @@ try {
         $msg -and $msg.Current.Name.Contains('NUL bytes') -and !(Find-Element 'File contents')
     }
     Close-Preview
-    Run-Palette 'SFTP files'
+    Close-Drawer
     $null = Wait-Until 'drawer closed' { !(Find-Element $preview $button) }
     foreach ($ch in 'after-preview'.ToCharArray()) { Post-Key 0x102 ([uint32]$ch) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-preview')
