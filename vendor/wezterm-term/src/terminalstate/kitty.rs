@@ -11,6 +11,7 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+mod feature_query;
 mod placement;
 mod playback;
 use placement::{Key, ProjectedPlacement};
@@ -516,6 +517,18 @@ impl TerminalState {
             }
         }
         match img {
+            KittyImage::FeatureQuery {
+                image_id,
+                action,
+                options,
+                verbosity,
+            } => {
+                let response = feature_query::response(image_id, action, &options, verbosity);
+                if let Some(response) = response {
+                    self.writer.write_all(response.as_bytes())?;
+                    self.writer.flush()?;
+                }
+            }
             KittyImage::Query { transmit } => match transmit.data.load_data() {
                 Ok(_) => {
                     self.kitty_send_response(
