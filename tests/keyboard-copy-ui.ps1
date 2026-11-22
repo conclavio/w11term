@@ -9,17 +9,25 @@ $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 $dot = ' ' + [char]0xb7 + ' '
-function Wait-Selection([string[]]$Expected) {
-    $null = Wait-Until "keyboard selection with exact rows [$($Expected -join '|')]" {
-        $document = Find-Element ("Terminal${dot}copy-fixture")
-        if (!$document) { return }
-        $pattern = $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
-        $ranges = @($pattern.GetSelection())
-        if ($ranges.Count -ne $Expected.Length) { return }
-        for ($i = 0; $i -lt $Expected.Length; $i++) {
-            if ($ranges[$i].GetText(-1) -cne $Expected[$i]) { return }
+function Read-SelectionRows {
+    $document = Find-Element ("Terminal${dot}copy-fixture")
+    if (!$document) { return }
+    $pattern = $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+    foreach ($range in $pattern.GetSelection()) { $range.GetText(-1) }
+}
+function Wait-Selection([string[]]$Expected, [string]$Stage = 'keyboard selection') {
+    try {
+        $null = Wait-Until "$Stage with exact rows [$($Expected -join '|')]" {
+            $rows = @(Read-SelectionRows)
+            if ($rows.Count -ne $Expected.Length) { return }
+            for ($i = 0; $i -lt $Expected.Length; $i++) {
+                if ($rows[$i] -cne $Expected[$i]) { return }
+            }
+            return $true
         }
-        return $true
+    } catch {
+        $observed = ConvertTo-Json -InputObject @(Read-SelectionRows) -Compress
+        throw "$_ Observed UIA selection: $observed"
     }
 }
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'copy-fixture') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -77,17 +85,22 @@ try {
     $null = Wait-Until 'copy mode for table selection' { Copy-ModeOpen }
     foreach ($key in 0x47,0x24,0x4a,0x4c,0x4c,0x4c,0x4c) { Press-Key $key } # g Home j l l l l
     Press-Key 0x52 # r, upper left corner
+    Wait-Selection '7' 'r anchor'
     foreach ($key in 0x4a,0x4a,0x4c,0x4c) { Press-Key $key } # j j l l
-    Wait-Selection $column
+    Wait-Selection $column 'forward r selection'
     if ($verifyClipboard -and $env:W11TERM_VERIFY_HOSTED_PASTE -ceq '1') {
         # Start a fresh rectangle at the lower right corner with the real chord.
         Press-Key 0x52
-        Wait-Selection ''
+        Wait-Selection '' 'cleared block selection'
         Add-Type -AssemblyName System.Windows.Forms
         if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'Fixture does not own keyboard input' }
         [Windows.Forms.SendKeys]::SendWait('^v')
-        foreach ($key in 0x48,0x48,0x4b,0x4b) { Press-Key $key } # h h k k
-        Wait-Selection $column
+        Wait-Selection ' ' 'Ctrl+V anchor'
+        # Posted messages can overtake native input queued for a different process.
+        # Deliver these movements through the same keyboard queue as the real chord.
+        if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'Fixture lost keyboard input' }
+        [Windows.Forms.SendKeys]::SendWait('hhkk')
+        Wait-Selection $column 'reverse Ctrl+V selection'
     }
     if ($verifyClipboard) {
         $before = [FixtureClipboard]::GetClipboardSequenceNumber()

@@ -12,14 +12,18 @@ import time
 from PIL import Image
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "kitty"
+SCENES = {
+    "placements": (["placements.vt", "layers.vt"], "samples.json"),
+    "clear-visible": (["clear-setup.vt", "clear-visible.vt"], "clear-visible-samples.json"),
+}
 
 
-def display(ready):
+def display(ready, scene):
     import fcntl
     import termios
 
-    sys.stdout.buffer.write((FIXTURE / "placements.vt").read_bytes())
-    sys.stdout.buffer.write((FIXTURE / "layers.vt").read_bytes())
+    for stream in SCENES[scene][0]:
+        sys.stdout.buffer.write((FIXTURE / stream).read_bytes())
     sys.stdout.buffer.flush()
     # GTK can resize the PTY after launching this command. Publish measured
     # geometry atomically so a capture never reads a partial or stale startup grid.
@@ -38,7 +42,7 @@ def display(ready):
         time.sleep(0.05)
 
 
-def compare(png, geometry, report):
+def compare(png, geometry, report, scene):
     cols, rows, width, height = geometry
     with Image.open(png) as image:
         image = image.convert("RGB")
@@ -46,7 +50,7 @@ def compare(png, geometry, report):
         cell_width = (width or image.width) / cols
         cell_height = (height or image.height) / rows
         measured = []
-        for item in json.loads((FIXTURE / "samples.json").read_text()):
+        for item in json.loads((FIXTURE / SCENES[scene][1]).read_text()):
             x = int((item["column"] + 0.5) * cell_width)
             y = int((item["row"] + 0.5) * cell_height)
             actual = image.getpixel((x, y)) if x < image.width and y < image.height else None
@@ -78,13 +82,13 @@ def launch_command(terminal, title):
     ]
 
 
-def capture(output, terminal):
+def capture(output, terminal, scene):
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as state, (output / f"{terminal}.log").open("w") as log:
         ready = Path(state) / "geometry"
         title = f"w11term-{terminal}-reference-{os.getpid()}"
         cmd = launch_command(terminal, title)
-        cmd.extend([sys.executable, str(Path(__file__).resolve()), "--display", str(ready)])
+        cmd.extend([sys.executable, str(Path(__file__).resolve()), "--display", str(ready), scene])
         env = {**os.environ, "LIBGL_ALWAYS_SOFTWARE": "1"}
         if terminal == "kitty":
             env["KITTY_CONFIG_DIRECTORY"] = state
@@ -110,7 +114,7 @@ def capture(output, terminal):
                 (output / "geometry.json").write_text(json.dumps(geometry))
                 subprocess.run(["import", "-window", wid, str(png)], check=True, timeout=5)
                 try:
-                    compare(png, geometry, output / "samples.json")
+                    compare(png, geometry, output / "samples.json", scene)
                     break
                 except ValueError:
                     if time.monotonic() >= deadline:
@@ -127,10 +131,11 @@ def capture(output, terminal):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--display"]:
-        display(Path(sys.argv[2]))
+        display(Path(sys.argv[2]), sys.argv[3])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("output", type=Path)
         parser.add_argument("--terminal", choices=("kitty", "ghostty"), default="kitty")
+        parser.add_argument("--scene", choices=SCENES, default="placements")
         args = parser.parse_args()
-        capture(args.output, args.terminal)
+        capture(args.output, args.terminal, args.scene)

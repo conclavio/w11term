@@ -1,12 +1,12 @@
 use super::*;
-use crate::Line;
+use crate::{Line, StableRowIndex};
 use std::collections::BTreeMap;
 use wezterm_cell::{color::ColorAttribute, image::ImageCell};
 use wezterm_surface::TextureCoordinate;
 
 mod diacritics;
 
-type Key = (u32, Option<u32>);
+pub(super) type Key = (u32, Option<u32>);
 type Point = (i64, i64);
 const MAX_DEPTH: usize = 16;
 const MAX_PROJECTED_TILES: usize = 65536;
@@ -91,69 +91,51 @@ impl TerminalState {
         }
         Err("ETOODEEP")
     }
-    pub(super) fn has_virtual_ancestor(&self, mut key: Key) -> bool {
-        while let Some(node) = self.kitty_img.projected.get(&key) {
-            if node.placement.virtual_placement {
-                return true;
+    pub(super) fn collect_kitty_dependents(
+        &self,
+        deleted: &mut HashSet<Key>,
+        free_ids: &mut HashSet<u32>,
+    ) {
+        for _ in 0..MAX_DEPTH {
+            let before = deleted.len();
+            for (&child, node) in &self.kitty_img.projected {
+                if node.parent.is_some_and(|parent| deleted.contains(&parent)) {
+                    deleted.insert(child);
+                    free_ids.insert(child.0);
+                }
             }
-            if let Some(p) = node.parent {
-                key = p;
-            } else {
+            if deleted.len() == before {
                 break;
             }
         }
-        false
     }
-    pub(super) fn remove_kitty_dependents(&mut self, id: u32, p: Option<u32>) {
-        let matches = |k: Key| k.0 == id && (p.is_none() || k.1 == p);
-        let mut deleted: HashSet<_> = self
+
+    pub(super) fn visible_kitty_relatives(&self, keys: &mut HashSet<Key>) {
+        if self
             .kitty_img
             .projected
-            .keys()
-            .chain(self.kitty_img.placements.keys())
-            .filter(|&&k| matches(k))
-            .copied()
-            .collect();
-        let mut children = HashSet::new();
-        for _ in 0..MAX_DEPTH {
-            let next: Vec<_> = self
-                .kitty_img
-                .projected
-                .iter()
-                .filter_map(|(&key, node)| {
-                    (!deleted.contains(&key)
-                        && node.parent.is_some_and(|parent| deleted.contains(&parent)))
-                    .then_some(key)
-                })
-                .collect();
-            if next.is_empty() {
-                break;
-            }
-            for key in next {
-                deleted.insert(key);
-                children.insert(key.0);
-            }
-        }
-        self.kitty_img
-            .projected
-            .retain(|key, _| !deleted.contains(key));
-        for child in children {
-            if !self
-                .kitty_img
-                .placements
-                .keys()
-                .chain(self.kitty_img.projected.keys())
-                .any(|k| k.0 == child)
-            {
-                self.kitty_img.remove_data_for_id(child);
-                self.kitty_img.number_to_id.retain(|_, id| *id != child);
-            }
+            .values()
+            .any(|node| node.parent.is_some())
+        {
+            let screen = self.screen();
+            self.project_or_find_kitty(None, screen.phys_row(0), screen.physical_rows, Some(keys));
         }
     }
 
     /// Project virtual and relative placements onto a private copy of visible
     /// lines. The screen and its scrollback retain ordinary editable text.
     pub fn project_kitty_placements(&self, lines: &mut [Line], first_phys: usize) -> bool {
+        let height = lines.len();
+        self.project_or_find_kitty(Some(lines), first_phys, height, None)
+    }
+
+    fn project_or_find_kitty(
+        &self,
+        lines: Option<&mut [Line]>,
+        first_phys: usize,
+        height: usize,
+        mut visible_relatives: Option<&mut HashSet<Key>>,
+    ) -> bool {
         if self.kitty_img.projected.is_empty() {
             return false;
         }
@@ -181,7 +163,7 @@ impl TerminalState {
             .filter_map(|node| node.parent)
             .collect();
         let mut tiles = Vec::new();
-        let height = lines.len();
+        let render = lines.is_some();
         let mut cache = self.kitty_img.history_anchors.lock().unwrap();
         let signature = (
             self.is_alt_screen_active(),
@@ -238,8 +220,8 @@ impl TerminalState {
                 }
                 if !parents.is_empty() {
                     for tile in cell.attrs().images().into_iter().flatten() {
-                        if let Some(id) = tile.image_id() {
-                            record((id, tile.placement_id()), x);
+                        if let Some(key) = self.kitty_img.tile_key(&tile) {
+                            record(key, x);
                         }
                     }
                 }
@@ -261,7 +243,7 @@ impl TerminalState {
                             continue;
                         }
                         record(key, x);
-                        if visible && tiles.len() < MAX_PROJECTED_TILES {
+                        if render && visible && tiles.len() < MAX_PROJECTED_TILES {
                             if let Some(tile) = grid.tile(ph.col, ph.row) {
                                 tiles.push((x as usize, y as usize, tile));
                             }
@@ -288,7 +270,7 @@ impl TerminalState {
         if !parents.is_empty() {
             self.screen()
                 .for_each_phys_line(|row, line| scan(line, row as i64 - first_phys as i64));
-        } else {
+        } else if let Some(lines) = &lines {
             for (row, line) in lines.iter().enumerate() {
                 scan(line, row as i64);
             }
@@ -312,6 +294,16 @@ impl TerminalState {
             };
             x += px;
             y += py;
+            if let Some(visible) = &mut visible_relatives {
+                if x < screen.physical_cols as i64
+                    && x + i64::from(grid.cols) > 0
+                    && y < height as i64
+                    && y + i64::from(grid.rows) > 0
+                {
+                    visible.insert(key);
+                }
+                continue;
+            }
             for row in y.max(0)..(y + i64::from(grid.rows)).min(height as i64) {
                 for col in x.max(0)..(x + i64::from(grid.cols)).min(screen.physical_cols as i64) {
                     if tiles.len() == MAX_PROJECTED_TILES {
@@ -326,6 +318,7 @@ impl TerminalState {
                 }
             }
         }
+        let Some(lines) = lines else { return true };
         for (x, y, tile) in tiles {
             let line = &mut lines[y];
             if x >= line.len() {

@@ -80,6 +80,40 @@ fixtures are `cargo test --test kitty_graphics --test image_limits --test synchr
 They also check loading, finite loops, signed gaps, fragmented transfers, old
 snapshots, resizing, scrolling, parent deletion and error replies.
 
+## Clearing images
+
+`kitten icat --clear` sends `a=d,d=A`. A physical placement that intersects the live
+grid is removed in full, including any rows in scrollback. A placement wholly
+in history survives. An image with a surviving placement can be displayed again.
+Lowercase `d=a` (also the default selector) keeps the image data for redisplay.
+Clearing acts on the active primary or alternate screen, even while the user is
+reading older output. [Kitty deletion protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images)
+
+Current kitty and w11term preserve an image transmitted without a placement
+when clearing the visible screen. Kitty 0.32.2 also released stored-only
+images on `d=A`. The shared screenshot fixture uses three placed images.
+[Current kitty](https://github.com/kovidgoyal/kitty/blob/master/kitty/graphics.c#L2570-L2605) · [Kitty 0.32.2](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L1683-L1699)
+
+`kitten icat --clear-all` selects the entire client image ID range with
+`d=R,y=4294967295`. Narrower ranges use inclusive `x` and `y` bounds and
+reach placements in scrollback. Lowercase `r` keeps the selected image data
+and uppercase `R` releases it. A delete command also cancels an unfinished
+transmission on that screen. [icat implementation](https://github.com/kovidgoyal/kitty/blob/master/kittens/icat/main.go)
+
+The Direct2D and stock kitty checks share `clear-setup.vt` and `clear-visible.vt`.
+The scene scrolls two lines, clears visible placements and tries to redisplay
+three images. Only the fully scrolled-off red image reappears. A Windows test
+also checks GPU texture counts on successive draws (three, one, then zero
+after the range clear). Rust wire tests cover range deletion, which kitty
+introduced in 0.33 after the pinned 0.32.2 reference.
+
+Range selection addresses client image IDs. This engine still represents
+anonymous uploads with ID zero. On a width reduction, a row containing only
+spaces and image tiles can clip horizontally under the existing text reflow
+rules. Deleting a placement checks its retained tiles after a resize.
+
+## Linux reference captures
+
 The `Kitty graphics reference` workflow runs two independent Linux jobs under
 Xvfb with Mesa software GL. One captures Ubuntu 24.04's kitty 0.32.2. The
 other captures Ghostty 1.4.0, the release that added animation and relative
@@ -119,7 +153,7 @@ solid glyph, and equal- and different-z image overlaps. The solid image tiles
 contain 8×8 texels so the cell-center sample falls inside an opaque texture
 region on all three renderers. The original five sample
 points exercise placement and selected animation frames. GPU interpolation,
-general deletion selectors, placeholders under every rendition attribute, and every
+other deletion selectors, placeholders under every rendition attribute, and every
 possible compositing edge remain outside this fixture.
 
 The equal-z sample transmits image 70 before 71, then places 71 before 70.

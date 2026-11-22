@@ -1905,6 +1905,27 @@ mod tests {
 
     #[test]
     fn offscreen_kitty_reference_cell_centers() {
+        assert_kitty_reference_colors(
+            &[
+                include_bytes!("../tests/fixtures/kitty/placements.vt"),
+                include_bytes!("../tests/fixtures/kitty/layers.vt"),
+            ],
+            include_bytes!("../tests/fixtures/kitty/samples.json"),
+        );
+    }
+
+    #[test]
+    fn clear_visible_kitty_images_matches_reference_pixels() {
+        assert_kitty_reference_colors(
+            &[KITTY_CLEAR_SETUP, KITTY_CLEAR_VISIBLE],
+            include_bytes!("../tests/fixtures/kitty/clear-visible-samples.json"),
+        );
+    }
+
+    const KITTY_CLEAR_SETUP: &[u8] = include_bytes!("../tests/fixtures/kitty/clear-setup.vt");
+    const KITTY_CLEAR_VISIBLE: &[u8] = include_bytes!("../tests/fixtures/kitty/clear-visible.vt");
+
+    fn assert_kitty_reference_colors(streams: &[&[u8]], expected: &[u8]) {
         #[derive(serde::Deserialize)]
         struct Sample {
             column: usize,
@@ -1921,15 +1942,15 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut terminal = w11term::terminal::create(size, tx);
-        terminal.advance_bytes(include_bytes!("../tests/fixtures/kitty/placements.vt"));
-        terminal.advance_bytes(include_bytes!("../tests/fixtures/kitty/layers.vt"));
+        for stream in streams {
+            terminal.advance_bytes(stream);
+        }
         let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("w11term.png");
         screenshot(&frame, size, &path).unwrap();
         let actual = image::open(path).unwrap().into_rgb8();
-        let samples: Vec<Sample> =
-            serde_json::from_slice(include_bytes!("../tests/fixtures/kitty/samples.json")).unwrap();
+        let samples: Vec<Sample> = serde_json::from_slice(expected).unwrap();
         for sample in samples {
             let x =
                 ((sample.column as f32 + 0.5) * actual.width() as f32 / size.cols as f32) as u32;
@@ -1947,6 +1968,40 @@ mod tests {
                     sample.rgb
                 );
             }
+        }
+    }
+
+    #[test]
+    fn kitty_clear_commands_release_gpu_textures_on_the_next_draw() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::new().unwrap();
+        let size = wezterm_term::TerminalSize {
+            cols: 16,
+            rows: 8,
+            pixel_width: 160,
+            pixel_height: 160,
+            dpi: 96,
+        };
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let target = device.create_render_target(320, 240).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        let clear_all = b"\x1b_Ga=d,d=R,x=0,y=4294967295,q=2\x1b\\";
+        for (sequence, stream, textures) in [
+            (1, KITTY_CLEAR_SETUP, 3),
+            (2, KITTY_CLEAR_VISIBLE, 1),
+            (3, clear_all.as_slice(), 0),
+        ] {
+            terminal.advance_bytes(stream);
+            let snapshot = Snapshot::capture(&terminal, None, sequence, 0, String::new(), 0);
+            target
+                .draw(|ctx| {
+                    renderer.draw_surface(ctx, 320.0, 240.0, sequence == 1, &snapshot)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(renderer.images.len(), textures, "after draw {sequence}");
+            assert_eq!(renderer.tile_bytes, textures * 8 * 8 * 4);
         }
     }
 

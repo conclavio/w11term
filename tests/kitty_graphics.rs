@@ -4,6 +4,43 @@ use wezterm_term::{Terminal, TerminalSize, image::ImageDataType};
 const PLACEMENTS: &[u8] = include_bytes!("fixtures/kitty/placements.vt");
 const ANIMATION: &[u8] = include_bytes!("fixtures/kitty/animation.vt");
 
+#[test]
+fn range_deletion_round_trips_icat_and_rejects_malformed_bounds() {
+    use termwiz::escape::{Action, KittyImage, apc::KittyImageDelete, parser::Parser};
+    for (fields, canonical, first, last, delete) in [
+        ("d=R,y=4294967295", "d=R,y=4294967295", 0, u32::MAX, true),
+        ("d=r,x=7,y=9", "d=r,x=7,y=9", 7, 9, false),
+        ("d=r,x=9,y=7", "d=r,x=9,y=7", 9, 7, false),
+        ("d=R,x=7", "d=R,x=7", 7, 0, true),
+        ("d=r", "d=r", 0, 0, false),
+        ("d=R,x=0,y=0", "d=R", 0, 0, true),
+    ] {
+        let wire = format!("\x1b_Ga=d,{fields}\x1b\\");
+        let actions = Parser::new().parse_as_vec(wire.as_bytes());
+        let Action::KittyImage(cmd) = &actions[0] else {
+            panic!("unparsed {fields}")
+        };
+        let KittyImage::Delete { what, .. } = cmd.as_ref() else {
+            panic!("expected deletion")
+        };
+        assert_eq!(
+            *what,
+            KittyImageDelete::ByImageIdRange {
+                first,
+                last,
+                delete
+            }
+        );
+        let encoded: String = actions.iter().map(ToString::to_string).collect();
+        assert_eq!(encoded, format!("\x1b_Ga=d,{canonical}\x1b\\"));
+    }
+    for bad in ["", "-1", "+1", "00000000000", "5x", "4294967296"] {
+        for key in ["x", "y"] {
+            assert!(KittyImage::parse_apc(format!("Ga=d,d=R,{key}={bad}").as_bytes()).is_none());
+        }
+    }
+}
+
 fn engine() -> (
     Terminal,
     tokio::sync::mpsc::UnboundedReceiver<TransportInput>,
@@ -25,6 +62,23 @@ fn engine() -> (
 }
 fn frame(t: &Terminal, old: Option<&Snapshot>, scroll: usize) -> Snapshot {
     Snapshot::capture(t, old, 1, scroll, String::new(), 0)
+}
+async fn read_through(
+    replies: &mut tokio::sync::mpsc::UnboundedReceiver<TransportInput>,
+    suffix: &[u8],
+) -> String {
+    let mut answer = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !answer.ends_with(suffix) {
+            let Some(TransportInput::Data(bytes)) = replies.recv().await else {
+                panic!("expected a terminal reply");
+            };
+            answer.extend(bytes);
+        }
+    })
+    .await
+    .expect("terminal reply timed out");
+    String::from_utf8(answer).unwrap()
 }
 fn pixel(f: &Snapshot, x: usize, y: usize, id: u32) -> Option<[u8; 4]> {
     let tiles = f.rows.get(y)?.get_cell(x)?.attrs().images()?;
@@ -148,19 +202,7 @@ async fn ancestry_errors_preserve_good_placements_and_normal_parent_reanchors() 
         ("i=2,p=2,P=88,Q=3", "ENOPARENT"),
     ] {
         t.advance_bytes(format!("\x1b_Ga=p,{command}\x1b\\"));
-        let mut response = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !response.ends_with(b"\x1b\\") {
-                if let Some(TransportInput::Data(data)) = replies.recv().await {
-                    response.extend(data);
-                } else {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        let response = String::from_utf8(response).unwrap();
+        let response = read_through(&mut replies, b"\x1b\\").await;
         assert!(
             response.contains(reason),
             "expected {reason}, received {response:?}"
@@ -246,7 +288,7 @@ async fn running_session_publishes_frames_without_incoming_data() {
 }
 
 #[test]
-fn global_delete_retains_only_virtual_prototypes() {
+fn visible_delete_retains_virtual_prototype_and_removes_its_displayed_child() {
     let (mut terminal, _) = engine();
     terminal.advance_bytes(PLACEMENTS);
     terminal.advance_bytes(b"\x1b_Ga=d,d=A\x1b\\");
@@ -254,4 +296,265 @@ fn global_delete_retains_only_virtual_prototypes() {
     assert!(pixel(&committed, 2, 2, 42).is_some());
     assert!(pixel(&committed, 5, 3, 43).is_none());
     assert!(pixel(&committed, 2, 4, 44).is_none());
+}
+
+const RED: Option<[u8; 4]> = Some([255, 0, 0, 255]);
+
+fn transmit_red(t: &mut Terminal, id: u32) {
+    t.advance_bytes(format!("\x1b_Ga=t,i={id},f=32,s=1,v=1,q=2;/wAA/w==\x1b\\"));
+}
+
+fn place(t: &mut Terminal, id: u32, placement: u32, row: usize, col: usize, height: usize) {
+    t.advance_bytes(format!(
+        "\x1b[{row};{col}H\x1b_Ga=p,i={id},p={placement},c=1,r={height},C=1,q=2\x1b\\"
+    ));
+}
+
+#[test]
+fn visible_delete_removes_intersecting_placements_and_preserves_historical_references() {
+    for (delete, redisplay) in [("a=d", RED), ("a=d,d=a", RED), ("a=d,d=A", None)] {
+        let (mut t, _) = engine();
+        for id in 11..=14 {
+            transmit_red(&mut t, id);
+        }
+        place(&mut t, 11, 1, 1, 1, 1);
+        place(&mut t, 11, 2, 5, 7, 1); // A second placement sharing the historical image.
+        place(&mut t, 12, 1, 2, 3, 2); // Straddles the new top edge.
+        place(&mut t, 13, 1, 4, 5, 1);
+        t.advance_bytes(b"\x1b[8;1H\r\n\r\n");
+        let history = frame(&t, None, 2);
+        let live = frame(&t, None, 0);
+        assert_eq!(pixel(&history, 0, 0, 11), RED);
+        assert_eq!(pixel(&history, 2, 1, 12), RED);
+        assert_eq!(pixel(&live, 2, 0, 12), RED);
+        assert_eq!(pixel(&live, 4, 1, 13), RED);
+        assert_eq!(pixel(&live, 6, 2, 11), RED);
+
+        t.advance_bytes(format!("\x1b_G{delete}\x1b\\"));
+        let history = frame(&t, Some(&history), 2);
+        let live = frame(&t, Some(&live), 0);
+        assert_eq!(pixel(&history, 0, 0, 11), RED, "{delete}");
+        assert_eq!(pixel(&history, 2, 1, 12), None, "{delete}");
+        assert_eq!(pixel(&live, 2, 0, 12), None, "{delete}");
+        assert_eq!(pixel(&live, 4, 1, 13), None, "{delete}");
+        assert_eq!(pixel(&live, 6, 2, 11), None, "{delete}");
+
+        for id in 11..=14 {
+            place(&mut t, id, 3, 7, (id - 10) as usize, 1);
+        }
+        let placed = frame(&t, Some(&live), 0);
+        assert_eq!(
+            pixel(&placed, 0, 6, 11),
+            RED,
+            "historical reference keeps data"
+        );
+        assert_eq!(pixel(&placed, 1, 6, 12), redisplay, "{delete}");
+        assert_eq!(pixel(&placed, 2, 6, 13), redisplay, "{delete}");
+        assert_eq!(
+            pixel(&placed, 3, 6, 14),
+            RED,
+            "unplaced image was not visible"
+        );
+    }
+}
+
+#[tokio::test]
+async fn id_range_deletes_both_endpoints_and_releases_only_matching_images() {
+    for (selector, redisplay) in [('r', RED), ('R', None)] {
+        let (mut t, mut replies) = engine();
+        for id in 19..=23 {
+            transmit_red(&mut t, id);
+            if id != 21 {
+                // Keep one matching image in storage without a placement.
+                place(
+                    &mut t,
+                    id,
+                    1,
+                    if id == 20 { 1 } else { 4 },
+                    (id - 18) as usize,
+                    1,
+                );
+            }
+        }
+        t.advance_bytes(b"\x1b[8;1H\r\n");
+        let history = frame(&t, None, 1);
+        let live = frame(&t, None, 0);
+        assert_eq!(pixel(&history, 1, 0, 20), RED);
+        assert_eq!(pixel(&live, 3, 2, 22), RED);
+        t.advance_bytes(format!("\x1b_Ga=d,d={selector},x=20,y=22\x1b\\"));
+        assert_eq!(pixel(&frame(&t, Some(&history), 1), 1, 0, 20), None);
+        let deleted = frame(&t, Some(&live), 0);
+        assert_eq!(pixel(&deleted, 0, 2, 19), RED);
+        assert_eq!(pixel(&deleted, 3, 2, 22), None);
+        assert_eq!(pixel(&deleted, 4, 2, 23), RED);
+
+        for id in 19..=23 {
+            place(&mut t, id, 2, 6, (id - 18) as usize, 1);
+        }
+        let placed = frame(&t, Some(&deleted), 0);
+        for (x, expected) in [RED, redisplay, redisplay, redisplay, RED]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                pixel(&placed, x, 5, 19 + x as u32),
+                expected,
+                "d={selector}, x={x}"
+            );
+        }
+
+        // Delete itself is silent. A later identified animation command with q=1
+        // reports a missing backing image; the status query fences both replies.
+        t.advance_bytes(b"\x1b_Ga=a,i=21,s=1,q=1\x1b\\\x1b[5n");
+        let reply = read_through(&mut replies, b"\x1b[0n").await;
+        let answer = reply.strip_suffix("\x1b[0n").unwrap();
+        if selector == 'R' {
+            let error = answer
+                .strip_prefix("\x1b_Gi=21;")
+                .unwrap()
+                .strip_suffix("\x1b\\")
+                .unwrap();
+            assert_eq!(error.split(':').next(), Some("ENOENT"));
+        } else {
+            assert_eq!(answer, "");
+        }
+    }
+}
+
+#[test]
+fn deleting_on_the_alternate_screen_preserves_the_primary_image_with_the_same_id() {
+    for delete in ["a=d,d=A", "a=d,d=R,x=41,y=41"] {
+        let (mut t, _) = engine();
+        transmit_red(&mut t, 41);
+        place(&mut t, 41, 7, 3, 5, 1);
+        let primary = frame(&t, None, 0);
+        assert_eq!(pixel(&primary, 4, 2, 41), RED);
+        t.advance_bytes(b"\x1b[?1049h");
+        place(&mut t, 41, 7, 3, 5, 1);
+        assert_eq!(pixel(&frame(&t, None, 0), 4, 2, 41), None);
+        t.advance_bytes(b"\x1b_Ga=t,i=41,f=32,s=1,v=1,q=2;AAD//w==\x1b\\");
+        place(&mut t, 41, 7, 3, 5, 1);
+        let alternate = frame(&t, None, 0);
+        assert_eq!(pixel(&alternate, 4, 2, 41), Some([0, 0, 255, 255]));
+        t.advance_bytes(format!("\x1b_G{delete}\x1b\\"));
+        place(&mut t, 41, 8, 2, 2, 1);
+        let cleared = frame(&t, Some(&alternate), 0);
+        assert_eq!(pixel(&cleared, 4, 2, 41), None);
+        assert_eq!(pixel(&cleared, 1, 1, 41), None);
+        t.advance_bytes(b"\x1b[?1049l");
+        place(&mut t, 41, 8, 2, 2, 1);
+        let restored = frame(&t, None, 0);
+        assert_eq!(
+            pixel(&restored, 4, 2, 41),
+            RED,
+            "{delete}: primary placement"
+        );
+        assert_eq!(pixel(&restored, 1, 1, 41), RED, "{delete}: primary data");
+    }
+}
+
+#[test]
+fn replacing_a_moved_placement_then_deleting_it_leaves_no_tiles_in_the_retained_grid() {
+    fn tile_positions(t: &Terminal) -> Vec<(usize, usize)> {
+        let mut positions = Vec::new();
+        for (row, line) in t.screen().physical_lines().enumerate() {
+            for cell in line.visible_cells() {
+                for tile in cell.attrs().images().into_iter().flatten() {
+                    if tile.image_id() == Some(41) {
+                        positions.push((row, cell.cell_index()));
+                    }
+                }
+            }
+        }
+        positions
+    }
+    for resize in [true, false] {
+        let (mut t, _) = engine();
+        t.advance_bytes(b"first text line\r\nsecond text line");
+        transmit_red(&mut t, 41);
+        place(&mut t, 41, 7, 2, 14, 1);
+        assert_eq!(tile_positions(&t), [(1, 13)]);
+        if resize {
+            let size = t.get_size();
+            t.resize(TerminalSize {
+                cols: 8,
+                pixel_width: 80,
+                ..size
+            });
+        } else {
+            t.advance_bytes(b"\x1b[H\x1b[2L");
+        }
+        let moved = tile_positions(&t);
+        assert_eq!(moved.len(), 1);
+        assert!(
+            moved[0].0 > 1,
+            "old tile must move beyond row 1: {moved:?}, resize={resize}"
+        );
+        t.advance_bytes(b"\x1b[H\x1b_Ga=T,i=41,p=7,c=1,r=1,C=1,f=32,s=1,v=1,q=2;AAD//w==\x1b\\");
+        assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 41), Some([0, 0, 255, 255]));
+        assert_eq!(
+            tile_positions(&t),
+            [(t.screen().phys_row(0), 0)],
+            "stale tile after replacement"
+        );
+        t.advance_bytes(b"\x1b_Ga=d,d=R,x=41,y=41\x1b\\");
+        assert!(tile_positions(&t).is_empty(), "stale tile after deletion");
+    }
+}
+
+#[test]
+fn same_image_and_placement_ids_on_reconnect_leave_the_previous_sessions_pixels_in_history() {
+    let (mut t, _) = engine();
+    transmit_red(&mut t, 41);
+    place(&mut t, 41, 7, 1, 1, 1);
+    t.reset_connection();
+    assert_eq!(pixel(&frame(&t, None, usize::MAX), 0, 0, 41), RED);
+    // A new connection is free to reuse both identifiers at the exact same cell.
+    t.advance_bytes(b"\x1b_Ga=t,i=41,f=32,s=1,v=1,q=2;AAD//w==\x1b\\");
+    place(&mut t, 41, 7, 1, 1, 1);
+    let current = frame(&t, None, 0);
+    assert_eq!(pixel(&current, 0, 0, 41), Some([0, 0, 255, 255]));
+    assert_eq!(pixel(&frame(&t, None, usize::MAX), 0, 0, 41), RED);
+    t.advance_bytes(b"\x1b_Ga=d,d=R,x=41,y=41\x1b\\");
+    assert_eq!(pixel(&frame(&t, Some(&current), 0), 0, 0, 41), None);
+    assert_eq!(pixel(&frame(&t, None, usize::MAX), 0, 0, 41), RED);
+}
+
+#[test]
+fn both_screens_share_the_image_id_budget() {
+    let (mut t, _) = engine();
+    for id in 1..=512 {
+        transmit_red(&mut t, id);
+    }
+    place(&mut t, 512, 1, 1, 1, 1);
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 512), RED);
+    t.advance_bytes(b"\x1b[?1049h");
+    transmit_red(&mut t, 513);
+    place(&mut t, 513, 1, 1, 1, 1);
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 513), None);
+    t.advance_bytes(b"\x1b[?1049l\x1b_Ga=d,d=R,x=1,y=1\x1b\\\x1b[?1049h");
+    transmit_red(&mut t, 513);
+    place(&mut t, 513, 1, 1, 1, 1);
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 513), RED);
+    t.advance_bytes(b"\x1b[?1049l");
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 512), RED);
+}
+
+#[test]
+fn delete_aborts_an_unfinished_chunk_even_when_the_selector_matches_nothing() {
+    for delete in ["a=d", "a=d,d=i,i=99", "a=d,d=R,x=80,y=81"] {
+        let (mut t, _) = engine();
+        // Three bytes of a four-byte RGBA pixel precede deletion. The orphaned
+        // continuation would make it a valid green pixel if the upload survived.
+        t.advance_bytes(b"\x1b_Ga=T,i=31,p=1,f=32,s=1,v=1,c=1,r=1,C=1,q=2,m=1;AP8A\x1b\\");
+        t.advance_bytes(format!("\x1b_G{delete}\x1b\\"));
+        t.advance_bytes(b"\x1b_Gm=0,q=2;/w==\x1b\\");
+        place(&mut t, 31, 2, 1, 2, 1);
+        let cancelled = frame(&t, None, 0);
+        assert_eq!(pixel(&cancelled, 0, 0, 31), None, "{delete}");
+        assert_eq!(pixel(&cancelled, 1, 0, 31), None, "{delete}");
+        transmit_red(&mut t, 31);
+        place(&mut t, 31, 3, 1, 3, 1);
+        assert_eq!(pixel(&frame(&t, Some(&cancelled), 0), 2, 0, 31), RED);
+    }
 }
