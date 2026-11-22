@@ -51,11 +51,14 @@ function Close-FixtureViews {
         } else {
             # Windows 11 can open a tab inside an existing Explorer window.
             # Invoke only the close button of the uniquely named fixture tab.
-            $tab = $tabs | Where-Object { $_.Current.Name -eq $leaf } | Select-Object -First 1
+            $tab = $tabs | Where-Object { $_.Current.Name.Contains($leaf) } | Select-Object -First 1
             if (!$tab) { throw 'Could not identify the fixture tab in the shared Explorer window' }
-            $close = $tab.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+            $buttons = $tab.FindAll([System.Windows.Automation.TreeScope]::Descendants,
                 [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,
                     [System.Windows.Automation.ControlType]::Button))
+            $close = if ($buttons.Count -eq 1) { $buttons[0] } else {
+                $buttons | Where-Object { $_.Current.AutomationId -like '*Close*' -or $_.Current.Name -like 'Close tab*' } | Select-Object -First 1
+            }
             if (!$close) { throw 'Could not identify the fixture tab close button' }
             Invoke-Button $close
         }
