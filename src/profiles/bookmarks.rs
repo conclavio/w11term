@@ -28,19 +28,33 @@ impl BookmarkPeer {
         }
     }
 
+    pub fn connection_matches_profile(link: &ConnectionShare, options: &SshOptions) -> bool {
+        matches_profile(link.verified_endpoint(), options)
+    }
+
     fn check_profile(&self, options: &SshOptions) -> Result<()> {
         ensure!(
-            self.host.eq_ignore_ascii_case(&options.host)
-                && self.user == options.user
-                && self.port == options.port
-                && options
-                    .host_key
-                    .as_ref()
-                    .is_none_or(|pin| pin == &self.fingerprint),
+            matches_profile(
+                (&self.host, &self.user, self.port, &self.fingerprint),
+                options
+            ),
             "The SSH profile no longer matches this connection's host, user, port or host key"
         );
         Ok(())
     }
+}
+
+fn matches_profile(
+    (host, user, port, fingerprint): (&str, &str, u16, &str),
+    options: &SshOptions,
+) -> bool {
+    host.eq_ignore_ascii_case(&options.host)
+        && user == options.user
+        && port == options.port
+        && options
+            .host_key
+            .as_deref()
+            .is_none_or(|pin| pin == fingerprint)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,8 +95,7 @@ pub fn bookmark_directory(path: &str) -> Option<&str> {
     }
     let path = path.strip_suffix('/').unwrap_or(path);
     let relative = path.strip_prefix('/')?;
-    (!path.contains('\\')
-        && !path.chars().any(char::is_control)
+    (!path.chars().any(char::is_control)
         && relative
             .split('/')
             .all(|part| !matches!(part, "" | "." | "..")))

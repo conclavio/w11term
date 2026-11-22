@@ -33,7 +33,7 @@ fn bookmarks_round_trip_and_share_neither_fingerprints_profiles_nor_catalogs() {
     let first = tempfile::tempdir().unwrap();
     let s = store(&first);
     let key = peer();
-    let saved = "/srv/crew's 日本 $tree";
+    let saved = r"/srv/crew's 日本 $tree\リプレイ";
     assert_eq!(
         s.add_bookmark("work", &key, &format!("{saved}/")).unwrap(),
         [saved]
@@ -126,7 +126,8 @@ fn bookmark_writes_validate_the_live_peer_and_fail_without_replacing_invalid_dat
         assert!(s.add_bookmark("work", &invalid, "/work").is_err());
     }
     for invalid in [
-        "", ".", "relative", "/../top", "/a/.", "//", "//a", "/a//b", "/a\\b", "/a\nb", "/a\0b",
+        "", ".", "relative", "C:\\work", "\\rooted", "/../top", "/a/.", "//", "//a", "/a//b",
+        "/a\nb", "/a\0b",
     ] {
         assert!(
             s.add_bookmark("work", &key, invalid).is_err(),

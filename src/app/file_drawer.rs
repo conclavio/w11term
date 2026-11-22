@@ -10,6 +10,15 @@ mod bookmarks;
 
 const PAGE_SIZE: usize = 32;
 
+fn request_generation(operation: &Operation, generation: u64) -> Option<u64> {
+    // A drawer opened before the first login can request its initial listing.
+    // Once connected, every path belongs to the SSH peer that supplied it.
+    match (operation, generation) {
+        (Operation::Realpath { .. } | Operation::Ls { .. }, 0) => None,
+        _ => Some(generation),
+    }
+}
+
 #[derive(Clone)]
 pub enum FileAction {
     Toggle,
@@ -1163,14 +1172,7 @@ impl FileDrawer {
         session
             .input
             .send(Command::Sftp(Job {
-                expected_generation: (matches!(
-                    step,
-                    Step::Change { .. } | Step::IdentifyDelete(_) | Step::Transfer(_)
-                ) || matches!(
-                    operation,
-                    Operation::ListMountedFolder { .. }
-                ))
-                .then_some(self.generation),
+                expected_generation: request_generation(&operation, self.generation),
                 operation,
                 progress: tx_progress,
                 cancel: transfer.as_ref().map(|active| active.cancel.clone()),
@@ -1537,6 +1539,15 @@ impl TerminalApp {
         if !tab.files.open {
             return content;
         }
+        let bookmark_profile = tab.profile_name.as_deref().filter(|name| {
+            self.catalog.profiles.get(*name).is_some_and(|saved| {
+                tab.session
+                    .ssh_connection_at(tab.files.generation)
+                    .is_some_and(|link| {
+                        w11term::profiles::BookmarkPeer::connection_matches_profile(&link, saved)
+                    })
+            })
+        });
         let width = (self.width * 0.45).clamp(1.0, 360.0);
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
@@ -1547,16 +1558,7 @@ impl TerminalApp {
                     Border::new().grid_column(1).content(tab.files.panel(
                         tab.session.pane_id,
                         ssh,
-                        tab.profile_name.as_deref().filter(|name| {
-                            self.catalog.profiles.get(*name).is_some_and(|saved| {
-                                saved.host.eq_ignore_ascii_case(&ssh.host)
-                                    && saved.user == ssh.user
-                                    && saved.port == ssh.port
-                            }) && tab
-                                .session
-                                .ssh_connection_at(tab.files.generation)
-                                .is_some()
-                        }),
+                        bookmark_profile,
                         context,
                     )),
                 ),
@@ -2340,6 +2342,22 @@ mod tests {
         drawer.observe_connection(17);
         assert!(drawer.filter.is_empty());
         assert!(!drawer.filter_editing());
+    }
+
+    #[test]
+    fn both_directory_read_steps_stay_bound_to_the_connection_that_supplied_the_path() {
+        let path = "/srv/logs".to_owned();
+        for request in [
+            Operation::Realpath { path: path.clone() },
+            Operation::Ls { path: path.clone() },
+        ] {
+            assert_eq!(request_generation(&request, 5), Some(5));
+            assert_eq!(request_generation(&request, 0), None);
+        }
+        assert_eq!(
+            request_generation(&Operation::ListMountedFolder { path }, 0),
+            Some(0)
+        );
     }
 
     #[test]
