@@ -79,6 +79,13 @@ pub enum Command {
     ScrollTo(isize),
     ScrollViewport(crate::terminal::ScrollbackTarget),
     ScrollRange(RangeScrollRequest),
+    CopyWord {
+        screen: crate::copy_mode::ScreenId,
+        cursor: crate::interaction::Point,
+        motion: crate::copy_mode::WordMotion,
+        delimiters: String,
+        reply: tokio::sync::oneshot::Sender<Option<crate::interaction::Point>>,
+    },
     CopyRange(
         crate::copy_mode::ScreenId,
         crate::interaction::Selection,
@@ -784,6 +791,13 @@ async fn run(
                             search.refresh(&terminal, scroll_offset);
                             search_dirty = false;
                             presentation.scrollback_cleared(terminal.screen().visible_row_to_stable_row(0));
+                        }
+                        Ok(())
+                    }
+                    Some(Command::CopyWord { screen, cursor, motion, delimiters, reply }) => {
+                        if !reply.is_closed() {
+                            let target = crate::copy_mode::word_target(&terminal, connection_generation, screen, cursor, motion, &delimiters);
+                            let _ = reply.send(target);
                         }
                         Ok(())
                     }
