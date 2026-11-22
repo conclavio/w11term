@@ -1,3 +1,4 @@
+use base64::{Engine, engine::general_purpose::STANDARD};
 use w11term::terminal::{self, Snapshot, TransportInput};
 use wezterm_term::{Terminal, TerminalSize, image::ImageDataType};
 
@@ -128,13 +129,15 @@ async fn graphics_feature_queries_only_report_options_supported_for_the_requeste
         "\x1b_Ga=q,i=39,e=p,q=1\x1b\\",
         "\x1b_Ga=q,i=40,e=p,q=2\x1b\\",
         "\x1b_Ga=q,i=41,s=1,v=1,f=24;AAAA\x1b\\",
+        "\x1b_Ga=q,i=42,e=q,f=16\x1b\\",
+        "\x1b_Ga=q,i=43,e=f,f=16\x1b\\",
         "\x1b[5n",
     ));
     let replies = read_through(&mut replies, b"\x1b[0n").await;
     assert_eq!(
         replies,
         concat!(
-            "\x1b_Gi=31,e=T,C=1,H=-2,U=1,w=3;OK\x1b\\",
+            "\x1b_Gi=31,e=T,C=1,H=-2,U=1,f=8,w=3;OK\x1b\\",
             "\x1b_Gi=32,e=f,X=1,f=24,r=1;OK\x1b\\",
             "\x1b_Gi=33,e=d,d=F,r=2;OK\x1b\\",
             "\x1b_Gi=34,e=c,C=1,r=3,w=1;OK\x1b\\",
@@ -143,6 +146,8 @@ async fn graphics_feature_queries_only_report_options_supported_for_the_requeste
             "\x1b_Gi=37,e=a,c=1,s=3,v=2,z=-1;OK\x1b\\",
             "\x1b_Gi=38,e=t,f=32,o=z,s=1,t=d,v=1;OK\x1b\\",
             "\x1b_Gi=41;OK\x1b\\",
+            "\x1b_Gi=42,e=q,f=16;OK\x1b\\",
+            "\x1b_Gi=43,e=f;OK\x1b\\",
             "\x1b[0n",
         )
     );
@@ -231,6 +236,115 @@ fn pixel(f: &Snapshot, x: usize, y: usize, id: u32) -> Option<[u8; 4]> {
             .try_into()
             .unwrap(),
     )
+}
+
+#[test]
+fn indexed_images_follow_palette_changes_and_keep_old_snapshots_intact() {
+    let (mut t, _) = engine();
+    let configured = t.palette_mut();
+    let color = |r, g, b| wezterm_term::color::RgbColor::new_8bpc(r, g, b).into();
+    configured.colors.0[247] = color(5, 6, 7);
+    configured.selection_bg = color(8, 9, 10);
+    configured.selection_fg = color(11, 12, 13);
+    configured.cursor_bg = color(14, 15, 16);
+    configured.cursor_fg = color(17, 18, 19);
+    let payload = STANDARD.encode([1, 247, 248, 249, 250, 251, 252, 253, 254, 255]);
+    t.advance_bytes(format!(
+        "\x1b]4;1;#010203\x07\x1b]11;#223344\x07\x1b]10;#556677\x07\
+         \x1b_Ga=T,f=8,s=10,v=1,i=9,c=10,r=1,C=1,q=2;{payload}\x1b\\"
+    ));
+    let old = frame(&t, None, 0);
+    let check = |frame: &Snapshot, ansi, bg, fg| {
+        let opaque = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255];
+        for (x, rgb) in [
+            ansi,
+            [5, 6, 7],
+            bg,
+            fg,
+            [8, 9, 10],
+            [11, 12, 13],
+            [14, 15, 16],
+            [17, 18, 19],
+            fg,
+            fg,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(pixel(frame, x, 0, 9), Some(opaque(rgb)), "at column {x}");
+        }
+    };
+    check(&old, [1, 2, 3], [34, 51, 68], [85, 102, 119]);
+
+    t.advance_bytes(b"\x1b]4;1;#040608\x07\x1b]11;#102030\x07\x1b]10;#abcdef\x07");
+    let updated = frame(&t, Some(&old), 0);
+    check(&updated, [4, 6, 8], [16, 32, 48], [171, 205, 239]);
+    check(&old, [1, 2, 3], [34, 51, 68], [85, 102, 119]);
+
+    t.advance_bytes(b"\x1b[?5h");
+    check(
+        &frame(&t, Some(&updated), 0),
+        [4, 6, 8],
+        [171, 205, 239],
+        [16, 32, 48],
+    );
+}
+
+#[test]
+fn anonymous_and_named_indexed_images_follow_palette_across_screen_switches() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "\x1b]4;1;#ff0000\x07",
+        "\x1b_Ga=T,f=16,s=1,v=1,c=1,r=1,C=1,o=z,q=2,m=1;eJxjbAIA\x1b\\",
+        "\x1b_Gm=0,q=2;AIYAhA==\x1b\\",
+        "\x1b[?1049h",
+        "\x1b_Ga=T,f=16,s=1,v=1,i=7,c=1,r=1,C=1,q=2;AQA=\x1b\\",
+    ));
+    let alternate = frame(&t, None, 0);
+    assert_eq!(pixel(&alternate, 0, 0, 7), Some([255, 0, 0, 0]));
+    t.advance_bytes(b"\x1b]4;1;#00ff00\x07\x1b[?1049l");
+    let primary = frame(&t, Some(&alternate), 0);
+    assert_eq!(pixel(&primary, 0, 0, 0), Some([0, 255, 0, 130]));
+    assert_eq!(pixel(&alternate, 0, 0, 7), Some([255, 0, 0, 0]));
+
+    t.advance_bytes(concat!(
+        "\x1b_Ga=d,d=A,q=2\x1b\\",
+        "\x1b_Ga=T,f=8,s=1,v=1,i=7,c=1,r=1,C=1,q=2;AQ==\x1b\\",
+        "\x1b_Ga=T,f=24,s=1,v=1,i=7,c=1,r=1,C=1,q=2;AAD/\x1b\\",
+        "\x1b]4;1;#ffffff\x07",
+    ));
+    let replaced = frame(&t, Some(&primary), 0);
+    assert_eq!(pixel(&replaced, 0, 0, 0), None);
+    assert_eq!(pixel(&replaced, 0, 0, 7), Some([0, 0, 255, 255]));
+}
+
+#[tokio::test]
+async fn indexed_queries_validate_pixels_and_animation_requests_preserve_the_image() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b]4;1;#ff0000\x07",
+        "\x1b_Ga=T,f=8,s=1,v=1,i=7,c=1,r=1,C=1,q=2;AQ==\x1b\\",
+        "\x1b_Ga=q,f=8,s=1,v=1,i=1;AQ==\x1b\\",
+        "\x1b_Ga=q,f=16,s=1,v=1,i=2;AQ==\x1b\\",
+        "\x1b_Ga=q,f=16,s=3000,v=2000,i=3;AA==\x1b\\",
+        "\x1b_Ga=q,f=8,s=0,v=1,i=4;AQ==\x1b\\",
+        "\x1b_Ga=T,f=16,s=1,v=1,i=7;AQ==\x1b\\",
+        "\x1b_Ga=f,f=24,s=1,v=1,i=7;AAD/\x1b\\",
+        "\x1b_Ga=c,i=7,r=1,c=1,w=1,h=1\x1b\\",
+        "\x1b_Ga=a,i=7,s=3\x1b\\",
+        "\x1b[5n",
+    ));
+    let output = read_through(&mut replies, b"\x1b[0n").await;
+    assert!(output.contains("\x1b_Gi=1;OK\x1b\\"), "{output:?}");
+    for id in [2, 3, 4] {
+        assert!(
+            output.contains(&format!("\x1b_Gi={id};EINVAL:")),
+            "{output:?}"
+        );
+    }
+    assert!(output.contains("exceeds 32 MiB"), "{output:?}");
+    assert_eq!(output.matches("\x1b_Gi=7;EINVAL:").count(), 4, "{output:?}");
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 7), RED);
 }
 
 #[test]

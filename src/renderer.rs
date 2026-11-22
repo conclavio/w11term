@@ -1865,6 +1865,42 @@ mod tests {
     }
 
     #[test]
+    fn offscreen_indexed_kitty_images_blend_and_follow_palette_changes() {
+        let size = wezterm_term::TerminalSize {
+            cols: 3,
+            rows: 2,
+            pixel_width: 30,
+            pixel_height: 40,
+            dpi: 96,
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(size, tx);
+        terminal.advance_bytes(concat!(
+            "\x1b[?25l\x1b]11;#000000\x07\x1b]4;1;#ff0000\x07",
+            "\x1b_Ga=T,f=8,s=1,v=1,i=1,c=1,r=1,C=1,q=2;AQ==\x1b\\",
+            "\x1b[1;2H\x1b_Ga=T,f=16,s=1,v=1,i=2,c=1,r=1,C=1,q=2;AYA=\x1b\\",
+            "\x1b[1;3H\x1b_Ga=T,f=16,s=1,v=1,i=3,c=1,r=1,C=1,q=2;AQA=\x1b\\",
+        ));
+        let first = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        terminal.advance_bytes(b"\x1b]4;1;#00ff00\x07");
+        let second = Snapshot::capture(&terminal, Some(&first), 2, 0, String::new(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        for (name, frame, colors) in [
+            ("initial", first, [[255, 0, 0], [128, 0, 0], [0, 0, 0]]),
+            ("recolored", second, [[0, 255, 0], [0, 128, 0], [0, 0, 0]]),
+        ] {
+            let path = directory.path().join(format!("{name}.png"));
+            screenshot(&frame, size, &path).unwrap();
+            let actual = image::open(path).unwrap().into_rgb8();
+            for (column, expected) in colors.into_iter().enumerate() {
+                let x = (2 * column as u32 + 1) * actual.width() / 6;
+                let pixel = actual.get_pixel(x, actual.height() / 4).0;
+                assert_eq!(pixel, expected, "{name}, column {column}");
+            }
+        }
+    }
+
+    #[test]
     fn offscreen_explicit_default_rgb_covers_a_below_background_image() {
         let size = wezterm_term::TerminalSize {
             cols: 3,

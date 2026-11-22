@@ -1,3 +1,4 @@
+use crate::color::ColorPalette;
 use crate::terminalstate::image::*;
 use crate::terminalstate::{ImageAttachParams, PlacementInfo};
 use crate::TerminalState;
@@ -12,8 +13,10 @@ use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 mod feature_query;
+mod indexed;
 mod placement;
 mod playback;
+use indexed::{IndexedImages, IndexedPixels};
 use placement::{Key, ProjectedPlacement};
 use playback::Playback;
 use wezterm_cell::image::{ImageCell, ImageDataType};
@@ -85,6 +88,7 @@ pub struct KittyImageState {
     id_to_data: HashMap<u32, Arc<ImageData>>,
     // An upload without a wire image ID belongs to its sole placement.
     anonymous_data: HashMap<Key, Arc<ImageData>>,
+    indexed: IndexedImages,
     // Cell attachments carry an occurrence token, independent of a client's p=.
     named_placements: HashMap<(u32, u32), Key>,
     placements: HashMap<Key, PhysicalPlacement>,
@@ -113,7 +117,8 @@ impl KittyImageState {
     fn remove_data_for_id(&mut self, image_id: u32) {
         self.playback.remove(&image_id);
         if let Some(data) = self.id_to_data.remove(&image_id) {
-            self.used_memory = self.used_memory.saturating_sub(data.len());
+            let freed = data.len() + self.indexed.remove(&data);
+            self.used_memory = self.used_memory.saturating_sub(freed);
         }
     }
 
@@ -155,24 +160,27 @@ impl KittyImageState {
             .id_to_data
             .values()
             .chain(self.anonymous_data.values())
-            .map(|data| data.len())
+            .map(|data| data.len() + self.indexed.len_for(data))
             .sum();
     }
 
     fn check_image_capacity(
         &mut self,
         image_id: u32,
-        data: &ImageData,
+        bytes: usize,
         inactive: &Self,
     ) -> anyhow::Result<()> {
         self.refresh_memory();
         self.prune_unreferenced();
-        let old = self.id_to_data.get(&image_id).map_or(0, |data| data.len());
+        let old = self
+            .id_to_data
+            .get(&image_id)
+            .map_or(0, |data| data.len() + self.indexed.len_for(data));
         anyhow::ensure!(
             self.used_memory
                 .saturating_sub(old)
                 .saturating_add(inactive.used_memory)
-                .saturating_add(data.len())
+                .saturating_add(bytes)
                 <= 64 * 1024 * 1024,
             "kitty image table exceeds 64 MiB"
         );
@@ -190,7 +198,8 @@ impl KittyImageState {
             self.placements.remove(key);
             self.projected.remove(key);
             if let Some(img) = self.anonymous_data.remove(key) {
-                self.used_memory = self.used_memory.saturating_sub(img.len());
+                let freed = img.len() + self.indexed.remove(&img);
+                self.used_memory = self.used_memory.saturating_sub(freed);
             }
         }
     }
@@ -266,11 +275,12 @@ impl KittyImageState {
                 .collect();
             let target = self.used_memory - budget;
             let mut freed = 0;
+            let indexed = &mut self.indexed;
             self.id_to_data.retain(|id, data| {
                 if referenced.contains(id) || freed > target {
                     true
                 } else {
-                    freed += data.len();
+                    freed += data.len() + indexed.remove(data);
                     false
                 }
             });
@@ -289,6 +299,11 @@ impl KittyImageState {
 }
 
 impl TerminalState {
+    /// Update live indexed graphics before freezing the active screen for display.
+    pub fn recolor_indexed_kitty_images(&self, palette: &ColorPalette) {
+        self.kitty_img.indexed.recolor(palette);
+    }
+
     fn reclaim_missing_kitty_placements(&mut self, placing: u32) {
         self.kitty_img.reclaim_missing(&self.screen, Some(placing));
         let inactive = if self.screen.alt_screen_is_active {
@@ -335,7 +350,7 @@ impl TerminalState {
             )
         })?);
 
-        self.kitty_place_data(image_id, image_number, img, placement, verbosity)
+        self.kitty_place_data(image_id, image_number, img, None, placement, verbosity)
     }
 
     fn kitty_place_data(
@@ -343,6 +358,7 @@ impl TerminalState {
         image_id: u32,
         image_number: Option<u32>,
         img: Arc<ImageData>,
+        indexed: Option<IndexedPixels>,
         mut placement: KittyImagePlacement,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
@@ -436,7 +452,9 @@ impl TerminalState {
             self.kitty_img.named_placements.insert((image_id, p), key);
         }
         if image_id == 0 {
-            self.kitty_img.used_memory += img.len();
+            self.kitty_img.used_memory +=
+                img.len() + indexed.as_ref().map_or(0, IndexedPixels::len);
+            self.kitty_img.indexed.insert(&img, indexed);
             self.kitty_img.anonymous_data.insert(key, img);
         }
         Ok(())
@@ -529,26 +547,20 @@ impl TerminalState {
                     self.writer.flush()?;
                 }
             }
-            KittyImage::Query { transmit } => match transmit.data.load_data() {
-                Ok(_) => {
-                    self.kitty_send_response(
-                        verbosity,
-                        true,
-                        transmit.image_id,
-                        transmit.image_number,
-                        "OK".to_string(),
-                    );
-                }
-                Err(err) => {
-                    self.kitty_send_response(
-                        verbosity,
-                        false,
-                        transmit.image_id,
-                        transmit.image_number,
-                        format!("ERROR:{:#}", err),
-                    );
-                }
-            },
+            KittyImage::Query { transmit } => {
+                let (id, number) = (transmit.image_id, transmit.image_number);
+                let stride = indexed::stride(transmit.format.as_ref());
+                let result = match stride {
+                    Some(stride) => checked_indexed_pixels(transmit, stride).map(|_| ()),
+                    None => transmit.data.load_data().map(|_| ()).map_err(Into::into),
+                };
+                let message = match &result {
+                    Ok(()) => "OK".into(),
+                    Err(err) if stride.is_some() => format!("EINVAL:{err:#}"),
+                    Err(err) => format!("ERROR:{err:#}"),
+                };
+                self.kitty_send_response(verbosity, result.is_ok(), id, number, message);
+            }
             KittyImage::Display {
                 image_id,
                 image_number,
@@ -596,6 +608,9 @@ impl TerminalState {
                     })
                     .ok_or("ENOENT")
                     .and_then(|(id, img)| {
+                        if self.kitty_img.indexed.len_for(&img) != 0 {
+                            return Err("EINVAL:indexed images do not support animation");
+                        }
                         let now = self.kitty_animation_time.unwrap_or_else(Instant::now);
                         self.kitty_img.playback.entry(id).or_default().control(
                             &mut img.data(),
@@ -1092,6 +1107,16 @@ impl TerminalState {
             .id_to_data
             .get(&image_id)
             .ok_or_else(|| anyhow::anyhow!("invalid image id {}", image_id))?;
+        if self.kitty_img.indexed.len_for(img) != 0 {
+            self.kitty_send_response(
+                verbosity,
+                false,
+                Some(image_id),
+                frame.image_number,
+                "EINVAL:indexed images do not support frame composition".into(),
+            );
+            return Ok(());
+        }
 
         let mut img = img.data();
         match &mut *img {
@@ -1202,7 +1227,22 @@ impl TerminalState {
             }
         }
 
-        let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
+        let indexed_source = indexed::stride(transmit.format.as_ref()).is_some();
+        let indexed_target = transmit
+            .image_id
+            .and_then(|id| self.kitty_img.id_to_data.get(&id))
+            .is_some_and(|img| self.kitty_img.indexed.len_for(img) != 0);
+        if indexed_source || indexed_target {
+            self.kitty_send_response(
+                verbosity,
+                false,
+                transmit.image_id,
+                transmit.image_number,
+                "EINVAL:indexed images do not support animation frames".into(),
+            );
+            return Ok(());
+        }
+        let (image_id, image_number, img, _) = self.kitty_img_transmit_inner(transmit)?;
 
         let img = match img.decode() {
             ImageDataType::Rgba8 {
@@ -1454,7 +1494,7 @@ impl TerminalState {
     fn kitty_img_transmit_inner(
         &mut self,
         transmit: KittyImageTransmit,
-    ) -> anyhow::Result<(u32, Option<u32>, ImageDataType)> {
+    ) -> anyhow::Result<(u32, Option<u32>, ImageDataType, Option<IndexedPixels>)> {
         log::trace!("transmit {:?}", transmit);
         let (id, no) = match (
             transmit.image_id.filter(|&id| id != 0),
@@ -1476,18 +1516,14 @@ impl TerminalState {
             }
         };
 
-        let data = transmit
-            .data
-            .load_data()
-            .context("data should have been materialized in coalesce_kitty_accumulation")?;
+        if let Some(stride) = indexed::stride(transmit.format.as_ref()) {
+            let pixels = checked_indexed_pixels(transmit, stride)?;
+            let palette = self.palette();
+            let img = self.kitty_img.indexed.decode(&pixels, palette);
+            return Ok((id, no, img, Some(pixels)));
+        }
 
-        let data = match transmit.compression {
-            KittyImageCompression::None => data,
-            KittyImageCompression::Deflate => {
-                miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, 32 * 1024 * 1024)
-                    .map_err(|e| anyhow::anyhow!("decompressing data: {:?}", e))?
-            }
-        };
+        let data = load_pixels(transmit.data, transmit.compression)?;
 
         let img = match transmit.format {
             None | Some(KittyImageFormat::Rgba) | Some(KittyImageFormat::Rgb) => {
@@ -1527,6 +1563,7 @@ impl TerminalState {
 
                 ImageDataType::new_single_frame(width, height, data)
             }
+            Some(KittyImageFormat::Indexed | KittyImageFormat::IndexedAlpha) => unreachable!(),
             Some(KittyImageFormat::Png) => {
                 let info = dimensions(&data)?;
                 check_image_dimensions(info.width, info.height)?;
@@ -1550,7 +1587,7 @@ impl TerminalState {
             }
         };
 
-        Ok((id, no, img))
+        Ok((id, no, img, None))
     }
 
     fn kitty_img_transmit(
@@ -1559,7 +1596,17 @@ impl TerminalState {
         display: Option<KittyImagePlacement>,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
-        let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
+        let (id, number) = (transmit.image_id, transmit.image_number);
+        let is_indexed = indexed::stride(transmit.format.as_ref()).is_some();
+        let (image_id, image_number, img, mut indexed) = match self
+            .kitty_img_transmit_inner(transmit)
+        {
+            Err(err) if is_indexed && (id.is_some() || number.is_some()) => {
+                self.kitty_send_response(verbosity, false, id, number, format!("EINVAL:{err:#}"));
+                return Ok(());
+            }
+            result => result?,
+        };
         if image_id == 0 && display.as_ref().is_none_or(|p| p.virtual_placement) {
             // Neither a later put nor a Unicode placeholder has an image ID
             // with which to retrieve these bytes.
@@ -1569,15 +1616,16 @@ impl TerminalState {
         // An image id owns its mutable animation frames. Equal initial pixels under
         // two ids may subsequently receive different frames and playback commands.
         let img = Arc::new(ImageData::with_data(img));
+        let bytes = img.len() + indexed.as_ref().map_or(0, IndexedPixels::len);
         let replacing = self.kitty_img.id_to_data.contains_key(&image_id);
         if self
             .kitty_img
-            .check_image_capacity(image_id, &img, &self.inactive_kitty_img)
+            .check_image_capacity(image_id, bytes, &self.inactive_kitty_img)
             .is_err()
         {
             self.reclaim_missing_kitty_placements(image_id);
             self.kitty_img
-                .check_image_capacity(image_id, &img, &self.inactive_kitty_img)?;
+                .check_image_capacity(image_id, bytes, &self.inactive_kitty_img)?;
         }
         if image_id != 0 {
             if replacing {
@@ -1589,7 +1637,8 @@ impl TerminalState {
                 self.kitty_img.remove_data_for_id(image_id);
             }
             self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
-            self.kitty_img.used_memory += img.len();
+            self.kitty_img.used_memory += bytes;
+            self.kitty_img.indexed.insert(&img, indexed.take());
             self.kitty_img.id_to_data.insert(image_id, Arc::clone(&img));
         }
         if let Some(number) = image_number {
@@ -1611,7 +1660,7 @@ impl TerminalState {
         }
 
         if let Some(placement) = display {
-            self.kitty_place_data(image_id, image_number, img, placement, verbosity)?;
+            self.kitty_place_data(image_id, image_number, img, indexed, placement, verbosity)?;
         }
         Ok(())
     }
@@ -1645,6 +1694,28 @@ impl TerminalState {
         }
         Ok(first)
     }
+}
+
+fn load_pixels(
+    data: KittyImageData,
+    compression: KittyImageCompression,
+) -> anyhow::Result<Vec<u8>> {
+    let data = data.load_data().context("decoding kitty image payload")?;
+    match compression {
+        KittyImageCompression::None => Ok(data),
+        KittyImageCompression::Deflate => {
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data, 32 * 1024 * 1024)
+                .map_err(|err| anyhow::anyhow!("decompressing data: {err:?}"))
+        }
+    }
+}
+
+fn checked_indexed_pixels(
+    transmit: KittyImageTransmit,
+    stride: usize,
+) -> anyhow::Result<IndexedPixels> {
+    let data = load_pixels(transmit.data, transmit.compression)?;
+    IndexedPixels::new(transmit.width, transmit.height, stride, data)
 }
 
 fn transmission(img: &mut KittyImage) -> Option<&mut KittyImageTransmit> {
