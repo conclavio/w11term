@@ -190,6 +190,7 @@ fn eligible() -> bool {
                         && !s.is_read_only()
                         && !s.search
                         && !s.modal
+                        && !s.drawer_focused
                         && !s.switcher
                         && s.picker.is_none()
                         && s.local_mode.is_none()

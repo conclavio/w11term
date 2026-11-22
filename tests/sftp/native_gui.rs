@@ -1202,6 +1202,28 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "keeps native drawer activation keys out of SSH and restores typing when the terminal canvas is clicked"]
+async fn native_sftp_file_rows_own_keyboard_focus_until_the_canvas_is_clicked() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    fs::create_dir(remote.path().join("projects")).unwrap();
+    fs::write(remote.path().join("note.txt"), []).unwrap();
+    let keyboard = remote.path().join("keyboard-input.bin");
+    fs::write(&keyboard, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("drawer-key-trace"),
+        keyboard.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("sftp-drawer-focus-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(keyboard).unwrap(), b"canvas-typed");
+    assert_eq!(channels.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens literal remote paths in the native SFTP drawer after an initial listing error"]
 async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

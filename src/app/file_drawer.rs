@@ -1734,14 +1734,17 @@ impl TerminalApp {
                 KeyedView::new("terminal", Border::new().grid_column(0).content(content)),
                 KeyedView::new(
                     "files",
-                    Border::new().grid_column(1).content(tab.files.panel(
-                        tab.session.pane_id,
-                        ssh,
-                        bookmark_profile,
-                        shell_ready,
-                        layout,
-                        context,
-                    )),
+                    Border::new()
+                        .automation_id(format!("w11term-sftp-{}", tab.session.pane_id))
+                        .grid_column(1)
+                        .content(tab.files.panel(
+                            tab.session.pane_id,
+                            ssh,
+                            bookmark_profile,
+                            shell_ready,
+                            layout,
+                            context,
+                        )),
                 ),
             ])
     }
@@ -1810,6 +1813,8 @@ impl TerminalApp {
             && self.switcher.is_none()
             && !self.clipboard.is_open();
         let dialog_was_open = files.entry_dialog_open();
+        let drawer_was_open = files.open;
+        let return_to_terminal = matches!(action, EditFilter(_, _, _, false));
         let was_editing = files.filter_editing();
         files.observe_connection(frame.connection_generation);
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
@@ -2195,10 +2200,14 @@ impl TerminalApp {
             if !typing {
                 tab.follow_shell_directory(&frame, context);
             }
-            if dialog_was_open != tab.files.entry_dialog_open()
+            if drawer_was_open != tab.files.open
+                || dialog_was_open != tab.files.entry_dialog_open()
                 || was_editing != tab.files.filter_editing()
             {
                 self.connection_ui(id);
+            }
+            if return_to_terminal {
+                self.keyboard.return_from_drawer();
             }
         }
     }

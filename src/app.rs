@@ -1071,6 +1071,8 @@ impl TerminalApp {
             tab.files.end_filter_edit();
         }
         let editing_files = tab.files.entry_dialog_open() || tab.files.filter_editing();
+        self.keyboard
+            .watch_file_drawer(tab.files.open.then_some(tab.session.pane_id));
         self.clipboard.connection_changed(
             tab.session.pane_id,
             frame.connection_generation,
@@ -1427,6 +1429,9 @@ impl TerminalApp {
         }
         if kind != MouseEventKind::Move {
             self.header.borrow_mut().take();
+        }
+        if kind == MouseEventKind::Press {
+            self.keyboard.return_from_drawer();
         }
         if kind == MouseEventKind::Press
             && let Some(active) = self.tabs.active_id()
@@ -2127,6 +2132,7 @@ impl TerminalApp {
         };
         if target.is_none() {
             self.keyboard.set_modal(false);
+            self.keyboard.watch_file_drawer(None);
         }
         self.keyboard.set_target(target);
         self.sync_ime_surface();
@@ -4906,6 +4912,7 @@ impl Component for TerminalApp {
                 Shortcut::CaretPresentationChanged => {
                     self.caret_interval = crate::cursor_blink::system_interval();
                 }
+                Shortcut::DrawerFocusChanged => {}
                 Shortcut::RememberWindow => {
                     if let Some(name) = &self.window_profile {
                         let _ = self.windows.borrow_mut().remember(name);
