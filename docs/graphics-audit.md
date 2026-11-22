@@ -111,6 +111,12 @@ deletion. Unicode placeholders remain editable text. The shared
 `clear-cell.vt` fixture compares the resulting pixels in stock kitty and
 Direct2D after cursor deletion, redisplay, cell deletion and z-index filtering.
 
+Use `d=y/Y` for all placements touching a live row. Column deletion
+(`d=x/X`) and deletion by z-index (`d=z/Z`) also reach placements in
+scrollback on the active screen. The stock kitty and Direct2D
+`clear-groups.vt` tests check row and column selection, layer removal, and
+redisplay after a different placement keeps an image's data alive.
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

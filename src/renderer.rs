@@ -1931,6 +1931,14 @@ mod tests {
     }
 
     #[test]
+    fn clear_kitty_image_groups_matches_reference_pixels() {
+        assert_kitty_reference_colors(
+            &[include_bytes!("../tests/fixtures/kitty/clear-groups.vt")],
+            include_bytes!("../tests/fixtures/kitty/clear-groups-samples.json"),
+        );
+    }
+
+    #[test]
     fn independent_kitty_placements_match_reference_pixels() {
         assert_kitty_reference_colors(
             &[include_bytes!(
