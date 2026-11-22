@@ -1,11 +1,57 @@
 use super::*;
 use std::path::Path;
 impl TerminalApp {
+    /// Read back the production Direct2D rail, which is outside the public
+    /// terminal screenshot's cell rectangle. Only the ui-smoke fixture calls this.
+    fn capture_rail(&self, pane: u64, path: &Path) -> anyhow::Result<()> {
+        let tab = self
+            .tabs
+            .entries()
+            .iter()
+            .find_map(|entry| match &entry.value.page {
+                Page::Terminal(tab) if tab.session.pane_id == pane => Some(tab),
+                _ => None,
+            })
+            .expect("fixture pane");
+        let (width, height, scale) = tab.surface.area.get().expect("measured fixture pane");
+        let metrics = tab.surface.metrics.get();
+        let frame = tab.session.frames.load();
+        let pixels = |dips: f32| (dips * scale).round() as u32;
+        let (w, h) = (pixels(width), pixels(height));
+        let device = windows_canvas::GpuDevice::new_or_warp()?;
+        let target = device.create_render_target(w, h)?;
+        target.draw(|ctx| {
+            crate::native_drawing::NativeDrawing::new(ctx)?.set_dpi(96.0 * scale);
+            ctx.clear(windows_canvas::ColorF::BLACK);
+            tab.surface
+                .scrollbar
+                .paint(ctx, &frame, width, height, metrics, &mut None)
+        })?;
+        let mut bgra = target.read_pixels()?;
+        for pixel in bgra.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let image = image::RgbaImage::from_raw(w, h, bgra).expect("render-target dimensions");
+        let left = pixels(width - PADDING);
+        let top = pixels(PADDING);
+        let bottom = pixels(height - STATUS_HEIGHT - PADDING);
+        image::imageops::crop_imm(&image, left, top, w - left, bottom - top)
+            .to_image()
+            .save(path)?;
+        Ok(())
+    }
+
     pub(super) fn scrollbar_pointer_smoke(
         &mut self,
         state: &Path,
         context: &ComponentContext<Self>,
     ) {
+        let capture = state.join("rail-capture");
+        if capture.is_file() {
+            let pane = std::fs::read_to_string(&capture).unwrap().parse().unwrap();
+            self.capture_rail(pane, &state.join("rail.png")).unwrap();
+            std::fs::remove_file(capture).unwrap();
+        }
         let request = state.join("rail-pointer");
         if request.is_file() {
             let gesture = std::fs::read_to_string(&request).unwrap();

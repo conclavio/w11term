@@ -67,6 +67,7 @@ impl PaneSearchAnchor {
             return None;
         }
         search.selected = Some(search.matches.iter().position(|hit| *hit == self.matched)?);
+        search.update_match_rows(screen.row_epoch());
         let offset = search.reveal(terminal, offset);
         Some((search, offset))
     }
@@ -227,6 +228,10 @@ mod tests {
         assert_eq!(find.selected, Some(0));
         assert_eq!(find.matches.len(), 1);
         assert_eq!(find.matches[0].start(), Point { row: 0, col: 6 });
+        let frame = terminal::Snapshot::capture(&term, None, 1, offset, String::new(), 0);
+        let result = find.snapshot_for_frame(&frame).unwrap();
+        assert_eq!(&*result.match_rows, &[0]);
+        assert_eq!(result.selected_row, Some(0));
     }
 
     #[test]
