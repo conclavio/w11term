@@ -62,6 +62,7 @@ mod keyboard_copy;
 mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod pane_colors;
 mod pane_picker;
 mod pane_view;
 mod scrollback_bar;
@@ -89,6 +90,7 @@ struct LiveTab {
     split_directory_report: Option<Arc<str>>,
     confirm_end: bool,
     durable_phase: Option<w11term::ssh::DurablePhase>,
+    color_scheme: ColorScheme,
     source: Source,
     profile_name: Option<String>,
     surface: PaneSurface,
@@ -789,6 +791,7 @@ pub enum Message {
     RestartExited(ExitedPane),
     Export(scrollback_export::Action),
     ClearScrollback(u64),
+    PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
@@ -940,6 +943,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             copy_output_unavailable: Some("waiting for shell markers"),
             can_clear_scrollback: false,
             split_directory_report: None,
+            color_scheme: source.color_scheme(),
             source,
             confirm_end: false,
             durable_phase: None,
@@ -2713,6 +2717,10 @@ impl TerminalApp {
         let split_target = directory_split.clone();
         let offered = arrangement.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
+            label if let Some(scheme) = pane_colors::from_menu(label) => pane
+                .map_or(Message::ControlIdle, |id| {
+                    Message::PaneColorScheme(id, scheme)
+                }),
             local_forwards::LABEL => local_forwards::open(forward),
             folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
                 Message::FolderShare(folder_shares::Action::Open(id))
@@ -3113,6 +3121,9 @@ impl TerminalApp {
             ..
         }) = self.tabs.active()
         {
+            if pane_colors::available(live) {
+                items.push(pane_colors::menu(live.color_scheme));
+            }
             if matches!(live.source, Source::Ssh(_) | Source::Local(_)) {
                 items.push(MenuItem::item(
                     "pane-read-only",
@@ -3977,6 +3988,12 @@ impl Component for TerminalApp {
                     let _ = tab.session.input.send(Command::ClearScrollback);
                 }
             }
+            Message::PaneColorScheme(pane, scheme) => {
+                let active = self.tabs.active_id().and_then(|id| self.tabs.get_mut(id));
+                if pane_colors::apply(active, pane, scheme) {
+                    self.refresh_open_commands();
+                }
+            }
             Message::DismissWindowError => self.window_error = None,
             Message::MoveTabToWindow => self.move_tab_window(context),
             Message::DuplicateTabLayout(group) => {
@@ -4651,6 +4668,7 @@ impl Component for TerminalApp {
                             tab.durable_phase = phase;
                             tab.confirm_end = false;
                             self.header.borrow_mut().take();
+                            pane_actions_changed |= active;
                         }
                     }
                     if active {

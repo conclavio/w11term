@@ -4,6 +4,43 @@ mod shared;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "switches the base colors of a read-only SSH split with retained OSC overrides"]
+async fn native_live_pane_scheme_preserves_remote_colors_input_and_profile() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, shells, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.color_scheme = w11term::options::ColorScheme::OneHalfDark;
+    let inputs = remote.path().join("split-inputs");
+    fs::create_dir(&inputs).unwrap();
+    fs::write(remote.path().join("pty-trace"), []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("live-pane-colors-ui.ps1", &ssh, state.path());
+    assert!(
+        fs::read_dir(inputs).unwrap().next().is_none(),
+        "a UI action sent shell input"
+    );
+    assert_eq!(
+        shells.load(Ordering::Relaxed),
+        3,
+        "original, split and fresh profile"
+    );
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "one shared login and one fresh profile"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits SSH and local profile schemes in WinUI and checks their restarted terminal PNGs"]
 async fn native_profile_color_schemes_survive_restart_and_isolate_palette_resets() {
     let (Source::Ssh(ssh), _remote, shells, server) = fixture_connections(false, 3).await else {

@@ -56,7 +56,7 @@ pub(super) fn palette(scheme: ColorScheme) -> ColorPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::{Snapshot, TransportInput, create_with_profile};
+    use crate::terminal::{Snapshot, TransportInput, create_with_profile, set_color_scheme};
     use tokio::sync::mpsc;
     use wezterm_term::Terminal;
 
@@ -185,5 +185,107 @@ mod tests {
             assert_eq!(light.palette(), palette(ColorScheme::OneHalfLight));
             assert_eq!(dark.palette(), dark_override);
         }
+    }
+
+    #[test]
+    fn live_switch_preserves_same_as_base_writes_and_rebases_queried_slots() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        for (slot, old) in [("10", 0xdcdfe4), ("12", 0xffffff), ("4;2", 0x98c379)] {
+            assert_query(&mut term, &mut replies, slot, old);
+        }
+        // The effective palette is identical to the base, but the application
+        // explicitly owns these two slots until OSC 111 and OSC 104;1.
+        term.advance_bytes(b"\x1b]11;#282c34\x07\x1b]4;1;#e06c75\x07\x1b[?5h");
+        term.implicit_palette_reset_if_same_as_configured();
+        set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfLight);
+        for (slot, value) in [
+            ("11", 0x282c34),
+            ("4;1", 0xe06c75),
+            ("10", 0x383a42),
+            ("12", 0x4f525d),
+            ("4;2", 0x50a14f),
+        ] {
+            assert_query(&mut term, &mut replies, slot, value);
+        }
+        let snapshot = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(snapshot.palette.foreground, rgb(0x282c34));
+        assert_eq!(snapshot.palette.background, rgb(0x383a42));
+        term.advance_bytes(b"\x1b]111\x07\x1b]104;1\x07");
+        assert_eq!(term.palette(), palette(ColorScheme::OneHalfLight));
+        set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfDark);
+        assert_eq!(term.palette(), palette(ColorScheme::OneHalfDark));
+    }
+
+    #[test]
+    fn live_switch_preserves_independent_dynamic_slots_until_their_resets() {
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfDark);
+        term.advance_bytes(concat!(
+            "\x1b]10;#112233;#445566;#778899\x07",
+            "\x1b]17;#123456\x07\x1b]19;#abcdef\x07",
+            "\x1b]4;15;#001122;245;#334455\x07",
+        ));
+        set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfLight);
+        for (slot, value) in [
+            ("10", 0x112233),
+            ("11", 0x445566),
+            ("12", 0x778899),
+            ("17", 0x123456),
+            ("19", 0xabcdef),
+            ("4;15", 0x001122),
+            ("4;245", 0x334455),
+        ] {
+            assert_query(&mut term, &mut replies, slot, value);
+        }
+        let light = palette(ColorScheme::OneHalfLight);
+        assert_eq!(term.palette().cursor_border, rgb(0x778899));
+        assert_eq!(term.palette().cursor_fg, light.cursor_fg);
+        term.advance_bytes(b"\x1b]104\x07\x1b]112\x07\x1b]117\x07");
+        assert_eq!(term.palette().colors, light.colors);
+        assert_eq!(term.palette().cursor_border, light.cursor_border);
+        for (slot, value) in [
+            ("12", 0x4f525d),
+            ("17", 0x383a42),
+            ("19", 0xabcdef),
+            ("10", 0x112233),
+        ] {
+            assert_query(&mut term, &mut replies, slot, value);
+        }
+        term.advance_bytes(b"\x1b]110\x07\x1b]111\x07\x1b]119\x07");
+        assert_eq!(term.palette(), light);
+        for reconnect in [false, true] {
+            term.advance_bytes(b"\x1b]11;#010203\x07");
+            if reconnect {
+                term.reset_connection()
+            } else {
+                term.advance_bytes(b"\x1bc")
+            }
+            assert_eq!(term.palette(), light);
+        }
+    }
+
+    #[test]
+    fn direct_palette_edits_survive_a_switch_without_pinning_unedited_fields() {
+        let (mut term, _) = engine(ColorScheme::OneHalfDark);
+        let dark = palette(ColorScheme::OneHalfDark);
+        let light = palette(ColorScheme::OneHalfLight);
+        term.palette_mut().split = rgb(0x123456);
+        term.palette_mut().colors.0[2] = light.colors.0[2];
+        term.advance_bytes(b"\x1b]4;1;#e06c75\x07");
+        set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfLight);
+        assert_eq!(term.palette().split, rgb(0x123456));
+        assert_eq!(term.palette().foreground, light.foreground);
+        set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfDark);
+        assert_eq!(term.palette().colors.0[2], light.colors.0[2]);
+        term.palette_mut().colors.0[2] = dark.colors.0[2];
+        term.palette_mut().split = dark.split;
+        term.implicit_palette_reset_if_same_as_configured();
+        set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfLight);
+        assert_eq!(
+            term.palette().colors.0[1],
+            dark.colors.0[1],
+            "explicit OSC assignment"
+        );
+        assert_eq!(term.palette().colors.0[2], light.colors.0[2]);
+        assert_eq!(term.palette().split, light.split);
     }
 }

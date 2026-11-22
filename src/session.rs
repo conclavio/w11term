@@ -1,6 +1,6 @@
 use crate::{
     demo,
-    options::Source,
+    options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
 };
@@ -37,6 +37,8 @@ pub enum Command {
     RestartExited(ClaimedRestart),
     /// Ordered with both native input and control-pipe writes on this pane.
     SetReadOnly(bool),
+    /// Change the local display defaults without sending input to the transport.
+    SetColorScheme(ColorScheme),
     /// Input method committed text has no corresponding physical key presses.
     Composed(String),
     Observe(tokio::sync::oneshot::Sender<tokio::sync::broadcast::Receiver<Vec<u8>>>),
@@ -433,6 +435,8 @@ async fn run(
         sharing,
     } = services;
     let mut size = terminal.get_size();
+    let scrollback_lines = source.scrollback_lines();
+    let mut color_scheme = source.color_scheme();
     let (output_tx, mut output) = mpsc::channel(32);
     let is_demo = matches!(source, Source::Demo);
     let is_ssh = matches!(source, Source::Ssh(_));
@@ -654,6 +658,14 @@ async fn run(
                         Ok(())
                     }
                     Some(Command::Shutdown) | None => break,
+                    Some(Command::SetColorScheme(scheme)) => {
+                        if color_scheme != scheme {
+                            terminal::set_color_scheme(&mut terminal, scrollback_lines, scheme);
+                            color_scheme = scheme;
+                            presentation.dirty = true;
+                        }
+                        Ok(())
+                    }
                     Some(Command::SetReadOnly(enabled)) => {
                         read_only = enabled;
                         if enabled && matches!(last_mouse.button, wezterm_term::MouseButton::Left | wezterm_term::MouseButton::Middle | wezterm_term::MouseButton::Right)

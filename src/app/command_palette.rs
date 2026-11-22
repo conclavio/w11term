@@ -6,6 +6,7 @@ pub enum CommandId {
     Menu(String),
     SaveScrollback(Option<u64>),
     ClearScrollback(Option<u64>),
+    PaneColorScheme(u64, ColorScheme),
     SharedFolders(Option<u64>),
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
@@ -46,6 +47,8 @@ fn menu_shortcut(message: Message) -> Option<Shortcut> {
 fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
     for item in items {
         match item {
+            // Color choices are bound below to the native pane ID and get a searchable verb.
+            MenuItem::Submenu { key, .. } if !profiles && key == pane_colors::MENU_KEY.into() => {}
             MenuItem::Submenu { items, .. } => menu_rows(items, profiles, rows),
             MenuItem::Separator { .. } => {}
             MenuItem::Item {
@@ -150,6 +153,16 @@ impl TerminalApp {
         });
         let tab_count = self.tabs.headers().len();
         let pane = live.map(|tab| tab.session.pane_id);
+        if let Some(live) = live.filter(|tab| pane_colors::available(tab)) {
+            rows.extend(
+                pane_colors::choices(live.color_scheme).map(|(scheme, label)| Row {
+                    id: CommandId::PaneColorScheme(live.session.pane_id, scheme),
+                    label: format!("Set pane color scheme to {label}"),
+                    chord: String::new(),
+                    enabled: true,
+                }),
+            );
+        }
         let forward = self.forward_origin();
         rows.push(Row {
             id: CommandId::LocalForward(forward),
@@ -292,6 +305,7 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
             CommandId::LocalForward(origin) => local_forwards::open(origin),
             CommandId::SplitInDirectory(axis, target) => {
                 directory_split::message(axis, target.as_ref())

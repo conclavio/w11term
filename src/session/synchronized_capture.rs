@@ -11,6 +11,57 @@ async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn changing_scheme_recolors_read_only_scrollback_and_commits_at_sync_boundaries() {
+    let size = TerminalSize {
+        rows: 3,
+        cols: 40,
+        ..Default::default()
+    };
+    with_demo(size, async |input, frames| {
+        feed(&input, "first\nsecond\nthird\nfourth\nfifth").await;
+        input.send(Command::ScrollEdge(true)).unwrap();
+        input.send(Command::SetReadOnly(true)).unwrap();
+        let old_live = capture(&input).await;
+        let old_view = frames.load();
+        assert!(old_view.scroll_offset > 0);
+        input
+            .send(Command::SetColorScheme(ColorScheme::OneHalfLight))
+            .unwrap();
+        let light = capture(&input).await;
+        let light_view = frames.load();
+        assert_eq!(light.palette.background, (0xfa, 0xfa, 0xfa).into());
+        assert_eq!(light_view.palette, light.palette);
+        assert_eq!(light_view.scroll_offset, old_view.scroll_offset);
+        assert_eq!(text(&light_view), text(&old_view));
+        assert_eq!(text(&light), text(&old_live));
+        assert_eq!(light.connection_generation, old_live.connection_generation);
+        input
+            .send(Command::SetColorScheme(ColorScheme::OneHalfLight))
+            .unwrap();
+        assert_eq!(capture(&input).await.generation, light.generation);
+
+        input.send(Command::SetReadOnly(false)).unwrap();
+        let held = feed(&input, "\x1b[?2026h").await;
+        let held_view = frames.load();
+        input
+            .send(Command::SetColorScheme(ColorScheme::OneHalfDark))
+            .unwrap();
+        let still_held = capture(&input).await;
+        assert_eq!(still_held.palette, held.palette);
+        assert_eq!(still_held.generation, held.generation);
+        assert_eq!(frames.load().generation, held_view.generation);
+        let committed = feed(&input, "\x1b[?2026l").await;
+        assert_eq!(
+            committed.generation,
+            held.generation.max(held_view.generation) + 1
+        );
+        assert_eq!(committed.palette.background, (0x28, 0x2c, 0x34).into());
+        assert_eq!(text(&committed), text(&held));
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn fragmented_update_and_control_capture_share_the_committed_frame() {
     let size = TerminalSize {
         cols: 40,

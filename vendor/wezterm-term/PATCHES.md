@@ -22,6 +22,9 @@ The original MIT license is preserved in `LICENSE.md`.
 - OSC 104 restores the requested indexed colors, or the full indexed table
   when no indices are given, while preserving dynamic foreground, background
   and cursor colors.
+  A change of configured palette updates inherited colors and preserves each
+  explicit OSC color assignment until the application resets it. Color queries
+  read the effective palette without marking rows dirty.
 
 - `src/terminal.rs`, `terminalstate/mod.rs`, `terminalstate/performer.rs`: implement
   synchronized-output mode 2026 and DECRQM state in the engine. The embedding can
