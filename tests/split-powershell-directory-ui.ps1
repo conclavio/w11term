@@ -5,13 +5,17 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
-$env:W11TERM_SPLIT_CWD = Join-Path $State ('100% # [pilot] ' + [char]0x96ea)
+$env:W11TERM_SPLIT_CWD = Join-Path $State ('100% ; # [pilot] ' + [char]0x96ea)
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_SPLIT_CWD)
 $profiles = Join-Path $State 'profiles.json'
 $catalog = [IO.File]::ReadAllText($profiles) | ConvertFrom-Json
 $localProfile = $catalog.profiles.'Palette PowerShell'
 $localProfile | Add-Member NoteProperty powershell_integration $true
 $localProfile | Add-Member NoteProperty cwd $State
+$catalog.profiles | Add-Member NoteProperty 'Windows Terminal prompt' @{
+    backend = 'local'; executable = 'powershell.exe'; args = @('-NoProfile', '-NoLogo'); cwd = $State
+    powershell_integration = $false
+}
 [IO.File]::WriteAllText($profiles, ($catalog | ConvertTo-Json -Depth 12))
 $right = 'Split right in current directory'
 $below = 'Split below in current directory'
@@ -105,6 +109,31 @@ try {
     if ((Confirm-Directory $parent.id 'still') -ne $parentPid) { throw 'Original PowerShell was replaced' }
     $saved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'Palette PowerShell'
     if ($saved.cwd -cne $State) { throw 'A local split changed the saved profile working directory' }
+
+    $custom = (Control @('open','--profile','Windows Terminal prompt','--activate')).pane
+    Wait-Focus $custom
+    $null = Control @('wait-for-text','--pane',"$custom",'--timeout','45','PS ')
+    Send-Line $custom $change
+    $customPid = Confirm-Directory $custom 'before'
+    Check-Actions $false
+    # Install the quoted OSC 9;9 PowerShell prompt in this test process only.
+    $promptDefinition = @'
+function global:prompt { [string][char]27 + ']9;9;"' + $PWD.Path + '"' + [char]7 + 'custom-' + $PWD.Provider.Name + '> ' }
+'@
+    Send-Line $custom $promptDefinition
+    $null = Control @('wait-for-text','--pane',"$custom",'--timeout','15','custom-FileSystem>')
+    Check-Actions $true
+    Send-Line $custom 'Set-Location -LiteralPath Env:'
+    $null = Control @('wait-for-text','--pane',"$custom",'--timeout','15','custom-Environment>')
+    Check-Actions $false
+    Send-Line $custom $change
+    if ((Confirm-Directory $custom 'reported') -ne $customPid) { throw 'Custom-prompt shell changed' }
+    $origin = (Control @('list')).sessions | Where-Object id -eq $custom
+    Run-Palette $right
+    $peer = Wait-Child $origin 6 'right'
+    $null = Control @('wait-for-text','--pane',"$($peer.id)",'--timeout','45','PS ')
+    if ((Confirm-Directory $peer.id 'custom') -eq $customPid) { throw 'OSC 9;9 split reused the reporting process' }
+
     $null = Control @('send-text','--pane',"$remote",'--no-paste','directory-split-ssh-live')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','directory-split-ssh-live')
 } finally {

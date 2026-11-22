@@ -67,9 +67,11 @@ Builds, deployments, and other programs that emit **OSC 9;4** can report progres
 
 Use **caret → Panes** to split right or below. Splitting the current host opens a new shell channel on its authenticated SSH connection when the endpoint, user, authentication method and host-key settings match. A server that declines the extra channel gets a separate login attempt. Choosing a specific profile always opens an independent login. Each pane owns its PTY and SFTP handles. Either pane can close while the other keeps running.
 
-Choose **Panes → Split right in current directory** or **Split below in current directory** to start a second shell in the folder the focused shell reports through OSC 7. You can also find both actions in the command palette or assign them keys under **Settings → Keyboard**.
+Choose **Panes → Split right in current directory** or **Split below in current directory** to start a second shell in the folder the focused shell reports. You can also find both actions in the command palette or assign them keys under **Settings → Keyboard**.
 
-In a local PowerShell pane, change to a checkout and use either action to start a separate PowerShell process there. Enable PowerShell integration in the profile to report the current folder, or use a prompt that already emits OSC 7. A location such as `Env:` has no Windows working directory, so the actions become unavailable. On an ordinary SSH connection, the actions open a shell on the same server and require a POSIX shell that accepts SSH exec requests.
+In a local PowerShell pane, change to a checkout and use either action to start a separate PowerShell process there. The bundled PowerShell integration reports the folder with OSC 7. Existing prompts can also report a drive path with Windows Terminal’s OSC 9;9, for example `ESC ] 9 ; 9 ; "C:\My Projects" BEL`. Both quoted and unquoted paths work with BEL or ST termination. A reported location such as `Env:` clears the previous directory. [Windows Terminal shell integration](https://learn.microsoft.com/en-us/windows/terminal/tutorials/shell-integration)
+
+On an ordinary SSH connection, the actions use the remote shell’s OSC 7 file URI and open a shell on the same server. The server must provide a POSIX shell and accept SSH exec requests.
 
 Saving the workspace remembers the new pane’s starting directory. Its next launch opens a shell there. The original pane keeps its running program.
 

@@ -1141,6 +1141,8 @@ mod tests {
             local.get_current_dir().unwrap().to_file_path().unwrap(),
             std::path::Path::new(&many_semicolons)
         );
+        local.advance_bytes(format!("\x1b]9;9;C:\\{}\x07", ";".repeat(140 * 1024)));
+        assert!(local.reported_current_dir().is_none());
         for bad in [
             "Env:",
             r"\\server\share",

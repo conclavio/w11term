@@ -312,6 +312,8 @@ impl VTActor for CollectingVTActor {
 
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC: usize = 64;
+// Covers a 32,767-UTF-16-unit Windows path even after UTF-8 conversion.
+const MAX_OSC_DIRECTORY_BYTES: usize = 128 * 1024;
 const MAX_PARAMS: usize = 256;
 
 struct OscState {
@@ -322,17 +324,20 @@ struct OscState {
     param_indices: [usize; MAX_OSC],
     num_params: usize,
     full: bool,
+    directory_payload: bool,
 }
 
 impl OscState {
     fn put(&mut self, param: char) {
         // OSC 9;9 has one literal Windows path after its two selectors.
         // Keep filename semicolons in that field, including beyond MAX_OSC.
-        if param == ';'
-            && !(self.num_params == 3
-                && self.param_indices[..2] == [1, 2]
-                && self.buffer.starts_with(b"99"))
-        {
+        if self.full {
+            return;
+        }
+        if param == ';' && !self.directory_payload {
+            self.directory_payload = self.num_params == 2
+                && self.param_indices[0] == 1
+                && self.buffer.as_slice() == b"99";
             match self.num_params {
                 MAX_OSC => {
                     self.full = true;
@@ -342,7 +347,16 @@ impl OscState {
                     self.num_params += 1;
                 }
             }
-        } else if !self.full {
+        } else {
+            if self.directory_payload
+                && self.buffer.len() + param.len_utf8() > MAX_OSC_DIRECTORY_BYTES + 2
+            {
+                // Retain the selectors and emit an empty report at ST. A
+                // prefix of an oversized path must never select a directory.
+                self.buffer.truncate(2);
+                self.full = true;
+                return;
+            }
             let mut buf = [0u8; 8];
             let extend_result = self
                 .buffer
@@ -351,6 +365,9 @@ impl OscState {
             #[cfg(all(not(feature = "std"), not(feature = "alloc")))]
             {
                 if extend_result.is_err() {
+                    if self.directory_payload {
+                        self.buffer.truncate(2);
+                    }
                     self.full = true;
                     return;
                 }
@@ -468,6 +485,7 @@ impl VTParser {
                 param_indices,
                 num_params: 0,
                 full: false,
+                directory_payload: false,
             },
 
             params: [CsiParam::default(); MAX_PARAMS],
@@ -539,6 +557,7 @@ impl VTParser {
                 self.ignored_excess_intermediates = false;
                 self.osc.num_params = 0;
                 self.osc.full = false;
+                self.osc.directory_payload = false;
                 self.num_params = 0;
                 self.params_full = false;
                 self.current_param.take();
@@ -625,6 +644,7 @@ impl VTParser {
                 self.osc.buffer.shrink_to_fit();
                 self.osc.num_params = 0;
                 self.osc.full = false;
+                self.osc.directory_payload = false;
             }
             Action::OscPut => self.osc.put(param as char),
 
