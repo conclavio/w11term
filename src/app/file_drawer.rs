@@ -3933,8 +3933,13 @@ mod tests {
         let folder = TransferFile::UploadFolder {
             remote: "/reports/run".into(),
         };
-        let partial =
-            json!({"cancelled":true,"remote_may_be_partial":true,"resolved_remote":"/archived/run","files":3,"bytes_transferred":42});
+        let partial = json!({
+            "cancelled": true,
+            "remote_may_be_partial": true,
+            "resolved_remote": "/archived/run",
+            "files": 3,
+            "bytes_transferred": 42,
+        });
         let message = folder.outcome(&partial);
         assert!(message.contains(
             "Cancelled upload of /archived/run (3 files completed, 42 bytes acknowledged)"
