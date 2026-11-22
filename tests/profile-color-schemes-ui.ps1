@@ -111,22 +111,8 @@ function Edit-Scheme([string]$Name, [string]$EditLabel, [string]$Scheme, [string
     }
     $popup = $field.GetCurrentPattern($expand)
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
-    # The SSH editor's save button is well below the fold on the hosted desktop.
-    # Bring its footer into view, then send exactly one keypress to the focused
-    # control after Windows confirms its entire rectangle is inside this window.
-    $saveButton = Wait-Until "'$Save' button" { Find-Element $Save $button }
-    $scroll = Editor-Scroll $saveButton
-    if ($scroll) { $scroll.SetScrollPercent(-1,100) }
-    $saveButton.SetFocus()
-    $null = Wait-Until "focused and onscreen '$Save' in '$Name' editor" {
-        $b = Find-Element $Save $button
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-        if ($b -and $b.Current.IsEnabled -and $b.Current.HasKeyboardFocus -and !$b.Current.IsOffscreen) {
-            $bounds = $b.Current.BoundingRectangle
-            $bounds.Width -gt 0 -and $bounds.Height -gt 0 -and $root.Current.BoundingRectangle.Contains($bounds)
-        }
-    }
-    $null = Press-FocusedKey 0x20 # Space activates the focused WinUI Button.
+    $scroll = Editor-Scroll $field
+    Click $Save
     # The profile store replaces the file atomically. Wait for the UI thread to
     # finish that replacement before opening the destination, even with delete sharing.
     if ($Save -eq 'Save profile changes') {
