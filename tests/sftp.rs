@@ -943,11 +943,11 @@ mod native_gui;
 mod remove;
 #[path = "sftp/rename.rs"]
 mod rename;
-#[path = "sftp/text_preview.rs"]
-mod text_preview;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/tab_windows.rs"]
 mod tab_windows;
+#[path = "sftp/text_preview.rs"]
+mod text_preview;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {
