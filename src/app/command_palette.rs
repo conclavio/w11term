@@ -5,6 +5,7 @@ use w11term::shortcuts::BINDINGS;
 pub enum CommandId {
     Menu(String),
     SaveScrollback(Option<u64>),
+    ClearScrollback(Option<u64>),
     SharedFolders(Option<u64>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
@@ -193,6 +194,9 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                Shortcut::ClearScrollback => {
+                    row.id = CommandId::ClearScrollback(pane);
+                }
                 Shortcut::DuplicateTabLayout => {
                     // A click queued on this row must keep its original tab even
                     // when a control client switches tabs before we receive it.
@@ -277,6 +281,9 @@ impl TerminalApp {
             CommandId::RestartExited(None) => return,
             CommandId::SaveScrollback(pane) => {
                 Message::Export(scrollback_export::Action::Start(pane))
+            }
+            CommandId::ClearScrollback(pane) => {
+                pane.map_or(Message::ControlIdle, Message::ClearScrollback)
             }
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),

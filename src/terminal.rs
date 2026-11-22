@@ -14,6 +14,8 @@ use wezterm_term::{
 
 mod export;
 mod kitty;
+mod retained_rows;
+pub use retained_rows::RetainedRows;
 #[cfg(test)]
 mod scrollback_tests;
 pub(crate) use export::export_text;
@@ -495,6 +497,8 @@ pub fn send_key_event_detailed(
 pub struct Snapshot {
     pub generation: u64,
     pub rows: Vec<Arc<Line>>,
+    /// Whether the last visible cell continues onto the following physical row.
+    row_wraps: Vec<bool>,
     pub palette: ColorPalette,
     pub cursor: CursorPosition,
     pub cursor_visible: bool,
@@ -507,6 +511,11 @@ pub struct Snapshot {
     pub bytes_received: u64,
     pub first_stable_row: isize,
     pub oldest_stable_row: isize,
+    row_epoch: u64,
+    /// Most recent successful local history clear. The floor is the first row
+    /// retained at the time of that clear, even if new output has since arrived.
+    pub scrollback_clear_generation: u64,
+    pub scrollback_clear_floor: Option<isize>,
     pub alternate: bool,
     pub mouse_grabbed: bool,
     pub search: Option<crate::search::SearchSnapshot>,
@@ -514,8 +523,9 @@ pub struct Snapshot {
     pub connection_generation: u64,
     pub size: TerminalSize,
     images: HashMap<usize, FrozenImage>,
+    /// Indices of rows whose cell data references the frozen image table.
+    image_rows: Vec<usize>,
     cell_maps: std::sync::OnceLock<Arc<[crate::text_layout::CellMap]>>,
-    projected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -551,32 +561,35 @@ impl Snapshot {
         let first_stable_row = screen.phys_to_stable_row_index(start);
         let alternate = terminal.is_alt_screen_active();
         let mut lines = screen.lines_in_phys_range(start..start + screen.physical_rows);
-        let projected = terminal.project_kitty_placements(&mut lines, start);
-        let rows: Vec<Arc<Line>> = lines
-            .into_iter()
-            .enumerate()
-            .map(|(index, line)| {
-                let stable = first_stable_row + index as isize;
-                let old_row = previous
-                    .filter(|old| old.alternate == alternate)
-                    .and_then(|old| {
-                        usize::try_from(stable - old.first_stable_row)
-                            .ok()
-                            .and_then(|i| old.rows.get(i))
-                    });
-                if let Some(old) = old_row
-                    && old.current_seqno() == line.current_seqno()
-                    && (!(projected || previous.is_some_and(|old| old.projected)) || **old == line)
-                {
-                    return Arc::clone(old);
-                }
-                Arc::new(line)
-            })
-            .collect();
+        terminal.project_kitty_placements(&mut lines, start);
+        let mut rows = Vec::with_capacity(lines.len());
+        let mut row_wraps = Vec::with_capacity(lines.len());
         let mut images = HashMap::new();
-        for line in &rows {
-            for cell in line.visible_cells() {
+        let mut image_rows = Vec::new();
+        for (index, line) in lines.into_iter().enumerate() {
+            let stable = first_stable_row + index as isize;
+            let candidate = previous
+                .filter(|old| old.row_epoch == screen.row_epoch())
+                .and_then(|old| {
+                    let i = usize::try_from(stable - old.first_stable_row).ok()?;
+                    let row = old.rows.get(i)?;
+                    let imaged = old.image_rows.binary_search(&i).is_ok();
+                    // Projected images can move without changing the underlying row revision.
+                    (row.current_seqno() == line.current_seqno() && (!imaged || **row == line))
+                        .then_some((row, old.row_wraps[i], imaged))
+                });
+            // Two placements may have equal pixels but different image allocations.
+            // Freeze tiles from the row we'll keep so its pointer keys resolve.
+            let scan = match candidate {
+                Some((row, _, true)) => row.as_ref(),
+                _ => &line,
+            };
+            let mut wrapped = false;
+            let mut has_images = false;
+            for cell in scan.visible_cells() {
+                wrapped = cell.attrs().wrapped();
                 for tile in cell.attrs().images().into_iter().flatten() {
+                    has_images = true;
                     let source = tile.image_data();
                     let identity = Arc::as_ptr(source) as usize;
                     if images.contains_key(&identity) {
@@ -623,11 +636,22 @@ impl Snapshot {
                     images.insert(identity, frozen);
                 }
             }
+            row_wraps.push(wrapped);
+            if has_images {
+                image_rows.push(index);
+            }
+            rows.push(match candidate {
+                Some((row, old_wrap, imaged)) if old_wrap == wrapped && imaged == has_images => {
+                    Arc::clone(row)
+                }
+                _ => Arc::new(line),
+            });
         }
         let cursor = terminal.cursor_pos();
         Self {
             generation,
             rows,
+            row_wraps,
             palette: terminal.palette(),
             cursor,
             cursor_visible: offset == 0
@@ -641,6 +665,9 @@ impl Snapshot {
             bytes_received,
             first_stable_row,
             oldest_stable_row: screen.phys_to_stable_row_index(0),
+            row_epoch: screen.row_epoch(),
+            scrollback_clear_generation: 0,
+            scrollback_clear_floor: None,
             alternate,
             mouse_grabbed: terminal.is_mouse_grabbed(),
             search: None,
@@ -648,14 +675,18 @@ impl Snapshot {
             connection_generation: 0,
             size: terminal.get_size(),
             images,
+            image_rows,
             cell_maps: Default::default(),
-            projected,
         }
     }
 
     /// Shared by drawing, local pointer input, and assistive clients.
     pub fn cell_map(&self, row: usize) -> Option<&crate::text_layout::CellMap> {
         self.cell_maps().get(row)
+    }
+
+    pub fn row_is_wrapped(&self, row: usize) -> bool {
+        self.row_wraps[row]
     }
 
     pub fn visual_cursor_column(&self) -> usize {
@@ -694,8 +725,10 @@ impl Snapshot {
 
     pub fn same_presentation(&self, old: &Self) -> bool {
         self.size == old.size
+            && self.row_epoch == old.row_epoch
             && self.first_stable_row == old.first_stable_row
             && self.oldest_stable_row == old.oldest_stable_row
+            && self.scrollback_clear_generation == old.scrollback_clear_generation
             && self.scroll_offset == old.scroll_offset
             && self.alternate == old.alternate
             && self.cursor_visible == old.cursor_visible
@@ -2281,6 +2314,52 @@ mod tests {
                 .flat_map(|l| l.visible_cells())
                 .any(|c| c.attrs().images().is_some())
         );
+    }
+
+    #[test]
+    fn snapshot_reuses_image_rows_and_freezes_their_actual_tile_allocations() {
+        use wezterm_term::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let (mut t, _) = engine();
+        t.advance_bytes(b"tile\r\ntext");
+        let source = || {
+            Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+                1,
+                1,
+                vec![1, 2, 3, 255],
+            )))
+        };
+        let attach = |t: &mut Terminal, data| {
+            t.screen_mut().line_mut(0).cells_mut_for_attr_changes_only()[0]
+                .attrs_mut()
+                .set_image(Box::new(ImageCell::new(
+                    TextureCoordinate::new_f32(0., 0.),
+                    TextureCoordinate::new_f32(1., 1.),
+                    data,
+                )));
+        };
+        let original = source();
+        attach(&mut t, original.clone());
+        let first = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+        let replacement = source();
+        assert!(!Arc::ptr_eq(&original, &replacement));
+        attach(&mut t, replacement);
+        let same = Snapshot::capture(&t, Some(&first), 2, 0, String::new(), 0);
+        assert!(Arc::ptr_eq(&first.rows[0], &same.rows[0]));
+        assert!(Arc::ptr_eq(&first.rows[1], &same.rows[1]));
+        assert!(std::ptr::eq(
+            first.image_data(&original),
+            same.image_data(&original)
+        ));
+        assert!(first.same_presentation(&same));
+
+        t.screen_mut().line_mut(0).cells_mut_for_attr_changes_only()[0]
+            .attrs_mut()
+            .clear_images();
+        let cleared = Snapshot::capture(&t, Some(&same), 3, 0, String::new(), 0);
+        assert!(cleared.images.is_empty());
+        assert!(cleared.image_rows.is_empty());
+        assert!(!same.same_presentation(&cleared));
+        assert!(Arc::ptr_eq(&same.rows[1], &cleared.rows[1]));
     }
 
     #[test]

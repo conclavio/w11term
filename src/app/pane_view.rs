@@ -251,7 +251,10 @@ impl TerminalApp {
             renderer.draw_interaction(
                 ctx,
                 &frame,
-                marked.as_ref().or(selection.borrow().as_ref()),
+                marked
+                    .as_ref()
+                    .or(selection.borrow().as_ref())
+                    .filter(|selection| selection.survives_scrollback_clear(&frame)),
                 hover.borrow().as_ref(),
             )?;
             if let Some(hints) = hints {

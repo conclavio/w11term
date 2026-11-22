@@ -118,6 +118,26 @@ impl server::Handler for Peer {
         if self.root.join("copy-history.vt").is_file() {
             s.data(c, fs::read(self.root.join("copy-history.vt"))?)?;
         }
+        #[cfg(feature = "ui-smoke")]
+        {
+            // Let a read-only, background pane lose its connection from the server side.
+            let gate = self.root.join("keep-first-connection");
+            if gate.is_file() {
+                let peer = s.handle();
+                tokio::spawn(async move {
+                    while gate.is_file() {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    let _ = peer
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "fixture reconnect".into(),
+                            "en".into(),
+                        )
+                        .await;
+                });
+            }
+        }
         if self.root.join("shell directory").is_dir() {
             s.data(c, b"\x1b]133;A\x07$ \x1b]133;B\x07first\r\n\x1b]133;C\x07first result\r\n\x1b]133;D;0\x07".as_slice())?;
             s.data(
@@ -233,6 +253,32 @@ fn entry_attrs(path: &std::path::Path) -> Result<FileAttributes, StatusCode> {
     Ok(attrs)
 }
 impl Files {
+    fn trace_transfer(&self, request: impl std::fmt::Display) -> Result<(), StatusCode> {
+        let path = self.root.join("transfer-trace");
+        if path.is_file() {
+            let mut log = fs::OpenOptions::new().append(true).open(path).map_err(io)?;
+            writeln!(log, "{request}").map_err(io)?;
+        }
+        Ok(())
+    }
+
+    async fn hold_transfer_response(&self, marker: &str) {
+        let gate = self.root.join(marker);
+        while gate.is_file() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(feature = "ui-smoke")]
+    fn trace_listing(&self, request: &str) -> Result<(), StatusCode> {
+        let path = self.root.join("listing-trace");
+        if path.is_file() {
+            let mut trace = fs::OpenOptions::new().append(true).open(path).map_err(io)?;
+            writeln!(trace, "{request}").map_err(io)?;
+        }
+        Ok(())
+    }
+
     fn path(&self, path: &str) -> PathBuf {
         assert!(!path.contains("..") && !path.contains(':'));
         self.root.join(path.trim_start_matches('/'))
@@ -329,12 +375,17 @@ impl russh_sftp::server::Handler for Files {
         flags: OpenFlags,
         _: FileAttributes,
     ) -> Result<Handle, StatusCode> {
+        self.trace_transfer(format_args!("OPEN {path}"))?;
         let file = fs::OpenOptions::from(flags)
             .open(self.path(&path))
             .map_err(io)?;
         Ok(self.add(id, Opened::File(file)))
     }
     async fn close(&mut self, id: u32, h: String) -> Result<Status, StatusCode> {
+        if matches!(self.handles.get(&h), Some(Opened::File(_))) {
+            self.trace_transfer("CLOSE")?;
+            self.hold_transfer_response("hold-transfer-close").await;
+        }
         self.handles.remove(&h).ok_or(StatusCode::Failure)?;
         Ok(status(id))
     }
@@ -345,6 +396,10 @@ impl russh_sftp::server::Handler for Files {
         offset: u64,
         len: u32,
     ) -> Result<Data, StatusCode> {
+        self.trace_transfer(format_args!("READ {offset}"))?;
+        if offset > 0 {
+            self.hold_transfer_response("hold-transfer-read").await;
+        }
         if self.root.join("small-reads").exists() && len > 512 {
             return Err(StatusCode::Failure);
         }
@@ -375,6 +430,10 @@ impl russh_sftp::server::Handler for Files {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, StatusCode> {
+        self.trace_transfer(format_args!("WRITE {offset}"))?;
+        if offset > 0 {
+            self.hold_transfer_response("hold-transfer-write").await;
+        }
         if offset > 0 && self.root.join("disconnect-next-write").exists() {
             let _ = self
                 .ssh
@@ -458,6 +517,8 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
+        #[cfg(feature = "ui-smoke")]
+        self.trace_listing(&format!("OPENDIR {path}"))?;
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
@@ -475,6 +536,8 @@ impl russh_sftp::server::Handler for Files {
         Ok(self.add(id, Opened::Dir(entries)))
     }
     async fn readdir(&mut self, id: u32, h: String) -> Result<Name, StatusCode> {
+        #[cfg(feature = "ui-smoke")]
+        self.trace_listing("READDIR")?;
         match self.handles.get_mut(&h) {
             Some(Opened::Dir(entries)) if !entries.is_empty() => Ok(Name {
                 id,
@@ -693,6 +756,7 @@ async fn guarded_job(
             deadline,
             reply,
             progress: None,
+            cancel: None,
         }))
         .unwrap();
     tokio::time::timeout_at(deadline + Duration::from_secs(1), response)
@@ -701,6 +765,8 @@ async fn guarded_job(
         .unwrap()
 }
 
+#[path = "sftp/cancellation.rs"]
+mod cancellation;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
@@ -733,6 +799,7 @@ async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {
                 deadline,
                 reply,
                 progress: None,
+                cancel: None,
             }))
             .unwrap();
         let result = tokio::time::timeout_at(deadline, result)
@@ -859,6 +926,7 @@ async fn directory_only_workspace_reconnects_to_an_interactive_shell() {
                 deadline,
                 reply,
                 progress: None,
+                cancel: None,
             }))
             .unwrap();
         let result = tokio::time::timeout_at(deadline, response)
@@ -918,6 +986,7 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
                 deadline,
                 reply,
                 progress: None,
+                cancel: None,
             }))
             .unwrap();
         tokio::time::timeout_at(deadline, response)
@@ -995,6 +1064,7 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
                 deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                 reply,
                 progress: Some(sender),
+                cancel: None,
             }))
             .unwrap();
         (progress, response)
@@ -1385,7 +1455,7 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         let _=fs::remove_file(root.path().join("read-entered"));
         fs::write(root.path().join("pause-reads"),[]).unwrap();
         let (reply,response)=tokio::sync::oneshot::channel();
-        session.input.send(Command::Sftp(w11term::sftp::Job{expected_generation:None,operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply,progress:None})).unwrap();
+        session.input.send(Command::Sftp(w11term::sftp::Job{expected_generation:None,operation:w11term::sftp::Operation::Read{handle:h,offset:0,len:3},deadline:tokio::time::Instant::now()+Duration::from_secs(5),reply,progress:None,cancel:None})).unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while !root.path().join("read-entered").exists() { tokio::task::yield_now().await; }
         }).await.unwrap();

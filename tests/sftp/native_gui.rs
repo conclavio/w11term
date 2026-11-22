@@ -40,6 +40,90 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits word delimiters and verifies UIA words and double-click selection in a live SSH pane"]
+async fn native_word_delimiters_update_reader_and_pointer_selection_in_running_ssh() {
+    run_palette_fixture(
+        "word-delimiters-ui.ps1",
+        b"",
+        Some("\r\nscope/srv/alpha/bin:tail;\r\nword-fixture-ready\r\n"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reads OSC 133 captures from a read-only, inactive SSH pane across a live reconnect"]
+async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(mut ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let state = tempfile::tempdir().unwrap();
+    let command = format!("show {} 界", "cmd".repeat(60));
+    let output = format!("résultat-{}\r\n\r\nend", "out".repeat(60));
+    let mut stream = format!(
+        "\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07\x1b[31m{output}\x1b[0m\x1b]133;D;17\x07\r\n"
+    );
+    // A shell may omit both the command and its exit code. Empty captured
+    // output still differs from output that has already fallen out of history.
+    stream.push_str("\x1b]133;A\x07$ \x1b]133;C\x07\x1b]133;D\x07\r\n");
+    stream.push_str("\x1b]133;A\x07$ \x1b]133;B\x07archived\r\n\x1b]133;C\x07");
+    stream.push_str(&"older row\r\n".repeat(150));
+    stream.push_str("\x1b[3J\x1b]133;D;3\x07\r\nhistory-one-ready\r\n");
+    fs::write(remote.path().join("copy-history.vt"), stream).unwrap();
+    fs::write(remote.path().join("keyboard-input.bin"), []).unwrap();
+    fs::write(remote.path().join("keep-first-connection"), []).unwrap();
+    fs::write(
+        state.path().join("peer-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        state.path().join("replacement.vt"),
+        b"\x1b]133;A\x07$ \x1b]133;B\x07replacement\r\n\x1b]133;C\x07second transport\x1b]133;D;0\x07\r\nhistory-two-ready\r\n",
+    ).unwrap();
+    drive_mixed_gui("control-command-history-ui.ps1", &ssh, state.path());
+    eprintln!(
+        "Command IDs on the original and reconnected SSH sessions: {}",
+        fs::read_to_string(state.path().join("observed-command-ids")).unwrap()
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 2, "two SSH transports");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one shell on each connection"
+    );
+    assert!(
+        fs::read(remote.path().join("keyboard-input.bin"))
+            .unwrap()
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches captured OSC 133 command text and copies the selected command on a hosted Windows desktop"]
+async fn native_ssh_command_history_searches_and_copies_the_full_command() {
+    let long = format!("deploy {} [Ångström]", "x".repeat(128));
+    let mut stream = String::new();
+    for (command, output, status) in [
+        (&long[..], "archived deploy output", 17),
+        ("check-status", "[Ångström] appears only in this output", 0),
+    ] {
+        stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;{status}\x07"));
+    }
+    stream.push_str("history-search-ready\r\n");
+    run_palette_fixture(
+        "search-command-history-ui.ps1",
+        b"history-resumed",
+        Some(&stream),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "samples a cursor cell on the focused native SSH canvas"]
 async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
     let (Source::Ssh(ssh), _remote, shells, server) = fixture_connections(false, 1).await else {
@@ -111,6 +195,12 @@ async fn native_powershell_shell_integration_records_history_and_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "duplicates, deletes and restores PowerShell profiles while SSH and a copied shell stay live"]
+async fn native_local_profile_copy_delete_and_restore_defaults() {
+    run_palette_fixture("local-profile-actions-ui.ps1", b"profile-actions-ok", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "keeps an open native tab menu actionable through SSH progress repaints"]
 async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
     let mut expected = Vec::new();
@@ -137,6 +227,22 @@ async fn native_profile_scrollback_limits_apply_to_new_panes_and_preserve_live_h
     run_palette_fixture(
         "profile-scrollback-ui.ps1",
         b"history-focus-ok",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "clears only the focused SSH pane's retained history in a mixed SSH and PowerShell split"]
+async fn native_clear_scrollback_preserves_the_ssh_prompt_and_neighboring_powershell_history() {
+    let mut history = String::from("ssh-archived-order\r\n");
+    for row in 0..140 {
+        history.push_str(&format!("ssh-history-{row:03}\r\n"));
+    }
+    history.push_str("ssh-history-ready\r\n");
+    run_palette_fixture(
+        "clear-scrollback-ui.ps1",
+        b"\x1b[?1049h\x1b[Halt-pilot\x1b[?1049l\r\nlive-heading\r\n\x1b]133;A\x07pilot> \x1b]133;B\x07status",
         Some(&history),
     )
     .await;
@@ -460,6 +566,143 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
         channels.load(Ordering::Relaxed),
         4,
         "one shell and one SFTP channel per login"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "cancels real SFTP transfers in a native SSH and PowerShell split"]
+async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let parent = remote.path().join("shell directory");
+    fs::create_dir(&picker).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let chunk = w11term::sftp::CHUNK;
+    let bytes: Vec<u8> = (0..(4 * chunk + 7)).map(|i| (i % 251) as u8).collect();
+    fs::write(picker.join("01-first-upload"), &bytes).unwrap();
+    fs::write(picker.join("02-queued-upload"), b"must stay local").unwrap();
+    fs::write(picker.join("retained-download"), b"keep these bytes").unwrap();
+    fs::write(parent.join("retained-download"), &bytes).unwrap();
+    fs::write(parent.join("verified-download"), b"same SFTP channel").unwrap();
+    for marker in [
+        "transfer-trace",
+        "keyboard-input.bin",
+        "hold-transfer-read",
+        "hold-transfer-write",
+    ] {
+        fs::write(remote.path().join(marker), []).unwrap();
+    }
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("cancel-sftp-transfer-ui.ps1", &ssh, state.path());
+
+    assert_eq!(
+        fs::read(parent.join("01-first-upload")).unwrap(),
+        &bytes[..2 * chunk]
+    );
+    assert!(!parent.join("02-queued-upload").exists());
+    assert_eq!(
+        fs::read(picker.join("retained-download")).unwrap(),
+        b"keep these bytes"
+    );
+    assert_eq!(
+        fs::read(picker.join("verified-download")).unwrap(),
+        b"same SFTP channel"
+    );
+    assert_eq!(
+        fs::read_dir(&picker).unwrap().count(),
+        4,
+        "partial download left a temporary file"
+    );
+    let trace = fs::read_to_string(remote.path().join("transfer-trace")).unwrap();
+    assert_eq!(
+        trace.lines().collect::<Vec<_>>(),
+        [
+            "OPEN /shell directory/01-first-upload",
+            "WRITE 0",
+            &format!("WRITE {chunk}"),
+            "CLOSE",
+            "OPEN /shell directory/retained-download",
+            "READ 0",
+            &format!("READ {chunk}"),
+            "CLOSE",
+            "OPEN /shell directory/verified-download",
+            "READ 0",
+            "READ 17",
+            "CLOSE",
+        ]
+    );
+    assert_eq!(
+        fs::read(remote.path().join("keyboard-input.bin")).unwrap(),
+        b"while-upload/after-cancel"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "filters a paginated SFTP listing while checking shell input and directory reads"]
+async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let parent = remote.path().join("shell directory");
+    let child = parent.join("nested");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(child.join("inside.txt"), []).unwrap();
+    let fillers = 38;
+    for index in 0..fillers {
+        fs::write(parent.join(format!("build-{index:02}.log")), []).unwrap();
+    }
+    fs::write(parent.join("zz-[Ångström].txt"), []).unwrap();
+    fs::write(parent.join("zz-Ångström.txt"), []).unwrap();
+    let keyboard = remote.path().join("keyboard-input.bin");
+    let wire = remote.path().join("listing-trace");
+    fs::write(&keyboard, []).unwrap();
+    fs::write(&wire, []).unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("filter-sftp-listing-ui.ps1", &ssh, state.path());
+
+    let trace = fs::read_to_string(wire).unwrap();
+    let mut listings: Vec<(&str, usize)> = vec![];
+    for request in trace.lines() {
+        if let Some(path) = request.strip_prefix("OPENDIR ") {
+            listings.push((path, 0));
+        } else {
+            assert_eq!(request, "READDIR");
+            listings.last_mut().expect("OPENDIR before READDIR").1 += 1;
+        }
+    }
+    // This fixture returns one entry per READDIR plus one final EOF. Only
+    // opening the drawer, refreshing, and entering the child may read a list.
+    assert_eq!(
+        listings,
+        [
+            ("/shell directory", fillers + 4),
+            ("/shell directory", fillers + 5),
+            ("/shell directory/nested", 2),
+        ]
+    );
+    assert_eq!(
+        fs::read(keyboard).unwrap(),
+        b"after-filter-donefilter-ssh-ready"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP channel"
     );
     server.abort();
 }

@@ -4,6 +4,7 @@ use super::*;
 use crate::config::BidiMode;
 use log::debug;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use termwiz::input::KeyboardEncoding;
 use wezterm_surface::SequenceNo;
@@ -28,6 +29,9 @@ pub struct Screen {
     /// increment this.  We use this offset to translate between
     /// PhysRowIndex and StableRowIndex.
     stable_row_index_offset: usize,
+    /// Identifies one interpretation of stable row coordinates. Ordinary output
+    /// and natural history eviction preserve it.
+    row_epoch: u64,
     /// Start of the primary shell's current OSC 133 C/D output range.
     pub(crate) command_start: Option<(StableRowIndex, usize)>,
 
@@ -77,6 +81,7 @@ impl Screen {
             physical_rows,
             physical_cols,
             stable_row_index_offset: 0,
+            row_epoch: Self::next_row_epoch(),
             command_start: None,
             dpi: size.dpi,
             keyboard_stack: vec![],
@@ -85,8 +90,22 @@ impl Screen {
     }
 
     pub fn full_reset(&mut self) {
+        self.invalidate_row_coordinates();
         self.keyboard_stack.clear();
         self.command_start = None;
+    }
+
+    fn next_row_epoch() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn invalidate_row_coordinates(&mut self) {
+        self.row_epoch = Self::next_row_epoch();
+    }
+
+    pub fn row_epoch(&self) -> u64 {
+        self.row_epoch
     }
 
     pub(crate) fn take_command_text(
@@ -304,6 +323,9 @@ impl Screen {
             size.dpi
         );
         self.dpi = size.dpi;
+        if physical_cols != self.physical_cols || physical_rows != self.physical_rows {
+            self.invalidate_row_coordinates();
+        }
 
         // pre-prune blank lines that range from the cursor position to the end of the display;
         // this avoids growing the scrollback size when rapidly switching between normal and

@@ -200,6 +200,7 @@ async fn request(
             deadline,
             reply,
             progress: None,
+            cancel: None,
         }))
         .context("SSH session closed")?;
     tokio::time::timeout_at(deadline + Duration::from_secs(1), response)
@@ -221,6 +222,7 @@ impl Drop for RemoteFile {
                 deadline: tokio::time::Instant::now() + Duration::from_secs(15),
                 reply,
                 progress: None,
+                cancel: None,
             }));
         }
     }

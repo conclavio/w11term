@@ -4,17 +4,27 @@
 #![allow(non_upper_case_globals)]
 mod document;
 mod ranges;
+#[cfg(test)]
+mod scroll_tests;
+#[cfg(test)]
+mod word_tests;
 use document::{Document, Selection};
 use ranges::{TextRange, interfaces};
 use std::{
     cell::RefCell,
     ops::Range,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
-use w11term::terminal::{FrameStore, Snapshot};
+use tokio::sync::mpsc::UnboundedSender;
+use w11term::{
+    appearance::Appearance,
+    session::{Command, RangeScroll},
+    terminal::{FrameStore, Snapshot},
+};
 use windows::{
     Win32::{
         Foundation::*,
@@ -43,8 +53,30 @@ pub struct Geometry {
 struct State {
     geometry: Geometry,
     selected: Option<Selection>,
-    cached: Option<(u64, Arc<Document>)>,
+    cached: Option<Arc<Document>>,
     requested: Option<SelectionRequest>,
+}
+impl State {
+    fn document(
+        &mut self,
+        frame: &Snapshot,
+        appearance: &RwLock<Appearance>,
+    ) -> Result<Arc<Document>> {
+        let word_delimiters = {
+            let appearance = appearance.read().map_err(|_| unavailable())?;
+            let delimiters = &appearance.interaction.word_delimiters;
+            if let Some(doc) = &self.cached
+                && doc.generation == frame.generation
+                && doc.word_delimiters == *delimiters
+            {
+                return Ok(doc.clone());
+            }
+            delimiters.clone()
+        };
+        let doc = Arc::new(Document::with_word_delimiters(frame, word_delimiters));
+        self.cached = Some(doc.clone());
+        Ok(doc)
+    }
 }
 #[derive(Clone, Copy)]
 pub struct SelectionRequest {
@@ -55,7 +87,9 @@ pub struct SelectionRequest {
 pub struct Pane<'a> {
     pub id: u64,
     pub label: &'a str,
+    pub appearance: &'a Arc<RwLock<Appearance>>,
     pub frames: &'a FrameStore,
+    pub input: &'a UnboundedSender<Command>,
     pub geometry: Geometry,
     pub selection: Option<&'a w11term::interaction::Selection>,
 }
@@ -63,8 +97,10 @@ struct Source {
     hwnd: usize,
     id: u64,
     name: String,
-    alive: AtomicBool,
+    appearance: Arc<RwLock<Appearance>>,
+    alive: Arc<AtomicBool>,
     frames: FrameStore,
+    input: UnboundedSender<Command>,
     state: Mutex<State>,
 }
 impl Source {
@@ -77,16 +113,11 @@ impl Source {
     }
     fn document(&self) -> Result<Arc<Document>> {
         self.check()?;
-        let f = self.frames.load();
-        let mut state = self.state.lock().map_err(|_| unavailable())?;
-        if let Some((gen_id, doc)) = &state.cached
-            && *gen_id == f.generation
-        {
-            return Ok(doc.clone());
-        }
-        let doc = Arc::new(Document::from_frame(&f));
-        state.cached = Some((f.generation, doc.clone()));
-        Ok(doc)
+        let frame = self.frames.load();
+        self.state
+            .lock()
+            .map_err(|_| unavailable())?
+            .document(&frame, &self.appearance)
     }
     fn rect(&self) -> Result<(Geometry, RECT)> {
         self.check()?;
@@ -114,6 +145,17 @@ impl Source {
                 WPARAM(0),
                 LPARAM(0),
             )
+        }
+    }
+    fn scroll(&self, doc: &Document, span: Range<usize>, align_top: bool) -> Result<()> {
+        self.check()?;
+        let rows = doc.retained_rows(&span).ok_or_else(unavailable)?;
+        let (command, result) = RangeScroll::request(rows, align_top, self.alive.clone());
+        self.input.send(command).map_err(|_| unavailable())?;
+        if result.wait(Duration::from_secs(1)) {
+            self.check()
+        } else {
+            Err(unavailable())
         }
     }
     fn focused(&self) -> bool {
@@ -321,7 +363,9 @@ impl Bridge {
         let Pane {
             id: pane,
             label,
+            appearance,
             frames,
+            input,
             geometry: g,
             selection,
         } = pane;
@@ -332,7 +376,10 @@ impl Bridge {
         });
         let mut slot = self.host.borrow_mut();
         let changed_pane = slot.as_ref().is_none_or(|h| {
-            h.source.id != pane || h.parent != parent || !h.source.alive.load(Ordering::Acquire)
+            h.source.id != pane
+                || h.parent != parent
+                || !h.source.input.same_channel(input)
+                || !h.source.alive.load(Ordering::Acquire)
         });
         if changed_pane {
             slot.take();
@@ -357,8 +404,10 @@ impl Bridge {
                 hwnd: hwnd.0 as usize,
                 id: pane,
                 name: format!("Terminal · {label}"),
-                alive: AtomicBool::new(true),
+                appearance: appearance.clone(),
+                alive: Arc::new(AtomicBool::new(true)),
                 frames: frames.clone(),
+                input: input.clone(),
                 state: Mutex::new(State {
                     geometry: g,
                     selected,

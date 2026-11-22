@@ -11,14 +11,20 @@ use std::{
 };
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
+#[cfg(test)]
+mod clear_scrollback_tests;
 mod clipboard;
 mod launch;
 pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
 #[cfg(test)]
 mod pane_search_tests;
 mod presentation;
+mod range_scroll;
+pub use range_scroll::{RangeScroll, RangeScrollRequest};
 #[cfg(test)]
 mod synchronized_capture;
+#[cfg(test)]
+mod test_worker;
 use launch::Phase;
 use presentation::Presentation;
 
@@ -65,7 +71,10 @@ pub enum Command {
     ExportText(tokio::sync::oneshot::Sender<Result<String, &'static str>>),
     Resize(TerminalSize),
     Scroll(isize),
+    /// Discard only the offscreen rows of the primary buffer on this worker.
+    ClearScrollback,
     ScrollTo(isize),
+    ScrollRange(RangeScrollRequest),
     CopyRange(
         crate::copy_mode::ScreenId,
         crate::interaction::Selection,
@@ -704,9 +713,35 @@ async fn run(
                         if !terminal.is_alt_screen_active() { scroll_offset = scroll_offset.saturating_add_signed(lines).min(crate::search::max_offset(&terminal)); }
                         Ok(())
                     }
+                    Some(Command::ClearScrollback) => {
+                        if !terminal.is_alt_screen_active() && crate::search::max_offset(&terminal) > 0 {
+                            terminal.erase_scrollback();
+                            scroll_offset = 0;
+                            search.refresh(&terminal, scroll_offset);
+                            search_dirty = false;
+                            presentation.scrollback_cleared(terminal.screen().visible_row_to_stable_row(0));
+                        }
+                        Ok(())
+                    }
                     Some(Command::CopyRange(id, selection, reply)) => {
                         let _ = reply.send(crate::copy_mode::selected_text(&terminal, connection_generation, id, selection));
                         Ok(())
+                    }
+                    Some(Command::ScrollRange(request)) => {
+                        if request.available()
+                            && let Some(offset) = request.rows.scroll_offset(&terminal, connection_generation, request.align_top)
+                        {
+                            let view = (offset != scroll_offset).then(||
+                                presentation.scrolled_view(&terminal, offset, &search));
+                            request.commit(|| {
+                                if let Some(view) = view {
+                                    scroll_offset = offset;
+                                    presentation.publish_scroll(view);
+                                }
+                            });
+                        }
+                        // The viewport was already published before acknowledging UIA.
+                        continue;
                     }
                     Some(Command::ScrollTo(top)) => {
                         if !terminal.is_alt_screen_active() {

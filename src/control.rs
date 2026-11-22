@@ -21,6 +21,7 @@ use windows::Win32::{
     Foundation::{ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
 };
+mod command_history;
 mod find;
 mod registry;
 mod security;
@@ -90,6 +91,14 @@ pub enum Request {
     },
     GetText {
         pane: u64,
+    },
+    ListCommands {
+        pane: u64,
+    },
+    GetCommand {
+        pane: u64,
+        id: u64,
+        connection_generation: u64,
     },
     FindText {
         pattern: String,
@@ -353,6 +362,7 @@ impl Registry {
                         deadline,
                         reply,
                         progress: None,
+                        cancel: None,
                     }))
                     .context("pane is closed")?;
                 let result = tokio::time::timeout_at(deadline + Duration::from_secs(1), response)
@@ -429,6 +439,12 @@ impl Registry {
                 pane,
                 all_panes,
             } => self.find_text(pattern, pane, all_panes).await,
+            Request::ListCommands { pane } => self.list_commands(pane).await,
+            Request::GetCommand {
+                pane,
+                id,
+                connection_generation,
+            } => self.get_command(pane, id, connection_generation).await,
             Request::GetText { pane } => {
                 let (frame, size) = Self::capture(&self.pane(pane)?).await?;
                 let lines: Vec<_> = frame

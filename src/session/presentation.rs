@@ -20,6 +20,8 @@ pub(super) struct Presentation {
     live: FrameStore,
     pending: Option<(Snapshot, Snapshot)>,
     generation: u64,
+    scrollback_clear_generation: u64,
+    scrollback_clear_floor: Option<isize>,
     pub refresh_view: bool,
     pub dirty: bool,
     pub deadline: Option<Instant>,
@@ -33,10 +35,41 @@ impl Presentation {
             live,
             pending: None,
             generation,
+            scrollback_clear_generation: 0,
+            scrollback_clear_floor: None,
             refresh_view: false,
             dirty: true,
             deadline: None,
         }
+    }
+    pub fn scrollback_cleared(&mut self, floor: isize) {
+        self.scrollback_clear_generation += 1;
+        self.scrollback_clear_floor = Some(floor);
+        self.dirty = true;
+    }
+    /// Only the viewport changes. Prepare the potentially expensive snapshot
+    /// before claiming a synchronous reader's bounded request.
+    pub fn scrolled_view(&self, terminal: &Terminal, offset: usize, search: &Search) -> Snapshot {
+        let old = self.frames.load();
+        let mut view = Snapshot::capture(
+            terminal,
+            Some(&old),
+            0,
+            offset,
+            old.status.clone(),
+            old.bytes_received,
+        );
+        view.connection_generation = old.connection_generation;
+        view.prompt = old.prompt.clone();
+        view.scrollback_clear_generation = old.scrollback_clear_generation;
+        view.scrollback_clear_floor = old.scrollback_clear_floor;
+        view.search = search.snapshot(view.first_stable_row, view.rows.len(), view.alternate);
+        view
+    }
+    pub fn publish_scroll(&mut self, mut view: Snapshot) {
+        self.generation += 1;
+        view.generation = self.generation;
+        self.frames.publish(view);
     }
     fn stage(&mut self, terminal: &TerminalState, offset: usize, status: &str, bytes: u64) {
         let previous = self.frames.load();
@@ -47,12 +80,17 @@ impl Presentation {
             .as_ref()
             .map(|p| &p.1)
             .unwrap_or(&previous_live);
-        let view = Snapshot::capture(terminal, Some(old), 0, offset, status.into(), bytes);
-        let live = if offset == 0 {
+        let mut view = Snapshot::capture(terminal, Some(old), 0, offset, status.into(), bytes);
+        let mut live = if offset == 0 {
             view.clone()
         } else {
             Snapshot::capture(terminal, Some(old_live), 0, 0, status.into(), bytes)
         };
+        // Commit the selection cutoff alongside its rows at the same sync boundary.
+        for snapshot in [&mut view, &mut live] {
+            snapshot.scrollback_clear_generation = self.scrollback_clear_generation;
+            snapshot.scrollback_clear_floor = self.scrollback_clear_floor;
+        }
         self.pending = Some((view, live));
     }
     pub fn advance(

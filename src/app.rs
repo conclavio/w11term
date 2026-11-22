@@ -46,6 +46,7 @@ mod folder_sharing_state;
 mod keyboard_settings;
 mod local_profile;
 mod pattern_settings;
+mod word_delimiters;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;
@@ -79,6 +80,7 @@ struct LiveTab {
     files: Box<FileDrawer>,
     discovery_page: Option<usize>,
     copy_output_unavailable: Option<&'static str>,
+    can_clear_scrollback: bool,
     confirm_end: bool,
     durable_phase: Option<w11term::ssh::DurablePhase>,
     source: Source,
@@ -118,6 +120,20 @@ pub enum FindOption {
     Regex,
 }
 impl LiveTab {
+    fn reconcile_selection(&mut self, frame: &w11term::terminal::Snapshot) -> bool {
+        let mut selection = self.selection.borrow_mut();
+        if selection.as_mut().is_some_and(|s| {
+            s.alternate != frame.alternate
+                || s.cols != frame.cols
+                || !s.reconcile_scrollback_clear(frame)
+        }) {
+            selection.take();
+            self.scroll_direction = 0;
+            return true;
+        }
+        false
+    }
+
     fn reset_transport_input(&mut self, keyboard: &KeyboardBridge) {
         self.remote_mouse = RemoteMouse::default();
         self.end_pointer_gesture();
@@ -276,6 +292,7 @@ pub enum InteractionField {
 enum SettingsEditor {
     Keyboard(keyboard_settings::KeyboardPage),
     Patterns(pattern_settings::PatternPage),
+    WordDelimiters(word_delimiters::Editor),
 }
 enum Page {
     SharedFolders(folder_shares::Panel),
@@ -336,14 +353,14 @@ impl AppTab {
 }
 
 #[derive(Clone, Default)]
-enum DraftOrigin {
+enum DraftOrigin<T = ProfileSnapshot> {
     #[default]
     New,
-    Edit(ProfileSnapshot),
-    Copy(ProfileSnapshot),
+    Edit(T),
+    Copy(T),
 }
-impl DraftOrigin {
-    fn editing(&self) -> Option<&ProfileSnapshot> {
+impl<T> DraftOrigin<T> {
+    fn editing(&self) -> Option<&T> {
         match self {
             Self::Edit(base) => Some(base),
             _ => None,
@@ -464,7 +481,8 @@ fn scrollback_editor(value: &str, on_change: Callback<String>) -> View {
     ))
 }
 
-fn command_menu_item(key: &str, label: &str, enabled: bool) -> MenuItem {
+fn command_menu_item(key: &str, label: impl Into<String>, enabled: bool) -> MenuItem {
+    let label = label.into();
     if enabled {
         MenuItem::item(key, label)
     } else {
@@ -519,6 +537,7 @@ fn tab_menu_message(label: String) -> Message {
         }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
+        "Clear scrollback" => Message::Shortcut(Shortcut::ClearScrollback),
         "Command history" => Message::History(command_history::Action::Open),
         "Notify when command finishes" => Message::Attention(attention::Action::WatchCommand(true)),
         "Cancel command notification" => Message::Attention(attention::Action::WatchCommand(false)),
@@ -715,6 +734,7 @@ pub enum Message {
     FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
     Export(scrollback_export::Action),
+    ClearScrollback(u64),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
@@ -788,6 +808,7 @@ pub enum Message {
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
+    WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
     Font(Option<usize>),
@@ -858,6 +879,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             files: Box::default(),
             discovery_page: None,
             copy_output_unavailable: Some("waiting for shell markers"),
+            can_clear_scrollback: false,
             source,
             confirm_end: false,
             durable_phase: None,
@@ -982,16 +1004,18 @@ impl TerminalApp {
         if prompt_id.is_some() {
             self.title_editor = None;
             tab.files.cancel_entry_dialog();
+            tab.files.end_filter_edit();
         }
+        let editing_files = tab.files.entry_dialog_open() || tab.files.filter_editing();
         self.clipboard.connection_changed(
             tab.session.pane_id,
             frame.connection_generation,
-            prompt_id.is_some() || tab.read_only.get() || tab.files.entry_dialog_open(),
+            prompt_id.is_some() || tab.read_only.get() || editing_files,
         );
         self.keyboard.set_modal(
             prompt_id.is_some()
                 || self.title_editor.is_some()
-                || tab.files.entry_dialog_open()
+                || editing_files
                 || self.clipboard.is_open(),
         );
         let choosing = tab.browsing_sessions();
@@ -1199,7 +1223,17 @@ impl TerminalApp {
             )
     }
     fn active_selection(&self) -> bool {
-        matches!(self.tabs.active(),Some(AppTab{page:Page::Terminal(tab),..}) if tab.selection.borrow().as_ref().is_some_and(|s|{let frame=tab.session.frames.load();s.active && s.alternate==frame.alternate && s.cols==frame.cols}))
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.active()
+        else {
+            return false;
+        };
+        tab.selection
+            .borrow()
+            .as_ref()
+            .is_some_and(|selection| selection.can_copy(&tab.session.frames.load()))
     }
     fn clear_selection(&mut self) {
         if let Some(AppTab {
@@ -1292,6 +1326,17 @@ impl TerminalApp {
         if !self.tabs.visible(id) {
             return;
         }
+        if kind == MouseEventKind::Press
+            && let Some(active) = self.tabs.active_id()
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(active)
+            && tab.files.filter_editing()
+        {
+            tab.files.end_filter_edit();
+            self.connection_ui(active);
+        }
         if self
             .copy_mode
             .borrow()
@@ -1305,6 +1350,7 @@ impl TerminalApp {
             self.focus_pane(id, context);
         }
         self.keyboard.hover_pane(id);
+        let active = self.tabs.active_id() == Some(id);
         let preferences = self.appearance.read().unwrap().interaction.clone();
         let modifiers = crate::input::modifiers();
         let Some(AppTab {
@@ -1316,6 +1362,9 @@ impl TerminalApp {
         };
         let metrics = tab.surface.metrics.get();
         let frame = tab.session.frames.load();
+        if tab.reconcile_selection(&frame) && active {
+            self.keyboard.set_selection(false);
+        }
         let hit = metrics.hit(pointer.x, pointer.y);
         let (x, y) = (hit.col, hit.row);
         let point = hit.point(&frame);
@@ -1681,6 +1730,13 @@ impl TerminalApp {
                 .into(),
         );
         children.push(TextBlock::new().text("Interaction").font_size(20.0).into());
+        children.push(
+            Button::new()
+                .on_click(
+                    context.callback(|_| Message::WordDelimiters(word_delimiters::Edit::Show)),
+                )
+                .content("Word selection delimiters…"),
+        );
         for (field, label, value) in [
             (
                 InteractionField::CopyOnSelect,
@@ -2314,12 +2370,7 @@ impl TerminalApp {
         let Some(base) = draft.origin.editing() else {
             return;
         };
-        let mut name = format!("{} copy", base.name);
-        let mut index = 2;
-        while self.catalog.profiles.contains_key(&name) || self.catalog.local.contains_key(&name) {
-            name = format!("{} copy {index}", base.name);
-            index += 1;
-        }
+        let name = self.catalog.copy_name(&base.name);
         let copy = ProfileDraft {
             origin: DraftOrigin::Copy(base.clone()),
             ..ProfileDraft::from_options(name, &base.options)
@@ -2561,6 +2612,9 @@ impl TerminalApp {
             }
             _ => match tab_menu_message(label) {
                 Message::Shortcut(Shortcut::SwapPane(direction)) => swaps.message(direction),
+                Message::Shortcut(Shortcut::ClearScrollback) => {
+                    pane.map_or(Message::ControlIdle, Message::ClearScrollback)
+                }
                 message => bind_tab_action(message, group),
             },
         });
@@ -2812,6 +2866,15 @@ impl TerminalApp {
     }
 
     fn binding_menu(&self, key: &str, label: &str, action: KeyAction) -> MenuItem {
+        self.binding_menu_enabled(key, label, action, true)
+    }
+    fn binding_menu_enabled(
+        &self,
+        key: &str,
+        label: &str,
+        action: KeyAction,
+        enabled: bool,
+    ) -> MenuItem {
         let description = self
             .appearance
             .read()
@@ -2819,7 +2882,7 @@ impl TerminalApp {
             .shortcuts
             .get(action.binding())
             .map_or_else(|| label.to_owned(), |chord| format!("{label}    {chord}"));
-        MenuItem::item(key, description)
+        command_menu_item(key, description, enabled)
     }
     fn duplicate_tab_item(&self) -> MenuItem {
         let action = KeyAction::DuplicateTabLayout;
@@ -2903,6 +2966,13 @@ impl TerminalApp {
                 "save-scrollback",
                 scrollback_export::LABEL,
                 self.export.pending.is_none(),
+            ));
+            let clear = KeyAction::ClearScrollback.binding();
+            items.push(self.binding_menu_enabled(
+                clear.id,
+                clear.label,
+                clear.action,
+                live.can_clear_scrollback,
             ));
             items.push(match live.session.events.command_watch() {
                 Some(true) => MenuItem::item("command-watch", "Cancel command notification"),
@@ -3587,7 +3657,8 @@ impl Component for TerminalApp {
                 if ssh.host == "127.0.0.1" && ssh.host_key.is_some() &&
                     ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
                          || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
-                         || std::env::var_os("W11TERM_FILE_SMOKE").is_some()))
+                         || std::env::var_os("W11TERM_FILE_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_WORD_SELECTION_SMOKE").is_some()))
                      || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())
                      || (ssh.user == "pilot" && std::env::var_os("W11TERM_DISCOVERY_SMOKE").is_some())
                      || (ssh.user == "bench" && std::env::var_os("W11TERM_PROFILE_SMOKE").is_some())));
@@ -3697,6 +3768,15 @@ impl Component for TerminalApp {
             Message::Export(action) => {
                 self.export_scrollback(action, context);
                 self.refresh_open_commands();
+            }
+            Message::ClearScrollback(pane) => {
+                if let Some(AppTab {
+                    page: Page::Terminal(tab),
+                    ..
+                }) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id))
+                {
+                    let _ = tab.session.input.send(Command::ClearScrollback);
+                }
             }
             Message::DismissWindowError => self.window_error = None,
             Message::MoveTabToWindow => self.move_tab_window(context),
@@ -4311,6 +4391,7 @@ impl Component for TerminalApp {
                 if self.tabs.visible(id) && self.watch_epoch == epoch {
                     self.frame_tasks.remove(&id);
                     let active = self.tabs.active_id() == Some(id);
+                    let mut clear_availability_changed = false;
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -4342,6 +4423,16 @@ impl Component for TerminalApp {
                             tab.follow_shell_directory(&frame, context);
                         }
                         let unavailable = frame.copy_output_unavailable();
+                        let can_clear = !frame.alternate
+                            && (frame.scroll_offset > 0
+                                || frame.first_stable_row > frame.oldest_stable_row);
+                        if tab.can_clear_scrollback != can_clear {
+                            tab.can_clear_scrollback = can_clear;
+                            if active {
+                                self.header.borrow_mut().take();
+                                clear_availability_changed = true;
+                            }
+                        }
                         if tab.copy_output_unavailable != unavailable {
                             tab.copy_output_unavailable = unavailable;
                             self.header.borrow_mut().take();
@@ -4357,22 +4448,17 @@ impl Component for TerminalApp {
                         self.refresh_copy_mode(id);
                         self.connection_ui(id);
                     }
+                    if clear_availability_changed {
+                        self.refresh_open_commands();
+                    }
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
-                    }) = self.tabs.get(id)
+                    }) = self.tabs.get_mut(id)
                     {
                         let frame = tab.session.frames.load();
-                        if tab
-                            .selection
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|s| s.alternate != frame.alternate || s.cols != frame.cols)
-                        {
-                            tab.selection.borrow_mut().take();
-                            if self.tabs.active_id() == Some(id) {
-                                self.keyboard.set_selection(false);
-                            }
+                        if tab.reconcile_selection(&frame) && active {
+                            self.keyboard.set_selection(false);
                         }
                         if let Some(selection) =
                             tab.selection.borrow_mut().as_mut().filter(|s| s.dragging)
@@ -4540,6 +4626,8 @@ impl Component for TerminalApp {
                     }
                 }
                 Shortcut::CopyMode => self.open_copy_mode(),
+                // Keyboard input uses the worker receiving the keydown. Menus carry its pane ID.
+                Shortcut::ClearScrollback => {}
                 Shortcut::CopyKey(key) => self.copy_key(key, context),
                 Shortcut::KeyboardHints => self.open_hints(),
                 Shortcut::HintKey(key) => self.hint_key(key, context),
@@ -4698,6 +4786,7 @@ impl Component for TerminalApp {
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
+            Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -5107,14 +5196,18 @@ impl Component for TerminalApp {
                 crate::accessibility::Pane {
                     id: tab.session.pane_id,
                     label,
+                    appearance: &self.appearance,
                     frames: &tab.session.frames,
+                    input: &tab.session.input,
                     geometry: crate::accessibility::Geometry {
                         bounds,
                         cell_width: f64::from(metrics.cell_width * metrics.scale),
                         cell_height: f64::from(metrics.cell_height * metrics.scale),
                         padding: f64::from(PADDING * metrics.scale),
                     },
-                    selection: marked.as_ref().or(tab.selection.borrow().as_ref()),
+                    selection: marked.as_ref().or(tab.selection.borrow().as_ref()).filter(
+                        |selection| selection.survives_scrollback_clear(&tab.session.frames.load()),
+                    ),
                 },
                 move |request| {
                     sender.send(Message::AccessibleSelection(request));
@@ -5158,6 +5251,9 @@ impl Component for TerminalApp {
                     _ => self.pane_view(id, tab, false, context),
                 },
                 Page::Settings(None) => self.settings_view(context),
+                Page::Settings(Some(SettingsEditor::WordDelimiters(editor))) => {
+                    word_delimiters::view(editor, context)
+                }
                 Page::Attention => self.attention_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),
@@ -5362,6 +5458,10 @@ impl TerminalApp {
         }
         if let Some(path) = std::env::var_os("W11TERM_UIA_SMOKE") {
             self.accessibility_smoke(step, std::path::Path::new(&path), context);
+            return;
+        }
+        if let Some(path) = std::env::var_os("W11TERM_WORD_SELECTION_SMOKE") {
+            self.word_selection_smoke(std::path::Path::new(&path), context);
             return;
         }
         if std::env::var_os("W11TERM_IME_SMOKE").is_some() {
