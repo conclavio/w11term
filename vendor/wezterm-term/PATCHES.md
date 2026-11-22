@@ -92,3 +92,7 @@ The original MIT license is preserved in `LICENSE.md`.
   transport has exited. Pending bytes on the old writer keep their original
   destination while the next shell starts in the same terminal model.
   The embedding can track window focus locally while the peer is offline.
+
+- The embedding can enable ConEmu / Windows Terminal OSC 9;9 reports for
+  local Windows panes. Reported drive paths feed the same current-directory
+  state as OSC 7. SSH panes continue to use their own OSC 7 host information.

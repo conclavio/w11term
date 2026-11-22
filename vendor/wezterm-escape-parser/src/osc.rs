@@ -49,6 +49,7 @@ pub enum OperatingSystemCommand {
     ChangeDynamicColors(DynamicColorNumber, Vec<ColorOrQuery>),
     ResetDynamicColor(DynamicColorNumber),
     CurrentWorkingDirectory(String),
+    ConEmuWorkingDirectory(String),
     ResetColors(Vec<u8>),
     RxvtExtension(Vec<String>),
     ConEmuProgress(Progress),
@@ -318,6 +319,10 @@ impl OperatingSystemCommand {
             SetHyperlink => Ok(OperatingSystemCommand::SetHyperlink(Hyperlink::parse(osc)?)),
             ManipulateSelectionData => Self::parse_selection(osc),
             SystemNotification => {
+                if let [b"9", b"9", path] = osc {
+                    let path = String::from_utf8(path.to_vec())?;
+                    return Ok(OperatingSystemCommand::ConEmuWorkingDirectory(path));
+                }
                 if osc.len() >= 3 && osc[1] == b"4" {
                     // Missing percentages default to zero. Clamp decimal values
                     // as they are parsed, including those wider than a machine word.
@@ -618,6 +623,7 @@ impl Display for OperatingSystemCommand {
                 write!(f, "{}", 100 + *color as u8)?;
             }
             CurrentWorkingDirectory(s) => write!(f, "7;{}", s)?,
+            ConEmuWorkingDirectory(s) => write!(f, "9;9;{}", s)?,
             ConEmuProgress(Progress::None) => write!(f, "9;4;0")?,
             ConEmuProgress(Progress::SetPercentage(pct)) => write!(f, "9;4;1;{pct}")?,
             ConEmuProgress(Progress::SetError(pct)) => write!(f, "9;4;2;{pct}")?,

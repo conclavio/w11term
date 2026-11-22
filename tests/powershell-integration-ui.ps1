@@ -31,7 +31,7 @@ function Click([string]$Name) {
 function Set-Integration([string]$Label) {
     Run-Palette 'Settings'
     Click "Edit local profile $Label"
-    $name = 'Enable command history and completion alerts in PowerShell'
+    $name = 'Enable PowerShell integration'
     $box = Wait-Until 'interactive PowerShell profile checkbox' {
         Find-Element $name ([System.Windows.Automation.ControlType]::CheckBox)
     }

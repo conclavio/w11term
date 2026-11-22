@@ -124,7 +124,7 @@ fn contain_worker_failure(
 ) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         events.close_restart();
-        events.command_stream(false);
+        events.command_stream(None);
         events.set_progress(wezterm_term::Progress::None);
         // Never resume a possibly inconsistent terminal engine after unwinding.
         let mut frame = (*frames.load()).clone();
@@ -365,6 +365,9 @@ impl Session {
             colors.effective(),
         );
         let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard));
+        if matches!(source, Source::Local(_)) {
+            terminal.enable_conemu_directory_reports();
+        }
         let clipboard: Arc<dyn wezterm_term::Clipboard> =
             Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
         terminal.set_clipboard(&clipboard);
@@ -447,7 +450,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.events.close_restart();
-        self.events.command_stream(false);
+        self.events.command_stream(None);
         let _ = self.input.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -911,7 +914,7 @@ async fn run(
                     terminal.clear_color_scheme_subscription();
                     let joined = transports.join_next().await;
                     prompts.cancel();
-                    events.command_stream(false);
+                    events.command_stream(None);
                     events.set_progress(wezterm_term::Progress::None);
                     if let Some(task) = asset_task.take() { task.abort(); }
                     pending_pack = Default::default();
@@ -944,7 +947,7 @@ async fn run(
                         ssh::Event::Disconnected => {
                             terminal.clear_color_scheme_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
-                            events.command_stream(false);
+                            events.command_stream(None);
                             events.set_progress(wezterm_term::Progress::None);
                             show_progress = interactive;
                         }
@@ -983,7 +986,7 @@ async fn run(
                             presentation.dirty = true;
                             connection_generation = generation;
                             phase = Phase::Running;
-                            events.command_stream(live_commands);
+                            events.command_stream(live_commands.then_some(generation));
                         }
                     }
                 }
@@ -992,7 +995,7 @@ async fn run(
             }
         }
     }
-    events.command_stream(false);
+    events.command_stream(None);
     drop(output);
     transports.shutdown().await;
     if let Some(task) = asset_task {

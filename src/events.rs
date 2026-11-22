@@ -36,10 +36,25 @@ struct State {
     restart_closed: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CommandWatch {
+    generation: u64,
     armed: bool,
     running: Option<RunningCommand>,
+}
+
+impl CommandWatch {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            armed: false,
+            running: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.generation);
+    }
 }
 
 #[derive(Debug)]
@@ -128,6 +143,16 @@ impl Events {
         self.state.lock().unwrap().watch_state()
     }
 
+    /// Current live shell stream, including the interval before its first frame.
+    pub fn shell_generation(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .command_watch
+            .as_ref()
+            .map(|watch| watch.generation)
+    }
+
     pub fn set_command_watch(&self, armed: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
@@ -139,10 +164,10 @@ impl Events {
         true
     }
 
-    pub(crate) fn command_stream(&self, live: bool) {
+    pub(crate) fn command_stream(&self, generation: Option<u64>) {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
-        state.command_watch = live.then(CommandWatch::default);
+        state.command_watch = generation.map(CommandWatch::new);
         state.refresh_watch(previous);
     }
 
@@ -150,7 +175,7 @@ impl Events {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
         if let Some(watch) = &mut state.command_watch {
-            *watch = CommandWatch::default();
+            watch.reset();
         }
         state.refresh_watch(previous);
     }
@@ -183,7 +208,7 @@ impl Events {
                     .as_ref()
                     .is_some_and(|command| command.aid.is_none())
                 {
-                    *watch = CommandWatch::default();
+                    watch.reset();
                     state.refresh_watch(previous);
                 }
                 return;

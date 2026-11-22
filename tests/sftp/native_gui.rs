@@ -1929,9 +1929,20 @@ async fn native_sftp_opens_a_shell_in_the_bookmarked_directory_on_the_original_t
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "opens right and below splits from verified OSC 7 paths on real SSH channels"]
-async fn native_splits_open_the_reported_directory_on_the_original_ssh_transport() {
-    for direction in ["right", "below"] {
+#[ignore = "opens local PowerShell tabs and splits from real directory reports beside a live SSH shell"]
+async fn native_powershell_directory_actions_inherit_cwd_and_preserve_the_mixed_window() {
+    run_palette_fixture(
+        "split-powershell-directory-ui.ps1",
+        b"directory-split-ssh-live",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens tabs and splits from verified OSC 7 paths on real SSH channels"]
+async fn native_ssh_directory_actions_open_on_the_original_transport() {
+    for destination in ["right", "below", "tab"] {
         let accepted = Arc::new(AtomicUsize::new(0));
         let (Source::Ssh(ssh), remote, opens, server) =
             fixture_counting_accepts(false, 2, accepted.clone()).await
@@ -1939,7 +1950,7 @@ async fn native_splits_open_the_reported_directory_on_the_original_ssh_transport
             unreachable!()
         };
         let state = tempfile::tempdir().unwrap();
-        fs::write(state.path().join("direction"), direction).unwrap();
+        fs::write(state.path().join("destination"), destination).unwrap();
         let inputs = remote.path().join("split-inputs");
         fs::create_dir(&inputs).unwrap();
         let exec = remote.path().join("workspace-exec.bin");

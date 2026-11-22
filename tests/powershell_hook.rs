@@ -49,6 +49,10 @@ impl Shell {
             "executable":executable, "args":["-NoLogo","-NoProfile","-NoExit","-File",startup],
             "cwd":startup.parent()
         }))?;
+        Ok(Self::launch(options))
+    }
+
+    fn launch(options: LocalOptions) -> Self {
         let (input, rx) = mpsc::unbounded_channel();
         let (tx, output) = mpsc::channel(32);
         let task = tokio::spawn(conpty::run(
@@ -61,11 +65,11 @@ impl Shell {
             rx,
             tx,
         ));
-        Ok(Self {
+        Self {
             input,
             output,
             task,
-        })
+        }
     }
 
     fn write(&self, line: &str) -> Result<()> {
@@ -82,6 +86,39 @@ impl Shell {
     }
 }
 
+#[tokio::test]
+async fn legacy_powershell_opens_bracketed_directories_with_and_without_prompt_integration()
+-> Result<()> {
+    let installed = LocalOptions::installed();
+    let legacy = installed
+        .get("Windows PowerShell")
+        .context("Windows PowerShell missing")?;
+    let temp = tempfile::tempdir()?;
+    let literal = temp.path().join("fixture [ab]");
+    std::fs::create_dir(&literal)?;
+    for matching_sibling in [false, true] {
+        if matching_sibling {
+            // The 5.1 fallback can select a different existing directory.
+            std::fs::create_dir(temp.path().join("fixture a"))?;
+        }
+        for integration in [false, true] {
+            let mut options = legacy.clone();
+            options.args = vec!["-NoLogo".into(), "-NoProfile".into()];
+            options.cwd = Some(literal.clone());
+            options.powershell_integration = integration;
+            let mut shell = Shell::launch(options);
+            let ready = if integration { "\x1b]133;B" } else { ">" };
+            let output = first_prompt(&mut shell.output, ready).await?;
+            ensure!(
+                output.contains("fixture [ab]>"),
+                "integration={integration}, sibling={matching_sibling}: {output:?}"
+            );
+            shell.close().await?;
+        }
+    }
+    Ok(())
+}
+
 async fn exercise(executable: &Path) -> Result<()> {
     eprintln!(
         "Checking ConsoleHost shell integration in {}",
@@ -96,12 +133,9 @@ async fn exercise(executable: &Path) -> Result<()> {
     // a hook that returned without installing, and a missing input marker in a
     // timeout transcript. They don't create a reader or generate OSC output.
     let stock_startup = temp.path().join("stock.ps1");
-    let script = include_str!("../src/conpty/shell-integration.ps1");
     std::fs::write(
         &stock_startup,
-        format!(
-            "[Console]::WriteLine('[fixture: stock startup entered]')\n{script}\n[Console]::WriteLine('[fixture: stock hook installed=' + [bool]$global:__W11TermSemanticPrompt + ']')\n"
-        ),
+        "[Console]::WriteLine('[fixture: stock startup entered]')\n. (Join-Path $PSScriptRoot 'hook.ps1')\n[Console]::WriteLine('[fixture: stock hook installed=' + [bool]$global:__W11TermSemanticPrompt + ']')\n",
     )?;
     let mut stock = Shell::start(executable, &stock_startup)?;
     let initial = first_prompt(&mut stock.output, ready)
@@ -140,6 +174,50 @@ function global:prompt { "$state-prompt-$?> " }
     let mut shell = Shell::start(executable, &startup)?;
     let initial = first_prompt(&mut shell.output, ready).await?;
     assert!(initial.contains("\x1b]133;A") && initial.contains("fixture-prompt-True>"));
+    // Feed the real ConsoleHost output to the same parser that publishes pane
+    // state. A provider drive has a display name unrelated to its native path.
+    let (writer, _replies) = mpsc::unbounded_channel();
+    let mut terminal = w11term::terminal::create(Default::default(), writer);
+    terminal.advance_bytes(initial.as_bytes());
+    let fixture_directory = temp.path().join("files 猫 #%2F;[]&");
+    std::fs::create_dir(&fixture_directory)?;
+    let start_drive = "New-PSDrive Fixture FileSystem (Join-Path $PWD ('files '+[char]0x732B+' #%2F;[]&')) -Scope Global | Out-Null; Set-Location Fixture:\\";
+    for (command, expected) in [
+        (start_drive, Some(fixture_directory.as_path())),
+        ("Set-Location Env:\\", None),
+        ("Set-Location Fixture:\\", Some(fixture_directory.as_path())),
+    ] {
+        shell.write(&format!("{command}\r"))?;
+        let bytes = through(&mut shell.output, ready).await?;
+        ensure!(
+            bytes.matches("\x1b]7;").count() == 1,
+            "{command}: {bytes:?}"
+        );
+        terminal.advance_bytes(bytes.as_bytes());
+        // A hosted runner can hand us an 8.3 TEMP path while PowerShell
+        // reports its long name. Compare the existing directories on disk.
+        let actual = terminal
+            .get_current_dir()
+            .and_then(|url| url.to_file_path().ok());
+        ensure!(
+            actual.as_deref().map(std::fs::canonicalize).transpose()?
+                == expected.map(std::fs::canonicalize).transpose()?,
+            "{command}: expected {expected:?}, got {:?} in {bytes:?}",
+            terminal.reported_current_dir(),
+        );
+        if expected.is_some() {
+            let raw = terminal
+                .reported_current_dir()
+                .context("missing file URI")?;
+            ensure!(
+                raw.trim_end_matches('/')
+                    .ends_with("/files%20%E7%8C%AB%20%23%252F%3B%5B%5D%26"),
+                "{raw}"
+            );
+        } else {
+            ensure!(terminal.reported_current_dir().is_none(), "{bytes:?}");
+        }
+    }
     shell.write("discardme")?;
     through(&mut shell.output, "discardme").await?;
     shell.write("\x03")?;
@@ -195,7 +273,7 @@ function global:prompt { "$state-prompt-$?> " }
         if command == "prompt\r" {
             let (before, _) = bytes.split_once("\x1b]133;D").unwrap();
             ensure!(
-                before.contains("fixture-prompt-True>"),
+                before.contains("fixture-prompt-True>") && !before.contains("\x1b]7;"),
                 "explicit prompt completed its parent command early: {bytes:?}"
             );
         }
