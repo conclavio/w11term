@@ -585,6 +585,28 @@ impl<T> Tabs<T> {
         self.groups.sort_by_key(|group| positions[&group.id]);
         true
     }
+
+    fn active_tab_move(&self, direction: Direction) -> Option<(usize, usize)> {
+        let index = self.active_index()?;
+        let neighbor = match direction {
+            Direction::Left if index > 0 => index - 1,
+            Direction::Right if index + 1 < self.groups.len() => index + 1,
+            _ => return None,
+        };
+        Some((index, neighbor))
+    }
+
+    pub fn can_move_active_tab(&self, direction: Direction) -> bool {
+        self.active_tab_move(direction).is_some()
+    }
+
+    pub fn move_active_tab(&mut self, direction: Direction) -> bool {
+        let Some((index, neighbor)) = self.active_tab_move(direction) else {
+            return false;
+        };
+        self.groups.swap(index, neighbor);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -1053,6 +1075,49 @@ mod tests {
         assert_eq!(tabs.active(), Some(&"settings"));
         tabs.remove(c);
         assert!(tabs.active().is_none());
+    }
+
+    #[test]
+    fn moving_the_active_header_keeps_its_zoomed_split_focus_and_visit_history() {
+        use Direction::{Left, Right};
+        let mut tabs = Tabs::default();
+        let pane = |value: &Option<u64>| *value;
+        assert!(!tabs.can_move_active_tab(Right));
+        assert!(!tabs.move_active_tab(Left));
+        let first = tabs.insert(Some(11));
+        tabs.record_pane_focus(pane);
+        assert!(!tabs.move_active_tab(Right));
+        let ssh = tabs.insert(Some(12));
+        let shell = tabs.split(ssh, Some(13), Axis::Columns).unwrap();
+        tabs.record_pane_focus(pane);
+        tabs.set_group_title(ssh, Some("Builds".to_owned().try_into().unwrap()));
+        assert!(tabs.set_ratio(&[], 0.375));
+        assert!(tabs.toggle_zoom());
+        let layout = tabs.active_layout().unwrap().clone();
+        let utility = tabs.insert(None);
+        tabs.select(shell);
+        let headers =
+            |tabs: &Tabs<Option<u64>>| tabs.headers().iter().map(|t| t.id).collect::<Vec<_>>();
+        assert!(tabs.can_move_active_tab(Right));
+        assert!(tabs.move_active_tab(Right));
+        assert_eq!(headers(&tabs), [first, utility, shell]);
+        assert!(!tabs.can_move_active_tab(Right));
+        assert!(!tabs.move_active_tab(Right));
+        assert_eq!(tabs.active_id(), Some(shell));
+        assert_eq!(tabs.layout_for(shell), Some(&layout));
+        assert_eq!(tabs.title_for(shell).unwrap().as_str(), "Builds");
+        assert_eq!(tabs.previous_pane(pane), Some(first));
+        assert!(tabs.zoomed());
+
+        tabs.select_index(1);
+        assert_eq!(tabs.active_id(), Some(utility));
+        assert!(tabs.move_active_tab(Left));
+        assert!(!tabs.move_active_tab(Left));
+        assert_eq!(headers(&tabs), [utility, first, shell]);
+        assert_eq!(tabs.previous_pane(pane), Some(shell));
+        tabs.select_index(2);
+        assert_eq!(tabs.active_id(), Some(shell));
+        assert!(tabs.zoomed());
     }
     #[test]
     fn cycling_wraps_and_invalid_reorders_cannot_drop_tabs() {

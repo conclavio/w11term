@@ -156,6 +156,8 @@ pub enum Shortcut {
     DrawerFocusChanged,
     NextTab,
     PreviousTab,
+    MoveTabLeft,
+    MoveTabRight,
     NewTab,
     DuplicateTabLayout,
     CloseTab,
@@ -1788,6 +1790,8 @@ impl From<Action> for Shortcut {
             Action::ClearScrollback => Self::ClearScrollback,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
+            Action::MoveTabLeft => Self::MoveTabLeft,
+            Action::MoveTabRight => Self::MoveTabRight,
             Action::NewTab => Self::NewTab,
             Action::DuplicateTabLayout => Self::DuplicateTabLayout,
             Action::CloseTab => Self::CloseTab,
@@ -2223,6 +2227,45 @@ mod tests {
         assert_eq!(snap_extent(1238, 24, 10), 1234);
         assert_eq!(snap_extent(980, 98, 20), 978);
         assert_eq!(snap_extent(0, 24, 10), 34);
+    }
+
+    #[test]
+    fn held_tab_reorder_chords_move_once_and_stay_out_of_the_terminal() {
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::MoveTabLeft, Some("F7".parse().unwrap()))
+            .unwrap();
+        bindings
+            .set(Action::MoveTabRight, Some("F8".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            keymap: bindings.keymap().unwrap(),
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        for vk in [0x76, 0x77] {
+            for (message, repeat) in [(WM_KEYDOWN, false), (WM_KEYDOWN, true), (WM_KEYUP, false)] {
+                assert!(state.handle(&MSG {
+                    message,
+                    wParam: WPARAM(vk),
+                    lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+                    ..Default::default()
+                }));
+            }
+            state.target = None; // The second key is dispatched from a utility tab.
+        }
+        assert_eq!(
+            *actions.borrow(),
+            [Shortcut::MoveTabLeft, Shortcut::MoveTabRight]
+        );
+        assert!(input.try_recv().is_err());
     }
 
     #[test]

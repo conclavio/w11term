@@ -574,6 +574,8 @@ fn tab_menu_message(label: String) -> Message {
         "Attention inbox" => Message::Attention(attention::Action::Open),
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
         "Duplicate tab layout" => Message::Shortcut(Shortcut::DuplicateTabLayout),
+        "Move tab left" => Message::Shortcut(Shortcut::MoveTabLeft),
+        "Move tab right" => Message::Shortcut(Shortcut::MoveTabRight),
         "SFTP files" => Message::Files(FileAction::Toggle),
         "Workspace startup…" => {
             Message::Workspace(workspace_view::WorkspaceAction::ConfigureStartup)
@@ -640,6 +642,12 @@ fn bind_tab_action(message: Message, group: Option<TabId>) -> Message {
         Message::Shortcut(Shortcut::DuplicateTabLayout) => {
             group.map_or(Message::ControlIdle, Message::DuplicateTabLayout)
         }
+        Message::Shortcut(Shortcut::MoveTabLeft) => group.map_or(Message::ControlIdle, |id| {
+            Message::MoveTab(id, Direction::Left)
+        }),
+        Message::Shortcut(Shortcut::MoveTabRight) => group.map_or(Message::ControlIdle, |id| {
+            Message::MoveTab(id, Direction::Right)
+        }),
         message => message,
     }
 }
@@ -828,6 +836,7 @@ pub enum Message {
     MovePaneToTab,
     MoveTabToWindow,
     DuplicateTabLayout(TabId),
+    MoveTab(TabId, Direction),
     WindowTick,
     DismissWindowError,
     TransferReady(u64),
@@ -869,7 +878,7 @@ pub enum Message {
     CloseWindow,
     Select(Option<usize>, u64, bool),
     CloseTab(String),
-    Reorder(Vec<String>, Option<TabId>),
+    Reorder(Vec<String>, Option<TabId>, u64),
     SyncSelection(u64),
     Shortcut(Shortcut),
     ProfileMenu(String),
@@ -2820,7 +2829,15 @@ impl TerminalApp {
             .on_close_requested(context.callback(Message::CloseTab))
             .on_reordered({
                 let selected = self.tabs.active_id();
-                context.callback(move |order| Message::Reorder(order, selected))
+                let epoch = self.selection_epoch;
+                let pending = self.selection_pending;
+                context.callback(move |order| {
+                    if pending {
+                        Message::ControlIdle
+                    } else {
+                        Message::Reorder(order, selected, epoch)
+                    }
+                })
             })
             .collection_slot(
                 TabViewSlot::TabItems,
@@ -2959,6 +2976,18 @@ impl TerminalApp {
             ),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             self.duplicate_tab_item(),
+            self.binding_menu_enabled(
+                "move-tab-left",
+                "Move tab left",
+                KeyAction::MoveTabLeft,
+                self.tabs.can_move_active_tab(Direction::Left),
+            ),
+            self.binding_menu_enabled(
+                "move-tab-right",
+                "Move tab right",
+                KeyAction::MoveTabRight,
+                self.tabs.can_move_active_tab(Direction::Right),
+            ),
             self.binding_menu("pane-picker", "Find pane…", KeyAction::PanePicker),
             self.binding_menu(
                 "find-all-panes",
@@ -4052,6 +4081,14 @@ impl Component for TerminalApp {
                     .err()
                     .map(|error| format!("Couldn’t duplicate tab layout. {error:#}"));
             }
+            Message::MoveTab(group, direction) => {
+                if self.tabs.active_group_id() == Some(group)
+                    && self.tabs.move_active_tab(direction)
+                {
+                    self.sync_selection(context);
+                    self.refresh_open_commands();
+                }
+            }
             Message::WindowTick => self.window_tick(context),
             Message::TransferReady(id) => self.offer_group(id, context),
             Message::TransferClaim(id) => self.claim_group(id, context),
@@ -4890,7 +4927,11 @@ impl Component for TerminalApp {
                     self.close_tab(id, context);
                 }
             }
-            Message::Reorder(order, selected) => {
+            Message::Reorder(order, selected, epoch) => {
+                // A delayed drag event belongs to the header order it was rendered with.
+                if self.selection_pending || epoch != self.selection_epoch {
+                    return;
+                }
                 if let Some(ids) = order
                     .iter()
                     .map(|id| id.parse().ok())
@@ -4904,6 +4945,8 @@ impl Component for TerminalApp {
                     self.sync_selection(context);
                     if changed {
                         self.activate(context);
+                    } else {
+                        self.refresh_open_commands();
                     }
                 }
             }
@@ -5017,10 +5060,11 @@ impl Component for TerminalApp {
                     self.default_profile.clone(),
                     context,
                 ),
-                Shortcut::DuplicateTabLayout => {
-                    if let Some(group) = self.tabs.active_group_id() {
-                        self.update(Message::DuplicateTabLayout(group), context);
-                    }
+                Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
+                    self.update(
+                        bind_tab_action(Message::Shortcut(shortcut), self.tabs.active_group_id()),
+                        context,
+                    );
                 }
                 Shortcut::CloseTab => {
                     if let Some(id) = self.tabs.active_id() {
@@ -6575,6 +6619,24 @@ mod profile_ui_tests {
             bind_tab_action(tab_menu_message("Duplicate tab layout".into()), None),
             Message::ControlIdle
         ));
+    }
+
+    #[test]
+    fn move_tab_commands_keep_the_group_of_the_invoking_menu_or_key() {
+        for (action, direction) in [
+            (KeyAction::MoveTabLeft, Direction::Left),
+            (KeyAction::MoveTabRight, Direction::Right),
+        ] {
+            let label = format!("{}    F8", action.binding().label);
+            for event in [tab_menu_message(label), Message::Shortcut(action.into())] {
+                assert!(matches!(bind_tab_action(event, Some(42)),
+                    Message::MoveTab(42, dir) if dir == direction));
+            }
+            assert!(matches!(
+                bind_tab_action(Message::Shortcut(action.into()), None),
+                Message::ControlIdle
+            ));
+        }
     }
     #[test]
     fn pane_menu_dispatch_preserves_profile_names_and_ignores_shortcut_labels() {

@@ -40,6 +40,8 @@ pub enum Action {
     ClearScrollback,
     NextTab,
     PreviousTab,
+    MoveTabLeft,
+    MoveTabRight,
     NewTab,
     DuplicateTabLayout,
     CloseTab,
@@ -186,6 +188,14 @@ pub const BINDINGS: &[Binding] = &[
         "Previous tab",
         0x09,
         CTRL_SHIFT,
+    ),
+    Binding::new(MoveTabLeft, "move_tab_left", "Move tab left", 0, Mods::NONE),
+    Binding::new(
+        MoveTabRight,
+        "move_tab_right",
+        "Move tab right",
+        0,
+        Mods::NONE,
     ),
     Binding::new(NewTab, "new_tab", "New tab", 0x54, CTRL_SHIFT),
     Binding::new(
@@ -490,6 +500,29 @@ mod tests {
             Some(ClearScrollback)
         );
         assert_eq!(map.resolve(chord.key, chord.mods, false, false), None);
+    }
+
+    #[test]
+    fn moving_a_tab_is_remappable_in_terminal_and_utility_tabs() {
+        let mut shortcuts = Shortcuts::default();
+        let bindings = [(MoveTabLeft, "F7"), (MoveTabRight, "F8")];
+        for (action, name) in bindings {
+            assert_eq!(shortcuts.get(action.binding()), None);
+            shortcuts.set(action, Some(name.parse().unwrap())).unwrap();
+        }
+        let json = serde_json::to_string(&shortcuts).unwrap();
+        assert_eq!(json, r#"{"move_tab_left":"F7","move_tab_right":"F8"}"#);
+        let restored: Shortcuts = serde_json::from_str(&json).unwrap();
+        let map = restored.keymap().unwrap();
+        for (action, name) in bindings {
+            let chord: Chord = name.parse().unwrap();
+            for terminal in [true, false] {
+                assert_eq!(
+                    map.resolve(chord.key, chord.mods, terminal, false),
+                    Some(action)
+                );
+            }
+        }
     }
 
     #[test]

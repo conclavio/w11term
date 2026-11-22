@@ -12,7 +12,7 @@ pub enum CommandId {
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
-    DuplicateTabLayout(Option<TabId>),
+    TabAction(Shortcut, Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
     SplitInDirectory(Axis, Option<directory_split::Origin>),
@@ -240,10 +240,10 @@ impl TerminalApp {
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
                 }
-                Shortcut::DuplicateTabLayout => {
+                Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
                     // A click queued on this row must keep its original tab even
                     // when a control client switches tabs before we receive it.
-                    row.id = CommandId::DuplicateTabLayout(self.tabs.active_group_id());
+                    row.id = CommandId::TabAction(shortcut, self.tabs.active_group_id());
                 }
                 Shortcut::SwapPane(direction) => {
                     if let Some(target) = arrangement.get(direction) {
@@ -325,8 +325,8 @@ impl TerminalApp {
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
             }
-            CommandId::DuplicateTabLayout(group) => {
-                bind_tab_action(Message::Shortcut(Shortcut::DuplicateTabLayout), group)
+            CommandId::TabAction(shortcut, group) => {
+                bind_tab_action(Message::Shortcut(shortcut), group)
             }
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
             CommandId::RotateSplit(target) => Message::RotateSplit(target),
