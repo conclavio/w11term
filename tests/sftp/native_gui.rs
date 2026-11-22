@@ -658,7 +658,12 @@ async fn native_regex_find_in_mixed_panes_keeps_search_input_off_the_wire() {
         history.push_str(&format!("scrollback filler {row}\r\n"));
     }
     history.push_str("find-fixture-ready\r\n");
-    run_palette_fixture("regex-find-ui.ps1", b"find-ssh-resumed", Some(&history)).await;
+    run_palette_fixture(
+        "regex-find-ui.ps1",
+        b"find-ssh-resumed\x1bOR",
+        Some(&history),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

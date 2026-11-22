@@ -48,6 +48,19 @@ enum KeySlot {
     KeypadVirtual(u32),
 }
 
+impl KeySlot {
+    fn can_emit_char(self) -> bool {
+        // Scanless WM_CHAR carries Unicode, not a virtual key. For example
+        // the letter 'u' has the same number as VK_F6.
+        match self {
+            Self::PrintableScan(_) | Self::KeypadScan { .. } => true,
+            Self::Virtual(key) | Self::KeypadVirtual(key) => {
+                matches!(key, 0x08 | 0x09 | 0x0d | 0x1b | 0x20)
+            }
+        }
+    }
+}
+
 struct HeldKey {
     vk: u32,
     key: KeyCode,
@@ -68,6 +81,7 @@ struct State {
     switcher: bool,
     grid: Option<Grid>,
     search: bool,
+    find_keys: HashMap<KeySlot, FindPress>,
     picker: Option<PickerStage>,
     local_mode: Option<LocalMode>,
     // A true entry may repeat a movement first pressed in this copy-mode session.
@@ -97,6 +111,13 @@ struct Target {
 struct HeldResize {
     key: KeySlot,
     repeat: Option<(KeyModifiers, Direction)>,
+}
+
+#[derive(Clone, Copy)]
+enum FindPress {
+    Held,
+    Navigate(KeyModifiers, Shortcut),
+    Released,
 }
 
 #[derive(Default)]
@@ -427,13 +448,7 @@ impl KeyboardBridge {
         let _native = self.scope.enter();
         with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
-                if visible {
-                    ime::cancel();
-                    s.release_keys();
-                    s.wheel_panes.hovered = None;
-                }
-                s.search = visible;
-                s.report_focus();
+                s.set_search(visible);
             }
         });
         ime::sync_context();
@@ -1139,6 +1154,7 @@ impl State {
             switcher: false,
             grid: None,
             search: false,
+            find_keys: HashMap::new(),
             picker: None,
             local_mode: None,
             local_held: HashMap::new(),
@@ -1189,6 +1205,7 @@ impl State {
             .is_some_and(|(a, b)| a.sender.same_channel(&b.sender))
         {
             ime::cancel();
+            self.stop_find_repeats();
         }
         self.release_keys();
         if let Some(old) = self.target.take() {
@@ -1209,6 +1226,31 @@ impl State {
             && !self.switcher
             && self.picker.is_none()
             && self.local_mode.is_none()
+    }
+
+    fn set_search(&mut self, visible: bool) {
+        if self.search == visible {
+            return;
+        }
+        self.search = visible;
+        if visible {
+            ime::cancel();
+            self.find_keys
+                .extend(self.pressed.keys().map(|&slot| (slot, FindPress::Held)));
+            self.release_keys();
+            self.wheel_panes.hovered = None;
+        } else {
+            self.stop_find_repeats();
+        }
+        self.report_focus();
+    }
+
+    fn stop_find_repeats(&mut self) {
+        for press in self.find_keys.values_mut() {
+            if matches!(press, FindPress::Navigate(..)) {
+                *press = FindPress::Held;
+            }
+        }
     }
 
     fn set_drawer_focus(&mut self, focused: bool) -> bool {
@@ -1258,6 +1300,49 @@ impl State {
             (None, Some(position)) => KeySlot::PrintableScan(position),
             (None, None) => KeySlot::Virtual(vk),
         };
+        // Bind a Find key to the pane that received its first press. Windows
+        // can queue a translated character even after key-up or a focus change.
+        if !self.find_keys.is_empty() {
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) == 0 => {
+                    self.find_keys
+                        .retain(|&key, press| key != slot && !matches!(press, FindPress::Released));
+                }
+                WM_KEYDOWN | WM_SYSKEYDOWN if self.find_keys.contains_key(&slot) => {
+                    if let FindPress::Navigate(required, action) = self.find_keys[&slot]
+                        && self.search
+                        && !self.modal
+                        && !self.drawer_focused
+                        && self.session_search.is_none()
+                        && self.picker.is_none()
+                        && !self.switcher
+                        && self.local_mode.is_none()
+                        && modifiers() == required
+                        && !ime::native_composing(message.hwnd)
+                    {
+                        (self.shortcut)(action);
+                    }
+                    return true;
+                }
+                WM_KEYUP | WM_SYSKEYUP if self.find_keys.contains_key(&slot) => {
+                    if slot.can_emit_char() {
+                        self.find_keys.insert(slot, FindPress::Released);
+                    } else {
+                        self.find_keys.remove(&slot);
+                    }
+                    return true;
+                }
+                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
+                    let owned = slot.can_emit_char() && self.find_keys.contains_key(&slot);
+                    self.find_keys
+                        .retain(|_, press| !matches!(press, FindPress::Released));
+                    if owned {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
         if !self.native_keys.is_empty() || self.native_late_char.is_some() {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) == 0 => {
@@ -1265,17 +1350,16 @@ impl State {
                     self.native_keys.remove(&slot);
                 }
                 WM_KEYUP | WM_SYSKEYUP if self.native_keys.remove(&slot) => {
-                    self.native_late_char = Some(slot);
+                    self.native_late_char = slot.can_emit_char().then_some(slot);
                     return false;
                 }
-                WM_CHAR | WM_SYSCHAR if self.native_late_char == Some(slot) => {
-                    self.native_late_char = None;
-                    return false;
+                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
+                    let late = self.native_late_char.take() == Some(slot);
+                    if slot.can_emit_char() && (late || self.native_keys.contains(&slot)) {
+                        return false;
+                    }
                 }
-                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR | WM_KEYDOWN
-                | WM_SYSKEYDOWN
-                    if self.native_keys.contains(&slot) =>
-                {
+                WM_KEYDOWN | WM_SYSKEYDOWN if self.native_keys.contains(&slot) => {
                     // Deliver the native press, character, and release as one unit,
                     // including when an activation removes its control on key-down.
                     return false;
@@ -1509,43 +1593,61 @@ impl State {
             return true;
         }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-            if (self.target.is_some() && !self.drawer_focused && self.session_search.is_none())
-                || self.search
-            {
-                let find = if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x46
-                {
-                    Some(Shortcut::Find)
-                } else if vk == 0x72 || (self.search && vk == 0x0d) {
-                    Some(if mods.contains(KeyModifiers::SHIFT) {
-                        Shortcut::FindPrevious
-                    } else {
-                        Shortcut::FindNext
-                    })
-                } else if self.search && vk == 0x1b {
-                    Some(Shortcut::FindClose)
-                } else {
-                    None
-                };
-                if let Some(shortcut) = find {
-                    self.swallowed.insert(slot);
-                    (self.shortcut)(shortcut);
+            let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
+            let find_editor = self.search
+                && self.target.is_some()
+                && !self.drawer_focused
+                && self.session_search.is_none();
+            let shortcut = if find_editor {
+                match (vk, mods) {
+                    (0x0d, KeyModifiers::NONE) => Some(Shortcut::FindNext),
+                    (0x0d, KeyModifiers::SHIFT) => Some(Shortcut::FindPrevious),
+                    (0x1b, KeyModifiers::NONE) => Some(Shortcut::FindClose),
+                    _ => self
+                        .keymap
+                        .resolve_in_find(vk, mods, right_alt)
+                        .map(Shortcut::from),
+                }
+            } else {
+                self.keymap
+                    .resolve(
+                        vk,
+                        mods,
+                        self.target.is_some()
+                            && !self.drawer_focused
+                            && self.session_search.is_none(),
+                        right_alt,
+                    )
+                    .map(Shortcut::from)
+            };
+            if let Some(shortcut) = shortcut {
+                if matches!(
+                    shortcut,
+                    Shortcut::Find
+                        | Shortcut::FindNext
+                        | Shortcut::FindPrevious
+                        | Shortcut::FindClose
+                ) {
+                    if find_editor && ime::native_composing(message.hwnd) {
+                        self.native_keys.insert(slot);
+                        return false;
+                    }
+                    if message.lParam.0 & (1 << 30) == 0 {
+                        // Gate subsequent input immediately, while the UI mounts the Find box.
+                        if shortcut != Shortcut::FindClose {
+                            self.set_search(true);
+                        }
+                        let press =
+                            if matches!(shortcut, Shortcut::FindNext | Shortcut::FindPrevious) {
+                                FindPress::Navigate(mods, shortcut)
+                            } else {
+                                FindPress::Held
+                            };
+                        self.find_keys.insert(slot, press);
+                        (self.shortcut)(shortcut);
+                    }
                     return true;
                 }
-            }
-            let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
-            let shortcut = self
-                .keymap
-                .resolve(
-                    vk,
-                    mods,
-                    self.target.is_some()
-                        && !self.search
-                        && !self.drawer_focused
-                        && self.session_search.is_none(),
-                    right_alt,
-                )
-                .map(Shortcut::from);
-            if let Some(shortcut) = shortcut {
                 if matches!(shortcut, Shortcut::NextTab | Shortcut::PreviousTab)
                     && self.preferences.tab_switcher_mode != TabSwitcherMode::Disabled
                 {
@@ -1592,15 +1694,12 @@ impl State {
                 return true;
             }
         }
-        if (self.drawer_focused || self.session_search.is_some())
+        if (self.search || self.drawer_focused || self.session_search.is_some())
             && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL)
         {
             if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
                 self.native_keys.insert(slot);
             }
-            return false;
-        }
-        if self.search && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL) {
             return false;
         }
         let Some(Target { sender, frames }) = &self.target else {
@@ -1877,6 +1976,9 @@ impl From<Action> for Shortcut {
             Action::Workspaces => Self::Workspaces,
             Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
+            Action::Find => Self::Find,
+            Action::FindNext => Self::FindNext,
+            Action::FindPrevious => Self::FindPrevious,
             Action::FindAllPanes => Self::FindAllPanes,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
@@ -2048,6 +2150,156 @@ fn special_key(vk: u32) -> Option<KeyCode> {
 mod tests {
     use super::*;
     use w11term::{options::Source, session::Session};
+
+    fn find_key(message: u32, vk: usize, scan: u32, repeat: bool) -> MSG {
+        MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(((scan << 16) | (u32::from(repeat) << 30)) as isize),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remapped_find_keeps_navigation_repeats_and_late_characters_in_the_original_pane() {
+        let _scope = WindowScope::default().enter();
+        let pane = Session::start(Source::Demo);
+        let (first, mut source) = mpsc::unbounded_channel();
+        let (second, mut sibling) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::FindNext, Some("F2".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            target: Some(Target {
+                sender: first,
+                frames: pane.frames.clone(),
+            }),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |action| seen.borrow_mut().push(action))
+        };
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, false)));
+        assert!(state.search, "own typing before the Find view mounts");
+        assert!(matches!(source.try_recv().unwrap(), Command::Focus(false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        assert_eq!(*actions.borrow(), [Shortcut::FindNext, Shortcut::FindNext]);
+        state.retarget(Some(Target {
+            sender: second,
+            frames: pane.frames.clone(),
+        }));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        assert!(state.handle(&find_key(WM_KEYUP, 0x71, 0x3c, false)));
+        assert_eq!(actions.borrow().len(), 2, "repeat navigated the new pane");
+
+        assert!(!state.handle(&find_key(WM_KEYDOWN, 0x51, 0x10, false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x1b, 1, false)));
+        state.set_search(false);
+        assert!(!state.handle(&find_key(WM_KEYDOWN, 0x51, 0x10, true)));
+        assert!(!state.handle(&find_key(WM_KEYUP, 0x51, 0x10, false)));
+        assert!(!state.handle(&find_key(WM_CHAR, 'q' as usize, 0x10, false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x1b, 1, true)));
+        assert!(state.handle(&find_key(WM_KEYUP, 0x1b, 1, false)));
+        assert!(state.handle(&find_key(WM_CHAR, 0x1b, 1, false)));
+        assert_eq!(
+            *actions.borrow(),
+            [Shortcut::FindNext, Shortcut::FindNext, Shortcut::FindClose]
+        );
+        assert!(
+            std::iter::from_fn(|| sibling.try_recv().ok()).all(|m| matches!(m, Command::Focus(_)))
+        );
+        // U+0071 equals VK_F2. Scanless Unicode input must survive the remap
+        // even without a corresponding keydown, including UTF-16 pairs.
+        for c in ['q' as usize, 0xd83d, 0xde80] {
+            assert!(state.handle(&find_key(WM_CHAR, c, 0, false)));
+        }
+        assert!(matches!(sibling.try_recv(), Ok(Command::Text(s)) if s == "q"));
+        assert!(matches!(sibling.try_recv(), Ok(Command::Text(s)) if s == "🚀"));
+        // A fresh F3 now belongs to the shell; clearing the old default works.
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x72, 0x3d, false)));
+        assert!(matches!(
+            sibling.try_recv().unwrap(),
+            Command::Key { down: true, .. }
+        ));
+    }
+
+    #[test]
+    fn remapped_find_does_not_steal_native_drawer_or_discovery_input() {
+        let pane = Session::start(Source::Demo);
+        let (tx, mut input) = mpsc::unbounded_channel();
+        let mut state = State {
+            target: Some(Target {
+                sender: tx,
+                frames: pane.frames.clone(),
+            }),
+            search: true,
+            drawer_focused: true,
+            ..State::new(|s| panic!("unexpected shortcut {s:?}"))
+        };
+        let f3 = |msg| find_key(msg, 0x72, 0x3d, false);
+        assert!(!state.handle(&f3(WM_KEYDOWN)));
+        assert!(!state.handle(&f3(WM_KEYUP)));
+        state.drawer_focused = false;
+        state.session_search = Some((1, 1, 1));
+        assert!(!state.handle(&f3(WM_KEYDOWN)));
+        assert!(!state.handle(&f3(WM_KEYUP)));
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn remapped_find_lets_altgr_type_and_does_not_reinterpret_the_held_shortcut_after_ctrl_release()
+    {
+        // SetKeyboardState only affects the current test thread's input queue.
+        struct RestoreKeys([u8; 256]);
+        impl Drop for RestoreKeys {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetKeyboardState(&self.0);
+                }
+            }
+        }
+        let mut original = RestoreKeys([0; 256]);
+        unsafe { GetKeyboardState(&mut original.0).unwrap() };
+        let pane = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::FindNext, Some("Ctrl+Alt+Q".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            search: true,
+            target: Some(Target {
+                sender,
+                frames: pane.frames.clone(),
+            }),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |s| seen.borrow_mut().push(s))
+        };
+        let q = |msg, repeat| find_key(msg, 0x51, 0x10, repeat);
+        let mut keys = [0; 256];
+        for key in [VK_CONTROL, VK_MENU, VK_RMENU] {
+            keys[key.0 as usize] = 0x80;
+        }
+        unsafe { SetKeyboardState(&keys).unwrap() };
+        assert!(!state.handle(&q(WM_SYSKEYDOWN, false)));
+        assert!(!state.handle(&find_key(WM_CHAR, '@' as usize, 0x10, false)));
+        assert!(!state.handle(&q(WM_SYSKEYUP, false)));
+        assert!(actions.borrow().is_empty());
+        keys[VK_RMENU.0 as usize] = 0;
+        keys[VK_LMENU.0 as usize] = 0x80;
+        unsafe { SetKeyboardState(&keys).unwrap() };
+        assert!(state.handle(&q(WM_SYSKEYDOWN, false)));
+        assert!(state.handle(&q(WM_SYSKEYDOWN, true)));
+        unsafe { SetKeyboardState(&[0; 256]).unwrap() };
+        assert!(state.handle(&q(WM_KEYDOWN, true)));
+        assert!(state.handle(&q(WM_KEYUP, false)));
+        assert!(state.handle(&find_key(WM_CHAR, 'q' as usize, 0x10, false)));
+        assert_eq!(*actions.borrow(), [Shortcut::FindNext, Shortcut::FindNext]);
+        assert!(input.try_recv().is_err());
+    }
 
     #[test]
     fn physical_printable_positions_use_the_pc101_make_code() {

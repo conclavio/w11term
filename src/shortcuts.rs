@@ -35,6 +35,9 @@ pub enum Action {
     MovePaneToExistingTab,
     CommandPalette,
     PanePicker,
+    Find,
+    FindNext,
+    FindPrevious,
     FindAllPanes,
     KeyboardHints,
     CopyMode,
@@ -162,6 +165,15 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
+    Binding::new(Find, "find", "Find in scrollback", 0x46, CTRL_SHIFT),
+    Binding::new(FindNext, "find_next", "Find next", 0x72, Mods::NONE),
+    Binding::new(
+        FindPrevious,
+        "find_previous",
+        "Find previous",
+        0x72,
+        Mods::SHIFT,
+    ),
     Binding::new(
         FindAllPanes,
         "find_all_panes",
@@ -273,6 +285,9 @@ impl Action {
                 | ClosePane
                 | MovePane
                 | MovePaneToExistingTab
+                | Find
+                | FindNext
+                | FindPrevious
                 | DuplicateTabLayout
                 | KeyboardHints
                 | CopyMode
@@ -405,11 +420,10 @@ impl Chord {
         let ctrl = mods.contains(Mods::CTRL);
         let alt = mods.contains(Mods::ALT);
         let shift = mods.contains(Mods::SHIFT);
-        matches!(key, 0x72 | 0x74 | 0x7a)
+        matches!(key, 0x74 | 0x7a)
             || (alt && matches!(key, 0x73 | 0x20 | 0x09 | 0x1b))
             || (ctrl && alt && key == 0x2e)
             || (ctrl && key == 0x1b)
-            || (ctrl && shift && key == 0x46)
             || (ctrl && key == 0x56)
             || (ctrl && !alt && matches!(key, 0x43 | 0x2d | 0xbb | 0xbd | 0x30))
             || (shift && matches!(key, 0x2d | 0x21 | 0x22))
@@ -476,6 +490,14 @@ impl Shortcuts {
 }
 pub struct KeyMap(HashMap<Chord, Action>);
 impl KeyMap {
+    /// The Find box keeps window shortcuts and its own navigation while native
+    /// text editing owns the remaining keys.
+    pub fn resolve_in_find(&self, key: u32, mods: Mods, right_alt: bool) -> Option<Action> {
+        self.resolve(key, mods, true, right_alt).filter(|action| {
+            !action.requires_terminal() || matches!(action, Find | FindNext | FindPrevious)
+        })
+    }
+
     pub fn resolve(&self, key: u32, mods: Mods, terminal: bool, right_alt: bool) -> Option<Action> {
         if right_alt {
             return None;
@@ -738,6 +760,50 @@ mod tests {
         );
     }
     #[test]
+    fn scrollback_find_bindings_can_release_function_keys_and_stay_local_to_the_find_box() {
+        let mut saved = Shortcuts::default();
+        for (action, expected, remap) in [
+            (Find, "Ctrl+Shift+F", "F6"),
+            (FindNext, "F3", "F2"),
+            (FindPrevious, "Shift+F3", "F1"),
+        ] {
+            let default = expected.parse::<Chord>().unwrap();
+            let replacement = remap.parse::<Chord>().unwrap();
+            assert_eq!(saved.get(action.binding()), Some(default));
+            saved.set(action, Some(replacement)).unwrap();
+            let keys = saved.keymap().unwrap();
+            assert_eq!(keys.resolve(default.key, default.mods, true, false), None);
+            assert_eq!(
+                keys.resolve_in_find(replacement.key, replacement.mods, false),
+                Some(action)
+            );
+            assert_eq!(
+                keys.resolve(replacement.key, replacement.mods, false, false),
+                None
+            );
+            assert_eq!(
+                keys.resolve_in_find(replacement.key, replacement.mods, true),
+                None
+            );
+        }
+        let keys = saved.keymap().unwrap();
+        assert_eq!(
+            keys.resolve_in_find(0x4b, CTRL_SHIFT, false),
+            Some(CommandPalette)
+        );
+        assert_eq!(keys.resolve_in_find(0x41, CTRL_SHIFT, false), None);
+        saved.set(FindNext, None).unwrap();
+        let json = serde_json::to_string(&saved).unwrap();
+        let mut reopened: Shortcuts = serde_json::from_str(&json).unwrap();
+        assert_eq!(reopened.get(FindNext.binding()), None);
+        reopened.restore(FindNext).unwrap();
+        assert_eq!(
+            reopened.get(FindNext.binding()),
+            Some("F3".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn invalid_chords_and_duplicate_saved_bindings_are_reported() {
         for invalid in [
             "t",
@@ -748,7 +814,6 @@ mod tests {
             "F11",
             "Alt+F4",
             "Win+K",
-            "Ctrl+Shift+F",
             "Alt+Tab",
             "F30",
         ] {
