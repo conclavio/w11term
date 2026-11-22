@@ -1989,7 +1989,8 @@ impl TerminalApp {
                         && let Some(path) = files.path_to_copy(revision, entry.as_ref())
                     {
                         files.status = match w11term::clipboard::write(&path) {
-                            Ok(()) => format!("Copied {path}"),
+                            Ok(()) if entry.is_some() => "Copied selected path".into(),
+                            Ok(()) => "Copied directory path".into(),
                             Err(error) => format!("Could not copy path: {error}"),
                         };
                     }

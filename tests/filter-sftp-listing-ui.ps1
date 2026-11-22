@@ -32,9 +32,13 @@ function Filter-Edit {
     Find-Element 'Filter filenames' ([System.Windows.Automation.ControlType]::Edit)
 }
 function Check-PathCopy([string]$ButtonName, [string]$Expected) {
+    $control = Wait-Until "available '$ButtonName' command" {
+        $b = Button $ButtonName
+        if ($b -and $b.Current.IsEnabled) { $b }
+    }
     if ($verifyClipboard) {
         $before = [FixtureClipboard]::GetClipboardSequenceNumber()
-        Click $ButtonName
+        Invoke-Button $control
         $null = Wait-Until "exact clipboard path from '$ButtonName'" {
             [FixtureClipboard]::ContainsNewText($before, $Expected)
         }
@@ -65,7 +69,10 @@ try {
     Run-Palette 'Open files here'
     $null = Wait-Until 'first page of the shell directory' { (Find-Element $parent) -and (Button 'build-00.log') -and (Find-Element '1 / 2') }
     if (Button $target) { throw 'The Unicode target must begin outside page one' }
-    if ((Button 'Copy selected path').Current.IsEnabled) { throw 'Copy selected path needs a selection' }
+    $null = Wait-Until 'Copy selected path disabled without a selection' {
+        $b = Button 'Copy selected path'
+        $b -and !$b.Current.IsEnabled
+    }
     Check-PathCopy 'Copy directory path' $parent
     Click 'Next'
     Click $target
