@@ -347,6 +347,7 @@ pub struct TerminalState {
     /// Movement events enabled
     any_event_mouse: bool,
     focus_tracking: bool,
+    report_color_scheme_changes: bool,
     /// X10 (legacy), SGR, and SGR-Pixels style mouse tracking and
     /// reporting is enabled
     mouse_encoding: MouseEncoding,
@@ -615,6 +616,7 @@ impl TerminalState {
             application_keypad: false,
             bracketed_paste: false,
             focus_tracking: false,
+            report_color_scheme_changes: false,
             mouse_encoding: MouseEncoding::X10,
             keyboard_encoding: KeyboardEncoding::Xterm,
             sixel_scrolls_right: false,
@@ -690,10 +692,37 @@ impl TerminalState {
         self.seqno += 1;
     }
 
+    /// The program that requested notifications no longer owns this connection.
+    pub fn clear_color_scheme_subscription(&mut self) {
+        self.report_color_scheme_changes = false;
+    }
+
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
+        let notify = self.report_color_scheme_changes
+            && (self.config.prefers_light_colors() != config.prefers_light_colors()
+                || self.config.color_palette() != config.color_palette());
         self.collect_palette_edits();
         self.config = config;
         self.rebuild_palette();
+        if notify {
+            // Config changes run outside parser dispatch. A framed viewer has a
+            // distinct reply channel so this notification cannot become a keystroke.
+            let reply = self
+                .parser_reply_writer
+                .as_mut()
+                .unwrap_or(&mut self.writer);
+            Self::write_color_scheme_report(reply, self.config.prefers_light_colors());
+        }
+    }
+
+    fn write_color_scheme_report(writer: &mut impl std::io::Write, light: bool) {
+        let report = if light {
+            b"\x1b[?997;2n"
+        } else {
+            b"\x1b[?997;1n"
+        };
+        writer.write_all(report).ok();
+        writer.flush().ok();
     }
 
     pub fn get_config(&self) -> Arc<dyn TerminalConfiguration> {
@@ -1728,18 +1757,12 @@ impl TerminalState {
         self.writer.flush().ok();
     }
 
-    fn decqrm_response(&mut self, mode: Mode, mut recognized: bool, enabled: bool) {
+    fn decqrm_response(&mut self, mode: Mode, recognized: bool, enabled: bool) {
         let (is_dec, number) = match &mode {
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(code)) => (true, code.to_u16().unwrap()),
-            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => {
-                recognized = false;
-                (true, *code)
-            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => (true, *code),
             Mode::QueryMode(TerminalMode::Code(code)) => (false, code.to_u16().unwrap()),
-            Mode::QueryMode(TerminalMode::Unspecified(code)) => {
-                recognized = false;
-                (false, *code)
-            }
+            Mode::QueryMode(TerminalMode::Unspecified(code)) => (false, *code),
             _ => unreachable!(),
         };
 
@@ -1762,6 +1785,15 @@ impl TerminalState {
 
     fn perform_csi_mode(&mut self, mode: Mode) {
         match mode {
+            Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
+                self.report_color_scheme_changes = true;
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
+                self.report_color_scheme_changes = false;
+            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
+                self.decqrm_response(mode, true, self.report_color_scheme_changes);
+            }
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::StartBlinkingCursor,
             ))

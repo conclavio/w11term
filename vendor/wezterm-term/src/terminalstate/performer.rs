@@ -19,7 +19,7 @@ use wezterm_cell::{
     grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
 use wezterm_escape_parser::csi::{
-    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
+    CharacterPath, CsiParam, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
 };
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -643,6 +643,14 @@ impl<'a> Performer<'a> {
                 // This is a response to QueryKittySupport and it is invalid for us
                 // to receive it. Just ignore it.
             }
+            CSI::Unspecified(unspec)
+                if unspec.control == 'n'
+                    && !unspec.parameters_truncated
+                    && unspec.params == [CsiParam::P(b'?'), CsiParam::Integer(996)] =>
+            {
+                let light = self.config.prefers_light_colors();
+                TerminalState::write_color_scheme_report(&mut self.writer, light);
+            }
             CSI::Unspecified(unspec) => {
                 if self.config.log_unknown_escape_sequences() {
                     log::warn!("unknown unspecified CSI: {:?}", format!("{}", unspec));
@@ -771,6 +779,7 @@ impl<'a> Performer<'a> {
                 self.application_keypad = false;
                 self.bracketed_paste = false;
                 self.focus_tracking = false;
+                self.report_color_scheme_changes = false;
                 self.mouse_tracking = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;

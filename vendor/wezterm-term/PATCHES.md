@@ -1,5 +1,8 @@
 # Local modifications
 
+- The Contour color-scheme query reports the embedding's configured light or
+  dark preference. Private mode 2031 subscribes the connection to user palette changes.
+
 - Framed terminal viewers can install separate nonblocking writers for user input and parser replies. The default writer remains threaded. The embedding can also detach its clipboard handler when a stream may repaint earlier output.
 
 Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term

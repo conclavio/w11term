@@ -25,10 +25,12 @@ enum Seen {
     Env(String, String),
     Data(Vec<u8>),
 }
+type OpenedShell = (Channel<server::Msg>, server::Handle);
 struct Peer {
     seen: mpsc::UnboundedSender<Seen>,
     drop_password: Arc<std::sync::atomic::AtomicBool>,
     allowed_opens: usize,
+    scripted_shells: Option<mpsc::UnboundedSender<OpenedShell>>,
 }
 impl server::Handler for Peer {
     type Error = anyhow::Error;
@@ -79,9 +81,9 @@ impl server::Handler for Peer {
     }
     async fn channel_open_session(
         &mut self,
-        _: Channel<server::Msg>,
+        channel: Channel<server::Msg>,
         reply: server::ChannelOpenHandle,
-        _: &mut server::Session,
+        session: &mut server::Session,
     ) -> Result<()> {
         if self.allowed_opens == 0 {
             reply
@@ -90,6 +92,11 @@ impl server::Handler for Peer {
         } else {
             self.allowed_opens -= 1;
             reply.accept().await;
+            if let Some(shells) = &self.scripted_shells {
+                shells
+                    .send((channel, session.handle()))
+                    .map_err(|_| anyhow::anyhow!("scripted peer closed"))?;
+            }
         }
         Ok(())
     }
@@ -124,6 +131,9 @@ impl server::Handler for Peer {
         Ok(())
     }
     async fn data(&mut self, c: ChannelId, data: &[u8], s: &mut server::Session) -> Result<()> {
+        if self.scripted_shells.is_some() {
+            return Ok(()); // The scripted peer reads each channel directly and supplies its output.
+        }
         self.seen.send(Seen::Data(data.into()))?;
         if data == b"drop" {
             anyhow::bail!("simulated link failure");
@@ -211,12 +221,13 @@ async fn fixture_with_password_drop(
     mpsc::UnboundedReceiver<Seen>,
     tokio::task::JoinHandle<()>,
 ) {
-    fixture_with_channel_limit(keys, drop_password, usize::MAX).await
+    fixture_with_channel_limit(keys, drop_password, usize::MAX, None).await
 }
 async fn fixture_with_channel_limit(
     keys: Vec<PrivateKey>,
     drop_password: Arc<std::sync::atomic::AtomicBool>,
     allowed_opens: usize,
+    scripted_shells: Option<mpsc::UnboundedSender<OpenedShell>>,
 ) -> (
     u16,
     mpsc::UnboundedReceiver<Seen>,
@@ -242,6 +253,7 @@ async fn fixture_with_channel_limit(
                         seen: tx.clone(),
                         drop_password: drop_password.clone(),
                         allowed_opens,
+                        scripted_shells: scripted_shells.clone(),
                     };
                     peers.spawn(async move {
                         if let Ok(running) = server::run_stream(config, stream, peer).await {
@@ -364,6 +376,146 @@ async fn expect_echo(session: &Session, text: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn theme_reports_follow_local_scheme_on_the_subscribed_ssh_channel_only() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use w11term::options::ColorScheme::{self, OneHalfDark, OneHalfLight};
+
+    // A standard operating-status DSR provides an ordered end marker. This checks
+    // both the complete wire bytes and silence without a timer-based quiet period.
+    async fn exchange(
+        channel: &mut russh::ChannelStream<server::Msg>,
+        command: &[u8],
+        reports: &[u8],
+    ) {
+        channel
+            .write_all(&[command, b"\x1b[5n"].concat())
+            .await
+            .unwrap();
+        let expected = [reports, b"\x1b[0n"].concat();
+        let mut received = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut buf = [0; 128];
+            while !received.ends_with(b"\x1b[0n") {
+                let len = channel.read(&mut buf).await.unwrap();
+                assert_ne!(len, 0, "SSH channel closed while awaiting replies");
+                received.extend_from_slice(&buf[..len]);
+                assert!(received.len() <= 1024, "unexpected report stream");
+            }
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "missing DSR fence; command={command:?}, received={received:?}"
+        );
+        assert_eq!(received, expected, "command={command:?}");
+    }
+    async fn set_scheme(pane: &Session, scheme: ColorScheme) {
+        pane.input.send(Command::SetColorScheme(scheme)).unwrap();
+        // The SSH peer can send a DSR as soon as the worker has applied this change.
+        let (tx, rx) = oneshot::channel();
+        pane.input.send(Command::Capture(tx)).unwrap();
+        rx.await.unwrap();
+    }
+    const DARK: &[u8] = b"\x1b[?997;1n";
+    const LIGHT: &[u8] = b"\x1b[?997;2n";
+    let key = key();
+    let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let (tx, mut shells) = mpsc::unbounded_channel();
+    let (port, _seen, server) =
+        fixture_with_channel_limit(vec![key], Arc::default(), usize::MAX, Some(tx)).await;
+    let source = Source::Ssh(options(port, Authentication::None, Some(pin)));
+    let pane = Session::start(source.clone());
+    let link = connection(&pane).await;
+    wait_for_generation(&pane, 0).await;
+    let first_generation = pane.frames.load().connection_generation;
+    let (first, server_link) = shells.recv().await.unwrap();
+    let sibling =
+        Session::start_configured_with_connection(source, Default::default(), false, Some(link));
+    drop(connection(&sibling).await);
+    let (other, _) = shells.recv().await.unwrap();
+    assert_ne!(
+        first.id(),
+        other.id(),
+        "expected separate PTYs on one transport"
+    );
+    let mut subscribed = first.into_stream();
+    let mut independent = other.into_stream();
+
+    exchange(&mut subscribed, b"\x1b[?996n", DARK).await;
+    exchange(
+        &mut subscribed,
+        b"\x1b[?2031h\x1b[?2031$p",
+        b"\x1b[?2031;1$y",
+    )
+    .await;
+    set_scheme(&pane, OneHalfLight).await;
+    set_scheme(&sibling, OneHalfLight).await;
+    exchange(&mut subscribed, b"", LIGHT).await;
+    exchange(&mut independent, b"\x1b[?996n", LIGHT).await;
+    set_scheme(&pane, OneHalfLight).await;
+    exchange(&mut subscribed, b"", b"").await;
+    set_scheme(&pane, OneHalfDark).await;
+    set_scheme(&pane, ColorScheme::Default).await;
+    exchange(&mut subscribed, b"", &[DARK, DARK].concat()).await;
+    // Remote applications can change the appearance of the whole screen. Only a
+    // local scheme change emits an unsolicited report; the explicit query still answers dark.
+    exchange(
+        &mut subscribed,
+        b"\x1b]11;#ffffff\x07\x1b[7m\x1b[?5h\x1b[?996n",
+        DARK,
+    )
+    .await;
+    exchange(
+        &mut subscribed,
+        b"\x1b[?2031l\x1b[?2031$p",
+        b"\x1b[?2031;2$y",
+    )
+    .await;
+    set_scheme(&pane, OneHalfLight).await;
+    exchange(&mut subscribed, b"", b"").await;
+    exchange(&mut independent, b"", b"").await;
+
+    // Reconnect with the original pane still subscribed and verify the new shell
+    // must opt in for itself, even though the locally selected light scheme persists.
+    exchange(
+        &mut subscribed,
+        b"\x1b[?2031h\x1b[?2031$p",
+        b"\x1b[?2031;1$y",
+    )
+    .await;
+    drop(sibling);
+    let mut tail = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), independent.read_to_end(&mut tail))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tail.is_empty());
+    server_link
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "fixture reconnect".into(),
+            "en".into(),
+        )
+        .await
+        .unwrap();
+    wait_for_generation(&pane, first_generation).await;
+    let (new_shell, _) = tokio::time::timeout(Duration::from_secs(3), shells.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut replacement = new_shell.into_stream();
+    exchange(
+        &mut replacement,
+        b"\x1b[?2031$p\x1b[?996n",
+        &[b"\x1b[?2031;2$y".as_slice(), LIGHT].concat(),
+    )
+    .await;
+    set_scheme(&pane, OneHalfDark).await;
+    exchange(&mut replacement, b"", b"").await;
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_channels_outlive_original_pane_and_sibling_shell_exit() {
     let key = key();
     let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
@@ -414,7 +566,7 @@ async fn refused_split_channel_authenticates_independently_without_closing_origi
     let key = key();
     let pin = key.public_key().fingerprint(HashAlg::Sha256).to_string();
     let (port, mut seen, server) =
-        fixture_with_channel_limit(vec![key], Default::default(), 1).await;
+        fixture_with_channel_limit(vec![key], Default::default(), 1, None).await;
     let source = Source::Ssh(options(port, Authentication::Password, Some(pin)));
     let original = Session::start(source.clone());
     enter_password(&original).await;

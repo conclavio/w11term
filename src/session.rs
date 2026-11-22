@@ -855,6 +855,7 @@ async fn run(
                 let Some(event) = event else {
                     // All sender clones are gone and every final Data/Status was processed.
                     // A transient disconnect with a scheduled reconnect never closes this queue.
+                    terminal.clear_color_scheme_subscription();
                     let joined = transports.join_next().await;
                     prompts.cancel();
                     events.command_stream(false);
@@ -888,6 +889,7 @@ async fn run(
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
                         ssh::Event::Disconnected => {
+                            terminal.clear_color_scheme_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
                             events.command_stream(false);
                             events.set_progress(wezterm_term::Progress::None);
