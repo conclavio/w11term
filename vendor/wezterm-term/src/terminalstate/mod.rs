@@ -34,6 +34,7 @@ mod mouse;
 mod palette;
 pub(crate) mod performer;
 mod sixel;
+mod title;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
 
@@ -373,6 +374,7 @@ pub struct TerminalState {
     title: String,
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
+    saved_titles: title::TitleStack,
     progress: Progress,
     // OSC 9;4 preserves the previous value while the bar is indeterminate.
     progress_value: u8,
@@ -654,6 +656,7 @@ impl TerminalState {
             tabs: TabStop::new(size.cols, 8),
             title: "wezterm".to_string(),
             icon_title: None,
+            saved_titles: Default::default(),
             palette: Default::default(),
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,
@@ -2565,12 +2568,15 @@ impl TerminalState {
                 // up to the user!
             }
             Window::Iconify | Window::DeIconify => {}
-            Window::PopIconAndWindowTitle
-            | Window::PopWindowTitle
-            | Window::PopIconTitle
-            | Window::PushIconAndWindowTitle
-            | Window::PushIconTitle
-            | Window::PushWindowTitle => {}
+            Window::PushIconAndWindowTitle => self.save_titles(title::Scope::Both, None),
+            Window::PushIconTitle => self.save_titles(title::Scope::Icon, None),
+            Window::PushWindowTitle => self.save_titles(title::Scope::Window, None),
+            Window::PopIconAndWindowTitle => self.restore_titles(title::Scope::Both, None),
+            Window::PopIconTitle => self.restore_titles(title::Scope::Icon, None),
+            Window::PopWindowTitle => self.restore_titles(title::Scope::Window, None),
+            Window::SaveTitleToSlot { scope, slot } => self.save_titles(scope, Some(slot)),
+            Window::RestoreTitleFromSlot { scope, slot } => self.restore_titles(scope, Some(slot)),
+            Window::ReportTitleStackPosition => self.report_title_stack_position(),
 
             _ => {
                 if self.config.log_unknown_escape_sequences() {

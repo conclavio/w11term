@@ -2130,6 +2130,57 @@ mod tests {
             _ => panic!("unexpected resize"),
         }
     }
+
+    #[test]
+    fn title_stack_restores_mixed_scopes_and_preserves_the_shell_title_after_ncurses() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]0;shell\x07\x1b[?1049h\x1b[22;0;0t\x1b]2;editor\x07");
+        assert!(term.is_alt_screen_active());
+        assert_eq!(term.get_title(), "editor");
+        term.advance_bytes(b"\x1b[?1049l\x1b[23;0;0t");
+        assert!(!term.is_alt_screen_active());
+        assert_eq!(term.get_title(), "shell");
+        term.advance_bytes(b"\x1b]2;next command\x07");
+        assert_eq!(term.get_title(), "next command");
+
+        // The inner entry saved only its icon. The window comes from the
+        // preceding entry when the application asks to restore both labels.
+        term.advance_bytes(b"\x1b[22;2t\x1b]2;inner\x07\x1b]1;tools\x07\x1b[22;1t");
+        term.advance_bytes(b"\x1b]0;transient\x07\x1b[23;0t");
+        assert_eq!(term.get_title(), "tools");
+        term.advance_bytes(b"\x1b]1;\x07");
+        assert_eq!(term.get_title(), "next command");
+    }
+
+    #[test]
+    fn indexed_titles_and_stack_depth_belong_to_the_requesting_connection() {
+        let (mut term, mut out) = engine();
+        let (mut sibling, mut other) = engine();
+        for i in 0..12 {
+            term.advance_bytes(format!("\x1b]2;title {i}\x07\x1b[22;2t"));
+        }
+        term.advance_bytes(b"\x1b[#S");
+        assert_eq!(receive(&mut out), b"\x1b[12;10#S");
+        term.advance_bytes(b"\x1b[23;2;1t");
+        assert_eq!(term.get_title(), "title 10");
+        term.advance_bytes(b"\x1b[23;2t");
+        assert_eq!(term.get_title(), "title 11");
+
+        sibling.advance_bytes(b"\x1b]2;sibling\x07\x1b[23;2;1t\x1b[23;2t\x1b[#S");
+        assert_eq!(sibling.get_title(), "sibling");
+        assert_eq!(receive(&mut other), b"\x1b[0;10#S");
+        for reconnect in [false, true] {
+            term.advance_bytes(b"\x1b]0;old shell\x07\x1b[22;0;10t\x1b[22;0t");
+            if reconnect {
+                term.reset_connection();
+            } else {
+                term.advance_bytes(b"\x1bc");
+            }
+            term.advance_bytes(b"\x1b]0;new shell\x07\x1b[23;0;10t\x1b[23;0t\x1b[#S");
+            assert_eq!(term.get_title(), "new shell");
+            assert_eq!(receive(&mut out), b"\x1b[0;10#S");
+        }
+    }
     #[test]
     fn in_band_resize_reports_committed_cells_and_pixels_when_subscribed() {
         let (mut term, mut out) = engine();
