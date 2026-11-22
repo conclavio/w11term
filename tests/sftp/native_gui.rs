@@ -5,10 +5,10 @@ mod recording_ui;
 mod replay_controls;
 #[path = "select_all.rs"]
 mod select_all;
-#[path = "sort_ui.rs"]
-mod sort_ui;
 #[path = "../support/native_gui.rs"]
 mod shared;
+#[path = "sort_ui.rs"]
+mod sort_ui;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
