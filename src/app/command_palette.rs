@@ -7,6 +7,7 @@ pub enum CommandId {
     SaveScrollback(Option<u64>),
     ClearScrollback(Option<u64>),
     SharedFolders(Option<u64>),
+    LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     DuplicateTabLayout(Option<TabId>),
@@ -55,7 +56,8 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                     || (!profiles
                         && (key == "save-scrollback".into()
                             || key == "restart-exited".into()
-                            || key == "shared-folders".into()))
+                            || key == "shared-folders".into()
+                            || key == "local-forward".into()))
                 {
                     continue;
                 }
@@ -147,6 +149,13 @@ impl TerminalApp {
         });
         let tab_count = self.tabs.headers().len();
         let pane = live.map(|tab| tab.session.pane_id);
+        let forward = self.forward_origin();
+        rows.push(Row {
+            id: CommandId::LocalForward(forward),
+            label: local_forwards::LABEL.into(),
+            chord: String::new(),
+            enabled: forward.is_some(),
+        });
         rows.push(Row {
             id: CommandId::SharedFolders(pane),
             label: folder_shares::LABEL.into(),
@@ -275,6 +284,7 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::LocalForward(origin) => local_forwards::open(origin),
             CommandId::SplitInDirectory(axis, target) => {
                 directory_split::message(axis, target.as_ref())
             }

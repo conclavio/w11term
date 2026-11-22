@@ -3,7 +3,7 @@ use russh::{Channel, ChannelId, server};
 use russh_sftp::protocol::*;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -21,6 +21,7 @@ use w11term::{
 
 struct Peer {
     channels: HashMap<ChannelId, Channel<server::Msg>>,
+    forwarded: HashSet<ChannelId>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
     reject: bool,
@@ -48,6 +49,49 @@ impl server::Handler for Peer {
         self.opens.fetch_add(1, Ordering::Relaxed);
         self.channels.insert(channel.id(), channel);
         reply.accept().await;
+        Ok(())
+    }
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<server::Msg>,
+        host: &str,
+        port: u32,
+        origin: &str,
+        origin_port: u32,
+        reply: server::ChannelOpenHandle,
+        _: &mut server::Session,
+    ) -> anyhow::Result<()> {
+        let trace = self.root.join("forward-trace");
+        if trace.is_file() {
+            writeln!(
+                fs::OpenOptions::new().append(true).open(trace)?,
+                "{host}:{port} {origin}:{origin_port}"
+            )?;
+        }
+        let allowed = fs::read_to_string(self.root.join("forward-port"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok());
+        let Some(target) = allowed.filter(|p| {
+            host == "127.0.0.1"
+                && u32::from(*p) == port
+                && !self.root.join("forward-refuse").is_file()
+        }) else {
+            reply
+                .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        let Ok(mut socket) =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, target)).await
+        else {
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        self.forwarded.insert(channel.id());
+        reply.accept().await;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut channel.into_stream(), &mut socket).await;
+        });
         Ok(())
     }
     async fn pty_request(
@@ -229,7 +273,14 @@ impl server::Handler for Peer {
         Ok(())
     }
     async fn channel_eof(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
-        s.close(c)?;
+        // A forwarded TCP client may still read a reply after shutting down its write half.
+        if !self.forwarded.contains(&c) {
+            s.close(c)?;
+        }
+        Ok(())
+    }
+    async fn channel_close(&mut self, c: ChannelId, _: &mut server::Session) -> anyhow::Result<()> {
+        self.forwarded.remove(&c);
         Ok(())
     }
     async fn subsystem_request(
@@ -711,6 +762,7 @@ async fn fixture_counting_accepts(
             accepted.fetch_add(1, Ordering::Relaxed);
             let peer = Peer {
                 channels: HashMap::new(),
+                forwarded: HashSet::new(),
                 root: root_path.clone(),
                 opens: opens_for_server.clone(),
                 reject,
@@ -819,6 +871,8 @@ mod cancellation;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
+#[path = "sftp/local_forward.rs"]
+mod local_forward;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;

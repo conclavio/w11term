@@ -183,6 +183,12 @@ SSH supports OpenSSH private keys supplied with `--identity`, protected w11term 
 
 The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`. Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog.
 
+## Forward a local port
+
+If a development server on the SSH host listens on `127.0.0.1:8000`, open the command palette in its SSH pane and choose **Forward a local port…**. Enter `8000` as the remote port. Leave the Windows port empty to have Windows assign one, or enter a specific port. Choose **Start forwarding**, then **Copy address** to use the Windows endpoint in your browser or TCP client. You can close the manager while the forward is running. For example, if Windows assigns port `54210`, visit `http://127.0.0.1:54210/` for an HTTP service.
+
+Both endpoints use IPv4 loopback. Each client connection uses the pane's authenticated SSH connection, and the SSH server must allow local TCP forwarding. Use **Stop** on a forward to close its listener and connected clients. Closing the owning pane or losing its SSH connection also stops its forwards, even when another pane shares that login. You can start a fresh forward after reconnecting. [OpenSSH local forwarding](https://man.openbsd.org/ssh#L)
+
 ## Browse existing Herdr terminals
 
 Choose **caret → Find remote sessions → Browse Herdr terminals on _profile_** for a saved Linux SSH profile with Herdr Core’s `hc` available to remote SSH commands. Select a terminal by its display name and numeric address (such as `t7`). w11term opens a full interactive viewer over that SSH login. The program receives input and resize events, and continues running after the viewer detaches. This explicit command runs `hc connect`, which can start the account’s Core daemon. Session discovery and attachment use existing terminal records. The adapter targets Core’s generation 1 framed protocol from v0.1.21. [Herdr viewer protocol](https://github.com/herdrdev/herdr-core/blob/v0.1.21/schema/README.md#attach-streams)
