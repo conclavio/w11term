@@ -8,6 +8,8 @@ pub enum CommandId {
     SaveScrollback(Option<u64>),
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
+    SelectAll(Option<clipboard_paste::Origin>),
+    CopySelection(Option<clipboard_paste::Origin>),
     PaneColorScheme(u64, ColorScheme),
     SharedFolders(Option<u64>),
     LocalForward(Option<local_forwards::Origin>),
@@ -65,6 +67,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                 if (!enabled && key == "panes".into())
                     || (!profiles
                         && (key == "save-scrollback".into()
+                            || key == "copy-selection".into()
                             || key == "restart-exited".into()
                             || key == "shared-folders".into()
                             || key == "local-forward".into()))
@@ -257,6 +260,10 @@ impl TerminalApp {
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
                 }
+                Shortcut::SelectAll => {
+                    row.id = CommandId::SelectAll(origin);
+                    row.enabled = self.copy_mode_target().is_some();
+                }
                 Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
                     // A click queued on this row must keep its original tab even
                     // when a control client switches tabs before we receive it.
@@ -322,7 +329,11 @@ impl TerminalApp {
             (Shortcut::ResetZoom, "Reset font size", "Ctrl+0", true),
         ] {
             rows.push(Row {
-                id: CommandId::Shortcut(shortcut),
+                id: if shortcut == Shortcut::Copy {
+                    CommandId::CopySelection(origin)
+                } else {
+                    CommandId::Shortcut(shortcut)
+                },
                 label: label.into(),
                 chord: chord.into(),
                 enabled,
@@ -360,6 +371,8 @@ impl TerminalApp {
             CommandId::ClearScrollback(pane) => {
                 pane.map_or(Message::ControlIdle, Message::ClearScrollback)
             }
+            CommandId::SelectAll(origin) => Message::SelectAll(origin),
+            CommandId::CopySelection(origin) => Message::CopySelection(origin),
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),
             CommandId::Recording(choice) => recordings::invoke(choice),
@@ -479,6 +492,23 @@ pub(super) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_all_menu_and_palette_share_the_configured_chord() {
+        let mut rows = Vec::new();
+        menu_rows(
+            vec![
+                MenuItem::item("select-all", "Select all terminal text    F10"),
+                MenuItem::item("copy-selection", "Copy selection    Ctrl+Shift+C"),
+            ],
+            false,
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1, "Copy has a separate pane-bound palette row");
+        assert_eq!(rows[0].id, CommandId::Shortcut(Shortcut::SelectAll));
+        assert_eq!(rows[0].chord, "F10");
+        assert_eq!(rows[0].label, KeyAction::SelectAll.binding().label);
+    }
 
     #[test]
     fn profile_results_preserve_menu_order_within_each_action() {

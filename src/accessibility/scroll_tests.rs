@@ -21,6 +21,27 @@ fn frame(t: &Terminal, offset: usize) -> Snapshot {
 }
 
 #[test]
+fn select_all_exclusive_empty_end_reports_no_new_content_in_the_accessible_range() {
+    use super::document::Selection;
+    use w11term::interaction::Point;
+    let doc = Document::from_frame(&frame(&terminal("first\r\nnew"), 0));
+    for (end_row, expected) in [(0, ""), (1, "first\r\n")] {
+        let selection = Selection {
+            anchor: Point { row: 0, col: 0 },
+            end: Point {
+                row: end_row,
+                col: 0,
+            },
+            end_exclusive: true,
+            block: false,
+        };
+        let spans = doc.selected(Some(selection));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(doc.text(spans[0].clone()), expected);
+    }
+}
+
+#[test]
 fn scroll_uses_covered_rows_for_exclusive_end_and_degenerate_ranges() {
     let doc = Document::from_frame(&frame(&terminal("界e\u{301}\r\nאב\r\n"), 0));
     let next = doc.starts[1];

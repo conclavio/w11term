@@ -414,7 +414,9 @@ impl TerminalApp {
             let frame = hints.map_or_else(|| frames.load(), |h| h.frame.clone());
             let mut renderer = renderer.borrow_mut();
             let mode = copy_mode.borrow();
-            let mode = mode.as_ref().filter(|m| m.pane == id);
+            let mode = mode
+                .as_ref()
+                .filter(|m| m.pane == id && m.state.valid(&frame));
             renderer.copy_cursor = mode.map(|m| m.state.cursor);
             renderer.read_only = read_only.get();
             let marked = mode.and_then(|m| m.state.selection());

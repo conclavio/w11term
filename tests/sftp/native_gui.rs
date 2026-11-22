@@ -3,6 +3,8 @@ use super::*;
 mod recording_ui;
 #[path = "replay_controls.rs"]
 mod replay_controls;
+#[path = "select_all.rs"]
+mod select_all;
 #[path = "../support/native_gui.rs"]
 mod shared;
 use shared::run_gui;

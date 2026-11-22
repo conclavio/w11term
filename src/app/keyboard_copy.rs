@@ -8,6 +8,7 @@ const MAX_QUEUED_KEYS: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pending {
+    SelectAll(u64),
     Word(u64),
     AwaitingFrame(u64, Point),
     Clipboard(u64),
@@ -46,33 +47,35 @@ impl ActiveCopy {
 }
 
 impl TerminalApp {
-    pub(super) fn open_copy_mode(&mut self) {
+    pub(super) fn copy_mode_target(&self) -> Option<(TabId, &LiveTab)> {
+        let id = self.tabs.active_id()?;
+        let Page::Terminal(tab) = &self.tabs.get(id)?.page else {
+            return None;
+        };
+        (!tab.find.open
+            && !tab.browsing_sessions()
+            && !tab.device_busy
+            && tab.session.frames.load().prompt.is_none()
+            && tab.session.prompts.current().is_none()
+            && !tab.files.entry_dialog_open()
+            && !tab.files.filter_editing()
+            && self.title_editor.is_none()
+            && !self.clipboard.is_open())
+        .then_some((id, tab))
+    }
+
+    pub(super) fn open_copy_mode(&mut self) -> bool {
         self.close_hints();
-        let Some((id, tab)) =
-            self.tabs
-                .active_id()
-                .zip(self.tabs.active())
-                .and_then(|(id, tab)| match &tab.page {
-                    Page::Terminal(tab) => Some((id, tab)),
-                    _ => None,
-                })
+        let Some((id, tab)) = self
+            .copy_mode_target()
+            .filter(|_| self.picker.is_none() && self.switcher.is_none())
         else {
             self.keyboard.set_copy_mode(false);
-            return;
+            return false;
         };
         let frame = tab.session.frames.load();
-        if frame.prompt.is_some()
-            || tab.find.open
-            || tab.browsing_sessions()
-            || tab.device_busy
-            || self.picker.is_some()
-            || self.switcher.is_some()
-        {
-            self.keyboard.set_copy_mode(false);
-            return;
-        }
         if self.copy_mode.borrow().is_some() {
-            return;
+            return true;
         }
         tab.selection.borrow_mut().take();
         self.keyboard.set_selection(false);
@@ -85,12 +88,124 @@ impl TerminalApp {
         });
         self.keyboard.set_copy_mode(true);
         tab.surface.invalidator.invalidate();
+        true
+    }
+
+    pub(super) fn select_all(
+        &mut self,
+        origin: Option<clipboard_paste::Origin>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if origin.is_none() || self.paste_origin() != origin {
+            // A pane switch can overtake a queued shortcut. Release its input
+            // capture without changing an overlay already open on the new pane.
+            if self.copy_mode.borrow().is_none() && self.hints.borrow().is_none() {
+                self.keyboard.set_copy_mode(false);
+            }
+            return;
+        }
+        if !self.open_copy_mode() {
+            return;
+        }
+        let mut active = self.copy_mode.borrow_mut();
+        let Some(mode) = active.as_mut() else { return };
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.get(mode.pane)
+        else {
+            return;
+        };
+        if matches!(
+            mode.pending,
+            Some(Pending::Clipboard(_) | Pending::SelectAll(_))
+        ) {
+            return;
+        }
+        let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        mode.pending = Some(Pending::SelectAll(request));
+        mode.queued.clear();
+        mode.error = None;
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let _ = tab.session.input.send(Command::SelectAll {
+            screen: mode.state.screen,
+            reply,
+        });
+        let id = mode.pane;
+        ctx.spawn_background_with_rejection(
+            move |_| {
+                Message::SelectAllResult(
+                    id,
+                    request,
+                    result
+                        .blocking_recv()
+                        .unwrap_or(Err("Pane closed before selecting")),
+                )
+            },
+            Message::SelectAllResult(id, request, Err("Unable to receive the selection")),
+        );
+    }
+
+    pub(super) fn finish_select_all(
+        &mut self,
+        id: TabId,
+        request: u64,
+        result: Result<CopyMode, &'static str>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let mut active = self.copy_mode.borrow_mut();
+        let Some(mode) = active
+            .as_mut()
+            .filter(|m| m.pane == id && m.pending == Some(Pending::SelectAll(request)))
+        else {
+            return;
+        };
+        let Some(AppTab {
+            page: Page::Terminal(tab),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let frame = tab.session.frames.load();
+        if self.tabs.active_id() != Some(id)
+            || self.copy_mode_target().is_none()
+            || mode.state.screen != (&*frame).into()
+        {
+            drop(active);
+            self.close_copy_mode();
+            return;
+        }
+        match result {
+            Ok(mut selected) if selected.valid(&frame) => {
+                // Preserve the viewport and its restore position when a user
+                // selects everything after navigating in keyboard copy mode.
+                selected.original_top = mode.state.original_top;
+                selected.top = mode.state.top.max(frame.oldest_stable_row);
+                mode.state = selected;
+                mode.pending = None;
+            }
+            outcome => {
+                mode.pending = Some(Pending::Stopped);
+                mode.queued.clear();
+                let reason = outcome
+                    .err()
+                    .unwrap_or("The terminal changed while selecting");
+                mode.error = Some(format!("Copy mode · {reason} · Esc cancel"));
+            }
+        }
+        tab.surface.invalidator.invalidate();
+        if !mode.queued.is_empty() {
+            drop(active);
+            self.drain_copy_keys(ctx);
+        }
     }
 
     pub(super) fn close_copy_mode(&mut self) {
         let Some(mode) = self.copy_mode.borrow_mut().take() else {
             return;
         };
+        self.header.borrow_mut().take();
         if let Some(AppTab {
             page: Page::Terminal(tab),
             ..

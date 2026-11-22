@@ -16,6 +16,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(super) struct Selection {
     pub anchor: Point,
     pub end: Point,
+    pub end_exclusive: bool,
     pub block: bool,
 }
 
@@ -227,8 +228,10 @@ impl Document {
             (s.end, s.anchor)
         };
         if !s.block {
-            return std::iter::once(self.stable_point(a, false)..self.stable_point(b, true))
-                .collect();
+            return std::iter::once(
+                self.stable_point(a, false)..self.stable_point(b, !s.end_exclusive),
+            )
+            .collect();
         }
         (0..self.starts.len())
             .filter_map(|r| {

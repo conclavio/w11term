@@ -343,6 +343,8 @@ The benchmark measures **only VT parsing and scrollback**. It excludes snapshot 
 
 ## Controls
 
+Press **Ctrl+Shift+A** or choose **Select all terminal text** in the command palette to select the focused pane’s retained text, including lines above the viewport. Press **Ctrl+Shift+C** to copy it as plain text, or **Esc** to cancel. Selecting leaves the clipboard untouched even when copy-on-select is on. In a full-screen application using the alternate screen, the selection covers that application’s text. For output larger than the 1 MiB clipboard limit, use **Panes → Save scrollback as text…**.
+
 **Ctrl+Shift+X** or **caret → Panes → Keyboard copy mode** lets you select text in the focused pane while its session continues running. Move with the arrow keys or **h/j/k/l**, page with **Page Up/Down**, use **Home/End** or **0/$** for the edges of a row, and **g/G** or **Ctrl+Home/End** for the ends of retained history. Press **v** for character selection or **Shift+V** for whole rows, then **y** or **Enter** to copy plain text. Soft-wrapped rows join in character and line selections. **Esc** cancels and restores your previous viewport. Inside an alternate screen the current grid is available. Remap the activation shortcut under **Settings → Keyboard**.
 
 To copy columns from a table, move to one corner, press **Ctrl+V** or **r** in copy mode, move to the opposite corner, then press **y** or **Enter**. A rectangular selection copies each displayed row on its own line, including across a soft wrap. **Settings → Remove trailing whitespace in block selections** controls whether short rows are trimmed or padded to the selected width. Press the same selection key again to clear the selection, or switch between character, line and rectangular selection while keeping the original anchor.
@@ -370,6 +372,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Right-click | Paste; with auto-copy disabled, copy an existing selection first |
 | Ctrl+V / Ctrl+Shift+V / Shift+Insert | Normal paste, using negotiated bracketed-paste mode |
 | Ctrl+Alt+V / caret → Paste raw | UTF-8 clipboard bytes, without bracket markers, trimming, newline conversion, or key encoding |
+| Ctrl+Shift+A | Select all retained text in the focused pane |
 | Ctrl+Shift+C / Ctrl+Insert | Copy the selection as plain Unicode text |
 | Ctrl+C with a selection | Copy; without a selection, send Ctrl+C to the remote program |
 | Ctrl++ / Ctrl+- / Ctrl+0 | Increase / decrease / reset font size (16 DIPs) |

@@ -121,6 +121,9 @@ pub struct Point {
 pub struct Selection {
     pub anchor: Point,
     pub end: Point,
+    /// The upper endpoint is an insertion point instead of a selected cell.
+    /// Select All uses this at column zero after a final hard line break.
+    pub end_exclusive: bool,
     pub block: bool,
     pub alternate: bool,
     pub active: bool,
@@ -134,6 +137,7 @@ impl Selection {
         Self {
             anchor: point,
             end: point,
+            end_exclusive: false,
             block,
             alternate,
             active: false,
@@ -192,6 +196,7 @@ impl Selection {
             self.active = true;
         }
         self.end = point;
+        self.end_exclusive = false;
     }
     pub fn span(&self, row: isize, cols: usize) -> Option<Range<usize>> {
         if !self.active {
@@ -214,7 +219,7 @@ impl Selection {
             (
                 if row == first.row { first.col } else { 0 },
                 if row == last.row {
-                    last.col.saturating_add(1)
+                    last.col.saturating_add(usize::from(!self.end_exclusive))
                 } else {
                     cols
                 },
