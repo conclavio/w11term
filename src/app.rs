@@ -1732,7 +1732,9 @@ impl TerminalApp {
         children.push(TextBlock::new().text("Interaction").font_size(20.0).into());
         children.push(
             Button::new()
-                .on_click(context.callback(|_| Message::WordDelimiters(word_delimiters::Edit::Show)))
+                .on_click(
+                    context.callback(|_| Message::WordDelimiters(word_delimiters::Edit::Show)),
+                )
                 .content("Word selection delimiters…"),
         );
         for (field, label, value) in [
