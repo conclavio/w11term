@@ -415,6 +415,18 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "samples focused and inactive GPU cursor cells in two native SSH panes"]
+async fn native_focused_block_cursor_redraws_the_glyph_and_tracks_pane_focus() {
+    let (Source::Ssh(ssh), _remote, shells, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("focused-block-cursor-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "samples a cursor cell on the focused native SSH canvas"]
 async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
     let (Source::Ssh(ssh), _remote, shells, server) = fixture_connections(false, 1).await else {

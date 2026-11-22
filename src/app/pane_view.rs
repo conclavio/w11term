@@ -210,7 +210,7 @@ impl PaneSurface {
     pub(super) fn pause_cursor(&self) {
         self.cursor_blink
             .borrow_mut()
-            .set_interval(None, &self.invalidator);
+            .set_focus(false, None, &self.invalidator);
     }
 
     pub(super) fn remeasure(&self, renderer: &mut Renderer) -> Option<TerminalSize> {
@@ -509,13 +509,12 @@ impl TerminalApp {
         if tab.surface.scrollbar.set_enabled(show_scrollbar) {
             tab.surface.invalidator.invalidate();
         }
-        let interval = self
-            .caret_interval
-            .filter(|_| tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input));
-        tab.surface
-            .cursor_blink
-            .borrow_mut()
-            .set_interval(interval, &tab.surface.invalidator);
+        let focused = tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input);
+        tab.surface.cursor_blink.borrow_mut().set_focus(
+            focused,
+            self.caret_interval,
+            &tab.surface.invalidator,
+        );
         tab.surface
             .window_grid
             .set(match self.tabs.active_layout() {

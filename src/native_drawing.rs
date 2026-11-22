@@ -5,7 +5,8 @@ use windows::Win32::Graphics::{
         D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
     },
     Direct2D::{
-        D2D1_BITMAP_PROPERTIES1, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+        D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_PROPERTIES1,
+        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_DRAW_TEXT_OPTIONS_NONE,
         D2D1_INTERPOLATION_MODE_LINEAR, ID2D1Bitmap1, ID2D1DeviceContext, ID2D1SolidColorBrush,
     },
     DirectWrite::{
@@ -143,6 +144,50 @@ impl NativeDrawing {
         rgba: [f32; 4],
         scale_x: f32,
     ) -> windows_canvas::Result<()> {
+        self.draw_text(
+            layout,
+            (x, y),
+            rgba,
+            scale_x,
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+        )
+    }
+
+    /// Repaint the original shaped glyphs in a single ink, including color fonts.
+    pub fn cursor_text(
+        &self,
+        layout: &TextLayout,
+        origin: (f32, f32),
+        rgba: [f32; 4],
+        scale_x: f32,
+    ) -> windows_canvas::Result<()> {
+        self.draw_text(layout, origin, rgba, scale_x, D2D1_DRAW_TEXT_OPTIONS_NONE)
+    }
+
+    /// The clip is expressed in terminal grid coordinates, before scaling a glyph run.
+    pub fn with_clip<T>(&self, bounds: Rect, draw: impl FnOnce() -> T) -> T {
+        struct Clip<'a>(&'a ID2D1DeviceContext);
+        impl Drop for Clip<'_> {
+            fn drop(&mut self) {
+                unsafe { self.0.PopAxisAlignedClip() };
+            }
+        }
+        unsafe {
+            self.context
+                .PushAxisAlignedClip(&rect(bounds), D2D1_ANTIALIAS_MODE_ALIASED)
+        };
+        let _clip = Clip(&self.context);
+        draw()
+    }
+
+    fn draw_text(
+        &self,
+        layout: &TextLayout,
+        (x, y): (f32, f32),
+        rgba: [f32; 4],
+        scale_x: f32,
+        options: windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS,
+    ) -> windows_canvas::Result<()> {
         let raw = layout.raw().as_raw();
         // SAFETY: borrowed layout remains alive for this synchronous draw call.
         let layout = unsafe { IDWriteTextLayout::from_raw_borrowed(&raw).unwrap() };
@@ -165,7 +210,7 @@ impl NativeDrawing {
                 windows_numerics::Vector2 { X: 0.0, Y: 0.0 },
                 layout,
                 &self.brush,
-                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                options,
             );
             self.context.SetTransform(&previous);
         }
