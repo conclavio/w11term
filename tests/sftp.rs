@@ -61,6 +61,15 @@ impl server::Handler for Peer {
         _: &[(russh::Pty, u32)],
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "ui-smoke")]
+        if self.root.join("pty-trace").is_file() {
+            writeln!(
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.root.join("pty-trace"))?,
+                "{c}"
+            )?;
+        }
         s.channel_success(c)?;
         Ok(())
     }
@@ -280,7 +289,7 @@ impl Files {
         Ok(())
     }
 
-    async fn hold_transfer_response(&self, marker: &str) {
+    async fn hold_response(&self, marker: &str) {
         let gate = self.root.join(marker);
         while gate.is_file() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -402,7 +411,7 @@ impl russh_sftp::server::Handler for Files {
     async fn close(&mut self, id: u32, h: String) -> Result<Status, StatusCode> {
         if matches!(self.handles.get(&h), Some(Opened::File(_))) {
             self.trace_transfer("CLOSE")?;
-            self.hold_transfer_response("hold-transfer-close").await;
+            self.hold_response("hold-transfer-close").await;
         }
         self.handles.remove(&h).ok_or(StatusCode::Failure)?;
         Ok(status(id))
@@ -416,7 +425,7 @@ impl russh_sftp::server::Handler for Files {
     ) -> Result<Data, StatusCode> {
         self.trace_transfer(format_args!("READ {offset}"))?;
         if offset > 0 {
-            self.hold_transfer_response("hold-transfer-read").await;
+            self.hold_response("hold-transfer-read").await;
         }
         if self.root.join("small-reads").exists() && len > 512 {
             return Err(StatusCode::Failure);
@@ -450,7 +459,7 @@ impl russh_sftp::server::Handler for Files {
     ) -> Result<Status, StatusCode> {
         self.trace_transfer(format_args!("WRITE {offset}"))?;
         if offset > 0 {
-            self.hold_transfer_response("hold-transfer-write").await;
+            self.hold_response("hold-transfer-write").await;
         }
         if offset > 0 && self.root.join("disconnect-next-write").exists() {
             let _ = self
@@ -536,7 +545,17 @@ impl russh_sftp::server::Handler for Files {
     }
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, StatusCode> {
         #[cfg(feature = "ui-smoke")]
-        self.trace_listing(&format!("OPENDIR {path}"))?;
+        {
+            self.trace_listing(&format!("OPENDIR {path}"))?;
+            if fs::read_to_string(self.root.join("hold-opendir"))
+                .ok()
+                .as_deref()
+                == Some(&path)
+            {
+                fs::write(self.root.join("opendir-paused"), &path).map_err(io)?;
+                self.hold_response("hold-opendir").await;
+            }
+        }
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
