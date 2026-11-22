@@ -1,7 +1,7 @@
 use super::*;
 use w11term::shortcuts::BINDINGS;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CommandId {
     Menu(String),
     RenamePane(Option<(u64, TabId)>),
@@ -21,6 +21,7 @@ pub enum CommandId {
     ReopenClosedTab(Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
+    BalancePanes(PaneBalance),
     OpenInDirectory(
         directory_split::Destination,
         Option<directory_split::Origin>,
@@ -297,6 +298,13 @@ impl TerminalApp {
                         row.enabled = false;
                     }
                 }
+                Shortcut::BalancePanes => {
+                    if let Some(target) = &arrangement.balance {
+                        row.id = CommandId::BalancePanes(target.clone());
+                    } else {
+                        row.enabled = false;
+                    }
+                }
                 Shortcut::FocusPane(dir) => {
                     row.enabled = self
                         .tabs
@@ -363,6 +371,7 @@ impl TerminalApp {
             }
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
             CommandId::RotateSplit(target) => Message::RotateSplit(target),
+            CommandId::BalancePanes(target) => Message::BalancePanes(target),
             CommandId::SharedFolders(Some(pane)) => {
                 Message::FolderShare(folder_shares::Action::Open(pane))
             }

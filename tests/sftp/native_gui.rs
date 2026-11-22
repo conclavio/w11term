@@ -948,6 +948,29 @@ async fn check_mixed_tab_layout(script: &str, expected_input: &[u8]) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "balances three live SSH and PowerShell columns and verifies the actual terminal grids"]
+async fn native_balance_panes_equalizes_live_columns_without_restarting_either_shell() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("balance-panes-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(trace).unwrap(), b"balance-ssh-live");
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        1,
+        "balancing opened a new SSH channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "rotates the nearest live SSH/PowerShell split and verifies the saved workspace geometry"]
 async fn native_rotate_split_keeps_shells_and_persists_only_its_parent_axis() {
     let accepted = Arc::new(AtomicUsize::new(0));

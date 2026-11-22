@@ -1,9 +1,46 @@
 //! Ordered tab headers, each with a split layout and a remembered focused entry.
 use crate::pane_layout::{Axis, Direction, Layout};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type TabId = u64;
+
+/// The exact split tree that was visible when the balance action was offered.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneBalance {
+    group: TabId,
+    layout: Arc<Layout>,
+}
+
+pub struct BalancedPanes {
+    expected: PaneBalance,
+    layout: Layout,
+}
+
+impl PaneBalance {
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// Supply the current outer extent and one-cell minimum in physical pixels.
+    pub fn measure(
+        &self,
+        divider_px: f64,
+        measure: impl FnMut(TabId, Axis) -> Option<(f64, f64)>,
+    ) -> Option<BalancedPanes> {
+        Some(BalancedPanes {
+            layout: self.layout.balanced(divider_px, measure)?,
+            expected: self.clone(),
+        })
+    }
+}
+
+impl BalancedPanes {
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneRotation {
@@ -281,6 +318,27 @@ impl<T> Tabs<T> {
             Axis::Rows => Axis::Columns,
         };
         Some(expected.panes)
+    }
+
+    pub fn pane_balance(&self) -> Option<PaneBalance> {
+        let group = self.groups.get(self.active_index()?)?;
+        (!group.zoomed && matches!(group.layout, Layout::Split { .. })).then(|| PaneBalance {
+            group: group.id,
+            layout: Arc::new(group.layout.clone()),
+        })
+    }
+
+    pub fn balance_panes(&mut self, plan: BalancedPanes) -> bool {
+        let Some(index) = self.active_index() else {
+            return false;
+        };
+        let group = &mut self.groups[index];
+        if group.zoomed || group.id != plan.expected.group || group.layout != *plan.expected.layout
+        {
+            return false;
+        }
+        group.layout = plan.layout;
+        true
     }
 
     pub fn swap_panes(&mut self, target: PaneSwap) -> bool {
@@ -745,6 +803,41 @@ mod tests {
         assert_eq!(tabs.previous_pane(pane), Some(c));
         tabs.remove(c);
         assert_eq!(tabs.previous_pane(pane), Some(b));
+    }
+
+    #[test]
+    fn balancing_preserves_live_panes_and_focus_and_rejects_stale_actions() {
+        let mut tabs = Tabs::default();
+        let a = tabs.insert("SSH");
+        assert!(tabs.pane_balance().is_none());
+        let b = tabs.split(a, "PowerShell", Axis::Columns).unwrap();
+        let c = tabs.split(b, "Log", Axis::Columns).unwrap();
+        let target = tabs.pane_balance().unwrap();
+        let plan = || target.measure(6.0, |_, _| Some((100.0, 12.0))).unwrap();
+
+        let other = tabs.insert("Other tab");
+        assert!(!tabs.balance_panes(plan()));
+        tabs.select(a);
+        tabs.toggle_zoom();
+        assert!(tabs.pane_balance().is_none());
+        assert!(!tabs.balance_panes(plan()));
+        tabs.toggle_zoom();
+        tabs.set_ratio(&[true], 0.68);
+        assert!(!tabs.balance_panes(plan()));
+        tabs.set_ratio(&[true], 0.5);
+        assert_eq!(tabs.active_layout(), Some(target.layout()));
+
+        // Focusing a different leaf of the same group keeps the user's focus.
+        tabs.select(b);
+        assert!(tabs.balance_panes(plan()));
+        assert_eq!(tabs.active_id(), Some(b));
+        assert_eq!(tabs.active_layout().unwrap().leaves(), [a, b, c]);
+        assert_eq!(
+            [tabs.get(a), tabs.get(b), tabs.get(c)],
+            [Some(&"SSH"), Some(&"PowerShell"), Some(&"Log")]
+        );
+        assert_eq!(tabs.layout_for(other), Some(&Layout::Leaf(other)));
+        assert!(!tabs.balance_panes(plan()));
     }
 
     #[test]
