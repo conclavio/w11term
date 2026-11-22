@@ -12,11 +12,25 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class InspectDpi {
-    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    public static uint WindowDpi(IntPtr hwnd) {
+        var previous = SetThreadDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd));
+        try { return GetDpiForWindow(hwnd); }
+        finally { if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous); }
+    }
 }
 '@
 
-function Inspect { Control @('inspect','--pane',"$remote") }
+$observed = [ordered]@{}
+function Inspect {
+    $observed.inspect = Control @('inspect','--pane',"$remote")
+    return $observed.inspect
+}
 function Set-RemoteModes([string]$Bytes) {
     $data = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($Bytes))
     $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64',$data)
@@ -36,31 +50,38 @@ function Is-Default($Mode) {
 }
 
 $wire = Open-PeerTraceReader ([IO.File]::ReadAllText((Join-Path $State 'ssh-wire')))
-$app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','132','--rows','32') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
+$app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','80','--rows','24') -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
+    if (![InspectDpi]::IsWindowVisible($window) -or [InspectDpi]::IsIconic($window)) {
+        # The first canvas paint replaces provisional startup dimensions with the measured DPI.
+        $null = [InspectDpi]::ShowWindowAsync($window, 4) # SW_SHOWNOACTIVATE
+    }
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','ready')
-    $ssh = (Control @('list')).sessions | Where-Object id -eq $remote
-    $initial = Wait-Until 'default parser state and final window geometry' {
+    $null = Wait-Until 'default SSH parser modes' { Is-Default (Inspect) }
+    $initial = Wait-Until 'measured geometry matching the live pane list and window DPI' {
+        # Startup may clamp the requested grid to this desktop's work area.
+        $observed.list = (Control @('list')).sessions | Where-Object id -eq $remote
         $m = Inspect
-        if ((Is-Default $m) -and $m.pane -eq $remote -and $m.connection_generation -eq $ssh.connection_generation -and
-            $m.cols -eq $ssh.cols -and $m.rows -eq $ssh.rows -and $m.pixel_width -gt $m.cols -and
-            $m.pixel_height -gt $m.rows -and $m.dpi -eq [InspectDpi]::GetDpiForWindow($window)) { $m }
+        $observed.window_dpi = [InspectDpi]::WindowDpi($window)
+        if ($m.pane -eq $remote -and $m.connection_generation -eq $observed.list.connection_generation -and
+            $m.cols -eq $observed.list.cols -and $m.rows -eq $observed.list.rows -and $m.cols -gt 0 -and $m.rows -gt 0 -and
+            $m.pixel_width -gt $m.cols -and $m.pixel_height -gt $m.rows -and $m.dpi -gt 0 -and $m.dpi -eq $observed.window_dpi) { $m }
     }
     Invoke-Button (Wait-Until 'menu' { Find-Element 'Tab menu' $button })
     Invoke-Button (Wait-Until 'open inspector' { Find-Element 'Terminal inspector: Off' })
-    $area = "Text area   $($initial.pixel_width) $([char]0xd7) $($initial.pixel_height) px at $($initial.dpi) DPI"
-    $null = Wait-Until 'inspector geometry and resize mode match the CLI' { (Find-Element $area) -and (Find-Element 'In-band resize   Off') }
-    Set-RemoteModes "$esc[?2048h"
-    $enabled = Wait-Until 'inspect and GUI show negotiated resize notifications' {
+    $null = Wait-Until 'inspector geometry and resize mode match the CLI' {
         $m = Inspect
-        if ($m.in_band_resize -and (Find-Element 'In-band resize   On')) { $m }
+        $area = "Text area   $($m.pixel_width) $([char]0xd7) $($m.pixel_height) px at $($m.dpi) DPI"
+        (Find-Element $area) -and !$m.in_band_resize -and (Find-Element 'In-band resize   Off')
     }
-    $report = "$esc[48;$($enabled.rows);$($enabled.cols);$($enabled.pixel_height);$($enabled.pixel_width)t"
-    $null = Wait-Until 'actual SSH resize report agrees with CLI cell and pixel geometry' {
-        [Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains($report)
+    Set-RemoteModes "$esc[?2048h"
+    $null = Wait-Until 'SSH resize report matches inspector and CLI geometry' {
+        $m = Inspect
+        $report = "$esc[48;$($m.rows);$($m.cols);$($m.pixel_height);$($m.pixel_width)t"
+        $m.in_band_resize -and (Find-Element 'In-band resize   On') -and [Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains($report)
     }
     Set-RemoteModes "$esc[?2048l"
     $null = Wait-Until 'inspector observes resize reporting disabled' { Find-Element 'In-band resize   Off' }
@@ -77,7 +98,7 @@ try {
     Set-RemoteModes "$esc[?1000;1002;1003;1016;2004;2048h$esc[>5u"
     $null = Wait-Until 'hidden SSH parser modes without character output' {
         $m = Inspect
-        $m.pane -eq $remote -and $m.connection_generation -eq $ssh.connection_generation -and
+        $m.pane -eq $remote -and $m.connection_generation -eq $initial.connection_generation -and
             !$m.alternate_screen -and !$m.synchronized_output -and $m.bracketed_paste -and $m.in_band_resize -and
             $m.mouse.click -and $m.mouse.drag -and $m.mouse.motion -and $m.mouse.encoding -ceq 'sgr-pixels' -and
             $m.keyboard.encoding -ceq 'kitty' -and $m.keyboard.flags -eq 5
@@ -96,6 +117,19 @@ try {
     Type-Line 'if ($inspectPid -eq $PID) { "local-inspect-" + "still-live" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','local-inspect-still-live')
     if ([Text.Encoding]::ASCII.GetString((Read-PeerTrace $wire)).Contains('local-inspect')) { throw 'PowerShell input landed in SSH' }
+} catch {
+    $failure = $_.Exception.Message
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $observed.window_visible = [InspectDpi]::IsWindowVisible($window)
+        $observed.window_minimized = [InspectDpi]::IsIconic($window)
+        $observed.window_bounds = $root.Current.BoundingRectangle.ToString()
+        $text = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+        $observed.inspector_rows = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$text) |
+            ForEach-Object { $_.Current.Name } | Where-Object { $_ -like 'Text area *' -or $_ -like 'In-band resize *' })
+    } catch { $observed.uia_error = $_.Exception.Message }
+    throw "$failure. Last pane observations: $($observed | ConvertTo-Json -Compress -Depth 5)"
 } finally {
     $wire.Dispose()
     if (!$app.HasExited) {
