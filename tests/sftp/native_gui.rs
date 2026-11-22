@@ -990,6 +990,93 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
+async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker");
+    let received = picker.join("receive here");
+    let conflict = picker.join("already exists");
+    fs::create_dir_all(&received).unwrap();
+    fs::create_dir_all(conflict.join("snapshot")).unwrap();
+    fs::write(received.join("neighbor.bin"), b"untouched sibling").unwrap();
+    fs::write(conflict.join("snapshot/.manifest"), b"local manifest").unwrap();
+
+    let parent = remote.path().join("shell directory");
+    let source = parent.join("snapshot");
+    fs::create_dir_all(source.join("data 雪/empty")).unwrap();
+    let data = [0, 255, 10, 13, 128, 42, 0];
+    fs::write(source.join("data 雪/trace 例.bin"), data).unwrap();
+    fs::write(source.join(".manifest"), b"remote manifest\n").unwrap();
+    let interrupted = parent.join("interrupted/nested");
+    fs::create_dir_all(&interrupted).unwrap();
+    fs::write(
+        interrupted.join("payload.bin"),
+        vec![42; 3 * w11term::sftp::CHUNK],
+    )
+    .unwrap();
+    for marker in ["transfer-trace", "hold-transfer-read", "keyboard-input.bin"] {
+        fs::write(remote.path().join(marker), []).unwrap();
+    }
+    fs::write(
+        state.path().join("fixture-root"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+
+    drive_mixed_gui("download-sftp-folder-ui.ps1", &ssh, state.path());
+
+    let downloaded = received.join("snapshot");
+    assert_eq!(
+        fs::read(downloaded.join(".manifest")).unwrap(),
+        b"remote manifest\n"
+    );
+    assert_eq!(
+        fs::read(downloaded.join("data 雪/trace 例.bin")).unwrap(),
+        data
+    );
+    assert_eq!(
+        fs::read_dir(downloaded.join("data 雪/empty"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(fs::read_dir(downloaded.join("data 雪")).unwrap().count(), 2);
+    assert_eq!(fs::read_dir(&downloaded).unwrap().count(), 2);
+    assert_eq!(
+        fs::read(received.join("neighbor.bin")).unwrap(),
+        b"untouched sibling"
+    );
+    assert_eq!(
+        fs::read_dir(&received).unwrap().count(),
+        2,
+        "interrupted transfer left a tree or staging directory"
+    );
+    assert_eq!(
+        fs::read(conflict.join("snapshot/.manifest")).unwrap(),
+        b"local manifest"
+    );
+    assert_eq!(
+        fs::read_dir(conflict.join("snapshot")).unwrap().count(),
+        1,
+        "existing directory was merged"
+    );
+    assert_eq!(fs::read_dir(&conflict).unwrap().count(), 1);
+    assert_eq!(
+        fs::read(remote.path().join("keyboard-input.bin")).unwrap(),
+        b"folder-download-live"
+    );
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "cancels real SFTP transfers in a native SSH and PowerShell split"]
 async fn native_sftp_cancel_transfer_preserves_files_and_live_shells() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

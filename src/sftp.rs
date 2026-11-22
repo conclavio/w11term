@@ -24,6 +24,10 @@ use tokio::{
     time::Instant,
 };
 
+mod directory;
+pub(crate) use directory::valid_component;
+pub use directory::validate_download_name;
+
 pub const CHUNK: usize = 32 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
@@ -58,6 +62,10 @@ pub enum Operation {
         max_bytes: Option<u64>,
         #[serde(default)]
         overwrite: bool,
+    },
+    GetDir {
+        remote: String,
+        local: PathBuf,
     },
     Put {
         local: PathBuf,
@@ -279,7 +287,7 @@ pub struct Job {
     pub deadline: Instant,
     pub reply: oneshot::Sender<JobResult>,
     pub progress: Option<watch::Sender<TransferProgress>>,
-    /// Used by native Get/Put only. A stopped transfer replies with cancelled,
+    /// Used by native transfers. A stopped transfer replies with cancelled,
     /// bytes_transferred and remote_may_be_partial after closing its handle.
     pub cancel: Option<TransferCancel>,
 }
@@ -293,6 +301,10 @@ struct PendingReply {
 
 enum JobStage {
     Ordinary,
+    DirectoryDownload {
+        staging: Option<tempfile::TempDir>,
+        deadline: Instant,
+    },
     Upload,
     NativeUpload {
         remote: String,
@@ -304,9 +316,17 @@ enum JobStage {
 }
 
 impl JobStage {
+    fn take_directory(&mut self) -> Option<tempfile::TempDir> {
+        match self {
+            Self::DirectoryDownload { staging, .. } => staging.take(),
+            _ => None,
+        }
+    }
+
     fn interrupted(&self) -> Cow<'static, str> {
         match self {
             Self::Ordinary => "SFTP operation interrupted; outcome may be unknown".into(),
+            Self::DirectoryDownload { .. } => "Folder download interrupted before publication".into(),
             Self::Upload => {
                 "SFTP upload interrupted; remote destination may contain a partial file".into()
             }
@@ -328,7 +348,14 @@ impl PendingReply {
 impl Drop for PendingReply {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
-            let _ = sender.send(Err(self.stage.interrupted().into()));
+            let result = Err(self.stage.interrupted().into());
+            if let Some(stage) = self.stage.take_directory() {
+                // The SSH connection was torn down. The cleanup task owns the
+                // reply and will deliver it after the uncommitted tree is gone.
+                directory::clean_up(stage, sender, result);
+            } else {
+                let _ = sender.send(result);
+            }
         }
     }
 }
@@ -383,8 +410,9 @@ pub(crate) async fn run(
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
-            && let Operation::Put { local, remote, .. } | Operation::Get { local, remote, .. } =
-                &operation
+            && let Operation::Put { local, remote, .. }
+            | Operation::Get { local, remote, .. }
+            | Operation::GetDir { local, remote } = &operation
         {
             let _ = reply.send(Ok(cancelled_transfer(local, remote, 0, false)));
             continue;
@@ -414,6 +442,10 @@ pub(crate) async fn run(
                     confirmed: 0,
                 },
                 Operation::Put { .. } => JobStage::Upload,
+                Operation::GetDir { .. } => JobStage::DirectoryDownload {
+                    staging: None,
+                    deadline,
+                },
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
@@ -462,6 +494,8 @@ pub(crate) async fn run(
                         ))
                 {
                     result.with_context(|| reply.stage.interrupted())
+                } else if lost && matches!(reply.stage, JobStage::DirectoryDownload { .. }) {
+                    result.context(reply.stage.interrupted())
                 } else if lost {
                     result.context("SFTP channel failed; outcome may be unknown; handles invalidated, do not blindly retry")
                 } else {
@@ -472,7 +506,8 @@ pub(crate) async fn run(
                 engine = None;
                 if matches!(
                     reply.stage,
-                    JobStage::Checking(_)
+                    JobStage::DirectoryDownload { .. }
+                        | JobStage::Checking(_)
                         | JobStage::AwaitingStatus(_)
                         | JobStage::NativeUpload { .. }
                 ) {
@@ -487,7 +522,12 @@ pub(crate) async fn run(
                 }
             }
         };
-        if let Err(Ok(value)) = reply.finish(result.map_err(|e| format!("SFTP: {e:#}")))
+        let result = result.map_err(|e| format!("SFTP: {e:#}"));
+        if let Some(stage) = reply.stage.take_directory() {
+            let _ = directory::clean_up(stage, reply.sender.take().unwrap(), result).await;
+            continue;
+        }
+        if let Err(Ok(value)) = reply.finish(result)
             && creates_handle
             && let Some(handle) = value["handle"].as_u64()
             && let Some(active) = engine.as_mut()
@@ -634,6 +674,13 @@ impl Engine {
                 max_bytes,
             } => {
                 self.get(remote, local, overwrite, max_bytes, progress, cancel)
+                    .await?
+            }
+            GetDir { remote, local } => {
+                let JobStage::DirectoryDownload { staging, deadline } = stage else {
+                    unreachable!("directory job stage")
+                };
+                self.get_dir(remote, local, progress, cancel, staging, *deadline)
                     .await?
             }
             Put {
@@ -877,6 +924,45 @@ impl Engine {
             }
         })
     }
+    async fn read_contents(
+        &self,
+        h: &str,
+        file: &mut tokio::fs::File,
+        limit: Option<(u64, &str)>,
+        cancel: Option<&TransferCancel>,
+        mut advanced: impl FnMut(u64) -> Result<()>,
+    ) -> Result<u64> {
+        let mut offset = 0u64;
+        while !cancel.is_some_and(TransferCancel::is_cancelled) {
+            match self.raw.read(h, offset, self.read_size as u32).await {
+                Ok(data) => {
+                    if cancel.is_some_and(TransferCancel::is_cancelled) {
+                        break;
+                    }
+                    ensure!(
+                        data.data.len() <= self.read_size,
+                        "server returned more SFTP data than requested"
+                    );
+                    ensure!(
+                        !data.data.is_empty(),
+                        "server returned empty data without EOF"
+                    );
+                    let next = offset
+                        .checked_add(data.data.len() as u64)
+                        .context("file size overflow")?;
+                    if let Some((max, reason)) = limit {
+                        ensure!(next <= max, "download exceeds {reason} ({max} bytes)");
+                    }
+                    file.write_all(&data.data).await?;
+                    offset = next;
+                    advanced(offset)?;
+                }
+                Err(e) if eof(&e) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(offset)
+    }
     async fn get(
         &self,
         remote: String,
@@ -937,36 +1023,18 @@ impl Engine {
                 None
             };
             report(progress, 0, total);
-            let mut offset = 0u64;
-            while !cancelled() {
-                match self.raw.read(&h, offset, self.read_size as u32).await {
-                    Ok(data) => {
-                        if cancelled() {
-                            break;
-                        }
-                        ensure!(
-                            data.data.len() <= self.read_size,
-                            "server returned more SFTP data than requested"
-                        );
-                        ensure!(
-                            !data.data.is_empty(),
-                            "server returned empty data without EOF"
-                        );
-                        let next = offset
-                            .checked_add(data.data.len() as u64)
-                            .context("file size overflow")?;
-                        ensure!(
-                            max_bytes.is_none_or(|limit| next <= limit),
-                            "download exceeds --max-bytes limit"
-                        );
-                        file.write_all(&data.data).await?;
-                        offset = next;
+            let offset = self
+                .read_contents(
+                    &h,
+                    &mut file,
+                    max_bytes.map(|n| (n, "--max-bytes limit")),
+                    cancel,
+                    |offset| {
                         report(progress, offset, total);
-                    }
-                    Err(e) if eof(&e) => break,
-                    Err(e) => return Err(e.into()),
-                }
-            }
+                        Ok(())
+                    },
+                )
+                .await?;
             if !cancelled() {
                 file.sync_all().await?;
             }
