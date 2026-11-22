@@ -81,12 +81,21 @@ impl<T> Tab<T> {
     }
 }
 
+#[derive(Clone)]
 struct Group {
     id: TabId,
     title: Option<TabTitle>,
     focused: TabId,
     layout: Layout,
     zoomed: bool,
+}
+
+/// Layout and launch recipes for a tab. The old pane IDs only identify its
+/// layout slots and focus. Opening the recipe allocates all new IDs.
+pub struct TabLayoutRecipe<P> {
+    index: usize,
+    group: Group,
+    panes: Vec<P>,
 }
 
 pub struct Tabs<T> {
@@ -326,54 +335,103 @@ impl<T> Tabs<T> {
         id
     }
 
-    /// Resolve every leaf before launching anything. A rejected recipe leaves
-    /// all tab state intact, including original focus and header order.
-    pub fn duplicate_active_group<P, E>(
-        &mut self,
-        mut prepare: impl FnMut(&T) -> Result<P, E>,
-        mut create: impl FnMut(P) -> T,
-    ) -> Result<Option<TabId>, E> {
-        let Some(index) = self.active_index() else {
+    /// Capture a group before closing it, even if the header is inactive or
+    /// its original pane has moved. An ineligible leaf rejects the whole group.
+    pub fn capture_group<P, E>(
+        &self,
+        group: TabId,
+        mut capture: impl FnMut(&T) -> Result<P, E>,
+    ) -> Result<Option<TabLayoutRecipe<P>>, E> {
+        let Some(index) = self.groups.iter().position(|g| g.id == group) else {
             return Ok(None);
         };
-        let original = &self.groups[index];
-        let recipes = original
+        let group = &self.groups[index];
+        let panes = group
             .layout
             .leaves()
             .into_iter()
-            .map(|id| prepare(self.get(id).expect("layout leaf belongs to the group")))
+            .map(|id| capture(self.get(id).expect("layout leaf belongs to the group")))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut recipes = recipes.into_iter();
-        let mut layout = original.layout.clone();
+        Ok(Some(TabLayoutRecipe {
+            index,
+            group: group.clone(),
+            panes,
+        }))
+    }
+
+    /// Recheck all saved launches before starting any pane. Borrowing the recipe
+    /// lets the caller keep it for a retry if preflight fails.
+    pub fn reopen_group<P, L, E>(
+        &mut self,
+        recipe: &TabLayoutRecipe<P>,
+        prepare: impl FnMut(&P) -> Result<L, E>,
+        launch: impl FnMut(L) -> T,
+    ) -> Result<TabId, E> {
+        let panes = recipe
+            .panes
+            .iter()
+            .map(prepare)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self.insert_fresh_group(recipe.index, recipe.group.clone(), panes, launch))
+    }
+
+    pub fn duplicate_active_group<P, E>(
+        &mut self,
+        prepare: impl FnMut(&T) -> Result<P, E>,
+        launch: impl FnMut(P) -> T,
+    ) -> Result<Option<TabId>, E> {
+        let Some(group) = self.active_group_id() else {
+            return Ok(None);
+        };
+        let recipe = self
+            .capture_group(group, prepare)?
+            .expect("active group exists");
+        Ok(Some(self.insert_fresh_group(
+            recipe.index + 1,
+            recipe.group,
+            recipe.panes,
+            launch,
+        )))
+    }
+
+    fn insert_fresh_group<P>(
+        &mut self,
+        index: usize,
+        source_group: Group,
+        panes: Vec<P>,
+        mut launch: impl FnMut(P) -> T,
+    ) -> TabId {
+        let mut recipes = panes.into_iter();
+        let mut layout = source_group.layout;
         let mut group = None;
         let mut focused = None;
         layout.replace_leaves(&mut |source| {
             let id = next_id();
             let group = *group.get_or_insert(id);
-            if original.focused == source {
+            if source_group.focused == source {
                 focused = Some(id);
             }
             self.entries.push(Tab {
                 id,
                 group,
-                value: create(recipes.next().expect("one recipe per leaf")),
+                value: launch(recipes.next().expect("one recipe per leaf")),
                 visit: None,
             });
             id
         });
         let id = group.expect("every tab group has a leaf");
         self.groups.insert(
-            index + 1,
+            index.min(self.groups.len()),
             Group {
                 id,
-                title: original.title.clone(),
+                title: source_group.title,
                 focused: focused.expect("the focused entry belongs to this layout"),
                 layout,
-                zoomed: original.zoomed,
+                zoomed: source_group.zoomed,
             },
         );
         self.active_group = Some(id);
-        Ok(Some(id))
+        id
     }
 
     fn insert_group(&mut self, id: TabId, entry_id: TabId, value: T, visit: Option<PaneVisit>) {
@@ -875,6 +933,102 @@ mod tests {
         tabs.remove_group(ids[1]);
         assert_eq!(tabs.layout_for(a), Some(&original));
         assert_eq!(tabs.get(b), Some(&2));
+    }
+
+    #[test]
+    fn reopen_preflights_a_background_group_and_restores_its_position_with_new_panes() {
+        let mut tabs = Tabs::default();
+        let before = tabs.insert(("before", false, 0));
+        let group = tabs.insert(("closed leaf", false, 0));
+        let ssh = tabs.split(group, ("SSH", true, 1), Axis::Rows).unwrap();
+        let local = tabs
+            .split(ssh, ("PowerShell", false, 2), Axis::Columns)
+            .unwrap();
+        tabs.remove(group);
+        assert!(tabs.select(ssh));
+        assert!(tabs.set_ratio(&[], 0.37));
+        let geometry = tabs.active_layout().unwrap().clone();
+        assert!(tabs.toggle_zoom());
+        let title = TabTitle::try_from("Operations".to_owned()).unwrap();
+        tabs.set_group_title(group, Some(title.clone()));
+        let after = tabs.insert(("after", false, 0));
+
+        // Header IDs outlive their first pane, and closing a background tab must
+        // capture its leaves without switching or changing keyboard focus.
+        assert!(tabs.get(group).is_none());
+        let rejected = tabs.capture_group(group, |&(profile, _, _)| match profile {
+            "PowerShell" => Err("unsupported launch"),
+            _ => Ok(profile),
+        });
+        assert!(matches!(rejected, Err("unsupported launch")));
+        let recipe = tabs
+            .capture_group(group, |&(profile, locked, _)| {
+                Ok::<_, ()>((profile, locked))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(tabs.active_id(), Some(after));
+        assert!(tabs.remove_group(local));
+
+        let failed = tabs.reopen_group(
+            &recipe,
+            |&(profile, _)| match profile {
+                "PowerShell" => Err("working directory no longer exists"),
+                _ => Ok(()),
+            },
+            |_| panic!("failed preflight started a shell"),
+        );
+        assert_eq!(failed, Err("working directory no longer exists"));
+        assert_eq!(tabs.active_id(), Some(after));
+        assert_eq!(tabs.headers().len(), 2);
+
+        let reopened = tabs
+            .reopen_group(
+                &recipe,
+                |pane| Ok::<_, ()>(*pane),
+                |(profile, locked)| (profile, locked, 3),
+            )
+            .unwrap();
+        let layout = tabs.active_layout().unwrap();
+        let ids = layout.leaves();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| ![group, ssh, local].contains(id)));
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+        assert_eq!(tabs.get(ids[0]), Some(&("SSH", true, 3)));
+        assert_eq!(tabs.get(ids[1]), Some(&("PowerShell", false, 3)));
+        assert_eq!(tabs.title_for(ids[0]), Some(&title));
+        assert!(tabs.zoomed());
+        assert_eq!(layout.bounds(ids[0]), geometry.bounds(ssh));
+        assert_eq!(layout.bounds(ids[1]), geometry.bounds(local));
+        assert_eq!(
+            tabs.headers()
+                .iter()
+                .map(|t| t.group_id())
+                .collect::<Vec<_>>(),
+            [before, reopened, after]
+        );
+    }
+
+    #[test]
+    fn reopen_appends_when_intervening_closes_remove_the_old_slot() {
+        let mut tabs = Tabs::default();
+        let first = tabs.insert(1);
+        let intervening = tabs.insert(2);
+        let last = tabs.insert(3);
+        let recipe = tabs
+            .capture_group(last, |&n| Ok::<_, ()>(n))
+            .unwrap()
+            .unwrap();
+        assert!(tabs.remove_group(last));
+        assert!(tabs.remove_group(intervening));
+        let restored = tabs
+            .reopen_group(&recipe, |&n| Ok::<_, ()>(n), |n| n)
+            .unwrap();
+        assert_eq!(
+            tabs.headers().iter().map(|t| t.id).collect::<Vec<_>>(),
+            [first, restored]
+        );
+        assert_eq!(tabs.active(), Some(&3));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub enum CommandId {
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     TabAction(Shortcut, Option<TabId>),
+    ReopenClosedTab(Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
     OpenInDirectory(
@@ -233,6 +234,11 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                Shortcut::ReopenClosedTab => {
+                    let closed = self.closed_tab.as_ref().map(|tab| tab.group);
+                    row.enabled = closed.is_some();
+                    row.id = CommandId::ReopenClosedTab(closed);
+                }
                 Shortcut::FocusPreviousPane => {
                     row.enabled = previous.is_some();
                     row.id = CommandId::FocusPreviousPane(previous);
@@ -319,6 +325,7 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::ReopenClosedTab(group) => Message::ReopenClosedTab(group),
             CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
             CommandId::LocalForward(origin) => local_forwards::open(origin),

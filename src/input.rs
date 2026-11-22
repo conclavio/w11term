@@ -160,6 +160,7 @@ pub enum Shortcut {
     MoveTabRight,
     NewTab,
     DuplicateTabLayout,
+    ReopenClosedTab,
     CloseTab,
     SplitRight,
     SplitBelow,
@@ -1796,6 +1797,7 @@ impl From<Action> for Shortcut {
             Action::MoveTabRight => Self::MoveTabRight,
             Action::NewTab => Self::NewTab,
             Action::DuplicateTabLayout => Self::DuplicateTabLayout,
+            Action::ReopenClosedTab => Self::ReopenClosedTab,
             Action::CloseTab => Self::CloseTab,
             Action::SelectTab(number) => Self::Select(usize::from(number - 1)),
         }

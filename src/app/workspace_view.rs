@@ -2,6 +2,7 @@ use super::*;
 use w11term::workspace::{SavedLayout, SavedSource, SshStartup, Workspace, WorkspaceStore};
 
 mod duplicate;
+pub(super) use duplicate::ClosedTab;
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {

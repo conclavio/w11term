@@ -1,7 +1,7 @@
 use super::*;
 use anyhow::{Result, bail, ensure};
 
-/// A duplicate starts ordinary shells only. Keep this check cheap enough for
+/// Duplicating or reopening a tab starts ordinary shells. Keep this check cheap enough for
 /// disabled menu/palette state; filesystem preflight happens on invocation.
 fn eligible(source: &Source, discovery: bool, startup: Option<&SshStartup>) -> Result<()> {
     if let Some(startup) = startup {
@@ -46,6 +46,24 @@ fn interactive_local(shell: &LocalOptions) -> bool {
         )
 }
 
+fn eligible_pane(tab: &AppTab) -> Result<&LiveTab> {
+    let Page::Terminal(live) = &tab.page else {
+        bail!("Select a terminal tab to open its layout")
+    };
+    eligible(
+        &live.source,
+        live.discovery_page.is_some(),
+        live.startup.as_deref(),
+    )?;
+    Ok(live)
+}
+
+pub(in crate::app) struct ClosedTab {
+    pub(in crate::app) group: TabId,
+    layout: w11term::tabs::TabLayoutRecipe<NewShell>,
+}
+
+#[derive(Clone)]
 struct NewShell {
     source: Source,
     label: String,
@@ -56,30 +74,39 @@ struct NewShell {
 }
 
 impl NewShell {
-    fn prepare(tab: &AppTab, catalog: Option<&Profiles>) -> Result<Self> {
-        let Page::Terminal(live) = &tab.page else {
-            bail!("Select a terminal tab to duplicate its layout")
-        };
+    fn capture(tab: &AppTab) -> Result<Self> {
+        let live = eligible_pane(tab)?;
         let mut source = live.source.clone();
         if let Source::Ssh(ssh) = &mut source {
             ssh.player = live.session.player.read().unwrap().clone();
+            ensure!(
+                !ssh.player.rustmush,
+                "This tab contains a RustMUSH player session"
+            );
         }
-        if let Source::Local(shell) = &source {
-            shell
-                .check_launch_paths()
-                .with_context(|| format!("Cannot duplicate {}", tab.label))?;
-        }
-        let profile = catalog
-            .and_then(|catalog| matching_profile(catalog, live.profile_name.as_deref(), &source));
-        let label = profile.clone().unwrap_or_else(|| source_label(&source));
         Ok(Self {
             source,
-            profile,
-            label,
+            profile: live.profile_name.clone(),
+            label: tab.label.clone(),
             size: live.last_size.get().unwrap_or_default(),
             read_only: live.read_only.get(),
             startup: live.startup.clone(),
         })
+    }
+
+    fn prepare(mut self, catalog: Option<&Profiles>) -> Result<Self> {
+        if let Source::Local(shell) = &self.source {
+            shell
+                .check_launch_paths()
+                .with_context(|| format!("Cannot open {}", self.label))?;
+        }
+        self.profile =
+            catalog.and_then(|c| matching_profile(c, self.profile.as_deref(), &self.source));
+        self.label = self
+            .profile
+            .clone()
+            .unwrap_or_else(|| source_label(&self.source));
+        Ok(self)
     }
 
     fn launch(self, osc52: bool) -> AppTab {
@@ -105,6 +132,40 @@ impl NewShell {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn close_user_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        if let Some(group) = self.tabs.group_id(id)
+            && let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture)
+        {
+            self.closed_tab = Some(ClosedTab { group, layout });
+        }
+        self.close_tab(id, context);
+    }
+
+    pub(in crate::app) fn reopen_closed_tab(
+        &mut self,
+        group: TabId,
+        context: &ComponentContext<Self>,
+    ) -> Result<()> {
+        let Some(closed) = self
+            .closed_tab
+            .as_ref()
+            .filter(|closed| closed.group == group)
+        else {
+            return Ok(());
+        };
+        let catalog = self.store.catalog().ok();
+        let osc52 = self.appearance.read().unwrap().interaction.osc52;
+        self.tabs.reopen_group(
+            &closed.layout,
+            |recipe| recipe.clone().prepare(catalog.as_ref()),
+            |shell| shell.launch(osc52),
+        )?;
+        self.closed_tab = None;
+        self.sync_selection(context);
+        self.activate(context);
+        Ok(())
+    }
+
     pub(in crate::app) fn can_duplicate_tab_layout(&self, group: TabId) -> Result<()> {
         ensure!(
             self.tabs.active_group_id() == Some(group),
@@ -116,14 +177,7 @@ impl TerminalApp {
             .context("The original tab was closed")?;
         for id in layout.leaves() {
             let tab = self.tabs.get(id).context("The original pane was closed")?;
-            let Page::Terminal(live) = &tab.page else {
-                bail!("Select a terminal tab to duplicate its layout")
-            };
-            eligible(
-                &live.source,
-                live.discovery_page.is_some(),
-                live.startup.as_deref(),
-            )?;
+            let live = eligible_pane(tab)?;
             if let Source::Ssh(_) = &live.source
                 && live.session.player.read().unwrap().rustmush
             {
@@ -144,7 +198,7 @@ impl TerminalApp {
         let catalog = self.store.catalog().ok();
         let osc52 = self.appearance.read().unwrap().interaction.osc52;
         self.tabs.duplicate_active_group(
-            |tab| NewShell::prepare(tab, catalog.as_ref()),
+            |tab| NewShell::capture(tab)?.prepare(catalog.as_ref()),
             |recipe| recipe.launch(osc52),
         )?;
         self.sync_selection(context);
@@ -242,6 +296,36 @@ mod tests {
         ] {
             assert!(eligible(&source, false, None).is_err(), "{source:?}");
         }
+    }
+
+    #[test]
+    fn reopen_checks_the_current_directory_without_retargeting_a_saved_shell() {
+        let mut catalog = Profiles::default();
+        let mut changed = ssh();
+        changed.host = "another.example".into();
+        catalog.profiles.insert("test".into(), changed);
+        let mut recipe = NewShell {
+            source: Source::Ssh(ssh()),
+            profile: Some("test".into()),
+            label: "test".into(),
+            size: TerminalSize::default(),
+            read_only: true,
+            startup: None,
+        };
+        let prepared = recipe.clone().prepare(Some(&catalog)).unwrap();
+        assert!(prepared.profile.is_none());
+        assert!(matches!(prepared.source, Source::Ssh(ref options) if options == &ssh()));
+        assert!(prepared.read_only);
+
+        let folder = tempfile::tempdir().unwrap();
+        let Source::Local(mut shell) = local("powershell.exe", &[]) else {
+            unreachable!()
+        };
+        shell.cwd = Some(folder.path().join("build"));
+        recipe.source = Source::Local(shell);
+        assert!(recipe.clone().prepare(None).is_err());
+        std::fs::create_dir(folder.path().join("build")).unwrap();
+        assert!(recipe.prepare(None).is_ok());
     }
 
     #[test]

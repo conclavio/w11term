@@ -45,6 +45,7 @@ pub enum Action {
     MoveTabRight,
     NewTab,
     DuplicateTabLayout,
+    ReopenClosedTab,
     CloseTab,
     SelectTab(u8),
     Workspaces,
@@ -214,6 +215,13 @@ pub const BINDINGS: &[Binding] = &[
         Mods::NONE,
     ),
     Binding::new(CloseTab, "close_tab", "Close tab", 0x57, CTRL_SHIFT),
+    Binding::new(
+        ReopenClosedTab,
+        "reopen_closed_tab",
+        "Reopen last closed tab layout",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(SelectTab(1), "select_tab_1", "Select tab 1", 0x31, CTRL_ALT),
     Binding::new(SelectTab(2), "select_tab_2", "Select tab 2", 0x32, CTRL_ALT),
     Binding::new(SelectTab(3), "select_tab_3", "Select tab 3", 0x33, CTRL_ALT),
@@ -553,23 +561,28 @@ mod tests {
     }
 
     #[test]
-    fn previous_pane_is_optional_and_can_return_from_a_utility_tab() {
-        let mut shortcuts = Shortcuts::default();
+    fn previous_pane_and_reopen_closed_tab_can_return_from_a_utility_tab() {
         let chord: Chord = "F8".parse().unwrap();
-        assert_eq!(shortcuts.get(FocusPreviousPane.binding()), None);
-        shortcuts.set(FocusPreviousPane, Some(chord)).unwrap();
-        let json = serde_json::to_string(&shortcuts).unwrap();
-        assert_eq!(json, r#"{"focus_previous_pane":"F8"}"#);
-        let map = serde_json::from_str::<Shortcuts>(&json)
-            .unwrap()
-            .keymap()
-            .unwrap();
-        for terminal in [true, false] {
-            assert_eq!(
-                map.resolve(chord.key, chord.mods, terminal, false),
-                Some(FocusPreviousPane)
-            );
-            assert_eq!(map.resolve(chord.key, chord.mods, terminal, true), None);
+        for (action, expected) in [
+            (FocusPreviousPane, r#"{"focus_previous_pane":"F8"}"#),
+            (ReopenClosedTab, r#"{"reopen_closed_tab":"F8"}"#),
+        ] {
+            let mut shortcuts = Shortcuts::default();
+            assert_eq!(shortcuts.get(action.binding()), None);
+            shortcuts.set(action, Some(chord)).unwrap();
+            let json = serde_json::to_string(&shortcuts).unwrap();
+            assert_eq!(json, expected);
+            let map = serde_json::from_str::<Shortcuts>(&json)
+                .unwrap()
+                .keymap()
+                .unwrap();
+            for terminal in [true, false] {
+                assert_eq!(
+                    map.resolve(chord.key, chord.mods, terminal, false),
+                    Some(action)
+                );
+                assert_eq!(map.resolve(chord.key, chord.mods, terminal, true), None);
+            }
         }
     }
 

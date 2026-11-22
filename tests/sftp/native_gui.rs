@@ -763,6 +763,24 @@ async fn native_clipboard_paste_confirms_original_bytes_for_the_original_pane() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "duplicates a named, zoomed SSH and PowerShell split and verifies two independent sets of sessions"]
 async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
+    check_mixed_tab_layout(
+        "duplicate-tab-layout-ui.ps1",
+        b"source-before/duplicate-background/duplicate-focused/source-after/",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reopens a named, closed tab layout with new SSH and PowerShell sessions beside a live tab"]
+async fn native_reopen_closed_tab_layout_restores_position_focus_and_input_lock() {
+    check_mixed_tab_layout(
+        "reopen-tab-layout-ui.ps1",
+        b"source-before/reopened-after-unlock/",
+    )
+    .await;
+}
+
+async fn check_mixed_tab_layout(script: &str, expected_input: &[u8]) {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, channels, server) =
         fixture_counting_accepts(false, 4, accepted.clone()).await
@@ -788,12 +806,12 @@ async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
         serde_json::to_vec(&json!({"version":1,"workspaces":{"duplicate":workspace}})).unwrap(),
     )
     .unwrap();
-    drive_mixed_gui("duplicate-tab-layout-ui.ps1", &ssh, state.path());
+    drive_mixed_gui(script, &ssh, state.path());
     assert_eq!(accepted.load(Ordering::Relaxed), 2, "SSH logins");
     assert_eq!(channels.load(Ordering::Relaxed), 2, "SSH shell channels");
     assert_eq!(
         fs::read(trace).unwrap(),
-        b"source-before/duplicate-background/duplicate-focused/source-after/",
+        expected_input,
         "SSH input seen by the loopback server"
     );
     server.abort();
