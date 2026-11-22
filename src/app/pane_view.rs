@@ -93,6 +93,7 @@ pub(super) struct PaneSurface {
     pub(super) paint_count: Rc<Cell<u64>>,
     pub(super) metrics: Rc<Cell<Metrics>>,
     pub(super) invalidator: Invalidator,
+    pub(super) scrollbar: Rc<scrollback_bar::ScrollBar>,
     cursor_blink: Rc<RefCell<crate::cursor_blink::CursorBlink>>,
     pub(super) area: Rc<Cell<Option<(f32, f32, f32)>>>,
     window_grid: Rc<Cell<WindowGrid>>,
@@ -108,6 +109,7 @@ impl PaneSurface {
 
     pub(super) fn release(&self) {
         self.pause_cursor();
+        self.scrollbar.set_enabled(false);
         self.canvas.borrow_mut().take();
     }
 
@@ -228,6 +230,8 @@ impl TerminalApp {
         let area = surface.area.clone();
         let selection = tab.selection.clone();
         let read_only = tab.read_only.clone();
+        let scrollbar = surface.scrollbar.clone();
+        let scrollbar_brush = RefCell::new(None);
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
         let copy_mode = self.copy_mode.clone();
@@ -260,6 +264,7 @@ impl TerminalApp {
             if let Some(hints) = hints {
                 renderer.draw_hint_labels(ctx, &frame, hints.visible_labels())?;
             }
+            scrollbar.draw(ctx, &frame, measured, &mut scrollbar_brush.borrow_mut())?;
             metrics.set(measured);
             area.set(Some((ctx.width, ctx.height, measured.scale)));
             if let Some(preedit) = crate::input::ime::preedit(&sender) {
@@ -318,6 +323,17 @@ impl TerminalApp {
         decorate: bool,
         context: &ViewContext<Self>,
     ) -> View {
+        let show_scrollbar = tab.error.is_none()
+            && !tab.browsing_sessions()
+            && !self.hints.borrow().as_ref().is_some_and(|h| h.pane == id)
+            && !self
+                .copy_mode
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| m.pane == id);
+        if tab.surface.scrollbar.set_enabled(show_scrollbar) {
+            tab.surface.invalidator.invalidate();
+        }
         let interval = self
             .caret_interval
             .filter(|_| tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input));

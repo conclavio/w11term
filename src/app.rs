@@ -62,6 +62,7 @@ mod keyboard_hints;
 mod local_smoke;
 mod pane_picker;
 mod pane_view;
+mod scrollback_bar;
 mod scrollback_export;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
@@ -143,6 +144,7 @@ impl LiveTab {
     }
 
     fn end_pointer_gesture(&mut self) {
+        self.surface.scrollbar.cancel();
         if let Some(release) = self.remote_mouse.release() {
             let _ = self.session.input.send(Command::Mouse(release));
         }
@@ -1337,6 +1339,44 @@ impl TerminalApp {
         if !self.tabs.visible(id) {
             return;
         }
+        let keyboard_navigation = self
+            .copy_mode
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.pane == id)
+            || self.hints.borrow().as_ref().is_some_and(|h| h.pane == id);
+        // Scrolling a background pane preserves the active pane's keyboard route and editors.
+        if !keyboard_navigation
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(id)
+            && tab.remote_mouse.held.is_none()
+            && tab.clicked_link.is_none()
+            && !tab.selection.borrow().as_ref().is_some_and(|s| s.dragging)
+            && tab.surface.scrollbar.pointer(
+                pointer,
+                kind,
+                || tab.session.frames.load().scrollback_view(),
+                |view, row| {
+                    let _ = tab.session.input.send(view.scroll_to(row));
+                },
+            )
+        {
+            if kind == MouseEventKind::Press {
+                tab.gesture += 1;
+            }
+            if tab.hover.borrow_mut().take().is_some() {
+                tab.surface.invalidator.invalidate();
+            }
+            if let Some(inspector) = &mut self.inspection {
+                inspector.clear_pointer();
+            }
+            return;
+        }
+        if kind != MouseEventKind::Move {
+            self.header.borrow_mut().take();
+        }
         if kind == MouseEventKind::Press
             && let Some(active) = self.tabs.active_id()
             && let Some(AppTab {
@@ -1348,13 +1388,7 @@ impl TerminalApp {
             tab.files.end_filter_edit();
             self.connection_ui(active);
         }
-        if self
-            .copy_mode
-            .borrow()
-            .as_ref()
-            .is_some_and(|m| m.pane == id)
-            || self.hints.borrow().as_ref().is_some_and(|h| h.pane == id)
-        {
+        if keyboard_navigation {
             return;
         }
         if kind == MouseEventKind::Press && self.tabs.active_id() != Some(id) {
@@ -3716,6 +3750,7 @@ impl Component for TerminalApp {
                     ((ssh.user == "test" && (std::env::var_os("W11TERM_SSH_SPLIT_SMOKE").is_some()
                          || std::env::var_os("W11TERM_LOCAL_SMOKE").is_some()
                          || std::env::var_os("W11TERM_FILE_SMOKE").is_some()
+                         || std::env::var_os("W11TERM_SCROLLBAR_SMOKE").is_some()
                          || std::env::var_os("W11TERM_WORD_SELECTION_SMOKE").is_some()))
                      || (ssh.user == "pilot" && ssh.durable && std::env::var_os("W11TERM_DURABLE_SMOKE").is_some())
                      || (ssh.user == "pilot" && std::env::var_os("W11TERM_DISCOVERY_SMOKE").is_some())
@@ -3773,7 +3808,9 @@ impl Component for TerminalApp {
                 | Message::DividerEnd(..)
                 | Message::HoverPane(..)
                 | Message::PointerExit(..)
-                | Message::Pointer(_, _, MouseEventKind::Move)
+                | Message::Pointer(..)
+                | Message::CaptureLost(..)
+                | Message::FinalizeCapture(..)
         ) {
             self.header.borrow_mut().take();
         }
@@ -5533,6 +5570,10 @@ impl TerminalApp {
         }
         if let Some(path) = std::env::var_os("W11TERM_WORD_SELECTION_SMOKE") {
             self.word_selection_smoke(std::path::Path::new(&path), context);
+            return;
+        }
+        if let Some(path) = std::env::var_os("W11TERM_SCROLLBAR_SMOKE") {
+            self.scrollbar_pointer_smoke(std::path::Path::new(&path), context);
             return;
         }
         if std::env::var_os("W11TERM_IME_SMOKE").is_some() {

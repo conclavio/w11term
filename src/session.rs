@@ -74,6 +74,7 @@ pub enum Command {
     /// Discard only the offscreen rows of the primary buffer on this worker.
     ClearScrollback,
     ScrollTo(isize),
+    ScrollViewport(crate::terminal::ScrollbackTarget),
     ScrollRange(RangeScrollRequest),
     CopyRange(
         crate::copy_mode::ScreenId,
@@ -752,7 +753,7 @@ async fn run(
                     }
                     Some(Command::ScrollRange(request)) => {
                         if request.available()
-                            && let Some(offset) = request.rows.scroll_offset(&terminal, connection_generation, request.align_top)
+                            && let Some(offset) = request.offset(&terminal, connection_generation, scroll_offset)
                         {
                             let view = (offset != scroll_offset).then(||
                                 presentation.scrolled_view(&terminal, offset, &search));
@@ -765,6 +766,12 @@ async fn run(
                         }
                         // The viewport was already published before acknowledging UIA.
                         continue;
+                    }
+                    Some(Command::ScrollViewport(target)) => {
+                        if let Some(offset) = target.offset(&terminal, connection_generation) {
+                            scroll_offset = offset;
+                        }
+                        Ok(())
                     }
                     Some(Command::ScrollTo(top)) => {
                         if !terminal.is_alt_screen_active() {

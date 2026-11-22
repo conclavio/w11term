@@ -4,6 +4,23 @@ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public static class FixtureMessages {
+    [StructLayout(LayoutKind.Sequential)]
+    struct GuiThreadInfo {
+        public int Size, Flags;
+        public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+        public int Left, Top, Right, Bottom;
+    }
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+    public static IntPtr FocusedWindow(IntPtr root, uint expectedPid) {
+        uint pid;
+        uint thread = GetWindowThreadProcessId(root, out pid);
+        var info = new GuiThreadInfo { Size = Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        if (pid != expectedPid || !GetGUIThreadInfo(thread, ref info) || info.Focus == IntPtr.Zero)
+            return IntPtr.Zero;
+        GetWindowThreadProcessId(info.Focus, out pid);
+        return pid == expectedPid ? info.Focus : IntPtr.Zero;
+    }
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(
         IntPtr hwnd, uint msg, UIntPtr key, IntPtr detail);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -126,6 +143,18 @@ function Post-Key([uint32]$Message, [uint32]$Key) {
 function Press-Key([uint32]$Key) {
     Post-Key 0x100 $Key
     Post-Key 0x101 $Key
+}
+function Press-FocusedKey([uint32]$Key) {
+    # WinUI routes ordinary typing through the focused child HWND. Inspect the
+    # fixture's own thread and keep both messages addressed to that process.
+    $target = Wait-Until 'focused input HWND owned by the fixture' {
+        $hwnd = [FixtureMessages]::FocusedWindow($window, $app.Id)
+        if ($hwnd -ne [IntPtr]::Zero) { $hwnd }
+    }
+    foreach ($message in 0x100,0x101) {
+        if (![FixtureMessages]::PostKey($target, $message, $Key)) { throw "Could not post $Key to HWND $target" }
+    }
+    return $target
 }
 function Open-Palette([string]$Command) {
     Press-Key 0x76 # F7 in the fixture's keymap

@@ -4,6 +4,7 @@
 #![allow(non_upper_case_globals)]
 mod document;
 mod ranges;
+mod scroll;
 #[cfg(test)]
 mod scroll_tests;
 #[cfg(test)]
@@ -150,7 +151,9 @@ impl Source {
     fn scroll(&self, doc: &Document, span: Range<usize>, align_top: bool) -> Result<()> {
         self.check()?;
         let rows = doc.retained_rows(&span).ok_or_else(unavailable)?;
-        let (command, result) = RangeScroll::request(rows, align_top, self.alive.clone());
+        self.apply_scroll(RangeScroll::request(rows, align_top, self.alive.clone()))
+    }
+    fn apply_scroll(&self, (command, result): (Command, RangeScroll)) -> Result<()> {
         self.input.send(command).map_err(|_| unavailable())?;
         if result.wait(Duration::from_secs(1)) {
             self.check()
@@ -165,7 +168,7 @@ impl Source {
     }
 }
 
-#[implement(IRawElementProviderSimple, ITextProvider2)]
+#[implement(IRawElementProviderSimple, ITextProvider2, IScrollProvider)]
 struct Provider {
     source: Arc<Source>,
 }
@@ -183,6 +186,8 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
         self.source.check()?;
         if id == UIA_TextPatternId || id == UIA_TextPattern2Id {
             self.to_interface::<ITextProvider2>().cast()
+        } else if id == UIA_ScrollPatternId {
+            self.to_interface::<IScrollProvider>().cast()
         } else {
             Err(Error::empty())
         }
@@ -199,6 +204,7 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
             | UIA_IsControlElementPropertyId
             | UIA_IsKeyboardFocusablePropertyId
             | UIA_IsTextPatternAvailablePropertyId
+            | UIA_IsScrollPatternAvailablePropertyId
             | UIA_IsTextPattern2AvailablePropertyId => true.into(),
             UIA_HasKeyboardFocusPropertyId => self.source.focused().into(),
             _ => VARIANT::default(),
@@ -490,10 +496,15 @@ impl Bridge {
         });
         let caret = (frame.cursor.x, frame.cursor.y, frame.cursor_visible);
         let caret_changed = host.last_caret.replace(caret) != Some(caret);
-        host.last_frame = Some(frame);
+        let previous = host.last_frame.replace(frame.clone());
         let provider = host.provider.clone();
         let focused = host.source.focused();
         drop(slot);
+        if let Some(previous) = previous
+            && previous.generation != frame.generation
+        {
+            scroll::notify(&provider, &previous, &frame);
+        }
         unsafe {
             if changed_pane && focused {
                 let _ = UiaRaiseAutomationEvent(&provider, UIA_AutomationFocusChangedEventId);

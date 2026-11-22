@@ -1,6 +1,62 @@
 use super::*;
 use std::path::Path;
 impl TerminalApp {
+    pub(super) fn scrollbar_pointer_smoke(
+        &mut self,
+        state: &Path,
+        context: &ComponentContext<Self>,
+    ) {
+        let request = state.join("rail-pointer");
+        if request.is_file() {
+            let gesture = std::fs::read_to_string(&request).unwrap();
+            let (id, gesture) = gesture.split_once(' ').unwrap();
+            let id = id.parse().unwrap();
+            let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
+                panic!("scrollbar probe must target a fixture pane")
+            };
+            let (width, height, _) = tab.surface.area.get().unwrap();
+            let top = PADDING + 1.0;
+            let bottom = height - STATUS_HEIGHT - PADDING - 1.0;
+            let (press, drag) = match gesture {
+                "drag-up" => (bottom, Some(top)),
+                "drag-down" => (top, Some(bottom)),
+                "page-up" => (top, None),
+                _ => panic!("unknown scrollbar probe"),
+            };
+            let event = |y: f32, held| PointerEventInfo {
+                x: (width - PADDING / 2.0) as f64,
+                y: y as f64,
+                is_left_button_pressed: held,
+                capture_succeeded: true,
+                ..Default::default()
+            };
+            // Only the specified pane receives Reactor's normal pointer messages.
+            self.update(
+                Message::Pointer(id, event(press, true), MouseEventKind::Press),
+                context,
+            );
+            if let Some(y) = drag {
+                self.update(
+                    Message::Pointer(id, event(y, true), MouseEventKind::Move),
+                    context,
+                );
+            }
+            self.update(
+                Message::Pointer(
+                    id,
+                    event(drag.unwrap_or(press), false),
+                    MouseEventKind::Release,
+                ),
+                context,
+            );
+            std::fs::remove_file(request).unwrap();
+        }
+        context.spawn_background(move |_| {
+            std::thread::sleep(Duration::from_millis(80));
+            Message::Smoke(0)
+        });
+    }
+
     pub(super) fn word_selection_smoke(&mut self, state: &Path, context: &ComponentContext<Self>) {
         let request = state.join("double-click");
         if request.is_file() {

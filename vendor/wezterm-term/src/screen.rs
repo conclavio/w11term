@@ -32,6 +32,8 @@ pub struct Screen {
     /// Identifies one interpretation of stable row coordinates. Ordinary output
     /// and natural history eviction preserve it.
     row_epoch: u64,
+    /// Identifies an explicit history erasure, which preserves surviving row coordinates.
+    history_clear_count: u64,
     /// Start of the primary shell's current OSC 133 C/D output range.
     pub(crate) command_start: Option<(StableRowIndex, usize)>,
 
@@ -82,6 +84,7 @@ impl Screen {
             physical_cols,
             stable_row_index_offset: 0,
             row_epoch: Self::next_row_epoch(),
+            history_clear_count: 0,
             command_start: None,
             dpi: size.dpi,
             keyboard_stack: vec![],
@@ -106,6 +109,10 @@ impl Screen {
 
     pub fn row_epoch(&self) -> u64 {
         self.row_epoch
+    }
+
+    pub fn history_clear_count(&self) -> u64 {
+        self.history_clear_count
     }
 
     pub(crate) fn take_command_text(
@@ -898,6 +905,9 @@ impl Screen {
     pub fn erase_scrollback(&mut self) {
         let len = self.lines.len();
         let to_clear = len - self.physical_rows;
+        if to_clear > 0 {
+            self.history_clear_count = self.history_clear_count.wrapping_add(1);
+        }
         for _ in 0..to_clear {
             self.lines.pop_front();
             if self.allow_scrollback {

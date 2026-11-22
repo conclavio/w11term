@@ -3,29 +3,6 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public static class FilterKeyboard {
-    [StructLayout(LayoutKind.Sequential)]
-    struct GuiThreadInfo {
-        public int Size, Flags;
-        public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
-        public int Left, Top, Right, Bottom;
-    }
-    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
-    public static IntPtr FocusedWindow(IntPtr root, uint expectedPid) {
-        uint pid;
-        uint thread = GetWindowThreadProcessId(root, out pid);
-        var info = new GuiThreadInfo { Size = Marshal.SizeOf(typeof(GuiThreadInfo)) };
-        if (pid != expectedPid || !GetGUIThreadInfo(thread, ref info) || info.Focus == IntPtr.Zero)
-            return IntPtr.Zero;
-        GetWindowThreadProcessId(info.Focus, out pid);
-        return pid == expectedPid ? info.Focus : IntPtr.Zero;
-    }
-}
-'@
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -82,14 +59,7 @@ try {
     $null = Wait-Until 'file selected on page two' { (Find-Element '2 / 2') -and (Button $download).Current.IsEnabled }
 
     $null = Open-Filter
-    $inputHwnd = Wait-Until 'focused input HWND owned by the fixture' {
-        $hwnd = [FilterKeyboard]::FocusedWindow($window, $app.Id)
-        if ($hwnd -ne [IntPtr]::Zero) { $hwnd }
-    }
-    # WinUI routes text through its focused child HWND. Keep both messages in this process.
-    foreach ($message in 0x100,0x101) {
-        if (![FixtureMessages]::PostKey($inputHwnd, $message, 0x54)) { throw 'Could not post T to the filter editor' }
-    }
+    $inputHwnd = Press-FocusedKey 0x54
     try {
         $null = Wait-Until 'typed T reaches the focused native filter' { (Filter-Value) -ieq 't' }
     } catch {
