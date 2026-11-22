@@ -301,7 +301,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(result, Some(Outcome::Stopped { pane: 7, path }) if path == PathBuf::from("session.vt"))
+            matches!(result, Some(Outcome::Stopped { pane: 7, path }) if path == std::path::Path::new("session.vt"))
         );
         worker.join().unwrap();
     }
