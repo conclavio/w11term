@@ -64,6 +64,33 @@ fn retained_rows_validate_every_row_and_clamp_alignment_after_eviction() {
 }
 
 #[test]
+fn retained_ranges_and_snapshots_distinguish_a_wrap_change_on_identical_text() {
+    let mut t = terminal(4, 2, 4);
+    t.advance_bytes("abcd\r\nxy");
+    let mut frame = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+    assert!(!frame.rows[0].last_cell_was_wrapped());
+    for (wrapped, revision_delta) in [(true, 0), (false, 1)] {
+        let retained = frame.retained_rows(0, 1).unwrap();
+        let other = retained.slice(1, 1).unwrap();
+        let seqno = frame.rows[0].current_seqno() + revision_delta;
+        t.screen_mut()
+            .line_mut(0)
+            .set_last_cell_was_wrapped(wrapped, seqno);
+        let next = Snapshot::capture(&t, Some(&frame), 2, 0, String::new(), 0);
+        assert_eq!(next.rows[0].as_str(), frame.rows[0].as_str());
+        assert_eq!(next.rows[0].current_seqno(), seqno);
+        assert_eq!(next.rows[0].last_cell_was_wrapped(), wrapped);
+        assert_eq!(next.row_is_wrapped(0), wrapped);
+        assert!(!next.same_presentation(&frame));
+        assert!(!retained.matches_visible(&next));
+        assert_eq!(retained.scroll_offset(&t, 0, true), None);
+        assert!(other.matches_visible(&next));
+        assert_eq!(other.scroll_offset(&t, 0, true), Some(0));
+        frame = next;
+    }
+}
+
+#[test]
 fn retained_rows_keep_live_rows_across_clear_and_reject_reused_coordinates() {
     let mut t = terminal(20, 3, 4);
     let capture = |t: &Terminal| {

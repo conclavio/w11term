@@ -10,6 +10,7 @@ const TEXT_BUDGET: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy, Debug)]
 struct RowRevision {
     seqno: usize,
+    wrapped: bool,
     text_geometry: Option<u64>,
 }
 
@@ -28,13 +29,14 @@ fn text_geometry(line: &Line, cols: usize, budget: &mut usize) -> Option<u64> {
 }
 
 impl RowRevision {
-    fn matches(&self, row: &Line, cols: usize, budget: &mut usize) -> bool {
+    fn matches(&self, row: &Line, wrapped: bool, cols: usize, budget: &mut usize) -> bool {
         // Cursor motion and palette changes can dirty a row without changing
         // the text or its screen geometry.
-        self.seqno == row.current_seqno()
-            || self
-                .text_geometry
-                .is_some_and(|old| text_geometry(row, cols, budget) == Some(old))
+        self.wrapped == wrapped
+            && (self.seqno == row.current_seqno()
+                || self
+                    .text_geometry
+                    .is_some_and(|old| text_geometry(row, cols, budget) == Some(old)))
     }
 }
 
@@ -64,8 +66,10 @@ impl Snapshot {
             first,
             revisions: rows
                 .iter()
-                .map(|row| RowRevision {
+                .zip(&self.row_wraps[start..=end])
+                .map(|(row, &wrapped)| RowRevision {
                     seqno: row.current_seqno(),
+                    wrapped,
                     text_geometry: text_geometry(row, self.cols, &mut budget),
                 })
                 .collect(),
@@ -106,8 +110,10 @@ impl RetainedRows {
         let mut budget = TEXT_BUDGET;
         first < end
             && (first..end).all(|row| {
+                let index = (row - frame.first_stable_row) as usize;
                 self.revisions[self.indices.start + (row - self.first) as usize].matches(
-                    &frame.rows[(row - frame.first_stable_row) as usize],
+                    &frame.rows[index],
+                    frame.row_is_wrapped(index),
                     frame.cols,
                     &mut budget,
                 )
@@ -135,7 +141,14 @@ impl RetainedRows {
             .skip(first)
             .take(last - first + 1)
             .zip(&self.revisions[self.indices.clone()])
-            .all(|(row, old)| old.matches(row, screen.physical_cols, &mut budget))
+            .all(|(row, old)| {
+                old.matches(
+                    row,
+                    row.last_cell_was_wrapped(),
+                    screen.physical_cols,
+                    &mut budget,
+                )
+            })
         {
             return None;
         }

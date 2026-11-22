@@ -60,7 +60,7 @@ impl Document {
         for (row, line) in frame.rows.iter().enumerate() {
             d.starts.push(d.len());
             d.row_end_cols.push(0);
-            if row == 0 || !frame.rows[row - 1].last_cell_was_wrapped() {
+            if row == 0 || !frame.row_is_wrapped(row - 1) {
                 d.paragraphs.push(d.len());
             }
             let mut col = 0;
@@ -89,10 +89,7 @@ impl Document {
                     col += 1;
                 }
             }
-            if row + 1 < frame.rows.len()
-                && !line.last_cell_was_wrapped()
-                && !d.push(col, 0, "\r\n")
-            {
+            if row + 1 < frame.rows.len() && !frame.row_is_wrapped(row) && !d.push(col, 0, "\r\n") {
                 break;
             }
         }
