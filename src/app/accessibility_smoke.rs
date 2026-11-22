@@ -28,7 +28,7 @@ impl TerminalApp {
                 .paint(ctx, &frame, width, height, metrics, &mut None)
         })?;
         let mut bgra = target.read_pixels()?;
-        for pixel in bgra.chunks_exact_mut(4) {
+        for pixel in bgra.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
         let image = image::RgbaImage::from_raw(w, h, bgra).expect("render-target dimensions");
