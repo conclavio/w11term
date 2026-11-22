@@ -895,6 +895,7 @@ pub enum Message {
     Paste,
     Clipboard(clipboard_paste::Action),
     CopyResult(TabId, u64, Result<(), String>),
+    CopyWordResult(TabId, u64, Option<Point>),
     Pointer(TabId, PointerEventInfo, MouseEventKind),
     RenderError(TabId, String),
     RetryRender(TabId),
@@ -4727,7 +4728,7 @@ impl Component for TerminalApp {
                         if discovery_changed {
                             self.tabs.record_pane_focus(AppTab::visited_terminal);
                         }
-                        self.refresh_copy_mode(id);
+                        self.refresh_copy_mode(id, context);
                         self.connection_ui(id);
                     }
                     if pane_actions_changed || discovery_changed {
@@ -5135,6 +5136,9 @@ impl Component for TerminalApp {
             Message::PasteRaw => self.paste(true, context),
             Message::CopyResult(pane, request, result) => {
                 self.finish_keyboard_copy(pane, request, result)
+            }
+            Message::CopyWordResult(pane, request, point) => {
+                self.finish_copy_word(pane, request, point, context)
             }
             Message::Clipboard(action) => self.clipboard_action(action, context),
             Message::MultilinePasteWarning(mode, checked) => {

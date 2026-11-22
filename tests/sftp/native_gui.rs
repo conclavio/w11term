@@ -1558,7 +1558,9 @@ async fn native_keyboard_copy_reads_scrollback_and_keeps_mode_keys_off_the_wire(
     let state = tempfile::tempdir().unwrap();
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
-    let mut history = String::from("\x1b[2J\x1b[3J\x1b[H\x1b[32mhistory-start\x1b[0m\r\n");
+    let mut history = String::from(
+        "\x1b[2J\x1b[3J\x1b[H\x1b[32mhistory-start\x1b[0m /srv/game/zone:pilot end\r\n",
+    );
     for row in 0..180 {
         history.push_str(&format!("fixture line {row}\r\n"));
     }
@@ -1571,7 +1573,7 @@ async fn native_keyboard_copy_reads_scrollback_and_keeps_mode_keys_off_the_wire(
     .unwrap();
     fs::write(
         state.path().join("appearance.json"),
-        br#"{"shortcuts":{"copy_mode":"F8"}}"#,
+        br#"{"shortcuts":{"copy_mode":"F8"},"interaction":{"wordDelimiters":":"}}"#,
     )
     .unwrap();
     let result = std::process::Command::new("powershell.exe")

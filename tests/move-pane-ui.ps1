@@ -94,8 +94,7 @@ try {
 
     Press-Key 0x77 # F8, Keyboard copy mode
     $dot = ' ' + [char]0xb7 + ' '
-    $copyBanner = "Copy mode${dot}Arrows or hjkl move${dot}v select${dot}Shift+V select lines${dot}Esc exit"
-    $null = Wait-Until 'copy mode in the moved pane' { Find-Element $copyBanner }
+    $null = Wait-Until 'copy mode in the moved pane' { Copy-ModeOpen }
     Press-Key 0x47 # g, go to oldest retained row
     try {
         $null = Wait-Until 'original scrollback in the moved SSH pane' {
@@ -107,7 +106,7 @@ try {
         }
     } catch {
         $panes = ((Control @('list')).sessions | Select-Object id,active,visible,cols,rows,tab_id | ConvertTo-Json -Compress)
-        $bannerVisible = [bool](Find-Element $copyBanner)
+        $bannerVisible = Copy-ModeOpen
         $document = Find-Element ("Terminal${dot}move-ssh")
         $viewport = if ($document) {
             $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(400)
@@ -115,7 +114,7 @@ try {
         throw "$_ Copy mode visible: $bannerVisible. Panes: $panes. First displayed cells: $viewport"
     }
     Press-Key 27
-    $null = Wait-Until 'copy mode to release input' { -not (Find-Element $copyBanner) }
+    $null = Wait-Until 'copy mode to release input' { -not (Copy-ModeOpen) }
     Press-Key 0x78 # F9, Focus right. SSH was placed left of PowerShell.
     Wait-Focus $shell.id
     $after = Read-ShellPid $shell.id 'after-move'

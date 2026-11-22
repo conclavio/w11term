@@ -31,7 +31,7 @@ try {
     $null = Wait-Until 'find to close' { !(Find-Element 'Find in scrollback' ([System.Windows.Automation.ControlType]::Edit)) }
     Press-Key 0x78 # keyboard copy mode
     $dot = ' ' + [char]0xb7 + ' '
-    $null = Wait-Until 'keyboard copy mode' { Find-Element "Copy mode${dot}Arrows or hjkl move${dot}v select${dot}Shift+V select lines${dot}Esc exit" }
+    $null = Wait-Until 'keyboard copy mode' { Copy-ModeOpen }
     Press-Key 0x47
     Press-Key 0x24
     Press-Key 0x56

@@ -6,6 +6,9 @@ use crate::{
 };
 use wezterm_term::{KeyModifiers as Mods, TerminalState};
 
+mod words;
+pub use words::{WordMotion, word_target};
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CopyKey {
     Left,
@@ -18,6 +21,7 @@ pub enum CopyKey {
     PageDown,
     First,
     Last,
+    Word(WordMotion),
     Character,
     Line,
     Copy,
@@ -32,6 +36,8 @@ impl CopyKey {
         }
         if mods.contains(Mods::CTRL) {
             return match vk {
+                0x25 if !mods.contains(Mods::SHIFT) => Some(Word(WordMotion::PreviousStart)),
+                0x27 if !mods.contains(Mods::SHIFT) => Some(Word(WordMotion::NextStart)),
                 0x24 => Some(First),
                 0x23 => Some(Last),
                 0x43 if mods.contains(Mods::SHIFT) => Some(Copy),
@@ -51,6 +57,9 @@ impl CopyKey {
             0x22 => PageDown,
             0x47 if shift => Last,
             0x47 => First,
+            0x57 if !shift => Word(WordMotion::NextStart),
+            0x42 if !shift => Word(WordMotion::PreviousStart),
+            0x45 if !shift => Word(WordMotion::NextEnd),
             0x56 if shift => Line,
             0x56 => Character,
             0x0d | 0x59 => Copy,
@@ -72,6 +81,8 @@ pub struct ScreenId {
     height: usize,
     alternate: bool,
     generation: u64,
+    row_epoch: u64,
+    history_clear_count: u64,
 }
 
 impl From<&Snapshot> for ScreenId {
@@ -81,7 +92,20 @@ impl From<&Snapshot> for ScreenId {
             height: frame.rows.len(),
             alternate: frame.alternate,
             generation: frame.connection_generation,
+            row_epoch: frame.row_epoch,
+            history_clear_count: frame.history_clear_count,
         }
+    }
+}
+
+impl ScreenId {
+    fn same_coordinates(self, terminal: &TerminalState, generation: u64) -> bool {
+        let screen = terminal.screen();
+        self.generation == generation
+            && self.cols == screen.physical_cols
+            && self.height == screen.physical_rows
+            && self.alternate == terminal.is_alt_screen_active()
+            && self.row_epoch == screen.row_epoch()
     }
 }
 
@@ -129,7 +153,9 @@ impl CopyMode {
 
     pub fn instructions(&self) -> &'static str {
         match self.anchor {
-            None => "Copy mode · Arrows or hjkl move · v select · Shift+V select lines · Esc exit",
+            None => {
+                "Copy mode · Arrows or hjkl move · w/b/e words · v select · Shift+V lines · Esc exit"
+            }
             Some((_, false)) => "Copy mode · Character selection · y or Enter copy · Esc cancel",
             Some((_, true)) => "Copy mode · Line selection · y or Enter copy · Esc cancel",
         }
@@ -179,9 +205,20 @@ impl CopyMode {
                     None => Some((self.cursor, lines)),
                 }
             }
-            Copy | Cancel => return,
+            Word(_) | Copy | Cancel => return,
         }
-        self.cursor.row = self.cursor.row.clamp(frame.oldest_stable_row, last_row);
+        self.move_to(self.cursor, frame);
+    }
+
+    pub fn move_to(&mut self, point: Point, frame: &Snapshot) {
+        let height = frame.rows.len().max(1) as isize;
+        let last_top = frame.first_stable_row + frame.scroll_offset as isize;
+        self.cursor = Point {
+            row: point
+                .row
+                .clamp(frame.oldest_stable_row, last_top + height - 1),
+            col: point.col.min(frame.cols.saturating_sub(1)),
+        };
         self.top = self
             .top
             .clamp(self.cursor.row - height + 1, self.cursor.row)
@@ -215,13 +252,7 @@ pub fn selected_text(
     selection: Selection,
 ) -> Result<String, &'static str> {
     let screen = terminal.screen();
-    if (
-        screen.physical_cols,
-        screen.physical_rows,
-        terminal.is_alt_screen_active(),
-        generation,
-    ) != (id.cols, id.height, id.alternate, id.generation)
-    {
+    if !id.same_coordinates(terminal, generation) {
         return Err("The terminal changed while selecting");
     }
     let first = selection.anchor.row.min(selection.end.row);
@@ -331,5 +362,119 @@ mod tests {
         assert_eq!(m.cursor.row, alt.first_stable_row);
         assert_eq!(CopyKey::from_vk(0x56, Mods::SHIFT), Some(Line));
         assert_eq!(CopyKey::from_vk(0x56, Mods::CTRL), None);
+    }
+
+    #[test]
+    fn word_stops_use_delimiter_runs_and_leading_grapheme_columns() {
+        use WordMotion::*;
+        let t = terminal("a//界e\u{301} z");
+        let id = ScreenId::from(&view(&t, 0));
+        let target = |col, motion, delimiters| {
+            word_target(&t, 0, id, Point { row: 0, col }, motion, delimiters).map(|p| p.col)
+        };
+        assert_eq!(target(0, NextStart, "/"), Some(1));
+        assert_eq!(target(1, NextEnd, "/"), Some(2));
+        assert_eq!(target(1, NextStart, "/"), Some(3));
+        assert_eq!(target(5, PreviousStart, "/"), Some(3));
+        assert_eq!(target(4, PreviousStart, "/"), Some(1)); // second column of 界
+        assert_eq!(target(4, NextEnd, "/"), Some(5)); // e + combining accent
+        assert_eq!(target(0, NextEnd, ""), Some(5));
+        assert_eq!(target(0, NextStart, ""), Some(7));
+        assert_eq!(target(7, NextStart, "/"), Some(7));
+        assert_eq!(target(7, NextEnd, "/"), Some(7));
+        assert_eq!(target(0, PreviousStart, "/"), Some(0));
+
+        let wrapped = terminal("abcdef界g x");
+        let id = ScreenId::from(&view(&wrapped, 0));
+        let p = |row, col| Point { row, col };
+        let target = |point, motion| word_target(&wrapped, 0, id, point, motion, "");
+        assert_eq!(target(p(0, 7), NextEnd), Some(p(1, 0)));
+        assert_eq!(target(p(1, 0), PreviousStart), Some(p(0, 0)));
+        assert_eq!(target(p(0, 6), NextStart), Some(p(1, 2)));
+    }
+
+    #[test]
+    fn word_stops_join_soft_wraps_and_cross_empty_hard_rows() {
+        use WordMotion::*;
+        let t = terminal("one twoABCDEFGHI\r\nJK\r\n\r\nnext");
+        let frame = view(&t, 0);
+        let p = |row, col| Point { row, col };
+        let target =
+            |origin, motion| word_target(&t, 0, (&frame).into(), origin, motion, "").unwrap();
+        assert_eq!(target(p(0, 4), NextEnd), p(1, 7));
+        assert_eq!(target(p(1, 3), PreviousStart), p(0, 4));
+        assert_eq!(target(p(0, 4), NextStart), p(2, 0));
+        assert_eq!(target(p(1, 7), NextEnd), p(2, 1));
+        assert_eq!(target(p(2, 0), PreviousStart), p(0, 4));
+        assert_eq!(target(p(2, 7), PreviousStart), p(2, 0)); // blank row padding
+        assert_eq!(target(p(2, 7), NextStart), p(4, 0));
+        assert_eq!(target(p(3, 0), NextEnd), p(4, 3));
+        assert_eq!(target(p(4, 0), PreviousStart), p(2, 0));
+
+        let mut mode = CopyMode::new(&frame);
+        mode.move_to(p(0, 4), &frame);
+        mode.navigate(Character, &frame);
+        mode.move_to(target(mode.cursor, NextEnd), &frame);
+        assert_eq!(mode.top, 0);
+        assert_eq!(
+            selected_text(&t, 0, mode.screen, mode.selection().unwrap()).as_deref(),
+            Ok("twoABCDEFGHI")
+        );
+    }
+
+    #[test]
+    fn word_queries_require_the_original_screen_and_a_retained_origin() {
+        let mut t = terminal("abc");
+        let id = ScreenId::from(&view(&t, 0));
+        let origin = Point { row: 0, col: 0 };
+        let target = |t: &TerminalState, generation, point| {
+            word_target(t, generation, id, point, WordMotion::NextEnd, "")
+        };
+        assert_eq!(target(&t, 0, origin), Some(Point { row: 0, col: 2 }));
+        assert_eq!(target(&t, 1, origin), None);
+        assert_eq!(target(&t, 0, Point { row: -1, col: 0 }), None);
+        assert_eq!(target(&t, 0, Point { row: 0, col: 8 }), None);
+        t.advance_bytes(b"\x1b[?1049h");
+        assert_eq!(target(&t, 0, origin), None);
+        t.advance_bytes(b"\x1b[?1049l");
+        assert_eq!(target(&t, 0, origin), None);
+
+        t.advance_bytes(b"\r\n1\r\n2\r\n3\r\n4");
+        let id = ScreenId::from(&view(&t, 0));
+        let live = Point {
+            row: t.screen().visible_row_to_stable_row(0),
+            col: 0,
+        };
+        t.advance_bytes(b"\x1b[3J");
+        assert!(t.screen().stable_row_to_phys(origin.row).is_none());
+        assert!(t.screen().stable_row_to_phys(live.row).is_some());
+        assert_eq!(
+            word_target(&t, 0, id, live, WordMotion::NextStart, ""),
+            None
+        );
+        let after_clear = ScreenId::from(&view(&t, 0));
+        assert_eq!(
+            word_target(&t, 0, after_clear, origin, WordMotion::NextStart, ""),
+            None
+        );
+        assert!(word_target(&t, 0, after_clear, live, WordMotion::NextStart, "").is_some());
+    }
+
+    #[test]
+    fn word_key_bindings_preserve_modified_chords() {
+        use WordMotion::*;
+        for (vk, mods, expected) in [
+            (0x57, Mods::NONE, NextStart),
+            (0x42, Mods::NONE, PreviousStart),
+            (0x45, Mods::NONE, NextEnd),
+            (0x27, Mods::CTRL, NextStart),
+            (0x25, Mods::CTRL, PreviousStart),
+        ] {
+            assert_eq!(CopyKey::from_vk(vk, mods), Some(Word(expected)));
+            assert!(Word(expected).repeats());
+        }
+        assert_eq!(CopyKey::from_vk(0x57, Mods::SHIFT), None);
+        assert_eq!(CopyKey::from_vk(0x27, Mods::CTRL | Mods::SHIFT), None);
+        assert_eq!(CopyKey::from_vk(0x57, Mods::ALT), None);
     }
 }

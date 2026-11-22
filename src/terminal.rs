@@ -549,8 +549,8 @@ pub struct Snapshot {
     pub bytes_received: u64,
     pub first_stable_row: isize,
     pub oldest_stable_row: isize,
-    row_epoch: u64,
-    history_clear_count: u64,
+    pub(crate) row_epoch: u64,
+    pub(crate) history_clear_count: u64,
     /// Most recent successful local history clear. The floor is the first row
     /// retained at the time of that clear, even if new output has since arrived.
     pub scrollback_clear_generation: u64,
