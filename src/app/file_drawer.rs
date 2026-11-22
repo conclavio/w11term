@@ -35,6 +35,7 @@ pub enum FileAction {
     Filter(u64, u64, u64, String),
     ClearFilter(u64, u64, u64),
     Choose(u64, u64, ListedEntry),
+    CopyPath(u64, u64, u64, Option<ListedEntry>),
     Rename(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
@@ -596,6 +597,20 @@ impl FileDrawer {
         remote_child(&entry.parent, &entry.name)
     }
 
+    fn path_to_copy(&self, revision: u64, entry: Option<&ListedEntry>) -> Option<String> {
+        if !self.open
+            || self.busy()
+            || self.bookmarks.is_some()
+            || self.listing_revision != revision
+        {
+            return None;
+        }
+        match entry {
+            Some(entry) => self.selected_path(entry).ok(),
+            None => self.directory.clone(),
+        }
+    }
+
     fn accept_listing(&mut self, path: String, entries: Vec<Entry>) {
         self.opening_bookmark = None;
         self.end_filter_edit();
@@ -987,6 +1002,21 @@ impl FileDrawer {
                             directory_split::message(Axis::Columns, shell.as_ref())
                         }))
                         .content("Open shell here"),
+                )),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .children((
+                    button(
+                        "Copy directory path",
+                        writable,
+                        CopyPath(pane, generation, revision, None),
+                    ),
+                    button(
+                        "Copy selected path",
+                        writable && selected.is_some(),
+                        CopyPath(pane, generation, revision, Some(listed(selected))),
+                    ),
                 )),
             CheckBox::new()
                 .is_checked(self.following)
@@ -1631,6 +1661,7 @@ impl TerminalApp {
             | Filter(id, ..)
             | ClearFilter(id, ..)
             | Choose(id, ..)
+            | CopyPath(id, ..)
             | Rename(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
@@ -1950,6 +1981,17 @@ impl TerminalApp {
                     if files.has_entry(&entry) {
                         files.selected = Some(entry.name);
                         files.end_filter_edit();
+                    }
+                }
+                CopyPath(_, generation, revision, entry) => {
+                    if generation == files.generation
+                        && may_open_dialog
+                        && let Some(path) = files.path_to_copy(revision, entry.as_ref())
+                    {
+                        files.status = match w11term::clipboard::write(&path) {
+                            Ok(()) => format!("Copied {path}"),
+                            Err(error) => format!("Could not copy path: {error}"),
+                        };
                     }
                 }
                 OpenEntry(_, _, entry) => {
@@ -2365,6 +2407,49 @@ mod tests {
         assert!(drawer.matching_entries().eq(listing().iter()));
         assert_eq!(drawer.listing_revision, revision);
         assert!(!drawer.busy());
+    }
+
+    #[test]
+    fn copy_path_uses_the_displayed_directory_and_literal_selected_name() {
+        let mut drawer = FileDrawer {
+            open: true,
+            ..Default::default()
+        };
+        assert_eq!(drawer.path_to_copy(0, None), None);
+        let name = "Å folder's [logs] $x";
+        let kind = ListedKind::Known(EntryKind::Symlink);
+        drawer.accept_listing(
+            "/".into(),
+            vec![Entry {
+                name: name.into(),
+                kind,
+            }],
+        );
+        let revision = drawer.listing_revision;
+        let listed = ListedEntry {
+            parent: "/".into(),
+            revision,
+            name: name.into(),
+            kind,
+        };
+        drawer.selected = Some(name.into());
+        assert_eq!(drawer.path_to_copy(revision, None).as_deref(), Some("/"));
+        assert_eq!(
+            drawer.path_to_copy(revision, Some(&listed)),
+            Some(format!("/{name}"))
+        );
+        drawer.set_filter("other".into());
+        assert!(drawer.path_to_copy(revision, Some(&listed)).is_none());
+        drawer.accept_listing("/new dir".into(), vec![]);
+        assert!(drawer.path_to_copy(revision, None).is_none());
+        assert_eq!(
+            drawer
+                .path_to_copy(drawer.listing_revision, None)
+                .as_deref(),
+            Some("/new dir")
+        );
+        drawer.open = false;
+        assert!(drawer.path_to_copy(drawer.listing_revision, None).is_none());
     }
 
     #[test]
