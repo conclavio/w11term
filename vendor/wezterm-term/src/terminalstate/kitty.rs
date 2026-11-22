@@ -8,6 +8,7 @@ use ::image::{
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
@@ -321,18 +322,39 @@ impl TerminalState {
         placement: KittyImagePlacement,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
+        let image_id = image_id.filter(|&id| id != 0);
         let image_number = image_number.filter(|&n| n != 0);
-        let image_id = match image_id.filter(|&id| id != 0) {
-            Some(id) => id,
-            None => self
-                .kitty_img
-                .id_for_number(
-                    image_number
-                        .ok_or_else(|| anyhow::anyhow!("no image_id or image_number specified!"))?,
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!("image_number has no matching image id {:?}", image_number)
-                })?,
+        let wire_placement = placement.placement_id.filter(|&p| p != 0);
+        if image_id.is_none() && image_number.is_none() {
+            return Ok(());
+        }
+        if image_id.is_some() && image_number.is_some() {
+            self.kitty_send_placement_response(
+                verbosity,
+                false,
+                image_id,
+                image_number,
+                wire_placement,
+                "EINVAL:specify either an image ID or an image number",
+            );
+            return Ok(());
+        }
+        let resolved = image_id.or_else(|| self.kitty_img.id_for_number(image_number?));
+        let Some((image_id, img)) = resolved.and_then(|id| {
+            self.kitty_img
+                .id_to_data
+                .get(&id)
+                .map(|img| (id, Arc::clone(img)))
+        }) else {
+            self.kitty_send_placement_response(
+                verbosity,
+                false,
+                image_id,
+                image_number,
+                wire_placement,
+                "ENOENT:image data is unavailable",
+            );
+            return Ok(());
         };
 
         log::trace!(
@@ -342,14 +364,6 @@ impl TerminalState {
             placement,
             verbosity
         );
-        let img = Arc::clone(self.kitty_img.id_to_data.get(&image_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no matching image id {} in id_to_data for image_number {:?}",
-                image_id,
-                image_number
-            )
-        })?);
-
         self.kitty_place_data(image_id, image_number, img, None, placement, verbosity)
     }
 
@@ -381,12 +395,13 @@ impl TerminalState {
         let parent = match self.validate_kitty_parent(key, &placement) {
             Ok(parent) => parent,
             Err(reason) => {
-                self.kitty_send_response(
+                self.kitty_send_placement_response(
                     verbosity,
                     false,
                     Some(image_id),
                     image_number,
-                    reason.into(),
+                    wire_placement,
+                    reason,
                 );
                 return Ok(());
             }
@@ -394,12 +409,13 @@ impl TerminalState {
         if !replacing
             && self.kitty_img.placement_count() + self.inactive_kitty_img.placement_count() >= 1024
         {
-            self.kitty_send_response(
+            self.kitty_send_placement_response(
                 verbosity,
                 false,
                 Some(image_id),
                 image_number,
-                "ENOSPC".into(),
+                wire_placement,
+                "ENOSPC",
             );
             return Ok(());
         }
@@ -435,7 +451,21 @@ impl TerminalState {
                 image_id: Some(image_id),
                 placement_id: Some(key.1),
                 do_not_move_cursor: placement.do_not_move_cursor,
-            })?;
+            });
+            let bounds = match bounds {
+                Ok(bounds) => bounds,
+                Err(err) => {
+                    self.kitty_send_placement_response(
+                        verbosity,
+                        false,
+                        Some(image_id),
+                        image_number,
+                        wire_placement,
+                        &format!("EINVAL:{err:#}"),
+                    );
+                    return Ok(());
+                }
+            };
 
             self.kitty_img.placements.insert(
                 key,
@@ -457,6 +487,14 @@ impl TerminalState {
             self.kitty_img.indexed.insert(&img, indexed);
             self.kitty_img.anonymous_data.insert(key, img);
         }
+        self.kitty_send_placement_response(
+            verbosity,
+            true,
+            Some(image_id),
+            image_number,
+            wire_placement,
+            "OK",
+        );
         Ok(())
     }
 
@@ -503,7 +541,25 @@ impl TerminalState {
                 _ => {
                     self.kitty_img.accumulator.clear();
                     self.kitty_img.accumulated_bytes = 0;
-                    anyhow::bail!("SSH kitty images require direct transport");
+                    let id = transmit.image_id.filter(|&id| id != 0);
+                    let number = transmit.image_number.filter(|&n| n != 0);
+                    if id.is_some() || number.is_some() {
+                        let placement = match &img {
+                            KittyImage::TransmitDataAndDisplay { placement, .. } => {
+                                placement.placement_id.filter(|&p| p != 0)
+                            }
+                            _ => None,
+                        };
+                        self.kitty_send_placement_response(
+                            verbosity,
+                            false,
+                            id,
+                            number,
+                            placement,
+                            "ENOTSUP:w11term requires direct kitty image transport",
+                        );
+                    }
+                    return Ok(());
                 }
             };
             if self
@@ -1018,6 +1074,18 @@ impl TerminalState {
         image_no: Option<u32>,
         message: String,
     ) {
+        self.kitty_send_placement_response(verbosity, success, image_id, image_no, None, &message);
+    }
+
+    fn kitty_send_placement_response(
+        &mut self,
+        verbosity: KittyImageVerbosity,
+        success: bool,
+        image_id: Option<u32>,
+        image_no: Option<u32>,
+        placement_id: Option<u32>,
+        message: &str,
+    ) {
         match verbosity {
             KittyImageVerbosity::Verbose => {}
             KittyImageVerbosity::OnlyErrors => {
@@ -1032,20 +1100,17 @@ impl TerminalState {
 
         log::trace!("Query Response: {}", message);
 
-        match (image_id, image_no) {
-            (Some(id), Some(no)) => {
-                write!(self.writer, "\x1b_GI={},i={};{}\x1b\\", no, id, message).ok();
-            }
-            (Some(id), None) => {
-                write!(self.writer, "\x1b_Gi={};{}\x1b\\", id, message).ok();
-            }
-            (None, Some(no)) => {
-                write!(self.writer, "\x1b_GI={};{}\x1b\\", no, message).ok();
-            }
-            (None, None) => {
-                write!(self.writer, "\x1b_G{}\x1b\\", message).ok();
+        let mut response = String::from("\x1b_G");
+        let mut delimiter = "";
+        for (key, value) in [("I", image_no), ("i", image_id), ("p", placement_id)] {
+            if let Some(value) = value {
+                let _ = write!(response, "{delimiter}{key}={value}");
+                delimiter = ",";
             }
         }
+        let separator = if delimiter.is_empty() { "" } else { ";" };
+        let _ = write!(response, "{separator}{message}\x1b\\");
+        self.writer.write_all(response.as_bytes()).ok();
         self.writer.flush().ok();
     }
 
@@ -1596,17 +1661,27 @@ impl TerminalState {
         display: Option<KittyImagePlacement>,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
-        let (id, number) = (transmit.image_id, transmit.image_number);
-        let is_indexed = indexed::stride(transmit.format.as_ref()).is_some();
-        let (image_id, image_number, img, mut indexed) = match self
-            .kitty_img_transmit_inner(transmit)
-        {
-            Err(err) if is_indexed && (id.is_some() || number.is_some()) => {
-                self.kitty_send_response(verbosity, false, id, number, format!("EINVAL:{err:#}"));
-                return Ok(());
-            }
-            result => result?,
-        };
+        let id = transmit.image_id.filter(|&id| id != 0);
+        let number = transmit.image_number.filter(|&n| n != 0);
+        let placement_id = display
+            .as_ref()
+            .and_then(|p| p.placement_id)
+            .filter(|&p| p != 0);
+        let (image_id, image_number, img, mut indexed) =
+            match self.kitty_img_transmit_inner(transmit) {
+                Err(err) if id.is_some() || number.is_some() => {
+                    self.kitty_send_placement_response(
+                        verbosity,
+                        false,
+                        id,
+                        number,
+                        placement_id,
+                        &format!("EINVAL:{err:#}"),
+                    );
+                    return Ok(());
+                }
+                result => result?,
+            };
         if image_id == 0 && display.as_ref().is_none_or(|p| p.virtual_placement) {
             // Neither a later put nor a Unicode placeholder has an image ID
             // with which to retrieve these bytes.
@@ -1624,8 +1699,22 @@ impl TerminalState {
             .is_err()
         {
             self.reclaim_missing_kitty_placements(image_id);
-            self.kitty_img
-                .check_image_capacity(image_id, bytes, &self.inactive_kitty_img)?;
+            if let Err(err) =
+                self.kitty_img
+                    .check_image_capacity(image_id, bytes, &self.inactive_kitty_img)
+            {
+                if image_id != 0 {
+                    self.kitty_send_placement_response(
+                        verbosity,
+                        false,
+                        id,
+                        number,
+                        placement_id,
+                        &format!("ENOSPC:{err:#}"),
+                    );
+                }
+                return Ok(());
+            }
         }
         if image_id != 0 {
             if replacing {
@@ -1649,19 +1738,19 @@ impl TerminalState {
                 .push(image_id);
         }
 
-        if image_number.is_some() {
-            self.kitty_send_response(
+        if let Some(placement) = display {
+            self.kitty_place_data(image_id, image_number, img, indexed, placement, verbosity)?;
+        } else if image_id != 0 {
+            self.kitty_send_placement_response(
                 verbosity,
                 true,
                 Some(image_id),
                 image_number,
-                "OK".to_string(),
+                None,
+                "OK",
             );
         }
 
-        if let Some(placement) = display {
-            self.kitty_place_data(image_id, image_number, img, indexed, placement, verbosity)?;
-        }
         Ok(())
     }
 

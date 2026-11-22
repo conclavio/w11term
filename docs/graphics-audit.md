@@ -149,6 +149,13 @@ animation controls and frame composition return an error for indexed
 images. The Windows tests check the protocol replies, RGBA values and
 rendered Direct2D pixels. [Kitty indexed color](https://sw.kovidgoyal.net/kitty/graphics-protocol/#indexed-color-data)
 
+An addressed upload or placement returns one status reply after it is
+processed. Placement replies include the requested placement ID, when
+present. A chunked upload replies on the final chunk. Clients can set
+`q=1` to receive only errors or `q=2` to silence all replies.
+An identified request for an unsupported local transport gets an error.
+[Kitty placement replies](https://sw.kovidgoyal.net/kitty/graphics-protocol/#display-images-on-screen)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.
