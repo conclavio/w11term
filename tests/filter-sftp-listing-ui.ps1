@@ -3,6 +3,8 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+$verifyClipboard = $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted'
+if ($verifyClipboard) { . (Join-Path $PSScriptRoot 'support/clipboard.ps1') }
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -29,6 +31,19 @@ function Click([string]$Name) {
 function Filter-Edit {
     Find-Element 'Filter filenames' ([System.Windows.Automation.ControlType]::Edit)
 }
+function Check-PathCopy([string]$ButtonName, [string]$Expected) {
+    $control = Wait-Until "available '$ButtonName' command" {
+        $b = Button $ButtonName
+        if ($b -and $b.Current.IsEnabled) { $b }
+    }
+    if ($verifyClipboard) {
+        $before = [FixtureClipboard]::GetClipboardSequenceNumber()
+        Invoke-Button $control
+        $null = Wait-Until "exact clipboard path from '$ButtonName'" {
+            [FixtureClipboard]::ContainsNewText($before, $Expected)
+        }
+    }
+}
 function Filter-Value {
     (Filter-Edit).GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
 }
@@ -54,6 +69,11 @@ try {
     Run-Palette 'Open files here'
     $null = Wait-Until 'first page of the shell directory' { (Find-Element $parent) -and (Button 'build-00.log') -and (Find-Element '1 / 2') }
     if (Button $target) { throw 'The Unicode target must begin outside page one' }
+    $null = Wait-Until 'Copy selected path disabled without a selection' {
+        $b = Button 'Copy selected path'
+        $b -and !$b.Current.IsEnabled
+    }
+    Check-PathCopy 'Copy directory path' $parent
     Click 'Next'
     Click $target
     $null = Wait-Until 'file selected on page two' { (Find-Element '2 / 2') -and (Button $download).Current.IsEnabled }
@@ -74,12 +94,15 @@ try {
     $null = Wait-Until 'Done retains the filtered rows and returns keyboard input to SSH' {
         !(Filter-Edit) -and (Find-Element '1 match') -and (Button $target)
     }
+    Check-PathCopy 'Copy selected path' "$parent/$target"
+    Check-PathCopy 'Copy directory path' $parent
     foreach ($c in 'after-filter-done'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','after-filter-done')
     Set-Filter 'nothing-matches-this'
     $null = Wait-Until 'no matches and no actions on the old selected file' {
         (Find-Element 'No matching files or folders') -and !(Button $target) -and
-            !(Button $download).Current.IsEnabled -and !(Button $rename).Current.IsEnabled
+            !(Button $download).Current.IsEnabled -and !(Button $rename).Current.IsEnabled -and
+            !(Button 'Copy selected path').Current.IsEnabled
     }
     Click 'Clear filter'
     $null = Wait-Until 'unfiltered first page without a selection' {
@@ -109,6 +132,7 @@ try {
     $null = Wait-Until 'child directory begins unfiltered' {
         (Find-Element "$parent/nested") -and (Button 'inside.txt') -and !(Button 'Open folder').Current.IsEnabled
     }
+    Check-PathCopy 'Copy directory path' "$parent/nested"
     $null = Open-Filter
     if ((Filter-Value) -cne '') { throw 'Child directory retained a filter from its parent' }
     Click 'Done'

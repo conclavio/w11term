@@ -9,6 +9,29 @@ use w11term::sftp::{DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, 
 mod bookmarks;
 
 const PAGE_SIZE: usize = 32;
+const PANEL_PADDING: f64 = 10.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DrawerLayout {
+    width: f64,
+    actions_max_height: f64,
+}
+
+impl DrawerLayout {
+    fn for_window(width: f64, height: f64) -> Self {
+        // WindowSize is in DIPs and includes the tall title bar. Reserve up to
+        // three file buttons beneath the actions, sharing space on tiny windows.
+        let body = (height - 48.0 - 2.0 * PANEL_PADDING).max(0.0);
+        Self {
+            width: (width * 0.45).clamp(1.0, 360.0),
+            actions_max_height: body - (body * 0.4).min(112.0),
+        }
+    }
+
+    fn content_width(self) -> f64 {
+        (self.width - 2.0 * PANEL_PADDING).max(1.0)
+    }
+}
 
 fn request_generation(operation: &Operation, generation: u64) -> Option<u64> {
     // A drawer opened before the first login can request its initial listing.
@@ -35,6 +58,7 @@ pub enum FileAction {
     Filter(u64, u64, u64, String),
     ClearFilter(u64, u64, u64),
     Choose(u64, u64, ListedEntry),
+    CopyPath(u64, u64, u64, Option<ListedEntry>),
     Rename(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
@@ -83,6 +107,7 @@ pub(super) struct FileDrawer {
 struct CachedPanel {
     profile: Option<String>,
     shell_ready: bool,
+    layout: DrawerLayout,
     view: View,
 }
 
@@ -596,6 +621,20 @@ impl FileDrawer {
         remote_child(&entry.parent, &entry.name)
     }
 
+    fn path_to_copy(&self, revision: u64, entry: Option<&ListedEntry>) -> Option<String> {
+        if !self.open
+            || self.busy()
+            || self.bookmarks.is_some()
+            || self.listing_revision != revision
+        {
+            return None;
+        }
+        match entry {
+            Some(entry) => self.selected_path(entry).ok(),
+            None => self.directory.clone(),
+        }
+    }
+
     fn accept_listing(&mut self, path: String, entries: Vec<Entry>) {
         self.opening_bookmark = None;
         self.end_filter_edit();
@@ -850,19 +889,21 @@ impl FileDrawer {
         ssh: &SshOptions,
         profile: Option<&str>,
         shell_ready: bool,
+        layout: DrawerLayout,
         context: &ViewContext<TerminalApp>,
     ) -> View {
-        if let Some(cached) =
-            self.cached.borrow().as_ref().filter(|saved| {
-                saved.profile.as_deref() == profile && saved.shell_ready == shell_ready
-            })
-        {
+        if let Some(cached) = self.cached.borrow().as_ref().filter(|saved| {
+            saved.profile.as_deref() == profile
+                && saved.shell_ready == shell_ready
+                && saved.layout == layout
+        }) {
             return cached.view.clone();
         }
         let cache = |view: View| {
             *self.cached.borrow_mut() = Some(CachedPanel {
                 profile: profile.map(str::to_owned),
                 shell_ready,
+                layout,
                 view: view.clone(),
             });
             view
@@ -900,6 +941,8 @@ impl FileDrawer {
         };
         let mut controls: Vec<View> = vec![
             Grid::new()
+                .width(layout.content_width())
+                .horizontal_alignment(HorizontalAlignment::Left)
                 .columns([GridLength::Star(1.0), GridLength::Auto])
                 .children((
                     TextBlock::new()
@@ -911,6 +954,8 @@ impl FileDrawer {
                 )),
             TextBlock::new()
                 .text(folder)
+                .max_width(layout.content_width())
+                .horizontal_alignment(HorizontalAlignment::Left)
                 .text_wrapping(TextWrapping::Wrap)
                 .into(),
             StackPanel::new()
@@ -988,6 +1033,21 @@ impl FileDrawer {
                         }))
                         .content("Open shell here"),
                 )),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .children((
+                    button(
+                        "Copy directory path",
+                        writable,
+                        CopyPath(pane, generation, revision, None),
+                    ),
+                    button(
+                        "Copy selected path",
+                        writable && selected.is_some(),
+                        CopyPath(pane, generation, revision, Some(listed(selected))),
+                    ),
+                )),
             CheckBox::new()
                 .is_checked(self.following)
                 .on_is_checked_changed(
@@ -1036,6 +1096,8 @@ impl FileDrawer {
         };
         controls.push(
             Grid::new()
+                .width(layout.content_width())
+                .horizontal_alignment(HorizontalAlignment::Left)
                 .columns([GridLength::Star(1.0), GridLength::Auto])
                 .children((
                     filter,
@@ -1072,6 +1134,8 @@ impl FileDrawer {
             controls.push(
                 TextBlock::new()
                     .text(&self.status)
+                    .max_width(layout.content_width())
+                    .horizontal_alignment(HorizontalAlignment::Left)
                     .text_wrapping(TextWrapping::Wrap)
                     .into(),
             );
@@ -1136,9 +1200,22 @@ impl FileDrawer {
                 )
             })
             .collect();
+        let actions = ScrollViewer::new()
+            .automation_name("SFTP actions")
+            .max_height(layout.actions_max_height)
+            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .content(
+                StackPanel::new().spacing(6.0).keyed_children(
+                    controls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, view)| KeyedView::new(index.to_string(), view)),
+                ),
+            );
         let drop_folder = folder.to_owned();
         let panel = Border::new()
-            .padding(10.0)
+            .padding(PANEL_PADDING)
             .background(Color::rgb(31, 32, 35))
             .drop_policy(writable.then(|| {
                 DragDropPolicy::new().storage_items(
@@ -1159,14 +1236,11 @@ impl FileDrawer {
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Star(1.0)])
                     .children((
-                        StackPanel::new().spacing(6.0).keyed_children(
-                            controls
-                                .into_iter()
-                                .enumerate()
-                                .map(|(index, view)| KeyedView::new(index.to_string(), view)),
-                        ),
+                        actions,
                         ScrollViewer::new()
                             .grid_row(1)
+                            .automation_name("SFTP entries")
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                             .content(StackPanel::new().keyed_children(list)),
                     )),
             );
@@ -1594,9 +1668,9 @@ impl TerminalApp {
         });
         let shell_ready =
             connection.is_some() && self.drawer_shell_eligible(tab, tab.files.generation);
-        let width = (self.width * 0.45).clamp(1.0, 360.0);
+        let layout = DrawerLayout::for_window(self.width, self.window_height);
         Grid::new()
-            .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
+            .columns([GridLength::Star(1.0), GridLength::Pixel(layout.width)])
             .keyed_children([
                 KeyedView::new("terminal", Border::new().grid_column(0).content(content)),
                 KeyedView::new(
@@ -1606,6 +1680,7 @@ impl TerminalApp {
                         ssh,
                         bookmark_profile,
                         shell_ready,
+                        layout,
                         context,
                     )),
                 ),
@@ -1631,6 +1706,7 @@ impl TerminalApp {
             | Filter(id, ..)
             | ClearFilter(id, ..)
             | Choose(id, ..)
+            | CopyPath(id, ..)
             | Rename(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
@@ -1950,6 +2026,18 @@ impl TerminalApp {
                     if files.has_entry(&entry) {
                         files.selected = Some(entry.name);
                         files.end_filter_edit();
+                    }
+                }
+                CopyPath(_, generation, revision, entry) => {
+                    if generation == files.generation
+                        && may_open_dialog
+                        && let Some(path) = files.path_to_copy(revision, entry.as_ref())
+                    {
+                        files.status = match w11term::clipboard::write(&path) {
+                            Ok(()) if entry.is_some() => "Copied selected path".into(),
+                            Ok(()) => "Copied directory path".into(),
+                            Err(error) => format!("Could not copy path: {error}"),
+                        };
                     }
                 }
                 OpenEntry(_, _, entry) => {
@@ -2288,6 +2376,21 @@ mod tests {
     }
 
     #[test]
+    fn drawer_reserves_file_rows_after_short_window_resizes() {
+        // 982x551 device pixels on a 150% display was the failing layout.
+        let short = DrawerLayout::for_window(982.0 / 1.5, 551.0 / 1.5);
+        let remaining = 551.0 / 1.5 - 48.0 - 2.0 * PANEL_PADDING - short.actions_max_height;
+        assert!(remaining >= 3.0 * 32.0);
+        assert!(short.width < 360.0);
+        let tall = DrawerLayout::for_window(1200.0, 900.0);
+        assert!(tall.actions_max_height > 600.0);
+        assert_eq!(tall.content_width(), 340.0);
+        let tiny = DrawerLayout::for_window(480.0, 200.0);
+        assert!(tiny.actions_max_height > 32.0);
+        assert!(200.0 - 48.0 - 2.0 * PANEL_PADDING - tiny.actions_max_height >= 32.0);
+    }
+
+    #[test]
     fn shell_here_binds_to_the_displayed_listing_and_leaves_browsing_state_alone() {
         let mut drawer = FileDrawer {
             open: true,
@@ -2365,6 +2468,49 @@ mod tests {
         assert!(drawer.matching_entries().eq(listing().iter()));
         assert_eq!(drawer.listing_revision, revision);
         assert!(!drawer.busy());
+    }
+
+    #[test]
+    fn copy_path_uses_the_displayed_directory_and_literal_selected_name() {
+        let mut drawer = FileDrawer {
+            open: true,
+            ..Default::default()
+        };
+        assert_eq!(drawer.path_to_copy(0, None), None);
+        let name = "Å folder's [logs] $x";
+        let kind = ListedKind::Known(EntryKind::Symlink);
+        drawer.accept_listing(
+            "/".into(),
+            vec![Entry {
+                name: name.into(),
+                kind,
+            }],
+        );
+        let revision = drawer.listing_revision;
+        let listed = ListedEntry {
+            parent: "/".into(),
+            revision,
+            name: name.into(),
+            kind,
+        };
+        drawer.selected = Some(name.into());
+        assert_eq!(drawer.path_to_copy(revision, None).as_deref(), Some("/"));
+        assert_eq!(
+            drawer.path_to_copy(revision, Some(&listed)),
+            Some(format!("/{name}"))
+        );
+        drawer.set_filter("other".into());
+        assert!(drawer.path_to_copy(revision, Some(&listed)).is_none());
+        drawer.accept_listing("/new dir".into(), vec![]);
+        assert!(drawer.path_to_copy(revision, None).is_none());
+        assert_eq!(
+            drawer
+                .path_to_copy(drawer.listing_revision, None)
+                .as_deref(),
+            Some("/new dir")
+        );
+        drawer.open = false;
+        assert!(drawer.path_to_copy(drawer.listing_revision, None).is_none());
     }
 
     #[test]
