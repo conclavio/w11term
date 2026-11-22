@@ -25,6 +25,8 @@ REPLIES = {
     b"\x1b[14t": b"\x1b[4;%d;%dt",
     b"\x1b[16t": b"\x1b[6;18;9t",
     b"\x1b[18t": b"\x1b[8;%d;%dt",
+    # The capture uses w11term's default dark profile.
+    b"\x1b[?996n": b"\x1b[?997;1n",
     b"\x1b]11;?\x1b\\": b"\x1b]11;rgb:0e14/1020/13f7\x1b\\",
     b"\x1b]10;?\x1b\\": b"\x1b]10;rgb:dc28/e146/e8f4\x1b\\",
     b"\x1b[?2026$p": b"\x1b[?2026;2$y",
