@@ -16,6 +16,9 @@ Regression coverage is in the parent project's `terminal.rs` unit tests and the 
 
 The original MIT license is preserved in `LICENSE.md`.
 
+- DECRQM for DEC private mode 5 reports the current screen polarity so applications
+  can restore the previous setting after using reverse-screen mode.
+
 - `src/terminal.rs`, `terminalstate/mod.rs`, `terminalstate/performer.rs`: implement
   synchronized-output mode 2026 and DECRQM state in the engine. The embedding can
   observe parsed begin/end boundaries, including multiple transitions within one

@@ -651,11 +651,17 @@ impl Snapshot {
             });
         }
         let cursor = terminal.cursor_pos();
+        // DECSCNM exchanges the display defaults. Leave the underlying OSC colors
+        // and indexed palette intact so queries and later resets see the originals.
+        let mut palette = terminal.palette();
+        if terminal.get_reverse_video() {
+            std::mem::swap(&mut palette.foreground, &mut palette.background);
+        }
         Self {
             generation,
             rows,
             row_wraps,
-            palette: terminal.palette(),
+            palette,
             cursor,
             cursor_visible: offset == 0
                 && cursor.visibility == termwiz::surface::CursorVisibility::Visible,
@@ -1968,6 +1974,50 @@ mod tests {
             _ => panic!("unexpected resize"),
         }
     }
+    #[test]
+    fn reverse_screen_reports_state_across_screen_switches_and_resets() {
+        let (mut terminal, mut replies) = engine();
+        for (request, answer) in [
+            ("", 2),
+            ("\x1b[?5h", 1),
+            ("\x1b[?5h", 1),
+            ("\x1b[?1049h", 1),
+            ("\x1b[?1049l", 1),
+            ("\x1b[?5l", 2),
+            ("\x1b[?5h\x1bc", 2),
+        ] {
+            terminal.advance_bytes(request.as_bytes());
+            terminal.advance_bytes(b"\x1b[?5$p");
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1b[?5;{answer}$y").as_bytes()
+            );
+        }
+        terminal.advance_bytes(b"\x1b[?5h");
+        terminal.reset_connection();
+        terminal.advance_bytes(b"\x1b[?5$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?5;2$y");
+    }
+
+    #[test]
+    fn reverse_screen_preserves_the_dynamic_colors_reported_to_applications() {
+        let (mut terminal, mut replies) = engine();
+        let query = b"\x1b]10;?\x07";
+        terminal.advance_bytes(b"\x1b]10;#13579b\x07\x1b]11;#421735\x07");
+        terminal.advance_bytes(query);
+        let normal_reply = receive(&mut replies);
+        terminal.advance_bytes(b"\x1b[?5h");
+        terminal.advance_bytes(query);
+        assert_eq!(receive(&mut replies), normal_reply);
+        terminal.advance_bytes(b"\x1b]10;#eeddaa\x07");
+        let palette = terminal.palette();
+        let capture = |term: &Terminal| Snapshot::capture(term, None, 0, 0, String::new(), 0);
+        assert_eq!(capture(&terminal).palette.background, palette.foreground);
+        assert_eq!(capture(&terminal).palette.foreground, palette.background);
+        terminal.advance_bytes(b"\x1b[?5l");
+        assert_eq!(capture(&terminal).palette, palette);
+    }
+
     #[test]
     fn cursor_blink_mode_preserves_shape_and_reports_the_latest_request() {
         use termwiz::surface::CursorShape::*;
