@@ -39,6 +39,67 @@ fn upload(local: &Path) -> Operation {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_download_timeout_removes_staging_and_publication_refuses_a_racing_destination() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let tree = remote.path().join("bundle");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("data.bin"), vec![42; CHUNK * 3]).unwrap();
+    let log = remote.path().join("transfer-trace");
+    let hold = remote.path().join("hold-transfer-read");
+    let parent = tempfile::tempdir().unwrap();
+    let local = parent.path().join("saved bundle");
+
+    for expire in [true, false] {
+        fs::write(&log, []).unwrap();
+        fs::write(&hold, []).unwrap();
+        let (reply, result) = oneshot::channel();
+        pane.input
+            .send(Command::Sftp(Job {
+                expected_generation: Some(pane.frames.load().connection_generation),
+                operation: Operation::GetDir {
+                    remote: "/bundle".into(),
+                    local: local.clone(),
+                },
+                deadline: tokio::time::Instant::now()
+                    + Duration::from_secs(if expire { 3 } else { 15 }),
+                reply,
+                progress: None,
+                cancel: None,
+            }))
+            .unwrap();
+        wait_for_packet(&log, &format!("READ {CHUNK}")).await;
+        assert!(
+            !local.exists(),
+            "the final name appeared before the last read"
+        );
+        if expire {
+            let failure = tokio::time::timeout(Duration::from_secs(6), result)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                failure.is_err(),
+                "expired folder download unexpectedly succeeded"
+            );
+            fs::remove_file(&hold).unwrap();
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        } else {
+            fs::create_dir(&local).unwrap();
+            fs::write(local.join("mine.txt"), b"existing").unwrap();
+            fs::remove_file(&hold).unwrap();
+            assert!(
+                result.await.unwrap().is_err(),
+                "download replaced a concurrent destination"
+            );
+            assert_eq!(fs::read(local.join("mine.txt")).unwrap(), b"existing");
+            assert_eq!(fs::read_dir(&local).unwrap().count(), 1);
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 1);
+        }
+    }
+    server.abort();
+}
+
 async fn wait_for_packet(log: &Path, packet: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !fs::read_to_string(log)

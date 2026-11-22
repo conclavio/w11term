@@ -103,6 +103,14 @@ On an SSH pane, choose **caret → Panes → SFTP files** to browse the server�
 
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
+Choose **Download folder…** on a remote directory and select a Windows folder
+to receive it. For example, choosing `Downloads` for `/tmp/diagnostics`
+creates `Downloads\diagnostics`. The transfer preserves regular files, dotfiles
+and empty directories, and reports skipped symbolic links and special entries.
+It stages the tree beside the destination and publishes it after the download
+finishes. An existing destination or a name Windows cannot represent stops
+the download. Use **Cancel transfer** in the drawer to stop it.
+
 When a file row or drawer control has keyboard focus, use the keyboard to operate that control. For example, press **Space** on a file row to select it. Click the terminal pane, or choose **Done** in the filename filter, to resume typing into the shell while the drawer stays open.
 
 Choose **Go to folder…** to enter a remote directory directly. An absolute path such as `/var/log` works even if the starting directory could not be listed. Relative paths start in the displayed directory. The SFTP server resolves `.`, `..` and symbolic links. Enter spaces, quotes and dollar signs literally. If the folder cannot be opened, the drawer keeps the previous listing and selection.

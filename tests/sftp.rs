@@ -489,6 +489,20 @@ impl russh_sftp::server::Handler for Files {
         self.trace_transfer(format_args!("READ {offset}"))?;
         if offset > 0 {
             self.hold_response("hold-transfer-read").await;
+            if self.root.join("disconnect-tree-read").is_file() {
+                let _ = self
+                    .ssh
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "fixture closed SFTP".into(),
+                        "en".into(),
+                    )
+                    .await;
+                return Err(StatusCode::ConnectionLost);
+            }
+            if self.root.join("tree-early-eof").is_file() {
+                return Err(StatusCode::Eof);
+            }
         }
         if self.root.join("small-reads").exists() && len > 512 {
             return Err(StatusCode::Failure);
@@ -565,6 +579,12 @@ impl russh_sftp::server::Handler for Files {
             return Err(StatusCode::ConnectionLost);
         }
         let mut attrs = entry_attrs(&self.path(&path))?;
+        if self.root.join("tree-unknown-size").is_file() {
+            attrs.size = None;
+        }
+        if path == "/tree/socket" {
+            attrs.permissions = Some(0o140600);
+        }
         if self.root.join("omit-lstat-permissions").is_file() {
             attrs.permissions = None;
         }
@@ -574,10 +594,12 @@ impl russh_sftp::server::Handler for Files {
         if self.root.join("no-fstat").exists() {
             return Err(StatusCode::OpUnsupported);
         }
-        Ok(Attrs {
-            id,
-            attrs: (&self.file(&h)?.metadata().map_err(io)?).into(),
-        })
+        let mut attrs = FileAttributes::from(&self.file(&h)?.metadata().map_err(io)?);
+        if self.root.join("tree-unknown-size").is_file() {
+            attrs.size = None;
+            attrs.permissions = Some(0o600);
+        }
+        Ok(Attrs { id, attrs })
     }
     async fn setstat(
         &mut self,
@@ -620,6 +642,19 @@ impl russh_sftp::server::Handler for Files {
             }
         }
         let omit_mode = fs::read_to_string(self.root.join("omit-listed-mode")).ok();
+        if path == "/tree"
+            && let Ok(names) = fs::read_to_string(self.root.join("tree-test-names"))
+        {
+            return Ok(self.add(
+                id,
+                Opened::Dir(
+                    names
+                        .lines()
+                        .map(|s| russh_sftp::protocol::File::new(s, FileAttributes::empty()))
+                        .collect(),
+                ),
+            ));
+        }
         let entries = fs::read_dir(self.path(&path))
             .map_err(io)?
             .map(|e| {
@@ -627,7 +662,10 @@ impl russh_sftp::server::Handler for Files {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
                 let mut attrs = entry_attrs(&e.path())?;
-                if Some(name.as_ref()) == omit_mode.as_deref() {
+                if self.root.join("tree-unknown-size").is_file() {
+                    attrs.size = None;
+                }
+                if Some(name.as_ref()) == omit_mode.as_deref() || name == "socket" {
                     attrs.permissions = None;
                 }
                 Ok(russh_sftp::protocol::File::new(name, attrs))
@@ -636,6 +674,12 @@ impl russh_sftp::server::Handler for Files {
         Ok(self.add(id, Opened::Dir(entries)))
     }
     async fn readdir(&mut self, id: u32, h: String) -> Result<Name, StatusCode> {
+        if self.root.join("empty-tree-page").is_file() {
+            return Ok(Name {
+                id,
+                files: Vec::new(),
+            });
+        }
         #[cfg(feature = "ui-smoke")]
         self.trace_listing("READDIR")?;
         match self.handles.get_mut(&h) {
@@ -711,6 +755,12 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        if path == "/tree/data" && self.root.join("tree-redirect").is_file() {
+            return Ok(Name {
+                id,
+                files: vec![russh_sftp::protocol::File::dummy("/elsewhere")],
+            });
+        }
         Ok(Name {
             id,
             files: vec![russh_sftp::protocol::File::dummy(if path == "." {
@@ -871,6 +921,8 @@ async fn guarded_job(
 
 #[path = "sftp/cancellation.rs"]
 mod cancellation;
+#[path = "sftp/download_folder.rs"]
+mod download_folder;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
@@ -1582,9 +1634,32 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         let pid=std::process::id().to_string();
         let output=tokio::task::spawn_blocking(move||std::process::Command::new(env!("CARGO_BIN_EXE_w11term-cli")).args(["--pid",&pid,"sftp","--pane","1","info"]).output().unwrap()).await.unwrap();
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stdout));
-        assert_eq!(opens.load(Ordering::Relaxed),2,"SFTP must reuse one sibling channel on the existing SSH connection");
         fs::remove_file(root.path().join("read-entered")).unwrap();
         assert_eq!(fs::read_dir(root.path()).unwrap().count(),0);
+        let remote_tree = root.path().join("cli-bundle");
+        fs::create_dir_all(remote_tree.join("nested/empty")).unwrap();
+        fs::write(remote_tree.join("nested/日本.bin"), [0, 255, 19]).unwrap();
+        fs::write(remote_tree.join(".marker"), b"complete").unwrap();
+        let destination = local.path().join("local bundle");
+        let arg = destination.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+                .args(["--pid", &std::process::id().to_string(), "sftp", "--pane", "1", "get-dir", "/cli-bundle"])
+                .arg(arg)
+                .output()
+                .unwrap()
+        }).await.unwrap();
+        assert!(output.status.success(), "get-dir failed: {}", String::from_utf8_lossy(&output.stdout));
+        let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let transfer = &response["result"]["sftp"];
+        assert_eq!(transfer["files"], 2);
+        assert_eq!(transfer["directories"], 3);
+        assert_eq!(transfer["skipped"], 0);
+        assert_eq!(transfer["bytes_transferred"], 11);
+        assert_eq!(fs::read(destination.join("nested/日本.bin")).unwrap(), [0, 255, 19]);
+        assert_eq!(fs::read(destination.join(".marker")).unwrap(), b"complete");
+        assert!(destination.join("nested/empty").is_dir());
+        assert_eq!(opens.load(Ordering::Relaxed),2,"SFTP must reuse one sibling channel on the existing SSH connection");
         fs::write(root.path().join("slow"),b"slow").unwrap();
         let handle=ok(json!({"op":"open","path":"/slow","flags":["read"]})).await["handle"].as_u64().unwrap();
         fs::write(root.path().join("pause-reads"),b"").unwrap();

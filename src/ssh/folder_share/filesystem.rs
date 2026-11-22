@@ -5,6 +5,7 @@
 //! A renamed root continues to refer to the originally selected directory.
 //! Read-only hard-link counts are checked on admission. Already-open files identify the
 //! same object even if a local owner later changes its contents or link count.
+use crate::sftp::valid_component;
 use std::{
     fs::{File, OpenOptions},
     io::{self, ErrorKind},
@@ -98,36 +99,6 @@ fn nt_result(status: NTSTATUS) -> io::Result<()> {
 
 fn handle(file: &File) -> HANDLE {
     HANDLE(file.as_raw_handle())
-}
-
-fn valid_component(name: &str) -> bool {
-    if name.is_empty()
-        || name.ends_with(['.', ' '])
-        || name.encode_utf16().count() > 255
-        || name
-            .chars()
-            .any(|c| c.is_control() || r#"\/:"<>|?*"#.contains(c))
-    {
-        return false;
-    }
-    let stem = name
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    !matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
-    ) && !stem
-        .strip_prefix("COM")
-        .or_else(|| stem.strip_prefix("LPT"))
-        .is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        })
 }
 
 fn parts<'a>(path: impl Iterator<Item = &'a str>) -> io::Result<Vec<&'a str>> {
