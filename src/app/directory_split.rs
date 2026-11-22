@@ -35,10 +35,11 @@ pub(super) fn message(axis: Axis, target: Option<&Origin>) -> Message {
 }
 
 fn child_options(connection: &SshOptions, pane: &SshOptions, player: PlayerOptions) -> SshOptions {
-    // A shared transport can serve PTYs opened with different TERM and history settings.
+    // PTYs sharing a transport keep their own terminal and presentation settings.
     SshOptions {
         terminal_type: pane.terminal_type.clone(),
         scrollback_lines: pane.scrollback_lines,
+        color_scheme: pane.color_scheme,
         local_forwards: pane.local_forwards.clone(),
         player,
         ..connection.clone()
@@ -158,7 +159,7 @@ mod tests {
         .unwrap();
         let pane: SshOptions = serde_json::from_value(serde_json::json!({
             "host":"example.test", "user":"login", "auth":"password",
-            "terminal_type":"xterm-sixel", "scrollback_lines":18,
+            "terminal_type":"xterm-sixel", "scrollback_lines":18, "color_scheme":"one-half-dark",
             "local_forwards":[{"local_port":8080, "remote_port":8000}]
         }))
         .unwrap();
@@ -170,6 +171,7 @@ mod tests {
         assert_eq!(child.authentication, connection.authentication);
         assert_eq!(child.terminal_type, pane.terminal_type);
         assert_eq!(child.scrollback_lines, pane.scrollback_lines);
+        assert_eq!(child.color_scheme, ColorScheme::OneHalfDark);
         assert_eq!(child.local_forwards, pane.local_forwards);
         assert_eq!(child.player, player);
     }

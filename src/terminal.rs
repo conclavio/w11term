@@ -1,5 +1,5 @@
 //! The terminal engine is independent of Reactor, rendering, and SSH.
-use crate::options::ScrollbackLines;
+use crate::options::{ColorScheme, ScrollbackLines};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
@@ -12,6 +12,7 @@ use wezterm_term::{
     CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
 };
 
+mod color_scheme;
 mod export;
 mod kitty;
 mod retained_rows;
@@ -62,6 +63,7 @@ pub fn scroll_wheel(
 #[derive(Debug)]
 struct Config {
     scrollback_lines: ScrollbackLines,
+    palette: ColorPalette,
 }
 
 impl TerminalConfiguration for Config {
@@ -73,12 +75,7 @@ impl TerminalConfiguration for Config {
     }
 
     fn color_palette(&self) -> ColorPalette {
-        ColorPalette {
-            foreground: SrgbaTuple(0.86, 0.88, 0.91, 1.0),
-            background: SrgbaTuple(0.055, 0.063, 0.078, 1.0),
-            cursor_bg: SrgbaTuple(0.48, 0.79, 0.98, 1.0),
-            ..ColorPalette::default()
-        }
+        self.palette.clone()
     }
 
     fn scrollback_size(&self) -> usize {
@@ -137,17 +134,26 @@ impl Write for ReplyWriter {
 }
 
 pub fn create(size: TerminalSize, writer: mpsc::UnboundedSender<TransportInput>) -> Terminal {
-    create_with_scrollback(size, writer, ScrollbackLines::default())
+    create_with_profile(
+        size,
+        writer,
+        ScrollbackLines::default(),
+        ColorScheme::Default,
+    )
 }
 
-pub(crate) fn create_with_scrollback(
+pub fn create_with_profile(
     size: TerminalSize,
     writer: mpsc::UnboundedSender<TransportInput>,
     scrollback_lines: ScrollbackLines,
+    scheme: ColorScheme,
 ) -> Terminal {
     Terminal::new(
         size,
-        Arc::new(Config { scrollback_lines }),
+        Arc::new(Config {
+            scrollback_lines,
+            palette: color_scheme::palette(scheme),
+        }),
         "w11term",
         env!("CARGO_PKG_VERSION"),
         Box::new(ReplyWriter {
@@ -1959,7 +1965,7 @@ mod tests {
             rx,
         )
     }
-    fn receive(rx: &mut mpsc::UnboundedReceiver<TransportInput>) -> Vec<u8> {
+    pub(super) fn receive(rx: &mut mpsc::UnboundedReceiver<TransportInput>) -> Vec<u8> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()

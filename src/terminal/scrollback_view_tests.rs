@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     options::Source,
     session::{RangeScroll, Session},
-    terminal::create_with_scrollback,
+    terminal::create_with_profile,
 };
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
@@ -19,7 +19,12 @@ fn size() -> TerminalSize {
 
 fn terminal(limit: u32) -> Terminal {
     let (writer, _) = mpsc::unbounded_channel();
-    create_with_scrollback(size(), writer, limit.try_into().unwrap())
+    create_with_profile(
+        size(),
+        writer,
+        limit.try_into().unwrap(),
+        Default::default(),
+    )
 }
 
 fn frame(term: &Terminal, offset: usize) -> Snapshot {

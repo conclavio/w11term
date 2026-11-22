@@ -320,8 +320,12 @@ impl Session {
         let worker_player = player.clone();
         let (notice_tx, notice_rx) = mpsc::channel(64);
         let (writer, transport_input) = mpsc::unbounded_channel();
-        let mut terminal =
-            terminal::create_with_scrollback(size, writer.clone(), source.scrollback_lines());
+        let mut terminal = terminal::create_with_profile(
+            size,
+            writer.clone(),
+            source.scrollback_lines(),
+            source.color_scheme(),
+        );
         let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard));
         let clipboard: Arc<dyn wezterm_term::Clipboard> =
             Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
@@ -1061,6 +1065,7 @@ mod failure_tests {
                 cwd: None,
                 powershell_integration: false,
                 scrollback_lines: Default::default(),
+                color_scheme: Default::default(),
             }
         )));
         assert!(!can_watch_commands(&Source::Demo));

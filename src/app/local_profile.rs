@@ -9,6 +9,7 @@ pub(super) struct Draft {
     executable: String,
     args: Vec<String>,
     cwd: String,
+    color_scheme: ColorScheme,
     scrollback_lines: String,
     powershell_integration: bool,
     error: String,
@@ -23,6 +24,7 @@ impl Default for Draft {
             executable: String::new(),
             args: Vec::new(),
             cwd: String::new(),
+            color_scheme: ColorScheme::default(),
             scrollback_lines: ScrollbackLines::default().to_string(),
             powershell_integration: false,
             error: String::new(),
@@ -41,6 +43,7 @@ impl Draft {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             args: options.args.clone(),
+            color_scheme: options.color_scheme,
             scrollback_lines: options.scrollback_lines.to_string(),
             powershell_integration: options.powershell_integration,
             ..Self::default()
@@ -52,6 +55,7 @@ impl Draft {
             executable: self.executable.trim().into(),
             args: self.args.clone(),
             cwd: (!self.cwd.trim().is_empty()).then(|| self.cwd.trim().into()),
+            color_scheme: self.color_scheme,
             scrollback_lines: self.scrollback_lines.parse()?,
             powershell_integration: self.powershell_integration && self.supports_integration(),
         })
@@ -59,6 +63,13 @@ impl Draft {
 
     fn supports_integration(&self) -> bool {
         LocalOptions::supports_powershell_integration(Path::new(self.executable.trim()), &self.args)
+    }
+
+    pub(super) fn set_color_scheme(&mut self, scheme: ColorScheme) {
+        if self.color_scheme != scheme {
+            self.color_scheme = scheme;
+            self.error.clear();
+        }
     }
 }
 
@@ -318,6 +329,7 @@ impl TerminalApp {
                     Message::LocalProfile(Action::Field(id, Field::ScrollbackLines, value))
                 }),
             ),
+            color_scheme_editor(id, draft.color_scheme, context),
             TextBlock::new().text("Arguments").into(),
         ];
         for (index, arg) in draft.args.iter().enumerate() {
@@ -454,6 +466,31 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_scheme_edits_round_trip_without_changing_the_launch() {
+        let mut draft = Draft {
+            executable: "powershell.exe".into(),
+            args: vec!["-NoLogo".into()],
+            cwd: r"C:\work".into(),
+            ..Default::default()
+        };
+        let original = draft.options().unwrap();
+        assert_eq!(original.color_scheme, ColorScheme::Default);
+        for scheme in ColorScheme::ALL {
+            draft.set_color_scheme(scheme);
+            let saved = draft.options().unwrap();
+            assert_eq!(
+                saved,
+                LocalOptions {
+                    color_scheme: scheme,
+                    ..original.clone()
+                }
+            );
+            let reopened = Draft::from_options("PowerShell".into(), &saved);
+            assert_eq!(reopened.options().unwrap(), saved);
+        }
+    }
 
     #[test]
     fn local_scrollback_editor_preserves_limits_and_rejects_invalid_changes() {

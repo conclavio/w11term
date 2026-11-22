@@ -269,6 +269,7 @@ mod tests {
             args: vec!["-nOlOgO".into()],
             cwd: None,
             scrollback_lines: Default::default(),
+            color_scheme: Default::default(),
             powershell_integration: true,
         };
         let line = |shell: &LocalOptions, exe: Option<&Path>| {

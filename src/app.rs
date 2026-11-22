@@ -18,7 +18,8 @@ use w11term::{
         word_range,
     },
     options::{
-        Authentication, LocalOptions, Profiles, ScrollbackLines, Source, SshOptions, TerminalType,
+        Authentication, ColorScheme, LocalOptions, Profiles, ScrollbackLines, Source, SshOptions,
+        TerminalType,
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
@@ -388,6 +389,7 @@ struct ProfileDraft {
     host: String,
     user: String,
     port: String,
+    color_scheme: ColorScheme,
     scrollback_lines: String,
     terminal_preset: usize,
     custom_terminal: String,
@@ -414,6 +416,7 @@ impl Default for ProfileDraft {
             host: String::new(),
             user: String::new(),
             port: "22".into(),
+            color_scheme: ColorScheme::default(),
             scrollback_lines: ScrollbackLines::default().to_string(),
             terminal_preset: 0,
             custom_terminal: String::new(),
@@ -454,6 +457,7 @@ impl ProfileDraft {
             host: options.host.clone(),
             user: options.user.clone(),
             port: options.port.to_string(),
+            color_scheme: options.color_scheme,
             scrollback_lines: options.scrollback_lines.to_string(),
             terminal_preset: match options.terminal_type.as_str() {
                 TerminalType::DEFAULT => 0,
@@ -468,6 +472,25 @@ impl ProfileDraft {
             ..Default::default()
         }
     }
+}
+
+fn color_scheme_editor(id: TabId, scheme: ColorScheme, context: &ViewContext<TerminalApp>) -> View {
+    let schemes = ColorScheme::ALL;
+    StackPanel::new().spacing(5.0).children((
+        TextBlock::new().text("Terminal color scheme"),
+        ComboBox::new()
+            .automation_name("Terminal color scheme")
+            .items_source(schemes.map(ColorScheme::label))
+            .selected_index(schemes.iter().position(|s| *s == scheme))
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .on_selection_changed(context.callback(move |index: Option<usize>| {
+                index
+                    .and_then(|i| schemes.get(i))
+                    .map_or(Message::ControlIdle, |&scheme| {
+                        Message::ProfileColorScheme(id, scheme)
+                    })
+            })),
+    ))
 }
 
 fn scrollback_editor(value: &str, on_change: Callback<String>) -> View {
@@ -864,6 +887,7 @@ pub enum Message {
     Edit(TabId, Field, String),
     Auth(TabId, Option<usize>),
     TerminalPreset(TabId, Option<usize>),
+    ProfileColorScheme(TabId, ColorScheme),
     SaveProfile(TabId),
     SaveProfileOnly(TabId),
     EditProfile(String),
@@ -2564,6 +2588,7 @@ impl TerminalApp {
             let options = SshOptions {
                 host: host.into(),
                 terminal_type: draft.terminal_type()?,
+                color_scheme: draft.color_scheme,
                 scrollback_lines: draft.scrollback_lines.parse()?,
                 user: user.into(),
                 port: draft
@@ -3280,6 +3305,7 @@ impl TerminalApp {
             &draft.scrollback_lines,
             context.callback(move |v| Message::Edit(id, Field::ScrollbackLines, v)),
         ));
+        fields.push(color_scheme_editor(id, draft.color_scheme, context));
         fields.push(
             StackPanel::new().spacing(5.0).children((
                 TextBlock::new().text("SSH terminal type (TERM)"),
@@ -5280,6 +5306,17 @@ impl Component for TerminalApp {
                 }
             }
             Message::Auth(_, None) => {}
+            Message::ProfileColorScheme(id, scheme) => {
+                match self.tabs.get_mut(id).map(|tab| &mut tab.page) {
+                    Some(Page::NewProfile(draft)) if draft.color_scheme != scheme => {
+                        draft.color_scheme = scheme;
+                        draft.saved = false;
+                        draft.error = None;
+                    }
+                    Some(Page::LocalProfile(draft)) => draft.set_color_scheme(scheme),
+                    _ => {}
+                }
+            }
             Message::TerminalPreset(id, selected) => {
                 if let Some(AppTab {
                     page: Page::NewProfile(draft),
@@ -5928,6 +5965,7 @@ impl TerminalApp {
                 };
                 assert_eq!(draft.name, "typo");
                 assert_eq!(draft.host, "127.0.0.1");
+                assert_eq!(draft.color_scheme, ColorScheme::Default);
                 assert_eq!(
                     draft.terminal_type().unwrap().as_str(),
                     TerminalType::DEFAULT
@@ -5945,6 +5983,10 @@ impl TerminalApp {
                 self.update(Message::Edit(id, Field::Name, "corrected".into()), context);
                 self.update(Message::Auth(id, Some(2)), context);
                 self.update(Message::TerminalPreset(id, Some(1)), context);
+                self.update(
+                    Message::ProfileColorScheme(id, ColorScheme::OneHalfDark),
+                    context,
+                );
                 self.update(
                     Message::Edit(
                         id,
@@ -5998,9 +6040,14 @@ impl TerminalApp {
                 assert!(matches!(draft.origin, DraftOrigin::Copy(_)));
                 assert_eq!(draft.name, "corrected copy");
                 assert_eq!(draft.terminal_type().unwrap().as_str(), TerminalType::SIXEL);
+                assert_eq!(draft.color_scheme, ColorScheme::OneHalfDark);
                 assert_eq!(draft.authentication, 2);
                 self.update(Message::Edit(copy, Field::Name, "second".into()), context);
                 self.update(Message::TerminalPreset(copy, Some(2)), context);
+                self.update(
+                    Message::ProfileColorScheme(copy, ColorScheme::OneHalfLight),
+                    context,
+                );
                 self.update(
                     Message::Edit(copy, Field::CustomTerminal, "vt220".into()),
                     context,
@@ -6010,10 +6057,10 @@ impl TerminalApp {
                     self.catalog.profiles.contains_key("corrected")
                         && self.catalog.profiles.contains_key("second")
                 );
-                assert_eq!(
-                    self.store.load().unwrap()["second"].terminal_type.as_str(),
-                    "vt220"
-                );
+                let profiles = self.store.load().unwrap();
+                assert_eq!(profiles["second"].terminal_type.as_str(), "vt220");
+                assert_eq!(profiles["second"].color_scheme, ColorScheme::OneHalfLight);
+                assert_eq!(profiles["corrected"].color_scheme, ColorScheme::OneHalfDark);
                 self.update(Message::DeleteProfile(copy), context);
             }
             31 => {
@@ -6498,6 +6545,7 @@ mod profile_ui_tests {
             let options = SshOptions {
                 host: "test.invalid".into(),
                 terminal_type: Default::default(),
+                color_scheme: ColorScheme::OneHalfLight,
                 scrollback_lines: "0".parse().unwrap(),
                 user: "pilot+character".into(),
                 port: 6792,
@@ -6516,6 +6564,7 @@ mod profile_ui_tests {
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
             assert_eq!(draft.scrollback_lines, "0");
+            assert_eq!(draft.color_scheme, ColorScheme::OneHalfLight);
             assert_eq!(draft.fingerprint, "SHA256:test");
             assert!(draft.player.mute && draft.player.game_mode);
             assert_eq!(draft.name, "existing");
