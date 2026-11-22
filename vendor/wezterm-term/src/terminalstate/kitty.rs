@@ -1,19 +1,19 @@
 use crate::terminalstate::image::*;
 use crate::terminalstate::{ImageAttachParams, PlacementInfo};
-use crate::{StableRowIndex, TerminalState};
+use crate::TerminalState;
 use ::image::{
     DynamicImage, GenericImage, GenericImageView, ImageBuffer, RgbImage, Rgba, RgbaImage,
 };
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 mod placement;
 mod playback;
-use placement::ProjectedPlacement;
+use placement::{Key, ProjectedPlacement};
 use playback::Playback;
-use wezterm_cell::image::ImageDataType;
+use wezterm_cell::image::{ImageCell, ImageDataType};
 use wezterm_escape_parser::apc::{
     KittyFrameCompositionMode, KittyImage, KittyImageCompression, KittyImageData, KittyImageDelete,
     KittyImageFormat, KittyImageFrame, KittyImageFrameCompose, KittyImagePlacement,
@@ -21,13 +21,22 @@ use wezterm_escape_parser::apc::{
 };
 use wezterm_surface::change::ImageData;
 
+#[derive(Debug)]
+struct PhysicalPlacement {
+    bounds: PlacementInfo,
+    row_revision: u64,
+    created: wezterm_surface::SequenceNo,
+    // A reconnected SSH session can reuse an ID still visible in frozen history.
+    data: Weak<ImageData>,
+}
+
 #[derive(Debug, Default)]
 pub struct KittyImageState {
     accumulator: Vec<KittyImage>,
     max_image_id: u32,
     number_to_id: HashMap<u32, u32>,
     id_to_data: HashMap<u32, Arc<ImageData>>,
-    placements: HashMap<(u32, Option<u32>), PlacementInfo>,
+    placements: HashMap<Key, PhysicalPlacement>,
     playback: HashMap<u32, Playback>,
     projected: HashMap<(u32, Option<u32>), ProjectedPlacement>,
     history_anchors: std::sync::Mutex<placement::HistoryAnchors>,
@@ -43,19 +52,39 @@ impl KittyImageState {
         }
     }
 
-    fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) -> anyhow::Result<()> {
+    fn keys(&self) -> impl Iterator<Item = Key> + '_ {
+        self.placements.keys().chain(self.projected.keys()).copied()
+    }
+
+    fn tile_key(&self, tile: &ImageCell) -> Option<Key> {
+        let key = (tile.image_id()?, tile.placement_id());
+        (self.placements.get(&key)?.data.as_ptr() == Arc::as_ptr(tile.image_data())).then_some(key)
+    }
+
+    fn placement_count(&self) -> usize {
+        self.placements.len() + self.projected.len()
+    }
+
+    fn record_id_to_data(
+        &mut self,
+        image_id: u32,
+        data: Arc<ImageData>,
+        inactive: &Self,
+    ) -> anyhow::Result<()> {
         self.used_memory = self.id_to_data.values().map(|data| data.len()).sum();
         self.prune_unreferenced();
         let old = self.id_to_data.get(&image_id).map_or(0, |data| data.len());
         anyhow::ensure!(
             self.used_memory
                 .saturating_sub(old)
+                .saturating_add(inactive.used_memory)
                 .saturating_add(data.len())
                 <= 64 * 1024 * 1024,
             "kitty image table exceeds 64 MiB"
         );
         anyhow::ensure!(
-            self.id_to_data.contains_key(&image_id) || self.id_to_data.len() < 512,
+            self.id_to_data.contains_key(&image_id)
+                || self.id_to_data.len() + inactive.id_to_data.len() < 512,
             "kitty image table exceeds 512 ids"
         );
         self.remove_data_for_id(image_id);
@@ -153,7 +182,7 @@ impl TerminalState {
         };
         if !self.kitty_img.placements.contains_key(&key)
             && !self.kitty_img.projected.contains_key(&key)
-            && self.kitty_img.placements.len() + self.kitty_img.projected.len() >= 1024
+            && self.kitty_img.placement_count() + self.inactive_kitty_img.placement_count() >= 1024
         {
             self.kitty_send_response(
                 verbosity,
@@ -165,8 +194,17 @@ impl TerminalState {
             return Ok(());
         }
         // Repositioning an existing parent preserves its dependent placements.
-        if let Some(info) = self.kitty_img.placements.remove(&key) {
-            self.kitty_remove_placement_from_model(image_id, placement.placement_id, info);
+        if let Some(physical) = self.kitty_img.placements.get(&key) {
+            if physical.row_revision == self.screen().placement_row_revision {
+                self.kitty_remove_placement_from_model(
+                    image_id,
+                    placement.placement_id,
+                    physical.bounds,
+                );
+            } else {
+                self.detach_kitty_cells(&HashSet::from([key]));
+            }
+            self.kitty_img.placements.remove(&key);
         }
         self.kitty_img.projected.remove(&key);
         if placement.virtual_placement || parent.is_some() {
@@ -178,7 +216,9 @@ impl TerminalState {
 
         let (image_width, image_height) = img.data().dimensions()?;
 
-        let info = self.assign_image_to_cells(ImageAttachParams {
+        let data = Arc::downgrade(&img);
+        let row_revision = self.screen().placement_row_revision;
+        let bounds = self.assign_image_to_cells(ImageAttachParams {
             image_width,
             image_height,
             source_width: placement.w,
@@ -197,9 +237,15 @@ impl TerminalState {
             do_not_move_cursor: placement.do_not_move_cursor,
         })?;
 
-        self.kitty_img
-            .placements
-            .insert((image_id, placement.placement_id), info);
+        self.kitty_img.placements.insert(
+            key,
+            PhysicalPlacement {
+                bounds,
+                row_revision,
+                created: self.seqno,
+                data,
+            },
+        );
         log::trace!(
             "record placement for {} (image_number {:?}) {:?}",
             image_id,
@@ -261,14 +307,21 @@ impl TerminalState {
                     anyhow::bail!("SSH kitty images require direct transport");
                 }
             };
-            if self.kitty_img.accumulated_bytes.saturating_add(bytes) > 48 * 1024 * 1024 {
+            if self
+                .kitty_img
+                .accumulated_bytes
+                .saturating_add(self.inactive_kitty_img.accumulated_bytes)
+                .saturating_add(bytes)
+                > 48 * 1024 * 1024
+            {
                 self.kitty_img.accumulator.clear();
                 self.kitty_img.accumulated_bytes = 0;
                 anyhow::bail!("kitty image transmission exceeds 48 MiB");
             }
             if transmit.more_data_follows {
                 if matches!(&img, KittyImage::Query { .. })
-                    || self.kitty_img.accumulator.len() >= 16384
+                    || self.kitty_img.accumulator.len() + self.inactive_kitty_img.accumulator.len()
+                        >= 16384
                 {
                     self.kitty_img.accumulated_bytes = 0;
                     self.kitty_img.accumulator.clear();
@@ -311,46 +364,11 @@ impl TerminalState {
             } => {
                 self.kitty_img_place(image_id, image_number, placement, verbosity)?;
             }
-            KittyImage::Delete {
-                what:
-                    KittyImageDelete::ByImageId {
-                        image_id,
-                        placement_id,
-                        delete,
-                    },
-                verbosity,
-            } => {
-                log::trace!(
-                    "remove a placement: image_id {} placement_id {:?} delete {} verb {:?}",
-                    image_id,
-                    placement_id,
-                    delete,
-                    verbosity
-                );
-
-                self.kitty_remove_placement(image_id, placement_id);
-
-                if delete
-                    && !self
-                        .kitty_img
-                        .placements
-                        .keys()
-                        .chain(self.kitty_img.projected.keys())
-                        .any(|key| key.0 == image_id)
-                {
-                    self.kitty_img.remove_data_for_id(image_id);
-                    self.kitty_img.number_to_id.retain(|_, id| *id != image_id);
-                    self.image_cache.clear();
-                }
-            }
-            KittyImage::Delete {
-                what: KittyImageDelete::All { delete },
-                verbosity: _,
-            } => {
-                self.kitty_remove_all_placements(delete);
-            }
-            KittyImage::Delete { what, verbosity } => {
-                log::warn!("unhandled KittyImage::Delete {:?} {:?}", what, verbosity);
+            KittyImage::Delete { what, .. } => {
+                // A delete aborts any incomplete transfer on this screen.
+                self.kitty_img.accumulator.clear();
+                self.kitty_img.accumulated_bytes = 0;
+                self.kitty_delete(what);
             }
             KittyImage::TransmitData { .. }
             | KittyImage::TransmitDataAndDisplay { .. }
@@ -415,9 +433,13 @@ impl TerminalState {
     ) {
         let seqno = self.seqno;
         let screen = self.screen_mut();
-        let range =
-            screen.stable_range(&(info.first_row..info.first_row + info.rows as StableRowIndex));
-        for idx in range {
+        let Some(start) = screen.stable_row_to_phys(info.first_row) else {
+            return;
+        };
+        let end = start
+            .saturating_add(info.rows)
+            .min(screen.scrollback_rows());
+        for idx in start..end {
             let line = screen.line_mut(idx);
             for c in line.cells_mut() {
                 c.attrs_mut()
@@ -427,74 +449,153 @@ impl TerminalState {
         }
     }
 
-    fn kitty_remove_placement(&mut self, image_id: u32, placement_id: Option<u32>) {
-        self.remove_kitty_dependents(image_id, placement_id);
-        if placement_id.is_some() {
-            if let Some(info) = self.kitty_img.placements.remove(&(image_id, placement_id)) {
-                log::trace!("removed placement {} {:?}", image_id, placement_id);
-                self.kitty_remove_placement_from_model(image_id, placement_id, info);
-            }
-        } else {
-            let mut to_clear = vec![];
-            for (id, p) in self.kitty_img.placements.keys() {
-                if *id == image_id {
-                    to_clear.push(*p);
+    fn kitty_delete(&mut self, what: KittyImageDelete) {
+        let (mut keys, mut free_ids): (HashSet<Key>, HashSet<u32>) = match what {
+            KittyImageDelete::All { delete } => {
+                let mut visible = HashSet::new();
+                let mut retained = HashSet::new();
+                if let Some(oldest) = self.kitty_img.placements.values().map(|p| p.created).min() {
+                    let screen = self.screen();
+                    let first_live = screen.phys_row(0);
+                    for (row, line) in screen.physical_lines().enumerate() {
+                        if !line.changed_since(oldest.saturating_sub(1)) {
+                            continue;
+                        }
+                        for cell in line.visible_cells() {
+                            for tile in cell.attrs().images().into_iter().flatten() {
+                                if let Some(key) = self.kitty_img.tile_key(&tile) {
+                                    retained.insert(key);
+                                    if row >= first_live && cell.cell_index() < screen.physical_cols
+                                    {
+                                        visible.insert(key);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+                self.visible_kitty_relatives(&mut visible);
+                let release = visible
+                    .iter()
+                    .map(|key| key.0)
+                    .filter(|&id| delete || id == 0)
+                    .collect();
+                // Cell erasure and history eviction can remove a physical placement
+                // independently. A stale entry must not pin its source data when
+                // the last visible placement of the same image is deleted.
+                visible.extend(
+                    self.kitty_img
+                        .placements
+                        .keys()
+                        .filter(|key| !retained.contains(key))
+                        .copied(),
+                );
+                (visible, release)
             }
-            for p in to_clear.into_iter() {
-                if let Some(info) = self.kitty_img.placements.remove(&(image_id, p)) {
-                    self.kitty_remove_placement_from_model(image_id, p, info);
-                }
+            KittyImageDelete::ByImageIdRange {
+                first,
+                last,
+                delete,
+            } => {
+                // Anonymous images have no client image ID.
+                let matches = |id: u32| id != 0 && (first..=last).contains(&id);
+                let keys = self.kitty_img.keys().filter(|key| matches(key.0)).collect();
+                let release = self
+                    .kitty_img
+                    .id_to_data
+                    .keys()
+                    .copied()
+                    .filter(|&id| delete && matches(id))
+                    .collect();
+                (keys, release)
             }
-        }
-
-        log::trace!(
-            "after remove: there are {} placements, {} images, {} memory",
-            self.kitty_img.placements.len(),
-            self.kitty_img.id_to_data.len(),
-            self.kitty_img.used_memory,
-        );
-    }
-
-    pub(crate) fn kitty_remove_all_placements(&mut self, delete: bool) {
-        for ((image_id, p), info) in std::mem::take(&mut self.kitty_img.placements).into_iter() {
-            self.kitty_remove_placement_from_model(image_id, p, info);
-        }
-        // A virtual prototype has no physical position. Global deletion drops
-        // its visible relative placements, but leaves the prototype available.
-        // Children of a deleted ordinary parent also lose orphaned image data.
-        let orphaned: HashSet<_> = self
-            .kitty_img
-            .projected
-            .iter()
-            .filter_map(|(&key, node)| {
-                (node.parent.is_some() && !self.has_virtual_ancestor(key)).then_some(key.0)
-            })
-            .collect();
+            KittyImageDelete::ByImageId {
+                image_id,
+                placement_id,
+                delete,
+            } => {
+                let keys = self
+                    .kitty_img
+                    .keys()
+                    .filter(|key| {
+                        key.0 == image_id && (placement_id.is_none() || key.1 == placement_id)
+                    })
+                    .collect();
+                let release = (delete || image_id == 0)
+                    .then_some(image_id)
+                    .into_iter()
+                    .collect();
+                (keys, release)
+            }
+            _ => {
+                log::warn!("unhandled KittyImage::Delete {:?}", what);
+                return;
+            }
+        };
+        self.collect_kitty_dependents(&mut keys, &mut free_ids);
+        self.detach_kitty_cells(&keys);
+        self.kitty_img
+            .placements
+            .retain(|key, _| !keys.contains(key));
         self.kitty_img
             .projected
-            .retain(|_, node| node.placement.virtual_placement);
-        for id in orphaned {
-            if !self.kitty_img.projected.keys().any(|k| k.0 == id) {
-                self.kitty_img.remove_data_for_id(id);
-                self.kitty_img.number_to_id.retain(|_, other| *other != id);
-            }
+            .retain(|key, _| !keys.contains(key));
+        for key in self.kitty_img.keys() {
+            free_ids.remove(&key.0);
         }
-        if delete {
-            let keep: HashSet<_> = self.kitty_img.projected.keys().map(|k| k.0).collect();
-            self.kitty_img.id_to_data.retain(|id, _| keep.contains(id));
-            self.kitty_img.playback.retain(|id, _| keep.contains(id));
-            self.image_cache.clear();
-            self.kitty_img.used_memory = self
-                .kitty_img
-                .id_to_data
-                .values()
-                .map(|img| img.len())
-                .sum();
+        if !free_ids.is_empty() {
             self.kitty_img
                 .number_to_id
-                .retain(|_, id| keep.contains(id));
+                .retain(|_, id| !free_ids.contains(id));
+            for id in free_ids {
+                self.kitty_img.remove_data_for_id(id);
+            }
+            self.image_cache.clear();
         }
+    }
+
+    fn detach_kitty_cells(&mut self, keys: &HashSet<Key>) {
+        let state = &self.kitty_img;
+        let Some(oldest) = keys
+            .iter()
+            .filter_map(|key| state.placements.get(key))
+            .map(|p| p.created)
+            .min()
+        else {
+            return;
+        };
+        // Reflow and line edits can move a tile outside its insertion rectangle.
+        // Scan retained rows once, expanding only lines with matching tiles.
+        let seqno = self.seqno;
+        let mut hits = Vec::new();
+        self.screen.for_each_phys_line_mut(|_, line| {
+            if !line.changed_since(oldest.saturating_sub(1)) {
+                return;
+            }
+            for cell in line.visible_cells() {
+                for tile in cell.attrs().images().into_iter().flatten() {
+                    if let Some(key) = state.tile_key(&tile) {
+                        if keys.contains(&key) {
+                            hits.push((cell.cell_index(), key));
+                        }
+                    }
+                }
+            }
+            if !hits.is_empty() {
+                let cells = line.cells_mut_for_attr_changes_only();
+                for (x, (id, p)) in hits.drain(..) {
+                    cells[x].attrs_mut().detach_image_with_placement(id, p);
+                }
+                line.update_last_change_seqno(seqno);
+            }
+        });
+    }
+
+    pub(super) fn reset_kitty_images(&mut self) {
+        let keys = self.kitty_img.placements.keys().copied().collect();
+        self.detach_kitty_cells(&keys);
+        self.kitty_img = Default::default();
+        self.image_cache.clear();
     }
 
     fn kitty_send_response(
@@ -777,7 +878,11 @@ impl TerminalState {
             "kitty animation exceeds 32 MiB"
         );
         anyhow::ensure!(
-            self.kitty_img.used_memory.saturating_add(growth) <= 64 * 1024 * 1024,
+            self.kitty_img
+                .used_memory
+                .saturating_add(self.inactive_kitty_img.used_memory)
+                .saturating_add(growth)
+                <= 64 * 1024 * 1024,
             "kitty image table exceeds 64 MiB"
         );
         let x = frame.x.unwrap_or(0);
@@ -1060,7 +1165,8 @@ impl TerminalState {
         // An image id owns its mutable animation frames. Equal initial pixels under
         // two ids may subsequently receive different frames and playback commands.
         let img = Arc::new(ImageData::with_data(img));
-        self.kitty_img.record_id_to_data(image_id, img)?;
+        self.kitty_img
+            .record_id_to_data(image_id, img, &self.inactive_kitty_img)?;
         if let Some(number) = image_number {
             self.kitty_img.number_to_id.insert(number, image_id);
         }

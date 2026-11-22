@@ -54,6 +54,11 @@ The original MIT license is preserved in `LICENSE.md`.
   control parameters. The projection uses the Unicode 6.0 diacritic indices
   published with kitty's graphics protocol. See `docs/graphics-audit.md`.
 
+- Kitty visible deletion uses the live screen boundary for physical placements.
+  The escape parser and image model support inclusive client ID ranges, including
+  the full range used by `kitten icat --clear-all`. The primary and alternate
+  screens have independent graphics state within the terminal's resource limits.
+
 - `screen.rs` and `terminalstate/` retain a primary-screen OSC 133 command's
   output boundaries across scrolling and reflow. On completion they expose
   bounded plain text and the numeric exit status. The sibling escape parser

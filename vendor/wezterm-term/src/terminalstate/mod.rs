@@ -407,6 +407,7 @@ pub struct TerminalState {
     user_vars: HashMap<String, String>,
 
     kitty_img: KittyImageState,
+    inactive_kitty_img: KittyImageState,
     seqno: SequenceNo,
 
     synchronized_output: bool,
@@ -562,9 +563,10 @@ impl TerminalState {
             ));
         }
         self.kitty_img = Default::default();
+        self.inactive_kitty_img = Default::default();
         self.image_cache.clear();
         self.screen.screen = primary;
-        self.screen.activate_primary_screen(self.seqno);
+        self.activate_screen(false);
     }
 
     /// Retained CPU image cache bytes (live screen/scrollback references are separate).
@@ -653,6 +655,7 @@ impl TerminalState {
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
+            inactive_kitty_img: Default::default(),
             synchronized_output: false,
             seqno,
             unicode_version,
@@ -964,6 +967,7 @@ impl TerminalState {
 
         self.erase_in_display(EraseInDisplay::EraseDisplay);
 
+        self.screen.placement_rows_changed();
         for (idx, row) in rows.into_iter().enumerate() {
             *self.screen.line_mut(idx) = row;
         }
@@ -987,6 +991,17 @@ impl TerminalState {
     /// to dispatch mouse events to the terminal.
     pub fn is_mouse_grabbed(&self) -> bool {
         self.mouse_tracking || self.button_event_mouse || self.any_event_mouse
+    }
+
+    fn activate_screen(&mut self, alternate: bool) {
+        if self.screen.is_alt_screen_active() != alternate {
+            std::mem::swap(&mut self.kitty_img, &mut self.inactive_kitty_img);
+        }
+        if alternate {
+            self.screen.activate_alt_screen(self.seqno);
+        } else {
+            self.screen.activate_primary_screen(self.seqno);
+        }
     }
 
     /// Returns true if the alternate screen (secondary screen buffer) is currently active.
@@ -1629,12 +1644,12 @@ impl TerminalState {
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as i64;
                 self.left_and_right_margins = 0..self.screen().physical_cols;
                 self.left_and_right_margin_mode = false;
-                self.screen.activate_alt_screen(self.seqno);
+                self.activate_screen(true);
+                self.reset_kitty_images();
                 self.screen.saved_cursor().take();
-                self.screen.activate_primary_screen(self.seqno);
+                self.activate_screen(false);
                 self.screen.saved_cursor().take();
-                self.kitty_remove_all_placements(true);
-                self.kitty_img = Default::default();
+                self.reset_kitty_images();
 
                 self.reverse_wraparound_mode = false;
                 self.reverse_video_mode = false;
@@ -2054,7 +2069,7 @@ impl TerminalState {
                 DecPrivateModeCode::EnableAlternateScreen,
             )) => {
                 if !self.screen.is_alt_screen_active() {
-                    self.screen.activate_alt_screen(self.seqno);
+                    self.activate_screen(true);
                     self.pen = CellAttributes::default();
                 }
             }
@@ -2064,7 +2079,8 @@ impl TerminalState {
                 if self.screen.is_alt_screen_active() {
                     self.pen = CellAttributes::default();
                     self.erase_in_display(EraseInDisplay::EraseDisplay);
-                    self.screen.activate_primary_screen(self.seqno);
+                    self.kitty_img = Default::default();
+                    self.activate_screen(false);
                 }
             }
 
@@ -2072,7 +2088,7 @@ impl TerminalState {
                 DecPrivateModeCode::EnableAlternateScreen,
             )) => {
                 if self.screen.is_alt_screen_active() {
-                    self.screen.activate_primary_screen(self.seqno);
+                    self.activate_screen(false);
                     self.pen = CellAttributes::default();
                 }
             }
@@ -2269,7 +2285,8 @@ impl TerminalState {
             )) => {
                 if !self.screen.is_alt_screen_active() {
                     self.dec_save_cursor();
-                    self.screen.activate_alt_screen(self.seqno);
+                    self.activate_screen(true);
+                    self.kitty_img = Default::default();
                     self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
                     self.pen = CellAttributes::default();
                     self.erase_in_display(EraseInDisplay::EraseDisplay);
@@ -2279,7 +2296,7 @@ impl TerminalState {
                 DecPrivateModeCode::ClearAndEnableAlternateScreen,
             )) => {
                 if self.screen.is_alt_screen_active() {
-                    self.screen.activate_primary_screen(self.seqno);
+                    self.activate_screen(false);
                     self.dec_restore_cursor();
                 }
             }
