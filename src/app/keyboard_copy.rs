@@ -212,12 +212,18 @@ impl TerminalApp {
                     let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
                     mode.pending = Some(Pending::Clipboard(request));
                     mode.queued.clear();
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let _ = tab.session.input.send(Command::CopyRange(
-                        mode.state.screen,
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    let _ = tab.session.input.send(Command::CopyRange {
+                        screen: mode.state.screen,
                         selection,
-                        tx,
-                    ));
+                        trim_block: self
+                            .appearance
+                            .read()
+                            .unwrap()
+                            .interaction
+                            .trim_block_selection,
+                        reply,
+                    });
                     ctx.spawn_background_with_rejection(
                         move |_| {
                             let result = rx
