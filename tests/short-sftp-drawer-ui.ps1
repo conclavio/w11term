@@ -19,6 +19,7 @@ public static class DrawerPointer {
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
     public static void ClickHosted(IntPtr window, int x, int y) {
         if (Environment.GetEnvironmentVariable("GITHUB_ACTIONS") != "true" ||
             Environment.GetEnvironmentVariable("RUNNER_ENVIRONMENT") != "github-hosted")
@@ -60,12 +61,36 @@ function Drawer-Action($Actions, [string]$Label) {
         [System.Windows.Automation.AutomationElement]::NameProperty, $Label)
     return $Actions.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$match)
 }
+function Check-NarrowNavigation {
+    $resize.Resize([Math]::Round(540 * $scale), $root.Current.BoundingRectangle.Height)
+    $null = Wait-Until 'two complete navigation rows in a drawer narrower than 300 DIPs' {
+        $actions = Find-Element 'SFTP actions'
+        if (!$actions) { return }
+        $viewport = $actions.Current.BoundingRectangle
+        if ($viewport.IsEmpty -or $viewport.Width -ge 300 * $scale) { return }
+        $position = $actions.GetCurrentPattern($scroll).Current
+        if ($position.HorizontallyScrollable -and $position.HorizontalScrollPercent -gt 0) { return }
+        $bounds = @{}
+        foreach ($label in 'Back','Forward','Up','Refresh') {
+            $item = Drawer-Action $actions $label
+            if (!$item -or $item.Current.IsOffscreen) { return }
+            $rect = $item.Current.BoundingRectangle
+            if ($rect.IsEmpty -or $rect.Width -lt 20 * $scale -or $rect.Height -lt 20 * $scale -or
+                $rect.Left -lt $viewport.Left - 1 -or $rect.Right -gt $viewport.Right + 1 -or
+                $rect.Top -lt $viewport.Top - 1 -or $rect.Bottom -gt $viewport.Bottom + 1) { return }
+            $bounds[$label] = $rect
+        }
+        [Math]::Abs($bounds.Back.Top - $bounds.Forward.Top) -le 1 -and $bounds.Back.Right -le $bounds.Forward.Left -and
+            [Math]::Abs($bounds.Up.Top - $bounds.Refresh.Top) -le 1 -and $bounds.Up.Right -le $bounds.Refresh.Left -and
+            $bounds.Back.Bottom -le $bounds.Up.Top
+    }
+}
 function Check-Actions {
     $actions = Find-Element 'SFTP actions'
     $actionsScroll = $actions.GetCurrentPattern($scroll)
     $remaining = [Collections.Generic.HashSet[string]]::new()
     $ellipsis = [char]0x2026
-    foreach ($label in 'Close',"Go to folder$ellipsis",'Up','Refresh',"Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Delete$ellipsis",
+    foreach ($label in 'Close',"Go to folder$ellipsis",'Back','Forward','Up','Refresh',"Bookmarks$ellipsis","Upload$ellipsis",'New folder',"Rename$ellipsis","Delete$ellipsis",
         'Open folder',"Download$ellipsis",'Open shell here','Copy directory path','Copy selected path','Follow shell directory',
         'Replace existing files',"Filter filenames$ellipsis",'Clear filter','Previous','Next') { $null = $remaining.Add($label) }
     $horizontal = if ($actionsScroll.Current.HorizontallyScrollable) { 0,100 } else { -1 }
@@ -94,7 +119,10 @@ try {
     $null = [DrawerPointer]::SetThreadDpiAwarenessContext([IntPtr](-4))
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
-    $resize.Resize(900,940)
+    $scale = [DrawerPointer]::GetDpiForWindow($window) / 96.0
+    $tallWidth = [Math]::Round(900 * $scale)
+    $tallWindowHeight = [Math]::Round(940 * $scale)
+    $resize.Resize($tallWidth,$tallWindowHeight)
     $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
     $pane = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
@@ -105,6 +133,7 @@ try {
     $rowHeight = $folder.Current.BoundingRectangle.Height
     if ($rowHeight -lt 10 -or $tallHeight -lt 3 * $rowHeight) { throw 'Expected at least three visible rows in the tall window' }
 
+    Check-NarrowNavigation
     # WinUI clamps this request to the current monitor's native minimum.
     $resize.Resize(900,200)
     try { $point = Wait-Until 'one complete, hit-testable file row in the short window' {
@@ -130,7 +159,7 @@ try {
         Invoke-Button (Find-Element 'projects/' $button)
     }
     $null = Wait-Until 'first selectable folder activated' { (Is-Enabled 'Open folder') -and !(Is-Enabled ('Download' + [char]0x2026)) }
-    $resize.Resize(900,940)
+    $resize.Resize($tallWidth,$tallWindowHeight)
     $null = Wait-Until 'file list expands again' { (Find-Element 'SFTP entries').Current.BoundingRectangle.Height -ge $tallHeight-2 }
 } finally {
     if (!$app.HasExited) {

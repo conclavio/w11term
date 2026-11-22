@@ -7,6 +7,9 @@ use w11term::folder_grants::Authority;
 use w11term::sftp::{DEFAULT_TIMEOUT, EntryKind, Job, Operation, TransferCancel, TransferProgress};
 
 mod bookmarks;
+mod history;
+
+use history::{FolderHistory, HistoryDirection};
 
 const PAGE_SIZE: usize = 32;
 const PANEL_PADDING: f64 = 10.0;
@@ -52,6 +55,7 @@ pub enum FileAction {
     Close(u64),
     CancelTransfer(TransferId),
     Browse(u64, u64, String),
+    History(u64, u64, u64, HistoryDirection),
     GoToFolder(u64, u64, u64),
     OpenEntry(u64, u64, ListedEntry),
     EditFilter(u64, u64, u64, bool),
@@ -70,7 +74,13 @@ pub enum FileAction {
     Pick(u64, u64, String, Option<ListedEntry>),
     Picked(u64, u64, Option<ListedEntry>, Result<Vec<PathBuf>, String>),
     Drop(u64, u64, String, Vec<PathBuf>),
-    Listed(u64, u64, String, Result<Vec<Entry>, String>),
+    Listed(
+        u64,
+        u64,
+        String,
+        Option<HistoryDirection>,
+        Result<Vec<Entry>, String>,
+    ),
     Tick(u64),
 }
 
@@ -79,6 +89,7 @@ pub(super) struct FileDrawer {
     pub(super) open: bool,
     generation: u64,
     directory: Option<String>,
+    history: FolderHistory,
     bookmarks: Option<bookmarks::List>,
     /// Describes an explicit navigation request if either REALPATH or listing fails.
     opening_target: Option<String>,
@@ -248,8 +259,8 @@ impl EntryChange {
 }
 
 enum Step {
-    Canonical,
-    Listing(String),
+    Canonical(Option<HistoryDirection>),
+    Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
     Transfer(TransferFile),
     Change { parent: String, change: EntryChange },
@@ -652,7 +663,31 @@ impl FileDrawer {
         }
     }
 
-    fn accept_listing(&mut self, path: String, entries: Vec<Entry>) {
+    fn history_target(
+        &self,
+        generation: u64,
+        revision: u64,
+        direction: HistoryDirection,
+    ) -> Option<&str> {
+        if !self.open
+            || self.directory.is_none()
+            || self.busy()
+            || self.bookmarks.is_some()
+            || self.generation != generation
+            || self.listing_revision != revision
+        {
+            return None;
+        }
+        self.history.target(direction)
+    }
+
+    fn accept_listing(
+        &mut self,
+        direction: Option<HistoryDirection>,
+        path: String,
+        entries: Vec<Entry>,
+    ) {
+        self.history.listed(&path, direction);
         self.opening_target = None;
         self.end_filter_edit();
         if self.directory.as_ref() != Some(&path) {
@@ -957,6 +992,12 @@ impl FileDrawer {
                 .on_click(context.callback(move |_| Message::Files(action.clone())))
                 .content(TextBlock::new().text(label))
         };
+        let button_pair = |first: View, second: View| {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(6.0)
+                .children((first, second))
+        };
         let folder = self.directory.as_deref().unwrap_or(".");
         let generation = self.generation;
         let ready = !self.busy();
@@ -1004,19 +1045,42 @@ impl FileDrawer {
                     )),
                 )),
             StackPanel::new()
+                .orientation(if layout.content_width() >= 300.0 {
+                    Orientation::Horizontal
+                } else {
+                    Orientation::Vertical
+                })
+                .spacing(6.0)
+                .children((
+                    button_pair(
+                        button(
+                            "Back",
+                            writable && self.history.target(HistoryDirection::Back).is_some(),
+                            History(pane, generation, revision, HistoryDirection::Back),
+                        ),
+                        button(
+                            "Forward",
+                            writable && self.history.target(HistoryDirection::Forward).is_some(),
+                            History(pane, generation, revision, HistoryDirection::Forward),
+                        ),
+                    ),
+                    button_pair(
+                        button(
+                            "Up",
+                            writable && folder != "/",
+                            Browse(
+                                pane,
+                                generation,
+                                format!("{}/..", folder.trim_end_matches('/')),
+                            ),
+                        ),
+                        button("Refresh", ready, Browse(pane, generation, folder.into())),
+                    ),
+                )),
+            StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(6.0)
                 .children((
-                    button(
-                        "Up",
-                        writable && folder != "/",
-                        Browse(
-                            pane,
-                            generation,
-                            format!("{}/..", folder.trim_end_matches('/')),
-                        ),
-                    ),
-                    button("Refresh", ready, Browse(pane, generation, folder.into())),
                     button(
                         "Bookmarks…",
                         ready && profile.is_some(),
@@ -1350,6 +1414,7 @@ impl FileDrawer {
         id: u64,
         session: &Session,
         path: String,
+        direction: Option<HistoryDirection>,
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.bookmarks = None;
@@ -1361,7 +1426,7 @@ impl FileDrawer {
             id,
             session,
             Operation::Realpath { path },
-            Step::Canonical,
+            Step::Canonical(direction),
             context,
         )
     }
@@ -1372,10 +1437,11 @@ impl FileDrawer {
         session: &Session,
         path: String,
         description: String,
+        direction: Option<HistoryDirection>,
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
         self.following = false;
-        let result = self.browse(pane, session, path, context);
+        let result = self.browse(pane, session, path, direction, context);
         self.opening_target = Some(description);
         result
     }
@@ -1483,7 +1549,7 @@ impl FileDrawer {
                     self.status.clear();
                 }
             }
-            Step::Canonical => {
+            Step::Canonical(direction) => {
                 let path = reply["entries"][0]["filename"]
                     .as_str()
                     .context("Missing canonical directory")?
@@ -1496,17 +1562,18 @@ impl FileDrawer {
                     id,
                     session,
                     Operation::Ls { path: path.clone() },
-                    Step::Listing(path),
+                    Step::Listing(path, direction),
                     context,
                 )?;
             }
-            Step::Listing(path) => {
+            Step::Listing(path, direction) => {
                 let generation = self.generation;
                 self.parsing = true;
                 let rejected = Message::Files(FileAction::Listed(
                     id,
                     generation,
                     path.clone(),
+                    direction,
                     Err("Unable to display the directory; refresh to retry".into()),
                 ));
                 context.spawn_background_with_rejection(
@@ -1515,6 +1582,7 @@ impl FileDrawer {
                             id,
                             generation,
                             path,
+                            direction,
                             directory_entries(&reply).map_err(|e| e.to_string()),
                         ))
                     },
@@ -1532,7 +1600,7 @@ impl FileDrawer {
                         id,
                         session,
                         Operation::Ls { path: path.clone() },
-                        Step::Listing(path),
+                        Step::Listing(path, None),
                         context,
                     )?;
                 } else {
@@ -1556,7 +1624,7 @@ impl FileDrawer {
                     Operation::Ls {
                         path: parent.clone(),
                     },
-                    Step::Listing(parent),
+                    Step::Listing(parent, None),
                     context,
                 )?;
             }
@@ -1597,7 +1665,7 @@ impl LiveTab {
             self.files.cached.borrow_mut().take();
             if let Err(error) =
                 self.files
-                    .browse(self.session.pane_id, &self.session, path, context)
+                    .browse(self.session.pane_id, &self.session, path, None, context)
             {
                 self.files.status = format!("{error:#}");
             }
@@ -1642,7 +1710,7 @@ impl TerminalApp {
             pane,
             &tab.session,
             Operation::ListMountedFolder { path: path.into() },
-            Step::Listing(path.into()),
+            Step::Listing(path.into(), None),
             context,
         )?;
         files.open = true;
@@ -1762,6 +1830,7 @@ impl TerminalApp {
             | Follow(id, ..)
             | Reveal(id, ..)
             | Browse(id, ..)
+            | History(id, ..)
             | GoToFolder(id, ..)
             | OpenEntry(id, ..)
             | EditFilter(id, ..)
@@ -1864,7 +1933,7 @@ impl TerminalApp {
                     self.initial_grid.set(None);
                     crate::input::clear_grid();
                     if files.open && files.directory.is_none() && !files.busy() {
-                        files.browse(pane, session, ".".into(), context)?;
+                        files.browse(pane, session, ".".into(), None, context)?;
                     }
                 }
                 OpenHere => {
@@ -1875,7 +1944,7 @@ impl TerminalApp {
                     if !files.busy() {
                         let path = shell_directory(frame.reported_directory.as_deref(), &ssh.host)
                             .unwrap_or_else(|| ".".into());
-                        files.browse(pane, session, path, context)?;
+                        files.browse(pane, session, path, None, context)?;
                     }
                 }
                 Close(_) => {
@@ -1897,7 +1966,7 @@ impl TerminalApp {
                         files.following = false;
                         self.initial_grid.set(None);
                         crate::input::clear_grid();
-                        files.browse(pane, session, directory, context)?;
+                        files.browse(pane, session, directory, None, context)?;
                         files.reveal = name.map(RevealTarget::Existing);
                     }
                 }
@@ -1910,9 +1979,9 @@ impl TerminalApp {
                         files.status = "Cancelling transfer…".into();
                     }
                 }
-                Listed(_, _, path, result) if files.parsing => {
+                Listed(_, _, path, direction, result) if files.parsing => {
                     files.parsing = false;
-                    files.accept_listing(path, result.map_err(|e| anyhow!("{e}"))?);
+                    files.accept_listing(direction, path, result.map_err(|e| anyhow!("{e}"))?);
                 }
                 Picked(_, _, remote, result) if files.picking => {
                     files.picking = false;
@@ -1972,6 +2041,7 @@ impl TerminalApp {
                                     session,
                                     path,
                                     format!("folder {name}"),
+                                    None,
                                     context,
                                 );
                             }
@@ -2059,6 +2129,23 @@ impl TerminalApp {
                     }
                 }
                 ClearFilter(..) => files.set_filter(String::new()),
+                History(_, generation, revision, direction) => {
+                    if may_open_dialog
+                        && let Some(path) = files
+                            .history_target(generation, revision, direction)
+                            .map(str::to_owned)
+                    {
+                        let description = format!("folder {path}");
+                        files.browse_named(
+                            pane,
+                            session,
+                            path,
+                            description,
+                            Some(direction),
+                            context,
+                        )?;
+                    }
+                }
                 GoToFolder(_, _, revision) => {
                     if may_open_dialog {
                         files.begin_go_to_folder(revision);
@@ -2101,7 +2188,7 @@ impl TerminalApp {
                     if files.directory.as_ref() != Some(&path) {
                         files.following = false;
                     }
-                    files.browse(pane, session, path, context)?;
+                    files.browse(pane, session, path, None, context)?;
                 }
                 Choose(_, _, entry) => {
                     if files.has_entry(&entry) {
@@ -2124,7 +2211,7 @@ impl TerminalApp {
                 OpenEntry(_, _, entry) => {
                     let path = files.selected_path(&entry)?;
                     files.following = false;
-                    files.browse(pane, session, path, context)?;
+                    files.browse(pane, session, path, None, context)?;
                 }
                 Page(_, _, _, page) => {
                     files.end_filter_edit();
@@ -2462,6 +2549,44 @@ mod tests {
     }
 
     #[test]
+    fn folder_history_uses_displayed_listings_and_current_connection() {
+        use HistoryDirection::{Back, Forward};
+        let mut drawer = FileDrawer {
+            open: true,
+            generation: 3,
+            ..Default::default()
+        };
+        drawer.accept_listing(None, "/home".into(), vec![]);
+        drawer.accept_listing(None, "/work".into(), vec![]);
+        drawer.accept_listing(None, "/srv".into(), vec![]);
+        let revision = drawer.listing_revision;
+        assert_eq!(drawer.history_target(3, revision, Back), Some("/work"));
+        assert_eq!(drawer.history_target(3, revision, Forward), None);
+        assert_eq!(drawer.history_target(2, revision, Back), None);
+        assert_eq!(drawer.history_target(3, revision - 1, Back), None);
+
+        // Resolving/reading the target may still fail. Asking for it must
+        // leave the current listing and the next Back destination intact.
+        drawer.parsing = true;
+        assert_eq!(drawer.history_target(3, revision, Back), None);
+        drawer.parsing = false;
+        assert_eq!(drawer.history_target(3, revision, Back), Some("/work"));
+        assert_eq!(drawer.directory.as_deref(), Some("/srv"));
+        drawer.accept_listing(Some(Back), "/work".into(), vec![]);
+        drawer.accept_listing(None, "/work".into(), vec![]); // Refresh
+        assert_eq!(drawer.history.target(Forward), Some("/srv"));
+        assert_eq!(drawer.history.target(Back), Some("/home"));
+        drawer.accept_listing(Some(Forward), "/srv".into(), vec![]);
+        drawer.accept_listing(Some(Back), "/work".into(), vec![]);
+        drawer.accept_listing(None, "/new".into(), vec![]);
+        assert_eq!(drawer.history.target(Back), Some("/work"));
+        assert_eq!(drawer.history.target(Forward), None);
+        drawer.observe_connection(4);
+        assert_eq!(drawer.history.target(Back), None);
+        assert_eq!(drawer.history.target(Forward), None);
+    }
+
+    #[test]
     fn drawer_reserves_file_rows_after_short_window_resizes() {
         // 982x551 device pixels on a 150% display was the failing layout.
         let short = DrawerLayout::for_window(982.0 / 1.5, 551.0 / 1.5);
@@ -2486,7 +2611,7 @@ mod tests {
         };
         assert!(drawer.shell_origin(17).is_none());
         let path = "/ops/shell's $(release);雪";
-        drawer.accept_listing(path.into(), listing());
+        drawer.accept_listing(None, path.into(), listing());
         drawer.set_filter("plain".into());
         drawer.set_page(1);
         let selected = drawer.page_entries().next().unwrap().name.clone();
@@ -2505,14 +2630,14 @@ mod tests {
         drawer.parsing = true;
         assert!(drawer.shell_origin(17).is_none());
         drawer.parsing = false;
-        drawer.accept_listing(path.into(), vec![]);
+        drawer.accept_listing(None, path.into(), vec![]);
         assert_ne!(drawer.shell_origin(17).unwrap(), target);
         drawer.open = false;
         assert!(drawer.shell_origin(17).is_none());
         drawer.open = true;
         drawer.observe_connection(4);
         assert!(drawer.shell_origin(17).is_none());
-        drawer.accept_listing(path.into(), vec![]);
+        drawer.accept_listing(None, path.into(), vec![]);
         assert_ne!(drawer.shell_origin(17).unwrap(), target);
         for invalid in [
             "relative",
@@ -2520,7 +2645,7 @@ mod tests {
             "/tmp/../etc",
             "/tmp/line\nbreak",
         ] {
-            drawer.accept_listing(invalid.into(), vec![]);
+            drawer.accept_listing(None, invalid.into(), vec![]);
             assert!(drawer.shell_origin(17).is_none(), "{invalid:?}");
         }
     }
@@ -2528,7 +2653,7 @@ mod tests {
     #[test]
     fn filename_filter_searches_every_retained_page_in_order_and_clamps_pages() {
         let mut drawer = FileDrawer::default();
-        drawer.accept_listing("/tmp".into(), listing());
+        drawer.accept_listing(None, "/tmp".into(), listing());
         let revision = drawer.listing_revision;
         drawer.set_page(2);
         drawer.set_filter(" [ÅNGSTRÖM] ".into());
@@ -2566,6 +2691,7 @@ mod tests {
         let name = "Å folder's [logs] $x";
         let kind = ListedKind::Known(EntryKind::Symlink);
         drawer.accept_listing(
+            None,
             "/".into(),
             vec![Entry {
                 name: name.into(),
@@ -2587,7 +2713,7 @@ mod tests {
         );
         drawer.set_filter("other".into());
         assert!(drawer.path_to_copy(revision, Some(&listed)).is_none());
-        drawer.accept_listing("/new dir".into(), vec![]);
+        drawer.accept_listing(None, "/new dir".into(), vec![]);
         assert!(drawer.path_to_copy(revision, None).is_none());
         assert_eq!(
             drawer
@@ -2605,7 +2731,7 @@ mod tests {
             open: true,
             ..Default::default()
         };
-        drawer.accept_listing("/tmp".into(), listing());
+        drawer.accept_listing(None, "/tmp".into(), listing());
         let entry = ListedEntry {
             parent: "/tmp".into(),
             revision: drawer.listing_revision,
@@ -2645,10 +2771,10 @@ mod tests {
             open: true,
             ..Default::default()
         };
-        drawer.accept_listing("/tmp".into(), listing());
+        drawer.accept_listing(None, "/tmp".into(), listing());
         drawer.set_filter("雪".into());
         drawer.reveal = Some(RevealTarget::Existing("70 [Ångström] 雪".into()));
-        drawer.accept_listing("/tmp".into(), listing());
+        drawer.accept_listing(None, "/tmp".into(), listing());
         assert_eq!(drawer.filter, "雪");
         assert_eq!(drawer.page, 1);
         assert_eq!(drawer.selected.as_deref(), Some("70 [Ångström] 雪"));
@@ -2656,12 +2782,12 @@ mod tests {
             from: "old".into(),
             to: "65 plain".into(),
         }));
-        drawer.accept_listing("/tmp".into(), listing());
+        drawer.accept_listing(None, "/tmp".into(), listing());
         assert!(drawer.filter.is_empty());
         assert_eq!(drawer.page, 2);
         assert_eq!(drawer.selected.as_deref(), Some("65 plain"));
         drawer.set_filter("plain".into());
-        drawer.accept_listing("/tmp/sub".into(), listing());
+        drawer.accept_listing(None, "/tmp/sub".into(), listing());
         assert!(drawer.filter.is_empty());
         assert!(drawer.selected.is_none());
         assert_eq!(drawer.page, 0);
@@ -2813,7 +2939,7 @@ mod tests {
             generation: 4,
             ..Default::default()
         };
-        drawer.accept_listing("/work/チーム".into(), listing());
+        drawer.accept_listing(None, "/work/チーム".into(), listing());
         drawer.set_filter("plain".into());
         drawer.set_page(1);
         let selected = drawer.page_entries().next().unwrap().name.clone();
@@ -2889,11 +3015,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(path, "/recovery");
-        drawer.accept_listing(path, listing());
+        drawer.accept_listing(None, path, listing());
         let revision = drawer.listing_revision;
         drawer.begin_go_to_folder(revision);
         drawer.dialog.as_mut().unwrap().name = ".".into();
-        drawer.accept_listing("/recovery".into(), Vec::new());
+        drawer.accept_listing(None, "/recovery".into(), Vec::new());
         assert!(
             drawer
                 .finish_edit(drawer.dialog_serial, ContentDialogResult::Primary)
@@ -3234,6 +3360,7 @@ mod tests {
             ..Default::default()
         };
         drawer.accept_listing(
+            None,
             "/work".into(),
             vec![Entry {
                 name: "alias".into(),
