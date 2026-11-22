@@ -327,7 +327,10 @@ enum JobStage {
         confirmed: u64,
     },
     Checking(&'static str),
-    EditorSave { temporary: String, publishing: bool },
+    EditorSave {
+        temporary: String,
+        publishing: bool,
+    },
     AwaitingStatus(&'static str),
 }
 
@@ -524,7 +527,9 @@ pub(crate) async fn run(
                     || (lost
                         && matches!(
                             reply.stage,
-                            JobStage::AwaitingStatus(_) | JobStage::NativeUpload { .. } | JobStage::EditorSave { .. }
+                            JobStage::AwaitingStatus(_)
+                                | JobStage::NativeUpload { .. }
+                                | JobStage::EditorSave { .. }
                         ))
                 {
                     result.with_context(|| reply.stage.interrupted())
@@ -699,8 +704,13 @@ impl Engine {
         let ok = json!({});
         let mounted = matches!(op, ListMountedFolder { .. });
         Ok(match op {
-            SaveText { path, original, text } => {
-                self.save_text(&path, original.as_deref(), &text, stage).await?;
+            SaveText {
+                path,
+                original,
+                text,
+            } => {
+                self.save_text(&path, original.as_deref(), &text, stage)
+                    .await?;
                 ok
             }
             Info => {

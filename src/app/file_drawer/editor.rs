@@ -13,6 +13,8 @@ pub(super) struct Editor {
     mode: Mode,
     saving: bool,
     status: String,
+    multiline_ready: bool,
+    native_text: Cell<Option<String>>,
     input: OnceCell<View>,
 }
 
@@ -24,6 +26,7 @@ enum Mode {
 
 #[derive(Clone)]
 pub enum Action {
+    Mounted,
     Text(String),
     Save,
     SaveAs,
@@ -64,6 +67,8 @@ impl Editor {
     pub(super) fn stash(&mut self) {
         self.open = false;
         self.mode = Mode::Edit;
+        self.multiline_ready = false;
+        self.native_text.take();
         self.input.take();
     }
 
@@ -123,9 +128,14 @@ impl Editor {
                 .on_click(context.callback(move |_| message(action.clone())))
                 .content(label)
         };
-        // TextChanged delivers the new text. Keeping this subtree stable lets WinUI
-        // own the caret/selection without cloning the document for every key or frame.
+        // Reuse the native TextChanged string for the next render. The controlled
+        // TextBox then keeps its caret, even when other terminal frames arrive.
         let input = self.input.get_or_init(|| {
+            // Reactor applies Text before AcceptsReturn when mounting a TextBox.
+            // Mount it empty first so WinUI cannot truncate the seed at line one.
+            if !self.multiline_ready {
+                context.sender().send(message(Action::Mounted));
+            }
             StackPanel::new().keyed_children([KeyedView::new(
                 "input",
                 TextBox::new()
@@ -135,12 +145,16 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap)
                     .min_height(100.0)
                     .max_height(320.0)
-                    .is_enabled(!self.saving)
-                    .text(self.draft.visible())
+                    .is_enabled(self.multiline_ready && !self.saving)
+                    .text_optional(self.multiline_ready.then(|| {
+                        self.native_text
+                            .take()
+                            .unwrap_or_else(|| self.draft.visible().replace('\n', "\r"))
+                    }))
                     .on_text_changed(context.callback(move |s| message(Action::Text(s)))),
             )])
         });
-        let writable = self.generation == generation && !self.saving;
+        let writable = self.multiline_ready && self.generation == generation && !self.saving;
         let mut fields = vec![
             KeyedView::new(
                 "path",
@@ -242,6 +256,8 @@ impl FileDrawer {
             mode: Mode::Edit,
             saving: false,
             status: String::new(),
+            multiline_ready: false,
+            native_text: Cell::default(),
             input: OnceCell::new(),
         });
     }
@@ -269,8 +285,19 @@ impl FileDrawer {
             .filter(|e| e.open && e.serial == serial)?;
         match action {
             Action::Close => editor.stash(),
+            Action::Mounted => {
+                if !editor.multiline_ready {
+                    editor.multiline_ready = true;
+                    editor.input.take();
+                }
+            }
             _ if editor.saving => {}
-            Action::Text(text) => editor.draft.edit(&text),
+            Action::Text(text) if editor.multiline_ready => {
+                editor.draft.edit(&text);
+                editor.native_text.set(Some(text));
+                editor.input.take();
+            }
+            Action::Text(_) => {}
             Action::SaveAs if editor.generation == self.generation => {
                 editor.mode = Mode::SaveAs(String::new())
             }
@@ -375,7 +402,27 @@ mod tests {
         files.finish_preview(preview, Ok(json!({"text":ORIGINAL})));
         files.start_editor(preview);
         let serial = files.editor.as_ref().unwrap().serial;
+        files.editor_action(serial, Action::Mounted);
         (files, serial)
+    }
+
+    #[test]
+    fn mounting_the_multiline_input_preserves_the_recovered_document() {
+        let (mut files, previous) = opened();
+        files.editor_action(previous, Action::Close);
+        files.resume_editor(previous);
+        let current = files.editor.as_ref().unwrap().serial;
+        files.editor_action(previous, Action::Mounted);
+        files.editor_action(current, Action::Text(String::new()));
+        let editor = files.editor.as_ref().unwrap();
+        assert!(!editor.multiline_ready);
+        assert_eq!(editor.draft.contents(), ORIGINAL);
+        files.editor_action(current, Action::Mounted);
+        files.editor_action(current, Action::Text("changed\rsecond\r".into()));
+        assert_eq!(
+            files.editor.as_ref().unwrap().draft.contents(),
+            "\u{feff}changed\r\nsecond\n"
+        );
     }
 
     #[test]

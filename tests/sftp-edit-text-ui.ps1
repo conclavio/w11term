@@ -27,11 +27,11 @@ function By-Id([string]$Id) {
     $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $Id)
     $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
-function Wait-Draft([string]$Expected) {
+function Wait-Draft([string]$Expected, [string]$Step) {
     try {
         Wait-Until 'editable draft with the expected contents' {
             $field = Find-Element 'File text' ([System.Windows.Automation.ControlType]::Edit)
-            if ($field -and $field.Current.AutomationId -eq 'sftp-editor-text') {
+            if ($field -and $field.Current.IsEnabled -and $field.Current.AutomationId -eq 'sftp-editor-text') {
                 $value = $field.GetCurrentPattern($getValue)
                 if (!$value.Current.IsReadOnly -and
                     $value.Current.Value.Replace("`r`n", "`n").Replace("`r", "`n") -ceq $Expected) { $value }
@@ -43,13 +43,28 @@ function Wait-Draft([string]$Expected) {
         $text = $null
         $range = if ($field -and $field.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$text)) { $text.DocumentRange.GetText(-1) }
         $details = [pscustomobject]@{ Expected = $Expected; Actual = $observed; TextRange = $range; ControlType = $field.Current.ControlType.ProgrammaticName; Name = $field.Current.Name; Open = [bool](Find-Element 'Close editor' $button); Draft = [bool](Find-Element 'Resume draft' $button) }
-        throw "Editor draft did not match: $($details | ConvertTo-Json -Compress)"
+        throw "Editor draft did not match during $Step. $($details | ConvertTo-Json -Compress)"
     }
 }
 function Open-Editor {
     Click $name
     Click $preview
     Click 'Edit'
+}
+function Replace-Word([string]$Old, [string]$New) {
+    $edit = Find-Element 'File text' ([System.Windows.Automation.ControlType]::Edit)
+    $edit.SetFocus()
+    $document = $edit.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange
+    $word = $document.FindText($Old, $false, $false)
+    if (!$word) { throw "Could not select '$Old' in the editable document" }
+    $word.Select()
+    $target = Wait-Until 'focused editor input HWND' {
+        $hwnd = [FixtureMessages]::FocusedWindow($window, $app.Id)
+        if ($hwnd -ne [IntPtr]::Zero) { $hwnd }
+    }
+    foreach ($ch in $New.ToCharArray()) {
+        if (![FixtureMessages]::PostKey($target, 0x102, [uint32]$ch)) { throw 'Could not type into the editor' }
+    }
 }
 function Check-File([string]$Path, [string]$Expected) {
     # Check bytes. ReadAllText consumes the BOM and cannot detect its removal.
@@ -88,20 +103,22 @@ try {
     Run-Palette 'Open files here'
 
     Open-Editor
-    (Wait-Draft $original).SetValue($saved.Replace("`n", "`r`n"))
-    $null = Wait-Draft $saved
+    $null = Wait-Draft $original 'initial load'
+    Replace-Word 'slow' 'fast'
+    $null = Wait-Draft $saved 'first edit'
     Click 'Close editor'
     $null = Wait-Until 'closed editor with a retained draft' { (Find-Element 'Resume draft' $button) -and !(By-Id 'sftp-editor-text') }
     Check-File $file $originalBytes
     Click 'Resume draft'
-    $null = Wait-Draft $saved
+    $null = Wait-Draft $saved 'resuming draft'
     Click 'Save'
     $null = Wait-Until 'successful save in the original folder' { (Find-Element "Saved $name") -and !(By-Id 'sftp-editor-text') }
     Check-File $file $savedBytes
 
     Open-Editor
-    (Wait-Draft $saved).SetValue($draft.Replace("`n", "`r`n"))
-    $null = Wait-Draft $draft
+    $null = Wait-Draft $saved 'opening saved file'
+    Replace-Word 'one' 'two'
+    $null = Wait-Draft $draft 'second edit'
     # A second writer changes the bytes without changing the size or timestamp.
     $mtime = [IO.File]::GetLastWriteTimeUtc($file)
     [IO.File]::WriteAllBytes($file, [Text.Encoding]::UTF8.GetBytes($externalBytes))
@@ -111,7 +128,7 @@ try {
         $status = By-Id 'sftp-editor-status'
         $status -and $status.Current.Name.Contains('remote file changed')
     }
-    $null = Wait-Draft $draft
+    $null = Wait-Draft $draft 'save conflict'
     Check-File $file $externalBytes
     Click $saveAs
     $field = Wait-Until 'new remote filename' { By-Id 'sftp-editor-filename' }

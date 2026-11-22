@@ -441,7 +441,9 @@ impl russh_sftp::server::Handler for Files {
     async fn init(&mut self, _: u32, _: HashMap<String, String>) -> Result<Version, StatusCode> {
         let mut version = Version::new();
         if let Ok(value) = fs::read_to_string(self.root.join("posix-rename-version")) {
-            version.extensions.insert("posix-rename@openssh.com".into(), value);
+            version
+                .extensions
+                .insert("posix-rename@openssh.com".into(), value);
             self.posix = Some(Default::default());
         }
         if self.root.join("small-reads").exists() {
