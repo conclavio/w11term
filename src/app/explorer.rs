@@ -99,7 +99,14 @@ pub(super) fn reveal(path: &Path) -> Result<()> {
                             .and_then(|()| {
                                 // With zero children the absolute PIDL identifies the item
                                 // to select in its parent, for both files and directories.
-                                SHOpenFolderAndSelectItems(item, None, 0)
+                                let selected = SHOpenFolderAndSelectItems(item, None, 0);
+                                #[cfg(feature = "ui-smoke")]
+                                if let Err(error) = trace_selection(item, &selected) {
+                                    log::warn!(
+                                        "Recording Explorer selection for the fixture: {error:#}"
+                                    );
+                                }
+                                selected
                             });
                     CoTaskMemFree(Some(item.cast()));
                     CoUninitialize();
@@ -110,6 +117,35 @@ pub(super) fn reveal(path: &Path) -> Result<()> {
             .join()
             .map_err(|_| anyhow!("File Explorer selection stopped"))?
     })
+}
+
+// A runner can have Shell32 without an observable Explorer desktop. Let the
+// native fixture verify the item parsed by Shell32 and the selection call's result.
+#[cfg(feature = "ui-smoke")]
+fn trace_selection(
+    item: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
+    selected: &windows::core::Result<()>,
+) -> Result<()> {
+    use windows::Win32::UI::Shell::{SHGetNameFromIDList, SIGDN_FILESYSPATH};
+
+    let Some(output) = std::env::var_os("W11TERM_TEST_EXPLORER_TRACE") else {
+        return Ok(());
+    };
+    let path = unsafe {
+        let wide = SHGetNameFromIDList(item, SIGDN_FILESYSPATH)?;
+        let path = wide.to_string();
+        CoTaskMemFree(Some(wide.0.cast()));
+        path?
+    };
+    let hresult = selected.as_ref().err().map_or(0, |e| e.code().0);
+    let output = Path::new(&output);
+    let file = tempfile::NamedTempFile::new_in(output.parent().context("Trace directory")?)?;
+    serde_json::to_writer(
+        file.as_file(),
+        &serde_json::json!({ "path": path, "hresult": hresult }),
+    )?;
+    file.persist(output)?;
+    Ok(())
 }
 
 #[cfg(test)]
