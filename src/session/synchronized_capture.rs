@@ -11,6 +11,66 @@ async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
 }
 
 #[tokio::test(start_paused = true)]
+async fn inspect_reads_live_modes_during_a_held_frame_without_enabling_the_gui_inspector() {
+    let size = TerminalSize {
+        cols: 80,
+        rows: 24,
+        pixel_width: 800,
+        pixel_height: 480,
+        dpi: 144,
+    };
+    with_demo(size, async |input, frames| {
+        let registry = Registry::default();
+        registry.replace([Pane {
+            id: 7,
+            tab_id: 2,
+            tab_title: None,
+            label: "background".into(),
+            active: false,
+            visible: false,
+            read_only: true,
+            input: input.clone(),
+        }]);
+        let old = feed(&input, "shell").await;
+        let get_text = || {
+            registry.execute(
+                Request::GetText { pane: 7 },
+                Arc::new(|_, _, _| unreachable!()),
+            )
+        };
+        let shell = get_text().await.unwrap();
+        assert!(shell["text"].as_str().unwrap().contains("shell"));
+        feed(
+            &input,
+            "\x1b[?2026h\x1b[?1049h\x1b[?2004h\x1b[?2048h\x1b[?1000h\x1b[?1016h\x1b[>3u",
+        )
+        .await;
+        input.send(Command::SetReadOnly(true)).unwrap();
+        let request: Request =
+            serde_json::from_value(serde_json::json!({"verb":"inspect","pane":7})).unwrap();
+        let modes = registry
+            .execute(request, Arc::new(|_, _, _| unreachable!()))
+            .await
+            .unwrap();
+        assert_eq!(
+            modes,
+            serde_json::json!({
+                "pane":7, "connection_generation":0, "cols":80, "rows":24,
+                "pixel_width":800, "pixel_height":480, "dpi":144, "alternate_screen":true,
+                "bracketed_paste":true, "synchronized_output":true, "in_band_resize":true,
+                "mouse":{"click":true, "drag":false, "motion":false, "encoding":"sgr-pixels"},
+                "keyboard":{"encoding":"kitty", "flags":3}
+            })
+        );
+        assert!(frames.inspection().is_none());
+        assert_eq!(frames.load().generation, old.generation);
+        assert!(!frames.load().alternate);
+        assert_eq!(get_text().await.unwrap(), shell);
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn changing_scheme_recolors_read_only_scrollback_and_commits_at_sync_boundaries() {
     let size = TerminalSize {
         rows: 3,

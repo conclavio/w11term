@@ -78,6 +78,7 @@ Open a new pipe connection for each command. Write one UTF-8 JSON object followe
 {"verb":"list"}
 {"verb":"send-text","pane":1,"no_paste":true,"data_base64":"Qk9BUkQN"}
 {"verb":"get-text","pane":1}
+{"verb":"inspect","pane":1}
 {"verb":"save-text","pane":1,"path":"C:\\tests\\shell-transcript.txt","overwrite":false}
 {"verb":"screenshot","pane":1,"path":"C:\\tests\\frame.png"}
 ```
@@ -92,6 +93,22 @@ Direct protocol screenshot paths must be absolute. The CLI resolves relative pat
 `list.result` contains `pid` and a `sessions` array. Use each entry’s `id` as the argument to `--pane`. Its `tab_id` identifies the containing tab. Both IDs are local to the running process. The `active` flag identifies the selected terminal pane, and `visible` reports whether the layout displays it. Selecting a utility tab leaves every terminal inactive. A script can address any pane independently of visibility or native keyboard focus.
 
 Each entry also has a `label` and `status`. Available sessions report `title`, `cols`, `rows`, `connection_generation`, and `prompt`. An unavailable session retains its IDs and flags and reports an `error`. Prompts expose public challenge metadata only. The connection generation increases after each new SSH login. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels.
+
+## Live pane inspection
+
+`inspect --pane ID` reads the selected pane’s local terminal parser once. It works on background and read-only panes and preserves keyboard focus. During a synchronized update, `inspect` can already show the new modes while `get-text` still returns the last committed screen.
+
+```powershell
+$reply = & $ctl --pid 12345 inspect --pane $pane | ConvertFrom-Json
+if (!$reply.ok) { throw $reply.error }
+$modes = $reply.result
+"$($modes.cols) × $($modes.rows) cells, $($modes.pixel_width) × $($modes.pixel_height) pixels"
+if ($modes.in_band_resize) { 'This pane has subscribed to resize reports.' }
+```
+
+The reply includes `pane`, `connection_generation`, `cols`, `rows`, `pixel_width`, `pixel_height` and `dpi`. Pixel dimensions describe the drawable text area. An unavailable measurement is zero. The booleans `alternate_screen`, `bracketed_paste`, `synchronized_output` and `in_band_resize` reflect the modes at the time of the read.
+
+`mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
 ## Completed shell commands
 

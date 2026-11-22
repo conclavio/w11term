@@ -710,6 +710,10 @@ impl TerminalState {
         self.synchronized_output
     }
 
+    pub fn in_band_resize_enabled(&self) -> bool {
+        self.report_text_area_resize
+    }
+
     /// Used by the embedding's watchdog; does not block parsing or input.
     pub fn end_synchronized_output(&mut self) {
         self.synchronized_output = false;
