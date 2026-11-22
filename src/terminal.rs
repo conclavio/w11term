@@ -163,6 +163,17 @@ pub fn create_with_profile(
     )
 }
 
+pub(crate) fn set_color_scheme(
+    terminal: &mut Terminal,
+    scrollback_lines: ScrollbackLines,
+    scheme: ColorScheme,
+) {
+    terminal.set_config(Arc::new(Config {
+        scrollback_lines,
+        palette: color_scheme::palette(scheme),
+    }));
+}
+
 pub(crate) fn replace_transport(
     terminal: &mut Terminal,
     writer: mpsc::UnboundedSender<TransportInput>,

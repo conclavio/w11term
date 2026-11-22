@@ -31,6 +31,7 @@ mod iterm;
 mod keyboard;
 mod kitty;
 mod mouse;
+mod palette;
 pub(crate) mod performer;
 mod sixel;
 use crate::terminalstate::image::*;
@@ -374,7 +375,7 @@ pub struct TerminalState {
     // OSC 9;4 preserves the previous value while the bar is indeterminate.
     progress_value: u8,
 
-    palette: Option<ColorPalette>,
+    palette: palette::PaletteOverrides,
 
     pixel_width: usize,
     pixel_height: usize,
@@ -630,7 +631,7 @@ impl TerminalState {
             tabs: TabStop::new(size.cols, 8),
             title: "wezterm".to_string(),
             icon_title: None,
-            palette: None,
+            palette: Default::default(),
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,
             dpi: size.dpi,
@@ -690,7 +691,9 @@ impl TerminalState {
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
+        self.collect_palette_edits();
         self.config = config;
+        self.rebuild_palette();
     }
 
     pub fn get_config(&self) -> Arc<dyn TerminalConfiguration> {
@@ -875,33 +878,25 @@ impl TerminalState {
     /// so that we can start tracking those changes.
     pub fn palette(&self) -> ColorPalette {
         self.palette
+            .effective
             .as_ref()
             .cloned()
             .unwrap_or_else(|| self.config.color_palette())
     }
 
-    /// Called in response to dynamic color scheme escape sequences.
-    /// Will make a copy of the palette from the config file if this
-    /// is the first of these escapes we've seen.
+    /// Edit the effective palette directly. Changes made through this reference
+    /// are reconciled before a subsequent scheme change or OSC mutation.
     pub fn palette_mut(&mut self) -> &mut ColorPalette {
-        if self.palette.is_none() {
-            self.palette.replace(self.config.color_palette());
-        }
-        self.palette.as_mut().unwrap()
+        self.palette.borrowed_mutably = true;
+        self.materialize_palette()
     }
 
-    /// If the current overridden palette is effectively the same as
-    /// the configured palette, remove the override and treat it as
-    /// being the same as the configured state.
-    /// This allows runtime changes to the configuration to take effect.
+    /// Release a directly edited palette after restoring the configured colors.
+    /// Explicit OSC assignments still belong to the application until it resets them.
     pub fn implicit_palette_reset_if_same_as_configured(&mut self) {
-        if self
-            .palette
-            .as_ref()
-            .map(|p| *p == self.config.color_palette())
-            .unwrap_or(false)
-        {
-            self.palette.take();
+        self.collect_palette_edits();
+        if self.palette.assigned.is_empty() {
+            self.palette.effective = None;
         }
     }
 
