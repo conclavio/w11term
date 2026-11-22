@@ -1111,6 +1111,60 @@ mod tests {
     }
 
     #[test]
+    fn conemu_directory_reports_round_trip_windows_paths_and_stay_local() {
+        let (mut local, _) = engine();
+        let (mut ssh, _) = engine();
+        local.enable_conemu_directory_reports();
+        ssh.advance_bytes(b"\x1b]7;file://server/home/pilot\x07");
+        for (path, terminator) in [
+            (r#""C:\Work\100% #;雪""#, "\x07"),
+            (r"D:\literal%2F\bracket[1]", "\x1b\\"),
+            (r"X:\", "\x07"),
+        ] {
+            let sequence = format!("\x1b]9;9;{path}{terminator}");
+            for chunk in sequence.as_bytes().chunks(3) {
+                local.advance_bytes(chunk);
+                ssh.advance_bytes(chunk);
+            }
+            assert_eq!(
+                local.get_current_dir().unwrap().to_file_path().unwrap(),
+                std::path::Path::new(path.trim_matches('"'))
+            );
+            assert_eq!(
+                ssh.reported_current_dir().unwrap().as_ref(),
+                "file://server/home/pilot"
+            );
+        }
+        let many_semicolons = format!(r"C:\{}suffix", ";".repeat(100));
+        local.advance_bytes(format!("\x1b]9;9;{many_semicolons}\x07"));
+        assert_eq!(
+            local.get_current_dir().unwrap().to_file_path().unwrap(),
+            std::path::Path::new(&many_semicolons)
+        );
+        local.advance_bytes(format!("\x1b]9;9;C:\\{}\x07", ";".repeat(140 * 1024)));
+        assert!(local.reported_current_dir().is_none());
+        for bad in [
+            "Env:",
+            r"\\server\share",
+            r"\\?\C:\a",
+            r"C:relative",
+            r"C:\one\..\two",
+            "",
+        ] {
+            local.advance_bytes(b"\x1b]7;file:///C:/previous\x07");
+            local.advance_bytes(format!("\x1b]9;9;{bad}\x07"));
+            assert!(local.reported_current_dir().is_none(), "{bad:?}");
+        }
+        local.advance_bytes(b"\x1b]9;9;C:\\first\x07\x1b]7;file:///C:/second\x07");
+        assert_eq!(
+            local.reported_current_dir().unwrap().as_ref(),
+            "file:///C:/second"
+        );
+        local.reset_connection();
+        assert!(local.reported_current_dir().is_none());
+    }
+
+    #[test]
     fn shell_metadata_follows_primary_pane_and_connection() {
         let (mut term, _) = engine();
         term.advance_bytes(b"\x1b]7;file://localhost/old%20dir\x07\x1b]133;C\x07left");

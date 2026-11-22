@@ -390,6 +390,7 @@ pub struct TerminalState {
     // Keep the wire authority, since URL normalization maps file://localhost
     // to an empty host. The SSH client must validate the reported destination.
     current_dir: Option<(Url, Arc<str>)>,
+    conemu_directory_reports: bool,
     command_history: Arc<VecDeque<Arc<CompletedCommand>>>,
     next_command_id: u64,
     capturing_shell_input: bool,
@@ -644,6 +645,7 @@ impl TerminalState {
             alert_handler: None,
             download_handler: None,
             current_dir: None,
+            conemu_directory_reports: false,
             command_history: Arc::default(),
             next_command_id: 1,
             capturing_shell_input: false,
@@ -810,6 +812,18 @@ impl TerminalState {
 
     pub fn reported_current_dir(&self) -> Option<&Arc<str>> {
         self.current_dir.as_ref().map(|(_, raw)| raw)
+    }
+
+    /// A local Windows pseudoconsole may report drive paths using OSC 9;9.
+    pub fn enable_conemu_directory_reports(&mut self) {
+        self.conemu_directory_reports = true;
+    }
+
+    fn set_reported_current_dir(&mut self, report: Option<(Url, Arc<str>)>) {
+        self.current_dir = report;
+        if let Some(handler) = self.alert_handler.as_mut() {
+            handler.alert(Alert::CurrentWorkingDirectoryChanged);
+        }
     }
 
     pub fn last_command(&self) -> Option<&Arc<CompletedCommand>> {

@@ -1043,9 +1043,16 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
-                self.current_dir = Url::parse(&url).ok().map(|parsed| (parsed, url.into()));
-                if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::CurrentWorkingDirectoryChanged);
+                self.set_reported_current_dir(
+                    Url::parse(&url).ok().map(|parsed| (parsed, url.into())),
+                );
+            }
+            OperatingSystemCommand::ConEmuWorkingDirectory(path) => {
+                if self.conemu_directory_reports {
+                    self.set_reported_current_dir(conemu_directory_url(&path).map(|url| {
+                        let raw = url.as_str().into();
+                        (url, raw)
+                    }));
                 }
             }
             OperatingSystemCommand::ChangeColorNumber(specs) => {
@@ -1170,4 +1177,31 @@ fn selection_to_selection(sel: Selection) -> ClipboardSelection {
         // if/when we add it
         _ => ClipboardSelection::Clipboard,
     }
+}
+/// Convert a quoted or unquoted Windows drive path into a file URI. Push each
+/// segment as literal text so percent signs and URL delimiters survive intact.
+fn conemu_directory_url(payload: &str) -> Option<Url> {
+    let path = payload
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(payload);
+    let bytes = path.as_bytes();
+    if !matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+        || path.contains('"')
+        || path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut url = Url::parse("file:///").ok()?;
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments.clear().push(&path[..2]);
+        for part in path[3..].split(['\\', '/']) {
+            if matches!(part, "." | "..") {
+                return None;
+            }
+            segments.push(part);
+        }
+    }
+    Some(url)
 }

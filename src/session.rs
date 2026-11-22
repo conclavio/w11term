@@ -365,6 +365,9 @@ impl Session {
             colors.effective(),
         );
         let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard));
+        if matches!(source, Source::Local(_)) {
+            terminal.enable_conemu_directory_reports();
+        }
         let clipboard: Arc<dyn wezterm_term::Clipboard> =
             Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
         terminal.set_clipboard(&clipboard);

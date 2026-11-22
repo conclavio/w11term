@@ -1198,7 +1198,10 @@ impl FileDrawer {
                         .automation_name("Open shell here")
                         .is_enabled(shell.is_some())
                         .on_click(context.callback(move |_| {
-                            directory_split::message(Axis::Columns, shell.as_ref())
+                            directory_split::message(
+                                directory_split::Destination::Split(Axis::Columns),
+                                shell.as_ref(),
+                            )
                         }))
                         .content("Open shell here"),
                 )),
