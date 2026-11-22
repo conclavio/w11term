@@ -111,6 +111,12 @@ async fn native_powershell_shell_integration_records_history_and_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "duplicates, deletes and restores PowerShell profiles while SSH and a copied shell stay live"]
+async fn native_local_profile_copy_delete_and_restore_defaults() {
+    run_palette_fixture("local-profile-actions-ui.ps1", b"profile-actions-ok", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "keeps an open native tab menu actionable through SSH progress repaints"]
 async fn native_open_caret_keeps_its_settings_item_while_the_header_repaints() {
     let mut expected = Vec::new();

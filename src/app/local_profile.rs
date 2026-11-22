@@ -1,9 +1,10 @@
 use super::*;
 use std::path::Path;
-use w11term::profiles::LocalProfileSnapshot;
+use w11term::profiles::{LocalProfileRemoval, LocalProfileSnapshot};
 
 pub(super) struct Draft {
-    original: Option<LocalProfileSnapshot>,
+    origin: DraftOrigin<LocalProfileSnapshot>,
+    confirm_removal: bool,
     name: String,
     executable: String,
     args: Vec<String>,
@@ -16,7 +17,8 @@ pub(super) struct Draft {
 impl Default for Draft {
     fn default() -> Self {
         Self {
-            original: None,
+            origin: DraftOrigin::New,
+            confirm_removal: false,
             name: String::new(),
             executable: String::new(),
             args: Vec::new(),
@@ -75,6 +77,9 @@ pub enum Action {
     RemoveArgument(TabId, usize),
     PowerShellIntegration(TabId, bool),
     Save(TabId),
+    Duplicate(TabId),
+    RequestRemoval(TabId),
+    ConfirmRemoval(TabId, bool),
 }
 
 impl TerminalApp {
@@ -89,7 +94,7 @@ impl TerminalApp {
                     match self.store.inspect_local(&name) {
                         Ok(base) => {
                             let mut draft = Draft::from_options(name, &base.options);
-                            draft.original = Some(base);
+                            draft.origin = DraftOrigin::Edit(base);
                             draft
                         }
                         Err(error) => {
@@ -110,6 +115,9 @@ impl TerminalApp {
                 return;
             }
             Action::Save(id)
+            | Action::Duplicate(id)
+            | Action::RequestRemoval(id)
+            | Action::ConfirmRemoval(id, _)
             | Action::Field(id, ..)
             | Action::AddArgument(id)
             | Action::PowerShellIntegration(id, _)
@@ -146,17 +154,94 @@ impl TerminalApp {
                     draft.args.remove(index);
                 }
             }
+            Action::Duplicate(_) => {
+                let Some(base) = draft.origin.editing() else {
+                    return;
+                };
+                let mut copy =
+                    Draft::from_options(self.catalog.copy_name(&base.name), &base.options);
+                let label = format!("Duplicate {}", base.name);
+                copy.origin = DraftOrigin::Copy(base.clone());
+                self.tabs.insert(AppTab {
+                    label,
+                    page: Page::LocalProfile(copy),
+                });
+                self.sync_selection(context);
+                self.activate(context);
+            }
+            Action::RequestRemoval(_) => {
+                draft.confirm_removal = draft
+                    .origin
+                    .editing()
+                    .and_then(LocalProfileSnapshot::removal)
+                    .is_some();
+            }
+            Action::ConfirmRemoval(_, accept) => {
+                if !std::mem::take(&mut draft.confirm_removal) || !accept {
+                    return;
+                }
+                let Some(base) = draft.origin.editing() else {
+                    return;
+                };
+                let name = base.name.clone();
+                match self.store.remove_local(base) {
+                    Ok(catalog) => self.catalog = catalog,
+                    Err(error) => {
+                        draft.error = format!("{error:#}");
+                        return;
+                    }
+                }
+                let fallback = self.catalog.local.get(&name);
+                if self.default_profile.as_ref() == Some(&name)
+                    && matches!(self.default_source, Source::Local(_))
+                {
+                    if let Some(shell) = fallback {
+                        self.default_source = Source::Local(shell.clone());
+                    } else {
+                        self.default_profile = None;
+                        self.default_source = Source::Demo;
+                        self.default_label = LAB.into();
+                    }
+                }
+                if fallback.is_none() {
+                    let linked: Vec<_> = self
+                        .tabs
+                        .entries()
+                        .iter()
+                        .filter(|entry| entry.value.profile_name() == Some(&name))
+                        .map(|entry| entry.id)
+                        .collect();
+                    for linked in linked {
+                        if let Some(AppTab {
+                            page: Page::Terminal(pane),
+                            ..
+                        }) = self.tabs.get_mut(linked)
+                            && matches!(pane.source, Source::Local(_))
+                        {
+                            pane.profile_name = None;
+                        }
+                    }
+                }
+                self.profile_error = None;
+                self.utility(true, context);
+                self.close_tab(id, context);
+            }
             Action::Save(_) => {
                 let result = draft
                     .options()
                     .and_then(|shell| {
-                        self.store
-                            .save_local(draft.original.as_ref(), draft.name.trim(), &shell)
+                        let name = draft.name.trim();
+                        match &draft.origin {
+                            DraftOrigin::Copy(source) => {
+                                self.store.duplicate_local(source, name, &shell)
+                            }
+                            origin => self.store.save_local(origin.editing(), name, &shell),
+                        }
                     })
                     .and_then(|_| self.store.catalog());
                 match result {
                     Ok(catalog) => {
-                        let original = draft.original.as_ref().map(|base| base.name.clone());
+                        let original = draft.origin.editing().map(|base| base.name.clone());
                         let name = draft.name.trim().to_owned();
                         self.catalog = catalog;
                         if let Some(old) = original {
@@ -273,8 +358,75 @@ impl TerminalApp {
         fields.push(
             Button::new()
                 .on_click(context.callback(move |_| Message::LocalProfile(Action::Save(id))))
-                .content("Save profile"),
+                .content(if matches!(draft.origin, DraftOrigin::Copy(_)) {
+                    "Save copy"
+                } else {
+                    "Save profile"
+                }),
         );
+        if let Some(base) = draft.origin.editing() {
+            if draft.confirm_removal
+                && let Some(action) = base.removal()
+            {
+                let (message, confirm) = match action {
+                    LocalProfileRemoval::Delete => (
+                        format!(
+                            "Delete saved profile “{}”? Open shells keep running.",
+                            base.name
+                        ),
+                        "Delete saved profile",
+                    ),
+                    LocalProfileRemoval::RestoreDefaults => (
+                        format!(
+                            "Restore the installed settings for “{}”? Open shells keep running.",
+                            base.name
+                        ),
+                        "Restore defaults",
+                    ),
+                };
+                fields.push(
+                    TextBlock::new()
+                        .text(message)
+                        .text_wrapping(TextWrapping::Wrap)
+                        .into(),
+                );
+                fields.push(
+                    Button::new()
+                        .on_click(context.callback(move |_| {
+                            Message::LocalProfile(Action::ConfirmRemoval(id, false))
+                        }))
+                        .content("Keep profile"),
+                );
+                fields.push(
+                    Button::new()
+                        .automation_name(format!("{confirm} {}", base.name))
+                        .on_click(context.callback(move |_| {
+                            Message::LocalProfile(Action::ConfirmRemoval(id, true))
+                        }))
+                        .content(confirm),
+                );
+            } else {
+                fields.push(
+                    Button::new()
+                        .on_click(
+                            context.callback(move |_| Message::LocalProfile(Action::Duplicate(id))),
+                        )
+                        .content("Duplicate saved profile…"),
+                );
+                if let Some(action) = base.removal() {
+                    fields.push(
+                        Button::new()
+                            .on_click(context.callback(move |_| {
+                                Message::LocalProfile(Action::RequestRemoval(id))
+                            }))
+                            .content(match action {
+                                LocalProfileRemoval::Delete => "Delete profile…",
+                                LocalProfileRemoval::RestoreDefaults => "Restore defaults…",
+                            }),
+                    );
+                }
+            }
+        }
         if !draft.error.is_empty() {
             fields.push(
                 TextBlock::new()
