@@ -24,6 +24,7 @@ jobs:
           xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/clear-visible --scene clear-visible
           xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/clear-cell --scene clear-cell
           xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/clear-groups --scene clear-groups
+          xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/clear-number --scene clear-number
           xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/independent-placements --scene independent-placements
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

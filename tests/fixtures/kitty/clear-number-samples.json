@@ -1,0 +1,8 @@
+[
+  {"column": 1, "row": 1, "rgb": [255, 0, 0]},
+  {"column": 4, "row": 1, "rgb": [0, 0, 0]},
+  {"column": 7, "row": 1, "rgb": [0, 0, 0]},
+  {"column": 10, "row": 1, "rgb": [0, 255, 0]},
+  {"column": 4, "row": 3, "rgb": [0, 0, 0]},
+  {"column": 1, "row": 5, "rgb": [255, 0, 0]}
+]

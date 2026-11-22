@@ -539,6 +539,73 @@ fn z_deletion_also_reaches_history_and_skips_virtual_placements() {
 }
 
 #[test]
+fn image_number_deletion_selects_only_the_newest_surviving_image_and_matching_placement() {
+    let (mut t, _) = engine();
+    let upload = |t: &mut Terminal, col, pixels| {
+        t.advance_bytes(format!(
+            "\x1b[2;{col}H\x1b_Ga=T,I=77,p=1,f=32,s=1,v=1,c=1,r=1,C=1,q=2;{pixels}\x1b\\"
+        ));
+    };
+    let put = |t: &mut Terminal, col, p| {
+        t.advance_bytes(format!(
+            "\x1b[3;{col}H\x1b_Ga=p,I=77,p={p},c=1,r=1,C=1,q=2\x1b\\"
+        ));
+    };
+    upload(&mut t, 2, "/wAA/w==");
+    upload(&mut t, 5, "AAD//w==");
+    put(&mut t, 5, 2);
+    let start = frame(&t, None, 0);
+    let id_at = |col| {
+        start.rows[1]
+            .get_cell(col)
+            .unwrap()
+            .attrs()
+            .images()
+            .unwrap()[0]
+            .image_id()
+            .unwrap()
+    };
+    let red = id_at(1);
+    let blue = id_at(4);
+    let blue_pixel = Some([0, 0, 255, 255]);
+    assert_ne!(red, blue);
+
+    t.advance_bytes(b"\x1b_Ga=d,d=N,I=77,p=99\x1b\\\x1b_Ga=d,d=n,I=77,p=1\x1b\\");
+    let partial = frame(&t, Some(&start), 0);
+    assert_eq!(pixel(&partial, 1, 1, red), RED);
+    assert_eq!(pixel(&partial, 4, 1, blue), None);
+    assert_eq!(pixel(&partial, 4, 2, blue), blue_pixel);
+
+    t.advance_bytes(b"\x1b_Ga=d,d=n,I=77\x1b\\");
+    put(&mut t, 7, 3);
+    let soft = frame(&t, Some(&partial), 0);
+    assert_eq!(pixel(&soft, 4, 2, blue), None);
+    assert_eq!(pixel(&soft, 6, 2, blue), blue_pixel);
+    t.advance_bytes(b"\x1b_Ga=d,d=N,I=77,p=3\x1b\\");
+    put(&mut t, 7, 3);
+    let released = frame(&t, Some(&soft), 0);
+    assert_eq!(pixel(&released, 6, 2, blue), None);
+    assert_eq!(pixel(&released, 6, 2, red), RED);
+
+    upload(&mut t, 5, "AAD//w==");
+    let latest = frame(&t, Some(&released), 0);
+    let latest = latest.rows[1]
+        .get_cell(4)
+        .unwrap()
+        .attrs()
+        .images()
+        .unwrap()[0]
+        .image_id()
+        .unwrap();
+    t.advance_bytes(format!("\x1b_Ga=d,d=I,i={latest}\x1b\\"));
+    put(&mut t, 8, 4);
+    assert_eq!(pixel(&frame(&t, None, 0), 7, 2, red), RED);
+    t.advance_bytes(b"\x1b_Ga=d,d=N,I=77\x1b\\");
+    put(&mut t, 9, 5);
+    assert_eq!(pixel(&frame(&t, None, 0), 8, 2, red), None);
+}
+
+#[test]
 fn targeted_delete_preserves_unnamed_placements_until_named_image_retransmission() {
     let (mut t, _) = engine();
     transmit_red(&mut t, 41);

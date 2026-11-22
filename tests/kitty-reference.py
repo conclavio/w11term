@@ -17,6 +17,7 @@ SCENES = {
     "clear-visible": (["clear-setup.vt", "clear-visible.vt"], "clear-visible-samples.json"),
     "clear-cell": (["clear-cell.vt"], "clear-cell-samples.json"),
     "clear-groups": (["clear-groups.vt"], "clear-groups-samples.json"),
+    "clear-number": (["clear-number.vt"], "clear-number-samples.json"),
     "independent-placements": (["independent-placements.vt"], "independent-placements-samples.json"),
 }
 
