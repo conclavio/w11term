@@ -1202,6 +1202,17 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "moves a mixed SSH/PowerShell tab and Settings with keyboard shortcuts in a real window"]
+async fn native_keyboard_tab_reorder_preserves_focused_pane_and_live_sessions() {
+    run_palette_fixture(
+        "keyboard-tab-reorder-ui.ps1",
+        b"before;after-right;after-select",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "toggles the previously focused live SSH or PowerShell pane across splits, tabs and Settings"]
 async fn native_previous_pane_reuses_live_shells_across_tabs_and_skips_closed_panes() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

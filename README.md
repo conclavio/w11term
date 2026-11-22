@@ -61,7 +61,7 @@ Choose **caret → Find in all panes…** to search terminal text across this wi
 
 Results show the text present when you searched. Use **Refresh** to include later output. Matching ignores case, accepts up to 4,096 UTF-8 bytes, and shows `10,000+` when a pane contains additional matches.
 
-The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. Drag tabs to reorder them. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
+The native WinUI tab strip sits in the title bar. Click **+** to open a profile in a new tab. To reorder the selected tab, drag it or use **Move tab left** or **Move tab right** in the caret menu or command palette. Both actions can be assigned shortcuts under **Settings → Keyboard**. Moving a tab keeps the same pane focused. Numbered tab shortcuts follow the new order. Closing a tab closes its panes, and closing the last tab closes the window. Each visible pane renders independently. Background sessions continue receiving output.
 
 Builds, deployments, and other programs that emit **OSC 9;4** can report progress in the tab header and on the window’s Windows taskbar button. The header shows a percentage, **Paused**, **Error**, or **In progress**. When several panes report at once, an error takes priority, followed by paused, normal, and indeterminate progress. Within the same state the least complete operation wins. Clearing a pane’s progress reveals the next one. [Windows Terminal progress sequences](https://learn.microsoft.com/en-us/windows/terminal/tutorials/progress-bar-sequences)
 
