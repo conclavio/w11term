@@ -64,6 +64,17 @@ pub fn scroll_wheel(
 struct Config {
     scrollback_lines: ScrollbackLines,
     palette: ColorPalette,
+    scheme: ColorScheme,
+}
+
+impl Config {
+    fn new(scrollback_lines: ScrollbackLines, scheme: ColorScheme) -> Self {
+        Self {
+            scrollback_lines,
+            scheme,
+            palette: color_scheme::palette(scheme),
+        }
+    }
 }
 
 impl TerminalConfiguration for Config {
@@ -76,6 +87,10 @@ impl TerminalConfiguration for Config {
 
     fn color_palette(&self) -> ColorPalette {
         self.palette.clone()
+    }
+
+    fn prefers_light_colors(&self) -> bool {
+        self.scheme == ColorScheme::OneHalfLight
     }
 
     fn scrollback_size(&self) -> usize {
@@ -150,10 +165,7 @@ pub fn create_with_profile(
 ) -> Terminal {
     Terminal::new(
         size,
-        Arc::new(Config {
-            scrollback_lines,
-            palette: color_scheme::palette(scheme),
-        }),
+        Arc::new(Config::new(scrollback_lines, scheme)),
         "w11term",
         env!("CARGO_PKG_VERSION"),
         Box::new(ReplyWriter {
@@ -168,10 +180,7 @@ pub(crate) fn set_color_scheme(
     scrollback_lines: ScrollbackLines,
     scheme: ColorScheme,
 ) {
-    terminal.set_config(Arc::new(Config {
-        scrollback_lines,
-        palette: color_scheme::palette(scheme),
-    }));
+    terminal.set_config(Arc::new(Config::new(scrollback_lines, scheme)));
 }
 
 pub(crate) fn replace_transport(

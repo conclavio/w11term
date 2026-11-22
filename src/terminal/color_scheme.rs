@@ -85,6 +85,61 @@ mod tests {
     }
 
     #[test]
+    fn theme_reports_follow_the_selected_scheme_and_only_notify_subscribers() {
+        use crate::terminal::tests::receive;
+        let (mut term, mut replies) = engine(ColorScheme::OneHalfLight);
+        let change = |t: &mut Terminal, scheme| {
+            crate::terminal::set_color_scheme(t, Default::default(), scheme);
+        };
+        const LIGHT: &[u8] = b"\x1b[?997;2n";
+        const DARK: &[u8] = b"\x1b[?997;1n";
+        // Configuration changes, remote colors and echoed replies before a query stay silent.
+        change(&mut term, ColorScheme::Default);
+        term.advance_bytes(b"\x1b[?997;2n\x1b]11;#ffffff\x07\x1b[?5h\x1b[?996");
+        term.advance_bytes(b"n");
+        assert_eq!(receive(&mut replies), DARK);
+        term.advance_bytes(b"\x1b[?2031$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?2031;2$y");
+        term.advance_bytes(b"\x1b[?2031h\x1b[?2031$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?2031;1$y");
+        // A different dark palette is a real palette update. Reapplying it is silent.
+        change(&mut term, ColorScheme::OneHalfDark);
+        assert_eq!(receive(&mut replies), DARK);
+        change(&mut term, ColorScheme::OneHalfDark);
+        term.advance_bytes(b"\x1b]11;#010203\x07\x1b[?5l\x1b[?1049h");
+        change(&mut term, ColorScheme::OneHalfLight);
+        assert_eq!(receive(&mut replies), LIGHT);
+        term.advance_bytes(b"\x1b[?2031l");
+        change(&mut term, ColorScheme::OneHalfDark);
+        term.advance_bytes(b"\x1b[?2031$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?2031;2$y");
+        term.advance_bytes(b"\x1b[?2031h\x1bc\x1b[?2031$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?2031;2$y");
+        term.advance_bytes(b"\x1b[?2031h");
+        term.reset_connection();
+        term.advance_bytes(b"\x1b[?2031$p\x1b[?996n\x1b[?2999$p");
+        assert_eq!(receive(&mut replies), b"\x1b[?2031;2$y");
+        assert_eq!(receive(&mut replies), DARK);
+        assert_eq!(receive(&mut replies), b"\x1b[?2999;0$y");
+    }
+
+    #[test]
+    fn framed_viewer_sends_requested_and_unsolicited_theme_reports_as_automatic_input() {
+        let (mut term, _original) = engine(ColorScheme::OneHalfDark);
+        let (writer, mut viewer) = mpsc::unbounded_channel();
+        crate::terminal::enter_herdr_viewer(&mut term, &writer, &Default::default());
+        term.advance_bytes(b"\x1b[?2031h\x1b[?996n");
+        crate::terminal::set_color_scheme(&mut term, Default::default(), ColorScheme::OneHalfLight);
+        for expected in [b"\x1b[?997;1n", b"\x1b[?997;2n"] {
+            let TransportInput::Automatic(bytes) = viewer.try_recv().unwrap() else {
+                panic!("theme report was sent as user input");
+            };
+            assert_eq!(bytes, expected);
+        }
+        assert!(viewer.try_recv().is_err());
+    }
+
+    #[test]
     fn named_profiles_keep_the_color_cube_and_publish_their_palette_on_the_first_frame() {
         assert_eq!(
             palette(ColorScheme::Default),
