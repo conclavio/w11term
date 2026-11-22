@@ -996,6 +996,38 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "previews read-only remote text through the native drawer in a live SSH and PowerShell split"]
+async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let parent = remote.path().join("shell directory");
+    let child = parent.join("nested");
+    fs::create_dir_all(&child).unwrap();
+    let name = "build 雪.txt";
+    let outer = "first 雪\r\n\tsecond café\r\n\r\nlast line";
+    let inner = "different directory\r\ninner 雪";
+    let binary = b"private header\0raw body";
+    fs::write(parent.join(name), outer.as_bytes()).unwrap();
+    fs::write(child.join(name), inner.as_bytes()).unwrap();
+    fs::write(child.join("binary.dat"), binary).unwrap();
+    let keys = remote.path().join("keyboard-input.bin");
+    fs::write(&keys, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("sftp-text-preview-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(parent.join(name)).unwrap(), outer.as_bytes());
+    assert_eq!(fs::read(child.join(name)).unwrap(), inner.as_bytes());
+    assert_eq!(fs::read(child.join("binary.dat")).unwrap(), binary);
+    assert_eq!(fs::read(keys).unwrap(), b"after-preview");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "downloads and cancels remote directory trees through the Windows folder picker"]
 async fn native_sftp_download_folder_preserves_tree_and_existing_destination() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

@@ -604,6 +604,9 @@ impl russh_sftp::server::Handler for Files {
             attrs.size = None;
             attrs.permissions = Some(0o600);
         }
+        if self.root.join("fstat-nonregular").is_file() {
+            attrs.permissions = Some(0o140600);
+        }
         Ok(Attrs { id, attrs })
     }
     async fn setstat(
@@ -940,6 +943,8 @@ mod native_gui;
 mod remove;
 #[path = "sftp/rename.rs"]
 mod rename;
+#[path = "sftp/text_preview.rs"]
+mod text_preview;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/tab_windows.rs"]
 mod tab_windows;

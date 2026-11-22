@@ -11,6 +11,7 @@ use w11term::sftp::{
 
 mod bookmarks;
 mod history;
+mod preview;
 
 use history::{FolderHistory, HistoryDirection};
 
@@ -67,6 +68,8 @@ pub enum FileAction {
     ClearFilter(u64, u64, u64),
     Choose(u64, u64, ListedEntry),
     CopyPath(u64, u64, u64, Option<ListedEntry>),
+    PreviewText(u64, u64, ListedEntry),
+    ClosePreview(u64, u64, u64),
     Rename(u64, u64, ListedEntry),
     Delete(u64, u64, ListedEntry),
     NewFolder(u64, u64, String),
@@ -114,6 +117,7 @@ pub(super) struct FileDrawer {
     selected: Option<String>,
     reveal: Option<RevealTarget>,
     dialog: Option<EntryDialog>,
+    preview: Option<preview::TextPreview>,
     dialog_serial: u64,
     replace: bool,
     picking: Option<u64>,
@@ -271,6 +275,7 @@ enum Step {
     Canonical(Option<HistoryDirection>),
     Listing(String, Option<HistoryDirection>),
     IdentifyDelete(ListedEntry),
+    Preview(u64),
     Transfer(TransferFile),
     Change { parent: String, change: EntryChange },
 }
@@ -594,10 +599,11 @@ impl FileDrawer {
     }
 
     pub(super) fn entry_dialog_open(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || self.preview.is_some()
     }
 
     pub(super) fn cancel_entry_dialog(&mut self) {
+        self.cancel_preview();
         if self.identifying_delete() {
             self.pending.take();
             self.status.clear();
@@ -720,6 +726,7 @@ impl FileDrawer {
         path: String,
         entries: Vec<Entry>,
     ) {
+        self.cancel_preview();
         self.history.listed(&path, direction);
         self.opening_target = None;
         self.end_filter_edit();
@@ -846,6 +853,9 @@ impl FileDrawer {
         ssh: &SshOptions,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
+        if let Some(preview) = &self.preview {
+            return Some(preview.dialog(pane, self.generation, context));
+        }
         let dialog = self.dialog.as_ref()?;
         let serial = dialog.serial;
         let generation = self.generation;
@@ -1220,6 +1230,11 @@ impl FileDrawer {
                         CopyPath(pane, generation, revision, Some(listed(selected))),
                     ),
                 )),
+            button(
+                "Preview text…",
+                writable && selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::File)),
+                PreviewText(pane, generation, listed(selected)),
+            ),
             CheckBox::new()
                 .is_checked(self.following)
                 .on_is_checked_changed(
@@ -1457,7 +1472,11 @@ impl FileDrawer {
                 expected_generation: request_generation(&operation, self.generation),
                 operation,
                 progress: tx_progress,
-                cancel: transfer.as_ref().map(|active| active.cancel.clone()),
+                cancel: if matches!(step, Step::Preview(_)) {
+                    self.preview.as_ref().map(|p| p.cancel.clone())
+                } else {
+                    transfer.as_ref().map(|active| active.cancel.clone())
+                },
                 deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
                 reply: tx,
             }))
@@ -1480,6 +1499,7 @@ impl FileDrawer {
         direction: Option<HistoryDirection>,
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
+        self.cancel_preview();
         self.bookmarks = None;
         self.opening_target = None;
         self.end_filter_edit();
@@ -1585,10 +1605,9 @@ impl FileDrawer {
             Ok(result) => result,
         };
         self.cached.borrow_mut().take();
-        let step = self.pending.take().unwrap().step;
-        let reply = match result {
-            Ok(reply) => reply,
-            Err(error) => {
+        match (self.pending.take().unwrap().step, result) {
+            (Step::Preview(serial), reply) => self.finish_preview(serial, reply),
+            (step, Err(error)) => {
                 if let Step::IdentifyDelete(entry) = &step {
                     bail!("Could not delete {}: {error}", entry.name);
                 }
@@ -1609,16 +1628,14 @@ impl FileDrawer {
                 }
                 bail!("{error}");
             }
-        };
-        match step {
-            Step::IdentifyDelete(entry) => {
+            (Step::IdentifyDelete(entry), Ok(reply)) => {
                 if self.open && may_open_dialog {
                     self.confirm_identified(entry, &reply["attrs"])?;
                 } else {
                     self.status.clear();
                 }
             }
-            Step::Canonical(direction) => {
+            (Step::Canonical(direction), Ok(reply)) => {
                 let path = reply["entries"][0]["filename"]
                     .as_str()
                     .context("Missing canonical directory")?
@@ -1635,7 +1652,7 @@ impl FileDrawer {
                     context,
                 )?;
             }
-            Step::Listing(path, direction) => {
+            (Step::Listing(path, direction), Ok(reply)) => {
                 let generation = self.generation;
                 self.parsing = true;
                 let rejected = Message::Files(FileAction::Listed(
@@ -1658,7 +1675,7 @@ impl FileDrawer {
                     rejected,
                 );
             }
-            Step::Transfer(file) => {
+            (Step::Transfer(file), Ok(reply)) => {
                 self.status = file.outcome(&reply);
                 if !matches!(file, TransferFile::Upload { .. }) || reply["cancelled"] == true {
                     return Ok(());
@@ -1676,7 +1693,7 @@ impl FileDrawer {
                     self.upload_next(id, session, context)?;
                 }
             }
-            Step::Change { parent, change } => {
+            (Step::Change { parent, change }, Ok(_)) => {
                 self.status = change.completed();
                 // The old name no longer identifies the entry the user selected.
                 // If the follow-up listing fails, do not leave stale rows actionable.
@@ -1908,6 +1925,8 @@ impl TerminalApp {
             | ClearFilter(id, ..)
             | Choose(id, ..)
             | CopyPath(id, ..)
+            | PreviewText(id, ..)
+            | ClosePreview(id, ..)
             | Rename(id, ..)
             | Delete(id, ..)
             | NewFolder(id, ..)
@@ -1959,7 +1978,7 @@ impl TerminalApp {
         if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
             return;
         }
-        if matches!(&action, NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) if *g != files.generation)
+        if matches!(&action, PreviewText(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2016,6 +2035,7 @@ impl TerminalApp {
                     }
                 }
                 Close(_) => files.close(),
+                ClosePreview(_, _, serial) => files.close_preview(serial),
                 Follow(_, _, enabled) => {
                     if files.open && files.following != enabled {
                         files.following = enabled;
@@ -2144,6 +2164,16 @@ impl TerminalApp {
                     }
                 }
                 _ if files.busy() || !files.open => {}
+                PreviewText(_, _, entry) => {
+                    if may_open_dialog {
+                        let (serial, operation) = files.begin_preview(entry)?;
+                        if let Err(error) =
+                            files.job(pane, session, operation, Step::Preview(serial), context)
+                        {
+                            files.finish_preview(serial, Err(format!("{error:#}")));
+                        }
+                    }
+                }
                 EditFilter(_, _, revision, enabled) => {
                     if enabled && files.directory.is_some() && may_open_dialog {
                         if !files.filter_editing() {
