@@ -16,17 +16,42 @@ $button = [System.Windows.Automation.ControlType]::Button
 $selection = [System.Windows.Automation.SelectionPattern]::Pattern
 $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
 
+function Editor-Scroll($Element) {
+    $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+    while ($Element -and $Element.Current.ProcessId -eq $app.Id) {
+        $pattern = $null
+        if ($Element.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern,[ref]$pattern) -and $pattern.Current.VerticallyScrollable) {
+            return $pattern
+        }
+        $Element = $walker.GetParent($Element)
+    }
+}
 function Editor-State {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
     $focusName = if ($focused -and $focused.Current.ProcessId -eq $app.Id) { $focused.Current.Name } else { '(outside fixture)' }
     $field = Find-Element 'Terminal color scheme' $combo
+    $saveState = foreach ($label in 'Save profile changes','Save profile') {
+        $control = Find-Element $label $button
+        if ($control) {
+            $view = Editor-Scroll $control
+            "$label focused=$($control.Current.HasKeyboardFocus) offscreen=$($control.Current.IsOffscreen) bounds=$($control.Current.BoundingRectangle) scroll=$($view.Current.VerticalScrollPercent)"
+        }
+    }
     $chosen = if ($field) {
         $field.GetCurrentPattern($selection).Current.GetSelection() | ForEach-Object { $_.Current.Name }
     }
     $byText = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Text)
-    $visible = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$byText) | Where-Object { !$_.Current.IsOffscreen -and $_.Current.Name } | ForEach-Object { $_.Current.Name })
-    "Focus '$focusName', scheme '$chosen', editor offscreen '$($field.Current.IsOffscreen)', window $($root.Current.BoundingRectangle), visible text: $($visible -join ' | ')"
+    $labels = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$byText) | ForEach-Object { $_.Current.Name })
+    $scroll = Editor-Scroll $field
+    if ($scroll) {
+        # SSH validation and save feedback live above the profile fields.
+        $scroll.SetScrollPercent(-1,0)
+        $null = Wait-Until 'profile feedback at the top of the editor' { $scroll.Current.VerticalScrollPercent -lt 1 }
+        $labels += @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$byText) | ForEach-Object { $_.Current.Name })
+    }
+    $labels = $labels | Where-Object { $_ } | Select-Object -Unique
+    "Focus '$focusName', scheme '$chosen', window $($root.Current.BoundingRectangle), $saveState, editor text including validation: $($labels -join ' | ')"
 }
 
 function Click([string]$Label) {
@@ -77,13 +102,33 @@ function Edit-Scheme([string]$Name, [string]$EditLabel, [string]$Scheme, [string
     }
     $popup = $field.GetCurrentPattern($expand)
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
-    Click $Save
-    $serialized = $Scheme.ToLowerInvariant().Replace(' ','-')
-    $null = Wait-Until "$Name saved as $serialized and acknowledged by the editor" {
-        if ((Saved-Scheme $Name) -cne $serialized) { return $false }
-        if ($Save -eq 'Save profile changes') { return Find-Element 'Changes saved.' }
-        Find-Element "$EditLabel $Name" $button
+    # The SSH editor's save button is well below the fold on the hosted desktop.
+    # Bring its footer into view, then send exactly one keypress to the focused
+    # control after Windows confirms its entire rectangle is inside this window.
+    $saveButton = Wait-Until "'$Save' button" { Find-Element $Save $button }
+    $scroll = Editor-Scroll $saveButton
+    if ($scroll) { $scroll.SetScrollPercent(-1,100) }
+    $saveButton.SetFocus()
+    $null = Wait-Until "focused and onscreen '$Save' in '$Name' editor" {
+        $b = Find-Element $Save $button
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        if ($b -and $b.Current.IsEnabled -and $b.Current.HasKeyboardFocus -and !$b.Current.IsOffscreen) {
+            $bounds = $b.Current.BoundingRectangle
+            $bounds.Width -gt 0 -and $bounds.Height -gt 0 -and $root.Current.BoundingRectangle.Contains($bounds)
+        }
     }
+    $null = Press-FocusedKey 0x20 # Space activates the focused WinUI Button.
+    # The profile store replaces the file atomically. Wait for the UI thread to
+    # finish that replacement before opening the destination, even with delete sharing.
+    if ($Save -eq 'Save profile changes') {
+        if ($scroll) { $scroll.SetScrollPercent(-1,0) }
+        $null = Wait-Until "SSH profile '$Name' save completed" { Find-Element 'Changes saved.' }
+    } else {
+        $null = Wait-Until "local profile '$Name' returned to Settings" { Find-Element "$EditLabel $Name" $button }
+    }
+    $serialized = $Scheme.ToLowerInvariant().Replace(' ','-')
+    $actual = Saved-Scheme $Name
+    if ($actual -cne $serialized) { throw "Saved '$Name' with scheme '$actual', expected '$serialized'" }
 }
 function Send-To([int]$Pane, [string]$Text) {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($Text))
@@ -109,6 +154,10 @@ for ($launch=1; $launch -le 2; $launch++) {
     $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','86','--rows','15') -WindowStyle Hidden -PassThru -RedirectStandardError $log
     try {
         $window = Wait-InputWindow
+        if ($launch -eq 1) {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern).Resize(900,422)
+        }
         $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
         $ssh = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
         $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','15','ready')
@@ -151,6 +200,13 @@ for ($launch=1; $launch -le 2; $launch++) {
         Check-Pixels $local 'saved-local-dark' $dark
     } catch {
         $failure = $_
+        try {
+            $diskState = foreach ($entry in 'palette-ssh','Palette PowerShell') {
+                $value = Saved-Scheme $entry
+                if (!$value) { $value = '(default/omitted)' }
+                "$entry='$value'"
+            }
+        } catch { $diskState = "Profile catalog unavailable: $_" }
         try { $uiState = Editor-State } catch { $uiState = "UI diagnostics unavailable: $_" }
     } finally {
         if (!$app.HasExited) {
@@ -161,6 +217,6 @@ for ($launch=1; $launch -le 2; $launch++) {
     }
     if ($failure) {
         try { $details = [IO.File]::ReadAllText($log) } catch { $details = "GUI log unavailable: $_" }
-        throw "Launch $launch failed: $failure at $($failure.ScriptStackTrace). $uiState. GUI: $details"
+        throw "Launch $launch failed: $failure at $($failure.ScriptStackTrace). Saved schemes: $($diskState -join ', '). $uiState. GUI: $details"
     }
 }
