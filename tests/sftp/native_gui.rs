@@ -1243,6 +1243,29 @@ async fn native_go_to_folder_recovers_and_preserves_the_listing_on_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "selects visible SFTP entries and reaches drawer actions at the minimum native window size"]
+async fn native_short_sftp_drawer_keeps_entries_and_actions_reachable() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    fs::create_dir(remote.path().join("projects")).unwrap();
+    for i in 0..35 {
+        fs::write(remote.path().join(format!("entry-{i:02}.txt")), []).unwrap();
+    }
+    let keyboard = remote.path().join("keyboard-input.bin");
+    fs::write(&keyboard, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("short-sftp-drawer-ui.ps1", &ssh, state.path());
+    assert!(fs::read(keyboard).unwrap().is_empty());
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP subsystem"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "creates remote folders through the native SFTP drawer while a PowerShell pane is live"]
 async fn native_new_folder_uses_the_selected_sftp_parent_and_preserves_existing_entries() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
