@@ -960,7 +960,14 @@ mod test {
 
     #[test]
     fn iterm_directory_invalid_bytes_do_not_select_a_shortened_name() {
-        for suffix in [&b"a\nb\x07"[..], b"a\x7fb\x07", b"a\x9db\x07", b"a\xffb\x07", b"a\xc3!\x07", b"a\xc3\x07"] {
+        for suffix in [
+            &b"a\nb\x07"[..],
+            b"a\x7fb\x07",
+            b"a\x9db\x07",
+            b"a\xffb\x07",
+            b"a\xc3!\x07",
+            b"a\xc3\x07",
+        ] {
             let mut bytes = b"\x1b]1337;CurrentDir=/".to_vec();
             bytes.extend_from_slice(suffix);
             bytes.extend_from_slice(b"OK");

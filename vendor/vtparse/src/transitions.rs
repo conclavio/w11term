@@ -262,7 +262,7 @@ const fn osc_string(i: u8) -> u16 {
         0xc2..=0xdf => pack(Utf8, Utf8Sequence),
         0xe0..=0xef => pack(Utf8, Utf8Sequence),
         0xf0..=0xf4 => pack(Utf8, Utf8Sequence),
-        0xa0..=0xc1 | 0xf5..=0xff => pack(OscIgnore, OscString),
+        0x9d | 0xa0..=0xc1 | 0xf5..=0xff => pack(OscIgnore, OscString),
         _ => anywhere_or(i, OscString),
     }
 }
@@ -362,7 +362,7 @@ mod tests {
                 hash(&v, 5381, 33), // djb2
                 hash(&v, 0, 65599), // sdbm
             ),
-            (17503, 806850, 7724798175718992007, 4492473502332985748)
+            (17505, 806968, 8223539738708542141, 6957234556783893394)
         );
     }
 
