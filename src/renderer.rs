@@ -201,17 +201,28 @@ fn run_extent(
     (count, Some(kind))
 }
 
-fn draw_strikethrough(ctx: &DrawingSession<'_>, brush: &Brush, cell: Rect, scale: f32) {
-    let top = ((cell.top + (cell.bottom - cell.top) * 0.5) * scale).round() / scale;
-    ctx.fill_rect(
-        &Rect::from_xywh(
-            cell.left,
-            top,
-            cell.right - cell.left,
-            scale.round().max(1.0) / scale,
-        ),
-        brush,
-    );
+fn draw_ink_lines(
+    ctx: &DrawingSession<'_>,
+    brush: &Brush,
+    cell: Rect,
+    scale: f32,
+    overline: bool,
+    strike: bool,
+) {
+    let thickness = scale.round().max(1.0) / scale;
+    let stripe = |top: f32| {
+        let top = (top * scale).round() / scale;
+        ctx.fill_rect(
+            &Rect::from_xywh(cell.left, top, cell.right - cell.left, thickness),
+            brush,
+        );
+    };
+    if overline {
+        stripe(cell.top);
+    }
+    if strike {
+        stripe(cell.top + (cell.bottom - cell.top) * 0.5);
+    }
 }
 
 fn draw_underline(
@@ -743,7 +754,7 @@ impl Renderer {
                 )
         });
         let mut block_extent = block.map(|cursor| (cursor.col, 1));
-        let mut block_decorations = (Underline::None, false);
+        let mut block_decorations = (Underline::None, false, false);
         let mut cursor_ink = None;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
@@ -764,8 +775,9 @@ impl Renderer {
                 {
                     block_extent = Some((map.visual(cell.cell_index()), cell.width()));
                     if !cell.attrs().invisible() {
+                        let attrs = cell.attrs();
                         block_decorations =
-                            (cell.attrs().underline(), cell.attrs().strikethrough());
+                            (attrs.underline(), attrs.overline(), attrs.strikethrough());
                     }
                 }
             }
@@ -847,13 +859,15 @@ impl Renderer {
                         self.metrics.scale,
                     );
                 }
-                if attrs.strikethrough() {
+                if attrs.overline() || attrs.strikethrough() {
                     brush.set_color(color(fg));
-                    draw_strikethrough(
+                    draw_ink_lines(
                         ctx,
                         &brush,
                         Rect::from_xywh(x, y, cw * cell.width() as f32, ch),
                         self.metrics.scale,
+                        attrs.overline(),
+                        attrs.strikethrough(),
                     );
                 }
             }
@@ -879,13 +893,11 @@ impl Renderer {
                         if let Some((layout, origin, scale)) = cursor_ink {
                             native.cursor_text(&layout, origin, ink, scale)?;
                         }
-                        let (underline, strike) = block_decorations;
-                        if underline != Underline::None || strike {
+                        let (underline, overline, strike) = block_decorations;
+                        if underline != Underline::None || overline || strike {
                             brush.set_color(color(ink));
                             draw_underline(ctx, &brush, underline, rect, self.metrics.scale);
-                            if strike {
-                                draw_strikethrough(ctx, &brush, rect, self.metrics.scale);
-                            }
+                            draw_ink_lines(ctx, &brush, rect, self.metrics.scale, overline, strike);
                         }
                         Ok(())
                     })?;
@@ -1238,7 +1250,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut terminal = w11term::terminal::create(wezterm_term::TerminalSize::default(), tx);
-        terminal.advance_bytes("A->B界X\x1b[4;9m \x1b[0m\r\nسلام");
+        terminal.advance_bytes("A->B界X\x1b[4;9;53m \x1b[0m\r\nسلام");
         for (request, left, cells, paper) in [
             ("\x1b]12;#ff0000\x1b\\\x1b[1;3H", 2, 1, [0, 0, 255, 255]),
             (
@@ -1467,6 +1479,19 @@ mod tests {
             strike.iter().any(|p| p[2] > 160 && p[1] < 64),
             "underline lost its explicit color"
         );
+
+        let overline = row_pixels(&pixels, 11, 9);
+        let top = |col| overline[col * cw + cw / 2];
+        let paper = overline[cw / 2 + 9 * cw]; // below the overlined space
+        // A green space, a two-column grapheme, and another space share one stroke.
+        assert!(overline[..4 * cw].iter().all(|&p| p == [0, 255, 0, 255]));
+        assert_ne!(top(0), paper);
+        assert_eq!(top(4), paper, "SGR 55 clears just the overline");
+        assert!((0..ch).any(|y| overline[y * 9 * cw + 4 * cw + cw / 2] == [0, 0, 255, 255]));
+        assert_eq!(top(5), paper, "concealed overline");
+        assert_eq!(top(6), paper, "reset cell");
+        assert_ne!(top(7), paper, "default foreground overline");
+        assert_eq!(top(8), paper, "SGR 0 clears the overline");
     }
 
     #[test]
