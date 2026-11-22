@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct SshStartup {
     host: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::options::deserialize_host_key_alias",
+        skip_serializing_if = "Option::is_none"
+    )]
+    host_key_alias: Option<String>,
     port: u16,
     user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -20,6 +26,7 @@ impl SshStartup {
     pub fn new(options: &SshOptions, directory: String, command: String) -> Result<Self> {
         let startup = Self {
             host: options.host.clone(),
+            host_key_alias: options.host_key_alias.clone(),
             port: options.port,
             user: options.user.clone(),
             directory,
@@ -30,6 +37,9 @@ impl SshStartup {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
+        if let Some(alias) = &self.host_key_alias {
+            crate::options::validate_host_key_alias(alias)?;
+        }
         ensure!(
             !self.host.is_empty() && self.port != 0 && !self.user.is_empty(),
             "Missing workspace startup destination"
@@ -53,6 +63,7 @@ impl SshStartup {
         self.validate()?;
         ensure!(
             self.host.eq_ignore_ascii_case(&options.host)
+                && self.host_key_alias == options.host_key_alias
                 && self.port == options.port
                 && self.user == options.user,
             "Workspace startup destination has changed. Reconfigure the pane for the new SSH account."

@@ -405,6 +405,7 @@ struct ProfileDraft {
     custom_terminal: String,
     identity: String,
     fingerprint: String,
+    host_key_alias: String,
     authentication: usize,
     error: Option<String>,
     player: w11term::options::PlayerOptions,
@@ -432,6 +433,7 @@ impl Default for ProfileDraft {
             custom_terminal: String::new(),
             identity: String::new(),
             fingerprint: String::new(),
+            host_key_alias: String::new(),
             authentication: 0,
             error: None,
             player: Default::default(),
@@ -442,6 +444,11 @@ impl Default for ProfileDraft {
 }
 
 impl ProfileDraft {
+    fn host_key_alias(&self) -> Option<String> {
+        let alias = self.host_key_alias.trim();
+        (!alias.is_empty()).then(|| alias.to_ascii_lowercase())
+    }
+
     fn terminal_type(&self) -> anyhow::Result<TerminalType> {
         let name = match self.terminal_preset {
             0 => TerminalType::DEFAULT,
@@ -477,6 +484,7 @@ impl ProfileDraft {
             custom_terminal: options.terminal_type.as_str().into(),
             identity,
             fingerprint: options.host_key.clone().unwrap_or_default(),
+            host_key_alias: options.host_key_alias.clone().unwrap_or_default(),
             authentication,
             player: options.player.clone(),
             ..Default::default()
@@ -662,6 +670,7 @@ pub enum Field {
     CustomTerminal,
     Identity,
     Fingerprint,
+    HostKeyAlias,
 }
 
 enum UiWork {
@@ -1135,8 +1144,11 @@ impl TerminalApp {
         use w11term::prompts::Question;
         let prompt_id = prompt.id;
         let (title,primary,children):(String,&str,Vec<View>)=match &prompt.question {
-            Question::HostKey{host,port,algorithm,fingerprint}=>("Trust this SSH host?".into(),"Accept and save",vec![
-                TextBlock::new().text(format!("First connection to {host}:{port}")).text_wrapping(TextWrapping::Wrap).into(),
+            Question::HostKey{host,port,host_key_alias,algorithm,fingerprint}=>("Trust this SSH host?".into(),"Accept and save",vec![
+                TextBlock::new().text(match host_key_alias {
+                    Some(alias) => format!("Connecting to {host}:{port}\nSave the host key as {alias}"),
+                    None => format!("First connection to {host}:{port}"),
+                }).text_wrapping(TextWrapping::Wrap).into(),
                 TextBlock::new().text(format!("{algorithm}\n{fingerprint}")).text_wrapping(TextWrapping::Wrap).into(),
                 TextBlock::new().text("Verify this fingerprint with the server owner. Accepting saves it in your OpenSSH known_hosts file.").text_wrapping(TextWrapping::Wrap).into(),
             ]),
@@ -2635,6 +2647,7 @@ impl TerminalApp {
                 authentication,
                 host_key: (!draft.fingerprint.trim().is_empty())
                     .then(|| draft.fingerprint.trim().into()),
+                host_key_alias: draft.host_key_alias(),
                 player: draft.player.clone(),
                 proxy_jump: draft.proxy_jump.clone(),
                 local_forwards: draft.local_forwards.clone(),
@@ -3381,6 +3394,12 @@ impl TerminalApp {
             (Field::Host, "Host", &draft.host, "example.com"),
             (Field::User, "User", &draft.user, "root"),
             (Field::Port, "Port", &draft.port, "22"),
+            (
+                Field::HostKeyAlias,
+                "Host key alias (optional)",
+                &draft.host_key_alias,
+                "Name used to verify this server in known_hosts",
+            ),
         ] {
             fields.push(
                 StackPanel::new().spacing(5.0).children((
@@ -5418,6 +5437,7 @@ impl Component for TerminalApp {
                         Field::CustomTerminal => &mut draft.custom_terminal,
                         Field::Identity => &mut draft.identity,
                         Field::Fingerprint => &mut draft.fingerprint,
+                        Field::HostKeyAlias => &mut draft.host_key_alias,
                     };
                     let changed = *target != text;
                     *target = text;
@@ -6282,7 +6302,7 @@ impl TerminalApp {
                     panic!()
                 };
                 let prompts = tab.session.prompts.clone();
-                context.spawn_background(move |_|{let question=if step==0{Question::HostKey{host:"loopback.test".into(),port:22,algorithm:"ssh-ed25519".into(),fingerprint:"SHA256:test-fingerprint".into()}}else{Question::Authentication{name:"MFA test".into(),instructions:"Isolated native prompt test".into(),challenges:vec![Challenge{label:"Account".into(),echo:true},Challenge{label:"Password".into(),echo:false}]}};
+                context.spawn_background(move |_|{let question=if step==0{Question::HostKey{host:"loopback.test".into(),port:22,host_key_alias:None,algorithm:"ssh-ed25519".into(),fingerprint:"SHA256:test-fingerprint".into()}}else{Question::Authentication{name:"MFA test".into(),instructions:"Isolated native prompt test".into(),challenges:vec![Challenge{label:"Account".into(),echo:true},Challenge{label:"Password".into(),echo:false}]}};
                     let answer=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(prompts.ask(question)).unwrap();
                     if step==0{assert!(matches!(answer,Answer::Trust(true)));}else{assert!(matches!(answer,Answer::Authentication(ref v)if v.len()==2&&v[0].as_str()=="pilot"&&v[1].as_str()=="secret"));}Message::Smoke(step+2)
                 });
@@ -6682,6 +6702,10 @@ mod profile_ui_tests {
     }
     #[test]
     fn existing_profiles_prefill_all_authentication_modes_and_preferences() {
+        let mut fresh = ProfileDraft::default();
+        assert!(fresh.host_key_alias().is_none());
+        fresh.host_key_alias = "  TeSt.Example  ".into();
+        assert_eq!(fresh.host_key_alias().as_deref(), Some("test.example"));
         for (expected, authentication) in [
             (0, Authentication::Agent),
             (
@@ -6703,6 +6727,7 @@ mod profile_ui_tests {
                 port: 6792,
                 authentication,
                 host_key: Some("SHA256:test".into()),
+                host_key_alias: Some("cockpit.example".into()),
                 proxy_jump: Vec::new(),
                 local_forwards: Vec::new(),
                 durable: false,
@@ -6718,6 +6743,8 @@ mod profile_ui_tests {
             assert_eq!(draft.scrollback_lines, "0");
             assert_eq!(draft.color_scheme, ColorScheme::OneHalfLight);
             assert_eq!(draft.fingerprint, "SHA256:test");
+            assert_eq!(draft.host, "test.invalid");
+            assert_eq!(draft.host_key_alias, "cockpit.example");
             assert!(draft.player.mute && draft.player.game_mode);
             assert_eq!(draft.name, "existing");
         }

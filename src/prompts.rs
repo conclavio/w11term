@@ -20,6 +20,8 @@ pub enum Question {
     HostKey {
         host: String,
         port: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        host_key_alias: Option<String>,
         algorithm: String,
         fingerprint: String,
     },

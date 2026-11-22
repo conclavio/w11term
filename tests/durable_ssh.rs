@@ -863,6 +863,7 @@ async fn durable_reference_checks_the_destination_key_through_a_jump() {
         user: "gate".into(),
         port,
         host_key: Some(fingerprint),
+        host_key_alias: None,
         authentication: Authentication::None,
     });
     let pane = fixture.open(None);

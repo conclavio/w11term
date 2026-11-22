@@ -135,9 +135,9 @@ try {
         if ($output -cnotmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
             throw 'The OpenSSH host certificate regression did not report exactly one pass'
         }
-        # This runs before the mount tests log in. The two rejected certificates must never reach login.
+        # Only the direct and aliased logins succeed; neither bad principal nor the wrong CA reaches login.
         $logins = [regex]::Matches((Read-Serial), 'Accepted publickey for w11fixture from ').Count
-        if ($logins -ne 1) { throw "Expected exactly one accepted public-key login in sshd's log, got $logins" }
+        if ($logins -ne 2) { throw "Expected two accepted public-key logins in sshd's log, got $logins" }
     }
     $cases = if ($LegacyFuse) { 'old_fusermount_refuses_before_export' } else { 'native_windows_passive_sshfs','native_windows_writable_sshfs' }
     foreach ($case in $cases) {

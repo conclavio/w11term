@@ -120,7 +120,13 @@ pub enum Action {
     Save(TabId, u64, usize),
 }
 
-fn endpoint(host: &str, port: u16, user: &str, auth: &Authentication) -> String {
+fn endpoint(
+    host: &str,
+    port: u16,
+    user: &str,
+    auth: &Authentication,
+    host_key_alias: Option<&str>,
+) -> String {
     let auth = match auth {
         Authentication::None => "none".to_owned(),
         Authentication::Agent => "SSH agent".to_owned(),
@@ -133,7 +139,10 @@ fn endpoint(host: &str, port: u16, user: &str, auth: &Authentication) -> String 
     } else {
         host.to_owned()
     };
-    format!("{user}@{host}:{port} ({auth})")
+    match host_key_alias {
+        Some(alias) => format!("{user}@{host}:{port} ({auth}, host key alias {alias})"),
+        None => format!("{user}@{host}:{port} ({auth})"),
+    }
 }
 
 pub(super) fn jump_summary(hops: &[JumpHost]) -> String {
@@ -145,6 +154,7 @@ pub(super) fn jump_summary(hops: &[JumpHost]) -> String {
             hop.port,
             &hop.user,
             &hop.authentication,
+            hop.host_key_alias.as_deref(),
         ));
     }
     text
@@ -371,7 +381,8 @@ impl TerminalApp {
                             &options.host,
                             options.port,
                             &options.user,
-                            &options.authentication
+                            &options.authentication,
+                            options.host_key_alias.as_deref()
                         )
                     ),
                 ));

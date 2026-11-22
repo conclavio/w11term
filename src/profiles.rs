@@ -405,6 +405,7 @@ impl ProfileStore {
                             || old.user != options.user
                             || old.port != options.port
                             || old.host_key != options.host_key
+                            || old.host_key_alias != options.host_key_alias
                     })
             {
                 object.remove(SHARE_TOKEN);
@@ -436,6 +437,9 @@ impl ProfileStore {
             }
             if options.scrollback_lines.is_default() {
                 object.remove("scrollback_lines");
+            }
+            if options.host_key_alias.is_none() {
+                object.remove("host_key_alias");
             }
             if !keep_route && options.proxy_jump.is_empty() {
                 object.remove("proxy_jump");
@@ -577,6 +581,7 @@ mod tests {
                 identity: "local-key".into(),
             },
             host_key: None,
+            host_key_alias: None,
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             durable: false,

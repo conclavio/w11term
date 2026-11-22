@@ -70,7 +70,7 @@ fn sorted_fragments_restore_global_scope_and_resolve_relative_to_ssh_home() {
 #[test]
 fn unsupported_scope_and_trust_block_only_the_relevant_alias_with_source_line() {
     let files = Files::new();
-    files.put(".ssh/fragment config","Host bad\n# comment\n HostKeyAlias unimportable\nHost nested\n Include corrupted\nHost port\n Port 0\nHost ok\n");
+    files.put(".ssh/fragment config","Host bad\n# comment\n HostKeyAlias wildcard*\nHost nested\n Include corrupted\nHost port\n Port 0\nHost ok\n");
     files.put(".ssh/corrupted", [0xff]);
     let report = files.report("Include = \"fragment config\"\n").unwrap();
     for (alias, line) in [("bad", 3), ("nested", 5), ("port", 7)] {

@@ -219,6 +219,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                     }
                 },
                 host_key: Some(pin),
+                host_key_alias: None,
                 proxy_jump: Vec::new(),
                 local_forwards: Vec::new(),
                 durable: false,
