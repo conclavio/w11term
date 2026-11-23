@@ -806,6 +806,7 @@ impl<'a> Performer<'a> {
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
                 self.saved_titles = Default::default();
+                self.title.from_application = false;
                 self.end_synchronized_output();
                 self.progress = Progress::default();
                 self.progress_value = 0;
@@ -855,7 +856,7 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
                 self.icon_title.take();
-                self.title = title.clone();
+                self.title.set_from_application(&title);
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::WindowTitleChanged(title.clone()));
                     handler.alert(Alert::IconTitleChanged(Some(title)));
@@ -864,7 +865,7 @@ impl<'a> Performer<'a> {
 
             OperatingSystemCommand::SetWindowTitleSun(title)
             | OperatingSystemCommand::SetWindowTitle(title) => {
-                self.title = title.clone();
+                self.title.set_from_application(&title);
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::WindowTitleChanged(title));
                 }

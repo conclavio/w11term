@@ -371,7 +371,7 @@ pub struct TerminalState {
     tabs: TabStop,
 
     /// The terminal title string (OSC 2)
-    title: String,
+    title: title::WindowTitle,
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
     saved_titles: title::TitleStack,
@@ -655,7 +655,7 @@ impl TerminalState {
             newline_mode: false,
             current_mouse_buttons: vec![],
             tabs: TabStop::new(size.cols, 8),
-            title: "wezterm".to_string(),
+            title: Default::default(),
             icon_title: None,
             saved_titles: Default::default(),
             palette: Default::default(),
@@ -835,7 +835,13 @@ impl TerminalState {
     /// What we do here is prefer to return the OSC 1 icon title
     /// if it is set, otherwise return the OSC 2 window title.
     pub fn get_title(&self) -> &str {
-        self.icon_title.as_ref().unwrap_or(&self.title)
+        self.icon_title.as_deref().unwrap_or(&self.title.raw)
+    }
+
+    /// The window title supplied by the application, independently of OSC 1
+    /// icon names. Full reset and a saved initial title clear its provenance.
+    pub fn application_window_title(&self) -> Option<&Arc<str>> {
+        self.title.from_application.then_some(&self.title.raw)
     }
 
     pub fn get_progress(&self) -> Progress {
@@ -2546,7 +2552,7 @@ impl TerminalState {
                     write!(
                         self.writer,
                         "{}",
-                        OperatingSystemCommand::SetWindowTitleSun(self.title.clone())
+                        OperatingSystemCommand::SetWindowTitleSun(self.title.raw.to_string())
                     )
                     .ok();
                     self.writer.flush().ok();

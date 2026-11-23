@@ -718,7 +718,7 @@ impl TerminalApp {
                 assert_eq!(restored.len(), 2);
                 assert_eq!(restored[1], opened);
                 for id in restored {
-                    assert_eq!(self.tab_label(id), "Operations");
+                    assert_eq!(self.tab_label(id, true), "Operations");
                     let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
                         panic!("expected terminal")
                     };
