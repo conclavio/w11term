@@ -803,6 +803,15 @@ impl TerminalApp {
                 .children((
                     bulk("Select shown", true, selected.len() < shown.len()),
                     bulk("Deselect shown", false, !selected.is_empty()),
+                    Button::new()
+                        .is_enabled(!selected_shown.is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            Message::HostGroup(Action::Saved(
+                                id,
+                                saved::Action::NewFromSelection(selected_shown.clone()),
+                            ))
+                        }))
+                        .content("Save selection as group…"),
                 )),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {

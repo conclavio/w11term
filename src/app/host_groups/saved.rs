@@ -15,6 +15,35 @@ struct Editor {
     name: String,
     members: Vec<String>,
     confirm_delete: bool,
+    without_profile: usize,
+}
+
+#[derive(Default)]
+struct Selection {
+    members: Vec<String>,
+    without_profile: usize,
+}
+
+impl Selection {
+    fn capture(
+        roster: &[Target],
+        selected: &BTreeSet<u64>,
+        available: impl Fn(&str) -> bool,
+    ) -> Self {
+        let mut seen = BTreeSet::new();
+        let mut selection = Self::default();
+        for target in roster
+            .iter()
+            .filter(|target| selected.contains(&target.pane))
+        {
+            match target.profile.as_deref().filter(|name| available(name)) {
+                Some(name) if seen.insert(name) => selection.members.push(name.into()),
+                Some(_) => {}
+                None => selection.without_profile += 1,
+            }
+        }
+        selection
+    }
 }
 
 impl SavedUi {
@@ -34,15 +63,18 @@ impl SavedUi {
             })
     }
 
-    fn edit(&mut self, original: Option<(String, Vec<String>)>) {
+    fn edit(&mut self, original: Option<(String, Vec<String>)>, selection: Selection) {
         self.next_editor += 1;
-        let (name, members) = original.clone().unwrap_or_default();
+        let (name, members) = original
+            .clone()
+            .unwrap_or_else(|| (String::new(), selection.members));
         self.editor = Some(Editor {
             id: self.next_editor,
             original,
             name,
             members,
             confirm_delete: false,
+            without_profile: selection.without_profile,
         });
         self.feedback.clear();
     }
@@ -51,6 +83,7 @@ impl SavedUi {
 pub enum Action {
     Select(String),
     New,
+    NewFromSelection(BTreeSet<u64>),
     Edit(String),
     Open { name: String, members: Vec<String> },
     Draft(u64, DraftAction),
@@ -84,9 +117,10 @@ impl TerminalApp {
             Action::New => {
                 self.refresh_profiles();
                 if let Some(page) = self.host_group_mut(id) {
-                    page.saved.edit(None);
+                    page.saved.edit(None, Selection::default());
                 }
             }
+            Action::NewFromSelection(offered) => self.new_saved_group_from_selection(id, offered),
             Action::Edit(name) => {
                 self.refresh_profiles();
                 let original = self
@@ -97,7 +131,7 @@ impl TerminalApp {
                     .map(|members| (name, members));
                 if let Some(page) = self.host_group_mut(id) {
                     if let Some(original) = original {
-                        page.saved.edit(Some(original));
+                        page.saved.edit(Some(original), Selection::default());
                     } else {
                         page.saved.feedback = "This SSH group was removed.".into();
                     }
@@ -116,6 +150,32 @@ impl TerminalApp {
                 }
             }
             Action::Draft(editor, action) => self.edit_saved_host_group(id, editor, action),
+        }
+    }
+
+    fn new_saved_group_from_selection(&mut self, id: TabId, offered: BTreeSet<u64>) {
+        if offered.is_empty() || self.host_group_command_target() != Some(id) {
+            return;
+        }
+        self.refresh_profiles();
+        let roster = self.host_group_targets();
+        let Some(page) = self.host_group_mut(id) else {
+            return;
+        };
+        if page.selected_shown(&roster) != offered {
+            page.saved.feedback = "The shown selection changed. Try again.".into();
+            return;
+        }
+        let selection = Selection::capture(&roster, &offered, |name| {
+            self.catalog.ssh_host_group_member(name).is_some()
+        });
+        let profile_error = self.profile_error.clone();
+        if let Some(page) = self.host_group_mut(id) {
+            if let Some(error) = profile_error {
+                page.saved.feedback = format!("Could not read SSH profiles. {error}");
+            } else {
+                page.saved.edit(None, selection);
+            }
         }
     }
 
@@ -450,6 +510,18 @@ impl TerminalApp {
         } else {
             StackPanel::new().spacing(4.0).keyed_children(rows)
         };
+        let selection_notice = match draft.without_profile {
+            0 => View::empty(),
+            count => {
+                let pane = if count == 1 { "pane has" } else { "panes have" };
+                TextBlock::new()
+                    .text(format!(
+                        "{count} selected {pane} no available saved SSH profile."
+                    ))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            }
+        };
         Some(
             Grid::new()
                 .margin(Thickness::uniform(16.0))
@@ -475,6 +547,7 @@ impl TerminalApp {
                         .on_text_changed(ctx.callback(move |name| action(DraftAction::Name(name)))),
                     ScrollViewer::new().grid_row(2).content(choices),
                     StackPanel::new().grid_row(3).spacing(5.0).children((
+                        selection_notice,
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
                             .spacing(8.0)
@@ -485,5 +558,33 @@ impl TerminalApp {
                     )),
                 )),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_selection_uses_roster_order_and_deduplicates_available_profiles() {
+        let target = |pane, profile: Option<&str>| Target {
+            pane,
+            name: format!("Pane {pane}"),
+            profile: profile.map(str::to_owned),
+            connected: true,
+            state: TargetState::InUse,
+        };
+        let roster = [
+            target(19, Some("West")),
+            target(2, Some("East")),
+            target(5, Some("West")),
+            target(7, None),
+            target(8, Some("Old")),
+            target(9, Some("Hidden")),
+        ];
+        let shown_selected = BTreeSet::from([19, 2, 5, 7, 8]);
+        let selection = Selection::capture(&roster, &shown_selected, |name| name != "Old");
+        assert_eq!(selection.members, ["West", "East"]);
+        assert_eq!(selection.without_profile, 2);
     }
 }
