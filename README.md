@@ -275,6 +275,8 @@ Programming ligatures default to enabled for adjacent ASCII cells with matching 
 
 SSH supports OpenSSH private keys supplied with `--identity`, protected w11term device keys, the Windows OpenSSH agent (the default for `ssh user@host`), `--auth none`, `--auth password`, and `--auth keyboard-interactive`. Password and MFA challenges use native dialogs; hidden answers never enter terminal input, profiles, event logs, or recordings. A successful password remains in memory only for reconnection; one-time codes are requested again. Passphrase-protected OpenSSH keys can be used through the agent.
 
+Choose **Private key file** in Quick Connect or an SSH profile, then use **Browse…** to select the file through the Windows dialog. The picker starts beside the entered path when that folder is available locally, or in your OpenSSH `.ssh` folder when it exists.
+
 The first connection to an unknown host shows its algorithm and SHA256 fingerprint. **Accept and save** writes the public key to OpenSSH `known_hosts`. Cancel stops the connection. A changed known key fails without offering to replace it. An explicitly verified `--host-key SHA256:...` pin remains an alternative. Headless probes fail on unknown hosts instead of opening a dialog.
 
 To trust a fleet’s SSH host CA, add its public key to `%USERPROFILE%\.ssh\known_hosts`.

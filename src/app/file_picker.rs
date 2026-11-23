@@ -20,6 +20,7 @@ pub(super) enum Purpose {
     UploadFiles,
     UploadFolder,
     SshConfig(PathBuf),
+    SshIdentity(Option<PathBuf>),
     Folder,
     DownloadFolder,
     Save(String),
@@ -28,31 +29,29 @@ pub(super) enum Purpose {
     OpenRecording,
 }
 
-fn local_config_folder(dialog: &IFileDialog, config: &Path) {
+fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
     use std::path::{Component, Prefix};
-    let Some(folder) = config.parent().filter(|path| path.is_absolute()) else {
-        return;
-    };
+    if !folder.is_absolute() {
+        return false;
+    }
     let Some(Component::Prefix(prefix)) = folder.components().next() else {
-        return;
+        return false;
     };
     let (Prefix::Disk(letter) | Prefix::VerbatimDisk(letter)) = prefix.kind() else {
-        return;
+        return false;
     };
     let drive = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
     unsafe {
         // A typed UNC path or disconnected mapped drive is not a starting folder.
         if !matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) {
-            return;
+            return false;
         }
         let wide: Vec<_> = folder.as_os_str().encode_wide().chain(Some(0)).collect();
         // The proposed parent (such as ~/.ssh) may not exist yet. In that case
         // leave the file dialog's normal starting directory available.
-        if let Ok(item) =
-            SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None)
-        {
-            let _ = dialog.SetFolder(&item);
-        }
+        SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None)
+            .and_then(|item| dialog.SetFolder(&item))
+            .is_ok()
     }
 }
 
@@ -163,6 +162,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 | Purpose::UploadFolder
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
+                | Purpose::SshIdentity(_)
                 | Purpose::Folder
                 | Purpose::DownloadFolder
         ) {
@@ -218,7 +218,22 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 dialog.SetTitle(w!("Open OpenSSH config"))?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 // Leave file types unrestricted: OpenSSH usually names this file "config".
-                local_config_folder(&dialog, &current);
+                if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::SshIdentity(current) => {
+                dialog.SetTitle(w!("Choose SSH private key"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                // OpenSSH private keys often have no extension.
+                let seeded = current
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .is_some_and(|folder| local_folder(&dialog, folder));
+                if !seeded && let Some(home) = std::env::home_dir() {
+                    local_folder(&dialog, &home.join(".ssh"));
+                }
                 None
             }
             Purpose::Folder | Purpose::DownloadFolder | Purpose::UploadFolder => {
