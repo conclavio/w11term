@@ -620,6 +620,13 @@ pub enum Window {
         bottom: OneBased,
         right: OneBased,
     },
+    /// DECSERA.
+    SelectiveEraseRectangle {
+        top: OneBased,
+        left: OneBased,
+        bottom: OneBased,
+        right: OneBased,
+    },
     /// DECRQCRA; used by esctest
     ChecksumRectangularArea {
         request_id: i64,
@@ -696,6 +703,9 @@ impl Display for Window {
             Window::ReportTitleStackPosition => write!(f, "#S"),
             Window::ReportRectangularSgr { top, left, bottom, right } => {
                 write!(f, "{};{};{};{}#|", top, left, bottom, right)
+            }
+            Window::SelectiveEraseRectangle { top, left, bottom, right } => {
+                write!(f, "{};{};{};{}${{", top, left, bottom, right)
             }
             Window::ChecksumRectangularArea {
                 request_id,
@@ -1279,6 +1289,11 @@ pub enum Edit {
 
     /// ED - ERASE IN PAGE (XTerm calls this Erase in Display)
     EraseInDisplay(EraseInDisplay),
+    /// DECSED and DECSEL.
+    SelectiveEraseInDisplay(EraseInDisplay),
+    SelectiveEraseInLine(EraseInLine),
+    /// DECSCA. Protection applies to subsequently written cells.
+    CharacterProtection(bool),
 
     /// REP - Repeat the preceding character n times
     Repeat(u32),
@@ -1331,6 +1346,15 @@ impl Display for Edit {
             Edit::ScrollDown(n) => n.write_csi(f, "T")?,
             Edit::ScrollUp(n) => n.write_csi(f, "S")?,
             Edit::EraseInDisplay(n) => n.write_csi(f, "J")?,
+            Edit::SelectiveEraseInDisplay(n) => {
+                write!(f, "?")?;
+                n.write_csi(f, "J")?;
+            }
+            Edit::SelectiveEraseInLine(n) => {
+                write!(f, "?")?;
+                n.write_csi(f, "K")?;
+            }
+            Edit::CharacterProtection(protected) => write!(f, "{}\"q", u8::from(*protected))?,
             Edit::Repeat(n) => n.write_csi(f, "b")?,
         }
         Ok(())
@@ -1884,6 +1908,20 @@ impl<'a> CSIParser<'a> {
         match (self.control, self.orig_params) {
             ('k', [.., CsiParam::P(b' ')]) => self.select_character_path(params),
             ('q', [.., CsiParam::P(b' ')]) => self.cursor_style(params),
+            ('q', [value @ .., CsiParam::P(b'"')]) if !self.parameters_truncated => {
+                let protected = match value {
+                    [] | [CsiParam::Integer(0 | 2)] => false,
+                    [CsiParam::Integer(1)] => true,
+                    _ => return Err(()),
+                };
+                Ok(CSI::Edit(Edit::CharacterProtection(protected)))
+            }
+            ('J', [CsiParam::P(b'?'), area @ ..]) if !self.parameters_truncated => {
+                parse!(Edit, SelectiveEraseInDisplay, area)
+            }
+            ('K', [CsiParam::P(b'?'), area @ ..]) if !self.parameters_truncated => {
+                parse!(Edit, SelectiveEraseInLine, area)
+            }
             ('y', [.., CsiParam::P(b'*')]) => self.checksum_area(params),
 
             ('c', [CsiParam::P(b'='), ..]) => self
@@ -1917,18 +1955,23 @@ impl<'a> CSIParser<'a> {
                 Ok(CSI::PushSgr(parameters))
             }
             ('q' | '}', [CsiParam::P(b'#')]) if !self.parameters_truncated => Ok(CSI::PopSgr),
-            ('|', [parameters @ .., CsiParam::P(b'#')]) if !self.parameters_truncated => {
+            ('|', [parameters @ .., CsiParam::P(b'#')])
+            | ('{', [parameters @ .., CsiParam::P(b'$')]) if !self.parameters_truncated => {
                 let area = Cracked::parse(parameters)?;
                 if area.len() > 4 {
                     return Err(());
                 }
                 let far_edge = CsiParam::Integer(0);
-                Ok(CSI::Window(Box::new(Window::ReportRectangularSgr {
-                    top: OneBased::from_optional_esc_param(area.get(0))?,
-                    left: OneBased::from_optional_esc_param(area.get(1))?,
-                    bottom: OneBased::from_esc_param_with_big_default(area.get(2).unwrap_or(&far_edge))?,
-                    right: OneBased::from_esc_param_with_big_default(area.get(3).unwrap_or(&far_edge))?,
-                })))
+                let top = OneBased::from_optional_esc_param(area.get(0))?;
+                let left = OneBased::from_optional_esc_param(area.get(1))?;
+                let bottom = OneBased::from_esc_param_with_big_default(area.get(2).unwrap_or(&far_edge))?;
+                let right = OneBased::from_esc_param_with_big_default(area.get(3).unwrap_or(&far_edge))?;
+                let operation = if self.control == '|' {
+                    Window::ReportRectangularSgr { top, left, bottom, right }
+                } else {
+                    Window::SelectiveEraseRectangle { top, left, bottom, right }
+                };
+                Ok(CSI::Window(Box::new(operation)))
             }
             ('S', [CsiParam::P(b'#')]) if !self.parameters_truncated => {
                 Ok(CSI::Window(Box::new(Window::ReportTitleStackPosition)))

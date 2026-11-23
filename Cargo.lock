@@ -3593,7 +3593,6 @@ dependencies = [
 [[package]]
 name = "wezterm-cell"
 version = "0.1.0"
-source = "git+https://github.com/wezterm/wezterm?rev=e2a98e1b8af156988ad0ac778658ac27b60a55fb#e2a98e1b8af156988ad0ac778658ac27b60a55fb"
 dependencies = [
  "finl_unicode",
  "image",

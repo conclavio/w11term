@@ -126,13 +126,13 @@ fn rectangle_axis(start: OneBased, end: OneBased, limits: Range<usize>) -> Range
 }
 
 impl TerminalState {
-    pub(super) fn report_rectangular_sgr(
-        &mut self,
+    pub(super) fn screen_rectangle(
+        &self,
         top: OneBased,
         left: OneBased,
         bottom: OneBased,
         right: OneBased,
-    ) {
+    ) -> (Range<usize>, Range<usize>) {
         let screen = self.screen();
         let (row_limits, col_limits) = if self.dec_origin_mode {
             (
@@ -144,8 +144,20 @@ impl TerminalState {
         } else {
             (0..screen.physical_rows, 0..screen.physical_cols)
         };
-        let rows = rectangle_axis(top, bottom, row_limits);
-        let cols = rectangle_axis(left, right, col_limits);
+        (
+            rectangle_axis(top, bottom, row_limits),
+            rectangle_axis(left, right, col_limits),
+        )
+    }
+
+    pub(super) fn report_rectangular_sgr(
+        &mut self,
+        top: OneBased,
+        left: OneBased,
+        bottom: OneBased,
+        right: OneBased,
+    ) {
+        let (rows, cols) = self.screen_rectangle(top, left, bottom, right);
         let shared = self.shared_rendition(rows, cols);
         write!(self.writer, "\x1b[{}m", shared.parameters()).ok();
         self.writer.flush().ok();

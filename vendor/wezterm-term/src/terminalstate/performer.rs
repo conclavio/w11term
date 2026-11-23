@@ -352,6 +352,11 @@ impl<'a> Performer<'a> {
                                 write!(self.writer, "{DCS}1$r{style} q{ST}").ok();
                                 self.writer.flush().ok();
                             }
+                            b"\"q" => {
+                                let protected = u8::from(self.pen.protected());
+                                write!(self.writer, "{DCS}1$r{protected}\"q{ST}").ok();
+                                self.writer.flush().ok();
+                            }
                             &[b'"', b'p'] => {
                                 // DECSCL - select conformance level
                                 write!(self.writer, "{}1$r65;1\"p{}", DCS, ST).ok();

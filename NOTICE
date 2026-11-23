@@ -13,6 +13,9 @@ License: MIT; the complete upstream notice is preserved in
 vendor/wezterm-term/LICENSE.md.
 Local modifications are documented in vendor/wezterm-term/PATCHES.md.
 
+The vendored wezterm-cell is from the same WezTerm revision under the MIT
+license. The upstream notice is preserved in vendor/wezterm-cell/LICENSE.md.
+
 The vendored vtparse parser is from the same WezTerm revision and retains its MIT license in vendor/vtparse/LICENSE.md.
 
 The vendored wezterm-escape-parser is from the same WezTerm revision under
