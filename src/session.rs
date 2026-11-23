@@ -146,6 +146,10 @@ pub enum Command {
     },
     Wheel(isize, KeyModifiers),
     Mouse(MouseEvent),
+    MouseLeave {
+        connection: u64,
+        modifiers: KeyModifiers,
+    },
     Focus(bool),
     ReloadDemo,
     Shutdown,
@@ -872,7 +876,7 @@ async fn run(
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
-                        Some(Command::Key {..} | Command::DetailedKey {..} | Command::Composed(_) | Command::Text(_) | Command::Paste(_) | Command::Mouse(_)) => continue,
+                        Some(Command::Key {..} | Command::DetailedKey {..} | Command::Composed(_) | Command::Text(_) | Command::Paste(_) | Command::Mouse(_) | Command::MouseLeave { .. }) => continue,
                         Some(Command::Wheel(lines, _)) => Some(Command::Scroll(lines)),
                         other => other,
                     }
@@ -884,7 +888,7 @@ async fn run(
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
                         }
-                        Some(Command::Key { .. } | Command::DetailedKey { .. } | Command::Mouse(_)
+                        Some(Command::Key { .. } | Command::DetailedKey { .. } | Command::Mouse(_) | Command::MouseLeave { .. }
                             | Command::Text(_) | Command::Paste(_) | Command::Composed(_)) => continue,
                         Some(Command::Wheel(lines, _)) => Some(Command::Scroll(lines)),
                         other => other,
@@ -1228,6 +1232,9 @@ async fn run(
                         terminal::scroll_wheel(&mut terminal,&mut scroll_offset,last_mouse,lines,modifiers,player.read().unwrap().alternate_scroll_enabled())
                     }
                     Some(Command::Mouse(event)) => { last_mouse = event; terminal.mouse_event(event) },
+                    Some(Command::MouseLeave { connection, modifiers }) => {
+                        if connection == connection_generation { terminal.mouse_left(modifiers) } else { Ok(()) }
+                    }
                     Some(Command::Focus(focused)) => { terminal.focus_changed(focused); Ok(()) }
                     Some(Command::ReloadDemo) => { if is_demo { presentation.advance(&mut terminal,demo::bytes(),scroll_offset,&status,total_bytes); } Ok(()) }
                 };

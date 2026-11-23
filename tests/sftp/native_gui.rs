@@ -384,6 +384,26 @@ async fn native_command_palette_opens_powershell_and_restores_ssh_input() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives pointer boundaries and capture across a live SSH and PowerShell split"]
+async fn native_pixel_mouse_leave_follows_the_pointer_and_preserves_capture() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        remote.path().join("copy-history.vt"),
+        b"\x1b[?1003h\x1b[?1016h\r\npixel-ready",
+    )
+    .unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    fs::write(state.path().join("trace-path"), trace.to_str().unwrap()).unwrap();
+    drive_mixed_gui("pixel-pointer-leave-ui.ps1", &ssh, state.path());
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "scrolls a live SSH pane via Windows UI Automation and its pointer rail beside PowerShell"]
 async fn native_pane_scrollbar_tracks_async_ssh_output_without_moving_its_neighbor() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

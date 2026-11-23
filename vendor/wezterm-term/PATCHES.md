@@ -168,3 +168,6 @@ The original MIT license is preserved in `LICENSE.md`.
   bounds restore strings and applies them only after a complete ST.
   CTC edits the shared table and DECST8C resets the eight-column pattern.
   Cursor tabbing visits only the stops on the active line.
+
+- SGR pixel mouse reporting encodes Kitty pointer departures and clears the
+  last motion sample so the first re-entry motion is reported again.

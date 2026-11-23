@@ -3640,6 +3640,51 @@ mod tests {
     }
 
     #[test]
+    fn pixel_mouse_leave_clears_motion_coalescing_and_keeps_the_button_held() {
+        use wezterm_term::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (mut terminal, mut replies) = engine();
+        terminal.advance_bytes(b"\x1b[?1003h\x1b[?1006h");
+        terminal.mouse_left(KeyModifiers::NONE).unwrap();
+        assert!(replies.try_recv().is_err());
+        terminal.advance_bytes(b"\x1b[?1016h");
+
+        let motion = MouseEvent {
+            kind: MouseEventKind::Move,
+            x: 0,
+            y: 0,
+            x_pixel_offset: 2,
+            y_pixel_offset: 3,
+            button: MouseButton::None,
+            modifiers: KeyModifiers::NONE,
+        };
+        terminal.mouse_event(motion).unwrap();
+        assert_eq!(receive(&mut replies), b"\x1b[<35;3;4M");
+        terminal.mouse_event(motion).unwrap();
+        assert!(replies.try_recv().is_err());
+        terminal
+            .mouse_left(KeyModifiers::CTRL | KeyModifiers::ALT)
+            .unwrap();
+        assert_eq!(receive(&mut replies), b"\x1b[<312;1;1M");
+        terminal.mouse_event(motion).unwrap();
+        assert_eq!(receive(&mut replies), b"\x1b[<35;3;4M");
+
+        let press = MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            ..motion
+        };
+        terminal.mouse_event(press).unwrap();
+        assert_eq!(receive(&mut replies), b"\x1b[<0;3;4M");
+        terminal.mouse_left(KeyModifiers::NONE).unwrap();
+        assert_eq!(receive(&mut replies), b"\x1b[<288;1;1M");
+        terminal.mouse_event(motion).unwrap();
+        assert_eq!(receive(&mut replies), b"\x1b[<32;3;4M");
+        terminal.advance_bytes(b"\x1b[?1016l");
+        terminal.mouse_left(KeyModifiers::NONE).unwrap();
+        assert!(replies.try_recv().is_err());
+    }
+
+    #[test]
     fn tab_stop_controls_edit_the_shared_table_and_restore_defaults() {
         let (mut terminal, mut replies) = engine();
         let size = terminal.get_size();
