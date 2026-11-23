@@ -57,6 +57,7 @@ mod folder_revoke;
 mod folder_shares;
 mod folder_sharing_state;
 mod keyboard_settings;
+mod live_profile;
 mod local_forwards;
 mod local_profile;
 mod pattern_settings;
@@ -3254,6 +3255,7 @@ impl TerminalApp {
                 }),
             local_forwards::LABEL => local_forwards::open(forward),
             tab_title::RENAME_PANE => tab_title::show_pane(pane.zip(group)),
+            live_profile::SAVE => live_profile::open(paste),
             label if let Some(color) = tab_colors::from_menu(label) => group
                 .map_or(Message::ControlIdle, |group| {
                     Message::SetTabColor(group, color)
@@ -3662,6 +3664,11 @@ impl TerminalApp {
             } else {
                 MenuItem::disabled("edit-profile", "Edit current profile…")
             },
+            command_menu_item(
+                "save-live-ssh-profile",
+                live_profile::SAVE,
+                self.saveable_ssh_origin().is_some(),
+            ),
             command_menu_item(
                 "enroll",
                 "Enroll this device (at game prompt)",
@@ -4816,7 +4823,7 @@ impl Component for TerminalApp {
             Message::TransferClaim(id) => self.claim_group(id, context),
             Message::TransferDone(id) => self.finish_transfer(id, context),
             Message::TransferCanceled(id) => self.cancel_transfer(id, context),
-            Message::TabTitle(action) => self.edit_tab_title(action),
+            Message::TabTitle(action) => self.edit_tab_title(action, context),
             Message::Attention(action) => self.handle_attention(action, context),
             Message::AttentionChanged | Message::FolderAuthority => {}
             Message::ToggleInspector => {

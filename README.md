@@ -257,6 +257,8 @@ To connect once, open **+ → New Profile…**, enter the SSH details and choose
 
 For a shorter route, choose **+ → Quick connect…** or search for it in the command palette. Paste an explicit address such as `play@conclav.io:6792`, `ssh://play@conclav.io:6792`, or `user@[2001:db8::1]:2222`, choose authentication, and select **Connect**. Quick Connect uses the existing host-key and authentication prompts. It leaves the profile catalog untouched.
 
+Once a one-off SSH pane is connected, choose **Save SSH connection as profile…** from the caret menu or command palette. Enter a new name to add the connection to the profile list and bind it to the current pane. The SSH session and its scrollback stay in place. The profile records the authentication method and any key file path. Passwords and keyboard-interactive answers stay in the session.
+
 The same destinations work with `w11term ssh`. The optional `--port` flag takes precedence over a port in the address.
 
 In a local shell profile editor, **Duplicate saved profile…** copies the saved executable, arguments, starting directory and scrollback settings. Change the name or settings and select **Save copy**. **Delete profile…** removes a custom profile after confirmation and leaves open shells running. If you customized an automatically discovered PowerShell profile, **Restore defaults…** removes its saved overrides and keeps the installed shell in the menu.

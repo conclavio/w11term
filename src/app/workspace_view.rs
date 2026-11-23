@@ -673,14 +673,17 @@ impl TerminalApp {
                 self.update(Message::SplitPane(Axis::Rows, None), context);
             }
             1 => {
-                self.edit_tab_title(tab_title::Action::Show);
+                self.edit_tab_title(tab_title::Action::Show, context);
                 assert!(self.title_editor.is_some(), "tab rename dialog");
                 let serial = self.name_edit_serial;
-                self.edit_tab_title(tab_title::Action::Edit(serial, "Operations".into()));
-                self.edit_tab_title(tab_title::Action::Finish(
-                    serial,
-                    ContentDialogResult::Primary,
-                ));
+                self.edit_tab_title(
+                    tab_title::Action::Edit(serial, "Operations".into()),
+                    context,
+                );
+                self.edit_tab_title(
+                    tab_title::Action::Finish(serial, ContentDialogResult::Primary),
+                    context,
+                );
                 let epoch = self.watch_epoch;
                 self.update(Message::DividerPress(epoch, vec![], 3.0), context);
                 self.update(Message::PaneRatio(epoch, vec![], 0.6), context);
