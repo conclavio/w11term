@@ -10,6 +10,8 @@ mod shared;
 #[path = "sort_ui.rs"]
 mod sort_ui;
 use shared::run_gui;
+#[path = "properties_ui.rs"]
+mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks persisted Follow Windows colors and reports against native UISettings"]

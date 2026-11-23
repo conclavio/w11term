@@ -594,12 +594,14 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
+        self.trace_properties("STAT", &path)?;
         Ok(Attrs {
             id,
             attrs: (&fs::metadata(self.path(&path)).map_err(io)?).into(),
         })
     }
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
+        self.trace_properties("LSTAT", &path)?;
         if self.root.join("deny-rename-check").exists() {
             return Err(StatusCode::PermissionDenied);
         }
@@ -627,7 +629,15 @@ impl russh_sftp::server::Handler for Files {
         if self.root.join("omit-lstat-permissions").is_file() {
             attrs.permissions = None;
         }
+        if let Ok(name) = fs::read_to_string(self.root.join("properties-omit-attrs"))
+            && path.rsplit('/').next() == Some(name.as_str())
+        {
+            attrs = FileAttributes::empty();
+        }
         Ok(Attrs { id, attrs })
+    }
+    async fn readlink(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        self.properties_readlink(id, &path)
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
         if self.root.join("no-fstat").exists() {
@@ -652,6 +662,7 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        self.trace_properties("SETSTAT", &path)?;
         if let Some(size) = attrs.size {
             fs::OpenOptions::new()
                 .write(true)
@@ -668,6 +679,7 @@ impl russh_sftp::server::Handler for Files {
         h: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        self.trace_properties("FSETSTAT", &h)?;
         if let Some(posix) = &mut self.posix {
             if self.root.join("deny-editor-fsetstat").is_file() {
                 return Err(StatusCode::PermissionDenied);
@@ -994,6 +1006,8 @@ mod local_forward;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
+#[path = "sftp/properties.rs"]
+mod properties;
 #[path = "sftp/remove.rs"]
 mod remove;
 #[path = "sftp/rename.rs"]
