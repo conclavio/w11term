@@ -120,7 +120,11 @@ impl KittyImageState {
 }
 
 impl TerminalState {
-    pub(super) fn visible_kitty_relatives(&self, keys: &mut HashSet<Key>) {
+    pub(super) fn find_visible_kitty_relatives(
+        &self,
+        keys: &mut HashSet<Key>,
+        cell: Option<PlacementCell>,
+    ) {
         if self
             .kitty_img
             .projected
@@ -128,7 +132,12 @@ impl TerminalState {
             .any(|node| node.parent.is_some())
         {
             let screen = self.screen();
-            self.project_or_find_kitty(None, screen.phys_row(0), screen.physical_rows, Some(keys));
+            self.project_or_find_kitty(
+                None,
+                screen.phys_row(0),
+                screen.physical_rows,
+                Some((keys, cell)),
+            );
         }
     }
 
@@ -144,7 +153,7 @@ impl TerminalState {
         lines: Option<&mut [Line]>,
         first_phys: usize,
         height: usize,
-        mut visible_relatives: Option<&mut HashSet<Key>>,
+        mut visible_relatives: Option<(&mut HashSet<Key>, Option<PlacementCell>)>,
     ) -> bool {
         if self.kitty_img.projected.is_empty() {
             return false;
@@ -312,12 +321,20 @@ impl TerminalState {
             };
             x += px;
             y += py;
-            if let Some(visible) = &mut visible_relatives {
-                if x < screen.physical_cols as i64
-                    && x + i64::from(grid.cols) > 0
-                    && y < height as i64
-                    && y + i64::from(grid.rows) > 0
-                {
+            if let Some((visible, cell)) = &mut visible_relatives {
+                let columns = x..x + i64::from(grid.cols);
+                let rows = y..y + i64::from(grid.rows);
+                let matches = if let Some(cell) = cell {
+                    columns.contains(&(cell.x as i64))
+                        && rows.contains(&(cell.y as i64))
+                        && cell.z.is_none_or(|z| z == grid.z)
+                } else {
+                    columns.start < screen.physical_cols as i64
+                        && columns.end > 0
+                        && rows.start < height as i64
+                        && rows.end > 0
+                };
+                if matches {
                     visible.insert(key);
                 }
                 continue;

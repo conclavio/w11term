@@ -408,6 +408,78 @@ fn place(t: &mut Terminal, id: u32, placement: u32, row: usize, col: usize, heig
 }
 
 #[test]
+fn cell_delete_uses_the_live_grid_and_preserves_image_data_referenced_in_history() {
+    for selector in ["d=C", "d=P,x=3,y=1"] {
+        let (mut t, _) = engine();
+        transmit_red(&mut t, 11);
+        transmit_red(&mut t, 12);
+        place(&mut t, 11, 1, 1, 1, 1);
+        place(&mut t, 11, 2, 2, 3, 3);
+        place(&mut t, 12, 1, 2, 3, 3);
+        place(&mut t, 12, 2, 6, 10, 1);
+        t.advance_bytes(b"\x1b[6;1H\x1b[M"); // The removed row must not pin image 12.
+        t.advance_bytes(b"\x1b[8;1H\r\n\r\n\x1b[1;3H");
+        let old = frame(&t, None, 2);
+        assert_eq!(pixel(&old, 2, 1, 11), RED);
+        assert_eq!(pixel(&old, 2, 2, 12), RED);
+        assert_eq!(pixel(&old, 9, 5, 12), None);
+        // Invalid and off-screen cells must not be clamped into the live grid.
+        t.advance_bytes(b"\x1b_Ga=d,d=P,x=3,y=0\x1b\\\x1b_Ga=d,d=P,x=4294967295,y=1\x1b\\");
+        assert_eq!(pixel(&frame(&t, None, 0), 2, 0, 11), RED);
+        t.advance_bytes(format!("\x1b_Ga=d,{selector}\x1b\\"));
+        let history = frame(&t, Some(&old), 2);
+        assert_eq!(pixel(&history, 0, 0, 11), RED);
+        for id in [11, 12] {
+            for row in 1..=3 {
+                assert_eq!(pixel(&history, 2, row, id), None, "{selector}");
+            }
+            place(&mut t, id, 3, 6, (id - 10) as usize, 1);
+        }
+        let live = frame(&t, None, 0);
+        assert_eq!(pixel(&live, 0, 5, 11), RED, "history pins image data");
+        assert_eq!(pixel(&live, 1, 5, 12), None, "last placement was deleted");
+    }
+}
+
+#[test]
+fn cell_and_z_deletion_preserve_other_layers_and_placeholder_text() {
+    let (mut t, _) = engine();
+    t.advance_bytes(PLACEMENTS);
+    transmit_red(&mut t, 51);
+    t.advance_bytes(b"\x1b[4;6H\x1b_Ga=p,i=51,p=1,z=7,c=1,r=1,C=1,q=2\x1b\\");
+    let start = frame(&t, None, 0);
+    assert!(pixel(&start, 5, 3, 43).is_some());
+    assert_eq!(pixel(&start, 5, 3, 51), RED);
+    t.advance_bytes(b"\x1b_Ga=d,d=Q,x=6,y=4,z=7\x1b\\");
+    let filtered = frame(&t, Some(&start), 0);
+    assert_eq!(pixel(&filtered, 5, 3, 51), None);
+    assert!(pixel(&filtered, 5, 3, 43).is_some());
+    t.advance_bytes(b"\x1b_Ga=d,d=p,x=6,y=4\x1b\\\x1b_Ga=d,d=P,x=3,y=3\x1b\\");
+    let deleted = frame(&t, Some(&filtered), 0);
+    assert_eq!(pixel(&deleted, 5, 3, 43), None);
+    assert!(
+        pixel(&deleted, 2, 2, 42).is_some(),
+        "virtual prototype survives"
+    );
+    assert_eq!(
+        deleted.rows[2].get_cell(2).unwrap().str(),
+        start.rows[2].get_cell(2).unwrap().str()
+    );
+    place(&mut t, 43, 91, 7, 1, 1);
+    place(&mut t, 51, 2, 7, 3, 1);
+    let redisplayed = frame(&t, Some(&deleted), 0);
+    assert!(
+        pixel(&redisplayed, 0, 6, 43).is_some(),
+        "lowercase retains bytes"
+    );
+    assert_eq!(
+        pixel(&redisplayed, 2, 6, 51),
+        None,
+        "uppercase releases bytes"
+    );
+}
+
+#[test]
 fn targeted_delete_preserves_unnamed_placements_until_named_image_retransmission() {
     let (mut t, _) = engine();
     transmit_red(&mut t, 41);

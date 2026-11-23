@@ -103,6 +103,14 @@ Lowercase `d=a` (also the default selector) keeps the image data for redisplay.
 Clearing acts on the active primary or alternate screen, even while the user is
 reading older output. [Kitty deletion protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images)
 
+The cursor (`d=c/C`) and an explicit one-based cell (`d=p/P`) can select
+individual placements. Use `d=q/Q` to restrict an explicit cell to a z-index.
+A hit removes the entire placement, including relative children. Images still
+used elsewhere on screen or in scrollback retain their data after uppercase
+deletion. Unicode placeholders remain editable text. The shared
+`clear-cell.vt` fixture compares the resulting pixels in stock kitty and
+Direct2D after cursor deletion, redisplay, cell deletion and z-index filtering.
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.
