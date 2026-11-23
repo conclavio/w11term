@@ -10,6 +10,7 @@ pub(super) struct Draft {
     args: Vec<String>,
     cwd: String,
     color_scheme: ColorScheme,
+    tab_color: TabColor,
     scrollback_lines: String,
     powershell_integration: bool,
     error: String,
@@ -25,6 +26,7 @@ impl Default for Draft {
             args: Vec::new(),
             cwd: String::new(),
             color_scheme: ColorScheme::default(),
+            tab_color: TabColor::default(),
             scrollback_lines: ScrollbackLines::default().to_string(),
             powershell_integration: false,
             error: String::new(),
@@ -44,6 +46,7 @@ impl Draft {
                 .unwrap_or_default(),
             args: options.args.clone(),
             color_scheme: options.color_scheme,
+            tab_color: options.tab_color,
             scrollback_lines: options.scrollback_lines.to_string(),
             powershell_integration: options.powershell_integration,
             ..Self::default()
@@ -56,6 +59,7 @@ impl Draft {
             args: self.args.clone(),
             cwd: (!self.cwd.trim().is_empty()).then(|| self.cwd.trim().into()),
             color_scheme: self.color_scheme,
+            tab_color: self.tab_color,
             scrollback_lines: self.scrollback_lines.parse()?,
             powershell_integration: self.powershell_integration && self.supports_integration(),
         })
@@ -68,6 +72,13 @@ impl Draft {
     pub(super) fn set_color_scheme(&mut self, scheme: ColorScheme) {
         if self.color_scheme != scheme {
             self.color_scheme = scheme;
+            self.error.clear();
+        }
+    }
+
+    pub(super) fn set_tab_color(&mut self, color: TabColor) {
+        if self.tab_color != color {
+            self.tab_color = color;
             self.error.clear();
         }
     }
@@ -330,6 +341,7 @@ impl TerminalApp {
                 }),
             ),
             color_scheme_editor(id, draft.color_scheme, context),
+            tab_color_editor(id, draft.tab_color, context),
             TextBlock::new().text("Arguments").into(),
         ];
         for (index, arg) in draft.args.iter().enumerate() {

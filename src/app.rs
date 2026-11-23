@@ -19,7 +19,7 @@ use w11term::{
     },
     options::{
         Authentication, ColorScheme, LocalOptions, Profiles, ScrollbackLines, Source, SshOptions,
-        TerminalType,
+        TabColor, TerminalType,
     },
     pane_layout::{Axis, Direction},
     profiles::{ProfileSnapshot, ProfileStore},
@@ -449,6 +449,7 @@ struct ProfileDraft {
     user: String,
     port: String,
     color_scheme: ColorScheme,
+    tab_color: TabColor,
     scrollback_lines: String,
     terminal_preset: usize,
     custom_terminal: String,
@@ -477,6 +478,7 @@ impl Default for ProfileDraft {
             user: String::new(),
             port: "22".into(),
             color_scheme: ColorScheme::default(),
+            tab_color: TabColor::default(),
             scrollback_lines: ScrollbackLines::default().to_string(),
             terminal_preset: 0,
             custom_terminal: String::new(),
@@ -530,6 +532,7 @@ impl ProfileDraft {
             host: host.into(),
             terminal_type: self.terminal_type()?,
             color_scheme: self.color_scheme,
+            tab_color: self.tab_color,
             scrollback_lines: self.scrollback_lines.parse()?,
             user: user.into(),
             port,
@@ -574,6 +577,7 @@ impl ProfileDraft {
             user: options.user.clone(),
             port: options.port.to_string(),
             color_scheme: options.color_scheme,
+            tab_color: options.tab_color,
             scrollback_lines: options.scrollback_lines.to_string(),
             terminal_preset: match options.terminal_type.as_str() {
                 TerminalType::DEFAULT => 0,
@@ -608,6 +612,40 @@ fn color_scheme_editor(id: TabId, scheme: ColorScheme, context: &ViewContext<Ter
                     })
             })),
     ))
+}
+
+fn tab_color_editor(id: TabId, color: TabColor, context: &ViewContext<TerminalApp>) -> View {
+    StackPanel::new().spacing(5.0).children((
+        TextBlock::new().text("Tab color"),
+        ComboBox::new()
+            .automation_name("Tab color")
+            .items_source(TabColor::ALL.map(TabColor::label))
+            .selected_index(TabColor::ALL.iter().position(|value| *value == color))
+            .horizontal_alignment(HorizontalAlignment::Stretch)
+            .on_selection_changed(context.callback(move |index: Option<usize>| {
+                index
+                    .and_then(|i| TabColor::ALL.get(i))
+                    .map_or(Message::ControlIdle, |&color| {
+                        Message::ProfileTabColor(id, color)
+                    })
+            })),
+    ))
+}
+
+fn tab_header_content(label: String, pinned: bool, color: TabColor) -> (String, String) {
+    let (header, name) = if let Some(marker) = color.marker() {
+        (
+            format!("{marker} {label}"),
+            format!("{label} ({} tab)", color.label()),
+        )
+    } else {
+        (label.clone(), label)
+    };
+    if pinned {
+        (format!("📌 {header}"), format!("Pinned: {name}"))
+    } else {
+        (header, name)
+    }
 }
 
 fn scrollback_editor(value: &str, on_change: Callback<String>) -> View {
@@ -1074,6 +1112,7 @@ pub enum Message {
     Auth(TabId, Option<usize>),
     TerminalPreset(TabId, Option<usize>),
     ProfileColorScheme(TabId, ColorScheme),
+    ProfileTabColor(TabId, TabColor),
     SaveProfile(TabId),
     SaveProfileOnly(TabId),
     ConnectOnce(TabId),
@@ -3273,11 +3312,11 @@ impl TerminalApp {
                         self.tab_label(tab.id, application_titles).as_ref(),
                         progress.get(&group).copied().unwrap_or_default(),
                     );
-                    let (header, name) = if pinned {
-                        (format!("📌 {label}"), format!("Pinned: {label}"))
-                    } else {
-                        (label.clone(), label)
+                    let color = match &tab.value.page {
+                        Page::Terminal(live) => live.source.tab_color(),
+                        _ => TabColor::None,
                     };
+                    let (header, name) = tab_header_content(label, pinned, color);
                     KeyedView::new(
                         group.to_string(),
                         TabViewItem::new()
@@ -3922,6 +3961,7 @@ impl TerminalApp {
             context.callback(move |v| Message::Edit(id, Field::ScrollbackLines, v)),
         ));
         fields.push(color_scheme_editor(id, draft.color_scheme, context));
+        fields.push(tab_color_editor(id, draft.tab_color, context));
         fields.push(
             StackPanel::new().spacing(5.0).children((
                 TextBlock::new().text("SSH terminal type (TERM)"),
@@ -6154,6 +6194,17 @@ impl Component for TerminalApp {
                     _ => {}
                 }
             }
+            Message::ProfileTabColor(id, color) => {
+                match self.tabs.get_mut(id).map(|tab| &mut tab.page) {
+                    Some(Page::NewProfile(draft)) if draft.tab_color != color => {
+                        draft.tab_color = color;
+                        draft.saved = false;
+                        draft.error = None;
+                    }
+                    Some(Page::LocalProfile(draft)) => draft.set_tab_color(color),
+                    _ => {}
+                }
+            }
             Message::TerminalPreset(id, selected) => {
                 if let Some(AppTab {
                     page: Page::NewProfile(draft),
@@ -7387,6 +7438,21 @@ mod profile_ui_tests {
     use super::*;
 
     #[test]
+    fn tab_color_labels_keep_the_pin_and_report_the_color_to_accessibility() {
+        assert_eq!(
+            tab_header_content("Production".into(), true, TabColor::Red),
+            (
+                "📌 🔴 Production".into(),
+                "Pinned: Production (Red tab)".into()
+            )
+        );
+        assert_eq!(
+            tab_header_content("Terminal".into(), false, TabColor::None),
+            ("Terminal".into(), "Terminal".into())
+        );
+    }
+
+    #[test]
     fn balance_actions_keep_the_offered_layout_after_geometry_or_tab_changes() {
         let mut tabs = Tabs::default();
         let left = tabs.insert(());
@@ -7557,6 +7623,7 @@ mod profile_ui_tests {
                 host: "test.invalid".into(),
                 terminal_type: Default::default(),
                 color_scheme: ColorScheme::OneHalfLight,
+                tab_color: TabColor::Purple,
                 scrollback_lines: "0".parse().unwrap(),
                 user: "pilot+character".into(),
                 port: 6792,

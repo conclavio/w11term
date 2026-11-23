@@ -298,6 +298,7 @@ mod tests {
             cwd: None,
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            tab_color: Default::default(),
             powershell_integration: true,
         };
         let line = |shell: &LocalOptions, exe: Option<&Path>| {
