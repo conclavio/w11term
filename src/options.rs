@@ -417,6 +417,7 @@ pub struct Profiles {
     /// Each available name once, including discovered local shells.
     pub profile_order: Vec<String>,
     pub startup_profile: Option<String>,
+    pub ssh_host_groups: BTreeMap<String, Vec<String>>,
     pub(crate) has_explicit_order: bool,
 }
 
@@ -428,6 +429,7 @@ impl Default for Profiles {
             profiles: BTreeMap::new(),
             local,
             startup_profile: None,
+            ssh_host_groups: BTreeMap::new(),
             has_explicit_order: false,
         }
     }
@@ -455,6 +457,31 @@ impl Profiles {
 
     pub fn source(&self, name: &str) -> Option<Source> {
         profile_source(&self.profiles, &self.local, name)
+    }
+
+    pub fn ssh_host_group_member(&self, name: &str) -> Option<&SshOptions> {
+        self.profiles
+            .get(name)
+            .filter(|options| !options.durable && !options.player.rustmush)
+    }
+
+    pub fn resolve_ssh_host_group_members<'a>(
+        &'a self,
+        members: &[String],
+    ) -> Result<Vec<&'a SshOptions>> {
+        ensure!(!members.is_empty(), "Choose at least one SSH profile");
+        let mut seen = std::collections::HashSet::new();
+        members
+            .iter()
+            .map(|name| {
+                ensure!(
+                    seen.insert(name),
+                    "SSH profile {name} appears more than once"
+                );
+                self.ssh_host_group_member(name)
+                    .with_context(|| format!("SSH profile {name} is unavailable for groups"))
+            })
+            .collect()
     }
 }
 
@@ -487,6 +514,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         profile_order: Option<serde_json::Value>,
         #[serde(default)]
         startup_profile: Option<String>,
+        #[serde(default)]
+        ssh_host_groups: BTreeMap<String, Vec<String>>,
     }
     let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
@@ -498,6 +527,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
     let mut profiles = Profiles {
         has_explicit_order: explicit_order.is_some(),
         startup_profile: document.startup_profile,
+        ssh_host_groups: document.ssh_host_groups,
         ..Profiles::default()
     };
     for (name, value) in document.profiles {
