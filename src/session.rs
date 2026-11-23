@@ -38,6 +38,8 @@ pub struct ClaimedRestart(pub(crate) u64);
 
 #[derive(Debug)]
 pub enum Command {
+    /// Additional keyboard destination, bound to the connection that opted in.
+    MirroredKeyboard(MirroredKeyboard),
     /// The caller claims this exited launch through Events::restart_exited.
     RestartExited(ClaimedRestart),
     /// Ordered with both native input and control-pipe writes on this pane.
@@ -165,6 +167,50 @@ fn contain_worker_failure(
             "session-error",
             serde_json::json!({"reason":"terminal worker panicked","recoverable_by_reopen":true}),
         );
+    }
+}
+
+#[derive(Debug)]
+pub struct MirroredKeyboard {
+    connection: u64,
+    input: Box<Command>,
+}
+
+impl Command {
+    pub fn mirrored_keyboard(&self, connection: u64) -> Option<Self> {
+        let input = match self {
+            Self::Key {
+                key,
+                modifiers,
+                down,
+                repeat,
+            } => Self::Key {
+                key: *key,
+                modifiers: *modifiers,
+                down: *down,
+                repeat: *repeat,
+            },
+            Self::DetailedKey {
+                key,
+                details,
+                modifiers,
+                down,
+                repeat,
+            } => Self::DetailedKey {
+                key: *key,
+                details: details.clone(),
+                modifiers: *modifiers,
+                down: *down,
+                repeat: *repeat,
+            },
+            Self::Text(text) => Self::Text(text.clone()),
+            Self::Composed(text) => Self::Composed(text.clone()),
+            _ => return None,
+        };
+        Some(Self::MirroredKeyboard(MirroredKeyboard {
+            connection,
+            input: Box::new(input),
+        }))
     }
 }
 
@@ -786,6 +832,17 @@ async fn run(
             command = commands.recv() => {
                 let queued_offline = queued_before_connection > 0;
                 queued_before_connection = queued_before_connection.saturating_sub(1);
+                let command = match command {
+                    Some(Command::MirroredKeyboard(input)) => {
+                        if input.connection != connection_generation
+                            || events.shell_generation() != Some(input.connection)
+                        {
+                            continue;
+                        }
+                        Some(*input.input)
+                    }
+                    command => command,
+                };
                 let command = if phase != Phase::Running || queued_offline {
                     match command {
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("No active terminal connection; clipboard text was not sent".into())); continue; }
@@ -814,6 +871,7 @@ async fn run(
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
+                    Some(Command::MirroredKeyboard(_)) => unreachable!("mirrored input was unwrapped above"),
                     Some(Command::ClipboardPaste(request, reply)) => {
                         use clipboard::Decision;
                         if interactive && connection_generation == 0 {

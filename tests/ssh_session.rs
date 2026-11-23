@@ -260,6 +260,24 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
             next(&mut observed, &session).await,
             Observed::Data(b"\x1b[0;1;34m".to_vec())
         );
+        let generation = session.events.shell_generation().expect("running shell");
+        for (text, connection) in [
+            ("stale input", generation + 1),
+            ("current input", generation),
+        ] {
+            session
+                .input
+                .send(
+                    Command::Composed(text.into())
+                        .mirrored_keyboard(connection)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(b"current input".to_vec())
+        );
         session
             .input
             .send(Command::Resize(TerminalSize {

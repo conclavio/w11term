@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandId {
     Menu(String),
+    BroadcastTyping(pane_broadcast::Action),
     RenamePane(Option<(u64, TabId)>),
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
@@ -162,12 +163,20 @@ impl TerminalApp {
             &mut rows,
         );
         let origin = self.paste_origin();
+        let broadcast = self.broadcast_offer();
         let rename_target = self
             .tabs
             .active()
             .and_then(AppTab::pane_id)
             .zip(self.tabs.active_group_id());
         for row in &mut rows {
+            if matches!(&row.id, CommandId::Menu(label) if pane_broadcast::is_label(label))
+                && let Some(action) = broadcast
+                    .as_ref()
+                    .filter(|action| action.label() == row.label)
+            {
+                row.id = CommandId::BroadcastTyping(action.clone());
+            }
             if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
                 row.id = CommandId::Clipboard(origin, shortcut == Shortcut::PasteRaw);
             }
@@ -396,6 +405,7 @@ impl TerminalApp {
             CommandId::CopySelection(origin) => Message::CopySelection(origin),
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),
+            CommandId::BroadcastTyping(action) => Message::BroadcastTyping(action),
             CommandId::Recording(choice) => recordings::invoke(choice),
             CommandId::Shortcut(shortcut) => Message::Shortcut(shortcut),
         };

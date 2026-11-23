@@ -63,6 +63,7 @@ mod keyboard_copy;
 mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod pane_broadcast;
 mod pane_colors;
 mod pane_picker;
 mod pane_view;
@@ -721,6 +722,7 @@ enum UiWork {
 }
 
 struct CaretMenuBinding {
+    broadcast: Option<pane_broadcast::Action>,
     recordings: recordings::Choices,
     previous: Option<previous_pane::Target>,
     forward: Option<local_forwards::Origin>,
@@ -807,6 +809,7 @@ pub struct TerminalApp {
     window_restored: bool,
     // Unhook before dropping tabs and shutting down their independent sessions.
     keyboard: KeyboardBridge,
+    broadcast_typing: Option<pane_broadcast::Plan>,
     _control: Arc<Server>,
     window_launch: w11term::options::Options,
     opening: Option<Rc<crate::workspace_window::Opening>>,
@@ -915,6 +918,7 @@ pub enum Message {
     TransferCanceled(u64),
     PaneFocus(TabId),
     SetPaneReadOnly(bool),
+    BroadcastTyping(pane_broadcast::Action),
     PaneRatio(u64, Vec<bool>, f64),
     HoverPane(TabId),
     DividerPress(u64, Vec<bool>, f64),
@@ -2956,7 +2960,9 @@ impl TerminalApp {
         let closed_group = self.closed_tab.as_ref().map(|closed| closed.group);
         let closed_pane = self.closed_pane.as_ref().map(|closed| closed.id);
         let forward = self.forward_origin();
+        let broadcast = self.broadcast_offer();
         if let Some(binding) = cached.as_ref()
+            && binding.broadcast == broadcast
             && binding.previous == previous
             && binding.forward == forward
             && binding.pane == pane
@@ -2975,7 +2981,12 @@ impl TerminalApp {
         // callback while repainting the title bar for the same action target.
         let split_target = directory_split.clone();
         let offered = arrangement.clone();
+        let offered_broadcast = broadcast.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
+            label if pane_broadcast::is_label(label) => offered_broadcast
+                .clone()
+                .filter(|action| action.label() == label)
+                .map_or(Message::ControlIdle, Message::BroadcastTyping),
             label if let Some(scheme) = pane_colors::from_menu(label) => pane
                 .map_or(Message::ControlIdle, |id| {
                     Message::PaneColorScheme(id, scheme)
@@ -3017,6 +3028,7 @@ impl TerminalApp {
             },
         });
         *cached = Some(CaretMenuBinding {
+            broadcast,
             recordings,
             previous,
             closed_group,
@@ -3484,6 +3496,7 @@ impl TerminalApp {
                 self.active_selection(),
             ),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
+            self.broadcast_menu(),
         ];
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
         {
@@ -4182,6 +4195,7 @@ impl Component for TerminalApp {
             window_profile: None,
             window_restored: moving || options.cols.is_some() || options.rows.is_some(),
             keyboard,
+            broadcast_typing: None,
             _control: control,
             window_launch: options.clone(),
             opening: opening.clone(),
@@ -4298,6 +4312,7 @@ impl Component for TerminalApp {
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         let _native = self.keyboard.scope().enter();
+        self.reconcile_broadcast();
         if !matches!(
             &message,
             Message::FrameReady(..)
@@ -5173,7 +5188,11 @@ impl Component for TerminalApp {
                     self.focus_previous_pane(target, context);
                 }
             }
+            Message::BroadcastTyping(action) => self.apply_broadcast(action),
             Message::SetPaneReadOnly(enabled) => {
+                if enabled && self.broadcast_typing.is_some() {
+                    self.stop_broadcast();
+                }
                 if let Some(id) = self.tabs.active_id()
                     && let Some(AppTab {
                         page: Page::Terminal(live),
@@ -5977,6 +5996,7 @@ impl Component for TerminalApp {
             }
         }
         self.discard_inactive_paste();
+        self.reconcile_broadcast();
     }
 
     fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
@@ -6113,6 +6133,9 @@ impl Component for TerminalApp {
             ),
             KeyedView::new("content", Border::new().grid_row(1).content(content)),
         ];
+        if let Some(plan) = &self.broadcast_typing {
+            views.push(KeyedView::new("broadcast-typing", plan.indicator(context)));
+        }
         let base_layers = views.len();
         if let Some(message) = &self.window_error {
             views.push(KeyedView::new(
@@ -6265,7 +6288,7 @@ impl Component for TerminalApp {
         }
         self.overlay_visible.set(views.len() > base_layers);
         Grid::new()
-            .rows([GridLength::Auto, GridLength::STAR])
+            .rows([GridLength::Auto, GridLength::STAR, GridLength::Auto])
             .background(Color::rgb(14, 16, 20))
             .keyed_children(views)
     }
