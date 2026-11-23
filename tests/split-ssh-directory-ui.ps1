@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/directory-actions.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'clipboard.txt'
 $profiles = Join-Path $State 'profiles.json'
 $destination = [IO.File]::ReadAllText((Join-Path $State 'destination'))
 $right = 'Split right in current directory'
@@ -42,13 +43,28 @@ try {
         Send-To $source 'login-host' 'login-host-seen'
         Check-DirectoryActions $false
         Send-To $source 'literal-dir' 'literal-dir-seen'
+        $expected = "/srv/Pilot's 100%2F;#" + [char]0x96ea
     } else {
         Send-To $source 'report-foreign' 'foreign-reported'
         Check-DirectoryActions $false
         Send-To $source 'report-current-again' 'current-confirmed'
+        $expected = "/srv/Pilot's Work"
     }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Directory reports unexpectedly created a session' }
     Check-DirectoryActions $true
+    if ($destination -eq 'below') {
+        Open-PanesMenu
+        Invoke-Button (Wait-Until 'enabled Copy current directory menu item' {
+            $item = Find-Element 'Copy current directory' $menuItem
+            if ($item -and $item.Current.IsEnabled) { $item }
+        })
+    } else {
+        Run-Palette 'Copy current directory'
+    }
+    $null = Wait-Until 'the exact remote folder was copied' {
+        [IO.File]::Exists($env:W11TERM_TEST_COPY_FILE) -and
+            [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $expected
+    }
     $original = (Control @('list')).sessions | Where-Object id -eq $source
     if ($destination -eq 'right') {
         Run-Palette $right

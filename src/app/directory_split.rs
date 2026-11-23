@@ -1,5 +1,8 @@
 use super::*;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use w11term::{options::PlayerOptions, ssh::ConnectionShare, workspace::SshStartup};
 
 pub(super) const OPEN_EXPLORER: &str = "Open current folder in File Explorer";
@@ -17,6 +20,13 @@ pub struct Origin {
     generation: u64,
     directory: Directory,
     listing_revision: Option<u64>,
+}
+
+pub(super) struct PendingCopy {
+    request: Arc<()>,
+    origin: Origin,
+    clipboard_sequence: u32,
+    task: ComponentTask,
 }
 
 impl Origin {
@@ -55,6 +65,12 @@ pub(super) fn explorer_message(target: Option<&Origin>) -> Message {
     target
         .cloned()
         .map_or(Message::ControlIdle, Message::OpenExplorer)
+}
+
+pub(super) fn copy_message(target: Option<&Origin>) -> Message {
+    target
+        .cloned()
+        .map_or(Message::ControlIdle, Message::CopyCurrentDirectory)
 }
 
 fn child_options(
@@ -245,6 +261,96 @@ impl TerminalApp {
             move |_| Message::ExplorerOpened(folder.open().map_err(|error| format!("{error:#}"))),
             Message::ExplorerOpened(Err("The Explorer request could not start.".into())),
         );
+    }
+
+    pub(super) fn cancel_directory_copy(&mut self) {
+        if let Some(copy) = self.pending_directory_copy.take() {
+            copy.task.cancel();
+        }
+    }
+
+    pub(super) fn copy_current_directory(&mut self, origin: Origin, ctx: &ComponentContext<Self>) {
+        if self.directory_split_origin().as_ref() != Some(&origin) {
+            return;
+        }
+        self.cancel_directory_copy();
+        let result = match &origin.directory {
+            Directory::Ssh(path) => w11term::clipboard::write(path),
+            Directory::Local(path) => w11term::clipboard::write(&path.to_string_lossy()),
+            Directory::Wsl(path) if path.starts_with('/') => w11term::clipboard::write(path),
+            Directory::Wsl(path) => {
+                let Some(Page::Terminal(live)) = self.tabs.active().map(|tab| &tab.page) else {
+                    return;
+                };
+                let Source::Local(shell) = &live.source else {
+                    return;
+                };
+                let Some(distribution) = shell.wsl_distribution().map(str::to_owned) else {
+                    return;
+                };
+                let executable = shell.executable.clone();
+                let path = path.clone();
+                let request = Arc::new(());
+                let result_request = request.clone();
+                let clipboard_sequence = w11term::clipboard::sequence();
+                let task = ctx.spawn_background_with_rejection(
+                    move |cancel| {
+                        let result = wsl_path::translate(
+                            &executable,
+                            &distribution,
+                            None,
+                            wsl_path::Direction::ToLinux,
+                            &path,
+                            Instant::now() + Duration::from_secs(8),
+                            || cancel.is_cancelled(),
+                        );
+                        Message::DirectoryCopyReady(
+                            result_request,
+                            result.map_err(|e| format!("{e:#}")),
+                        )
+                    },
+                    Message::DirectoryCopyReady(
+                        request.clone(),
+                        Err("The WSL translation could not start.".into()),
+                    ),
+                );
+                self.pending_directory_copy = Some(PendingCopy {
+                    request,
+                    origin,
+                    clipboard_sequence,
+                    task,
+                });
+                return;
+            }
+        };
+        self.directory_copy_result(result);
+    }
+
+    pub(super) fn finish_directory_copy(
+        &mut self,
+        request: Arc<()>,
+        result: Result<String, String>,
+    ) {
+        if !self
+            .pending_directory_copy
+            .as_ref()
+            .is_some_and(|copy| Arc::ptr_eq(&copy.request, &request))
+        {
+            return;
+        }
+        let copy = self.pending_directory_copy.take().unwrap();
+        if self.directory_split_origin().as_ref() != Some(&copy.origin) {
+            return;
+        }
+        self.directory_copy_result(result.map_err(anyhow::Error::msg).and_then(|path| {
+            w11term::clipboard::write_if_sequence(&path, copy.clipboard_sequence)
+        }));
+    }
+
+    fn directory_copy_result(&mut self, result: anyhow::Result<()>) {
+        if let Err(error) = result {
+            self.window_error = Some(format!("Couldn’t copy the current directory. {error:#}"));
+        }
     }
 
     pub(super) fn open_in_directory(

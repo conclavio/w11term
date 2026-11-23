@@ -28,6 +28,7 @@ pub enum Action {
     SplitRightInCurrentDirectory,
     SplitBelowInCurrentDirectory,
     NewTabInCurrentDirectory,
+    CopyCurrentDirectory,
     ZoomPane,
     RotateSplit,
     BalancePanes,
@@ -145,6 +146,13 @@ pub const BINDINGS: &[Binding] = &[
         NewTabInCurrentDirectory,
         "new_tab_in_current_directory",
         "New tab in current directory",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(
+        CopyCurrentDirectory,
+        "copy_current_directory",
+        "Copy current directory",
         0,
         Mods::NONE,
     ),
@@ -296,6 +304,7 @@ impl Action {
                 | SplitRightInCurrentDirectory
                 | SplitBelowInCurrentDirectory
                 | NewTabInCurrentDirectory
+                | CopyCurrentDirectory
                 | ZoomPane
                 | RotateSplit
                 | BalancePanes

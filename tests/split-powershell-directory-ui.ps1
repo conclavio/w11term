@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/directory-actions.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'clipboard.txt'
 $env:W11TERM_SPLIT_CWD = Join-Path $State ('100% ; # [pilot] ' + [char]0x96ea)
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_SPLIT_CWD)
 $env:W11TERM_CWD_PROOF = '.w11term-' + [guid]::NewGuid().ToString('N')
@@ -63,6 +64,17 @@ try {
     Send-Line $parent.id $change
     $parentPid = Confirm-Directory $parent.id 'first'
     Check-DirectoryActions $true
+    Run-Palette 'Copy current directory'
+    $copied = Wait-Until 'the PowerShell folder was copied' {
+        if ([IO.File]::Exists($env:W11TERM_TEST_COPY_FILE)) {
+            [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE)
+        }
+    }
+    if (![IO.Path]::IsPathRooted($copied) -or
+        [IO.Path]::GetFileName($copied) -cne [IO.Path]::GetFileName($env:W11TERM_SPLIT_CWD) -or
+        ![IO.File]::Exists([IO.Path]::Combine($copied, $env:W11TERM_CWD_PROOF))) {
+        throw "Unexpected copied PowerShell folder: $copied"
+    }
     Send-Line $parent.id 'Set-Location -LiteralPath Env:'
     $null = Control @('wait-for-text','--pane',"$($parent.id)",'--timeout','15','PS Env:')
     Check-DirectoryActions $false
