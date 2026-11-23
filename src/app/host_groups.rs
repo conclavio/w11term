@@ -17,6 +17,8 @@ pub(super) struct HostGroup {
     selected: BTreeSet<u64>,
     filter: String,
     draft: String,
+    previous_draft: Option<String>,
+    command_editor: ElementRef<TextBox>,
     submissions: VecDeque<Submission>,
     viewing: u64,
     next_submission: u64,
@@ -194,6 +196,7 @@ impl HostGroup {
     fn submit(&mut self, text: Arc<str>, results: Vec<Delivery>) {
         self.next_submission += 1;
         self.viewing = self.next_submission;
+        self.previous_draft = None;
         self.copy_feedback.clear();
         self.submissions.push_back(Submission {
             id: self.viewing,
@@ -203,6 +206,34 @@ impl HostGroup {
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
         }
+    }
+
+    fn viewed_submission(&self, id: u64) -> Option<&Submission> {
+        if self.viewing != id {
+            return None;
+        }
+        self.submissions
+            .iter()
+            .find(|submission| submission.id == id)
+    }
+
+    fn load_command(&mut self, id: u64) -> bool {
+        let Some(command) = self.viewed_submission(id).map(|item| item.text.clone()) else {
+            return false;
+        };
+        if self.draft != command.as_ref() {
+            let previous = std::mem::replace(&mut self.draft, command.to_string());
+            self.previous_draft.get_or_insert(previous);
+        }
+        true
+    }
+
+    fn restore_draft(&mut self) -> bool {
+        let Some(previous) = self.previous_draft.take() else {
+            return false;
+        };
+        self.draft = previous;
+        true
     }
 }
 
@@ -216,6 +247,8 @@ pub enum Action {
     SelectShown(TabId, Vec<u64>, bool),
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
+    LoadCommand(TabId, u64),
+    RestoreDraft(TabId),
     CopyResults(TabId, u64),
     ViewOutput(TabId, u64, CommandLink),
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
@@ -528,6 +561,20 @@ impl TerminalApp {
                     page.copy_feedback.clear();
                 }
             }
+            Action::LoadCommand(id, submission) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && page.load_command(submission)
+                {
+                    let _ = page.command_editor.request_focus();
+                }
+            }
+            Action::RestoreDraft(id) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && page.restore_draft()
+                {
+                    let _ = page.command_editor.request_focus();
+                }
+            }
             Action::CopyResults(id, submission) => self.copy_host_group_results(id, submission),
             Action::ViewOutput(id, pane, link) => {
                 if self.host_group_mut(id).is_some() {
@@ -569,10 +616,7 @@ impl TerminalApp {
         let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
             return;
         };
-        if page.viewing != submission_id {
-            return;
-        }
-        let Some(submission) = page.submissions.iter().find(|run| run.id == submission_id) else {
+        let Some(submission) = page.viewed_submission(submission_id) else {
             return;
         };
         let copied = report::build(submission, w11term::clipboard::MAX_TEXT, |pane, link| {
@@ -706,6 +750,7 @@ impl TerminalApp {
             "Select panes with a fresh shell marker or a configured prompt match."
         };
         let entry = TextBox::new()
+            .element_ref(&page.command_editor)
             .automation_name("Group command")
             .placeholder_text("Enter one shell command")
             .text(&page.draft)
@@ -717,6 +762,13 @@ impl TerminalApp {
                 Message::HostGroup(Action::Send(id, text.clone(), selected.clone()))
             }))
             .content(send_label);
+        let restore = if page.previous_draft.is_some() {
+            Button::new()
+                .on_click(ctx.callback(move |_| Message::HostGroup(Action::RestoreDraft(id))))
+                .content("Restore draft")
+        } else {
+            View::empty()
+        };
         let hidden_selection = if hidden_count == 0 {
             View::empty()
         } else {
@@ -747,7 +799,10 @@ impl TerminalApp {
                 filter,
                 StackPanel::new().grid_row(3).spacing(7.0).children((
                     entry,
-                    send,
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((send, restore)),
                     hidden_selection,
                     TextBlock::new()
                         .text(instructions)
@@ -835,6 +890,11 @@ impl TerminalApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
                     .children((
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::LoadCommand(id, submission_id))
+                            }))
+                            .content("Load command"),
                         Button::new()
                             .on_click(ctx.callback(move |_| {
                                 Message::HostGroup(Action::CopyResults(id, submission_id))
@@ -991,5 +1051,36 @@ mod tests {
         assert_eq!(group.submissions.len(), SUBMISSION_LIMIT);
         assert_eq!(group.submissions.front().unwrap().id, 3);
         assert_eq!(group.submissions.back().unwrap().id, group.viewing);
+    }
+
+    #[test]
+    fn loading_previous_commands_preserves_the_draft_and_current_recipient_scope() {
+        let mut group = HostGroup {
+            draft: "in progress".into(),
+            selected: BTreeSet::from([11, 12]),
+            filter: "east".into(),
+            ..Default::default()
+        };
+        group.submit("show  inventory".into(), Vec::new());
+        group.submit("show revision".into(), Vec::new());
+
+        assert!(!group.load_command(1));
+        assert_eq!(group.draft, "in progress");
+        group.viewing = 1;
+        assert!(group.load_command(1));
+        assert_eq!(group.draft, "show  inventory");
+        group.viewing = 2;
+        assert!(group.load_command(2));
+        assert_eq!(group.draft, "show revision");
+        assert_eq!(group.selected, BTreeSet::from([11, 12]));
+        assert_eq!(group.filter, "east");
+        assert_eq!(group.submissions.len(), 2);
+
+        assert!(group.restore_draft());
+        assert_eq!(group.draft, "in progress");
+        assert!(!group.restore_draft());
+        assert!(group.load_command(2));
+        group.submit("show revision".into(), Vec::new());
+        assert!(!group.restore_draft());
     }
 }
