@@ -20,18 +20,25 @@ $edit = [System.Windows.Automation.ControlType]::Edit
 $dot = ' ' + [char]0xb7 + ' '
 $saveOutput = 'Save output as text' + [char]0x2026
 function Click([string]$Label) {
-    Invoke-Button (Wait-Until "enabled '$Label'" {
+    $invoke = Wait-Until "invoke provider for '$Label'" {
         $b = Find-Element $Label $button
-        if ($b -and $b.Current.IsEnabled) { $b }
-    })
+        $provider = $null
+        if ($b -and $b.Current.IsEnabled -and
+            $b.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$provider)) {
+            $provider
+        }
+    }
+    $invoke.Invoke()
 }
-function Search([string]$Text) {
-    $value = Wait-Until 'command search field value provider' {
-        $field = Find-Element 'Search command history' $edit
+function Edit-Provider([string]$Label) {
+    Wait-Until "value provider for '$Label'" {
+        $field = Find-Element $Label $edit
         $provider = $null
         if ($field -and $field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider)) { $provider }
     }
-    $value.SetValue($Text)
+}
+function Search([string]$Text) {
+    (Edit-Provider 'Search command history').SetValue($Text)
 }
 function Visible-TerminalText {
     $doc = Find-Element ("Terminal" + $dot + "palette-ssh") ([System.Windows.Automation.ControlType]::Document)
@@ -63,20 +70,26 @@ function Status-Box([string]$Expected) {
         $provider = $null
         if ($box -and $box.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$provider)) {
             $items = $provider.Current.GetSelection()
-            if ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Expected) { $box }
+            $popup = $null
+            if ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Expected -and
+                $box.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$popup)) {
+                $popup
+            }
         }
     }
 }
 function Change-Status([string]$From, [string]$To) {
-    $box = Status-Box $From
-    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $box.GetCurrentPattern($expand).Expand()
+    (Status-Box $From).Expand()
     $choice = Wait-Until "status option '$To'" {
         $item = Find-Element $To ([System.Windows.Automation.ControlType]::ListItem)
-        if ($item -and $item.Current.IsEnabled -and !$item.Current.IsOffscreen) { $item }
+        $selection = $null
+        if ($item -and $item.Current.IsEnabled -and !$item.Current.IsOffscreen -and
+            $item.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)) {
+            $selection
+        }
     }
-    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-    $popup = (Status-Box $To).GetCurrentPattern($expand)
+    $choice.Select()
+    $popup = Status-Box $To
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 function Check-List([string]$Status, [string[]]$Expected) {
@@ -198,13 +211,11 @@ try {
     }
     $saveAs = 'Save as command' + [char]0x2026
     Click $saveAs
-    $name = Wait-Until 'saved command name editor' { Find-Element 'Saved command name' $edit }
-    $name.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Audit deployment')
+    (Edit-Provider 'Saved command name').SetValue('Audit deployment')
     Click 'Cancel saving command'
     $null = Wait-Until 'history save editor closes' { !(Find-Element 'Saved command name' $edit) }
     Click $saveAs
-    $name = Wait-Until 'new command name editor' { Find-Element 'Saved command name' $edit }
-    $value = $name.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    $value = Edit-Provider 'Saved command name'
     if ($value.Current.Value) { throw 'Canceled name carried into a new save' }
     $value.SetValue('Audit deployment')
     Click 'Save to commands'
@@ -251,6 +262,8 @@ try {
     Click 'Show output in pane'
     $missing = 'This command' + [char]0x2019 + 's output location is no longer available.'
     $null = Wait-Until 'cleared output reports its missing location in history' { Find-Element $missing }
+} catch {
+    throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

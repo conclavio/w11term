@@ -130,10 +130,16 @@ try {
     $label = 'Save scrollback as text' + [char]0x2026
     $field = Open-Palette $label
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($label)
-    Invoke-Button (Wait-Until 'export palette action' { Find-Element $label ([System.Windows.Automation.ControlType]::Button) })
-    $dialog = Wait-Until 'foreground save dialog' {
-        $handle = Find-OwnedDialog 'Save scrollback as text'
-        if ($handle -and [FixtureMessages]::GetForegroundWindow() -eq $handle) { $handle }
+    Invoke-Button (Wait-Until 'enabled export palette action' {
+        $action = Find-Element $label ([System.Windows.Automation.ControlType]::Button)
+        if ($action -and $action.Current.IsEnabled) { $action }
+    })
+    $dialog = Wait-Until 'fixture-owned save dialog' { Find-OwnedDialog 'Save scrollback as text' }
+    $null = Wait-Until 'foreground save dialog' {
+        if ([FixtureMessages]::GetForegroundWindow() -ne $dialog) {
+            $null = [CursorCellProbe]::SetForegroundWindow($dialog)
+        }
+        [FixtureMessages]::GetForegroundWindow() -eq $dialog
     }
     $below = [Math]::Max($green.Bounds.Y + $green.Bounds.Height,$magenta.Bounds.Y + $magenta.Bounds.Height) + 50
     if (![CursorCellProbe]::PositionDialog($dialog,$magenta.Bounds.X,$below)) { throw 'Could not position fixture dialog below cursor cells' }
