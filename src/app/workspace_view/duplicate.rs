@@ -293,6 +293,7 @@ mod tests {
             powershell_integration: false,
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            tab_color: Default::default(),
         })
     }
 

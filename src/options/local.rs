@@ -1,4 +1,4 @@
-use super::{ColorScheme, ScrollbackLines};
+use super::{ColorScheme, ScrollbackLines, TabColor};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,6 +19,8 @@ pub struct LocalOptions {
     pub scrollback_lines: ScrollbackLines,
     #[serde(default, skip_serializing_if = "ColorScheme::is_default")]
     pub color_scheme: ColorScheme,
+    #[serde(default, skip_serializing_if = "TabColor::is_default")]
+    pub tab_color: TabColor,
 }
 
 impl LocalOptions {
@@ -124,6 +126,7 @@ impl LocalOptions {
                     cwd: None,
                     scrollback_lines: Default::default(),
                     color_scheme: ColorScheme::default(),
+                    tab_color: Default::default(),
                     powershell_integration: false,
                 });
             }
@@ -254,6 +257,7 @@ mod tests {
             cwd: Some("working".into()),
             scrollback_lines: Default::default(),
             color_scheme: ColorScheme::default(),
+            tab_color: Default::default(),
             powershell_integration: false,
         };
         assert!(store.save_local(None, "ssh", &shell).is_err());

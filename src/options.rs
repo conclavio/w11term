@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 mod local;
+mod tab_color;
 pub use local::LocalOptions;
+pub use tab_color::TabColor;
 
 /// Base colors for a new terminal pane. Applications can override them with OSC.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -238,6 +240,8 @@ pub struct SshOptions {
     pub scrollback_lines: ScrollbackLines,
     #[serde(default, skip_serializing_if = "ColorScheme::is_default")]
     pub color_scheme: ColorScheme,
+    #[serde(default, skip_serializing_if = "TabColor::is_default")]
+    pub tab_color: TabColor,
     #[serde(flatten)]
     pub authentication: Authentication,
     pub host_key: Option<String>,
@@ -285,6 +289,7 @@ impl From<JumpHost> for SshOptions {
             terminal_type: TerminalType::default(),
             scrollback_lines: ScrollbackLines::default(),
             color_scheme: ColorScheme::default(),
+            tab_color: Default::default(),
             authentication: hop.authentication,
             host_key: hop.host_key,
             host_key_alias: hop.host_key_alias,
@@ -571,6 +576,14 @@ impl Source {
         }
     }
 
+    pub fn tab_color(&self) -> TabColor {
+        match self {
+            Self::Local(shell) => shell.tab_color,
+            Self::Ssh(ssh) => ssh.tab_color,
+            _ => TabColor::None,
+        }
+    }
+
     pub fn scrollback_lines(&self) -> ScrollbackLines {
         match self {
             Self::Local(shell) => shell.scrollback_lines,
@@ -678,6 +691,7 @@ impl Options {
                         terminal_type: TerminalType::default(),
                         scrollback_lines: ScrollbackLines::default(),
                         color_scheme: ColorScheme::default(),
+                        tab_color: Default::default(),
                         authentication: Authentication::Agent,
                         host_key: None,
                         host_key_alias: None,

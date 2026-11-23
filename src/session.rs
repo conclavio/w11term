@@ -1483,6 +1483,7 @@ mod failure_tests {
                 powershell_integration: false,
                 scrollback_lines: Default::default(),
                 color_scheme: Default::default(),
+                tab_color: Default::default(),
             }
         )));
         assert!(!can_watch_commands(&Source::Demo));

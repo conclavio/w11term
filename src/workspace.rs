@@ -618,6 +618,7 @@ mod tests {
             user: "tester".into(),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            tab_color: Default::default(),
             terminal_type: Default::default(),
             port: 22,
             authentication: Authentication::Agent,
@@ -903,6 +904,7 @@ mod tests {
             cwd: Some(dir.path().to_owned()),
             scrollback_lines: "420".parse().unwrap(),
             color_scheme: crate::options::ColorScheme::OneHalfLight,
+            tab_color: crate::options::TabColor::Purple,
             powershell_integration: true,
         };
         let store = WorkspaceStore::new(dir.path().join("workspaces.json"));
@@ -935,6 +937,7 @@ mod tests {
                 cwd: Some(cwd.into()),
                 scrollback_lines: Default::default(),
                 color_scheme: Default::default(),
+                tab_color: Default::default(),
                 powershell_integration: false,
                 args: Vec::new(),
             },

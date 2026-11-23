@@ -284,6 +284,11 @@ impl ProfileStore {
                     serde_json::to_value(shell.color_scheme)?,
                 );
             }
+            if shell.tab_color.is_default() {
+                fields.remove("tab_color");
+            } else {
+                fields.insert("tab_color".into(), serde_json::to_value(shell.tab_color)?);
+            }
             if shell.scrollback_lines.is_default() {
                 fields.remove("scrollback_lines");
             } else {
@@ -476,6 +481,9 @@ impl ProfileStore {
             if options.color_scheme.is_default() {
                 object.remove("color_scheme");
             }
+            if options.tab_color.is_default() {
+                object.remove("tab_color");
+            }
             if options.scrollback_lines.is_default() {
                 object.remove("scrollback_lines");
             }
@@ -628,6 +636,7 @@ mod tests {
             host: "new.test".into(),
             scrollback_lines: Default::default(),
             color_scheme: Default::default(),
+            tab_color: Default::default(),
             terminal_type: Default::default(),
             user: "root".into(),
             port: 22,
@@ -812,15 +821,19 @@ mod order_tests {
     }
 
     #[test]
-    fn schemes_survive_profile_copies_and_allow_independent_resets() {
+    fn schemes_and_tab_colors_survive_profile_copies_and_allow_resets() {
         use crate::options::ColorScheme::{Default, OneHalfDark, OneHalfLight};
+        use crate::options::TabColor;
         let (_dir, store) = fixture();
         let catalog = store.catalog().unwrap();
         assert_eq!(catalog.source("Alpha").unwrap().color_scheme(), Default);
         assert_eq!(catalog.source("Lima").unwrap().color_scheme(), Default);
+        assert_eq!(catalog.source("Alpha").unwrap().tab_color(), TabColor::None);
+        assert_eq!(catalog.source("Lima").unwrap().tab_color(), TabColor::None);
 
         let mut ssh = catalog.profiles["Alpha"].clone();
         ssh.color_scheme = OneHalfLight;
+        ssh.tab_color = TabColor::Red;
         store
             .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
             .unwrap();
@@ -828,6 +841,7 @@ mod order_tests {
         store.duplicate(&base, "SSH copy", &base.options).unwrap();
         let mut shell = catalog.local["Lima"].clone();
         shell.color_scheme = OneHalfDark;
+        shell.tab_color = TabColor::Blue;
         store
             .save_local(Some(&store.inspect_local("Lima").unwrap()), "Lima", &shell)
             .unwrap();
@@ -845,15 +859,29 @@ mod order_tests {
             catalog.source("Local copy").unwrap().color_scheme(),
             OneHalfDark
         );
+        assert_eq!(
+            catalog.source("SSH copy").unwrap().tab_color(),
+            TabColor::Red
+        );
+        assert_eq!(
+            catalog.source("Local copy").unwrap().tab_color(),
+            TabColor::Blue
+        );
         ssh.color_scheme = Default;
+        ssh.tab_color = TabColor::None;
         store
             .edit("Alpha", "Alpha", &ssh, &catalog.profiles["Alpha"])
             .unwrap();
         shell.color_scheme = Default;
+        shell.tab_color = TabColor::None;
         store.save_local(Some(&base), "Lima", &shell).unwrap();
         let entries = &disk(&store)["profiles"];
         assert!(entries["Alpha"].get("color_scheme").is_none());
         assert!(entries["Lima"].get("color_scheme").is_none());
+        assert!(entries["Alpha"].get("tab_color").is_none());
+        assert!(entries["Lima"].get("tab_color").is_none());
+        assert_eq!(entries["SSH copy"]["tab_color"], "red");
+        assert_eq!(entries["Local copy"]["tab_color"], "blue");
         assert_eq!(entries["SSH copy"]["color_scheme"], "one-half-light");
         assert_eq!(entries["Local copy"]["color_scheme"], "one-half-dark");
         assert_eq!(entries["SSH copy"]["extra"], 7);

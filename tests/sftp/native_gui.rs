@@ -1548,6 +1548,18 @@ async fn native_bulk_close_tabs_keeps_the_pinned_ssh_and_selected_shell() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits SSH and local tab colors through WinUI and checks live split headers"]
+async fn native_profile_tab_colors_follow_focused_panes_and_new_launches() {
+    let (Source::Ssh(ssh), _remote, opens, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("profile-tab-colors-ui.ps1", &ssh, state.path());
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "toggles the previously focused live SSH or PowerShell pane across splits, tabs and Settings"]
 async fn native_previous_pane_reuses_live_shells_across_tabs_and_skips_closed_panes() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {

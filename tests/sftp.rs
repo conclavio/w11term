@@ -916,6 +916,7 @@ async fn fixture_with_wire(
     let source = Source::Ssh(SshOptions {
         scrollback_lines: Default::default(),
         color_scheme: Default::default(),
+        tab_color: Default::default(),
         terminal_type: Default::default(),
         host: "127.0.0.1".into(),
         user: "test".into(),
