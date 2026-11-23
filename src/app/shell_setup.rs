@@ -7,15 +7,17 @@ pub enum Setup {
     FishDirectory,
     BashIntegration,
     ZshIntegration,
+    FishIntegration,
 }
 
 impl Setup {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::BashDirectory,
         Self::ZshDirectory,
         Self::FishDirectory,
         Self::BashIntegration,
         Self::ZshIntegration,
+        Self::FishIntegration,
     ];
 
     fn label(self) -> &'static str {
@@ -25,6 +27,7 @@ impl Setup {
             Self::FishDirectory => "Copy Fish directory setup",
             Self::BashIntegration => "Copy Bash shell integration",
             Self::ZshIntegration => "Copy Zsh shell integration",
+            Self::FishIntegration => "Copy Fish shell integration",
         }
     }
 
@@ -40,6 +43,7 @@ impl Setup {
                 Self::FishDirectory => "copy-fish-directory",
                 Self::BashIntegration => "copy-bash-integration",
                 Self::ZshIntegration => "copy-zsh-integration",
+                Self::FishIntegration => "copy-fish-integration",
             };
             MenuItem::item(key, shell.label())
         })
@@ -59,6 +63,11 @@ impl Setup {
                 include_str!("zsh-directory.zsh"),
                 "\n",
                 include_str!("zsh-integration.zsh")
+            ),
+            Self::FishIntegration => concat!(
+                include_str!("fish-directory.fish"),
+                "\n",
+                include_str!("fish-integration.fish")
             ),
         };
         w11term::clipboard::write(setup.trim_end())

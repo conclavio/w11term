@@ -1,4 +1,4 @@
-"""Exercise the directory setups in real interactive shells."""
+"""Exercise directory reporting and command integration in real interactive shells."""
 
 import argparse
 import os
@@ -11,7 +11,8 @@ from urllib.parse import quote_from_bytes, unquote_to_bytes
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "src/app"
 REPORT = re.compile(rb"\x1b\]7;([^\x07]*)\x07")
-MARK = re.compile(rb"\x1b\]133;([^\x07]*)\x07")
+MARK_END = rb"(?:\x07|\x1b\\)"
+MARK = re.compile(rb"\x1b\]133;([^\x07\x1b]*)" + MARK_END)
 
 
 def run(command, commands, environment=None, *, interactive=True, cwd=None, merge_output=False):
@@ -308,8 +309,7 @@ builtin printf '%s\n' '雪+;%'
     print("Zsh shell integration pairs command starts and exits and preserves prompt hooks.")
 
 
-def check_fish(executable, directory):
-    setup = (SCRIPTS / "fish-directory.fish").read_text(encoding="utf-8")
+def fish_environment(executable, directory):
     # A forced interactive shell handles explicit prompt events even with
     # piped stdio. Isolate Fish's universal variables, cache and config.
     config = directory.parent / "fish-state"
@@ -320,7 +320,7 @@ def check_fish(executable, directory):
     )
     assert not stderr, stderr
     shell_config = shell_root.decode("utf-8").rstrip("\r\n") + "/fish-state"
-    environment = {
+    return {
         "XDG_CONFIG_HOME": shell_config,
         "XDG_DATA_HOME": shell_config,
         "XDG_CACHE_HOME": shell_config,
@@ -328,6 +328,10 @@ def check_fish(executable, directory):
         "TERM": "xterm-256color",
         "W11TERM_TEST_SHELL_DIRECTORY": "./" + directory.name,
     }
+
+
+def check_fish(executable, directory, environment):
+    setup = (SCRIPTS / "fish-directory.fish").read_text(encoding="utf-8")
     startup = r"""set -g fish_greeting
 function fixture_before --on-event fish_prompt
     builtin printf 'before-status=%s\n' "$status"
@@ -360,11 +364,11 @@ builtin printf 'report-end\n'
     if os.name != "nt":
         control_directory = directory.parent / "control\x07\x1b\n"
         control_directory.mkdir()
-        environment["W11TERM_TEST_SHELL_DIRECTORY"] = "./" + control_directory.name
         command = 'builtin cd -- "$W11TERM_TEST_SHELL_DIRECTORY"; or exit 73; emit fish_prompt'
         stdout, stderr = run(
             [executable, "--no-config", "--interactive", "--command", setup + "\n" + command],
-            "", environment, interactive=False, cwd=directory.parent,
+            "", {**environment, "W11TERM_TEST_SHELL_DIRECTORY": "./" + control_directory.name},
+            interactive=False, cwd=directory.parent,
         )
         assert not stderr, stderr
         assert REPORT.findall(stdout)[-1].endswith(b"/control%07%1B%0A"), stdout
@@ -374,6 +378,116 @@ builtin printf 'report-end\n'
     )
     assert not stdout and not stderr, (stdout, stderr)
     print("Fish directory setup preserves other prompt events and emits one usable OSC 7 report.")
+
+
+def check_fish_integration(executable, directory, environment):
+    setup = "\n".join((SCRIPTS / script).read_text(encoding="utf-8") for script in (
+        "fish-directory.fish", "fish-integration.fish",
+    ))
+    command = [executable, "--no-config"]
+    version = subprocess.check_output([executable, "--version"]).decode("ascii").split()[-1]
+    is_old = int(version.split(".")[0]) < 4
+    flags, stderr = run(
+        [*command, "--command", "builtin status test-feature mark-prompt; builtin printf '%s' $status"],
+        "", environment, interactive=False, cwd=directory.parent,
+    )
+    assert not stderr, stderr
+    cases = [(command, is_old or flags == b"1")]
+    if flags == b"0":
+        cases.append(([*command, "--features", "no-mark-prompt"], True))
+
+    tail = r"""builtin printf 'event-start\n'
+set -l command 'builtin echo 雪+;%
+# second'
+false; emit fish_prompt
+emit fish_preexec "$command"
+function fixture_exit_code
+    return 23
+end
+function fixture_postexec --on-event fish_postexec
+    builtin printf 'postexec-status=%s\n' $status
+end
+fixture_exit_code; emit fish_postexec "$command"
+set -l oversized (builtin string repeat --count 1366 雪)
+emit fish_preexec "$oversized"
+"""
+    for shell, use_hooks in cases:
+        script = "\n".join((setup, setup, tail))
+        stdout, stderr = run(
+            [*shell, "--interactive", "--command", script],
+            "", environment, interactive=False, cwd=directory.parent,
+        )
+        assert not stderr, stderr
+        assert stdout.count(b"w11term command recording is enabled") == int(use_hooks), stdout
+        events = stdout.split(b"event-start\n", 1)[1]
+        marks = MARK.findall(events)
+        if use_hooks:
+            assert marks[0] == b"A" and marks[2:] == [b"D;23", b"C"], marks
+            assert marks[1].startswith(b"C;cmdline_url="), marks
+            assert unquote_to_bytes(marks[1][len(b"C;cmdline_url="):]) == "builtin echo 雪+;%\n# second".encode(), marks
+            assert b"postexec-status=23\n" in events, events
+        else:
+            assert not marks, events
+        if os.name != "nt":
+            check_fish_pty(shell, setup, directory, environment)
+
+    stdout, stderr = run(command, setup, environment, interactive=False, cwd=directory.parent)
+    assert not stdout and not stderr, (stdout, stderr)
+    print(f"Fish {version} shell integration emits one command lifecycle and preserves status and command text.")
+
+
+def check_fish_pty(shell, setup, directory, environment):
+    import fcntl
+    import pty
+    import select
+    import signal
+    import struct
+    import termios
+    import time
+
+    startup = """set -g fish_greeting
+set -g fish_history ''
+function fish_prompt
+    builtin printf 'FISH-FIXTURE[%s]> ' $status
+end
+"""
+    pid, tty = pty.fork()
+    if pid == 0:
+        os.chdir(directory.parent)
+        os.execvpe(shell[0], [*shell, "--interactive", "--init-command", startup + setup + "\n" + setup],
+                   {**os.environ, **environment})
+    output = bytearray()
+
+    def through(pattern, start=0):
+        end = time.monotonic() + 10
+        while not re.search(pattern, output[start:], re.DOTALL):
+            timeout = max(0, end - time.monotonic())
+            assert select.select([tty], [], [], timeout)[0], bytes(output)
+            output.extend(os.read(tty, 8192))
+        return bytes(output[start:])
+
+    try:
+        fcntl.ioctl(tty, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        through(rb"FISH-FIXTURE\[[0-9]+\]> ")
+        for line, status in [("builtin echo '雪+;%'", 0), ("false", 1)]:
+            start = len(output)
+            os.write(tty, (line + "\r").encode())
+            end_status = f"D;{status}".encode()
+            cycle = through(rb"\x1b\]133;" + end_status + MARK_END
+                            + rb".*?FISH-FIXTURE\[" + str(status).encode() + rb"\]> ", start)
+            marks = MARK.findall(cycle)
+            starts = [m for m in marks if m.startswith(b"C")]
+            assert len(starts) == 1 and starts[0].startswith(b"C;cmdline_url="), cycle
+            assert unquote_to_bytes(starts[0][len(b"C;cmdline_url="):]) == line.encode(), starts
+            assert [m for m in marks if m.startswith(b"D")] == [end_status], cycle
+            assert any(m.startswith(b"A") for m in marks), cycle
+    finally:
+        os.close(tty)
+        try:
+            os.kill(pid, signal.SIGHUP)
+        except ProcessLookupError:
+            pass
+        os.waitpid(pid, 0)
 
 
 def main():
@@ -393,7 +507,9 @@ def main():
             check_zsh(args.zsh, directory)
             check_zsh_integration(args.zsh, directory)
         if args.shell in ("all", "fish"):
-            check_fish(args.fish, directory)
+            environment = fish_environment(args.fish, directory)
+            check_fish(args.fish, directory, environment)
+            check_fish_integration(args.fish, directory, environment)
 
 
 if __name__ == "__main__":
