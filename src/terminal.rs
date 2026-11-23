@@ -1220,6 +1220,40 @@ mod tests {
     }
 
     #[test]
+    fn wsl_conemu_reports_accept_only_wsl_shares_beside_dos_paths() {
+        let (mut wsl, _) = engine();
+        let (mut local, _) = engine();
+        wsl.enable_wsl_directory_reports();
+        local.enable_conemu_directory_reports();
+        for path in [
+            r#""\\wsl.localhost\QA Linux\home\100% # 雪""#,
+            r"\\WSL$\QA Linux\home\100% # 雪",
+        ] {
+            let report = format!("\x1b]9;9;{path}\x1b\\");
+            wsl.advance_bytes(report.as_bytes());
+            local.advance_bytes(report.as_bytes());
+            assert_eq!(
+                wsl.reported_current_dir().unwrap().as_ref(),
+                "file://wsl.localhost/QA%20Linux/home/100%25%20%23%20%E9%9B%AA"
+            );
+            assert!(local.reported_current_dir().is_none());
+        }
+        for path in [
+            r"\\server\QA Linux\a",
+            r"\\wsl$\QA Linux\..\other",
+            r"\\wsl.localhost\",
+        ] {
+            wsl.advance_bytes(format!("\x1b]9;9;{path}\x07"));
+            assert!(wsl.reported_current_dir().is_none(), "{path}");
+        }
+        wsl.advance_bytes(b"\x1b]9;9;C:\\work\x07");
+        assert_eq!(
+            wsl.reported_current_dir().unwrap().as_ref(),
+            "file:///C:/work"
+        );
+    }
+
+    #[test]
     fn ssh_iterm_directory_snapshot_is_bound_to_the_current_login() {
         let (mut ssh, _) = engine();
         let (mut local, _) = engine();

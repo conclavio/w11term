@@ -19,6 +19,42 @@ use windows::{
     core::{PCWSTR, PWSTR, w},
 };
 
+pub(super) struct InteractiveShell<'a> {
+    pub(super) distribution: &'a str,
+    pub(super) directory_arg: Option<usize>,
+}
+
+pub(super) fn interactive_shell<'a>(
+    executable: &Path,
+    args: &'a [String],
+) -> Option<InteractiveShell<'a>> {
+    let name = executable.file_name()?;
+    if !(name.eq_ignore_ascii_case("wsl.exe")
+        || (name == executable.as_os_str() && name.eq_ignore_ascii_case("wsl")))
+    {
+        return None;
+    }
+    let (mut distribution, mut directory_arg, mut user) = (None, None, None);
+    for (index, args) in args.chunks(2).enumerate() {
+        let [option, value] = args else { return None };
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return None;
+        }
+        match option.as_str() {
+            "--distribution" | "-d" if distribution.is_none() => {
+                distribution = Some(value.as_str())
+            }
+            "--cd" if directory_arg.is_none() => directory_arg = Some(index * 2 + 1),
+            "--user" | "-u" if user.is_none() => user = Some(value),
+            _ => return None,
+        }
+    }
+    Some(InteractiveShell {
+        distribution: distribution?,
+        directory_arg,
+    })
+}
+
 struct RegistryKey(HKEY);
 
 impl Drop for RegistryKey {
@@ -199,5 +235,47 @@ mod tests {
             assert!(profile(launcher, name.into()).is_none(), "{name:?}");
         }
         assert!(profile(launcher, "docker-desktop-dev".into()).is_some());
+    }
+
+    #[test]
+    fn only_named_interactive_wsl_launches_can_replace_the_directory() {
+        let launcher = Path::new(r"C:\Windows\System32\wsl.exe");
+        let make = |args: &[&str]| {
+            LocalOptions::discovered(
+                launcher.to_owned(),
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+            )
+        };
+        let shell = make(&["--cd", "~", "-d", "QA Linux", "-u", "dev"]);
+        assert_eq!(shell.wsl_distribution(), Some("QA Linux"));
+        let child = shell.wsl_in_directory("/work/100% # notes".into()).unwrap();
+        assert_eq!(
+            child.args,
+            ["--cd", "/work/100% # notes", "-d", "QA Linux", "-u", "dev"]
+        );
+        assert!(child.matches_wsl_profile(&shell));
+        assert!(!child.matches_wsl_profile(&make(&["--cd", "~", "-d", "Other", "-u", "dev"])));
+        assert!(!child.matches_wsl_profile(&make(&["--cd", "~", "-d", "QA Linux", "-u", "other"])));
+        assert_eq!(shell.args[1], "~");
+        assert_eq!(
+            make(&["--distribution", "Debian"])
+                .wsl_in_directory("/".into())
+                .unwrap()
+                .args,
+            ["--distribution", "Debian", "--cd", "/"]
+        );
+        for args in [
+            &[][..],
+            &["--distribution"][..],
+            &["--distribution", ""][..],
+            &["--distribution", "a", "-d", "b"][..],
+            &["--distribution", "Debian", "--", "ls"][..],
+            &["--distribution", "Debian", "--exec", "make"][..],
+        ] {
+            assert!(
+                make(args).wsl_in_directory("/".into()).is_none(),
+                "{args:?}"
+            );
+        }
     }
 }

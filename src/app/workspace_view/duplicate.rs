@@ -38,7 +38,9 @@ fn eligible(source: &Source, discovery: bool, startup: Option<&SshStartup>) -> R
 }
 
 fn interactive_local(shell: &LocalOptions) -> bool {
-    if LocalOptions::supports_powershell_integration(&shell.executable, &shell.args) {
+    if LocalOptions::supports_powershell_integration(&shell.executable, &shell.args)
+        || shell.wsl_distribution().is_some()
+    {
         return true;
     }
     let Some(name) = shell.executable.file_name().and_then(|name| name.to_str()) else {
@@ -283,7 +285,10 @@ fn matching_profile(catalog: &Profiles, name: Option<&str>, source: &Source) -> 
     let name = name?;
     let matches = match source {
         Source::Ssh(ssh) => catalog.profiles.get(name) == Some(ssh),
-        Source::Local(shell) => catalog.local.get(name) == Some(shell),
+        Source::Local(shell) => catalog
+            .local
+            .get(name)
+            .is_some_and(|saved| saved == shell || shell.matches_wsl_profile(saved)),
         _ => false,
     };
     matches.then(|| name.to_owned())
@@ -356,6 +361,7 @@ mod tests {
             local("pwsh", &[]),
             local("cmd.exe", &[]),
             local("wsl.exe", &[]),
+            local("wsl.exe", &["-d", "Build Linux", "--cd", "/work"]),
         ] {
             assert!(eligible(&source, false, None).is_ok(), "{source:?}");
         }
@@ -366,6 +372,10 @@ mod tests {
             local("pwsh.exe", &["-File", "job.ps1"]),
             local("maintenance.cmd", &[]),
             local("wsl.exe", &["--exec", "make"]),
+            local(
+                "wsl.exe",
+                &["--distribution", "Build Linux", "--exec", "make"],
+            ),
         ] {
             assert!(eligible(&source, false, None).is_err(), "{source:?}");
         }

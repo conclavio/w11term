@@ -34,8 +34,14 @@ function Click([string]$Name, $Type = $button) {
         if ($control -and $control.Current.IsEnabled) { $control }
     })
 }
-function Wait-Launch([int]$Pane, [string]$Name) {
+function Wait-Launch([int]$Pane, [string]$Name, [string]$Directory = '~') {
     Wait-Text $Pane "wsl-fixture ready $Name"
+    Wait-Text $Pane "wsl-fixture directory $Directory"
+}
+function Publish-Report([int]$Pane, [string]$Kind) {
+    $text = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("report-$Kind" + [char]13))
+    $null = Control @('send-text','--pane',"$Pane",'--no-paste','--base64',$text)
+    Wait-Text $Pane "wsl-fixture published $Kind"
 }
 
 try {
@@ -48,16 +54,42 @@ try {
     Register-Distro 'not-a-distro-subkey' 'Registry metadata'
     Add-Type -OutputAssembly $launcher -OutputType ConsoleApplication -TypeDefinition @'
 using System;
+using System.Runtime.InteropServices;
 using System.Text;
 public static class WslFixture {
+    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int kind);
+    [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle, out uint mode);
+    [DllImport("kernel32.dll")] static extern bool SetConsoleMode(IntPtr handle, uint mode);
     public static int Main(string[] args) {
         Console.OutputEncoding = new UTF8Encoding(false);
-        if (args.Length != 4 || args[0] != "--distribution" || args[2] != "--cd" || args[3] != "~") {
+        if (args.Length != 4 || args[0] != "--distribution" || args[2] != "--cd") {
             Console.WriteLine("wsl-fixture got unexpected arguments");
             return 2;
         }
+        IntPtr output = GetStdHandle(-11);
+        uint mode;
+        if (!GetConsoleMode(output, out mode) || !SetConsoleMode(output, mode | 4)) {
+            Console.WriteLine("wsl-fixture could not enable VT output");
+            return 3;
+        }
         Console.WriteLine("wsl-fixture ready " + args[1]);
-        while (Console.ReadLine() != null) { }
+        Console.WriteLine("wsl-fixture directory " + args[3]);
+        string line;
+        while ((line = Console.ReadLine()) != null) {
+            switch (line) {
+                case "report-linux":
+                    Console.Write("\u001b]7;file:///mnt/c/work%20tree\u0007");
+                    break;
+                case "report-foreign":
+                    Console.Write("\u001b]9;9;\\\\wsl.localhost\\Other distro\\home\u0007");
+                    break;
+                case "report-share":
+                    Console.Write("\u001b]9;9;\"\\\\wsl$\\" + args[1] + "\\home\\100% # notes\"\u001b\\");
+                    break;
+                default: continue;
+            }
+            Console.WriteLine("wsl-fixture published " + line.Substring(7));
+        }
         return 0;
     }
 }
@@ -85,11 +117,57 @@ public static class WslFixture {
         Sessions | Where-Object { $_.active -and $_.label -ceq $leftLabel }
     }
     Wait-Launch $left.id $leftName
+    Publish-Report $left.id 'linux'
+    Run-Palette 'New tab in current directory'
+    $newTab = Wait-Until 'WSL tab opens in the reported Linux directory' {
+        Sessions | Where-Object { $_.active -and $_.label -ceq $leftLabel -and $_.tab_id -ne $left.tab_id }
+    }
+    Wait-Launch $newTab.id $leftName '/mnt/c/work tree'
+    Press-Key 0x79 # F10 closes the extra tab.
+    Wait-Focus $left.id
+
     Run-Palette "Split right with $rightLabel"
     $right = Wait-Until 'different WSL distro split in the same tab' {
         Sessions | Where-Object { $_.active -and $_.label -ceq $rightLabel -and $_.tab_id -eq $left.tab_id }
     }
     Wait-Launch $right.id $rightName
+    Publish-Report $right.id 'foreign'
+    $action = 'Split below in current directory'
+    $search = Open-Palette $action
+    $search.GetCurrentPattern($value).SetValue($action)
+    $null = Wait-Until 'a report for another distribution leaves the action disabled' {
+        $row = Find-Element $action $button
+        $row -and !$row.Current.IsEnabled
+    }
+    Press-Key 27
+    $null = Wait-Until 'command palette dismissed' { !(Find-Element 'Search commands') }
+    Publish-Report $right.id 'share'
+    Run-Palette $action
+    $directory = '/home/100% # notes'
+    $child = Wait-Until 'WSL split uses a report for its own distribution' {
+        Sessions | Where-Object { $_.active -and $_.label -ceq $rightLabel -and $_.id -ne $right.id -and $_.tab_id -eq $right.tab_id }
+    }
+    Wait-Launch $child.id $rightName $directory
+
+    Click 'Tab menu'
+    $panes = Wait-Until 'Panes submenu' { Find-Element 'Panes' $menu }
+    $panes.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    Click 'Close pane    Ctrl+Alt+Shift+W' $menu
+    $null = Wait-Until 'the directory split closes alone' { !(Sessions | Where-Object id -eq $child.id) }
+    Click 'Tab menu'
+    Click 'Reopen last closed pane' $menu
+    $reopened = Wait-Until 'fresh WSL pane at the same layout position' {
+        Sessions | Where-Object { $_.active -and $_.id -ne $right.id -and $_.label -ceq $rightLabel -and $_.tab_id -eq $right.tab_id }
+    }
+    Wait-Launch $reopened.id $rightName $directory
+
+    Run-Palette 'Duplicate tab layout'
+    $duplicate = Wait-Until 'duplicated WSL layout opens a new tab' {
+        Sessions | Where-Object { $_.active -and $_.label -ceq $rightLabel -and $_.tab_id -ne $right.tab_id }
+    }
+    Wait-Launch $duplicate.id $rightName $directory
+    Press-Key 0x79
+    Wait-Focus $reopened.id
 
     Run-Palette ('Workspaces' + [char]0x2026)
     $name = Wait-Until 'workspace name field' { Find-Element 'Workspace name' $edit }
@@ -104,7 +182,7 @@ public static class WslFixture {
         Sessions | Where-Object { $_.active -and $_.label -ceq $rightLabel -and $_.tab_id -eq $restoredLeft.tab_id }
     }
     Wait-Launch $restoredLeft.id $leftName
-    Wait-Launch $restoredRight.id $rightName
+    Wait-Launch $restoredRight.id $rightName $directory
     if ([IO.File]::ReadAllText($profiles) -cne $catalog) { throw 'Discovering and opening WSL changed the profile catalog' }
 } finally {
     if ($app) {

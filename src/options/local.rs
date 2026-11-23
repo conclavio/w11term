@@ -26,6 +26,32 @@ pub struct LocalOptions {
 }
 
 impl LocalOptions {
+    /// A named WSL launch that starts a shell with no command to replay.
+    pub fn wsl_distribution(&self) -> Option<&str> {
+        Some(wsl::interactive_shell(&self.executable, &self.args)?.distribution)
+    }
+
+    pub fn wsl_in_directory(&self, directory: String) -> Option<Self> {
+        let invocation = wsl::interactive_shell(&self.executable, &self.args)?;
+        let mut shell = self.clone();
+        if let Some(index) = invocation.directory_arg {
+            shell.args[index] = directory;
+        } else {
+            shell.args.extend(["--cd".into(), directory]);
+        }
+        Some(shell)
+    }
+
+    /// Compare a launched WSL pane with its profile while allowing the pane's
+    /// directory override. All other launch settings must agree.
+    pub fn matches_wsl_profile(&self, profile: &Self) -> bool {
+        wsl::interactive_shell(&self.executable, &self.args)
+            .and_then(|invocation| invocation.directory_arg)
+            .and_then(|index| profile.wsl_in_directory(self.args[index].clone()))
+            .as_ref()
+            == Some(self)
+    }
+
     /// Only append a startup file when all existing arguments have an
     /// unambiguous, interactive meaning in both PowerShell 5.1 and 7.
     pub fn supports_powershell_integration(executable: &Path, args: &[String]) -> bool {

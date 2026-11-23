@@ -1231,6 +1231,9 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
 
 fn source_label(source: &Source) -> String {
     match source {
+        Source::Local(shell) if let Some(distro) = shell.wsl_distribution() => {
+            format!("WSL: {distro}")
+        }
         Source::Local(shell) => shell
             .executable
             .file_name()

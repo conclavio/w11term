@@ -83,6 +83,8 @@ In a local PowerShell pane, change to a checkout and use either action to start 
 
 On an ordinary SSH connection, the actions use the directory reported by the remote shell and open another shell on the same server. w11term recognizes OSC 7 file URIs and the paired OSC 1337 `RemoteHost` and `CurrentDir` reports from iTerm2 shell integration. The iTerm2 report must name the SSH login and host. If you connect through an alias and the shell reports a different hostname, set `iterm2_hostname` in the remote shell to the hostname in your SSH profile. The server must provide a POSIX shell and accept SSH exec requests. [iTerm2 Bash integration](https://iterm2.com/shell_integration/bash)
 
+In a named WSL shell, the same actions open another shell in the distribution using the reported directory. The shell can send an OSC 7 file URI such as `file:///home/dev/my%20project`, or an OSC 9;9 path from `wslpath -w "$PWD"`. For example, follow the Bash or Zsh instructions for reporting the working directory. Duplicate and Reopen start fresh WSL processes using each pane’s saved launch directory. [WSL prompt examples](https://learn.microsoft.com/windows/terminal/tutorials/new-tab-same-directory#bash)
+
 Saving the workspace remembers the starting directory of the new tab or split. Its next launch opens a shell there.
 
 Windows PowerShell 5.1 can treat square brackets in its starting directory as a wildcard. For those paths, w11term restores the literal directory if PowerShell opens at `$PSHOME` or a matching sibling. A profile that intentionally selects that same fallback directory will also start in the requested folder.
