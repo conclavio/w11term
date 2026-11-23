@@ -171,10 +171,25 @@ impl TerminalApp {
     }
 
     pub(super) fn paste(&mut self, raw: bool, ctx: &ComponentContext<Self>) {
-        self.paste_from(self.paste_origin(), raw, ctx);
+        self.paste_from(self.paste_origin(), raw, None, ctx);
     }
 
-    fn paste_from(&mut self, origin: Option<Origin>, raw: bool, ctx: &ComponentContext<Self>) {
+    pub(super) fn paste_saved_text(
+        &mut self,
+        origin: Origin,
+        text: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.paste_from(Some(origin), false, Some(text), ctx);
+    }
+
+    fn paste_from(
+        &mut self,
+        origin: Option<Origin>,
+        raw: bool,
+        saved_text: Option<String>,
+        ctx: &ComponentContext<Self>,
+    ) {
         if self.clipboard.is_open() {
             return;
         }
@@ -184,7 +199,8 @@ impl TerminalApp {
         };
         let sender = tab.session.input.clone();
         let ticket = self.clipboard.start(origin);
-        let text = match read_clipboard() {
+        let preserve_text = saved_text.is_some();
+        let text = match saved_text.map_or_else(read_clipboard, Ok) {
             Ok(text) => text,
             Err(error) => {
                 self.clipboard.clear();
@@ -192,7 +208,10 @@ impl TerminalApp {
                 return;
             }
         };
-        let preferences = self.appearance.read().unwrap().interaction.clone();
+        let mut preferences = self.appearance.read().unwrap().interaction.clone();
+        if preserve_text {
+            preferences.trim_paste = false;
+        }
         send(
             &sender,
             ticket,
@@ -209,7 +228,7 @@ impl TerminalApp {
 
     pub(super) fn clipboard_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         let ticket = match &action {
-            Action::Start(origin, raw) => return self.paste_from(*origin, *raw, ctx),
+            Action::Start(origin, raw) => return self.paste_from(*origin, *raw, None, ctx),
             Action::Reply(t, _) | Action::Closed(t, _) => *t,
         };
         if self.clipboard.ticket != Some(ticket) {

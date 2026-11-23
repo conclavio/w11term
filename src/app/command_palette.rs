@@ -18,6 +18,10 @@ pub enum CommandId {
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
+    SavedCommand(
+        Option<clipboard_paste::Origin>,
+        w11term::saved_commands::Entry,
+    ),
     TabAction(Shortcut, Option<TabId>),
     ReopenClosedTab(Option<TabId>),
     ReopenClosedPane(Option<TabId>),
@@ -365,6 +369,13 @@ impl TerminalApp {
                 enabled,
             });
         }
+        let origin = self.saved_command_origin();
+        rows.extend(self.saved_commands.entries().iter().map(|entry| Row {
+            id: CommandId::SavedCommand(origin, entry.clone()),
+            label: format!("Insert command · {}", entry.name),
+            chord: String::new(),
+            enabled: origin.is_some(),
+        }));
         filter(rows, query)
     }
 
@@ -382,6 +393,10 @@ impl TerminalApp {
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
             }
+            CommandId::SavedCommand(Some(origin), entry) => {
+                return self.insert_saved_command(origin, entry, ctx);
+            }
+            CommandId::SavedCommand(None, _) => return,
             CommandId::TabAction(shortcut, group) => {
                 bind_tab_action(Message::Shortcut(shortcut), group)
             }

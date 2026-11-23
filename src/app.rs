@@ -48,6 +48,7 @@ mod keyboard_settings;
 mod local_forwards;
 mod local_profile;
 mod pattern_settings;
+mod saved_commands;
 mod word_delimiters;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
@@ -331,6 +332,7 @@ pub enum InteractionField {
 enum SettingsEditor {
     Keyboard(keyboard_settings::KeyboardPage),
     Patterns(pattern_settings::PatternPage),
+    SavedCommands(saved_commands::Editor),
     WordDelimiters(word_delimiters::Editor),
 }
 enum Page {
@@ -849,6 +851,7 @@ pub struct TerminalApp {
     appearance: Arc<RwLock<Appearance>>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
+    saved_commands: w11term::saved_commands::Commands,
     dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     rotation_hover: Option<pane_view::RotationHover>,
@@ -961,6 +964,7 @@ pub enum Message {
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
     Patterns(pattern_settings::Edit),
+    SavedCommands(saved_commands::Edit),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -2031,6 +2035,12 @@ impl TerminalApp {
                 .content("Import OpenSSH config…"),
         );
         children.splice(1..1, profiles);
+        children.insert(
+            1,
+            Button::new()
+                .on_click(context.callback(|_| Message::SavedCommands(saved_commands::Edit::Show)))
+                .content("Saved commands"),
+        );
         children.insert(
             1,
             Button::new()
@@ -4237,6 +4247,7 @@ impl Component for TerminalApp {
             appearance,
             fonts,
             appearance_error,
+            saved_commands: Default::default(),
             dividers: Rc::default(),
             measured_layout: None,
             rotation_hover: None,
@@ -4324,6 +4335,9 @@ impl Component for TerminalApp {
                 | Message::Keyboard(keyboard_settings::Edit::Text(..))
                 | Message::Patterns(
                     pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
+                )
+                | Message::SavedCommands(
+                    saved_commands::Edit::Name(_) | saved_commands::Edit::Text(_)
                 )
                 | Message::PickerQuery(..)
                 | Message::Discovery(
@@ -5540,6 +5554,7 @@ impl Component for TerminalApp {
             }
             Message::Keyboard(edit) => self.edit_keyboard(edit),
             Message::Patterns(edit) => self.edit_patterns(edit),
+            Message::SavedCommands(edit) => self.edit_saved_commands(edit),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 if let Some(AppTab {
@@ -6113,6 +6128,9 @@ impl Component for TerminalApp {
                     &self.appearance.read().unwrap().hint_patterns,
                     context,
                 ),
+                Page::Settings(Some(SettingsEditor::SavedCommands(page))) => {
+                    saved_commands::view(page, &self.saved_commands, context)
+                }
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),

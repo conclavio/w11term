@@ -627,6 +627,7 @@ impl TerminalApp {
             self.finish_switcher(false, ctx);
         }
         let (matches, commands) = if mode == Mode::Commands {
+            self.reload_saved_commands();
             (vec![], self.command_rows(""))
         } else if mode == Mode::Text {
             (vec![], vec![])
