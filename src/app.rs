@@ -25,7 +25,7 @@ use w11term::{
     profiles::{ProfileSnapshot, ProfileStore},
     session::{Command, Session},
     shortcuts::Action as KeyAction,
-    tabs::{PaneRotation, PaneSwap, TabId, Tabs},
+    tabs::{BalancedPanes, PaneBalance, PaneRotation, PaneSwap, TabId, Tabs},
 };
 use wezterm_term::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind, TerminalSize};
 use windows_canvas::{Canvas, Invalidator};
@@ -654,6 +654,7 @@ fn tab_menu_message(label: String) -> Message {
         "Swap pane down" => Message::Shortcut(Shortcut::SwapPane(Direction::Down)),
         "Zoom pane" | "Restore panes" => Message::ZoomPane,
         "Rotate split" => Message::Shortcut(Shortcut::RotateSplit),
+        "Balance panes" => Message::Shortcut(Shortcut::BalancePanes),
         "Close pane" => Message::ClosePane,
         "Enable read-only pane input" => Message::SetPaneReadOnly(true),
         "Disable read-only pane input" => Message::SetPaneReadOnly(false),
@@ -733,8 +734,9 @@ struct CaretMenuBinding {
 }
 
 /// Pane layout actions offered while this menu is visible.
-#[derive(Clone, Default, Eq, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 struct PaneArrangement {
+    balance: Option<PaneBalance>,
     rotation: Option<PaneRotation>,
     left: Option<PaneSwap>,
     right: Option<PaneSwap>,
@@ -751,6 +753,7 @@ impl PaneArrangement {
             return Self::default();
         }
         Self {
+            balance: None,
             left: tabs.pane_swap(Direction::Left),
             rotation: tabs.pane_rotation(),
             right: tabs.pane_swap(Direction::Right),
@@ -772,6 +775,12 @@ impl PaneArrangement {
         self.rotation
             .clone()
             .map_or(Message::ControlIdle, Message::RotateSplit)
+    }
+
+    fn balance(&self) -> Message {
+        self.balance
+            .clone()
+            .map_or(Message::ControlIdle, Message::BalancePanes)
     }
 
     fn message(&self, direction: Direction) -> Message {
@@ -886,6 +895,7 @@ pub enum Message {
     FocusPreviousPane(previous_pane::Target),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
+    BalancePanes(PaneBalance),
     ZoomPane,
     ClosePane,
     MovePaneToTab,
@@ -2983,6 +2993,7 @@ impl TerminalApp {
                 Message::Shortcut(Shortcut::FocusPreviousPane) => previous_pane::message(previous),
                 Message::Shortcut(Shortcut::SwapPane(direction)) => offered.message(direction),
                 Message::Shortcut(Shortcut::RotateSplit) => offered.rotate(),
+                Message::Shortcut(Shortcut::BalancePanes) => offered.balance(),
                 Message::Shortcut(shortcut)
                     if let Some(destination) = directory_split::destination(shortcut) =>
                 {
@@ -3375,6 +3386,7 @@ impl TerminalApp {
             PaneArrangement::default()
         } else {
             let mut arrangement = PaneArrangement::for_tab(&self.tabs);
+            arrangement.balance = self.available_balance();
             if arrangement.rotation.is_some() && !self.rotation_fits() {
                 arrangement.rotation = None;
             }
@@ -3542,13 +3554,13 @@ impl TerminalApp {
                 MenuItem::disabled(binding.id, binding.label)
             });
         }
-        let rotate = KeyAction::RotateSplit.binding();
-        items.push(self.binding_menu_enabled(
-            rotate.id,
-            rotate.label,
-            KeyAction::RotateSplit,
-            arrangement.rotation.is_some(),
-        ));
+        for (action, enabled) in [
+            (KeyAction::RotateSplit, arrangement.rotation.is_some()),
+            (KeyAction::BalancePanes, arrangement.balance.is_some()),
+        ] {
+            let binding = action.binding();
+            items.push(self.binding_menu_enabled(binding.id, binding.label, action, enabled));
+        }
         items.push(previous_item);
         if self
             .tabs
@@ -3965,6 +3977,10 @@ impl Component for TerminalApp {
                     .borrow()
                     .as_ref()
                     .map_or(Message::ControlIdle, |menu| menu.arrangement.rotate()),
+                Shortcut::BalancePanes => shortcut_menu
+                    .borrow()
+                    .as_ref()
+                    .map_or(Message::ControlIdle, |menu| menu.arrangement.balance()),
                 shortcut if let Some(destination) = directory_split::destination(shortcut) => {
                     let menu = shortcut_menu.borrow();
                     directory_split::message(
@@ -5193,6 +5209,20 @@ impl Component for TerminalApp {
                     self.panes_rearranged(panes);
                 }
             }
+            Message::BalancePanes(target) => {
+                if self.incoming.is_none()
+                    && self.outgoing.is_none()
+                    && let Some(plan) = self.measure_balance(&target)
+                    && self.tabs.balance_panes(plan)
+                {
+                    let panes = target.layout().leaves();
+                    self.rotation_hover = self.reset_balance_measurements(&panes);
+                    for &id in &panes {
+                        self.keyboard.leave_pane(id);
+                    }
+                    self.panes_rearranged(panes);
+                }
+            }
             Message::ZoomPane => {
                 if self.tabs.toggle_zoom() {
                     self.activate(context);
@@ -5305,6 +5335,7 @@ impl Component for TerminalApp {
                 // The native shortcut and palette bind both panes before dispatch.
                 Shortcut::SwapPane(_)
                 | Shortcut::RotateSplit
+                | Shortcut::BalancePanes
                 | Shortcut::SplitRightInCurrentDirectory
                 | Shortcut::SplitBelowInCurrentDirectory
                 | Shortcut::NewTabInCurrentDirectory => {}
@@ -5701,17 +5732,21 @@ impl Component for TerminalApp {
                     } else {
                         self.restore_rotation_hover();
                     }
-                    let fits =
-                        self.incoming.is_none() && self.outgoing.is_none() && self.rotation_fits();
+                    let available = self.incoming.is_none() && self.outgoing.is_none();
+                    let rotation = available && self.rotation_fits();
+                    let balance = available && self.available_balance().is_some();
                     let changed = self
                         .caret_menu_binding
                         .borrow()
                         .as_ref()
-                        .is_none_or(|cached| cached.arrangement.rotation.is_some() != fits);
+                        .is_none_or(|cached| {
+                            cached.arrangement.rotation.is_some() != rotation
+                                || cached.arrangement.balance.is_some() != balance
+                        });
                     if changed {
                         self.header.borrow_mut().take();
-                        self.refresh_open_commands();
                     }
+                    self.refresh_open_commands();
                 }
             }
             Message::Geometry(width, height, epoch, first) => {
@@ -7001,6 +7036,44 @@ mod find_tests {
 #[cfg(test)]
 mod profile_ui_tests {
     use super::*;
+
+    #[test]
+    fn balance_actions_keep_the_offered_layout_after_geometry_or_tab_changes() {
+        let mut tabs = Tabs::default();
+        let left = tabs.insert(());
+        let right = tabs.split(left, (), Axis::Columns).unwrap();
+        tabs.set_ratio(&[], 0.3);
+        let offered = PaneArrangement {
+            balance: tabs.pane_balance(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            tab_menu_message("Balance panes    F8".into()),
+            Message::Shortcut(Shortcut::BalancePanes)
+        ));
+        assert!(matches!(
+            PaneArrangement::default().balance(),
+            Message::ControlIdle
+        ));
+        let Message::BalancePanes(original) = offered.balance() else {
+            unreachable!()
+        };
+        let measure =
+            |target: &PaneBalance| target.measure(6.0, |_, _| Some((160.0, 16.0))).unwrap();
+        let other = tabs.insert(());
+        tabs.split(other, (), Axis::Columns);
+        assert!(!tabs.balance_panes(measure(&original)));
+        tabs.select(right);
+        tabs.set_ratio(&[], 0.4);
+        assert!(!tabs.balance_panes(measure(&original)));
+        let fresh = tabs.pane_balance().unwrap();
+        assert_ne!(
+            command_palette::CommandId::BalancePanes(original),
+            command_palette::CommandId::BalancePanes(fresh.clone())
+        );
+        assert!(tabs.balance_panes(measure(&fresh)));
+        assert_eq!(tabs.active_id(), Some(right));
+    }
 
     #[test]
     fn swap_actions_use_the_neighbors_offered_when_invoked() {

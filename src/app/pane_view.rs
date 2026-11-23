@@ -78,6 +78,7 @@ impl PaneGeometry {
 pub(super) struct RotationHover {
     point: (i32, i32),
     before: BTreeMap<TabId, (f32, f32, f32)>,
+    remeasuring: bool,
 }
 
 impl RotationHover {
@@ -95,7 +96,11 @@ impl RotationHover {
             .iter()
             .map(|id| Some((*id, geometry.areas.get(id)?.get()?)))
             .collect::<Option<_>>()?;
-        Some(Self { point, before })
+        Some(Self {
+            point,
+            before,
+            remeasuring: false,
+        })
     }
 
     fn measured(&self, geometry: &PaneGeometry) -> bool {
@@ -104,7 +109,7 @@ impl RotationHover {
                 .areas
                 .get(id)
                 .and_then(|area| area.get())
-                .is_some_and(|new| (new.0, new.1) != (old.0, old.1))
+                .is_some_and(|new| self.remeasuring || (new.0, new.1) != (old.0, old.1))
         })
     }
 
@@ -276,6 +281,27 @@ impl TerminalApp {
             crate::input::cursor_client()?,
             crate::input::ime::client_height()?,
         )
+    }
+
+    pub(super) fn reset_balance_measurements(&self, panes: &[TabId]) -> Option<RotationHover> {
+        let mut hover = (!self.overlay_visible.get())
+            .then(|| self.capture_rotation_hover(panes))
+            .flatten();
+        if let Some(hover) = &mut hover {
+            hover.remeasuring = true;
+        }
+        // A translated pane can keep its size. Clear each old measurement so
+        // every invalidated canvas, including unchanged ones, reports its draw.
+        for &id in panes {
+            if let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get(id)
+            {
+                tab.surface.area.set(None);
+            }
+        }
+        hover
     }
 
     pub(super) fn restore_rotation_hover(&mut self) {
@@ -767,15 +793,46 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn rotation_fits(&self) -> bool {
-        let Some(AppTab {
-            page: Page::Terminal(focused),
-            ..
-        }) = self.tabs.active()
-        else {
-            return false;
+    fn split_scale(&self) -> Option<f32> {
+        let Page::Terminal(focused) = &self.tabs.active()?.page else {
+            return None;
         };
-        let Some((_, _, scale)) = focused.surface.area.get() else {
+        if self.tabs.zoomed() {
+            return None;
+        }
+        Some(focused.surface.area.get()?.2)
+    }
+
+    fn measured_extent(&self, pane: TabId, axis: Axis, scale: f32) -> Option<(f64, f64)> {
+        let Page::Terminal(tab) = &self.tabs.get(pane)?.page else {
+            return None;
+        };
+        if tab.error.is_some() {
+            return None;
+        }
+        rotation_extent(
+            tab.surface.area.get()?,
+            tab.surface.metrics.get(),
+            axis,
+            scale,
+        )
+    }
+
+    pub(super) fn available_balance(&self) -> Option<PaneBalance> {
+        let target = self.tabs.pane_balance()?;
+        self.measure_balance(&target)?;
+        Some(target)
+    }
+
+    pub(super) fn measure_balance(&self, target: &PaneBalance) -> Option<BalancedPanes> {
+        let scale = self.split_scale()?;
+        target.measure(DIVIDER * f64::from(scale), |pane, axis| {
+            self.measured_extent(pane, axis, scale)
+        })
+    }
+
+    pub(super) fn rotation_fits(&self) -> bool {
+        let Some(scale) = self.split_scale() else {
             return false;
         };
         let Some(layout) = self.tabs.active_layout() else {
@@ -784,19 +841,8 @@ impl TerminalApp {
         let Some(id) = self.tabs.active_id() else {
             return false;
         };
-        if self.tabs.zoomed() {
-            return false;
-        }
         layout.rotation_fits(id, DIVIDER * f64::from(scale), |pane, axis| {
-            let Page::Terminal(tab) = &self.tabs.get(pane)?.page else {
-                return None;
-            };
-            rotation_extent(
-                tab.surface.area.get()?,
-                tab.surface.metrics.get(),
-                axis,
-                scale,
-            )
+            self.measured_extent(pane, axis, scale)
         })
     }
 
@@ -891,6 +937,15 @@ mod tests {
         assert_eq!(same_pane.hit(&geometry, Some(same_point), height), Some(1));
         assert_eq!(pending.hit(&geometry, Some(same_point), height), None);
         assert_eq!(pending.hit(&geometry, None, height), None);
+        // Balancing invalidates all measurements; an unchanged-size sibling
+        // can still be under the pointer after its origin moves.
+        let mut balanced = pending;
+        balanced.remeasuring = true;
+        right.set(None);
+        assert!(!balanced.measured(&geometry));
+        right.set(Some((98.0, 98.0, 2.0)));
+        assert!(balanced.measured(&geometry));
+        right.set(left.get());
         for outside in [(150, 35), (150, 158), (420, 200)] {
             assert!(
                 !geometry.contains(1, outside, height) && !geometry.contains(2, outside, height)

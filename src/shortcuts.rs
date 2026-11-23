@@ -30,6 +30,7 @@ pub enum Action {
     NewTabInCurrentDirectory,
     ZoomPane,
     RotateSplit,
+    BalancePanes,
     ClosePane,
     MovePane,
     MovePaneToExistingTab,
@@ -148,6 +149,13 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(ZoomPane, "zoom_pane", "Zoom pane", 0x5a, PANE),
     Binding::new(RotateSplit, "rotate_split", "Rotate split", 0, Mods::NONE),
+    Binding::new(
+        BalancePanes,
+        "balance_panes",
+        "Balance panes",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(ClosePane, "close_pane", "Close pane", 0x57, PANE),
     Binding::new(MovePane, "move_pane", "Move pane to new tab", 0, Mods::NONE),
     Binding::new(
@@ -282,6 +290,7 @@ impl Action {
                 | NewTabInCurrentDirectory
                 | ZoomPane
                 | RotateSplit
+                | BalancePanes
                 | ClosePane
                 | MovePane
                 | MovePaneToExistingTab
@@ -659,6 +668,7 @@ mod tests {
             SwapPaneUp,
             SwapPaneDown,
             RotateSplit,
+            BalancePanes,
             SplitRightInCurrentDirectory,
             SplitBelowInCurrentDirectory,
             NewTabInCurrentDirectory,
