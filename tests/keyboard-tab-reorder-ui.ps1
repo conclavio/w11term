@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $keymap = @{ shortcuts = @{
-    command_palette='F7'; focus_left='F4'; focus_right='F3'; move_tab_left='F6'; move_tab_right='F10'
+    command_palette='F7'; focus_left='F4'; focus_right='F12'; move_tab_left='F6'; move_tab_right='F10'
     close_tab='F2'; close_pane='F5'
     select_tab_1='F8'; select_tab_2='F9'
 } }
@@ -119,7 +119,7 @@ try {
     $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','12',';while-pinned')
     Wait-Strip 'Pinned: palette-ssh' 'Settings' 'Pinned: palette-ssh'
 
-    Press-Key 0x72 # F3 focuses PowerShell in the pinned tab
+    Press-Key 0x7b # F12 focuses PowerShell in the pinned tab
     Wait-Focus $localPane
     Press-Key 0x74 # F5 can close a split if the pinned tab remains open
     $null = Wait-Until 'the original SSH pane to outlast the closed PowerShell split' {
