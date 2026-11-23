@@ -19,12 +19,14 @@ mod saved;
 mod transfer;
 
 pub(super) const LABEL: &str = "SSH host group";
+pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;
 
 #[derive(Default)]
 pub(super) struct HostGroup {
     saved: saved::SavedUi,
+    roster: Option<Box<MemberRoster>>,
     selected: BTreeSet<u64>,
     filter: filter::Filter,
     draft: String,
@@ -43,6 +45,12 @@ pub(super) struct HostGroup {
     retry_feedback: String,
     prompt_setup: prompt_setup::State,
     transfer: transfer::State,
+}
+
+#[derive(Default)]
+struct MemberRoster {
+    panes: BTreeSet<u64>,
+    show_window: bool,
 }
 
 struct DraftBackup {
@@ -219,10 +227,27 @@ fn execution_caption(result: &GroupExecution) -> Cow<'_, str> {
 }
 
 impl HostGroup {
+    fn includes_pane(&self, pane: u64) -> bool {
+        self.roster
+            .as_ref()
+            .is_none_or(|roster| roster.show_window || roster.panes.contains(&pane))
+    }
+
+    fn show_window_roster(&mut self, show: bool) {
+        if let Some(roster) = &mut self.roster
+            && roster.show_window != show
+        {
+            roster.show_window = show;
+            if !show {
+                self.selected.retain(|pane| roster.panes.contains(pane));
+            }
+        }
+    }
+
     fn shown<'a>(&self, targets: &'a [Target]) -> impl Iterator<Item = &'a Target> {
         targets
             .iter()
-            .filter(move |target| self.filter.matches(target))
+            .filter(move |target| self.includes_pane(target.pane) && self.filter.matches(target))
     }
 
     fn selected_shown(&self, targets: &[Target]) -> BTreeSet<u64> {
@@ -302,12 +327,14 @@ impl HostGroup {
 
 pub enum Action {
     Open,
+    NewTab,
     OpenNamedGroup { name: String, members: Vec<String> },
     Saved(TabId, saved::Action),
     Tick,
     Edit(TabId, String),
     Filter(TabId, String),
     FilterWildcards(TabId, bool),
+    ShowWindowRoster(TabId, bool),
     Select(TabId, u64, bool),
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
@@ -333,20 +360,43 @@ pub enum Action {
 }
 
 impl TerminalApp {
-    fn host_group_tab_id(&self) -> Option<TabId> {
-        self.tabs
-            .entries()
+    fn recent_host_group_tab(&self) -> Option<TabId> {
+        self.mru_groups
             .iter()
-            .find(|entry| matches!(entry.value.page, Page::HostGroup(_)))
-            .map(|entry| entry.id)
+            .copied()
+            .chain(self.tabs.entries().iter().map(|entry| entry.id))
+            .find(|&id| {
+                self.tabs
+                    .get(id)
+                    .is_some_and(|tab| matches!(tab.page, Page::HostGroup(_)))
+            })
     }
 
-    fn ensure_host_group_tab(&mut self) -> TabId {
-        self.host_group_tab_id().unwrap_or_else(|| {
-            self.tabs.insert(AppTab {
-                label: LABEL.into(),
-                page: Page::HostGroup(HostGroup::default()),
-            })
+    fn unique_host_group_label(&self, base: &str, existing: Option<TabId>) -> String {
+        let available = |label: &str| {
+            self.tabs
+                .entries()
+                .iter()
+                .all(|entry| Some(entry.id) == existing || entry.value.label != label)
+        };
+        if available(base) {
+            return base.to_owned();
+        }
+        (2..)
+            .map(|index| format!("{base} ({index})"))
+            .find(|label| available(label))
+            .expect("There are finitely many tabs")
+    }
+
+    fn new_host_group_tab(&mut self, name: Option<&str>) -> TabId {
+        let base = name.map(|name| format!("SSH group · {name}"));
+        let label = self.unique_host_group_label(base.as_deref().unwrap_or(LABEL), None);
+        self.tabs.insert(AppTab {
+            label,
+            page: Page::HostGroup(HostGroup {
+                roster: name.map(|_| Box::default()),
+                ..Default::default()
+            }),
         })
     }
 
@@ -385,6 +435,9 @@ impl TerminalApp {
         }
         self.tabs.select(id);
         if let Some(page) = self.host_group_mut(id) {
+            if let Some(roster) = &mut page.roster {
+                roster.panes.extend(selected.iter().copied());
+            }
             page.selected = selected;
             page.filter.clear();
             page.saved.feedback.clear();
@@ -607,9 +660,12 @@ impl TerminalApp {
 
     pub(super) fn handle_host_group(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
-            Action::Open => {
+            Action::Open | Action::NewTab => {
                 self.refresh_profiles();
-                let id = self.ensure_host_group_tab();
+                let existing = matches!(action, Action::Open)
+                    .then(|| self.recent_host_group_tab())
+                    .flatten();
+                let id = existing.unwrap_or_else(|| self.new_host_group_tab(None));
                 self.tabs.select(id);
                 self.sync_selection(ctx);
                 self.activate(ctx);
@@ -623,9 +679,6 @@ impl TerminalApp {
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
             Action::Transfer(id, action) => self.handle_host_group_transfer(id, action, ctx),
             Action::Tick => {
-                let Some(id) = self.tabs.active_id() else {
-                    return;
-                };
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
                     Some(Page::HostGroup(_))
@@ -637,12 +690,23 @@ impl TerminalApp {
                     .into_iter()
                     .map(|target| target.pane)
                     .collect();
-                if let Some(page) = self.host_group_mut(id) {
-                    page.selected.retain(|pane| panes.contains(pane));
-                    page.prompt_setup.poll();
-                    for submission in &mut page.submissions {
-                        for delivery in &mut submission.results {
-                            delivery.poll();
+                let groups: Vec<_> = self
+                    .tabs
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry.value.page, Page::HostGroup(_)))
+                    .map(|entry| entry.id)
+                    .collect();
+                for id in groups {
+                    if let Some(Page::HostGroup(page)) =
+                        self.tabs.get_mut(id).map(|tab| &mut tab.page)
+                    {
+                        page.selected.retain(|pane| panes.contains(pane));
+                        page.prompt_setup.poll();
+                        for submission in &mut page.submissions {
+                            for delivery in &mut submission.results {
+                                delivery.poll();
+                            }
                         }
                     }
                 }
@@ -663,8 +727,18 @@ impl TerminalApp {
                     page.filter.set_wildcards(wildcards);
                 }
             }
+            Action::ShowWindowRoster(id, show) => {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
+                {
+                    page.show_window_roster(show);
+                }
+            }
             Action::Select(id, pane, selected) => {
-                if let Some(page) = self.host_group_mut(id) {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
+                    && page.includes_pane(pane)
+                {
                     if selected {
                         page.selected.insert(pane);
                     } else {
@@ -940,8 +1014,12 @@ impl TerminalApp {
         if shown.is_empty() && filter_error.is_none() {
             details.push(KeyedView::new(
                 "empty",
-                TextBlock::new().text(if targets.is_empty() {
-                    "Open a direct SSH shell to add it to this roster."
+                TextBlock::new().text(if !targets.iter().any(|target| page.includes_pane(target.pane)) {
+                    if page.roster.as_ref().is_some_and(|roster| !roster.show_window) {
+                        "This group has no open SSH panes. Import a host list or show the window roster."
+                    } else {
+                        "Open a direct SSH shell to add it to this roster."
+                    }
                 } else {
                     "No SSH panes match this filter."
                 }),
@@ -952,7 +1030,9 @@ impl TerminalApp {
         let hidden_count = targets
             .iter()
             .filter(|target| {
-                page.selected.contains(&target.pane) && !selected_shown.contains(&target.pane)
+                page.includes_pane(target.pane)
+                    && page.selected.contains(&target.pane)
+                    && !selected_shown.contains(&target.pane)
             })
             .count();
         let shown_ids: BTreeSet<_> = shown.iter().map(|target| target.pane).collect();
@@ -993,6 +1073,15 @@ impl TerminalApp {
             ));
         let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
             filter_input,
+            page.roster.as_ref().map_or_else(View::empty, |roster| {
+                CheckBox::new()
+                    .automation_name("Show all window SSH panes")
+                    .is_checked(roster.show_window)
+                    .on_is_checked_changed(ctx.callback(move |show| {
+                        Message::HostGroup(Action::ShowWindowRoster(id, show))
+                    }))
+                    .content("Show all window SSH panes")
+            }),
             filter_error.map_or_else(View::empty, |error| {
                 TextBlock::new()
                     .text(error)
@@ -1407,6 +1496,42 @@ mod tests {
         assert!(group.selected_shown(&roster).is_empty());
         group.filter.clear();
         assert_eq!(group.selected_shown(&roster), BTreeSet::from([7, 8]));
+    }
+
+    #[test]
+    fn a_named_roster_scopes_bulk_targets_and_deselects_external_panes_on_return() {
+        let targets = [1, 2, 3].map(|pane| Target {
+            pane,
+            name: format!("Host {pane}"),
+            names: Default::default(),
+            profile: None,
+            connected: true,
+            state: TargetState::Unverified,
+        });
+        let mut group = HostGroup {
+            roster: Some(Box::new(MemberRoster {
+                panes: BTreeSet::from([1, 3]),
+                show_window: false,
+            })),
+            selected: BTreeSet::from([1, 3]),
+            ..Default::default()
+        };
+        assert_eq!(
+            group
+                .shown(&targets)
+                .map(|target| target.pane)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        group.show_window_roster(true);
+        group.selected.insert(2);
+        group.filter.set_query("Host 2".into());
+        assert_eq!(group.selected_shown(&targets), BTreeSet::from([2]));
+        group.show_window_roster(false);
+        assert!(group.selected_shown(&targets).is_empty());
+        assert_eq!(group.selected, BTreeSet::from([1, 3]));
+        group.filter.clear();
+        assert_eq!(group.selected_shown(&targets), BTreeSet::from([1, 3]));
     }
 
     #[test]
