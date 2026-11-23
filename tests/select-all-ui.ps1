@@ -39,15 +39,10 @@ function Set-Sentinel {
     }
     return [FixtureClipboard]::GetClipboardSequenceNumber()
 }
-function Read-PrivateClipboard {
-    $stream = [IO.File]::Open($env:W11TERM_TEST_COPY_FILE,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
-    $reader = [IO.StreamReader]::new($stream,$utf8)
-    try { $reader.ReadToEnd() } finally { $reader.Dispose() }
-}
 function Assert-Uncopied([uint32]$Sequence) {
     if ($real) {
         if ([FixtureClipboard]::GetClipboardSequenceNumber() -ne $Sequence) { throw 'Selection modified the Windows clipboard before Copy' }
-    } elseif ((Read-PrivateClipboard) -cne $sentinel) { throw 'Selection copied text before explicit Copy' }
+    } elseif ((Read-ClipboardFixture) -cne $sentinel) { throw 'Selection copied text before explicit Copy' }
 }
 function Start-Selection([string]$Scope, [string]$Marker, [switch]$Palette) {
     if ($Palette) {
@@ -71,7 +66,7 @@ function Copy-Selection([uint32]$Sequence,[string]$Expected) {
     if ($real) { Send-Chord '^+c' } else { Press-Key 0x59 } # y in copy mode
     $null = Wait-Until 'explicit Copy produced exactly the expected Unicode text' {
         if ($real) { return [FixtureClipboard]::ContainsNewText($Sequence,$Expected) }
-        return (Read-PrivateClipboard) -ceq $Expected
+        return (Read-ClipboardFixture) -ceq $Expected
     }
     $null = Wait-Until 'copy mode closed after Copy' { !(Copy-ModeOpen) }
 }
