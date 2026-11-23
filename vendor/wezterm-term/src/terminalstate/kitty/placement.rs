@@ -28,6 +28,19 @@ pub(super) struct HistoryAnchors {
 pub(super) struct ProjectedPlacement {
     pub(super) placement: KittyImagePlacement,
     pub(super) parent: Option<Key>,
+    pub(super) row_limit: u32,
+}
+
+enum RelativeQuery<'a> {
+    Find {
+        keys: &'a mut HashSet<Key>,
+        columns: Range<usize>,
+        z: Option<i32>,
+    },
+    Archive {
+        last_row: &'a mut usize,
+        clips: &'a mut Vec<(Key, u32)>,
+    },
 }
 impl TerminalState {
     pub(super) fn validate_kitty_parent(
@@ -133,8 +146,40 @@ impl TerminalState {
             .values()
             .any(|node| node.parent.is_some())
         {
-            self.project_or_find_kitty(None, rows.start, rows.len(), Some((keys, columns, z)));
+            self.project_or_find_kitty(
+                None,
+                rows.start,
+                rows.len(),
+                Some(RelativeQuery::Find { keys, columns, z }),
+            );
         }
+    }
+
+    pub(in crate::terminalstate) fn archive_kitty_relative_rows(&mut self) -> usize {
+        if !self
+            .kitty_img
+            .projected
+            .values()
+            .any(|node| node.parent.is_some())
+        {
+            return 0;
+        }
+        let screen = self.screen();
+        let mut last_row = 0;
+        let mut clips = Vec::new();
+        self.project_or_find_kitty(
+            None,
+            screen.phys_row(0),
+            screen.physical_rows,
+            Some(RelativeQuery::Archive {
+                last_row: &mut last_row,
+                clips: &mut clips,
+            }),
+        );
+        for (key, rows) in clips {
+            self.kitty_img.projected.get_mut(&key).unwrap().row_limit = rows;
+        }
+        last_row
     }
 
     /// Project virtual and relative placements onto a private copy of visible
@@ -149,7 +194,7 @@ impl TerminalState {
         lines: Option<&mut [Line]>,
         first_phys: usize,
         height: usize,
-        mut visible_relatives: Option<(&mut HashSet<Key>, Range<usize>, Option<i32>)>,
+        mut query: Option<RelativeQuery<'_>>,
     ) -> bool {
         if self.kitty_img.projected.is_empty() {
             return false;
@@ -317,18 +362,35 @@ impl TerminalState {
             };
             x += px;
             y += py;
-            if let Some((visible, columns, z)) = &mut visible_relatives {
+            let rows = grid.rows.min(node.row_limit);
+            if rows == 0 {
+                continue;
+            }
+            let end_y = y + i64::from(rows);
+            if let Some(RelativeQuery::Find { keys, columns, z }) = &mut query {
                 if x < columns.end as i64
                     && x + i64::from(grid.cols) > columns.start as i64
                     && y < height as i64
-                    && y + i64::from(grid.rows) > 0
+                    && end_y > 0
                     && z.is_none_or(|z| z == grid.z)
                 {
-                    visible.insert(key);
+                    keys.insert(key);
                 }
                 continue;
             }
-            for row in y.max(0)..(y + i64::from(grid.rows)).min(height as i64) {
+            if let Some(RelativeQuery::Archive { last_row, clips }) = &mut query {
+                let end = end_y.min(height as i64);
+                if x < screen.physical_cols as i64 && x + i64::from(grid.cols) > 0 && end > y.max(0)
+                {
+                    **last_row = (**last_row).max(end as usize);
+                }
+                // The hidden part of an archived placement must not spill into the new display.
+                if end < end_y {
+                    clips.push((key, (end - y).max(0) as u32));
+                }
+                continue;
+            }
+            for row in y.max(0)..end_y.min(height as i64) {
                 for col in x.max(0)..(x + i64::from(grid.cols)).min(screen.physical_cols as i64) {
                     if tiles.len() == MAX_PROJECTED_TILES {
                         break;
