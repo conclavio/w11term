@@ -282,7 +282,7 @@ impl TerminalApp {
                 .unwrap_or_default();
             match shortcut {
                 Shortcut::ReopenClosedTab => {
-                    let closed = self.closed_tab.as_ref().map(|tab| tab.group);
+                    let closed = self.closed_tabs.back().map(|tab| tab.group);
                     row.enabled = closed.is_some();
                     row.id = CommandId::ReopenClosedTab(closed);
                 }

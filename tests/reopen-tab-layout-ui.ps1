@@ -26,6 +26,15 @@ try {
     Wait-Focus $neighbor
     Wait-Text $neighbor 'PS '
     $before = Identity $neighbor 'NeighborBefore' '$global:DupValue="neighbor"; '
+    $older = (Control @('open','--profile','Palette PowerShell','--activate')).pane
+    Wait-Focus $older
+    Wait-Text $older 'PS '
+    $olderState = Identity $older 'OlderShell' '$global:DupValue="older"; '
+    Press-Key 0x79 # F10 closes this tab before the split layout.
+    $null = Wait-Until 'the older PowerShell layout to close first' {
+        $rows = @(Sessions)
+        $rows.Count -eq 3 -and $older -notin $rows.id
+    }
     Press-Key 0x77 # F8 selects tab 1.
     Wait-Focus $sourceShell.id
     Press-Key 0x73 # F4 focuses the left SSH pane.
@@ -76,6 +85,19 @@ try {
     Type-Text 'reopened-after-unlock/'
     Wait-Text $newSsh.id 'reopened-after-unlock/'
     Check-History $newSsh.id 'reopened-after-unlock/' 'source-before/'
+
+    Run-Palette 'Reopen last closed tab layout'
+    $olderAgain = Wait-Until 'the second reopen to bring back the older tab' {
+        $rows = @(Sessions)
+        $opened = $rows | Where-Object { $_.active -and $_.id -notin @($older,$neighbor,$newShell.id,$newSsh.id) }
+        if ($rows.Count -eq 4 -and $opened -and $opened.label -ceq 'Palette PowerShell' -and
+            $opened.tab_id -notin $restored.tab_id) { $opened.id }
+    }
+    Wait-Text $olderAgain 'PS '
+    $olderFresh = Identity $olderAgain 'OlderAgain' 'if ($null -eq $global:DupValue) { $global:DupValue="fresh" }; '
+    if ($olderFresh[1].Value -eq $olderState[1].Value -or $olderFresh[2].Value -cne 'fresh') {
+        throw 'The older tab did not open a fresh PowerShell process'
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

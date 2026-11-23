@@ -5,7 +5,7 @@ use crate::{
 use anyhow::Context as _;
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     rc::Rc,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -883,7 +883,7 @@ pub struct TerminalApp {
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiWork>>>,
     control_task: Option<ComponentTask>,
     tabs: Tabs<AppTab>,
-    closed_tab: Option<workspace_view::ClosedTab>,
+    closed_tabs: VecDeque<workspace_view::ClosedTab>,
     closed_pane: Option<workspace_view::ClosedPane>,
     metrics: Rc<Cell<Metrics>>,
     invalidator: Invalidator,
@@ -3056,7 +3056,7 @@ impl TerminalApp {
         let paste = self.paste_origin();
         let group = self.tabs.active_group_id();
         let mut cached = self.caret_menu_binding.borrow_mut();
-        let closed_group = self.closed_tab.as_ref().map(|closed| closed.group);
+        let closed_group = self.closed_tabs.back().map(|closed| closed.group);
         let closed_pane = self.closed_pane.as_ref().map(|closed| closed.id);
         let forward = self.forward_origin();
         let broadcast = self.broadcast_offer();
@@ -3356,7 +3356,7 @@ impl TerminalApp {
                 "reopen_closed_tab",
                 KeyAction::ReopenClosedTab.binding().label,
                 KeyAction::ReopenClosedTab,
-                self.closed_tab.is_some(),
+                !self.closed_tabs.is_empty(),
             ),
             self.binding_menu_enabled(
                 KeyAction::ReopenClosedPane.binding().id,
@@ -4327,7 +4327,7 @@ impl Component for TerminalApp {
             control_rx: Arc::new(std::sync::Mutex::new(control_rx)),
             control_task: None,
             tabs,
-            closed_tab: None,
+            closed_tabs: VecDeque::new(),
             closed_pane: None,
             metrics: Rc::new(Cell::new(Metrics::default())),
             invalidator: Invalidator::new(),
@@ -5599,7 +5599,7 @@ impl Component for TerminalApp {
                     }
                 }
                 Shortcut::ReopenClosedTab => {
-                    let group = self.closed_tab.as_ref().map(|closed| closed.group);
+                    let group = self.closed_tabs.back().map(|closed| closed.group);
                     self.update(Message::ReopenClosedTab(group), context);
                 }
                 Shortcut::ReopenClosedPane => {
