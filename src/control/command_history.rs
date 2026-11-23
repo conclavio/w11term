@@ -1,12 +1,38 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandStatus {
+    #[default]
+    All,
+    Failed,
+    Succeeded,
+    Unknown,
+}
+
+impl CommandStatus {
+    pub fn matches(self, exit_code: Option<i32>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Failed => exit_code.is_some_and(|code| code != 0),
+            Self::Succeeded => exit_code == Some(0),
+            Self::Unknown => exit_code.is_none(),
+        }
+    }
+
+    pub(super) fn is_all(&self) -> bool {
+        *self == Self::All
+    }
+}
+
 impl Registry {
-    pub(super) async fn list_commands(&self, pane: u64) -> Result<Value> {
+    pub(super) async fn list_commands(&self, pane: u64, status: CommandStatus) -> Result<Value> {
         let (frame, _) = Self::capture(&self.pane(pane)?).await?;
         let commands: Vec<_> = frame
             .command_history
             .iter()
             .rev()
+            .filter(|entry| status.matches(entry.exit_code))
             .map(|entry| {
                 json!({
                     "id": entry.id,
@@ -90,6 +116,47 @@ mod tests {
                 Arc::new(|_, _, _| unreachable!()),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn status_filters_use_reported_codes_and_preserve_order_and_metadata() {
+        let (registry, _session) = pane(concat!(
+            "\x1b]133;D;1\x07",
+            "\x1b]133;D\x07",
+            "\x1b]133;D;0\x07",
+            "\x1b]133;D;9\x07",
+        ));
+        let legacy = json!({"verb":"list-commands","pane":23});
+        let request: Request = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), legacy);
+        let all = execute(&registry, legacy).await.unwrap();
+        for (status, ids) in [
+            ("all", vec![4, 3, 2, 1]),
+            ("failed", vec![4, 1]),
+            ("succeeded", vec![3]),
+            ("unknown", vec![2]),
+        ] {
+            let list = execute(
+                &registry,
+                json!({"verb":"list-commands","pane":23,"status":status}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(list["pane"], all["pane"]);
+            assert_eq!(list["connection_generation"], all["connection_generation"]);
+            let entries = all["commands"].as_array().unwrap();
+            let expected: Vec<_> = ids.into_iter().map(|id: usize| &entries[4 - id]).collect();
+            assert_eq!(list["commands"], json!(expected));
+        }
+        assert!(CommandStatus::Failed.matches(Some(-1)));
+        assert!(
+            execute(
+                &registry,
+                json!({"verb":"list-commands","pane":23,"status":"typo"})
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
