@@ -8,6 +8,7 @@ use w11term::events::{
 mod import;
 mod live_output;
 mod progress;
+mod reconnect;
 mod report;
 mod save_command;
 mod saved;
@@ -32,6 +33,7 @@ pub(super) struct HostGroup {
     result_filter: progress::Filter,
     live_output: Option<live_output::State>,
     import: import::State,
+    reconnect_feedback: String,
 }
 
 struct Submission {
@@ -59,6 +61,7 @@ pub struct Target {
 #[derive(Clone, Copy)]
 enum TargetState {
     Offline,
+    Restartable(ExitedPane),
     Authentication,
     ReadOnly,
     Alternate,
@@ -76,6 +79,7 @@ impl TargetState {
     fn label(self) -> &'static str {
         match self {
             Self::Offline => "Disconnected",
+            Self::Restartable(_) => "Disconnected · reconnect available",
             Self::Authentication => "Authentication required",
             Self::ReadOnly => "Read-only",
             Self::Alternate => "Alternate screen",
@@ -293,6 +297,7 @@ pub enum Action {
     ViewSubmission(TabId, u64),
     LiveOutput(TabId, u64, live_output::Action),
     Import(TabId, import::Action),
+    Reconnect(TabId, reconnect::Request),
     FilterResults(TabId, u64, progress::Filter),
     LoadCommand(TabId, u64),
     OpenSavedCommands(TabId),
@@ -359,6 +364,7 @@ impl TerminalApp {
             page.filter.clear();
             page.saved.feedback.clear();
             page.import.feedback.clear();
+            page.reconnect_feedback.clear();
         }
         self.sync_selection(ctx);
         self.activate(ctx);
@@ -418,7 +424,10 @@ impl TerminalApp {
                 let state = if live.device_busy || live.session.prompts.current().is_some() {
                     TargetState::Authentication
                 } else if !connected {
-                    TargetState::Offline
+                    entry
+                        .value
+                        .exited_pane()
+                        .map_or(TargetState::Offline, TargetState::Restartable)
                 } else if live.read_only.get() {
                     TargetState::ReadOnly
                 } else if live.session.frames.load().alternate {
@@ -591,6 +600,7 @@ impl TerminalApp {
             }
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Import(id, action) => self.handle_host_import(id, action, ctx),
+            Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::Tick => {
                 let Some(id) = self.tabs.active_id() else {
                     return;
@@ -844,6 +854,7 @@ impl TerminalApp {
                                         Message::HostGroup(Action::Visit(id, pane))
                                     }))
                                     .content("Focus pane"),
+                                reconnect::host_button(id, target.state, ctx),
                             )),
                     )),
                 )
@@ -904,6 +915,7 @@ impl TerminalApp {
                         }))
                         .content("Save selection as group…"),
                 )),
+            reconnect::selection_controls(id, page, &shown, ctx),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes.".into()
