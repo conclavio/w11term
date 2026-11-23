@@ -17,7 +17,7 @@ const MAX_PROJECTED_TILES: usize = 65536;
 /// revision. Parent/color changes, screen swaps and reflow invalidate the index.
 #[derive(Debug, Default)]
 pub(super) struct HistoryAnchors {
-    screen: (bool, usize, usize),
+    screen: (bool, usize, usize, u64),
     parents: HashSet<Key>,
     defaults: HashMap<u32, Key>,
     rows: HashMap<StableRowIndex, (usize, Vec<(Key, i64)>)>,
@@ -234,6 +234,7 @@ impl TerminalState {
             self.is_alt_screen_active(),
             screen.physical_cols,
             screen.physical_rows,
+            screen.row_epoch(),
         );
         if cache.screen != signature
             || cache.parents != parents

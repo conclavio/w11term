@@ -482,6 +482,7 @@ pub struct TerminalState {
     seqno: SequenceNo,
 
     synchronized_output: bool,
+    unscrolled_rows: usize,
     saved_private_modes: SavedPrivateModes,
     sgr_stack: sgr_stack::SgrStack,
     attribute_extent: u8,
@@ -751,6 +752,7 @@ impl TerminalState {
             inactive_kitty_img: Default::default(),
             kitty_animation_time: None,
             synchronized_output: false,
+            unscrolled_rows: 0,
             saved_private_modes: SavedPrivateModes::default(),
             sgr_stack: Default::default(),
             attribute_extent: 0,
@@ -794,6 +796,11 @@ impl TerminalState {
 
     pub fn increment_seqno(&mut self) {
         self.seqno += 1;
+    }
+
+    /// Cumulative rows pulled out of scrollback by reverse scrolling.
+    pub fn unscrolled_rows(&self) -> usize {
+        self.unscrolled_rows
     }
 
     /// The program that requested notifications no longer owns this connection.
@@ -1650,6 +1657,30 @@ impl TerminalState {
         );
         self.finish_kitty_tile_update(graphics);
         self.cursor.x = self.constrain_line_column(self.cursor.x, self.cursor.y);
+    }
+
+    fn scroll_down_from_history(&mut self, num_rows: usize) {
+        let screen = self.screen();
+        let history = if !self.is_alt_screen_active()
+            && self.top_and_bottom_margins.start == 0
+            && self.left_and_right_margins == (0..screen.physical_cols)
+        {
+            screen.phys_row(0)
+        } else {
+            0
+        };
+        let count = num_rows.min(screen.physical_rows.max(history));
+        let restored = count.min(history);
+        if restored != 0 {
+            let bottom = self.top_and_bottom_margins.end;
+            self.screen_mut().restore_scrollback_rows(bottom, restored);
+            self.unscrolled_rows = self.unscrolled_rows.wrapping_add(restored);
+        }
+        if count > restored {
+            self.scroll_down(count - restored);
+        } else if restored != 0 {
+            self.cursor.x = self.constrain_line_column(self.cursor.x, self.cursor.y);
+        }
     }
 
     /// Defined by FinalTermSemanticPrompt; a fresh-line is a NOP if the
@@ -3052,6 +3083,7 @@ impl TerminalState {
                 }
             }
             Edit::ScrollDown(n) => self.scroll_down(n as usize),
+            Edit::ScrollDownFromHistory(n) => self.scroll_down_from_history(n as usize),
             Edit::ScrollUp(n) => self.scroll_up(n as usize),
             Edit::ScrollLeft(n) => self.scroll_columns(n, column_edit::Shift::Left),
             Edit::ScrollRight(n) => self.scroll_columns(n, column_edit::Shift::Right),

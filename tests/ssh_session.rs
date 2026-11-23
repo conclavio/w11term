@@ -504,7 +504,11 @@ async fn roundtrip(
             session.input.send(Command::Capture(tx)).unwrap();
             rx.await.unwrap().0
         }
-        let old = echoed(&session, &mut output, b"\x1b[2J\x1b[HOLD").await;
+        // Leave older history behind after unscrolling so clamping alone
+        // cannot explain why the displayed viewport follows the restored row.
+        let base = echoed(&session, &mut output, b"\x1b[2J\x1b[HBASE").await;
+        let old = echoed(&session, &mut output, b"\x1b[22J\x1b[HOLD").await;
+        assert_eq!(old.first_stable_row, base.first_stable_row + 1);
         let held = echoed(&session, &mut output, b"\x1b[?2026h\rNEW").await;
         assert_eq!(held.generation, old.generation);
         assert!(held.rows[0].as_str().starts_with("OLD"));
@@ -521,6 +525,14 @@ async fn roundtrip(
         assert_eq!(history.scroll_offset, 1);
         assert!(history.rows[0].as_str().starts_with("NEW"));
         assert!(history.rows[1].as_str().starts_with("AFTER"));
+        let held = echoed(&session, &mut output, b"\x1b[?2026h\x1b[+T").await;
+        assert_eq!(held.generation, archived.generation);
+        assert_eq!(session.frames.load().generation, history.generation);
+        let restored = echoed(&session, &mut output, b"\x1b[?2026l").await;
+        assert_eq!(session.frames.load().scroll_offset, 0);
+        assert_eq!(restored.first_stable_row, history.first_stable_row);
+        assert!(restored.rows[0].as_str().starts_with("NEW"));
+        assert!(restored.rows[1].as_str().starts_with("AFTER"));
         drop(session);
         tokio::time::timeout(Duration::from_secs(2), server)
             .await

@@ -725,7 +725,7 @@ async fn run(
                 resize_model(&mut terminal, size, &mut scroll_offset);
             }
             total_bytes = capture.bytes.len() as u64;
-            presentation.advance(
+            scroll_offset = presentation.advance(
                 &mut terminal,
                 capture.bytes,
                 scroll_offset,
@@ -819,7 +819,7 @@ async fn run(
                         let anchor = (scroll_offset > 0 && !terminal.is_alt_screen_active()).then(||
                             terminal.screen().visible_row_to_stable_row(0) - scroll_offset as isize);
                         total_bytes += bytes.len() as u64;
-                        presentation.advance_at(&mut terminal, bytes, scroll_offset, &status, total_bytes, now);
+                        scroll_offset = presentation.advance_at(&mut terminal, bytes, scroll_offset, &status, total_bytes, now);
                         presentation.replay_time(&mut terminal, now);
                         if let Some(anchor) = anchor && !terminal.is_alt_screen_active() {
                             scroll_offset = (terminal.screen().visible_row_to_stable_row(0) - anchor)
@@ -1047,12 +1047,12 @@ async fn run(
                     }
                     Some(Command::DetailedKey {key,details,modifiers,down,repeat}) => {
                         scroll_offset=0;
-                        if is_demo && down { if let Some(text)=details.text { presentation.advance(&mut terminal,text,scroll_offset,&status,total_bytes); } else { demo_key(&mut terminal,key,modifiers); } Ok(()) }
+                        if is_demo && down { if let Some(text)=details.text { scroll_offset = presentation.advance(&mut terminal,text,scroll_offset,&status,total_bytes); } else { demo_key(&mut terminal,key,modifiers); } Ok(()) }
                         else { terminal::send_key_event_detailed(&mut terminal,&writer,key,modifiers,down,repeat,&details) }
                     }
                     Some(Command::Paste(text)) => {
                         scroll_offset = 0;
-                        if is_demo { presentation.advance(&mut terminal,text.replace('\n', "\r\n"),scroll_offset,&status,total_bytes); Ok(()) } else { terminal.send_paste(&text) }
+                        if is_demo { scroll_offset = presentation.advance(&mut terminal,text.replace('\n', "\r\n"),scroll_offset,&status,total_bytes); Ok(()) } else { terminal.send_paste(&text) }
                     }
                     Some(Command::Text(text)) => {
                         scroll_offset = 0;
@@ -1085,7 +1085,7 @@ async fn run(
                             if is_demo && !demo_loaded {
                                 let bytes = demo::bytes();
                                 total_bytes += bytes.len() as u64;
-                                presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes);
+                                scroll_offset = presentation.advance(&mut terminal,bytes,scroll_offset,&status,total_bytes);
                                 demo_loaded = true;
                             }
                         }
@@ -1236,7 +1236,7 @@ async fn run(
                         if connection == connection_generation { terminal.mouse_left(modifiers) } else { Ok(()) }
                     }
                     Some(Command::Focus(focused)) => { terminal.focus_changed(focused); Ok(()) }
-                    Some(Command::ReloadDemo) => { if is_demo { presentation.advance(&mut terminal,demo::bytes(),scroll_offset,&status,total_bytes); } Ok(()) }
+                    Some(Command::ReloadDemo) => { if is_demo { scroll_offset = presentation.advance(&mut terminal,demo::bytes(),scroll_offset,&status,total_bytes); } Ok(()) }
                 };
                 if let Err(error) = result { status = format!("Input: {error:#}"); }
                 presentation.dirty|=scroll_offset!=old_offset;
@@ -1295,7 +1295,7 @@ async fn run(
                             update_recording(&mut recorder, &events, |active| active.write(&bytes));
                             total_bytes += bytes.len() as u64;
                             let before = terminal.get_progress();
-                            presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                            scroll_offset = presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
                             if show_progress && before != terminal.get_progress() {
                                 events.set_progress(terminal.get_progress());
                             }

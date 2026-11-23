@@ -6,6 +6,7 @@
 - Framed terminal viewers can install separate nonblocking writers for user input and parser replies. The default writer remains threaded. The embedding can also detach its clipboard handler when a stream may repaint earlier output.
 - DA1 reports the OSC 52 write capability only when the embedding has an enabled clipboard handler.
 - Kitty ED 22 archives the primary display through the normal scrollback buffer and clips relative image placements at the archived screen edge.
+- Kitty's `CSI Ps + T` restores history into the primary display. Surviving command output anchors follow their rows, and the embedding can keep a scrolled viewport anchored as rows leave history.
 
 Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term
 

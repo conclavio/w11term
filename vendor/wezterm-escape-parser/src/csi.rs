@@ -1362,6 +1362,8 @@ pub enum Edit {
     /// Also known as Pan Up in DEC:
     /// https://vt100.net/docs/vt510-rm/SD.html
     ScrollDown(u32),
+    /// Kitty's reverse scroll that fills from retained history.
+    ScrollDownFromHistory(u32),
 
     /// SU - SCROLL UP
     /// SU causes the data in the presentation component to be moved by n line
@@ -1437,6 +1439,7 @@ impl Display for Edit {
             Edit::InsertCharacter(n) => n.write_csi(f, "@")?,
             Edit::InsertLine(n) => n.write_csi(f, "L")?,
             Edit::ScrollDown(n) => n.write_csi(f, "T")?,
+            Edit::ScrollDownFromHistory(n) => write!(f, "{n}+T")?,
             Edit::ScrollUp(n) => n.write_csi(f, "S")?,
             Edit::ScrollLeft(n) => n.write_csi(f, " @")?,
             Edit::ScrollRight(n) => n.write_csi(f, " A")?,
@@ -2044,6 +2047,14 @@ impl<'a> CSIParser<'a> {
             }
             ('J', [CsiParam::Integer(22)]) if !self.parameters_truncated => {
                 Ok(CSI::Edit(Edit::ArchiveDisplay))
+            }
+            ('T', [count @ .., CsiParam::P(b'+')]) if !self.parameters_truncated => {
+                let count = match count {
+                    [] => 1,
+                    [CsiParam::Integer(n)] => u32::try_from(*n).map_err(|_| ())?,
+                    _ => return Err(()),
+                };
+                Ok(CSI::Edit(Edit::ScrollDownFromHistory(count)))
             }
             ('J', [CsiParam::P(b'?'), area @ ..]) if !self.parameters_truncated => {
                 parse!(Edit, SelectiveEraseInDisplay, area)

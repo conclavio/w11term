@@ -100,8 +100,8 @@ impl Presentation {
         offset: usize,
         status: &str,
         total: u64,
-    ) {
-        self.advance_at(terminal, bytes, offset, status, total, Instant::now());
+    ) -> usize {
+        self.advance_at(terminal, bytes, offset, status, total, Instant::now())
     }
     pub fn advance_at(
         &mut self,
@@ -111,7 +111,11 @@ impl Presentation {
         status: &str,
         total: u64,
         now: Instant,
-    ) {
+    ) -> usize {
+        let before = terminal.unscrolled_rows();
+        let adjusted_offset = |state: &TerminalState| {
+            offset.saturating_sub(state.unscrolled_rows().wrapping_sub(before))
+        };
         terminal.advance_bytes_with_sync(bytes, |state, enabled| {
             // Begin commits the preceding unsynchronized prefix. End commits the
             // completed update even when another begin follows in the same read.
@@ -123,13 +127,14 @@ impl Presentation {
             );
             self.stage(
                 state,
-                offset,
+                adjusted_offset(state),
                 status,
                 if enabled { committed_bytes } else { total },
             );
             self.deadline = enabled.then(|| now + SYNC_TIMEOUT);
         });
         self.dirty = true;
+        adjusted_offset(terminal)
     }
     pub fn expire(&mut self, terminal: &mut Terminal) {
         terminal.end_synchronized_output();
