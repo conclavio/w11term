@@ -2942,6 +2942,8 @@ impl TerminalState {
             }
             Edit::ScrollDown(n) => self.scroll_down(n as usize),
             Edit::ScrollUp(n) => self.scroll_up(n as usize),
+            Edit::ScrollLeft(n) => self.scroll_columns(n, column_edit::Shift::Left),
+            Edit::ScrollRight(n) => self.scroll_columns(n, column_edit::Shift::Right),
             Edit::EraseInDisplay(erase) => self.erase_in_display(erase),
             Edit::Repeat(n) => {
                 let mut y = self.cursor.y;

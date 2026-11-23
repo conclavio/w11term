@@ -14,13 +14,19 @@ pub(super) enum Index {
 
 impl TerminalState {
     pub(super) fn edit_columns(&mut self, count: u32, shift: Shift) {
-        let x = self.cursor.x;
-        if !self.top_and_bottom_margins.contains(&self.cursor.y)
-            || !self.left_and_right_margins.contains(&x)
+        self.shift_with_cursor_in_region(self.cursor.x, count, shift);
+    }
+
+    pub(super) fn scroll_columns(&mut self, count: u32, shift: Shift) {
+        self.shift_with_cursor_in_region(self.left_and_right_margins.start, count, shift);
+    }
+
+    fn shift_with_cursor_in_region(&mut self, x: usize, count: u32, shift: Shift) {
+        if self.top_and_bottom_margins.contains(&self.cursor.y)
+            && self.left_and_right_margins.contains(&self.cursor.x)
         {
-            return;
+            self.shift_columns_at(x, count, shift);
         }
-        self.shift_columns_at(x, count, shift);
     }
 
     pub(super) fn horizontal_index(&mut self, index: Index) {
