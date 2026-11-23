@@ -65,6 +65,7 @@ mod pane_drop;
 mod pattern_settings;
 mod saved_commands;
 mod word_delimiters;
+mod wsl_path;
 use file_drawer::{FileAction, FileDrawer};
 #[cfg(feature = "ui-smoke")]
 mod accessibility_smoke;

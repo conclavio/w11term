@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use std::{
     os::windows::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
 };
 use windows::{
     Win32::{
@@ -21,15 +21,14 @@ use windows::{
     core::{PCWSTR, w},
 };
 
-pub(super) enum Folder {
+pub(super) enum Location {
     Drive(PathBuf),
     Wsl(PathBuf),
 }
 
-impl Folder {
+impl Location {
     pub(super) fn wsl(distribution: &str, linux_path: &str) -> Option<Self> {
-        w11term::sftp::validate_download_name(distribution).ok()?;
-        let mut folder = PathBuf::from(format!(r"\\wsl.localhost\{distribution}\"));
+        let mut folder = wsl_root(distribution)?;
         let tail = linux_path.strip_prefix('/')?;
         if tail.starts_with('/') {
             return None;
@@ -44,14 +43,46 @@ impl Folder {
         Some(Self::Wsl(folder))
     }
 
-    pub(super) fn open(&self) -> Result<()> {
-        let path = match self {
-            Self::Drive(path) => {
-                check_drive(path)?;
-                path
-            }
-            Self::Wsl(path) => path,
+    pub(super) fn translated_from_wsl(distribution: &str, translated: &str) -> Option<Self> {
+        let mut components = Path::new(translated).components();
+        let Component::Prefix(prefix) = components.next()? else {
+            return None;
         };
+        match prefix.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {
+                resolve(translated.strip_prefix(r"\\?\").unwrap_or(translated), None)
+                    .map(Self::Drive)
+            }
+            Prefix::UNC(host, share) | Prefix::VerbatimUNC(host, share)
+                if (host.eq_ignore_ascii_case("wsl.localhost")
+                    || host.eq_ignore_ascii_case("wsl$"))
+                    && share.eq_ignore_ascii_case(distribution) =>
+            {
+                let mut location = wsl_root(distribution)?;
+                for component in components {
+                    match component {
+                        Component::RootDir => {}
+                        Component::Normal(name) => {
+                            w11term::sftp::validate_download_name(name.to_str()?).ok()?;
+                            location.push(name);
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(Self::Wsl(location))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn reveal(&self) -> Result<()> {
+        let path = self.checked_path()?;
+        check_item(path)?;
+        shell_item(path, ShellAction::Select)
+    }
+
+    pub(super) fn open(&self) -> Result<()> {
+        let path = self.checked_path()?;
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("Cannot read the folder {}", path.display()))?;
         ensure!(
@@ -60,6 +91,21 @@ impl Folder {
         );
         shell_item(path, ShellAction::Explore)
     }
+
+    fn checked_path(&self) -> Result<&Path> {
+        match self {
+            Self::Drive(path) => {
+                check_drive(path)?;
+                Ok(path)
+            }
+            Self::Wsl(path) => Ok(path),
+        }
+    }
+}
+
+fn wsl_root(distribution: &str) -> Option<PathBuf> {
+    w11term::sftp::validate_download_name(distribution).ok()?;
+    Some(PathBuf::from(format!(r"\\wsl.localhost\{distribution}\")))
 }
 
 fn drive_path(text: &str) -> Option<(PathBuf, &str)> {
@@ -131,15 +177,9 @@ fn check_drive(path: &Path) -> Result<()> {
 }
 
 fn check_item(path: &Path) -> Result<()> {
-    check_drive(path)?;
     // Check the directory entry itself, so links retain their own names.
     std::fs::symlink_metadata(path).with_context(|| format!("Cannot find {}", path.display()))?;
     Ok(())
-}
-
-pub(super) fn reveal(path: &Path) -> Result<()> {
-    check_item(path)?;
-    shell_item(path, ShellAction::Select)
 }
 
 #[derive(Clone, Copy)]
@@ -261,9 +301,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wsl_translations_can_address_local_drives_or_the_selected_wsl_share() {
+        assert!(matches!(
+            Location::translated_from_wsl("QA Linux", r"\\wsl$\qa linux\home\雪.rs"),
+            Some(Location::Wsl(item)) if item == Path::new(r"\\wsl.localhost\QA Linux\home\雪.rs"),
+        ));
+        assert!(matches!(
+            Location::translated_from_wsl("QA Linux", r"C:\source tree\main.rs"),
+            Some(Location::Drive(item)) if item == Path::new(r"C:\source tree\main.rs"),
+        ));
+        for invalid in [
+            r"\\wsl.localhost\Other Linux\file",
+            r"\\invalid.example\QA Linux\file",
+            r"\\wsl$\QA Linux\..\Other Linux\file",
+            r"\\.\PhysicalDrive0",
+            r"\\wsl$\QA Linux\home\file:stream",
+            r"rel\file",
+        ] {
+            assert!(
+                Location::translated_from_wsl("QA Linux", invalid).is_none(),
+                "{invalid}"
+            );
+        }
+    }
+    #[test]
     fn the_folder_action_refuses_a_regular_file() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let error = Folder::Drive(file.path().into()).open().unwrap_err();
+        let error = Location::Drive(file.path().into()).open().unwrap_err();
         assert!(format!("{error:#}").contains("The path must identify a filesystem folder"));
     }
 
@@ -276,7 +340,7 @@ mod tests {
                 r"\\wsl.localhost\QA Linux\home\雪 [pilot] 100% #",
             ),
         ] {
-            let Some(Folder::Wsl(folder)) = Folder::wsl("QA Linux", linux) else {
+            let Some(Location::Wsl(folder)) = Location::wsl("QA Linux", linux) else {
                 panic!("expected a WSL folder for {linux}");
             };
             assert_eq!(folder, Path::new(expected));
@@ -292,7 +356,7 @@ mod tests {
             ("dev", "/home/file:stream"),
             ("dev", "/home/rewrite. "),
         ] {
-            assert!(Folder::wsl(distro, linux).is_none(), "{distro} {linux}");
+            assert!(Location::wsl(distro, linux).is_none(), "{distro} {linux}");
         }
     }
 
@@ -370,6 +434,6 @@ mod tests {
         assert!(check_item(&entry).is_err());
         std::fs::write(&entry, []).unwrap();
         assert!(check_item(&entry).is_ok());
-        assert!(check_item(Path::new(r"\\invalid.example\share\file")).is_err());
+        assert!(check_drive(Path::new(r"\\invalid.example\share\file")).is_err());
     }
 }

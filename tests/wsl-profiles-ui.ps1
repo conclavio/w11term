@@ -1,6 +1,8 @@
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
+$keymap.shortcuts.keyboard_hints = 'F12'
+[IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($keymap | ConvertTo-Json))
 
 $hostKey = 'Software\w11term-wsl-fixture-' + (Split-Path -Leaf $State)
 $env:W11TERM_TEST_WSL_FIXTURE = $State
@@ -43,6 +45,25 @@ function Publish-Report([int]$Pane, [string]$Kind) {
     $null = Control @('send-text','--pane',"$Pane",'--no-paste','--base64',$text)
     Wait-Text $Pane "wsl-fixture published $Kind"
 }
+function Find-HintText([string]$Pattern) {
+    $guiRoot = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $texts = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    $guiRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants, $texts) |
+        Where-Object { $_.Current.Name -match $Pattern } | Select-Object -First 1
+}
+function Reveal-Hint([int]$Pane, [string]$Kind, [string]$Diagnostic, [string]$ErrorPattern) {
+    Publish-Report $Pane $Kind
+    Wait-Text $Pane $Diagnostic
+    Press-Key 0x7b # F12 opens hints
+    $null = Wait-Until 'hint labels on the WSL pane' { Find-HintText '^Type a hint label' }
+    Press-Key 0x41
+    $null = Wait-Until 'reveal action attached to the WSL diagnostic' { Find-HintText 'R reveal in File Explorer' }
+    Press-Key 0x52
+    $null = Wait-Until 'retryable result for the WSL path' { Find-HintText $ErrorPattern }
+    Press-Key 27
+    $null = Wait-Until 'hints dismissed' { !(Find-HintText '^(Type a hint label|Enter copy|Reveal failed|Opening File Explorer)') }
+}
 
 try {
     # The runtime uses the real registry reader against this unique volatile
@@ -54,6 +75,7 @@ try {
     Register-Distro 'not-a-distro-subkey' 'Registry metadata'
     Add-Type -OutputAssembly $launcher -OutputType ConsoleApplication -TypeDefinition @'
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class WslFixture {
@@ -62,6 +84,19 @@ public static class WslFixture {
     [DllImport("kernel32.dll")] static extern bool SetConsoleMode(IntPtr handle, uint mode);
     public static int Main(string[] args) {
         Console.OutputEncoding = new UTF8Encoding(false);
+        if (args.Length == 9 && args[0] == "--distribution" && args[1] == "QA Linux \u96ea" &&
+            args[2] == "--cd" && args[3] == "/mnt/c/work tree" && args[4] == "--exec" &&
+            args[5] == "/usr/bin/wslpath" && args[6] == "-a" && args[7] == "-w" &&
+            args[8] == "./../src/fixture.rs") {
+            Console.WriteLine(Path.Combine(Environment.GetEnvironmentVariable("W11TERM_TEST_WSL_FIXTURE"), "selected-wsl-file.rs"));
+            return 0;
+        }
+        if (args.Length == 7 && args[0] == "--distribution" && args[1] == "QA Linux \u96ea" &&
+            args[2] == "--exec" && args[3] == "/usr/bin/wslpath" && args[4] == "-a" &&
+            args[5] == "-w" && args[6] == "/home/dev/foreign.rs") {
+            Console.WriteLine(@"\\wsl.localhost\Other distro\home\dev\foreign.rs");
+            return 0;
+        }
         if (args.Length != 4 || args[0] != "--distribution" || args[2] != "--cd") {
             Console.WriteLine("wsl-fixture got unexpected arguments");
             return 2;
@@ -85,6 +120,14 @@ public static class WslFixture {
                     break;
                 case "report-share":
                     Console.Write("\u001b]9;9;\"\\\\wsl$\\" + args[1] + "\\home\\100% # notes\"\u001b\\");
+                    break;
+                case "report-hint-relative":
+                    Console.Write("\u001b[2J\u001b[H");
+                    Console.WriteLine("../src/fixture.rs:4:2");
+                    break;
+                case "report-hint-foreign":
+                    Console.Write("\u001b[2J\u001b[H");
+                    Console.WriteLine("/home/dev/foreign.rs:4:2");
                     break;
                 default: continue;
             }
@@ -127,6 +170,9 @@ public static class WslFixture {
     }
     Press-Key 27
     $null = Wait-Until 'command palette dismissed' { !(Find-Element 'Search commands') }
+    $selectedFile = [regex]::Escape((Join-Path $State 'selected-wsl-file.rs'))
+    Reveal-Hint $left.id 'hint-relative' '../src/fixture.rs:4:2' ('^Reveal failed: Cannot find ' + $selectedFile)
+    Reveal-Hint $left.id 'hint-foreign' '/home/dev/foreign.rs:4:2' '^Reveal failed: wslpath must return a local drive'
     Run-Palette 'New tab in current directory'
     $newTab = Wait-Until 'WSL tab opens in the reported Linux directory' {
         Sessions | Where-Object { $_.active -and $_.label -ceq $leftLabel -and $_.tab_id -ne $left.tab_id }

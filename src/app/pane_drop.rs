@@ -1,13 +1,9 @@
 use super::*;
 use anyhow::ensure;
 use std::{
-    io::{Read, Seek, SeekFrom},
-    os::windows::process::CommandExt,
     path::{Component, Path, PathBuf, Prefix},
-    process::{Command as ProcessCommand, Stdio},
     time::{Duration, Instant},
 };
-use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Target {
@@ -109,9 +105,11 @@ impl TerminalApp {
                             let deadline = Instant::now() + Duration::from_secs(8);
                             let result = format_paths(paths, |path| {
                                 let mounted = wsl_path(path, &distribution, |drive_path| {
-                                    translate_drive_path(
+                                    wsl_path::translate(
                                         &executable,
                                         &distribution,
+                                        None,
+                                        wsl_path::Direction::ToLinux,
                                         drive_path,
                                         deadline,
                                         || cancel.is_cancelled(),
@@ -230,16 +228,10 @@ fn validate_windows_path(path: &str) -> anyhow::Result<()> {
                     if matches!(prefix.kind(),
                         Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))
             )
-            && safe_terminal_text(path),
+            && wsl_path::safe_text(path),
         "Drop absolute file or folder paths without control characters"
     );
     Ok(())
-}
-
-fn safe_terminal_text(text: &str) -> bool {
-    !text
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
 }
 
 fn quote_powershell(path: &str) -> String {
@@ -315,77 +307,6 @@ fn wsl_path(
     }
 }
 
-const MAX_WSL_OUTPUT: u64 = 128 * 1024;
-
-fn translate_drive_path(
-    executable: &Path,
-    distribution: &str,
-    path: &str,
-    deadline: Instant,
-    cancelled: impl Fn() -> bool,
-) -> anyhow::Result<String> {
-    ensure!(
-        !cancelled() && Instant::now() < deadline,
-        "WSL path translation expired"
-    );
-    let mut output = tempfile::tempfile()?;
-    // Redirect stdout to a file so waiting on an unusually long path cannot
-    // block the child on a pipe while the worker is waiting for it to exit.
-    let mut child = ProcessCommand::new(executable)
-        .args([
-            "--distribution",
-            distribution,
-            "--exec",
-            "/usr/bin/wslpath",
-            "-u",
-            path,
-        ])
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::from(output.try_clone()?))
-        .spawn()
-        .context("Starting wslpath")?;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if !cancelled() && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) => break Err(anyhow::anyhow!("WSL path translation expired")),
-            Err(error) => break Err(error.into()),
-        }
-    };
-    if status.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    ensure!(
-        status?.success(),
-        "wslpath couldn’t translate this Windows drive path"
-    );
-    output.seek(SeekFrom::Start(0))?;
-    let mut linux = String::new();
-    output.take(MAX_WSL_OUTPUT + 1).read_to_string(&mut linux)?;
-    parse_wsl_output(&linux)
-}
-
-fn parse_wsl_output(linux: &str) -> anyhow::Result<String> {
-    ensure!(
-        linux.len() as u64 <= MAX_WSL_OUTPUT,
-        "wslpath returned too much data"
-    );
-    let linux = linux
-        .strip_suffix("\r\n")
-        .or_else(|| linux.strip_suffix('\n'))
-        .unwrap_or(linux);
-    ensure!(
-        linux.starts_with('/') && safe_terminal_text(linux),
-        "wslpath returned an unusable Linux path"
-    );
-    Ok(linux.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,22 +358,5 @@ mod tests {
         assert!(wsl_path(r"\\wsl$\Ubuntu\home", "Debian", |_| unreachable!()).is_err());
         assert!(wsl_path(r"\\server\share\home", "Debian", |_| unreachable!()).is_err());
         assert!(wsl_path(r"\\wsl$\Debian\..\home", "Debian", |_| unreachable!()).is_err());
-    }
-
-    #[test]
-    fn wsl_helper_output_preserves_spaces_and_rejects_terminal_controls() {
-        assert_eq!(
-            parse_wsl_output("/mount/with trailing space \r\n").unwrap(),
-            "/mount/with trailing space "
-        );
-        for output in [
-            "relative\n",
-            "/line\nline\n",
-            "/x\u{1b}[200~\n",
-            "/x\u{2028}\n",
-        ] {
-            assert!(parse_wsl_output(output).is_err());
-        }
-        assert!(parse_wsl_output(&format!("/{}", "a".repeat(MAX_WSL_OUTPUT as usize))).is_err());
     }
 }

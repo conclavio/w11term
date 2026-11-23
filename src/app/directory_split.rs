@@ -135,6 +135,14 @@ fn wsl_directory(report: &str, distribution: &str, computer: Option<&str>) -> Op
     Some(path)
 }
 
+pub(super) fn reported_wsl_directory(report: Option<&str>, distribution: &str) -> Option<String> {
+    wsl_directory(
+        report?,
+        distribution,
+        std::env::var("COMPUTERNAME").ok().as_deref(),
+    )
+}
+
 impl LiveTab {
     fn ssh_directory_split(&self) -> Option<(Origin, ConnectionShare)> {
         if !self.session.is_direct_ssh_shell() {
@@ -203,7 +211,7 @@ impl TerminalApp {
         }
     }
 
-    fn explorer_folder(&self, origin: &Origin) -> Option<explorer::Folder> {
+    fn explorer_folder(&self, origin: &Origin) -> Option<explorer::Location> {
         let Page::Terminal(tab) = &self.tabs.active()?.page else {
             return None;
         };
@@ -214,11 +222,11 @@ impl TerminalApp {
             return None;
         }
         match &origin.directory {
-            Directory::Local(path) => Some(explorer::Folder::Drive(path.clone())),
+            Directory::Local(path) => Some(explorer::Location::Drive(path.clone())),
             Directory::Wsl(path) if path.starts_with('/') => {
-                explorer::Folder::wsl(shell.wsl_distribution()?, path)
+                explorer::Location::wsl(shell.wsl_distribution()?, path)
             }
-            Directory::Wsl(path) => Some(explorer::Folder::Drive(PathBuf::from(path))),
+            Directory::Wsl(path) => Some(explorer::Location::Drive(PathBuf::from(path))),
             Directory::Ssh(_) => None,
         }
     }
