@@ -45,6 +45,7 @@ pub enum OperatingSystemCommand {
     SystemNotification(String),
     ITermProprietary(ITermProprietary),
     FinalTermSemanticPrompt(FinalTermSemanticPrompt),
+    VscodeShellIntegration(VscodeShellIntegration),
     ChangeColorNumber(Vec<ChangeColorPair>),
     ChangeDynamicColors(DynamicColorNumber, Vec<ColorOrQuery>),
     ResetDynamicColor(DynamicColorNumber),
@@ -379,6 +380,8 @@ impl OperatingSystemCommand {
             }
             FinalTermSemanticPrompt => self::FinalTermSemanticPrompt::parse(osc)
                 .map(OperatingSystemCommand::FinalTermSemanticPrompt),
+            VscodeShellIntegration => self::VscodeShellIntegration::parse(&osc[1..])
+                .map(OperatingSystemCommand::VscodeShellIntegration),
             ChangeColorNumber => Self::parse_change_color_number(osc),
             ResetColors => Self::parse_reset_colors(osc),
 
@@ -514,6 +517,7 @@ osc_entries!(
     ResetHighlightForegroundColor = "119",
     RxvtProprietary = "777",
     FinalTermSemanticPrompt = "133",
+    VscodeShellIntegration = "633",
     ITermProprietary = "1337",
     /// Here the "Sun" suffix comes from the table in
     /// <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Miscellaneous>
@@ -601,6 +605,7 @@ impl Display for OperatingSystemCommand {
             SystemNotification(s) => write!(f, "9;{}", s)?,
             ITermProprietary(i) => i.fmt(f)?,
             FinalTermSemanticPrompt(i) => i.fmt(f)?,
+            VscodeShellIntegration(i) => i.fmt(f)?,
             ResetColors(colors) => {
                 write!(f, "104")?;
                 for c in colors {
@@ -848,6 +853,101 @@ impl FinalTermSemanticPrompt {
             param,
             params
         );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VscodeShellIntegration {
+    PromptStart,
+    PromptEnd,
+    CommandStart,
+    CommandFinished(Option<i32>),
+    CommandLine(String),
+    WorkingDirectory(String),
+}
+
+impl VscodeShellIntegration {
+    fn parse(fields: &[&[u8]]) -> Result<Self> {
+        use vtparse::{MAX_OSC_DIRECTORY_BYTES, MAX_REPORTED_COMMAND_BYTES};
+        let marker = match fields {
+            [b"A"] => Self::PromptStart,
+            [b"B"] => Self::PromptEnd,
+            [b"C"] => Self::CommandStart,
+            [b"D"] | [b"D", b""] => Self::CommandFinished(None),
+            [b"D", code] => Self::CommandFinished(Some(str::from_utf8(code)?.parse()?)),
+            [b"E", command] | [b"E", command, _] => {
+                let command = decode_vscode_value(command, MAX_REPORTED_COMMAND_BYTES)
+                    .filter(|text| text.chars().all(|c| !c.is_control() || matches!(c, '\t' | '\n')))
+                    .ok_or_else(|| format_err!("invalid OSC 633 command line"))?;
+                Self::CommandLine(command)
+            }
+            [b"P", property] => {
+                let path = property.strip_prefix(b"Cwd=")
+                    .and_then(|p| decode_vscode_value(p, MAX_OSC_DIRECTORY_BYTES))
+                    .filter(|path| !path.chars().any(char::is_control))
+                    .ok_or_else(|| format_err!("invalid OSC 633 directory property"))?;
+                Self::WorkingDirectory(path)
+            }
+            _ => bail!("unsupported OSC 633 marker"),
+        };
+        Ok(marker)
+    }
+}
+
+fn decode_vscode_value(mut encoded: &[u8], limit: usize) -> Option<String> {
+    if encoded.len() > limit * 4 {
+        return None;
+    }
+    let mut value = Vec::with_capacity(encoded.len().min(limit));
+    while let Some((&head, tail)) = encoded.split_first() {
+        if value.len() == limit {
+            return None;
+        }
+        encoded = tail;
+        let mut byte = head;
+        if head == b'\\' {
+            match encoded {
+                [b'\\', rest @ ..] => encoded = rest,
+                [b'x' | b'X', a, b, rest @ ..] => {
+                    let mut escaped = [0];
+                    if hex::decode_to_slice([*a, *b], &mut escaped).is_ok() {
+                        byte = escaped[0];
+                        encoded = rest;
+                    }
+                }
+                _ => {}
+            }
+        }
+        value.push(byte);
+    }
+    String::from_utf8(value).ok()
+}
+
+impl Display for VscodeShellIntegration {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        let value = match self {
+            Self::PromptStart => return f.write_str("633;A"),
+            Self::PromptEnd => return f.write_str("633;B"),
+            Self::CommandStart => return f.write_str("633;C"),
+            Self::CommandFinished(None) => return f.write_str("633;D"),
+            Self::CommandFinished(Some(code)) => return write!(f, "633;D;{code}"),
+            Self::CommandLine(text) => {
+                f.write_str("633;E;")?;
+                text
+            }
+            Self::WorkingDirectory(path) => {
+                f.write_str("633;P;Cwd=")?;
+                path
+            }
+        };
+        for ch in value.chars() {
+            match ch {
+                '\\' => f.write_str("\\\\")?,
+                '\x00'..=' ' | ';' => write!(f, "\\x{:02x}", u32::from(ch))?,
+                _ => write!(f, "{ch}")?,
+            }
+        }
+        Ok(())
     }
 }
 

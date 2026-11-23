@@ -524,7 +524,7 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "filters OSC 133 history by command and status through native controls and the CLI"]
+#[ignore = "filters OSC 133 and 633 command history through native controls and the CLI"]
 async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     let long = format!("deploy {} [Ångström]", "x".repeat(128));
     let encoded = percent_encoding::utf8_percent_encode(&long, percent_encoding::NON_ALPHANUMERIC);
@@ -535,9 +535,9 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
          \r\nsecond line\r\n\x1b]133;D;17\x07"
     );
     stream.push_str(concat!(
-        "\x1b]133;A\x07$ \x1b]133;B\x07wrapped command\r\n",
-        "\x1b]133;C;cmdline_url=echo%20first%0A%20%20echo%20second\x07",
-        "multiline output\r\n\x1b]133;D;0\x07"
+        "\x1b]633;A\x07$ \x1b]633;B\x07wrapped command\r\n",
+        "\x1b]633;E;echo first\\x0a  echo second;fixture-nonce\x07\x1b]633;C\x07",
+        "multiline output\r\n\x1b]633;D;0\x07"
     ));
     let successful_output = format!(
         "{}[Ångström] appears only in this output",

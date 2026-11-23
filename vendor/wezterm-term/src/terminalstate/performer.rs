@@ -4,7 +4,7 @@ use crate::terminalstate::palette::Slot;
 use crate::terminalstate::rendition::Rendition;
 use crate::terminalstate::{
     default_color_map, CharSet, ConEmuDirectoryReports, MouseEncoding, TabStop,
-    UnicodeVersionStackEntry,
+    UnicodeVersionStackEntry, VscodeCommand,
 };
 use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -24,6 +24,7 @@ use wezterm_cell::{
 use wezterm_escape_parser::csi::{
     CharacterPath, CsiParam, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
 };
+use wezterm_escape_parser::osc::VscodeShellIntegration;
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
     ITermUnicodeVersionOp, Selection,
@@ -785,6 +786,7 @@ impl Performer<'_> {
                 self.command_history = Default::default();
                 self.capturing_shell_input = false;
                 self.command_label = None;
+                self.vscode_command = VscodeCommand::Idle;
                 self.current_dir = None;
                 self.forget_iterm_reported_host();
                 self.pen = Default::default();
@@ -859,7 +861,7 @@ impl Performer<'_> {
         }
     }
 
-    fn semantic_prompt(&mut self, marker: FinalTermSemanticPrompt) {
+    fn semantic_prompt(&mut self, marker: FinalTermSemanticPrompt, fresh_line: bool) {
         let primary = !self.is_alt_screen_active();
         let pending =
             (primary && !self.capturing_shell_input && self.screen.command_start.is_some())
@@ -869,7 +871,9 @@ impl Performer<'_> {
             FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. } => {
                 self.retire_running_program_statuses();
                 self.next_shell_prompt();
-                self.fresh_line();
+                if fresh_line {
+                    self.fresh_line();
+                }
                 self.pen.set_semantic_type(SemanticType::Prompt);
             }
             FinalTermSemanticPrompt::StartPrompt(_) => {
@@ -903,6 +907,101 @@ impl Performer<'_> {
                 handler.semantic_prompt(&marker, completed);
             }
         }
+    }
+
+    fn vscode_shell_integration(&mut self, marker: VscodeShellIntegration) {
+        use FinalTermSemanticPrompt::{
+            CommandStatus, FreshLineAndStartPrompt, MarkEndOfInputAndStartOfOutput,
+            MarkEndOfPromptAndStartOfInputUntilNextMarker,
+        };
+        if self.is_alt_screen_active() {
+            return;
+        }
+        let marker = match marker {
+            VscodeShellIntegration::PromptStart => {
+                self.vscode_command = VscodeCommand::Idle;
+                FreshLineAndStartPrompt {
+                    aid: None,
+                    cl: None,
+                }
+            }
+            VscodeShellIntegration::PromptEnd => {
+                if !matches!(self.vscode_command, VscodeCommand::Pending(_)) {
+                    self.vscode_command = VscodeCommand::Pending(None);
+                }
+                MarkEndOfPromptAndStartOfInputUntilNextMarker
+            }
+            VscodeShellIntegration::CommandStart => {
+                let command =
+                    match std::mem::replace(&mut self.vscode_command, VscodeCommand::Running) {
+                        VscodeCommand::Idle => None,
+                        VscodeCommand::Pending(command) => command,
+                        VscodeCommand::Running => return,
+                    };
+                if command.as_ref().is_some_and(|line| line.trim().is_empty()) {
+                    self.vscode_command = VscodeCommand::Idle;
+                    if self.capturing_shell_input {
+                        self.next_shell_prompt();
+                    }
+                    return;
+                }
+                MarkEndOfInputAndStartOfOutput { aid: None, command }
+            }
+            VscodeShellIntegration::CommandFinished(status) => {
+                match std::mem::take(&mut self.vscode_command) {
+                    VscodeCommand::Running => {}
+                    // Some PowerShell setups report an exit code without a C marker.
+                    VscodeCommand::Pending(command)
+                        if status.is_some()
+                            && !command.as_ref().is_some_and(|line| line.trim().is_empty()) =>
+                    {
+                        self.command_label = command
+                    }
+                    VscodeCommand::Pending(_) if self.capturing_shell_input => {
+                        self.next_shell_prompt();
+                        return;
+                    }
+                    _ => return,
+                }
+                CommandStatus { aid: None, status }
+            }
+            VscodeShellIntegration::CommandLine(command) => {
+                if matches!(self.vscode_command, VscodeCommand::Running) {
+                    if command.trim().is_empty() {
+                        self.command_label = None;
+                        self.screen.command_start = None;
+                        self.vscode_command = VscodeCommand::Idle;
+                    } else {
+                        self.command_label = Some(command);
+                    }
+                } else {
+                    self.vscode_command = VscodeCommand::Pending(Some(command));
+                }
+                return;
+            }
+            VscodeShellIntegration::WorkingDirectory(path) => {
+                let report = if path.starts_with('/')
+                    && !matches!(
+                        self.conemu_directory_reports,
+                        Some(ConEmuDirectoryReports::Drive)
+                    )
+                    && !path.starts_with("//")
+                {
+                    self.shell_posix_directory(&path)
+                } else {
+                    self.conemu_directory_reports
+                        .and_then(|mode| conemu_directory_url(&path, mode))
+                        .map(|url| {
+                            let raw = url.as_str().into();
+                            (url, raw)
+                        })
+                };
+                self.forget_iterm_reported_host();
+                self.set_reported_current_dir(report);
+                return;
+            }
+        };
+        self.semantic_prompt(marker, false);
     }
 
     fn osc_dispatch(&mut self, osc: OperatingSystemCommand) {
@@ -1047,7 +1146,14 @@ impl Performer<'_> {
             },
 
             OperatingSystemCommand::FinalTermSemanticPrompt(marker) => {
-                self.semantic_prompt(marker);
+                if !self.is_alt_screen_active() {
+                    self.vscode_command = VscodeCommand::Idle;
+                }
+                self.semantic_prompt(marker, true);
+            }
+
+            OperatingSystemCommand::VscodeShellIntegration(marker) => {
+                self.vscode_shell_integration(marker);
             }
 
             OperatingSystemCommand::SystemNotification(message) => {

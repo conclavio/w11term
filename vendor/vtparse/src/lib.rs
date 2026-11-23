@@ -324,7 +324,7 @@ impl VTActor for CollectingVTActor {
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC: usize = 64;
 // Covers a 32,767-UTF-16-unit Windows path even after UTF-8 conversion.
-const MAX_OSC_DIRECTORY_BYTES: usize = 128 * 1024;
+pub const MAX_OSC_DIRECTORY_BYTES: usize = 128 * 1024;
 const MAX_OSC_REMOTE_HOST_BYTES: usize = 1024;
 // OSC 7501 has a 4096-byte wire limit including its introducer and ST.
 const MAX_OSC_PROGRAM_STATUS_BYTES: usize = 4096 - b"\x1b]7501;\x1b\\".len();
@@ -343,6 +343,7 @@ struct OscState {
     literal_field: Option<(usize, usize)>,
     // (value offset, discarded). A following parameter is still parsed.
     command_field: Option<(usize, bool)>,
+    vscode_limit: Option<usize>,
 }
 
 impl OscState {
@@ -350,8 +351,24 @@ impl OscState {
         if self.full {
             return;
         }
+        if self.vscode_limit.is_some_and(|limit| {
+            param.is_control()
+                || self.buffer.len() + self.num_params + param.len_utf8() > limit
+        }) {
+            self.discard_vscode();
+            return;
+        }
         if param == ';' && self.literal_field.is_none() {
             self.command_field = None;
+            if self.num_params == 1 && self.buffer.as_slice() == b"633" {
+                self.vscode_limit = Some(256);
+            } else if self.num_params == 2 && self.vscode_limit.is_some() {
+                self.vscode_limit = Some(match &self.buffer[3..] {
+                    b"E" => 64 + 128 + 4 * MAX_REPORTED_COMMAND_BYTES,
+                    b"P" => 64 + 4 * MAX_OSC_DIRECTORY_BYTES,
+                    _ => 256,
+                });
+            }
             if self.num_params == 1 && self.buffer.as_slice() == b"7501" {
                 self.literal_field = Some((4, MAX_OSC_PROGRAM_STATUS_BYTES));
             }
@@ -431,6 +448,14 @@ impl OscState {
         if let Some((offset, discarded)) = &mut self.command_field {
             self.buffer.truncate(*offset);
             *discarded = true;
+        }
+    }
+
+    fn discard_vscode(&mut self) {
+        if self.vscode_limit.is_some() {
+            self.buffer.clear();
+            self.num_params = 0;
+            self.full = true;
         }
     }
 
@@ -548,6 +573,7 @@ impl VTParser {
                 full: false,
                 literal_field: None,
                 command_field: None,
+                vscode_limit: None,
             },
 
             params: [CsiParam::default(); MAX_PARAMS],
@@ -621,6 +647,7 @@ impl VTParser {
                 self.osc.full = false;
                 self.osc.literal_field = None;
                 self.osc.command_field = None;
+                self.osc.vscode_limit = None;
                 self.num_params = 0;
                 self.params_full = false;
                 self.current_param.take();
@@ -709,17 +736,20 @@ impl VTParser {
                 self.osc.full = false;
                 self.osc.literal_field = None;
                 self.osc.command_field = None;
+                self.osc.vscode_limit = None;
             }
             Action::OscPut => self.osc.put(param as char),
             Action::OscIgnore => {
                 self.osc.discard_command();
                 self.osc.discard_literal();
+                self.osc.discard_vscode();
             }
 
             Action::OscEnd => {
                 if !matches!(param, 0x07 | 0x1b | 0x9c) {
                     self.osc.discard_command();
                     self.osc.discard_literal();
+                    self.osc.discard_vscode();
                 }
                 if self.osc.num_params == 0 {
                     actor.osc_dispatch(&[]);
