@@ -73,6 +73,24 @@ function Submit([string]$Command) {
     Click 'Send to 1 host'
     $null = Wait-Until "'$Command' was submitted" { Find-Element "Submitted${dot}$Command" }
 }
+function Choose-GroupCommand([string]$Command) {
+    # The fixture can exercise the palette through its own UIA providers even
+    # when another window owns the desktop foreground.
+    Press-Key 0x76
+    (Field 'Search commands').SetValue($Command)
+    $null = Wait-Until "invoke group command '$Command'" {
+        try {
+            $item = Find-Element $Command $button
+            if ($item -and $item.Current.IsEnabled) {
+                Invoke-Button $item
+                return $true
+            }
+        } catch {
+            if ($_.Exception.GetBaseException() -isnot [System.Windows.Automation.ElementNotAvailableException]) { throw }
+        }
+    }
+    $null = Wait-Until 'the group command closes the palette' { !(Find-Element 'Search commands' $edit) }
+}
 
 $argsForApp = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','110','--rows','34')
 $app = Start-Process -FilePath $Gui -ArgumentList $argsForApp -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -80,7 +98,7 @@ try {
     $window = Wait-InputWindow
     $eastTab = "SSH group${dot}Fleet East"
     $westTab = "SSH group${dot}Fleet West"
-    Run-Palette "Open SSH group${dot}Fleet East"
+    Choose-GroupCommand "Open SSH group${dot}Fleet East"
     Wait-Tab $eastTab
     $east = (Session 'East').id
     $eastName = Target-Label 'East' $east
@@ -110,7 +128,7 @@ try {
 
     Click "Focus result pane $west"
     Wait-Focus $west
-    Run-Palette 'SSH host group'
+    Choose-GroupCommand 'SSH host group'
     Wait-Tab $westTab
     (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
     (Wait-CheckBox $eastName Off).Toggle()
@@ -133,7 +151,7 @@ try {
             !(Find-Element "Submitted${dot}west-probe")
     }
 
-    Run-Palette 'New SSH group tab'
+    Choose-GroupCommand 'New SSH group tab'
     Wait-Tab 'SSH host group'
     $null = Wait-CheckBox $eastName Off
     $null = Wait-CheckBox $westName Off
