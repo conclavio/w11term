@@ -107,7 +107,7 @@ impl TerminalApp {
                 if self
                     .host_group_mut(id)
                     .is_some_and(|page| page.saved.editor.is_none())
-                    && let Err(error) = self.open_saved_host_group(id, &name, &members, ctx)
+                    && let Err(error) = self.open_saved_host_group(Some(id), &name, &members, ctx)
                 {
                     self.refresh_profiles();
                     if let Some(page) = self.host_group_mut(id) {
@@ -211,11 +211,19 @@ impl TerminalApp {
 
     fn open_saved_host_group(
         &mut self,
-        id: TabId,
+        id: Option<TabId>,
         name: &str,
         expected: &[String],
         ctx: &ComponentContext<Self>,
     ) -> Result<()> {
+        if let Some(id) = id
+            && let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page)
+        {
+            ensure!(
+                !page.saved.is_editing(),
+                "Finish editing the SSH group before opening another group."
+            );
+        }
         let catalog = self.store.catalog()?;
         ensure!(
             catalog.ssh_host_groups.get(name).map(Vec::as_slice) == Some(expected),
@@ -227,6 +235,7 @@ impl TerminalApp {
             .cloned()
             .collect::<Vec<_>>();
         self.use_group_catalog(catalog);
+        let id = id.unwrap_or_else(|| self.ensure_host_group_tab());
         let mut selected = BTreeSet::new();
         for (profile, ssh) in expected.iter().zip(members) {
             let tab = self.make_live_tab(profile.clone(), Source::Ssh(ssh), Some(profile.clone()));
@@ -245,6 +254,19 @@ impl TerminalApp {
         self.sync_selection(ctx);
         self.activate(ctx);
         Ok(())
+    }
+
+    pub(super) fn open_host_group_from_palette(
+        &mut self,
+        name: &str,
+        members: &[String],
+        ctx: &ComponentContext<Self>,
+    ) {
+        if let Err(error) = self.open_saved_host_group(self.host_group_tab_id(), name, members, ctx)
+        {
+            self.refresh_profiles();
+            self.window_error = Some(format!("{error:#}"));
+        }
     }
 
     pub(super) fn saved_host_group_toolbar(

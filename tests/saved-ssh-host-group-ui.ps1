@@ -35,16 +35,30 @@ function Name-Group([string]$Name) {
     }
     $value.SetValue($Name)
 }
-function Launch-GroupWindow {
+function Launch-Window {
     $launchArgs = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
     $script:app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
     $script:window = Wait-InputWindow
     $menu = Wait-Until 'tab menu button' { Find-Element 'Tab menu' $button }
     $menu.SetFocus()
+}
+function Open-GroupPage {
     Click 'Tab menu'
     Invoke-Button (Wait-Until 'SSH host group menu item' {
         Find-Element 'SSH host group' ([System.Windows.Automation.ControlType]::MenuItem)
     })
+}
+function Open-FleetPalette {
+    $command = "Open SSH group${dot}Fleet"
+    $field = Open-Palette $command
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('FLEET')
+    $null = Wait-Until 'saved group found in the palette' { Find-Element $command $button }
+}
+function Dismiss-PaletteError([string]$Message, [int]$Count = 1) {
+    Click ($Message + '  ' + [char]0xb7 + '  Dismiss')
+    if (@((Control @('list')).sessions).Count -ne $Count -or (Find-Element 'Group command' $edit)) {
+        throw 'A failed palette launch changed the active surface or opened SSH sessions'
+    }
 }
 function Close-GroupWindow {
     if (!$app) { return }
@@ -57,7 +71,8 @@ function Close-GroupWindow {
 }
 
 try {
-    Launch-GroupWindow
+    Launch-Window
+    Open-GroupPage
     Click 'New group'
     Name-Group 'Fleet'
     if (Find-Element 'Group member Local witness') { throw 'Local shell was offered as a group member' }
@@ -69,10 +84,6 @@ try {
     $null = Wait-Until 'both saved members on the group page' { Find-Element 'East, West' }
     if (((Catalog).ssh_host_groups.Fleet -join ',') -cne 'East,West') { throw 'Both members were not saved' }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Saving opened terminal sessions' }
-    Close-GroupWindow
-
-    Launch-GroupWindow
-    $null = Wait-Until 'group loaded from disk' { Find-Element 'East, West' }
     $original = [IO.File]::ReadAllBytes($profiles)
     $changed = Catalog
     $changed.profiles.PSObject.Properties.Remove('West')
@@ -83,7 +94,26 @@ try {
     }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'A group with a missing member opened a partial set of sessions' }
     [IO.File]::WriteAllBytes($profiles, $original)
-    Click 'Open group'
+    Close-GroupWindow
+
+    Launch-Window
+    Open-FleetPalette
+    $changed = Catalog
+    $changed.ssh_host_groups.Fleet = @('East')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click "Open SSH group${dot}Fleet"
+    Dismiss-PaletteError 'The SSH group changed on disk. Select it again.'
+    [IO.File]::WriteAllBytes($profiles, $original)
+    Open-FleetPalette
+    $changed = Catalog
+    $changed.profiles.PSObject.Properties.Remove('West')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click "Open SSH group${dot}Fleet"
+    Dismiss-PaletteError 'SSH profile West is unavailable for groups'
+    [IO.File]::WriteAllBytes($profiles, $original)
+    Open-FleetPalette
+    Click "Open SSH group${dot}Fleet"
+    $null = Wait-Until 'the saved group opened in the group tab' { Find-Element 'Opened 2 SSH panes for Fleet' }
     $sessions = Wait-Until 'two group sessions in separate tabs' {
         $current = @((Control @('list')).sessions)
         if ($current.Count -eq 3 -and @($current.tab_id | Sort-Object -Unique).Count -eq 3) { ,$current }
@@ -101,6 +131,10 @@ try {
     (Wait-CheckBox 'Group member West' On).Toggle()
     $null = Wait-CheckBox 'Group member West' Off
     Name-Group 'East only'
+    Open-FleetPalette
+    Click "Open SSH group${dot}Fleet"
+    Dismiss-PaletteError 'Finish editing the SSH group before opening another group.' 3
+    $null = Wait-CheckBox 'Group member West' Off
     Click 'Save group'
     $null = Wait-Until 'group editor closes after rename' { Find-Element 'Edit group' $button }
     $groups = (Catalog).ssh_host_groups

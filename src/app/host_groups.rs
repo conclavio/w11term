@@ -248,6 +248,7 @@ impl HostGroup {
 
 pub enum Action {
     Open,
+    OpenNamedGroup { name: String, members: Vec<String> },
     Saved(TabId, saved::Action),
     Tick,
     Edit(TabId, String),
@@ -269,6 +270,23 @@ pub enum Action {
 }
 
 impl TerminalApp {
+    fn host_group_tab_id(&self) -> Option<TabId> {
+        self.tabs
+            .entries()
+            .iter()
+            .find(|entry| matches!(entry.value.page, Page::HostGroup(_)))
+            .map(|entry| entry.id)
+    }
+
+    fn ensure_host_group_tab(&mut self) -> TabId {
+        self.host_group_tab_id().unwrap_or_else(|| {
+            self.tabs.insert(AppTab {
+                label: LABEL.into(),
+                page: Page::HostGroup(HostGroup::default()),
+            })
+        })
+    }
+
     pub(super) fn host_group_command_target(&self) -> Option<TabId> {
         let id = self.tabs.active_id()?;
         match &self.tabs.get(id)?.page {
@@ -488,25 +506,13 @@ impl TerminalApp {
         match action {
             Action::Open => {
                 self.refresh_profiles();
-                if let Some(id) = self
-                    .tabs
-                    .entries()
-                    .iter()
-                    .find(|entry| matches!(entry.value.page, Page::HostGroup(_)))
-                    .map(|entry| entry.id)
-                {
-                    self.tabs.select(id);
-                    self.sync_selection(ctx);
-                    self.activate(ctx);
-                } else {
-                    self.insert_tab(
-                        AppTab {
-                            label: LABEL.into(),
-                            page: Page::HostGroup(HostGroup::default()),
-                        },
-                        ctx,
-                    );
-                }
+                let id = self.ensure_host_group_tab();
+                self.tabs.select(id);
+                self.sync_selection(ctx);
+                self.activate(ctx);
+            }
+            Action::OpenNamedGroup { name, members } => {
+                self.open_host_group_from_palette(&name, &members, ctx);
             }
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Tick => {

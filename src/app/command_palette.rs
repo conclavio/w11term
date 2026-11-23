@@ -27,6 +27,7 @@ pub enum CommandId {
         w11term::saved_commands::Entry,
     ),
     GroupSavedCommand(TabId, w11term::saved_commands::Entry),
+    OpenSavedHostGroup(String, Vec<String>),
     TabAction(Shortcut, Option<TabId>),
     SetTabPinned(Option<TabId>, bool),
     SetTabColor(TabId, Option<TabColor>),
@@ -243,6 +244,17 @@ impl TerminalApp {
             }
         }
         menu_rows(self.profile_items(), true, &mut rows);
+        rows.extend(
+            self.catalog
+                .ssh_host_groups
+                .iter()
+                .map(|(name, members)| Row {
+                    id: CommandId::OpenSavedHostGroup(name.clone(), members.clone()),
+                    label: format!("Open SSH group · {name}"),
+                    chord: String::new(),
+                    enabled: !members.is_empty(),
+                }),
+        );
         let live = self.tabs.active().and_then(|tab| match &tab.page {
             Page::Terminal(live) => Some(live),
             _ => None,
@@ -490,6 +502,9 @@ impl TerminalApp {
             CommandId::SavedCommand(None, _) => return,
             CommandId::GroupSavedCommand(group, entry) => {
                 Message::HostGroup(host_groups::Action::LoadSavedCommand(group, entry))
+            }
+            CommandId::OpenSavedHostGroup(name, members) => {
+                Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
             }
             CommandId::TabAction(shortcut, group) => {
                 bind_tab_action(Message::Shortcut(shortcut), group)
