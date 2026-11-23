@@ -5,6 +5,7 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt,
 };
+mod filter;
 mod import;
 mod live_output;
 mod progress;
@@ -24,7 +25,7 @@ const SUBMISSION_LIMIT: usize = 8;
 pub(super) struct HostGroup {
     saved: saved::SavedUi,
     selected: BTreeSet<u64>,
-    filter: String,
+    filter: filter::Filter,
     draft: String,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
@@ -64,6 +65,7 @@ impl HostGroup {
 pub struct Target {
     pane: u64,
     name: String,
+    names: filter::Names,
     profile: Option<String>,
     connected: bool,
     state: TargetState,
@@ -216,17 +218,9 @@ fn execution_caption(result: &GroupExecution) -> Cow<'_, str> {
 
 impl HostGroup {
     fn shown<'a>(&self, targets: &'a [Target]) -> impl Iterator<Item = &'a Target> {
-        let query = self.filter.trim().to_lowercase();
-        targets.iter().filter(move |target| {
-            if query.is_empty() {
-                return true;
-            }
-            let name = target.name.to_lowercase();
-            let profile = target.profile.as_deref().unwrap_or_default().to_lowercase();
-            query
-                .split_whitespace()
-                .all(|term| name.contains(term) || profile.contains(term))
-        })
+        targets
+            .iter()
+            .filter(move |target| self.filter.matches(target))
     }
 
     fn selected_shown(&self, targets: &[Target]) -> BTreeSet<u64> {
@@ -311,6 +305,7 @@ pub enum Action {
     Tick,
     Edit(TabId, String),
     Filter(TabId, String),
+    FilterWildcards(TabId, bool),
     Select(TabId, u64, bool),
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
@@ -465,21 +460,15 @@ impl TerminalApp {
                         _ => TargetState::Unverified,
                     }
                 };
-                let host = if options.host.contains(':') && !options.host.starts_with('[') {
-                    format!("[{}]", options.host)
-                } else {
-                    options.host.clone()
-                };
                 let label = entry
                     .value
                     .pane_name()
                     .map_or(entry.value.label.as_str(), |name| name.as_str());
+                let names = filter::Names::new(label, &options.host, &options.user, options.port);
                 Some(Target {
                     pane,
-                    name: format!(
-                        "{label} · {}@{host}:{} · Pane {pane}",
-                        options.user, options.port
-                    ),
+                    name: names.display(pane),
+                    names,
                     profile: live.profile_name.clone(),
                     connected,
                     state,
@@ -661,7 +650,12 @@ impl TerminalApp {
             }
             Action::Filter(id, query) => {
                 if let Some(page) = self.host_group_mut(id) {
-                    page.filter = query;
+                    page.filter.set_query(query);
+                }
+            }
+            Action::FilterWildcards(id, wildcards) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.filter.set_wildcards(wildcards);
                 }
             }
             Action::Select(id, pane, selected) => {
@@ -908,7 +902,8 @@ impl TerminalApp {
                 )
             })
             .collect();
-        if shown.is_empty() {
+        let filter_error = page.filter.error();
+        if shown.is_empty() && filter_error.is_none() {
             details.push(KeyedView::new(
                 "empty",
                 TextBlock::new().text(if targets.is_empty() {
@@ -938,14 +933,38 @@ impl TerminalApp {
                 }))
                 .content(label)
         };
+        let filter_input = Grid::new()
+            .column_spacing(8.0)
+            .columns([GridLength::STAR, GridLength::Auto])
+            .children((
+                TextBox::new()
+                    .automation_name("Host filter")
+                    .placeholder_text(if page.filter.wildcards() {
+                        "Patterns such as web-*, db-??, !*-canary"
+                    } else {
+                        "Filter by profile, pane, or SSH address"
+                    })
+                    .text(page.filter.query())
+                    .on_text_changed(
+                        ctx.callback(move |query| Message::HostGroup(Action::Filter(id, query))),
+                    ),
+                CheckBox::new()
+                    .grid_column(1)
+                    .automation_name("Use wildcards")
+                    .is_checked(page.filter.wildcards())
+                    .on_is_checked_changed(ctx.callback(move |checked| {
+                        Message::HostGroup(Action::FilterWildcards(id, checked))
+                    }))
+                    .content("Use wildcards"),
+            ));
         let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
-            TextBox::new()
-                .automation_name("Host filter")
-                .placeholder_text("Filter by profile, pane, or SSH address")
-                .text(&page.filter)
-                .on_text_changed(
-                    ctx.callback(move |query| Message::HostGroup(Action::Filter(id, query))),
-                ),
+            filter_input,
+            filter_error.map_or_else(View::empty, |error| {
+                TextBlock::new()
+                    .text(error)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            }),
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)
@@ -1307,6 +1326,7 @@ mod tests {
             Target {
                 pane: 7,
                 name: "Primary database · ops@db.example:2222 · Pane 7".into(),
+                names: filter::Names::new("Primary database", "db.example", "ops", 2222),
                 profile: Some("East Prod".into()),
                 connected: false,
                 state: TargetState::Offline,
@@ -1314,6 +1334,7 @@ mod tests {
             Target {
                 pane: 8,
                 name: "Replica · ops@db.example:22 · Pane 8".into(),
+                names: filter::Names::new("Replica", "db.example", "ops", 22),
                 profile: Some("West Prod".into()),
                 connected: false,
                 state: TargetState::Offline,
@@ -1324,10 +1345,10 @@ mod tests {
             ..Default::default()
         };
         for query in [" EAST    PRIMARY ", "ops@db.example:2222", "pane 7"] {
-            group.filter = query.into();
+            group.filter.set_query(query.into());
             assert_eq!(group.selected_shown(&roster), BTreeSet::from([7]));
         }
-        group.filter = "missing".into();
+        group.filter.set_query("missing".into());
         assert!(group.selected_shown(&roster).is_empty());
         group.filter.clear();
         assert_eq!(group.selected_shown(&roster), BTreeSet::from([7, 8]));
@@ -1353,9 +1374,9 @@ mod tests {
         let mut group = HostGroup {
             draft: "in progress".into(),
             selected: BTreeSet::from([11, 12]),
-            filter: "east".into(),
             ..Default::default()
         };
+        group.filter.set_query("east".into());
         group.submit(
             "show  inventory".into(),
             Vec::new(),
@@ -1376,7 +1397,7 @@ mod tests {
         assert!(group.load_command(2));
         assert_eq!(group.draft, "show revision");
         assert_eq!(group.selected, BTreeSet::from([11, 12]));
-        assert_eq!(group.filter, "east");
+        assert_eq!(group.filter.query(), "east");
         assert_eq!(group.submissions.len(), 2);
 
         assert!(group.restore_draft());

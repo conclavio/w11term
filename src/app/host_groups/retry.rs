@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct Scope {
     pub selected: BTreeSet<u64>,
-    pub filter: String,
+    pub filter: filter::Filter,
 }
 
 fn retryable(delivery: &Delivery) -> bool {
@@ -119,6 +119,7 @@ mod tests {
         Target {
             pane,
             name: name.into(),
+            names: filter::Names::new(name, "example.test", "ops", 22),
             profile: None,
             connected: false,
             state: TargetState::Offline,
@@ -161,10 +162,11 @@ mod tests {
         ];
         let mut group = HostGroup {
             draft: "working draft".into(),
-            filter: "west".into(),
             selected: BTreeSet::from([3, 6]),
             ..Default::default()
         };
+        group.filter.set_wildcards(true);
+        group.filter.set_query("west*".into());
         group.submit(
             "show  status".into(),
             vec![
@@ -212,10 +214,12 @@ mod tests {
         assert_eq!(group.draft, "show  status");
         assert_eq!(group.submissions.len(), 1);
         group.filter.clear();
+        group.filter.set_wildcards(false);
         group.selected.clear();
         assert!(group.restore_draft());
         assert_eq!(group.selected, BTreeSet::from([3, 6]));
-        assert_eq!(group.filter, "west");
+        assert!(group.filter.wildcards());
+        assert_eq!(group.filter.query(), "west*");
         assert_eq!(group.draft, "working draft");
     }
 }

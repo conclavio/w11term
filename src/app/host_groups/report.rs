@@ -142,6 +142,7 @@ mod tests {
             target: Target {
                 pane,
                 name: format!("Host {pane}"),
+                names: Default::default(),
                 profile: None,
                 connected: true,
                 state: TargetState::InUse,

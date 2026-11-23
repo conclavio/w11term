@@ -140,6 +140,7 @@ mod tests {
         Target {
             pane,
             name: name.into(),
+            names: Default::default(),
             profile: None,
             connected: false,
             state,
@@ -157,11 +158,11 @@ mod tests {
             target(4, "prod west", TargetState::Restartable(active[3])),
             target(5, "prod west", TargetState::Offline),
         ];
-        let page = HostGroup {
-            filter: "west".into(),
+        let mut page = HostGroup {
             selected: BTreeSet::from([1, 2, 3, 5]),
             ..Default::default()
         };
+        page.filter.set_query("west".into());
         let request = Request::Selection(vec![
             exit(1, 1),
             active[1],

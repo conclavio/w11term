@@ -149,12 +149,25 @@ try {
     $null = Wait-Until 'the hidden selection is disclosed' {
         Find-Element '1 selected host is hidden by the filter.'
     }
+    (Wait-CheckBox 'Use wildcards' Off).Toggle()
+    Set-HostFilter 'Eas['
+    $null = Wait-Until 'an incomplete wildcard disables sending and bulk selection' {
+        $send = Find-Element 'Send to 0 hosts' $button
+        $bulk = Find-Element 'Select shown' $button
+        (Find-Element 'Close the wildcard character set with ].') -and
+            $send -and !$send.Current.IsEnabled -and $bulk -and !$bulk.Current.IsEnabled
+    }
+    Set-HostFilter "Eas?, West, !test@127.0.0.1:$($profileData.West.port)"
+    $null = Wait-Until 'the wildcard exclusion removes West from the send scope' {
+        (Find-Element "Focus pane $east" $button) -and !(Find-Element "Focus pane $west" $button)
+    }
     Submit 'one' 'Send to 1 host'
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
     Click 'Deselect shown'
     $null = Wait-CheckBox $eastName Off
     Set-HostFilter ''
+    (Wait-CheckBox 'Use wildcards' On).Toggle()
     $null = Wait-CheckBox $westName On
     $null = Wait-CheckBox $eastName Off
     Click 'Select shown'

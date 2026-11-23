@@ -105,6 +105,7 @@ mod tests {
             target: Target {
                 pane: 1,
                 name: "host".into(),
+                names: Default::default(),
                 profile: None,
                 connected: true,
                 state: TargetState::InUse,

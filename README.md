@@ -85,6 +85,8 @@ Choose **Prompt setup…** on a connected host’s roster row to copy the Bash, 
 
 Use **Host filter** to find SSH panes by profile, pane name, or address. **Select shown** and **Deselect shown** change the visible rows. The filter preserves hidden selections and scopes **Send** and **Interrupt selected** to the shown hosts. Prior submission results remain visible.
 
+Turn on **Use wildcards** for a list such as `web-[01][0-9], db-??, !*-canary`. Patterns match whole hostnames, SSH addresses with or without ports, pane names, or profile names. Separate patterns with commas. Use `*` for any number of characters, `?` for one character, brackets for sets or ranges, and `!` before a pattern to exclude matching hosts. Use `*, !*-canary` to include every host except canaries. A backslash escapes a special character. Matching ignores case. An incomplete pattern keeps the target list empty until you fix it.
+
 The command editor shows how many selected, visible hosts are ready. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
 
 When an SSH shell has exited or its connection attempts have ended, use **Reconnect** on its roster row or **Reconnect selected** for checked hosts shown by the filter. Each attempt starts a fresh SSH login in the same pane with its scrollback and selection intact. Previous submissions stay available, and the replacement shell needs a fresh prompt before it can receive another group command.
