@@ -21,7 +21,7 @@ mod scrollback_view;
 pub use scrollback_view::{ScrollbackTarget, ScrollbackView};
 #[cfg(test)]
 mod scrollback_tests;
-pub(crate) use export::export_text;
+pub(crate) use export::{export_text, retained_text_rows};
 pub use kitty::KeypadKey;
 
 pub type Rgba = [f32; 4];
@@ -173,7 +173,7 @@ pub(crate) fn create_with_palette(
     scrollback_lines: ScrollbackLines,
     scheme: ResolvedColorScheme,
 ) -> Terminal {
-    Terminal::new(
+    Terminal::with_nonblocking_writer(
         size,
         Arc::new(Config::new(scrollback_lines, scheme)),
         "w11term",
@@ -197,19 +197,14 @@ pub(crate) fn replace_transport(
     terminal: &mut Terminal,
     writer: mpsc::UnboundedSender<TransportInput>,
 ) {
-    terminal.replace_writer(Box::new(ReplyWriter {
+    terminal.replace_nonblocking_writer(Box::new(ReplyWriter {
         sender: writer,
         message: TransportInput::Data,
     }));
 }
 
-/// Herdr can send a screen reconstruction on attach or while a viewer falls behind.
-/// Screen paint and subsequent live bytes share the same stream.
-pub(crate) fn enter_herdr_viewer(
-    terminal: &mut Terminal,
-    writer: &mpsc::UnboundedSender<TransportInput>,
-    events: &crate::events::Events,
-) {
+/// View archived or reconstructed output without applying historical desktop effects.
+pub(crate) fn configure_output_viewer(terminal: &mut Terminal, events: &crate::events::Events) {
     struct ViewerAlerts(crate::events::Events);
     impl wezterm_term::AlertHandler for ViewerAlerts {
         fn alert(&mut self, alert: wezterm_term::Alert) {
@@ -221,6 +216,16 @@ pub(crate) fn enter_herdr_viewer(
     events.command_stream(None);
     terminal.clear_clipboard();
     terminal.set_notification_handler(Box::new(ViewerAlerts(events.clone())));
+}
+
+/// Herdr can send a screen reconstruction on attach or while a viewer falls behind.
+/// Screen paint and subsequent live bytes share the same stream.
+pub(crate) fn enter_herdr_viewer(
+    terminal: &mut Terminal,
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    events: &crate::events::Events,
+) {
+    configure_output_viewer(terminal, events);
     terminal.set_nonblocking_viewer_writers(
         Box::new(ReplyWriter {
             sender: writer.clone(),
@@ -543,6 +548,7 @@ pub struct Snapshot {
     pub cols: usize,
     pub scroll_offset: usize,
     pub title: String,
+    application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
     pub reported_directory: Option<Arc<str>>,
     pub status: String,
@@ -550,6 +556,7 @@ pub struct Snapshot {
     pub first_stable_row: isize,
     pub oldest_stable_row: isize,
     pub(crate) row_epoch: u64,
+    pub(crate) seqno: usize,
     pub(crate) history_clear_count: u64,
     /// Most recent successful local history clear. The floor is the first row
     /// retained at the time of that clear, even if new output has since arrived.
@@ -574,7 +581,22 @@ struct FrozenImage {
     data: Arc<wezterm_term::image::ImageDataType>,
 }
 
+#[derive(Debug)]
+struct ApplicationTitle {
+    raw: Arc<str>,
+    caption: String,
+}
+
 impl Snapshot {
+    /// A bounded single-line caption from the application's window title.
+    /// A shell that has only set an icon title still uses its profile label.
+    pub fn application_title(&self) -> Option<&str> {
+        self.application_title
+            .as_ref()
+            .map(|title| title.caption.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn copy_output_unavailable(&self) -> Option<&'static str> {
         match self.command_history.back() {
             Some(command) => command.output.as_ref().err().copied(),
@@ -590,6 +612,13 @@ impl Snapshot {
         status: String,
         bytes_received: u64,
     ) -> Self {
+        // DECSCNM exchanges the display defaults. Leave the underlying OSC colors
+        // and indexed palette intact so queries and later resets see the originals.
+        let mut palette = terminal.palette();
+        if terminal.get_reverse_video() {
+            std::mem::swap(&mut palette.foreground, &mut palette.background);
+        }
+        terminal.recolor_indexed_kitty_images(&palette);
         let screen = terminal.screen();
         let offset = if terminal.is_alt_screen_active() {
             0
@@ -687,12 +716,6 @@ impl Snapshot {
             });
         }
         let cursor = terminal.cursor_pos();
-        // DECSCNM exchanges the display defaults. Leave the underlying OSC colors
-        // and indexed palette intact so queries and later resets see the originals.
-        let mut palette = terminal.palette();
-        if terminal.get_reverse_video() {
-            std::mem::swap(&mut palette.foreground, &mut palette.background);
-        }
         Self {
             generation,
             rows,
@@ -704,6 +727,18 @@ impl Snapshot {
             cols: screen.physical_cols,
             scroll_offset: offset,
             title: terminal.get_title().to_owned(),
+            application_title: terminal.application_window_title().map(|raw| {
+                previous
+                    .and_then(|s| s.application_title.as_ref())
+                    .filter(|old| Arc::ptr_eq(&old.raw, raw))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::new(ApplicationTitle {
+                            raw: raw.clone(),
+                            caption: crate::events::display_field(raw),
+                        })
+                    })
+            }),
             command_history: terminal.command_history().clone(),
             reported_directory: terminal.reported_current_dir().cloned(),
             status,
@@ -711,6 +746,7 @@ impl Snapshot {
             first_stable_row,
             oldest_stable_row: screen.phys_to_stable_row_index(0),
             row_epoch: screen.row_epoch(),
+            seqno: terminal.current_seqno(),
             history_clear_count: screen.history_clear_count(),
             scrollback_clear_generation: 0,
             scrollback_clear_floor: None,
@@ -739,7 +775,7 @@ impl Snapshot {
         usize::try_from(self.cursor.y)
             .ok()
             .and_then(|row| self.cell_map(row))
-            .map_or(self.cursor.x, |map| map.visual(self.cursor.x))
+            .map_or(self.cursor.x, |map| map.visual_grid(self.cursor.x))
     }
 
     pub fn cell_maps(&self) -> &Arc<[crate::text_layout::CellMap]> {
@@ -793,6 +829,7 @@ impl Snapshot {
             )
             && self.palette == old.palette
             && self.title == old.title
+            && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.reported_directory == old.reported_directory
             && self.status == old.status
@@ -825,6 +862,7 @@ pub struct FrameStore(Arc<(Mutex<ViewState>, Condvar, tokio::sync::Notify)>);
 struct ViewState {
     frame: Arc<Snapshot>,
     inspection: Option<TerminalModes>,
+    title_inbox: Option<crate::events::Inbox>,
 }
 
 impl FrameStore {
@@ -833,6 +871,7 @@ impl FrameStore {
             Mutex::new(ViewState {
                 frame: Arc::new(frame),
                 inspection: None,
+                title_inbox: None,
             }),
             Condvar::new(),
             tokio::sync::Notify::new(),
@@ -842,9 +881,25 @@ impl FrameStore {
         self.0.0.lock().unwrap().frame.clone()
     }
     pub fn publish(&self, frame: Snapshot) {
-        self.0.0.lock().unwrap().frame = Arc::new(frame);
+        let title_inbox = {
+            let mut state = self.0.0.lock().unwrap();
+            let inbox = state
+                .title_inbox
+                .as_ref()
+                .filter(|_| frame.application_title() != state.frame.application_title())
+                .cloned();
+            state.frame = Arc::new(frame);
+            inbox
+        };
         self.0.1.notify_all();
         self.0.2.notify_waiters();
+        if let Some(inbox) = title_inbox {
+            inbox.refresh();
+        }
+    }
+    /// Wake a window with inactive tabs only when a committed caption changes.
+    pub fn watch_application_title(&self, inbox: Option<&crate::events::Inbox>) {
+        self.0.0.lock().unwrap().title_inbox = inbox.cloned();
     }
     pub async fn changed(&self, generation: u64, deadline: tokio::time::Instant) -> bool {
         let changed = self.0.2.notified();
@@ -1165,6 +1220,67 @@ mod tests {
     }
 
     #[test]
+    fn ssh_iterm_directory_snapshot_is_bound_to_the_current_login() {
+        let (mut ssh, _) = engine();
+        let (mut local, _) = engine();
+        ssh.enable_iterm_directory_reports("alice", "host.example");
+        local.enable_conemu_directory_reports();
+        local.advance_bytes(b"\x1b]7;file:///C:/work\x07");
+        let report =
+            b"\x1b]1337;RemoteHost=alice@host.example\x07\x1b]1337;CurrentDir=/srv/demo\x1b\\";
+        for bytes in report.chunks(3) {
+            ssh.advance_bytes(bytes);
+            local.advance_bytes(bytes);
+        }
+        let frame = Snapshot::capture(&ssh, None, 1, 0, String::new(), 0);
+        assert_eq!(
+            frame.reported_directory.as_deref(),
+            Some("file://host.example/srv/demo")
+        );
+        assert_eq!(
+            local.reported_current_dir().map(AsRef::as_ref),
+            Some("file:///C:/work")
+        );
+
+        ssh.reset_connection();
+        ssh.advance_bytes(b"\x1b]1337;CurrentDir=/from-old-login\x07");
+        assert!(ssh.reported_current_dir().is_none());
+        ssh.advance_bytes(report);
+        assert_eq!(
+            ssh.reported_current_dir().map(AsRef::as_ref),
+            frame.reported_directory.as_deref()
+        );
+        ssh.advance_bytes(b"\x1b]1337;RemoteHost=other@host.example\x07");
+        assert!(ssh.reported_current_dir().is_none());
+        // Captures used by a visible picker or hint overlay keep their original directory.
+        assert_eq!(
+            frame.reported_directory.as_deref(),
+            Some("file://host.example/srv/demo")
+        );
+    }
+
+    #[test]
+    fn incomplete_and_oversized_iterm_reports_do_not_publish_partial_directories() {
+        let (mut ssh, _) = engine();
+        ssh.enable_iterm_directory_reports("alice", "host.example");
+        ssh.advance_bytes(b"\x1b]1337;RemoteHost=alice@host.example\x07");
+        let prompt = b"\x1b]1337;CurrentDir=/shell\x07";
+        for bad in [
+            b"\x1b]1337;CurrentDir=/interrupted\x1b[0m".to_vec(),
+            format!("\x1b]1337;CurrentDir=/{}\x07", "a".repeat(140 * 1024)).into_bytes(),
+        ] {
+            ssh.advance_bytes(prompt);
+            ssh.advance_bytes(&bad);
+            assert!(ssh.reported_current_dir().is_none());
+            ssh.advance_bytes(prompt);
+            assert_eq!(
+                ssh.reported_current_dir().map(AsRef::as_ref),
+                Some("file://host.example/shell")
+            );
+        }
+    }
+
+    #[test]
     fn shell_metadata_follows_primary_pane_and_connection() {
         let (mut term, _) = engine();
         term.advance_bytes(b"\x1b]7;file://localhost/old%20dir\x07\x1b]133;C\x07left");
@@ -1249,6 +1365,281 @@ mod tests {
             term.last_command().unwrap().output.as_deref(),
             Ok("abc界defg")
         );
+    }
+
+    #[test]
+    fn xterm_report_sgr_returns_common_text_attributes_and_colors() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[1;3;4:3;31;48;5;220mA\x1b[32mB\r\n\x1b[24;31mCD");
+        term.advance_bytes(b"\x1b[3;1H\x1b[0;38;2;11;22;33;58;5;32mEFG\x1b[0m");
+        let before = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        for (query, expected) in [
+            ("\x1b[1;1;2;2#|", "\x1b[0;1;3;48:5:220m"),
+            ("\x1b[1;1;1;1#|", "\x1b[0;1;3;4:3;31;48:5:220m"),
+            ("\x1b[3;2;3;3#|", "\x1b[0;38:2::11:22:33;58:5:32m"),
+            ("\x1b[1;1;3;3#|", "\x1b[0m"),
+        ] {
+            for byte in query.bytes() {
+                term.advance_bytes([byte]);
+            }
+            assert_eq!(receive(&mut out), expected.as_bytes(), "{query:?}");
+        }
+        term.advance_bytes(b"\x1bP$qm\x1b\\\x1b[6n");
+        assert_eq!(receive(&mut out), b"\x1bP1$r0m\x1b\\");
+        assert_eq!(receive(&mut out), b"\x1b[3;4R");
+        let after = Snapshot::capture(&term, Some(&before), 2, 0, String::new(), 0);
+        assert!(
+            before
+                .rows
+                .iter()
+                .zip(after.rows.iter())
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        );
+    }
+
+    #[test]
+    fn xterm_report_sgr_uses_origin_margins_for_defaults_and_clamping() {
+        let (tx, mut out) = mpsc::unbounded_channel();
+        let size = TerminalSize {
+            cols: 7,
+            rows: 4,
+            ..Default::default()
+        };
+        let mut term = create(size, tx);
+        term.advance_bytes(b"\x1b[1;31m\x1b[2;3Habc\x1b[3;3Hdef\x1b[0m");
+        term.advance_bytes(b"\x1b[2;3r\x1b[?69h\x1b[3;5s\x1b[?6h");
+        for (query, expected) in [
+            ("\x1b[#|", "\x1b[0;1;31m"),
+            ("\x1b[0;0;0;0#|", "\x1b[0;1;31m"),
+            ("\x1b[1;1;4294967295;999#|", "\x1b[0;1;31m"),
+            ("\x1b[999;999;999;999#|", "\x1b[0;1;31m"),
+            ("\x1b[2;3;1;1#|", "\x1b[0m"),
+        ] {
+            term.advance_bytes(query);
+            assert_eq!(receive(&mut out), expected.as_bytes(), "{query:?}");
+        }
+        term.advance_bytes(b"\x1b[1:2;1;1;1#|\x1b[?6l\x1b[#|");
+        assert_eq!(receive(&mut out), b"\x1b[0m");
+        assert!(out.try_recv().is_err());
+    }
+
+    #[test]
+    fn xterm_report_sgr_covers_wide_cells_and_the_active_screen() {
+        let (tx, mut out) = mpsc::unbounded_channel();
+        let size = TerminalSize {
+            cols: 8,
+            rows: 3,
+            ..Default::default()
+        };
+        let mut term = create(size, tx);
+        term.advance_bytes("\x1b#6\x1b[34m界X \x1b[0m");
+        for (query, expected) in [
+            ("\x1b[1;2;1;2#|", "\x1b[0;34m"),
+            ("\x1b[1;1;1;4#|", "\x1b[0;34m"),
+            ("\x1b[1;1;1;5#|", "\x1b[0m"),
+            ("\x1b[2;1;2;1#|", "\x1b[0m"),
+        ] {
+            term.advance_bytes(query);
+            assert_eq!(receive(&mut out), expected.as_bytes(), "{query:?}");
+        }
+        term.advance_bytes(b"\x1b[?1049h\x1b[1;2;1;2#|\x1b[?1049l\x1b[1;2;1;2#|");
+        assert_eq!(receive(&mut out), b"\x1b[0m");
+        assert_eq!(receive(&mut out), b"\x1b[0;34m");
+    }
+
+    #[test]
+    fn xterm_sgr_stack_restores_text_style_while_leaving_the_current_link() {
+        use wezterm_term::{Intensity, Underline};
+
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]8;;https://example.test/old\x1b\\");
+        term.advance_bytes(b"\x1b[1;3;4:3;5;7;8;9;53;73m\x1b[38;2;11;22;33;48;5;200;58;5;220mA");
+        for byte in b"\x1b[#{\x1b[0m\x1b]8;;https://example.test/new\x1b\\\x1b[#}B" {
+            term.advance_bytes([*byte]);
+        }
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let mut cells = frame.rows[0].visible_cells();
+        let a = cells.next().unwrap();
+        let b = cells.next().unwrap();
+        assert_eq!((a.str(), b.str()), ("A", "B"));
+        let (original, restored) = (a.attrs(), b.attrs());
+        assert_eq!(
+            restored.hyperlink().unwrap().uri(),
+            "https://example.test/new"
+        );
+        assert_eq!(restored.intensity(), Intensity::Bold);
+        assert_eq!(restored.underline(), Underline::Curly);
+        assert!(restored.italic() && restored.reverse() && restored.invisible());
+        assert!(restored.strikethrough() && restored.overline());
+        assert_eq!(restored.blink(), original.blink());
+        assert_eq!(restored.vertical_align(), original.vertical_align());
+        assert_eq!(restored.foreground(), original.foreground());
+        assert_eq!(restored.background(), original.background());
+        assert_eq!(restored.underline_color(), original.underline_color());
+    }
+
+    #[test]
+    fn xterm_sgr_stack_restores_only_the_selected_attributes() {
+        use wezterm_term::{Intensity, Underline, color::ColorAttribute};
+
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b[1;31m\x1b[1;10#p\x1b[22;32;44;21m\x1b[#qA");
+        term.advance_bytes(b"\x1b[2;4#{\x1b[2;4m\x1b[#}B");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let mut cells = frame.rows[0].visible_cells();
+        let first = cells.next().unwrap();
+        let second = cells.next().unwrap();
+        assert_eq!(first.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        assert_eq!(first.attrs().background(), ColorAttribute::PaletteIndex(4));
+        assert_eq!(first.attrs().intensity(), Intensity::Bold);
+        assert_eq!(first.attrs().underline(), Underline::Double);
+        assert_eq!(second.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        assert_eq!(second.attrs().background(), ColorAttribute::PaletteIndex(4));
+        assert_eq!(second.attrs().intensity(), Intensity::Normal);
+        assert_eq!(second.attrs().underline(), Underline::None);
+    }
+
+    #[test]
+    fn xterm_sgr_stack_caps_saved_levels_and_pairs_extra_pushes_with_pops() {
+        use wezterm_term::color::ColorAttribute;
+
+        let (mut term, _) = engine();
+        for index in 20..=30 {
+            term.advance_bytes(format!("\x1b[38;5;{index}m\x1b[#{{"));
+        }
+        term.advance_bytes(b"\x1b[38;5;42m\x1b[#}A");
+        for _ in 0..10 {
+            term.advance_bytes(b"\x1b[#}X");
+        }
+        term.advance_bytes(b"\x1b[#}B\x1b[0#{\x1b[35m\x1b[#}C");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let expected = std::iter::once(42).chain((20..30).rev()).chain([20, 5]);
+        let colors = frame.rows[0]
+            .visible_cells()
+            .map(|cell| cell.attrs().foreground());
+        assert!(colors.eq(expected.map(ColorAttribute::PaletteIndex)));
+    }
+
+    #[test]
+    fn xterm_sgr_stack_survives_terminal_resets_and_clears_on_reconnect() {
+        use wezterm_term::color::ColorAttribute;
+
+        let (mut term, _) = engine();
+        for reset in ["\x1bc", "\x1b[!p"] {
+            term.advance_bytes(format!("\x1b[31m\x1b[#p{reset}\x1b[#q\x1b[H"));
+            term.advance_bytes(b"A");
+            let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+            let cell = frame.rows[0].visible_cells().next().unwrap();
+            assert_eq!(cell.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        }
+        term.advance_bytes(b"\x1b[31m\x1b[#p");
+        term.reset_connection();
+        term.advance_bytes(b"\x1b[32m\x1b[#qB");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let cell = frame.rows[0].visible_cells().next().unwrap();
+        assert_eq!(cell.attrs().foreground(), ColorAttribute::PaletteIndex(2));
+    }
+
+    #[test]
+    fn xterm_private_modes_restore_named_values_without_consuming_them() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[?1;2004h\x1b[?25l");
+        // Save both set and reset values. A numerically valid unknown mode can
+        // appear anywhere in the list.
+        term.advance_bytes(b"\x1b[?1;65530;25;2004s\x1b[?1;2004l\x1b[?25h");
+        term.advance_bytes(b"\x1b[?65530;2004r");
+        assert!(term.bracketed_paste_enabled());
+        term.send_paste("saved paste").unwrap();
+        assert_eq!(receive(&mut out), b"\x1b[200~saved paste\x1b[201~");
+        term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+        assert_eq!(receive(&mut out), b"\x1b[A");
+
+        for _ in 0..2 {
+            term.advance_bytes(b"\x1b[?1l\x1b[?25h\x1b[?1;25r\x1b[?25$p");
+            assert_eq!(receive(&mut out), b"\x1b[?25;2$y");
+            term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+            assert_eq!(receive(&mut out), b"\x1bOA");
+        }
+
+        term.advance_bytes(b"\x1b[?2004l\x1b[?2004s\x1b[?2004h\x1b[?2004r");
+        term.send_paste("new saved value").unwrap();
+        assert_eq!(receive(&mut out), b"new saved value");
+    }
+
+    #[test]
+    fn xterm_private_modes_save_mouse_groups_and_preserve_both_screen_buffers() {
+        use wezterm_term::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"primary\x1b[?47s\x1b[?1049halternate");
+        term.advance_bytes(b"\x1b[?1047r\x1b[?1049$p");
+        assert_eq!(receive(&mut out), b"\x1b[?1049;2$y");
+        assert!(text(&term).starts_with("primary"));
+        term.advance_bytes(b"\x1b[?47h\x1b[?1049s\x1b[?47l\x1b[?47r");
+        assert!(term.is_alt_screen_active());
+        assert!(text(&term).starts_with("alternate"));
+
+        // Each group saves its current state, including when the named alias
+        // differs from the active reporting level or encoding.
+        term.advance_bytes(b"\x1b[?1002;1006h\x1b[?1000;1005s");
+        term.advance_bytes(b"\x1b[?1002l\x1b[?1003;1016h\x1b[?1003;1016r");
+        assert!(term.button_event_mouse_enabled());
+        assert!(!term.any_event_mouse_enabled());
+        assert_eq!(term.get_mouse_encoding(), wezterm_term::MouseEncoding::SGR);
+        term.mouse_event(MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            x: 2,
+            y: 3,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert_eq!(receive(&mut out), b"\x1b[<0;3;4M");
+    }
+
+    #[test]
+    fn xterm_private_modes_restore_cursor_and_resize_side_effects() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[5;10H\x1b[?1048s\x1b[H\x1b[?1048r\x1b[6n");
+        assert_eq!(receive(&mut out), b"\x1b[5;10R");
+        term.advance_bytes(b"\x1b[2;8r\x1b[?6h\x1b[?6s\x1b[?6l\x1b[5;10H\x1b[?6r\x1b[6n");
+        assert_eq!(receive(&mut out), b"\x1b[1;1R");
+        assert_eq!(term.cursor_pos().y, 1);
+
+        term.advance_bytes(b"\x1b[?2048h");
+        assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+        term.advance_bytes(b"\x1b[?2048s\x1b[?2048l\x1b[?2048r");
+        assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+    }
+
+    #[test]
+    fn xterm_private_modes_keep_saves_through_soft_reset_and_clear_on_full_reset() {
+        for reset_connection in [false, true] {
+            let (mut term, mut out) = engine();
+            term.advance_bytes(b"\x1b[?1;2004h\x1b[?1;2004s\x1b[!p\x1b[?2004l\x1b[?1;2004r");
+            assert!(term.bracketed_paste_enabled());
+            term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+            assert_eq!(receive(&mut out), b"\x1bOA");
+
+            term.advance_bytes(b"\x1b[5;10H\x1b[?1048s");
+            if reset_connection {
+                term.reset_connection();
+            } else {
+                term.advance_bytes(b"\x1bc");
+            }
+            term.advance_bytes(b"\x1b[?1;2004;1048r\x1b[6n");
+            assert_eq!(receive(&mut out), b"\x1b[1;1R");
+            assert!(!term.bracketed_paste_enabled());
+            term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+            assert_eq!(receive(&mut out), b"\x1b[A");
+
+            term.advance_bytes(b"keep\x1b[?3s\x1b[?3r\x1b[?7r");
+            assert!(text(&term).starts_with("keep"));
+            term.advance_bytes(b"\x1b[?7$p");
+            assert_eq!(receive(&mut out), b"\x1b[?7;1$y");
+        }
     }
 
     #[test]
@@ -2069,6 +2460,251 @@ mod tests {
             _ => panic!("unexpected resize"),
         }
     }
+
+    #[test]
+    fn title_stack_restores_mixed_scopes_and_preserves_the_shell_title_after_ncurses() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]0;shell\x07\x1b[?1049h\x1b[22;0;0t\x1b]2;editor\x07");
+        assert!(term.is_alt_screen_active());
+        assert_eq!(term.get_title(), "editor");
+        term.advance_bytes(b"\x1b[?1049l\x1b[23;0;0t");
+        assert!(!term.is_alt_screen_active());
+        assert_eq!(term.get_title(), "shell");
+        term.advance_bytes(b"\x1b]2;next command\x07");
+        assert_eq!(term.get_title(), "next command");
+
+        // The inner entry saved only its icon. The window comes from the
+        // preceding entry when the application asks to restore both labels.
+        term.advance_bytes(b"\x1b[22;2t\x1b]2;inner\x07\x1b]1;tools\x07\x1b[22;1t");
+        term.advance_bytes(b"\x1b]0;transient\x07\x1b[23;0t");
+        assert_eq!(term.get_title(), "tools");
+        term.advance_bytes(b"\x1b]1;\x07");
+        assert_eq!(term.get_title(), "next command");
+    }
+
+    #[test]
+    fn application_title_distinguishes_initial_literal_restored_and_reset_window_titles() {
+        let (mut term, _) = engine();
+        let capture = |term: &Terminal| Snapshot::capture(term, None, 0, 0, String::new(), 0);
+        let initial = capture(&term);
+        assert_eq!(initial.title, "wezterm");
+        assert_eq!(initial.application_title(), None);
+        term.advance_bytes(b"\x1b[22;2;10t\x1b]2;wezterm\x07");
+        let explicit = capture(&term);
+        assert_eq!(explicit.application_title(), Some("wezterm"));
+        assert!(!explicit.same_presentation(&initial));
+        term.advance_bytes(b"\x1b[22;2t\x1b[23;2;10t");
+        assert_eq!(capture(&term).application_title(), None);
+        term.advance_bytes(b"\x1b[23;2t");
+        assert_eq!(capture(&term).application_title(), Some("wezterm"));
+
+        term.advance_bytes(b"\x1b]1;icon only\x07");
+        let icon = capture(&term);
+        assert_eq!(icon.title, "icon only");
+        assert_eq!(icon.application_title(), Some("wezterm"));
+        term.advance_bytes(b"\x1b]2;\x07");
+        let empty = capture(&term);
+        assert_eq!(empty.title, "icon only");
+        assert_eq!(empty.application_title(), None);
+        term.advance_bytes(b"\x1b]0;shell\x07\x1b[22;0t\x1bc\x1b[23;0t");
+        let reset = capture(&term);
+        assert_eq!(reset.title, "shell"); // Existing raw RIS title behavior.
+        assert_eq!(reset.application_title(), None);
+        term.advance_bytes(b"\x1b]0;new shell\x07");
+        assert_eq!(capture(&term).application_title(), Some("new shell"));
+        term.reset_connection();
+        assert_eq!(capture(&term).application_title(), None);
+    }
+
+    #[test]
+    fn application_title_reuses_a_bounded_single_line_without_changing_the_raw_title() {
+        let (mut term, _) = engine();
+        let raw = format!(
+            "  shell\u{2028}雪\u{2029}\u{202e}job\u{2066}  {}",
+            "é".repeat(500)
+        );
+        term.advance_bytes(format!("\x1b]2;{raw}\x07"));
+        let first = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(first.title, raw);
+        let caption = first.application_title().unwrap();
+        assert!(caption.starts_with("shell 雪 job é"));
+        assert!(caption.chars().count() <= 200);
+        assert!(!caption.contains(['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}']));
+        term.advance_bytes(b"ordinary output");
+        term.advance_bytes(format!("\x1b]2;{raw}\x07"));
+        let second = Snapshot::capture(&term, Some(&first), 2, 0, String::new(), 0);
+        assert!(Arc::ptr_eq(
+            first.application_title.as_ref().unwrap(),
+            second.application_title.as_ref().unwrap()
+        ));
+        term.advance_bytes("\x1b]0;\u{202e}\u{2066}\u{2028}  \x07");
+        assert_eq!(
+            Snapshot::capture(&term, None, 3, 0, String::new(), 0).application_title(),
+            None
+        );
+    }
+
+    #[test]
+    fn application_title_refreshes_only_the_subscribed_window_after_publication() {
+        let (mut term, _) = engine();
+        let frame = |term: &Terminal| Snapshot::capture(term, None, 0, 0, String::new(), 0);
+        let store = FrameStore::new(frame(&term));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observe = |name| {
+            let store = store.clone();
+            let observed = observed.clone();
+            crate::events::Inbox::new(move || {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((name, store.load().application_title().map(str::to_owned)));
+            })
+        };
+        let first = observe("first");
+        let second = observe("second");
+        store.watch_application_title(Some(&first));
+        term.advance_bytes(b"\x1b]1;background icon\x07");
+        store.publish(frame(&term));
+        assert!(observed.lock().unwrap().is_empty());
+        term.advance_bytes(b"\x1b]2;building\x07");
+        store.publish(frame(&term));
+        first.acknowledge_wake();
+        term.advance_bytes(b"more output\x1b]2;  building  \x07");
+        store.publish(frame(&term));
+        store.watch_application_title(Some(&second));
+        term.advance_bytes(b"\x1bc");
+        store.publish(frame(&term));
+        store.watch_application_title(None);
+        term.advance_bytes(b"\x1b]0;unwatched\x07");
+        store.publish(frame(&term));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [("first", Some("building".to_owned())), ("second", None)]
+        );
+    }
+
+    #[test]
+    fn indexed_titles_and_stack_depth_belong_to_the_requesting_connection() {
+        let (mut term, mut out) = engine();
+        let (mut sibling, mut other) = engine();
+        for i in 0..12 {
+            term.advance_bytes(format!("\x1b]2;title {i}\x07\x1b[22;2t"));
+        }
+        term.advance_bytes(b"\x1b[#S");
+        assert_eq!(receive(&mut out), b"\x1b[12;10#S");
+        term.advance_bytes(b"\x1b[23;2;1t");
+        assert_eq!(term.get_title(), "title 10");
+        term.advance_bytes(b"\x1b[23;2t");
+        assert_eq!(term.get_title(), "title 11");
+
+        sibling.advance_bytes(b"\x1b]2;sibling\x07\x1b[23;2;1t\x1b[23;2t\x1b[#S");
+        assert_eq!(sibling.get_title(), "sibling");
+        assert_eq!(receive(&mut other), b"\x1b[0;10#S");
+        for reconnect in [false, true] {
+            term.advance_bytes(b"\x1b]0;old shell\x07\x1b[22;0;10t\x1b[22;0t");
+            if reconnect {
+                term.reset_connection();
+            } else {
+                term.advance_bytes(b"\x1bc");
+            }
+            term.advance_bytes(b"\x1b]0;new shell\x07\x1b[23;0;10t\x1b[23;0t\x1b[#S");
+            assert_eq!(term.get_title(), "new shell");
+            assert_eq!(receive(&mut out), b"\x1b[0;10#S");
+        }
+    }
+    #[test]
+    fn in_band_resize_reports_committed_cells_and_pixels_when_subscribed() {
+        let (mut term, mut out) = engine();
+        let (mut neighbor, mut other_out) = engine();
+        term.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;2$y");
+        for _ in 0..2 {
+            term.advance_bytes(b"\x1b[?2048h");
+            assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+        }
+        let mut size = TerminalSize {
+            rows: 36,
+            cols: 120,
+            pixel_height: 864,
+            pixel_width: 1440,
+            dpi: 120,
+        };
+        term.advance_bytes(b"\x1b[?1049h");
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;36;120;864;1440t");
+        neighbor.resize(size);
+        neighbor.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut other_out), b"\x1b[?2048;2$y");
+
+        // Neither a repeated size nor a DPI change that keeps the text area
+        // identical should precede the query reply with another report.
+        term.resize(size);
+        size.dpi = 144;
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;1$y");
+
+        size.pixel_width = 0;
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;36;120;864;0t");
+        size.pixel_height = 0;
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;36;120;0;0t");
+        // Screen storage always has at least one cell, even if geometry isn't
+        // yet measurable. Report the committed grid rather than the raw request.
+        size.cols = 0;
+        size.rows = 0;
+        term.resize(size);
+        assert_eq!(receive(&mut out), b"\x1b[48;1;1;0;0t");
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?1049l\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;1$y");
+    }
+
+    #[test]
+    fn in_band_resize_subscription_obeys_disable_reset_and_disconnect() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[?2048h\x1b[!p\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+        // DECSTR resets a limited set of VT controls. Like focus and color
+        // subscriptions, this subscription lasts until DECRST, RIS or disconnect.
+        assert_eq!(receive(&mut out), b"\x1b[?2048;1$y");
+        term.advance_bytes(b"\x1b[?2048l");
+        let size = TerminalSize::default();
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?2048$p");
+        assert_eq!(receive(&mut out), b"\x1b[?2048;2$y");
+        for reset in [
+            |t: &mut Terminal| t.advance_bytes(b"\x1bc"),
+            |t: &mut Terminal| t.clear_resize_subscription(),
+            |t: &mut Terminal| t.reset_connection(),
+        ] {
+            term.advance_bytes(b"\x1b[?2048h");
+            assert_eq!(receive(&mut out), b"\x1b[48;24;80;0;0t");
+            reset(&mut term);
+            term.resize(TerminalSize { cols: 60, ..size });
+            term.resize(size);
+            term.advance_bytes(b"\x1b[?2048$p");
+            assert_eq!(receive(&mut out), b"\x1b[?2048;2$y");
+        }
+    }
+
+    #[test]
+    fn in_band_resize_uses_the_automatic_reply_channel_on_a_framed_viewer() {
+        let (mut term, _ordinary) = engine();
+        let (tx, mut viewer) = mpsc::unbounded_channel();
+        enter_herdr_viewer(&mut term, &tx, &crate::events::Events::default());
+        term.advance_bytes(b"\x1b[?2048h");
+        term.resize(TerminalSize::default());
+        for expected in [b"\x1b[48;24;80;480;800t".as_slice(), b"\x1b[48;24;80;0;0t"] {
+            match viewer.try_recv().unwrap() {
+                TransportInput::Automatic(bytes) => assert_eq!(bytes, expected),
+                _ => panic!("a size report was routed as user input"),
+            }
+        }
+        assert!(viewer.try_recv().is_err());
+    }
+
     #[test]
     fn reverse_screen_reports_state_across_screen_switches_and_resets() {
         let (mut terminal, mut replies) = engine();
@@ -2151,6 +2787,114 @@ mod tests {
             .map(|l| l.as_str().trim_end().to_owned())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 11,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+
+        // The full-width row contains a wide grapheme straddling the new edge.
+        term.advance_bytes("ABCD界GHIJK\x1b#6\x1b[6n");
+        let doubled = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(doubled.rows[0].as_str().trim_end(), "ABCD");
+        assert!(doubled.rows[0].is_double_width());
+        assert_eq!(doubled.cell_map(0).unwrap().logical_cols(), 5);
+        assert_eq!(doubled.visual_cursor_column(), 8);
+        assert_eq!(receive(&mut replies), b"\x1b[1;5R");
+
+        term.advance_bytes(b"\r123456\x1b[11G\x1b[A\x1b[6n\r\t\x1b[6n");
+        assert_eq!(receive(&mut replies), b"\x1b[1;5R");
+        assert_eq!(receive(&mut replies), b"\x1b[1;5R");
+        let wrapped = Snapshot::capture(&term, Some(&doubled), 2, 0, String::new(), 0);
+        assert_eq!(wrapped.rows[0].as_str().trim_end(), "12345");
+        assert_eq!(wrapped.rows[1].as_str().trim_end(), "6");
+
+        term.advance_bytes(b"\x1b#5\x1b[1;11HX");
+        let restored = Snapshot::capture(&term, Some(&wrapped), 3, 0, String::new(), 0);
+        assert_eq!(restored.rows[0].as_str().trim_end(), "12345     X");
+        assert!(!restored.rows[0].is_double_width());
+        assert_eq!(restored.cell_map(0).unwrap().logical_cols(), 11);
+
+        term.advance_bytes("\x1b[3;1H\x1b#6abc界\x1b[3;1H\x1b[@\x1b#5");
+        let edited = Snapshot::capture(&term, None, 4, 0, String::new(), 0);
+        assert_eq!(edited.rows[2].as_str().trim_end(), " abc");
+    }
+
+    #[test]
+    fn dec_line_renditions_reset_while_horizontal_margin_mode_is_enabled() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 10,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"\x1b#312345\r\n\x1b#412345");
+        let pair = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(pair.rows[0].is_double_height_top());
+        assert!(pair.rows[1].is_double_height_bottom());
+
+        term.advance_bytes(b"\x1b[?69hZ\x1b#6\x1b[3;1H\x1b#3\x1b[4;1H\x1b#4");
+        let margins = Snapshot::capture(&term, Some(&pair), 2, 0, String::new(), 0);
+        assert!(margins.cell_maps().iter().all(|map| map.width_scale() == 1));
+        assert_eq!(margins.rows[0].as_str().trim_end(), "12345");
+        assert_eq!(margins.rows[1].as_str().trim_end(), "1234Z");
+        assert!(margins.rows[2].as_str().trim_end().is_empty());
+
+        term.advance_bytes(b"\x1b[?69l\x1b#6");
+        let normal = Snapshot::capture(&term, Some(&margins), 3, 0, String::new(), 0);
+        assert!(normal.rows[3].is_double_width());
+    }
+
+    #[test]
+    fn dec_line_halves_survive_resize_and_keep_their_own_text() {
+        for alternate in [false, true] {
+            let size = TerminalSize {
+                cols: 12,
+                rows: 6,
+                ..Default::default()
+            };
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut term = create(size, tx);
+            if alternate {
+                term.advance_bytes(b"\x1b[?1049h");
+            }
+            term.advance_bytes(b"abcdefghijkl_\x1b[2;1H\x1b#3TopABC\r\n\x1b#4BotDEF");
+            term.resize(TerminalSize {
+                cols: 8,
+                rows: 8,
+                ..size
+            });
+            let screen = term.screen();
+            let lines: Vec<_> = screen.physical_lines().collect();
+            let top = lines
+                .iter()
+                .position(|line| line.is_double_height_top())
+                .unwrap();
+            assert!(lines[top + 1].is_double_height_bottom());
+            assert_eq!(lines[top].as_str().trim_end(), "TopA");
+            assert_eq!(lines[top + 1].as_str().trim_end(), "BotD");
+            assert_eq!(term.cursor_pos().x, 3);
+
+            term.advance_bytes(b"\x1b[S");
+            let visible = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+            let top = visible
+                .rows
+                .iter()
+                .position(|line| line.is_double_height_top())
+                .unwrap();
+            assert!(visible.rows[top + 1].is_double_height_bottom());
+        }
     }
 
     #[test]

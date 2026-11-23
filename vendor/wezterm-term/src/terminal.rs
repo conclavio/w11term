@@ -171,6 +171,27 @@ impl Terminal {
         }
     }
 
+    /// Construct a terminal whose sink already enqueues writes without blocking.
+    /// Input and device replies enter that queue before the calling operation returns.
+    pub fn with_nonblocking_writer(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration + Send + Sync>,
+        term_program: &str,
+        term_version: &str,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> Terminal {
+        Terminal {
+            state: TerminalState::with_nonblocking_writer(
+                size,
+                config,
+                term_program,
+                term_version,
+                writer,
+            ),
+            parser: Parser::new(),
+        }
+    }
+
     /// Feed the terminal parser a slice of bytes from the output
     /// of the associated program.
     /// The slice is not required to be a complete sequence of escape

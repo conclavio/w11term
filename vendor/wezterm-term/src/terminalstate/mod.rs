@@ -33,9 +33,20 @@ mod kitty;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod rendition;
+mod sgr_stack;
 mod sixel;
+mod title;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
+
+#[derive(Default)]
+struct SavedPrivateModes {
+    flags: HashMap<u16, bool>,
+    alternate_screen: Option<bool>,
+    mouse_reporting: Option<(bool, bool, bool)>,
+    mouse_encoding: Option<MouseEncoding>,
+}
 
 lazy_static::lazy_static! {
     static ref DB: Database = {
@@ -348,6 +359,7 @@ pub struct TerminalState {
     any_event_mouse: bool,
     focus_tracking: bool,
     report_color_scheme_changes: bool,
+    report_text_area_resize: bool,
     /// X10 (legacy), SGR, and SGR-Pixels style mouse tracking and
     /// reporting is enabled
     mouse_encoding: MouseEncoding,
@@ -369,9 +381,10 @@ pub struct TerminalState {
     tabs: TabStop,
 
     /// The terminal title string (OSC 2)
-    title: String,
+    title: title::WindowTitle,
     /// The icon title string (OSC 1)
     icon_title: Option<String>,
+    saved_titles: title::TitleStack,
     progress: Progress,
     // OSC 9;4 preserves the previous value while the bar is indeterminate.
     progress_value: u8,
@@ -391,6 +404,7 @@ pub struct TerminalState {
     // to an empty host. The SSH client must validate the reported destination.
     current_dir: Option<(Url, Arc<str>)>,
     conemu_directory_reports: bool,
+    iterm_directory_peer: Option<iterm::DirectoryPeer>,
     command_history: Arc<VecDeque<Arc<CompletedCommand>>>,
     next_command_id: u64,
     capturing_shell_input: bool,
@@ -409,9 +423,12 @@ pub struct TerminalState {
 
     kitty_img: KittyImageState,
     inactive_kitty_img: KittyImageState,
+    kitty_animation_time: Option<std::time::Instant>,
     seqno: SequenceNo,
 
     synchronized_output: bool,
+    saved_private_modes: SavedPrivateModes,
+    sgr_stack: sgr_stack::SgrStack,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -555,7 +572,6 @@ impl TerminalState {
             self.config.bidi_mode(),
         );
         primary.full_reset();
-        primary.saved_cursor = None;
         self.increment_seqno();
         {
             let mut performer = performer::Performer::new(self);
@@ -566,6 +582,7 @@ impl TerminalState {
         self.kitty_img = Default::default();
         self.inactive_kitty_img = Default::default();
         self.image_cache.clear();
+        self.sgr_stack = Default::default();
         self.screen.screen = primary;
         self.activate_screen(false);
     }
@@ -585,7 +602,22 @@ impl TerminalState {
         term_version: &str,
         writer: Box<dyn std::io::Write + Send>,
     ) -> TerminalState {
-        let writer: Box<dyn std::io::Write + Send> = Box::new(ThreadedWriter::new(writer));
+        Self::with_nonblocking_writer(
+            size,
+            config,
+            term_program,
+            term_version,
+            Box::new(ThreadedWriter::new(writer)),
+        )
+    }
+
+    pub(crate) fn with_nonblocking_writer(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> TerminalState {
         let seqno = 1;
         let screen = ScreenOrAlt::new(size, &config, seqno, config.bidi_mode());
 
@@ -620,6 +652,7 @@ impl TerminalState {
             bracketed_paste: false,
             focus_tracking: false,
             report_color_scheme_changes: false,
+            report_text_area_resize: false,
             mouse_encoding: MouseEncoding::X10,
             keyboard_encoding: KeyboardEncoding::Xterm,
             sixel_scrolls_right: false,
@@ -634,8 +667,9 @@ impl TerminalState {
             newline_mode: false,
             current_mouse_buttons: vec![],
             tabs: TabStop::new(size.cols, 8),
-            title: "wezterm".to_string(),
+            title: Default::default(),
             icon_title: None,
+            saved_titles: Default::default(),
             palette: Default::default(),
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,
@@ -646,6 +680,7 @@ impl TerminalState {
             download_handler: None,
             current_dir: None,
             conemu_directory_reports: false,
+            iterm_directory_peer: None,
             command_history: Arc::default(),
             next_command_id: 1,
             capturing_shell_input: false,
@@ -658,7 +693,10 @@ impl TerminalState {
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
             inactive_kitty_img: Default::default(),
+            kitty_animation_time: None,
             synchronized_output: false,
+            saved_private_modes: SavedPrivateModes::default(),
+            sgr_stack: Default::default(),
             seqno,
             unicode_version,
             unicode_version_stack: vec![],
@@ -688,6 +726,10 @@ impl TerminalState {
         self.synchronized_output
     }
 
+    pub fn in_band_resize_enabled(&self) -> bool {
+        self.report_text_area_resize
+    }
+
     /// Used by the embedding's watchdog; does not block parsing or input.
     pub fn end_synchronized_output(&mut self) {
         self.synchronized_output = false;
@@ -700,6 +742,11 @@ impl TerminalState {
     /// The program that requested notifications no longer owns this connection.
     pub fn clear_color_scheme_subscription(&mut self) {
         self.report_color_scheme_changes = false;
+    }
+
+    /// Stop asynchronous size reports when the program that requested them disconnects.
+    pub fn clear_resize_subscription(&mut self) {
+        self.report_text_area_resize = false;
     }
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
@@ -770,7 +817,13 @@ impl TerminalState {
     /// Replace the input/reply sink when the host launches a new transport.
     /// Bytes still queued on the old writer remain bound to the old sink.
     pub fn replace_writer(&mut self, writer: Box<dyn std::io::Write + Send>) {
-        self.writer = BufWriter::new(Box::new(ThreadedWriter::new(writer)));
+        self.replace_nonblocking_writer(Box::new(ThreadedWriter::new(writer)));
+    }
+
+    /// Replace a queue-backed sink without another thread reordering writes
+    /// relative to resize requests on the same transport queue.
+    pub fn replace_nonblocking_writer(&mut self, writer: Box<dyn std::io::Write + Send>) {
+        self.writer = BufWriter::new(writer);
         self.parser_reply_writer = None;
     }
 
@@ -796,7 +849,13 @@ impl TerminalState {
     /// What we do here is prefer to return the OSC 1 icon title
     /// if it is set, otherwise return the OSC 2 window title.
     pub fn get_title(&self) -> &str {
-        self.icon_title.as_ref().unwrap_or(&self.title)
+        self.icon_title.as_deref().unwrap_or(&self.title.raw)
+    }
+
+    /// The window title supplied by the application, independently of OSC 1
+    /// icon names. Full reset and a saved initial title clear its provenance.
+    pub fn application_window_title(&self) -> Option<&Arc<str>> {
+        self.title.from_application.then_some(&self.title.raw)
     }
 
     pub fn get_progress(&self) -> Progress {
@@ -1010,6 +1069,9 @@ impl TerminalState {
     fn activate_screen(&mut self, alternate: bool) {
         if self.screen.is_alt_screen_active() != alternate {
             std::mem::swap(&mut self.kitty_img, &mut self.inactive_kitty_img);
+            if let Some(now) = self.kitty_animation_time {
+                self.advance_kitty_animations(now);
+            }
         }
         if alternate {
             self.screen.activate_alt_screen(self.seqno);
@@ -1235,6 +1297,9 @@ impl TerminalState {
     /// We need to resize both the primary and alt screens, adjusting
     /// the cursor positions of both accordingly.
     pub fn resize(&mut self, size: TerminalSize) {
+        let previous = self
+            .report_text_area_resize
+            .then(|| self.text_area_dimensions());
         self.increment_seqno();
         let (cursor_main, cursor_alt) = if self.screen.alt_screen_is_active {
             (
@@ -1296,6 +1361,30 @@ impl TerminalState {
                 saved.wrap_next = false;
             }
         }
+
+        if let Some(previous) = previous {
+            let current = self.text_area_dimensions();
+            if current != previous {
+                // Resizes happen outside parser dispatch. Preserve the separate
+                // automatic-reply channel on a framed session.
+                let reply = self
+                    .parser_reply_writer
+                    .as_mut()
+                    .unwrap_or(&mut self.writer);
+                Self::write_resize_report(reply, current);
+            }
+        }
+    }
+
+    /// Mode 2048 uses height before width, first in cells and then in pixels.
+    fn text_area_dimensions(&self) -> [usize; 4] {
+        let size = self.get_size();
+        [size.rows, size.cols, size.pixel_height, size.pixel_width]
+    }
+
+    fn write_resize_report(writer: &mut impl Write, [rows, cols, height, width]: [usize; 4]) {
+        write!(writer, "\x1b[48;{rows};{cols};{height};{width}t").ok();
+        writer.flush().ok();
     }
 
     pub fn get_size(&self) -> TerminalSize {
@@ -1357,13 +1446,22 @@ impl TerminalState {
         }
     }
 
-    /// Sets the cursor position to precisely the x and values provided
+    /// Limit the cursor to the addressable columns of a DEC-sized row.
+    fn constrain_line_column(&self, x: usize, y: VisibleRowIndex) -> usize {
+        if self.screen().line_width_scale(y) == 1 {
+            x
+        } else {
+            x.min(self.screen().logical_cols(y) - 1)
+        }
+    }
+
+    /// Set the cursor position in visible screen coordinates.
     fn set_cursor_position_absolute(&mut self, x: usize, y: VisibleRowIndex) {
         if self.cursor.y != y {
             self.clear_semantic_attribute_due_to_movement();
         }
         self.cursor.y = y;
-        self.cursor.x = x;
+        self.cursor.x = self.constrain_line_column(x, y);
         self.cursor.seqno = self.seqno;
         self.wrap_next = false;
     }
@@ -1436,6 +1534,13 @@ impl TerminalState {
         let top_and_bottom_margins = self.top_and_bottom_margins.clone();
         let left_and_right_margins = self.left_and_right_margins.clone();
         let bidi_mode = self.get_bidi_mode();
+        let count =
+            num_rows.min((top_and_bottom_margins.end - top_and_bottom_margins.start) as usize);
+        let graphics = self.prepare_kitty_margin_scroll(
+            &top_and_bottom_margins,
+            &left_and_right_margins,
+            -(count as VisibleRowIndex),
+        );
         self.screen_mut().scroll_up_within_margins(
             &top_and_bottom_margins,
             &left_and_right_margins,
@@ -1443,7 +1548,9 @@ impl TerminalState {
             seqno,
             blank_attr,
             bidi_mode,
-        )
+        );
+        self.finish_kitty_tile_update(graphics);
+        self.cursor.x = self.constrain_line_column(self.cursor.x, self.cursor.y);
     }
 
     fn scroll_down(&mut self, num_rows: usize) {
@@ -1452,6 +1559,13 @@ impl TerminalState {
         let top_and_bottom_margins = self.top_and_bottom_margins.clone();
         let left_and_right_margins = self.left_and_right_margins.clone();
         let bidi_mode = self.get_bidi_mode();
+        let count =
+            num_rows.min((top_and_bottom_margins.end - top_and_bottom_margins.start) as usize);
+        let graphics = self.prepare_kitty_margin_scroll(
+            &top_and_bottom_margins,
+            &left_and_right_margins,
+            count as VisibleRowIndex,
+        );
         self.screen_mut().scroll_down_within_margins(
             &top_and_bottom_margins,
             &left_and_right_margins,
@@ -1459,7 +1573,9 @@ impl TerminalState {
             seqno,
             blank_attr,
             bidi_mode,
-        )
+        );
+        self.finish_kitty_tile_update(graphics);
+        self.cursor.x = self.constrain_line_column(self.cursor.x, self.cursor.y);
     }
 
     /// Defined by FinalTermSemanticPrompt; a fresh-line is a NOP if the
@@ -1546,7 +1662,11 @@ impl TerminalState {
             Some(x) => x,
             None => self.left_and_right_margins.end - 1,
         };
-        self.cursor.x = x.min(self.left_and_right_margins.end - 1);
+        let right = self
+            .left_and_right_margins
+            .end
+            .min(self.screen().logical_cols(self.cursor.y));
+        self.cursor.x = x.min(right - 1);
         self.cursor.seqno = seqno;
     }
 
@@ -1773,8 +1893,7 @@ impl TerminalState {
     /// Indicates that mode is permanently enabled
     fn decqrm_response_permanent(&mut self, mode: Mode) {
         let (is_dec, number) = match &mode {
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(code)) => (true, code.to_u16().unwrap()),
-            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => (true, *code),
+            Mode::QueryDecPrivateMode(code) => (true, Self::private_mode_number(code)),
             Mode::QueryMode(TerminalMode::Code(code)) => (false, code.to_u16().unwrap()),
             Mode::QueryMode(TerminalMode::Unspecified(code)) => (false, *code),
             _ => unreachable!(),
@@ -1788,8 +1907,7 @@ impl TerminalState {
 
     fn decqrm_response(&mut self, mode: Mode, recognized: bool, enabled: bool) {
         let (is_dec, number) = match &mode {
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(code)) => (true, code.to_u16().unwrap()),
-            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(code)) => (true, *code),
+            Mode::QueryDecPrivateMode(code) => (true, Self::private_mode_number(code)),
             Mode::QueryMode(TerminalMode::Code(code)) => (false, code.to_u16().unwrap()),
             Mode::QueryMode(TerminalMode::Unspecified(code)) => (false, *code),
             _ => unreachable!(),
@@ -1812,16 +1930,148 @@ impl TerminalState {
         self.writer.flush().ok();
     }
 
+    fn private_mode_flag(&self, mode: &DecPrivateMode) -> Option<bool> {
+        use DecPrivateModeCode::*;
+        let flag = match mode {
+            DecPrivateMode::Unspecified(2031) => self.report_color_scheme_changes,
+            DecPrivateMode::Code(code) => match code {
+                InBandResize => self.report_text_area_resize,
+                StartBlinkingCursor => self.cursor.shape.is_blinking(),
+                Win32InputMode => self.keyboard_encoding == KeyboardEncoding::Win32,
+                ReverseWraparound => self.reverse_wraparound_mode,
+                LeftRightMarginMode => self.left_and_right_margin_mode,
+                AutoWrap => self.dec_auto_wrap,
+                OriginMode => self.dec_origin_mode,
+                UsePrivateColorRegistersForEachGraphic => {
+                    self.use_private_color_registers_for_each_graphic
+                }
+                SynchronizedOutput => self.synchronized_output,
+                ReverseVideo => self.reverse_video_mode,
+                BracketedPaste => self.bracketed_paste,
+                ApplicationCursorKeys => self.application_cursor_keys,
+                SixelDisplayMode => self.sixel_display_mode,
+                DecAnsiMode => self.dec_ansi_mode,
+                ShowCursor => self.cursor_visible,
+                MouseTracking => self.mouse_tracking,
+                ButtonEventMouse => self.button_event_mouse,
+                AnyEventMouse => self.any_event_mouse,
+                FocusTracking => self.focus_tracking,
+                SGRMouse => matches!(self.mouse_encoding, MouseEncoding::SGR),
+                SGRPixelsMouse => matches!(self.mouse_encoding, MouseEncoding::SgrPixels),
+                Utf8Mouse => matches!(self.mouse_encoding, MouseEncoding::Utf8),
+                SixelScrollsRight => self.sixel_scrolls_right,
+                EnableAlternateScreen
+                | OptEnableAlternateScreen
+                | ClearAndEnableAlternateScreen => self.screen.is_alt_screen_active(),
+                _ => return None,
+            },
+            DecPrivateMode::Unspecified(_) => return None,
+        };
+        Some(flag)
+    }
+
+    fn private_mode_number(mode: &DecPrivateMode) -> u16 {
+        match mode {
+            DecPrivateMode::Code(code) => code.to_u16().unwrap(),
+            DecPrivateMode::Unspecified(number) => *number,
+        }
+    }
+
+    // XTSAVE/XTRESTORE use one saved value per setting, with aliases for
+    // the alternate buffer, mouse reporting level and mouse encoding.
+    fn save_private_mode(&mut self, mode: DecPrivateMode) {
+        use DecPrivateMode::Code;
+        use DecPrivateModeCode::*;
+        match mode {
+            Code(
+                EnableAlternateScreen | OptEnableAlternateScreen | ClearAndEnableAlternateScreen,
+            ) => {
+                self.saved_private_modes.alternate_screen =
+                    Some(self.screen.is_alt_screen_active());
+            }
+            Code(MouseTracking | HighlightMouseTracking | ButtonEventMouse | AnyEventMouse) => {
+                self.saved_private_modes.mouse_reporting = Some((
+                    self.mouse_tracking,
+                    self.button_event_mouse,
+                    self.any_event_mouse,
+                ));
+            }
+            Code(Utf8Mouse | SGRMouse | SGRPixelsMouse) => {
+                self.saved_private_modes.mouse_encoding = Some(self.mouse_encoding);
+            }
+            Code(SaveCursor) => self.dec_save_cursor(),
+            mode => {
+                if let Some(value) = self.private_mode_flag(&mode) {
+                    self.saved_private_modes
+                        .flags
+                        .insert(Self::private_mode_number(&mode), value);
+                }
+            }
+        }
+    }
+
+    fn restore_private_mode(&mut self, mode: DecPrivateMode) {
+        use DecPrivateMode::Code;
+        use DecPrivateModeCode::*;
+        match mode {
+            Code(
+                EnableAlternateScreen | OptEnableAlternateScreen | ClearAndEnableAlternateScreen,
+            ) => {
+                // Preserve the contents of both buffers when restoring the selector.
+                if let Some(alternate) = self.saved_private_modes.alternate_screen {
+                    if alternate != self.screen.is_alt_screen_active() {
+                        self.activate_screen(alternate);
+                    }
+                }
+            }
+            Code(MouseTracking | HighlightMouseTracking | ButtonEventMouse | AnyEventMouse) => {
+                if let Some((press, drag, motion)) = self.saved_private_modes.mouse_reporting {
+                    (
+                        self.mouse_tracking,
+                        self.button_event_mouse,
+                        self.any_event_mouse,
+                    ) = (press, drag, motion);
+                    self.last_mouse_move.take();
+                }
+            }
+            Code(Utf8Mouse | SGRMouse | SGRPixelsMouse) => {
+                if let Some(encoding) = self.saved_private_modes.mouse_encoding {
+                    self.mouse_encoding = encoding;
+                    self.last_mouse_move.take();
+                }
+            }
+            Code(SaveCursor) => self.dec_restore_cursor(),
+            mode => {
+                if let Some(&enabled) = self
+                    .saved_private_modes
+                    .flags
+                    .get(&Self::private_mode_number(&mode))
+                {
+                    self.perform_csi_mode(if enabled {
+                        Mode::SetDecPrivateMode(mode)
+                    } else {
+                        Mode::ResetDecPrivateMode(mode)
+                    });
+                }
+            }
+        }
+    }
+
     fn perform_csi_mode(&mut self, mode: Mode) {
         match mode {
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::InBandResize)) => {
+                self.report_text_area_resize = true;
+                let dimensions = self.text_area_dimensions();
+                Self::write_resize_report(&mut self.writer, dimensions);
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::InBandResize)) => {
+                self.clear_resize_subscription();
+            }
             Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
                 self.report_color_scheme_changes = true;
             }
             Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
                 self.report_color_scheme_changes = false;
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
-                self.decqrm_response(mode, true, self.report_color_scheme_changes);
             }
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::StartBlinkingCursor,
@@ -1841,11 +2091,6 @@ impl TerminalState {
                     (Default, false) => Default,
                 };
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::StartBlinkingCursor,
-            )) => {
-                self.decqrm_response(mode, true, self.cursor.shape.is_blinking());
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AutoRepeat))
             | Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AutoRepeat)) => {
@@ -1860,14 +2105,6 @@ impl TerminalState {
                 self.keyboard_encoding = KeyboardEncoding::Xterm;
             }
 
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::Win32InputMode)) => {
-                self.decqrm_response(
-                    mode,
-                    true,
-                    self.keyboard_encoding == KeyboardEncoding::Win32,
-                );
-            }
-
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::ReverseWraparound,
             )) => {
@@ -1880,15 +2117,19 @@ impl TerminalState {
                 self.reverse_wraparound_mode = false;
             }
 
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ReverseWraparound,
-            )) => {
-                self.decqrm_response(mode, true, self.reverse_wraparound_mode);
-            }
-
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::LeftRightMarginMode,
             )) => {
+                if !self.left_and_right_margin_mode {
+                    if self.screen().line_width_scale(self.cursor.y) > 1 {
+                        self.wrap_next = false;
+                    }
+                    // DECLRMM restores the live pages to single-width, single-height.
+                    self.screen.screen.reset_visible_line_renditions(self.seqno);
+                    self.screen
+                        .alt_screen
+                        .reset_visible_line_renditions(self.seqno);
+                }
                 self.left_and_right_margin_mode = true;
             }
 
@@ -1897,12 +2138,6 @@ impl TerminalState {
             )) => {
                 self.left_and_right_margin_mode = false;
                 self.left_and_right_margins = 0..self.screen().physical_cols;
-            }
-
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::LeftRightMarginMode,
-            )) => {
-                self.decqrm_response(mode, true, self.left_and_right_margin_mode);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -1936,10 +2171,6 @@ impl TerminalState {
                 self.dec_auto_wrap = false;
             }
 
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AutoWrap)) => {
-                self.decqrm_response(mode, true, self.dec_auto_wrap);
-            }
-
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::OriginMode)) => {
                 self.dec_origin_mode = true;
                 self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
@@ -1948,10 +2179,6 @@ impl TerminalState {
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::OriginMode)) => {
                 self.dec_origin_mode = false;
                 self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
-            }
-
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::OriginMode)) => {
-                self.decqrm_response(mode, true, self.dec_origin_mode);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -1964,15 +2191,6 @@ impl TerminalState {
             )) => {
                 self.use_private_color_registers_for_each_graphic = false;
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::UsePrivateColorRegistersForEachGraphic,
-            )) => {
-                self.decqrm_response(
-                    mode,
-                    true,
-                    self.use_private_color_registers_for_each_graphic,
-                );
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
@@ -1983,11 +2201,6 @@ impl TerminalState {
                 DecPrivateModeCode::SynchronizedOutput,
             )) => {
                 self.synchronized_output = false;
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::SynchronizedOutput,
-            )) => {
-                self.decqrm_response(mode, true, self.synchronized_output);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SmoothScroll))
@@ -2005,10 +2218,6 @@ impl TerminalState {
                 // Turn off reverse video for all of the lines on the
                 // display.
                 self.reverse_video_mode = false;
-            }
-
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::ReverseVideo)) => {
-                self.decqrm_response(mode, true, self.reverse_video_mode);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::Select132Columns))
@@ -2072,9 +2281,6 @@ impl TerminalState {
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::BracketedPaste)) => {
                 self.bracketed_paste = false;
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::BracketedPaste)) => {
-                self.decqrm_response(mode, true, self.bracketed_paste);
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::OptEnableAlternateScreen,
@@ -2117,11 +2323,6 @@ impl TerminalState {
             )) => {
                 self.application_cursor_keys = false;
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ApplicationCursorKeys,
-            )) => {
-                self.decqrm_response(mode, true, self.application_cursor_keys);
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SixelDisplayMode)) => {
                 self.sixel_display_mode = true;
@@ -2131,11 +2332,6 @@ impl TerminalState {
             )) => {
                 self.sixel_display_mode = false;
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::SixelDisplayMode,
-            )) => {
-                self.decqrm_response(mode, true, self.sixel_display_mode);
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::DecAnsiMode)) => {
                 self.dec_ansi_mode = true;
@@ -2143,18 +2339,12 @@ impl TerminalState {
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::DecAnsiMode)) => {
                 self.dec_ansi_mode = false;
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::DecAnsiMode)) => {
-                self.decqrm_response(mode, true, self.dec_ansi_mode);
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::ShowCursor)) => {
                 self.cursor_visible = true;
             }
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::ShowCursor)) => {
                 self.cursor_visible = false;
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::ShowCursor)) => {
-                self.decqrm_response(mode, true, self.cursor_visible);
             }
             Mode::SetMode(TerminalMode::Code(TerminalModeCode::ShowCursor)) => {
                 self.cursor_visible = true;
@@ -2170,9 +2360,6 @@ impl TerminalState {
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::MouseTracking)) => {
                 self.mouse_tracking = false;
                 self.last_mouse_move.take();
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::MouseTracking)) => {
-                self.decqrm_response(mode, true, self.mouse_tracking);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -2192,11 +2379,6 @@ impl TerminalState {
                 self.button_event_mouse = false;
                 self.last_mouse_move.take();
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::ButtonEventMouse,
-            )) => {
-                self.decqrm_response(mode, true, self.button_event_mouse);
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AnyEventMouse)) => {
                 self.any_event_mouse = true;
@@ -2205,9 +2387,6 @@ impl TerminalState {
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AnyEventMouse)) => {
                 self.any_event_mouse = false;
                 self.last_mouse_move.take();
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::AnyEventMouse)) => {
-                self.decqrm_response(mode, true, self.any_event_mouse);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::FocusTracking)) => {
@@ -2218,9 +2397,6 @@ impl TerminalState {
                 self.focus_tracking = false;
                 self.last_mouse_move.take();
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::FocusTracking)) => {
-                self.decqrm_response(mode, true, self.focus_tracking);
-            }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SGRMouse)) => {
                 self.mouse_encoding = MouseEncoding::SGR;
@@ -2230,16 +2406,6 @@ impl TerminalState {
                 self.mouse_encoding = MouseEncoding::X10;
                 self.last_mouse_move.take();
             }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SGRMouse)) => {
-                self.decqrm_response(
-                    mode,
-                    true,
-                    match self.mouse_encoding {
-                        MouseEncoding::SGR => true,
-                        _ => false,
-                    },
-                );
-            }
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SGRPixelsMouse)) => {
                 self.mouse_encoding = MouseEncoding::SgrPixels;
                 self.last_mouse_move.take();
@@ -2247,16 +2413,6 @@ impl TerminalState {
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SGRPixelsMouse)) => {
                 self.mouse_encoding = MouseEncoding::X10;
                 self.last_mouse_move.take();
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SGRPixelsMouse)) => {
-                self.decqrm_response(
-                    mode,
-                    true,
-                    match self.mouse_encoding {
-                        MouseEncoding::SgrPixels => true,
-                        _ => false,
-                    },
-                );
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::Utf8Mouse)) => {
@@ -2266,16 +2422,6 @@ impl TerminalState {
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::Utf8Mouse)) => {
                 self.mouse_encoding = MouseEncoding::X10;
                 self.last_mouse_move.take();
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::Utf8Mouse)) => {
-                self.decqrm_response(
-                    mode,
-                    true,
-                    match self.mouse_encoding {
-                        MouseEncoding::Utf8 => true,
-                        _ => false,
-                    },
-                );
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -2287,11 +2433,6 @@ impl TerminalState {
                 DecPrivateModeCode::SixelScrollsRight,
             )) => {
                 self.sixel_scrolls_right = false;
-            }
-            Mode::QueryDecPrivateMode(DecPrivateMode::Code(
-                DecPrivateModeCode::SixelScrollsRight,
-            )) => {
-                self.decqrm_response(mode, true, self.sixel_scrolls_right);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -2314,10 +2455,8 @@ impl TerminalState {
                     self.dec_restore_cursor();
                 }
             }
-            Mode::SaveDecPrivateMode(DecPrivateMode::Code(n))
-            | Mode::RestoreDecPrivateMode(DecPrivateMode::Code(n)) => {
-                log::warn!("save/restore dec mode {:?} unimplemented", n)
-            }
+            Mode::SaveDecPrivateMode(mode) => self.save_private_mode(mode),
+            Mode::RestoreDecPrivateMode(mode) => self.restore_private_mode(mode),
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::MinTTYApplicationEscapeKeyMode,
@@ -2341,9 +2480,7 @@ impl TerminalState {
             )) => {}
 
             Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(_))
-            | Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(_))
-            | Mode::SaveDecPrivateMode(DecPrivateMode::Unspecified(_))
-            | Mode::RestoreDecPrivateMode(DecPrivateMode::Unspecified(_)) => {
+            | Mode::ResetDecPrivateMode(DecPrivateMode::Unspecified(_)) => {
                 if self.config.log_unknown_escape_sequences() {
                     log::warn!("unhandled DecPrivateMode {:?}", mode);
                 }
@@ -2372,9 +2509,11 @@ impl TerminalState {
                 }
             }
 
-            Mode::QueryDecPrivateMode(_) | Mode::QueryMode(_) => {
-                self.decqrm_response(mode, false, false);
+            Mode::QueryDecPrivateMode(ref private_mode) => {
+                let value = self.private_mode_flag(private_mode);
+                self.decqrm_response(mode, value.is_some(), value.unwrap_or(false));
             }
+            Mode::QueryMode(_) => self.decqrm_response(mode, false, false),
         }
     }
 
@@ -2466,13 +2605,21 @@ impl TerminalState {
                     write!(
                         self.writer,
                         "{}",
-                        OperatingSystemCommand::SetWindowTitleSun(self.title.clone())
+                        OperatingSystemCommand::SetWindowTitleSun(self.title.raw.to_string())
                     )
                     .ok();
                     self.writer.flush().ok();
                 }
             }
 
+            Window::ReportRectangularSgr {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                self.report_rectangular_sgr(top, left, bottom, right);
+            }
             Window::ChecksumRectangularArea {
                 request_id,
                 top,
@@ -2497,12 +2644,15 @@ impl TerminalState {
                 // up to the user!
             }
             Window::Iconify | Window::DeIconify => {}
-            Window::PopIconAndWindowTitle
-            | Window::PopWindowTitle
-            | Window::PopIconTitle
-            | Window::PushIconAndWindowTitle
-            | Window::PushIconTitle
-            | Window::PushWindowTitle => {}
+            Window::PushIconAndWindowTitle => self.save_titles(title::Scope::Both, None),
+            Window::PushIconTitle => self.save_titles(title::Scope::Icon, None),
+            Window::PushWindowTitle => self.save_titles(title::Scope::Window, None),
+            Window::PopIconAndWindowTitle => self.restore_titles(title::Scope::Both, None),
+            Window::PopIconTitle => self.restore_titles(title::Scope::Icon, None),
+            Window::PopWindowTitle => self.restore_titles(title::Scope::Window, None),
+            Window::SaveTitleToSlot { scope, slot } => self.save_titles(scope, Some(slot)),
+            Window::RestoreTitleFromSlot { scope, slot } => self.restore_titles(scope, Some(slot)),
+            Window::ReportTitleStackPosition => self.report_title_stack_position(),
 
             _ => {
                 if self.config.log_unknown_escape_sequences() {
@@ -2527,7 +2677,10 @@ impl TerminalState {
                 self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToStartOfLine));
                 0..cy
             }
-            EraseInDisplay::EraseDisplay => 0..rows,
+            EraseInDisplay::EraseDisplay => {
+                self.clear_visible_kitty_images();
+                0..rows
+            }
             EraseInDisplay::EraseScrollback => {
                 self.screen_mut().erase_scrollback();
                 return;
@@ -2535,12 +2688,56 @@ impl TerminalState {
         };
 
         {
-            let bidi_mode = self.get_bidi_mode();
-            let screen = self.screen_mut();
+            let preserve_kitty = erase != EraseInDisplay::EraseDisplay;
             for y in row_range {
-                screen.clear_line(y, col_range.clone(), &pen, seqno, bidi_mode);
+                self.erase_line_text(y, col_range.clone(), &pen, preserve_kitty);
+                let screen = self.screen_mut();
                 let line_idx = screen.phys_row(y);
                 screen.line_mut(line_idx).set_single_width(seqno);
+            }
+        }
+    }
+
+    fn erase_line_text(
+        &mut self,
+        y: VisibleRowIndex,
+        cols: Range<usize>,
+        pen: &CellAttributes,
+        preserve_kitty: bool,
+    ) {
+        let seqno = self.seqno;
+        let bidi_mode = self.get_bidi_mode();
+        let keep_placements = preserve_kitty && self.kitty_img.has_physical_placements();
+        let screen = self.screen_mut();
+        let row = screen.phys_row(y);
+        let mut saved = Vec::new();
+        if keep_placements {
+            let line = screen.line_mut(row);
+            // Wide glyph continuations can hold their own image tiles. Take
+            // the raw cells when the line has graphics or a wide character.
+            if line
+                .visible_cells()
+                .any(|cell| cell.width() > 1 || cell.attrs().images().is_some())
+            {
+                let cells = line.cells_mut_for_attr_changes_only();
+                for (x, cell) in cells.iter().enumerate().take(cols.end).skip(cols.start) {
+                    for tile in cell.attrs().images().into_iter().flatten() {
+                        if tile.has_placement_id() {
+                            saved.push((x, tile));
+                        }
+                    }
+                }
+            }
+        }
+        screen.clear_line(y, cols, pen, seqno, bidi_mode);
+        if let Some((last, _)) = saved.last() {
+            let line = screen.line_mut(row);
+            if *last >= line.len() {
+                line.resize(*last + 1, seqno);
+            }
+            let cells = line.cells_mut_for_attr_changes_only();
+            for (x, tile) in saved {
+                cells[x].attrs_mut().attach_image(Box::new(tile));
             }
         }
     }
@@ -2564,14 +2761,20 @@ impl TerminalState {
                 let x = self.cursor.x;
 
                 if x >= self.left_and_right_margins.start && x < self.left_and_right_margins.end {
-                    let right_margin = self.left_and_right_margins.end;
+                    let right_margin = self
+                        .left_and_right_margins
+                        .end
+                        .min(self.screen().logical_cols(y));
                     let limit = (x + n as usize).min(right_margin);
 
                     let blank_attr = self.pen.clone_sgr_only();
+                    let graphics =
+                        self.prepare_kitty_text_edit(&(y..y + 1), &(x..right_margin), false);
                     let screen = self.screen_mut();
                     for _ in x..limit as usize {
                         screen.erase_cell(x, y, right_margin, seqno, blank_attr.clone());
                     }
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::DeleteLine(n) => {
@@ -2582,6 +2785,11 @@ impl TerminalState {
                     let left_and_right_margins = self.left_and_right_margins.clone();
                     let blank_attr = self.pen.clone_sgr_only();
                     let bidi_mode = self.get_bidi_mode();
+                    let graphics = self.prepare_kitty_text_edit(
+                        &top_and_bottom_margins,
+                        &left_and_right_margins,
+                        true,
+                    );
                     self.screen_mut().scroll_up_within_margins(
                         &top_and_bottom_margins,
                         &left_and_right_margins,
@@ -2590,12 +2798,13 @@ impl TerminalState {
                         blank_attr,
                         bidi_mode,
                     );
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::EraseCharacter(n) => {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
-                let limit = (x + n as usize).min(self.screen().physical_cols);
+                let limit = (x + n as usize).min(self.screen().logical_cols(y));
                 {
                     let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
                     let screen = self.screen_mut();
@@ -2609,8 +2818,7 @@ impl TerminalState {
                 let cx = self.cursor.x;
                 let cy = self.cursor.y;
                 let pen = self.pen.clone_sgr_only();
-                let cols = self.screen().physical_cols;
-                let bidi_mode = self.get_bidi_mode();
+                let cols = self.screen().logical_cols(cy);
                 let range = match erase {
                     // If wrap_next is true, then cx is effectively 1 column to the right.
                     // It feels wrong to handle this here, but in trying to centralize
@@ -2623,8 +2831,7 @@ impl TerminalState {
                     EraseInLine::EraseLine => 0..cols,
                 };
 
-                self.screen_mut()
-                    .clear_line(cy, range, &pen, seqno, bidi_mode);
+                self.erase_line_text(cy, range, &pen, true);
             }
             Edit::InsertCharacter(n) => {
                 // https://vt100.net/docs/vt510-rm/ICH.html
@@ -2638,11 +2845,16 @@ impl TerminalState {
                 if self.top_and_bottom_margins.contains(&y)
                     && self.left_and_right_margins.contains(&x)
                 {
-                    let margin = self.left_and_right_margins.end;
+                    let margin = self
+                        .left_and_right_margins
+                        .end
+                        .min(self.screen().logical_cols(y));
+                    let graphics = self.prepare_kitty_text_edit(&(y..y + 1), &(x..margin), false);
                     let screen = self.screen_mut();
                     for _ in 0..n as usize {
                         screen.insert_cell(x, y, margin, seqno);
                     }
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::InsertLine(n) => {
@@ -2653,6 +2865,11 @@ impl TerminalState {
                     let top_and_bottom_margins = self.cursor.y..self.top_and_bottom_margins.end;
                     let left_and_right_margins = self.left_and_right_margins.clone();
                     let blank_attr = self.pen.clone_sgr_only();
+                    let graphics = self.prepare_kitty_text_edit(
+                        &top_and_bottom_margins,
+                        &left_and_right_margins,
+                        false,
+                    );
                     self.screen_mut().scroll_down_within_margins(
                         &top_and_bottom_margins,
                         &left_and_right_margins,
@@ -2661,6 +2878,7 @@ impl TerminalState {
                         blank_attr,
                         bidi_mode,
                     );
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::ScrollDown(n) => self.scroll_down(n as usize),
@@ -2699,15 +2917,19 @@ impl TerminalState {
                 };
 
                 for _ in 0..n {
-                    {
+                    let right = left_and_right_margins
+                        .end
+                        .min(self.screen().logical_cols(y));
+                    x = self.constrain_line_column(x, y);
+                    let sized = self.screen().line_width_scale(y) > 1;
+                    let width = if sized { cell.width() } else { 1 };
+                    if !sized || x.saturating_add(width) <= right {
                         let screen = self.screen_mut();
                         let line_idx = screen.phys_row(y);
-                        let line = screen.line_mut(line_idx);
-
-                        line.set_cell(x, cell.clone(), seqno);
+                        screen.line_mut(line_idx).set_cell(x, cell.clone(), seqno);
                     }
-                    x += 1;
-                    if x > left_and_right_margins.end - 1 {
+                    x += width;
+                    if x >= right {
                         x = left_and_right_margins.start;
                         if y == top_and_bottom_margins.end - 1 {
                             self.scroll_up(1);
@@ -2719,7 +2941,7 @@ impl TerminalState {
                         }
                     }
                 }
-                self.cursor.x = x;
+                self.cursor.x = self.constrain_line_column(x, y);
                 self.cursor.y = y;
             }
         }
@@ -2821,7 +3043,7 @@ impl TerminalState {
                     (self.cursor.x + n as usize).min(self.left_and_right_margins.end - 1)
                 };
 
-                self.cursor.x = new_x;
+                self.cursor.x = self.constrain_line_column(new_x, self.cursor.y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -2846,6 +3068,7 @@ impl TerminalState {
                 let new_y = new_y.max(0);
 
                 self.cursor.y = new_y;
+                self.cursor.x = self.constrain_line_column(self.cursor.x, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -2862,6 +3085,7 @@ impl TerminalState {
                 };
 
                 self.cursor.y = new_y;
+                self.cursor.x = self.constrain_line_column(self.cursor.x, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -2883,7 +3107,7 @@ impl TerminalState {
                 } else {
                     col
                 };
-                self.cursor.x = col.min(self.screen().physical_cols - 1);
+                self.cursor.x = col.min(self.screen().logical_cols(self.cursor.y) - 1);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -2919,7 +3143,8 @@ impl TerminalState {
                 };
 
                 self.cursor.y = new_y;
-                self.cursor.x = self.left_and_right_margins.start;
+                self.cursor.x =
+                    self.constrain_line_column(self.left_and_right_margins.start, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -2942,7 +3167,8 @@ impl TerminalState {
                 let new_y = new_y.max(0);
 
                 self.cursor.y = new_y;
-                self.cursor.x = self.left_and_right_margins.start;
+                self.cursor.x =
+                    self.constrain_line_column(self.left_and_right_margins.start, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -2963,7 +3189,7 @@ impl TerminalState {
                     (self
                         .cursor
                         .x
-                        .min(self.screen().physical_cols - 1)
+                        .min(self.screen().logical_cols(self.cursor.y) - 1)
                         .saturating_sub(if self.dec_origin_mode {
                             self.left_and_right_margins.start
                         } else {

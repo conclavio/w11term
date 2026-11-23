@@ -18,11 +18,14 @@ use windows::{
 
 pub(super) enum Purpose {
     UploadFiles,
+    UploadFolder,
     SshConfig(PathBuf),
     Folder,
     DownloadFolder,
     Save(String),
     Scrollback,
+    StartRecording,
+    OpenRecording,
 }
 
 fn local_config_folder(dialog: &IFileDialog, config: &Path) {
@@ -127,8 +130,8 @@ pub(super) fn pick(owner: usize, purpose: Purpose) -> Result<Option<Selection>> 
     Ok(selected.pop())
 }
 
-pub(super) fn pick_uploads(owner: usize) -> Result<Vec<PathBuf>> {
-    Ok(pick_items(owner, Purpose::UploadFiles)?
+pub(super) fn pick_paths(owner: usize, purpose: Purpose) -> Result<Vec<PathBuf>> {
+    Ok(pick_items(owner, purpose)?
         .into_iter()
         .map(|item| item.path)
         .collect())
@@ -157,6 +160,8 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let clsid = if matches!(
             purpose,
             Purpose::UploadFiles
+                | Purpose::UploadFolder
+                | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
                 | Purpose::Folder
                 | Purpose::DownloadFolder
@@ -170,6 +175,36 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let confirmed = Rc::new(RefCell::new(None));
         let multiple = matches!(purpose, Purpose::UploadFiles);
         let cookie = match purpose {
+            Purpose::StartRecording | Purpose::OpenRecording => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetFileTypes(&[
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("Terminal recordings"),
+                        pszSpec: w!("*.vt"),
+                    },
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("All files"),
+                        pszSpec: w!("*.*"),
+                    },
+                ])?;
+                dialog.SetDefaultExtension(w!("vt"))?;
+                options |= FOS_PATHMUSTEXIST;
+                if matches!(purpose, Purpose::StartRecording) {
+                    dialog.SetTitle(w!("Start timed recording"))?;
+                    dialog.SetFileName(w!("session.vt"))?;
+                    // The recorder creates the capture and its sidecars exclusively.
+                    options &= !FOS_OVERWRITEPROMPT;
+                    options |= FOS_NOTESTFILECREATE;
+                } else {
+                    dialog.SetTitle(w!("Open recording"))?;
+                    options |= FOS_FILEMUSTEXIST;
+                }
+                #[cfg(feature = "ui-smoke")]
+                if fixture_picker_folder(&dialog, "W11TERM_RECORDING_SMOKE_DIR")? {
+                    options |= FOS_DONTADDTORECENT;
+                }
+                None
+            }
             Purpose::UploadFiles => {
                 dialog.SetTitle(w!("Choose files to upload"))?;
                 options |= FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST;
@@ -186,21 +221,20 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 local_config_folder(&dialog, &current);
                 None
             }
-            Purpose::Folder | Purpose::DownloadFolder => {
-                let download = matches!(purpose, Purpose::DownloadFolder);
-                dialog.SetTitle(if download {
-                    w!("Choose a download destination folder")
-                } else {
-                    w!("Choose a folder to share")
+            Purpose::Folder | Purpose::DownloadFolder | Purpose::UploadFolder => {
+                dialog.SetTitle(match purpose {
+                    Purpose::DownloadFolder => w!("Choose a download destination folder"),
+                    Purpose::UploadFolder => w!("Choose a folder to upload"),
+                    _ => w!("Choose a folder to share"),
                 })?;
                 options |= FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 #[cfg(feature = "ui-smoke")]
                 fixture_picker_folder(
                     &dialog,
-                    if download {
-                        "W11TERM_SFTP_PICKER_SMOKE_DIR"
-                    } else {
+                    if matches!(purpose, Purpose::Folder) {
                         "W11TERM_FOLDER_SHARE_SMOKE_DIR"
+                    } else {
+                        "W11TERM_SFTP_PICKER_SMOKE_DIR"
                     },
                 )?;
                 None

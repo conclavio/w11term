@@ -3,6 +3,7 @@
 use crate::durable::DurableReference;
 use crate::options::{Authentication, Source, SshOptions};
 use crate::pane_layout::{Axis, Layout};
+use crate::tabs::TabTitle;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +36,9 @@ pub enum SavedSource {
     },
     Demo,
     Replay(PathBuf),
+    ViewRecording(PathBuf),
+    TimedReplay(PathBuf),
+    PausedReplay(PathBuf),
     /// Connection options contain authentication methods and key paths; live
     /// passwords, private key material and authentication answers live elsewhere.
     Ssh(Box<SshOptions>),
@@ -111,9 +115,22 @@ impl SavedSource {
                 }
             }
             (Source::Demo, _) => Self::Demo,
+            (Source::ViewRecording(path), _) => {
+                ensure!(!path.as_os_str().is_empty(), "Empty recording path");
+                Self::ViewRecording(std::path::absolute(path)?)
+            }
             (Source::Replay(path), _) => {
                 ensure!(!path.as_os_str().is_empty(), "Empty replay path");
                 Self::Replay(std::path::absolute(path)?)
+            }
+            (Source::TimedReplay(path) | Source::PausedReplay(path), _) => {
+                ensure!(!path.as_os_str().is_empty(), "Empty replay path");
+                let path = std::path::absolute(path)?;
+                if matches!(source, Source::PausedReplay(_)) {
+                    Self::PausedReplay(path)
+                } else {
+                    Self::TimedReplay(path)
+                }
             }
             (Source::Ssh(_), Some(name)) => Self::SavedProfile(name.into()),
             (Source::Ssh(options), None) => {
@@ -175,7 +192,12 @@ impl SavedSource {
                 shell.validate()?;
                 shell.validate_resolved_paths()?;
             }
-            Self::Replay(path) => ensure!(path.is_absolute(), "Expected an absolute replay path"),
+            Self::Replay(path)
+            | Self::TimedReplay(path)
+            | Self::PausedReplay(path)
+            | Self::ViewRecording(path) => {
+                ensure!(path.is_absolute(), "Expected an absolute replay path")
+            }
             Self::Ssh(options) => {
                 options.validate_route()?;
                 ensure!(
@@ -241,17 +263,31 @@ impl SavedSource {
                 Source::Ssh(options)
             }
             Self::Demo => Source::Demo,
+            Self::ViewRecording(path) => {
+                crate::recorder::check_raw_file(path)?;
+                crate::recorder::raw_grid(path)?;
+                Source::ViewRecording(path.clone())
+            }
             Self::Local { shell, .. } => {
                 shell.check_launch_paths()?;
                 Source::Local(shell.clone())
             }
-            Self::Replay(path) => {
+            Self::Replay(path) | Self::TimedReplay(path) | Self::PausedReplay(path) => {
                 ensure!(
                     path.is_file(),
                     "Workspace replay file is unavailable: {}",
                     path.display()
                 );
-                Source::Replay(path.clone())
+                if matches!(self, Self::TimedReplay(_) | Self::PausedReplay(_)) {
+                    crate::recorder::TimedReplay::read_initial_size(path)?;
+                    if matches!(self, Self::PausedReplay(_)) {
+                        Source::PausedReplay(path.clone())
+                    } else {
+                        Source::TimedReplay(path.clone())
+                    }
+                } else {
+                    Source::Replay(path.clone())
+                }
             }
             Self::Ssh(options) => Source::Ssh(options.as_ref().clone()),
         })
@@ -271,6 +307,8 @@ pub enum SavedLayout {
     Leaf {
         slot: u64,
         source: SavedSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_name: Option<TabTitle>,
     },
     Split {
         #[serde(with = "SavedAxis")]
@@ -286,7 +324,7 @@ impl SavedLayout {
         layout: &Layout,
         depth: usize,
         slots: &mut BTreeMap<u64, u64>,
-        source: &mut impl FnMut(u64) -> Result<SavedSource>,
+        source: &mut impl FnMut(u64) -> Result<(SavedSource, Option<TabTitle>)>,
     ) -> Result<Self> {
         ensure!(depth <= MAX_DEPTH, "Workspace split tree is too deep");
         Ok(match layout {
@@ -296,9 +334,11 @@ impl SavedLayout {
                     slots.insert(*id, slot).is_none(),
                     "Pane occurs more than once"
                 );
+                let (source, pane_name) = source(*id)?;
                 Self::Leaf {
                     slot,
-                    source: source(*id)?,
+                    source,
+                    pane_name,
                 }
             }
             Layout::Split {
@@ -322,7 +362,7 @@ impl SavedLayout {
     ) -> Result<()> {
         ensure!(depth <= MAX_DEPTH, "Workspace split tree is too deep");
         match self {
-            Self::Leaf { slot, source } => leaf(*slot, source),
+            Self::Leaf { slot, source, .. } => leaf(*slot, source),
             Self::Split {
                 ratio,
                 first,
@@ -344,7 +384,7 @@ impl SavedLayout {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<crate::tabs::TabTitle>,
+    pub title: Option<TabTitle>,
     pub focused: u64,
     pub layout: SavedLayout,
 }
@@ -393,6 +433,14 @@ impl Workspace {
         tabs: impl IntoIterator<Item = (&'a Layout, u64)>,
         active_tab: usize,
         mut source: impl FnMut(u64) -> Result<SavedSource>,
+    ) -> Result<Self> {
+        Self::capture_with_pane_names(tabs, active_tab, |id| Ok((source(id)?, None)))
+    }
+
+    pub fn capture_with_pane_names<'a>(
+        tabs: impl IntoIterator<Item = (&'a Layout, u64)>,
+        active_tab: usize,
+        mut source: impl FnMut(u64) -> Result<(SavedSource, Option<TabTitle>)>,
     ) -> Result<Self> {
         let mut slots = BTreeMap::new();
         let mut saved = Self {
@@ -708,6 +756,47 @@ mod tests {
     }
 
     #[test]
+    fn pane_names_round_trip_per_leaf_and_clear_without_changing_the_workspace_format() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workspaces.json");
+        let store = WorkspaceStore::new(path.clone());
+        let mut split = Layout::Leaf(41);
+        split.split(41, 87, Axis::Columns);
+        let capture = |name: Option<TabTitle>| {
+            let mut workspace = Workspace::capture_with_pane_names([(&split, 87)], 0, |id| {
+                let pane_name = if id == 41 { name.clone() } else { None };
+                Ok((SavedSource::SavedProfile("ops".into()), pane_name))
+            })
+            .unwrap();
+            workspace.tabs[0].title = Some("Servers".to_owned().try_into().unwrap());
+            workspace
+        };
+        let named = capture(Some("Build 雪".to_owned().try_into().unwrap()));
+        store.save("work", &named).unwrap();
+        assert_eq!(store.load().unwrap()["work"], named);
+        let mut json = serde_json::to_value(&named).unwrap();
+        let layout = &mut json["tabs"][0]["layout"];
+        assert_eq!(layout["first"]["pane_name"], "Build 雪");
+        assert!(layout["second"].get("pane_name").is_none());
+        assert_eq!(layout["first"]["source"], layout["second"]["source"]);
+        layout["first"]["pane_name"] = serde_json::Value::String(" name ".into());
+        assert!(serde_json::from_value::<Workspace>(json).is_err());
+
+        let cleared = capture(None);
+        store.save("work", &cleared).unwrap();
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(file["version"], 1);
+        let tab = &file["workspaces"]["work"]["tabs"][0];
+        assert_eq!(tab["title"], "Servers");
+        assert_eq!(tab["focused"], 2);
+        for child in ["first", "second"] {
+            assert!(tab["layout"][child].get("pane_name").is_none());
+        }
+        assert_eq!(store.load().unwrap()["work"], cleared);
+    }
+
+    #[test]
     fn saved_host_browser_reopens_unselected_or_pinned_without_changing_profile_defaults() {
         let options = ssh("host.example");
         let source = SavedSource::Discovery("work".into());
@@ -898,10 +987,12 @@ mod tests {
                 first: Box::new(SavedLayout::Leaf {
                     slot: 1,
                     source: SavedSource::Demo,
+                    pane_name: None,
                 }),
                 second: Box::new(SavedLayout::Leaf {
                     slot: 2,
                     source: SavedSource::Demo,
+                    pane_name: None,
                 }),
             };
             assert!(workspace.validate().is_err());
@@ -931,6 +1022,36 @@ mod tests {
         assert!(store.save("   ", &demo()).is_err());
         store.save("ops", &demo()).unwrap();
         assert_eq!(store.load().unwrap()["ops"], demo());
+    }
+
+    #[test]
+    fn workspace_round_trips_timed_replay_and_detects_a_missing_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cockpit.vt");
+        crate::recorder::Recorder::start_timed(&path, wezterm_term::TerminalSize::default())
+            .unwrap()
+            .finish()
+            .unwrap();
+        let source = Source::TimedReplay(path.clone());
+        let paused = Source::PausedReplay(path.clone());
+        let paused_recipe = SavedSource::capture(&paused, None).unwrap();
+        let paused_json = serde_json::to_value(&paused_recipe).unwrap();
+        assert_eq!(paused_json["kind"], "paused_replay");
+        let reopened: SavedSource = serde_json::from_value(paused_json).unwrap();
+        assert_eq!(reopened.resolve(&BTreeMap::new()).unwrap(), paused);
+        let saved = SavedSource::capture(&source, None).unwrap();
+        let serialized = serde_json::to_value(&saved).unwrap();
+        assert_eq!(serialized["kind"], "timed_replay");
+        let restored: SavedSource = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.resolve(&BTreeMap::new()).unwrap(), source);
+        std::fs::remove_file(path.with_extension("vt.jsonl")).unwrap();
+        assert!(restored.resolve(&BTreeMap::new()).is_err());
+        assert_eq!(
+            SavedSource::Replay(path.clone())
+                .resolve(&BTreeMap::new())
+                .unwrap(),
+            Source::Replay(path)
+        );
     }
 
     #[test]

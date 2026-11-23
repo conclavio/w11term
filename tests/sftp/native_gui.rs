@@ -1,7 +1,24 @@
 use super::*;
+#[path = "../support/drive_gui.rs"]
+mod drive;
+use drive::{drive_gui, drive_mixed_gui};
+#[path = "mixed_drop_ui.rs"]
+mod mixed_drop_ui;
+#[path = "recording_ui.rs"]
+mod recording_ui;
+#[path = "replay_controls.rs"]
+mod replay_controls;
+#[path = "select_all.rs"]
+mod select_all;
 #[path = "../support/native_gui.rs"]
 mod shared;
+#[path = "sort_ui.rs"]
+mod sort_ui;
+#[path = "upload_folder_ui.rs"]
+mod upload_folder_ui;
 use shared::run_gui;
+#[path = "properties_ui.rs"]
+mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks persisted Follow Windows colors and reports against native UISettings"]
@@ -402,6 +419,24 @@ async fn native_pane_scrollbar_tracks_async_ssh_output_without_moving_its_neighb
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reads back actual Direct2D Find marks in a live SSH and PowerShell split"]
+async fn native_find_scrollbar_marks_show_the_current_result_and_clear_with_find() {
+    let lines = (0..201)
+        .map(|row| match row {
+            20 | 100 | 175 => format!("line {row:03} has a rail-witness"),
+            _ => format!("line {row:03}"),
+        })
+        .collect::<Vec<_>>();
+    let history = format!("\x1b[H\x1b[2J\x1b[3J{}", lines.join("\r\n"));
+    run_palette_fixture(
+        "find-scrollbar-marks-ui.ps1",
+        b"\x1b[?1049h\x1b[Halt-screen-ready\x1b[?1049lmark-search-closed",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits word delimiters and verifies UIA words and double-click selection in a live SSH pane"]
 async fn native_word_delimiters_update_reader_and_pointer_selection_in_running_ssh() {
     run_palette_fixture(
@@ -466,15 +501,21 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "searches captured OSC 133 command text and copies the selected command on a hosted Windows desktop"]
+#[ignore = "filters OSC 133 history by command and status through native controls and the CLI"]
 async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     let long = format!("deploy {} [Ångström]", "x".repeat(128));
     let mut stream = String::new();
     for (command, output, status) in [
-        (&long[..], "archived deploy output", 17),
-        ("check-status", "[Ångström] appears only in this output", 0),
+        (&long[..], "archived deploy output", ";17"),
+        ("deploy audit", "no status reported", ""),
+        ("deploy retry", "retry failed", ";2"),
+        (
+            "check-status",
+            "[Ångström] appears only in this output",
+            ";0",
+        ),
     ] {
-        stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D;{status}\x07"));
+        stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D{status}\x07"));
     }
     stream.push_str("history-search-ready\r\n");
     run_palette_fixture(
@@ -569,6 +610,12 @@ async fn native_powershell_shell_integration_records_history_and_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reveals a PowerShell diagnostic in the native File Explorer beside a live SSH pane"]
+async fn native_local_path_hint_selects_the_file_in_explorer() {
+    run_palette_fixture("reveal-local-path-ui.ps1", b"ssh-neighbor-ok", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "duplicates, deletes and restores PowerShell profiles while SSH and a copied shell stay live"]
 async fn native_local_profile_copy_delete_and_restore_defaults() {
     run_palette_fixture("local-profile-actions-ui.ps1", b"profile-actions-ok", None).await;
@@ -639,7 +686,29 @@ async fn native_regex_find_in_mixed_panes_keeps_search_input_off_the_wire() {
         history.push_str(&format!("scrollback filler {row}\r\n"));
     }
     history.push_str("find-fixture-ready\r\n");
-    run_palette_fixture("regex-find-ui.ps1", b"find-ssh-resumed", Some(&history)).await;
+    run_palette_fixture(
+        "regex-find-ui.ps1",
+        b"find-ssh-resumed\x1bOR",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens real Find from an accessible or keyboard selection in a mixed SSH and PowerShell window"]
+async fn native_find_from_selected_text_uses_a_literal_and_keeps_input_on_the_original_pane() {
+    let tail = "n".repeat(100);
+    let needle = format!("Issue.[雪]+/{tail}/end!");
+    let history = format!(
+        "\x1b[H\x1b[2J\x1b[3JKEY[42]\r\nprevious token\r\npreviews token\r\nhard-line-first\r\nhard-line-second\r\n\
+        {needle}\r\n{needle}\r\nissue.[雪]+/{tail}/end!\r\nIssueX雪雪/{tail}/end!\r\nselect-find-ready\r\n"
+    );
+    run_palette_fixture(
+        "find-selected-text-ui.ps1",
+        b"selected-find-shell-ok",
+        Some(&history),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -676,44 +745,53 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
     server.abort();
 }
 
-fn drive_mixed_gui(script: &str, ssh: &SshOptions, state: &std::path::Path) {
-    fs::write(
-        state.join("profiles.json"),
-        serde_json::to_vec(&json!({"profiles":{
-        "palette-ssh":ssh, "Palette PowerShell":{
-            "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]}}}))
-        .unwrap(),
-    )
-    .unwrap();
-    fs::write(
-        state.join("appearance.json"),
-        br#"{"shortcuts":{"command_palette":"F7","select_tab_1":"F8","copy_mode":"F9"}}"#,
-    )
-    .unwrap();
-    let output = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-STA", "-File"])
-        .arg(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests")
-                .join(script),
-        )
-        .args([
-            "-Gui",
-            env!("CARGO_BIN_EXE_w11term"),
-            "-Cli",
-            env!("CARGO_BIN_EXE_w11term-cli"),
-        ])
-        .arg("-State")
-        .arg(state)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-        fs::read_to_string(state.join("gui.log")).unwrap_or_default()
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "checks actual tab and window titles while native Settings, SSH and PowerShell change the active title"]
+async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manual_name() {
+    let input = concat!(
+        "\x1b]2;background-build\x07",
+        "\x1b[22;0t\x1b]2;editor: 雪.txt\x07",
+        "\x1b[23;0t",
+        "\x1b]2;unfocused-watch\x07",
+        "\x1b]2;renamed-build\x07",
+        "\x1b]2;\x07",
+        "ssh-title-controls-ok"
     );
+    run_palette_fixture(
+        "application-tab-titles-ui.ps1",
+        input.as_bytes(),
+        Some("\x1b]2;ssh-seed\x07"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "names one of two identical SSH splits, navigates by name and reopens its workspace"]
+async fn native_pane_names_identify_one_ssh_split_and_survive_workspace_restore() {
+    let (Source::Ssh(ssh), remote, shells, server) = fixture_connections(false, 4).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        remote.path().join("copy-history.vt"),
+        b"\x1b]2;shared-application\x07",
+    )
+    .unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+
+    drive_mixed_gui("pane-display-name-ui.ps1", &ssh, state.path());
+
+    assert_eq!(
+        fs::read(trace).unwrap(),
+        b"named-input/\x1b]2;changed-by-shell\x07restored-input/"
+    );
+    assert_eq!(
+        shells.load(Ordering::Relaxed),
+        4,
+        "original pair and restored pair only"
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -755,8 +833,97 @@ async fn native_clipboard_paste_confirms_original_bytes_for_the_original_pane() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "records real SSH output and resizes, then compares timed replay pixels and frame timing"]
+async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let gate = remote.path().join("hold-shell-output");
+    fs::write(&gate, []).unwrap();
+    fs::write(
+        remote.path().join("deferred-output.vt"),
+        b"\x1b[?25l\x1b[2J\x1b[H\x1b]2;timed-first\x07FIRST-SSH-FRAME",
+    )
+    .unwrap();
+    fs::write(state.path().join("output-gate"), gate.to_str().unwrap()).unwrap();
+    drive_mixed_gui("timed-replay-ui.ps1", &ssh, state.path());
+    let live = image::open(state.path().join("live.png"))
+        .unwrap()
+        .to_rgba8();
+    let replay = image::open(state.path().join("replayed.png"))
+        .unwrap()
+        .to_rgba8();
+    assert!(
+        live.pixels().any(|p| p.0 == [255, 0, 0, 255]),
+        "missing red Kitty image"
+    );
+    assert_eq!(live.dimensions(), replay.dimensions());
+    assert!(
+        live.as_raw() == replay.as_raw(),
+        "timed replay changed rendered pixels"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "replay opened an SSH channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "inspects live SSH modes and geometry from the CLI while PowerShell keeps input focus"]
+async fn native_inspect_reads_background_ssh_without_disturbing_powershell() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let wire = remote.path().join("keyboard-input.bin");
+    fs::write(&wire, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("ssh-wire"), wire.to_str().unwrap()).unwrap();
+    drive_mixed_gui("inspect-pane-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "inspect opened an SSH channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "duplicates a named, zoomed SSH and PowerShell split and verifies two independent sets of sessions"]
 async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
+    check_mixed_tab_layout(
+        "duplicate-tab-layout-ui.ps1",
+        b"source-before/duplicate-background/duplicate-focused/source-after/",
+        2,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reopens a named, closed tab layout with new SSH and PowerShell sessions beside a live tab"]
+async fn native_reopen_closed_tab_layout_restores_position_focus_and_input_lock() {
+    check_mixed_tab_layout(
+        "reopen-tab-layout-ui.ps1",
+        b"source-before/reopened-after-unlock/",
+        2,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "restores a single PowerShell pane beside a live SSH shell after closing the split"]
+async fn native_reopen_closed_pane_keeps_the_neighboring_ssh_session() {
+    check_mixed_tab_layout(
+        "reopen-pane-ui.ps1",
+        b"before-local-close/after-local-reopen/",
+        1,
+    )
+    .await;
+}
+
+async fn check_mixed_tab_layout(script: &str, expected_input: &[u8], ssh_logins: usize) {
     let accepted = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, channels, server) =
         fixture_counting_accepts(false, 4, accepted.clone()).await
@@ -782,13 +949,40 @@ async fn native_duplicate_tab_layout_starts_independent_ssh_and_powershell() {
         serde_json::to_vec(&json!({"version":1,"workspaces":{"duplicate":workspace}})).unwrap(),
     )
     .unwrap();
-    drive_mixed_gui("duplicate-tab-layout-ui.ps1", &ssh, state.path());
-    assert_eq!(accepted.load(Ordering::Relaxed), 2, "SSH logins");
-    assert_eq!(channels.load(Ordering::Relaxed), 2, "SSH shell channels");
+    drive_mixed_gui(script, &ssh, state.path());
+    assert_eq!(accepted.load(Ordering::Relaxed), ssh_logins, "SSH logins");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        ssh_logins,
+        "SSH shell channels"
+    );
     assert_eq!(
         fs::read(trace).unwrap(),
-        b"source-before/duplicate-background/duplicate-focused/source-after/",
+        expected_input,
         "SSH input seen by the loopback server"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "balances three live SSH and PowerShell columns and verifies the actual terminal grids"]
+async fn native_balance_panes_equalizes_live_columns_without_restarting_either_shell() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+    drive_mixed_gui("balance-panes-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(trace).unwrap(), b"balance-ssh-live");
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        1,
+        "balancing opened a new SSH channel"
     );
     server.abort();
 }
@@ -985,6 +1179,38 @@ async fn native_restart_exited_panes_preserves_history_and_their_live_neighbor()
         channels.load(Ordering::Relaxed),
         4,
         "one shell and one SFTP channel per login"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "previews read-only remote text through the native drawer in a live SSH and PowerShell split"]
+async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let parent = remote.path().join("shell directory");
+    let child = parent.join("nested");
+    fs::create_dir_all(&child).unwrap();
+    let name = "build 雪.txt";
+    let outer = "first 雪\r\n\tsecond café\r\n\r\nlast line";
+    let inner = "different directory\r\ninner 雪";
+    let binary = b"private header\0raw body";
+    fs::write(parent.join(name), outer.as_bytes()).unwrap();
+    fs::write(child.join(name), inner.as_bytes()).unwrap();
+    fs::write(child.join("binary.dat"), binary).unwrap();
+    let keys = remote.path().join("keyboard-input.bin");
+    fs::write(&keys, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("sftp-text-preview-ui.ps1", &ssh, state.path());
+    assert_eq!(fs::read(parent.join(name)).unwrap(), outer.as_bytes());
+    assert_eq!(fs::read(child.join(name)).unwrap(), inner.as_bytes());
+    assert_eq!(fs::read(child.join("binary.dat")).unwrap(), binary);
+    assert_eq!(fs::read(keys).unwrap(), b"after-preview");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one shell and one SFTP channel"
     );
     server.abort();
 }
@@ -1943,47 +2169,111 @@ async fn native_powershell_directory_actions_inherit_cwd_and_preserve_the_mixed_
 #[ignore = "opens tabs and splits from verified OSC 7 paths on real SSH channels"]
 async fn native_ssh_directory_actions_open_on_the_original_transport() {
     for destination in ["right", "below", "tab"] {
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let (Source::Ssh(ssh), remote, opens, server) =
-            fixture_counting_accepts(false, 2, accepted.clone()).await
-        else {
-            unreachable!()
-        };
-        let state = tempfile::tempdir().unwrap();
-        fs::write(state.path().join("destination"), destination).unwrap();
-        let inputs = remote.path().join("split-inputs");
-        fs::create_dir(&inputs).unwrap();
-        let exec = remote.path().join("workspace-exec.bin");
-        fs::write(&exec, []).unwrap();
-        drive_mixed_gui("split-ssh-directory-ui.ps1", &ssh, state.path());
-        assert_eq!(
-            accepted.load(Ordering::Relaxed),
-            1,
-            "must retain original SSH connection"
-        );
-        assert_eq!(
-            opens.load(Ordering::Relaxed),
-            2,
-            "exactly one new session channel"
-        );
-        assert_eq!(
-            fs::read_to_string(exec).unwrap(),
-            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s Work'"#,
-        );
-        let mut streams: Vec<_> = fs::read_dir(inputs)
-            .unwrap()
-            .map(|f| fs::read_to_string(f.unwrap().path()).unwrap())
-            .collect();
-        streams.sort();
-        assert_eq!(
-            streams,
-            [
-                "child-live",
-                "report-currentreport-foreignreport-current-againparent-live"
-            ]
-        );
-        server.abort();
+        check_ssh_directory_action(destination, false).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a real SSH tab using paired iTerm2 host and literal directory reports"]
+async fn native_iterm2_directory_opens_a_tab_on_the_original_transport() {
+    check_ssh_directory_action("tab", true).await;
+}
+
+async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, opens, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("destination"), destination).unwrap();
+    if iterm2 {
+        fs::write(state.path().join("iterm2"), []).unwrap();
+    }
+    let inputs = remote.path().join("split-inputs");
+    fs::create_dir(&inputs).unwrap();
+    let exec = remote.path().join("workspace-exec.bin");
+    fs::write(&exec, []).unwrap();
+    drive_mixed_gui("split-ssh-directory-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "must retain original SSH connection"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "exactly one new session channel"
+    );
+    assert_eq!(
+        fs::read_to_string(exec).unwrap(),
+        if iterm2 {
+            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s 100%2F;#雪'"#
+        } else {
+            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s Work'"#
+        },
+    );
+    let mut streams: Vec<_> = fs::read_dir(inputs)
+        .unwrap()
+        .map(|f| fs::read_to_string(f.unwrap().path()).unwrap())
+        .collect();
+    streams.sort();
+    assert_eq!(
+        streams,
+        [
+            "child-live",
+            if iterm2 {
+                "report-currentnested-hostnested-dirother-loginlogin-hostliteral-dirparent-live"
+            } else {
+                "report-currentreport-foreignreport-current-againparent-live"
+            }
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits UTF-8 text in the SFTP drawer and saves a conflicting draft under a new name"]
+async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let folder = remote.path().join("shell directory");
+    fs::create_dir(&folder).unwrap();
+    let source = folder.join("pilot 雪.ini");
+    let original = "\u{feff}pilot=one\r\nspeed=slow\nlabel=雪";
+    fs::write(&source, original.as_bytes()).unwrap();
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    let keys = remote.path().join("keyboard-input.bin");
+    fs::write(&keys, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-folder"),
+        folder.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("sftp-edit-text-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        "\u{feff}pilot=one\r\nspeed=peer\nlabel=雪".as_bytes()
+    );
+    assert_eq!(
+        fs::read(folder.join("draft 雪.ini")).unwrap(),
+        "\u{feff}pilot=two\r\nspeed=fast\nlabel=雪".as_bytes()
+    );
+    assert_eq!(
+        fs::read_dir(&folder).unwrap().count(),
+        2,
+        "editor left staging files behind"
+    );
+    assert_eq!(fs::read(keys).unwrap(), b"after-editor");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and one SFTP channel"
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

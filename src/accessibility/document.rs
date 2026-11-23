@@ -16,6 +16,7 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 pub(super) struct Selection {
     pub anchor: Point,
     pub end: Point,
+    pub end_exclusive: bool,
     pub block: bool,
 }
 
@@ -76,8 +77,11 @@ impl Document {
                 d.paragraphs.push(d.len());
             }
             let mut col = 0;
+            let row_cols = frame
+                .cell_map(row)
+                .map_or(frame.cols, CellMap::logical_cols);
             for cell in line.visible_cells() {
-                if cell.cell_index() >= frame.cols {
+                if cell.cell_index() >= row_cols {
                     break;
                 }
                 while col < cell.cell_index() {
@@ -227,8 +231,10 @@ impl Document {
             (s.end, s.anchor)
         };
         if !s.block {
-            return std::iter::once(self.stable_point(a, false)..self.stable_point(b, true))
-                .collect();
+            return std::iter::once(
+                self.stable_point(a, false)..self.stable_point(b, !s.end_exclusive),
+            )
+            .collect();
         }
         (0..self.starts.len())
             .filter_map(|r| {

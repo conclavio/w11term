@@ -1,7 +1,9 @@
 use super::*;
+use w11term::tabs::TabTitle;
 use w11term::workspace::{SavedLayout, SavedSource, SshStartup, Workspace, WorkspaceStore};
 
 mod duplicate;
+pub(super) use duplicate::{ClosedPane, ClosedTab};
 
 #[derive(Default)]
 pub(super) struct WorkspacePage {
@@ -311,12 +313,12 @@ impl TerminalApp {
                 header.id,
             )
         });
-        let mut workspace = Workspace::capture(layouts, active_tab, |id| {
+        let mut workspace = Workspace::capture_with_pane_names(layouts, active_tab, |id| {
             let tab = self.tabs.get(id).context("Workspace pane was closed")?;
             let Page::Terminal(live) = &tab.page else {
                 anyhow::bail!("Expected a terminal pane")
             };
-            let source = if live.discovery_page.is_some() {
+            let source = if live.discovery.is_some() {
                 let name = live
                     .profile_name
                     .clone()
@@ -333,17 +335,19 @@ impl TerminalApp {
             } else {
                 SavedSource::capture(&live.source, live.profile_name.as_deref())?
             };
-            if let Some(launch) = live.startup.as_deref() {
-                return Ok(SavedSource::Startup {
+            let source = if let Some(launch) = live.startup.as_deref() {
+                SavedSource::Startup {
                     connection: Box::new(source),
                     launch: launch.clone(),
-                });
-            }
-            source.with_session(
-                live.session
-                    .durable_state()
-                    .and_then(|state| state.reference),
-            )
+                }
+            } else {
+                source.with_session(
+                    live.session
+                        .durable_state()
+                        .and_then(|state| state.reference),
+                )?
+            };
+            Ok((source, live.pane_name.clone()))
         })?;
         for (tab, header) in workspace.tabs.iter_mut().zip(headers) {
             tab.title = self.tabs.title_for(header.id).cloned();
@@ -535,22 +539,22 @@ pub(super) fn append_resolved_workspace(
     mut sources: BTreeMap<u64, Source>,
     osc52: bool,
 ) {
-    restore_tabs(tabs, workspace, |slot, saved| {
+    restore_tabs(tabs, workspace, |slot, saved, pane_name| {
         let source = sources.remove(&slot).expect("validated workspace slot");
         let profile_name = saved.profile_name().map(str::to_owned);
         let label = profile_name
             .clone()
             .unwrap_or_else(|| source_label(&source));
-        if let (true, Source::Ssh(options)) = (saved.is_discovery(), &source) {
-            return session_browser::discovery_tab(
+        let mut tab = if let (true, Source::Ssh(options)) = (saved.is_discovery(), &source) {
+            session_browser::discovery_tab(
                 label,
                 options.clone(),
                 osc52,
                 saved.session().cloned(),
                 saved.is_herdr_browser(),
-            );
-        }
-        if let (SavedSource::Startup { launch, .. }, Source::Ssh(options)) = (saved, &source) {
+            )
+        } else if let (SavedSource::Startup { launch, .. }, Source::Ssh(options)) = (saved, &source)
+        {
             let session = Session::start_workspace_ssh(
                 options.clone(),
                 TerminalSize::default(),
@@ -561,24 +565,33 @@ pub(super) fn append_resolved_workspace(
             if let Page::Terminal(live) = &mut tab.page {
                 live.startup = Some(Box::new(launch.clone()));
             }
-            return tab;
+            tab
+        } else {
+            live_tab_sized(
+                label,
+                source,
+                TerminalSize::default(),
+                osc52,
+                None,
+                saved.session().cloned(),
+            )
+            .with_profile(profile_name)
+        };
+        if let Page::Terminal(live) = &mut tab.page {
+            live.pane_name = pane_name.cloned();
         }
-        live_tab_sized(
-            label,
-            source,
-            TerminalSize::default(),
-            osc52,
-            None,
-            saved.session().cloned(),
-        )
-        .with_profile(profile_name)
+        tab
     });
 }
 
-fn first_leaf(mut layout: &SavedLayout) -> (u64, &SavedSource) {
+fn first_leaf(mut layout: &SavedLayout) -> (u64, &SavedSource, Option<&TabTitle>) {
     loop {
         match layout {
-            SavedLayout::Leaf { slot, source } => return (*slot, source),
+            SavedLayout::Leaf {
+                slot,
+                source,
+                pane_name,
+            } => return (*slot, source, pane_name.as_ref()),
             SavedLayout::Split { first, .. } => layout = first,
         }
     }
@@ -589,7 +602,7 @@ fn first_leaf(mut layout: &SavedLayout) -> (u64, &SavedSource) {
 fn restore_tabs<T>(
     tabs: &mut Tabs<T>,
     workspace: &Workspace,
-    mut create: impl FnMut(u64, &SavedSource) -> T,
+    mut create: impl FnMut(u64, &SavedSource, Option<&TabTitle>) -> T,
 ) {
     fn restore_split<T>(
         tabs: &mut Tabs<T>,
@@ -597,7 +610,7 @@ fn restore_tabs<T>(
         entry: TabId,
         path: &mut Vec<bool>,
         ids: &mut BTreeMap<u64, TabId>,
-        create: &mut impl FnMut(u64, &SavedSource) -> T,
+        create: &mut impl FnMut(u64, &SavedSource, Option<&TabTitle>) -> T,
     ) {
         match layout {
             SavedLayout::Leaf { slot, .. } => {
@@ -609,9 +622,9 @@ fn restore_tabs<T>(
                 first,
                 second,
             } => {
-                let (slot, source) = first_leaf(second);
+                let (slot, source, pane_name) = first_leaf(second);
                 let sibling = tabs
-                    .split(entry, create(slot, source), *axis)
+                    .split(entry, create(slot, source, pane_name), *axis)
                     .expect("restore parent exists");
                 let set = tabs.set_ratio(path, *ratio);
                 debug_assert!(set, "validated workspace divider");
@@ -625,8 +638,8 @@ fn restore_tabs<T>(
     }
     let mut active = None;
     for (index, tab) in workspace.tabs.iter().enumerate() {
-        let (slot, source) = first_leaf(&tab.layout);
-        let entry = tabs.insert(create(slot, source));
+        let (slot, source, pane_name) = first_leaf(&tab.layout);
+        let entry = tabs.insert(create(slot, source, pane_name));
         tabs.set_group_title(entry, tab.title.clone());
         let mut ids = BTreeMap::new();
         restore_split(tabs, &tab.layout, entry, &mut vec![], &mut ids, &mut create);
@@ -651,11 +664,12 @@ impl TerminalApp {
                 self.update(Message::SplitPane(Axis::Rows, None), context);
             }
             1 => {
-                let group = self.tabs.group_id(self.tabs.active_id().unwrap()).unwrap();
                 self.edit_tab_title(tab_title::Action::Show);
-                self.edit_tab_title(tab_title::Action::Edit(group, "Operations".into()));
+                assert!(self.title_editor.is_some(), "tab rename dialog");
+                let serial = self.name_edit_serial;
+                self.edit_tab_title(tab_title::Action::Edit(serial, "Operations".into()));
                 self.edit_tab_title(tab_title::Action::Finish(
-                    group,
+                    serial,
                     ContentDialogResult::Primary,
                 ));
                 let epoch = self.watch_epoch;
@@ -717,7 +731,7 @@ impl TerminalApp {
                 assert_eq!(restored.len(), 2);
                 assert_eq!(restored[1], opened);
                 for id in restored {
-                    assert_eq!(self.tab_label(id), "Operations");
+                    assert_eq!(self.tab_label(id, true), "Operations");
                     let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
                         panic!("expected terminal")
                     };
@@ -763,6 +777,7 @@ mod tests {
         SavedLayout::Leaf {
             slot,
             source: SavedSource::Demo,
+            pane_name: None,
         }
     }
 
@@ -800,7 +815,7 @@ mod tests {
         workspace.validate().unwrap();
         let mut tabs = Tabs::default();
         let existing = tabs.insert(0);
-        restore_tabs(&mut tabs, &workspace, |slot, _| slot);
+        restore_tabs(&mut tabs, &workspace, |slot, _, _| slot);
         assert_eq!(tabs.get(existing), Some(&0));
         assert_eq!(
             tabs.headers()
@@ -839,11 +854,51 @@ mod tests {
                 second: Box::new(Layout::Leaf(right)),
             })
         );
-        restore_tabs(&mut tabs, &workspace, |slot, _| slot);
+        restore_tabs(&mut tabs, &workspace, |slot, _, _| slot);
         assert_eq!(tabs.active_index(), Some(3));
         assert_ne!(tabs.active_id(), Some(left_bottom));
         assert_eq!(tabs.get(left_bottom), Some(&12));
         assert_eq!(tabs.headers().len(), 5);
+    }
+
+    #[test]
+    fn restored_pane_names_follow_live_panes_through_move_and_detach() {
+        let mut split = Layout::Leaf(51);
+        split.split(51, 96, Axis::Rows);
+        let name: TabTitle = "Live metrics".to_owned().try_into().unwrap();
+        let mut workspace = Workspace::capture_with_pane_names([(&split, 51)], 0, |id| {
+            Ok((SavedSource::Demo, (id == 51).then(|| name.clone())))
+        })
+        .unwrap();
+        workspace.tabs[0].title = Some("Dashboard".to_owned().try_into().unwrap());
+
+        let mut tabs = Tabs::default();
+        append_workspace(&mut tabs, &workspace, &BTreeMap::new(), false).unwrap();
+        let named = tabs.active_id().unwrap();
+        let sibling = tabs.active_layout().unwrap().leaves()[1];
+        let live = |tabs: &Tabs<AppTab>, id| {
+            let AppTab {
+                label,
+                page: Page::Terminal(pane),
+            } = tabs.get(id).unwrap()
+            else {
+                panic!("expected live terminal")
+            };
+            assert_eq!(*label, source_label(&Source::Demo));
+            (pane.pane_name.clone(), pane.session.pane_id)
+        };
+        let original = live(&tabs, named);
+        assert_eq!(original.0.as_ref(), Some(&name));
+        assert!(live(&tabs, sibling).0.is_none());
+        assert!(tabs.move_active_to_new_tab());
+        assert_eq!(tabs.title_for(sibling).unwrap().as_str(), "Dashboard");
+        assert!(tabs.title_for(named).is_none());
+
+        let detached = tabs.take_group(tabs.group_id(named).unwrap()).unwrap();
+        let mut window = Tabs::default();
+        window.restore_group(detached, 0, true);
+        assert_eq!(live(&window, named), original);
+        assert!(live(&tabs, sibling).0.is_none());
     }
 
     #[test]
@@ -852,6 +907,7 @@ mod tests {
         workspace.tabs[1].layout = SavedLayout::Leaf {
             slot: 14,
             source: SavedSource::SavedProfile("missing".into()),
+            pane_name: None,
         };
         let mut tabs = Tabs::default();
         let existing = tabs.insert(AppTab {

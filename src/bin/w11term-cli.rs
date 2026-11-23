@@ -25,7 +25,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         };
         match arg.as_str() {
             "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
-            | "save-text" | "restart" | "list-commands" | "get-command"
+            | "save-text" | "restart" | "list-commands" | "get-command" | "inspect"
+            | "playback"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -161,12 +162,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn playback_requires_one_pane_and_at_most_one_action() {
+        use w11term::session::ReplayAction;
+        let cli = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        for (tail, expected) in [
+            ("", ReplayAction::Status),
+            ("--pause", ReplayAction::Pause),
+            ("--resume", ReplayAction::Resume),
+            ("--step", ReplayAction::Step),
+        ] {
+            assert!(
+                matches!(cli(&format!("--pid 42 playback --pane 7 {tail}")).unwrap(),
+                (Some(42), Request::Playback { pane: 7, action }) if action == expected)
+            );
+        }
+        for args in [
+            "playback",
+            "playback --pane 1 --step --step",
+            "playback --pane 1 --step --resume",
+            "playback --pane 1 --all-panes",
+            "playback --pane 1 32",
+            "inspect --pane 1 --pause",
+        ] {
+            assert!(cli(args).is_err(), "{args}");
+        }
+        let request: Request = serde_json::from_str(r#"{"verb":"playback","pane":7}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::Playback {
+                pane: 7,
+                action: ReplayAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn inspect_requires_a_pane_and_accepts_the_optional_process_id() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 42 inspect --pane 7").unwrap(),
+            (Some(42), Request::Inspect { pane: 7 })
+        ));
+        assert!(matches!(
+            parse_line("--pane 7 inspect").unwrap(),
+            (None, Request::Inspect { pane: 7 })
+        ));
+        for line in [
+            "inspect",
+            "inspect --pane a",
+            "inspect --pane 1 --all-panes",
+            "inspect --pane 1 extra",
+            "inspect --pane 2 --stdin",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
+
+    #[test]
     fn command_history_requires_the_listed_pane_id_and_generation_for_lookup() {
+        use w11term::control::CommandStatus;
         let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
         assert!(matches!(
             parse_line("--pane 2 list-commands --pid 7").unwrap(),
-            (Some(7), Request::ListCommands { pane: 2 })
+            (
+                Some(7),
+                Request::ListCommands {
+                    pane: 2,
+                    status: CommandStatus::All
+                }
+            )
         ));
+        for (value, expected) in [
+            ("all", CommandStatus::All),
+            ("failed", CommandStatus::Failed),
+            ("succeeded", CommandStatus::Succeeded),
+            ("unknown", CommandStatus::Unknown),
+        ] {
+            assert!(matches!(
+                parse_line(&format!("list-commands --status {value} --pane 2")).unwrap(),
+                (None, Request::ListCommands { pane: 2, status }) if status == expected
+            ));
+        }
         assert!(matches!(
             parse_line("--pid 7 get-command --id 53 --connection-generation 0 --pane 2").unwrap(),
             (
@@ -182,6 +258,10 @@ mod tests {
             "list-commands",
             "list-commands --pane 2 --id 53",
             "list-commands --pane 2 --connection-generation 1",
+            "list-commands --pane 2 --status",
+            "list-commands --pane 2 --status running",
+            "list-commands --pane 2 --status failed --status succeeded",
+            "get-command --pane 2 --id 53 --connection-generation 0 --status failed",
             "get-command --pane 2 --id 53",
             "get-command --pane 2 --connection-generation 0",
             "get-command --id 53 --connection-generation 1",

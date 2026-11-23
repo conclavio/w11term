@@ -44,7 +44,7 @@ transmissions to 48 MiB encoded / 32 MiB inflated, limits decoded kitty frames t
 are pruned when the table exceeds 32 MiB. Remote SSH peers cannot request local
 file, temporary-file, or shared-memory kitty transports. These limits cover direct
 replacement; they do not establish a global RAM limit for sixel, iTerm images,
-images retained in primary scrollback or other image protocols. APC buffers are capped at 48 MiB; oversized strings are discarded through their terminator. Kitty animations are capped at 256 frames / 32 MiB and accounted in the 64 MiB table. The separate CPU dedup cache retains at most 4 MiB, and clears on deletion, reset and animation edits. Chunked animation frames share the direct transmission budget. Chunked queries are unsupported.
+images retained in primary scrollback or other image protocols. APC buffers are capped at 48 MiB; oversized strings are discarded through their terminator. Kitty animations are capped at 256 frames / 32 MiB and accounted in the 64 MiB table. The separate CPU dedup cache retains at most 4 MiB, and clears on deletion, reset and animation edits. Chunked animation frames and upload probes share the direct transmission budget.
 Large graphics or unused table entries may be rejected or evicted.
 
 DA1 includes attribute 4 and XTVERSION identifies `w11term <package-version>`.
@@ -102,6 +102,92 @@ in history survives. An image with a surviving placement can be displayed again.
 Lowercase `d=a` (also the default selector) keeps the image data for redisplay.
 Clearing acts on the active primary or alternate screen, even while the user is
 reading older output. [Kitty deletion protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images)
+
+The cursor (`d=c/C`) and an explicit one-based cell (`d=p/P`) can select
+individual placements. Use `d=q/Q` to restrict an explicit cell to a z-index.
+A hit removes the entire placement, including relative children. Images still
+used elsewhere on screen or in scrollback retain their data after uppercase
+deletion. Unicode placeholders remain editable text. The shared
+`clear-cell.vt` fixture compares the resulting pixels in stock kitty and
+Direct2D after cursor deletion, redisplay, cell deletion and z-index filtering.
+
+Use `d=y/Y` for all placements touching a live row. Column deletion
+(`d=x/X`) and deletion by z-index (`d=z/Z`) also reach placements in
+scrollback on the active screen. The stock kitty and Direct2D
+`clear-groups.vt` tests check row and column selection, layer removal, and
+redisplay after a different placement keeps an image's data alive.
+
+Use `d=n/N,I=<number>` to target the newest image uploaded under that number.
+An optional `p` selects one placement on that image. When `N` frees the
+newest image, the same number addresses the next newest surviving image.
+Kitty 0.45 and Direct2D share the `clear-number.vt` comparison. Kitty 0.32.2
+applies number deletion to every image with that number.
+[Kitty 0.45](https://github.com/kovidgoyal/kitty/blob/v0.45.0/kitty/graphics.c#L2011-L2020) · [Kitty 0.32.2](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L1885-L1888)
+
+Animation frame deletion uses `d=f/F` with an image ID or number and a
+one-based frame number in `r`. A missing or zero `r` selects the first frame.
+A number beyond the end selects the last frame. Lowercase `f` keeps the
+only remaining frame, while uppercase `F` removes its image and placements.
+The shared `clear-frame.vt` fixture checks these results in stock kitty and
+Direct2D. [Kitty 0.45 frame deletion](https://github.com/kovidgoyal/kitty/blob/v0.45.0/kitty/graphics.c#L1591-L1630)
+
+Applications can query an action with `a=q,i=<id>,e=<action>` and include
+the option values they need. For example, `a=q,i=31,e=T,U=1,C=1` reports
+`e=T,C=1,U=1` to confirm Unicode placeholders and cursor preservation.
+The response omits unavailable options such as file and shared-memory
+transports. Queries do not load their payload or disturb an upload in progress.
+[Kitty feature queries](https://sw.kovidgoyal.net/kitty/graphics-protocol/#querying-support-for-protocol-features)
+
+An upload probe with an image ID and a payload checks the same format,
+dimensions, compression and byte counts as an upload. Probe data stays
+out of the image table. A multipart probe replies after its final chunk,
+and a standalone probe can run during an in-flight upload.
+[Kitty upload probes](https://sw.kovidgoyal.net/kitty/graphics-protocol/#querying-support-and-available-transmission-mediums)
+
+Indexed uploads use either one palette index per pixel or an index followed
+by alpha. Each indexed image counts both its source indices and expanded
+RGBA pixels toward the 32 MiB per-image and 64 MiB image-table budgets.
+Palette changes recolor committed images and produce new GPU texture keys.
+Older snapshots keep their captured colors. Palette index 254 uses the
+default foreground, which is the fallback for the renderer's URL-hover
+color. The indexed formats support static images, and frame uploads,
+animation controls and frame composition return an error for indexed
+images. The Windows tests check the protocol replies, RGBA values and
+rendered Direct2D pixels. [Kitty indexed color](https://sw.kovidgoyal.net/kitty/graphics-protocol/#indexed-color-data)
+
+An addressed upload or placement returns one status reply after it is
+processed. Placement replies include the requested placement ID, when
+present. A multipart upload inherits quiet mode from its first chunk and
+accepts `q=1` or `q=2` on its final chunk. A malformed continuation, an
+unsupported transport, or a transmission limit reports the original image
+and placement or frame when those identifiers are present.
+[Kitty placement replies](https://sw.kovidgoyal.net/kitty/graphics-protocol/#display-images-on-screen)
+
+Animation frame uploads acknowledge the one-based frame number that was
+edited or appended. Multipart frame uploads retain their first chunk's
+address and reply after the final chunk. Frame composition acknowledges
+the result and checks the source and destination rectangles before changing
+the destination. Successful playback controls run silently. Image and
+frame errors follow the requested quiet mode.
+[Kitty animation reference](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty_tests/graphics.py#L1694-L1873)
+
+Erase-in-line and partial erase-in-display clear text without removing
+direct kitty graphics. Unicode placeholder images disappear when their
+placeholder text is erased. A full display erase clears visible graphics
+and keeps named image data available for later placement.
+[Kitty interaction with terminal actions](https://sw.kovidgoyal.net/kitty/graphics-protocol/#interaction-with-other-terminal-actions)
+
+In a bounded scroll region, a direct kitty placement that crosses a margin
+stays in place while the text scrolls. Placements entirely inside the region
+move with the text and keep their original scale when clipped at the edge.
+Rows may enter primary-screen scrollback during a bounded scroll. The image
+tiles clipped by the margin stay out of those rows.
+[Kitty scrolling reference](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty_tests/graphics.py#L1423-L1500)
+
+Inserting or deleting characters or lines leaves direct kitty placements
+at their original positions. Images displayed through Unicode placeholders
+follow the edited text.
+[Kitty text editing implementation](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty/screen.c#L2889-L3009)
 
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only

@@ -1,11 +1,106 @@
 use super::*;
-use w11term::durable::{Backend, DurableReference};
+use std::cell::Ref;
+use w11term::durable::{Backend, DiscoveredSession, DurableReference};
 use w11term::ssh::{DurableAction, DurablePhase};
+
+const PER_PAGE: usize = 32;
+
+#[derive(Default)]
+pub(super) struct Browser {
+    query: String,
+    pub(super) query_revision: u64,
+    page: usize,
+    input: ElementRef<TextBox>,
+    cached: RefCell<Option<Matches>>,
+}
+
+struct Matches {
+    listing: Arc<[DiscoveredSession]>,
+    indices: Vec<usize>,
+}
+
+impl Browser {
+    fn version(&self, listing: u64) -> ListVersion {
+        ListVersion {
+            listing,
+            query: self.query_revision,
+        }
+    }
+
+    fn set_query(&mut self, query: String) {
+        if self.query != query {
+            self.query = query;
+            self.query_revision = self.query_revision.wrapping_add(1);
+            self.page = 0;
+            self.cached.get_mut().take();
+        }
+    }
+
+    fn matches(&self, listing: &Arc<[DiscoveredSession]>) -> Ref<'_, Matches> {
+        if !self
+            .cached
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| Arc::ptr_eq(&m.listing, listing))
+        {
+            let needle = self.query.to_lowercase();
+            let indices = listing
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    let found = needle.is_empty()
+                        || [
+                            entry.display_name.as_str(),
+                            &entry.reference.name,
+                            backend_name(entry.reference.backend),
+                            &entry.command,
+                            &entry.directory,
+                        ]
+                        .iter()
+                        .any(|field| field.to_lowercase().contains(&needle));
+                    found.then_some(index)
+                })
+                .collect();
+            self.cached.replace(Some(Matches {
+                listing: listing.clone(),
+                indices,
+            }));
+        }
+        Ref::map(self.cached.borrow(), |cached| cached.as_ref().unwrap())
+    }
+
+    fn unique(&self, listing: &Arc<[DiscoveredSession]>) -> Option<DurableReference> {
+        if self.query.trim().is_empty() {
+            return None;
+        }
+        let matches = self.matches(listing);
+        let [index] = matches.indices.as_slice() else {
+            return None;
+        };
+        Some(listing[*index].reference.clone())
+    }
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Zmx => "zmx",
+        Backend::Tmux => "tmux",
+        Backend::Herdr => "Herdr",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListVersion {
+    listing: u64,
+    query: u64,
+}
 
 pub enum Action {
     Discover { name: String, herdr: bool },
-    Page(TabId, usize),
-    Pick(TabId, DurableAction),
+    Query(TabId, String),
+    Focus(TabId, u8),
+    Page(TabId, ListVersion, usize),
+    Pick(TabId, ListVersion, DurableAction),
 }
 
 pub(super) fn discovery_tab(
@@ -27,7 +122,7 @@ pub(super) fn discovery_tab(
     };
     let mut tab = live_tab_for_session(name.clone(), source, session).with_profile(Some(name));
     if let Page::Terminal(live) = &mut tab.page {
-        live.discovery_page = Some(0);
+        live.discovery = Some(Browser::default());
     }
     tab
 }
@@ -35,13 +130,18 @@ pub(super) fn discovery_tab(
 pub(super) fn discovery_view(
     id: TabId,
     tab: &LiveTab,
+    active: bool,
+    keyboard: &KeyboardBridge,
     context: &ViewContext<TerminalApp>,
 ) -> Option<View> {
-    let page = tab.discovery_page?;
+    let browser = tab.discovery.as_ref()?;
     let state = tab.session.durable_state()?;
     if !state.phase.is_browser() {
         return None;
     }
+    let version = browser.version(state.listing_revision);
+    let matches = browser.matches(&state.candidates);
+    let count = matches.indices.len();
     let mut rows = vec![
         KeyedView::new(
             "heading",
@@ -62,19 +162,45 @@ pub(super) fn discovery_view(
                 .text_wrapping(TextWrapping::Wrap),
         ),
         KeyedView::new(
+            "search",
+            TextBox::new()
+                .element_ref(&browser.input)
+                .automation_name("Search remote sessions")
+                .automation_id(keyboard.session_search_tag(id))
+                .placeholder_text("Search remote sessions")
+                .is_enabled(active)
+                .text(&browser.query)
+                .on_text_changed(
+                    context.callback(move |query| Message::Discovery(Action::Query(id, query))),
+                ),
+        ),
+        KeyedView::new(
             "refresh",
             Button::new()
-                .is_enabled(state.phase == DurablePhase::Choosing)
+                .is_enabled(active && state.phase == DurablePhase::Choosing)
                 .on_click(context.callback(move |_| {
-                    Message::Discovery(Action::Pick(id, DurableAction::Refresh))
+                    Message::Discovery(Action::Pick(id, version, DurableAction::Refresh))
                 }))
                 .content("Refresh"),
         ),
     ];
-    // Keep the WinUI tree bounded even for a busy multi-session account.
-    const PER_PAGE: usize = 32;
-    let last = state.candidates.len().saturating_sub(1) / PER_PAGE;
-    let page = page.min(last);
+    if state.phase == DurablePhase::Choosing {
+        let summary = match (browser.query.is_empty(), count) {
+            (false, 0) => "No matching sessions".into(),
+            (false, 1) => "1 match".into(),
+            (false, n) => format!("{n} matches"),
+            (true, 1) => "1 session".into(),
+            (true, n) => format!("{n} sessions"),
+        };
+        rows.push(KeyedView::new(
+            "count",
+            TextBlock::new()
+                .automation_id("session-search-count")
+                .text(summary),
+        ));
+    }
+    let last = count.saturating_sub(1) / PER_PAGE;
+    let page = browser.page.min(last);
     if last > 0 {
         for (key, label, target, enabled) in [
             (
@@ -88,15 +214,18 @@ pub(super) fn discovery_view(
             rows.push(KeyedView::new(
                 key,
                 Button::new()
-                    .is_enabled(enabled)
+                    .is_enabled(active && enabled)
                     .on_click(
-                        context.callback(move |_| Message::Discovery(Action::Page(id, target))),
+                        context.callback(move |_| {
+                            Message::Discovery(Action::Page(id, version, target))
+                        }),
                     )
                     .content(label),
             ));
         }
     }
-    for entry in state.candidates.iter().skip(page * PER_PAGE).take(PER_PAGE) {
+    for &index in matches.indices.iter().skip(page * PER_PAGE).take(PER_PAGE) {
+        let entry = &state.candidates[index];
         let reference = entry.reference.clone();
         let count = entry.clients;
         let clients = if count == 1 {
@@ -104,10 +233,11 @@ pub(super) fn discovery_view(
         } else {
             format!("{count} clients")
         };
-        let backend = match reference.backend {
-            Backend::Zmx => "zmx",
-            Backend::Tmux => "tmux",
-            Backend::Herdr => "Herdr",
+        let backend = backend_name(reference.backend);
+        let name = if reference.backend == Backend::Tmux && entry.display_name != reference.name {
+            format!("{} ({})", entry.display_name, reference.name)
+        } else {
+            entry.display_name.clone()
         };
         let windows = match entry.windows {
             Some(1) => "1 window".into(),
@@ -115,7 +245,7 @@ pub(super) fn discovery_view(
             None => String::new(),
         };
         let label = [
-            entry.display_name.as_str(),
+            name.as_str(),
             backend,
             &entry.command,
             &entry.directory,
@@ -131,11 +261,16 @@ pub(super) fn discovery_view(
         .collect::<Vec<_>>()
         .join(" · ");
         rows.push(KeyedView::new(
-            format!("{backend}-{}", reference.name),
+            format!("{backend}-{}-{}", reference.name, reference.generation),
             Button::new()
+                .is_enabled(active && state.phase == DurablePhase::Choosing)
                 .automation_name(format!("Attach to {label}"))
                 .on_click(context.callback(move |_| {
-                    Message::Discovery(Action::Pick(id, DurableAction::Choose(reference.clone())))
+                    Message::Discovery(Action::Pick(
+                        id,
+                        version,
+                        DurableAction::Choose(reference.clone()),
+                    ))
                 }))
                 .content(
                     TextBlock::new()
@@ -188,7 +323,15 @@ impl TerminalApp {
                 assert!(state.reference.is_none());
                 assert_eq!(state.candidates.len(), 1, "{}", state.detail);
                 let action = DurableAction::Choose(state.candidates[0].reference.clone());
-                self.update(Message::Discovery(Action::Pick(id, action)), context);
+                let version = tab
+                    .discovery
+                    .as_ref()
+                    .unwrap()
+                    .version(state.listing_revision);
+                self.update(
+                    Message::Discovery(Action::Pick(id, version, action)),
+                    context,
+                );
                 4
             }
             (4, Some(DurablePhase::Attached))
@@ -246,43 +389,208 @@ impl TerminalApp {
         }
     }
     pub(super) fn discovery_action(&mut self, action: Action, context: &ComponentContext<Self>) {
-        match action {
-            Action::Page(id, page) => {
-                if let Some(AppTab {
-                    page: Page::Terminal(live),
-                    ..
-                }) = self.tabs.get_mut(id)
-                    && let Some(current) = live.discovery_page.as_mut()
-                {
-                    *current = page;
-                }
-            }
+        let id = match &action {
             Action::Discover { name, herdr } => {
                 if let Some(options) = self
                     .catalog
                     .profiles
-                    .get(&name)
-                    .filter(|options| !options.player.rustmush)
+                    .get(name)
+                    .filter(|o| !o.player.rustmush)
                 {
                     let osc52 = self.appearance.read().unwrap().interaction.osc52;
-                    self.tabs
-                        .insert(discovery_tab(name, options.clone(), osc52, None, herdr));
-                    self.sync_selection(context);
-                    self.activate(context);
+                    self.insert_tab(
+                        discovery_tab(name.clone(), options.clone(), osc52, None, *herdr),
+                        context,
+                    );
                 }
+                return;
             }
-            Action::Pick(id, choice) => {
-                if let Some(AppTab {
-                    page: Page::Terminal(live),
-                    ..
-                }) = self.tabs.get(id)
-                    && live.session.durable_action(choice).is_ok()
-                {
-                    self.tabs.select(id);
-                    self.sync_selection(context);
-                    self.activate(context);
-                }
-            }
+            Action::Page(id, ..)
+            | Action::Pick(id, ..)
+            | Action::Query(id, _)
+            | Action::Focus(id, _) => *id,
+        };
+        if !self.discovery_input_available(id) {
+            return;
         }
+        let Some(AppTab {
+            page: Page::Terminal(live),
+            ..
+        }) = self.tabs.get_mut(id)
+        else {
+            return;
+        };
+        let Some(browser) = &mut live.discovery else {
+            return;
+        };
+        let Some(state) = live.session.durable_state() else {
+            return;
+        };
+        match action {
+            Action::Query(_, text) => {
+                browser.set_query(text);
+                self.connection_ui(id);
+            }
+            Action::Focus(_, attempt) => {
+                let sender = context.sender();
+                let queued = browser.input.request_focus_result(move |result| {
+                    if !result.unwrap_or(false) && attempt < 4 {
+                        sender.send(Message::Discovery(Action::Focus(id, attempt + 1)));
+                    }
+                });
+                if !queued && attempt < 4 {
+                    context.spawn_background(move |_| {
+                        std::thread::sleep(Duration::from_millis(20));
+                        Message::Discovery(Action::Focus(id, attempt + 1))
+                    });
+                }
+            }
+            Action::Page(_, version, page) => {
+                if version == browser.version(state.listing_revision) {
+                    browser.page = page;
+                }
+            }
+            Action::Pick(_, version, action) => {
+                if version == browser.version(state.listing_revision) {
+                    let _ = live
+                        .session
+                        .durable_action_for_listing(version.listing, action);
+                }
+            }
+            Action::Discover { .. } => unreachable!(),
+        }
+    }
+
+    fn discovery_input_available(&self, id: TabId) -> bool {
+        self.tabs.active_id() == Some(id)
+            && self.picker.is_none()
+            && self.switcher.is_none()
+            && self.title_editor.is_none()
+            && !self.clipboard.is_open()
+            && matches!(self.tabs.get(id).map(|t| &t.page), Some(Page::Terminal(live))
+                if live.browsing_sessions() && live.session.frames.load().prompt.is_none() && live.session.prompts.current().is_none())
+    }
+
+    pub(super) fn submit_session_search(&self, id: TabId, listing: u64, query: u64) {
+        if !self.discovery_input_available(id) {
+            return;
+        }
+        let Some(AppTab {
+            page: Page::Terminal(live),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let Some(browser) = &live.discovery else {
+            return;
+        };
+        if let Some(state) = live.session.durable_state()
+            && state.phase == DurablePhase::Choosing
+            && browser.version(state.listing_revision) == (ListVersion { listing, query })
+            && let Some(reference) = browser.unique(&state.candidates)
+        {
+            let _ = live
+                .session
+                .durable_action_for_listing(listing, DurableAction::Choose(reference));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(
+        backend: Backend,
+        id: &str,
+        name: &str,
+        directory: &str,
+        command: &str,
+    ) -> DiscoveredSession {
+        DiscoveredSession {
+            reference: DurableReference {
+                backend,
+                host: "fixture.invalid".into(),
+                host_key_alias: None,
+                port: 22,
+                user: "tester".into(),
+                host_key: "test-key".into(),
+                name: id.into(),
+                generation: "session-generation".into(),
+            },
+            display_name: name.into(),
+            windows: None,
+            clients: 1,
+            directory: directory.into(),
+            command: command.into(),
+        }
+    }
+
+    #[test]
+    fn session_search_filters_all_pages_and_fields_without_treating_names_as_patterns() {
+        let mut entries: Vec<_> = (0..PER_PAGE)
+            .map(|n| candidate(Backend::Tmux, &format!("${n}"), "running", "", ""))
+            .collect();
+        entries.push(candidate(
+            Backend::Zmx,
+            "remote-777",
+            "Night Shift",
+            "/tmp/ÉTÉ[1]",
+            "Cargo WATCH",
+        ));
+        entries.push(candidate(Backend::Herdr, "t17", "Build (t17)", "", ""));
+        let listing: Arc<[_]> = entries.into();
+        let mut browser = Browser::default();
+        assert_eq!(browser.matches(&listing).indices.len(), PER_PAGE + 2);
+        browser.page = 1;
+        for query in [
+            "nIgHt ShIfT",
+            "remote-777",
+            "zMx",
+            "cargo watch",
+            "/TMP/été[1]",
+        ] {
+            browser.set_query(query.into());
+            assert_eq!(browser.page, 0);
+            assert_eq!(
+                browser.unique(&listing),
+                Some(listing[PER_PAGE].reference.clone())
+            );
+        }
+        browser.set_query("herdr".into());
+        assert_eq!(browser.matches(&listing).indices, [PER_PAGE + 1]);
+        browser.set_query(".*".into());
+        assert!(browser.matches(&listing).indices.is_empty());
+        assert!(browser.unique(&listing).is_none());
+    }
+
+    #[test]
+    fn session_search_refresh_keeps_query_and_enter_requires_one_verified_nonempty_match() {
+        let first = candidate(Backend::Tmux, "$12", "ops", "", "");
+        let second = candidate(Backend::Tmux, "$23", "ops", "", "");
+        let both: Arc<[_]> = vec![first.clone(), second.clone()].into();
+        let refreshed: Arc<[_]> = vec![second.clone()].into();
+        let mut browser = Browser::default();
+        assert!(browser.unique(&refreshed).is_none());
+        browser.set_query("ops".into());
+        let offered = browser.version(1);
+        assert!(browser.unique(&both).is_none());
+        assert_eq!(browser.unique(&refreshed), Some(second.reference.clone()));
+        assert_ne!(
+            offered,
+            browser.version(2),
+            "refresh invalidates the offered row"
+        );
+        browser.set_query("$12".into());
+        assert_ne!(
+            offered,
+            browser.version(1),
+            "editing invalidates the old query"
+        );
+        assert_eq!(browser.unique(&both), Some(first.reference));
+        assert!(browser.unique(&refreshed).is_none());
+        browser.set_query(" ".into());
+        assert!(browser.unique(&both).is_none());
     }
 }

@@ -112,6 +112,27 @@ async fn same_read_boundaries_preserve_completed_frames_and_pending_prefix() {
 }
 
 #[tokio::test]
+async fn xterm_private_mode_restore_preserves_synchronized_frame_boundaries() {
+    let session = Session::start(Source::Demo);
+    feed(&session, "\x1b[?2026h\x1b[?2026s\x1b[?2026lold").await;
+    let held = feed(&session, "\rfirst\x1b[?2026r\rhidden").await;
+    assert!(text(&held).starts_with("first"));
+    let released = feed(&session, "\x1b[?2026l").await;
+    assert!(text(&released).starts_with("hidden"));
+    assert_eq!(released.generation, held.generation + 1);
+
+    let held = feed(
+        &session,
+        "\x1b[?2026s\x1b[?2026h\rsecond\x1b[?2026r\x1b[?2026h\rpending",
+    )
+    .await;
+    assert!(text(&held).starts_with("second"));
+    let released = feed(&session, "\x1b[?2026l").await;
+    assert!(text(&released).starts_with("pending"));
+    assert_eq!(released.generation, held.generation + 1);
+}
+
+#[tokio::test]
 async fn missing_sync_end_times_out_and_survives_resize() {
     let session = Session::start(Source::Demo);
     let old = feed(&session, "old").await;

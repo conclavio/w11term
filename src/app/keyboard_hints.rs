@@ -1,4 +1,5 @@
 use super::*;
+use std::path::PathBuf;
 use w11term::{
     hints::{self, Hint, Target},
     terminal::Snapshot,
@@ -10,9 +11,33 @@ pub(super) struct Hints {
     entries: Vec<Hint>,
     prefix: String,
     selected: Option<usize>,
-    ssh: bool,
-    directory: Option<String>,
+    backend: HintBackend,
+    opening_explorer: Option<Arc<()>>,
     message: Option<String>,
+}
+
+enum HintBackend {
+    Ssh(Option<String>),
+    Local(Option<PathBuf>),
+    Other,
+}
+
+enum Reveal {
+    Sftp(String, Option<String>),
+    Explorer(PathBuf),
+}
+
+impl HintBackend {
+    fn resolve(&self, target: &Target) -> Option<Reveal> {
+        let path = target.file_path()?;
+        match self {
+            Self::Ssh(cwd) => {
+                reveal_path(path, cwd.as_deref()).map(|(dir, name)| Reveal::Sftp(dir, name))
+            }
+            Self::Local(cwd) => explorer::resolve(path, cwd.as_deref()).map(Reveal::Explorer),
+            Self::Other => None,
+        }
+    }
 }
 
 // Only SFTP on this pane interprets the path. Its server resolves "." and "..",
@@ -56,11 +81,12 @@ impl Hints {
         self.selected.map(|i| &self.entries[i].target)
     }
 
-    fn reveal(&self) -> Option<(String, Option<String>)> {
-        if !self.ssh {
-            return None;
+    fn reveal_instruction(&self, target: &Target) -> &'static str {
+        match self.backend.resolve(target) {
+            Some(Reveal::Sftp(..)) => " · R reveal in SFTP",
+            Some(Reveal::Explorer(_)) => " · R reveal in File Explorer",
+            None => "",
         }
-        reveal_path(self.selected()?.file_path()?, self.directory.as_deref())
     }
 
     pub fn instructions(&self) -> String {
@@ -69,17 +95,17 @@ impl Hints {
         }
         match self.selected() {
             Some(Target::Url(uri)) => format!("Enter open · C copy · Esc cancel   {uri}"),
-            Some(Target::Path(path)) if self.reveal().is_some() => {
-                format!("Enter copy · R reveal in SFTP · Esc cancel   {path}")
+            Some(target @ Target::Path(path)) => {
+                format!(
+                    "Enter copy{} · Esc cancel   {path}",
+                    self.reveal_instruction(target)
+                )
             }
-            Some(Target::Path(path)) => format!("Enter copy · Esc cancel   {path}"),
             Some(target @ Target::Pattern { name, text }) => {
                 let action = if target.pattern_url().is_some() {
                     " · O open URL"
-                } else if self.reveal().is_some() {
-                    " · R reveal in SFTP"
                 } else {
-                    ""
+                    self.reveal_instruction(target)
                 };
                 format!("{name} · Enter copy{action} · Esc cancel   {text}")
             }
@@ -123,12 +149,13 @@ impl TerminalApp {
                 &settings.hint_patterns,
             )
         };
-        let (ssh, directory) = match &tab.source {
-            Source::Ssh(ssh) => (
-                true,
-                file_drawer::shell_directory(frame.reported_directory.as_deref(), &ssh.host),
-            ),
-            _ => (false, None),
+        let report = frame.reported_directory.as_deref();
+        let backend = match &tab.source {
+            Source::Ssh(ssh) => HintBackend::Ssh(file_drawer::shell_directory(report, &ssh.host)),
+            Source::Local(_) => {
+                HintBackend::Local(directory_split::reported_local_directory(report))
+            }
+            _ => HintBackend::Other,
         };
         *self.hints.borrow_mut() = Some(Hints {
             pane: id,
@@ -136,8 +163,8 @@ impl TerminalApp {
             entries,
             prefix: String::new(),
             selected: None,
-            ssh,
-            directory,
+            backend,
+            opening_explorer: None,
             message: None,
         });
         if let Some(inspector) = &mut self.inspection {
@@ -181,6 +208,9 @@ impl TerminalApp {
             self.close_hints();
             return;
         }
+        if h.opening_explorer.is_some() {
+            return;
+        }
         h.message = None;
         if vk == 0x08 {
             h.selected = None;
@@ -215,21 +245,40 @@ impl TerminalApp {
                     return;
                 }
             }
-            (0x52, _) => {
-                let Some((dir, name)) = h.reveal() else {
-                    return;
-                };
-                if tab.files.busy() {
-                    h.message = Some("File drawer busy · R retry · Esc cancel".into());
+            (0x52, _) => match h.backend.resolve(target) {
+                Some(Reveal::Explorer(path)) => {
+                    let request = Arc::new(());
+                    h.opening_explorer = Some(request.clone());
+                    h.message = Some("Opening File Explorer… · Esc close".into());
+                    let rejected = Message::HintRevealed(
+                        request.clone(),
+                        Err("File Explorer is unavailable".into()),
+                    );
+                    context.spawn_background_with_rejection(
+                        move |_| {
+                            Message::HintRevealed(
+                                request,
+                                explorer::reveal(&path).map_err(|e| format!("{e:#}")),
+                            )
+                        },
+                        rejected,
+                    );
                     return;
                 }
-                reveal = Some(FileAction::Reveal(
-                    tab.session.pane_id,
-                    h.frame.connection_generation,
-                    dir,
-                    name,
-                ));
-            }
+                Some(Reveal::Sftp(dir, name)) => {
+                    if tab.files.busy() {
+                        h.message = Some("File drawer busy · R retry · Esc cancel".into());
+                        return;
+                    }
+                    reveal = Some(FileAction::Reveal(
+                        tab.session.pane_id,
+                        h.frame.connection_generation,
+                        dir,
+                        name,
+                    ));
+                }
+                None => return,
+            },
             _ => return,
         }
         drop(state);
@@ -238,11 +287,63 @@ impl TerminalApp {
             self.file_action(action, context);
         }
     }
+
+    pub(super) fn hint_revealed(&mut self, request: Arc<()>, result: Result<(), String>) {
+        let mut state = self.hints.borrow_mut();
+        let Some(h) = state.as_mut() else { return };
+        if !h
+            .opening_explorer
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(pending, &request))
+        {
+            return;
+        }
+        h.opening_explorer = None;
+        if let Err(error) = result {
+            h.message = Some(format!("Reveal failed: {error} · R retry · Esc cancel"));
+            return;
+        }
+        drop(state);
+        self.close_hints();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn path_actions_follow_the_pane_that_produced_the_text() {
+        let local = HintBackend::Local(Some(PathBuf::from(r"C:\build")));
+        let remote = HintBackend::Ssh(Some("/srv/build".into()));
+        let path = Target::Pattern {
+            name: "Source".into(),
+            text: "src/main.rs".into(),
+        };
+        assert!(
+            matches!(local.resolve(&path), Some(Reveal::Explorer(p)) if p == std::path::Path::new(r"C:\build\src\main.rs"))
+        );
+        assert!(
+            matches!(remote.resolve(&path), Some(Reveal::Sftp(dir, Some(name))) if dir == "/srv/build/src" && name == "main.rs")
+        );
+        assert!(HintBackend::Other.resolve(&path).is_none());
+        assert!(HintBackend::Local(None).resolve(&path).is_none());
+        assert!(
+            local
+                .resolve(&Target::Path("/etc/profile".into()))
+                .is_none()
+        );
+        assert!(
+            remote
+                .resolve(&Target::Path(r"C:\work\code.rs".into()))
+                .is_none()
+        );
+        assert!(
+            local
+                .resolve(&Target::Url("https://example.org/a.rs".into()))
+                .is_none()
+        );
+    }
+
     #[test]
     fn ssh_reveal_resolves_unix_paths_against_the_reported_directory() {
         assert_eq!(

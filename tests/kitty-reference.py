@@ -15,6 +15,10 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "kitty"
 SCENES = {
     "placements": (["placements.vt", "layers.vt"], "samples.json"),
     "clear-visible": (["clear-setup.vt", "clear-visible.vt"], "clear-visible-samples.json"),
+    "clear-cell": (["clear-cell.vt"], "clear-cell-samples.json"),
+    "clear-groups": (["clear-groups.vt"], "clear-groups-samples.json"),
+    "clear-number": (["clear-number.vt"], "clear-number-samples.json"),
+    "clear-frame": (["clear-frame.vt"], "clear-frame-samples.json"),
     "independent-placements": (["independent-placements.vt"], "independent-placements-samples.json"),
 }
 

@@ -1,6 +1,7 @@
 //! Literal and regular expression scrollback search with stable cell coordinates, including soft wraps.
 use crate::interaction::Point;
 use regex::{Regex, RegexBuilder};
+use std::sync::Arc;
 use wezterm_term::{SemanticType, Terminal};
 
 mod literal;
@@ -45,6 +46,9 @@ pub struct SearchSnapshot {
     pub incomplete: bool,
     pub total: usize,
     pub selected: Option<usize>,
+    /// Sorted, distinct stable physical rows on which a retained match starts.
+    pub match_rows: Arc<[isize]>,
+    pub selected_row: Option<isize>,
     pub truncated: bool,
     pub visible: Vec<(bool, Match)>,
 }
@@ -58,6 +62,8 @@ pub struct Search {
     error: Option<String>,
     incomplete: bool,
     matches: Vec<Match>,
+    match_rows: Arc<[isize]>,
+    match_row_epoch: u64,
     selected: Option<usize>,
     truncated: bool,
     alternate: bool,
@@ -121,6 +127,7 @@ impl Search {
         self.incomplete = false;
         self.alternate = terminal.is_alt_screen_active();
         if !self.open || self.query.is_empty() || self.error.is_some() {
+            self.update_match_rows(terminal.screen().row_epoch());
             self.selected = None;
             return;
         }
@@ -130,6 +137,7 @@ impl Search {
             self.search_literal(terminal);
         }
         let screen = terminal.screen();
+        self.update_match_rows(screen.row_epoch());
         let anchor = previous.unwrap_or(Point {
             row: screen.visible_row_to_stable_row(0) - offset as isize,
             col: 0,
@@ -142,6 +150,20 @@ impl Search {
     }
     fn search_literal(&mut self, terminal: &Terminal) {
         self.collect_literal(terminal, || false);
+    }
+
+    fn update_match_rows(&mut self, row_epoch: u64) {
+        self.match_row_epoch = row_epoch;
+        // Both scanners return matches in screen order. An output refresh can
+        // change the number of hits on a row without moving any scrollbar marks.
+        let rows = || {
+            self.matches
+                .chunk_by(|a, b| a.start().row == b.start().row)
+                .map(|group| group[0].start().row)
+        };
+        if !rows().eq(self.match_rows.iter().copied()) {
+            self.match_rows = rows().collect();
+        }
     }
 
     fn collect_literal(&mut self, terminal: &Terminal, cancelled: impl Fn() -> bool) {
@@ -181,10 +203,34 @@ impl Search {
         let desired = matched.start().row - screen.physical_rows.saturating_sub(1) as isize / 2;
         (live - desired).max(0).min(screen.phys_row(0) as isize) as usize
     }
+    pub(crate) fn snapshot_for_frame(
+        &self,
+        frame: &crate::terminal::Snapshot,
+    ) -> Option<SearchSnapshot> {
+        let mut result =
+            self.snapshot(frame.first_stable_row, frame.rows.len(), frame.alternate)?;
+        // Between a reflow/reset and the next debounced scan the query and
+        // count remain useful, but its stable rows belong to a different grid.
+        if frame.row_epoch != self.match_row_epoch {
+            result.match_rows = Arc::default();
+            result.selected_row = None;
+        }
+        Some(result)
+    }
+
     pub fn snapshot(&self, first: isize, rows: usize, alternate: bool) -> Option<SearchSnapshot> {
         if !self.open || self.alternate != alternate {
             return None;
         }
+        // Match spans are nonempty and ordered by both start and end, including
+        // hits that start above this viewport and wrap onto its first row.
+        let end = first.saturating_add_unsigned(rows);
+        let start_index = self
+            .matches
+            .partition_point(|m| m.spans.last().unwrap().0.row < first);
+        let visible = self.matches[start_index..]
+            .iter()
+            .take_while(|m| rows != 0 && m.start().row < end);
         Some(SearchSnapshot {
             query: self.query.clone(),
             sensitive: self.sensitive,
@@ -193,17 +239,12 @@ impl Search {
             incomplete: self.incomplete,
             total: self.matches.len(),
             selected: self.selected,
+            match_rows: self.match_rows.clone(),
+            selected_row: self.selected.map(|i| self.matches[i].start().row),
             truncated: self.truncated,
-            visible: self
-                .matches
-                .iter()
+            visible: visible
                 .enumerate()
-                .filter(|(_, m)| {
-                    m.spans
-                        .iter()
-                        .any(|(p, _)| p.row >= first && p.row < first + rows as isize)
-                })
-                .map(|(i, m)| (Some(i) == self.selected, m.clone()))
+                .map(|(i, m)| (Some(start_index + i) == self.selected, m.clone()))
                 .collect(),
         })
     }
@@ -326,6 +367,77 @@ mod tests {
     use crate::terminal;
     use tokio::sync::mpsc;
     use wezterm_term::TerminalSize;
+    #[test]
+    fn find_marks_share_sorted_start_rows_across_navigation_and_paints() {
+        let term = screen(8, 3, "aa aa\r\n.......aa\r\nnone\r\naa aa");
+        for regex in [false, true] {
+            let mut search = Search::default();
+            let query = if regex { "a{2}" } else { "aa" };
+            let offset =
+                search.configure_with_mode(query.into(), true, regex, &term, max_offset(&term));
+            let first = search.snapshot(0, 3, false).unwrap();
+            assert_eq!(first.total, 5);
+            assert_eq!(&*first.match_rows, &[0, 1, 4]);
+            assert_eq!(first.selected_row, Some(0));
+            let offset = search.navigate(1, &term, offset);
+            assert_eq!(search.snapshot(0, 3, false).unwrap().selected_row, Some(0));
+            search.navigate(1, &term, offset);
+            // Only the second half of the selected hit is in this viewport.
+            let tail = search.snapshot(2, 1, false).unwrap();
+            assert!(Arc::ptr_eq(&first.match_rows, &tail.match_rows));
+            assert_eq!(tail.selected_row, Some(1));
+            assert_eq!(tail.visible.len(), 1);
+            assert!(tail.visible[0].0);
+            assert_eq!(tail.visible[0].1.spans.len(), 2);
+            assert!(search.snapshot(2, 0, false).unwrap().visible.is_empty());
+            search.refresh(&term, 0);
+            assert!(Arc::ptr_eq(&first.match_rows, &search.match_rows));
+            search.open = false;
+            assert!(search.snapshot(0, 3, false).is_none());
+            search.configure_with_mode("[".into(), false, true, &term, 0);
+            let invalid = search.snapshot(0, 3, false).unwrap();
+            assert!(invalid.match_rows.is_empty());
+            assert_eq!(invalid.selected_row, None);
+        }
+    }
+
+    #[test]
+    fn find_marks_follow_eviction_clear_rewrites_and_screen_switches() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = terminal::create_with_profile(
+            TerminalSize {
+                cols: 20,
+                rows: 2,
+                ..Default::default()
+            },
+            tx,
+            2u32.try_into().unwrap(),
+            crate::options::ColorScheme::Default,
+        );
+        let mut search = Search::default();
+        term.advance_bytes("hit\r\nhit\r\nhit\r\nhit");
+        search.configure("hit".into(), true, &term, 0);
+        let initial = search.match_rows.clone();
+        assert_eq!(&*initial, &[0, 1, 2, 3]);
+        term.advance_bytes("\r\nhit");
+        search.refresh(&term, 0);
+        assert_eq!(&*search.match_rows, &[1, 2, 3, 4]);
+        assert_eq!(&*initial, &[0, 1, 2, 3]);
+        term.erase_scrollback();
+        search.refresh(&term, 0);
+        assert_eq!(&*search.match_rows, &[3, 4]);
+        term.advance_bytes("\rnew");
+        search.refresh(&term, 0);
+        assert_eq!(&*search.match_rows, &[3]);
+        term.advance_bytes("\x1b[?1049h\x1b[Halt hit");
+        search.refresh(&term, 0);
+        assert!(search.snapshot(0, 2, false).is_none());
+        assert_eq!(&*search.snapshot(0, 2, true).unwrap().match_rows, &[0]);
+        term.advance_bytes("\x1b[?1049l");
+        search.refresh(&term, 0);
+        assert_eq!(&*search.match_rows, &[3]);
+    }
+
     #[test]
     fn wrapped_unicode_search_navigation_and_alternate_isolation() {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -521,10 +633,15 @@ mod tests {
         search.configure_with_mode(r"z|\b".into(), true, true, &term, 0);
         assert_eq!(search.matches.len(), LIMIT);
         assert!(!search.truncated);
-        term.advance_bytes("z");
+        let marks = search.match_rows.clone();
+        term.advance_bytes("\r\nz");
         search.refresh(&term, 0);
         assert_eq!(search.matches.len(), LIMIT);
         assert!(search.truncated && !search.incomplete);
+        assert!(
+            Arc::ptr_eq(&search.match_rows, &marks),
+            "the capped-out row must have no mark"
+        );
     }
 
     #[test]

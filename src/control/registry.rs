@@ -468,6 +468,7 @@ mod tests {
             id,
             tab_id: id + 10,
             tab_title: None,
+            pane_name: None,
             label: "fixture".into(),
             active: true,
             visible: true,
@@ -478,6 +479,36 @@ mod tests {
 
     fn capture() -> CapturePng {
         Arc::new(|_, _, _| unreachable!())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inspect_reports_a_missing_closed_or_unresponsive_pane() {
+        let registry = Registry::default();
+        let inspect = || registry.execute(Request::Inspect { pane: 7 }, capture());
+        assert!(
+            inspect()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown pane 7")
+        );
+        registry.replace([pane(7)]);
+        assert!(
+            inspect()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pane is closed")
+        );
+        let (input, _unresponsive) = mpsc::unbounded_channel();
+        registry.replace([Pane { input, ..pane(7) }]);
+        assert!(
+            inspect()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("inspection timed out")
+        );
     }
 
     #[tokio::test]

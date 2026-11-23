@@ -4,17 +4,13 @@ use std::io::Write;
 use termwiz::input::{KeyCodeEncodeModes, KeyboardEncoding};
 
 impl TerminalState {
-    fn effective_keyboard_encoding(&self) -> KeyboardEncoding {
-        match self
-            .screen()
-            .keyboard_stack
-            .last()
-            .unwrap_or(&self.keyboard_encoding)
-        {
+    /// Encoding used to send key events, including the configured CSI u fallback.
+    pub fn effective_keyboard_encoding(&self) -> KeyboardEncoding {
+        match self.get_keyboard_encoding() {
             KeyboardEncoding::Xterm if self.config.enable_csi_u_key_encoding() => {
                 KeyboardEncoding::CsiU
             }
-            enc => *enc,
+            enc => enc,
         }
     }
 

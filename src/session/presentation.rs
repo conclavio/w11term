@@ -63,7 +63,7 @@ impl Presentation {
         view.prompt = old.prompt.clone();
         view.scrollback_clear_generation = old.scrollback_clear_generation;
         view.scrollback_clear_floor = old.scrollback_clear_floor;
-        view.search = search.snapshot(view.first_stable_row, view.rows.len(), view.alternate);
+        view.search = search.snapshot_for_frame(&view);
         view
     }
     pub fn publish_scroll(&mut self, mut view: Snapshot) {
@@ -101,6 +101,17 @@ impl Presentation {
         status: &str,
         total: u64,
     ) {
+        self.advance_at(terminal, bytes, offset, status, total, Instant::now());
+    }
+    pub fn advance_at(
+        &mut self,
+        terminal: &mut Terminal,
+        bytes: impl AsRef<[u8]>,
+        offset: usize,
+        status: &str,
+        total: u64,
+        now: Instant,
+    ) {
         terminal.advance_bytes_with_sync(bytes, |state, enabled| {
             // Begin commits the preceding unsynchronized prefix. End commits the
             // completed update even when another begin follows in the same read.
@@ -116,7 +127,7 @@ impl Presentation {
                 status,
                 if enabled { committed_bytes } else { total },
             );
-            self.deadline = enabled.then(|| Instant::now() + SYNC_TIMEOUT);
+            self.deadline = enabled.then(|| now + SYNC_TIMEOUT);
         });
         self.dirty = true;
     }
@@ -124,6 +135,18 @@ impl Presentation {
         terminal.end_synchronized_output();
         self.deadline = None;
         self.dirty = true;
+    }
+    pub fn replay_time(&mut self, terminal: &mut Terminal, now: Instant) {
+        terminal.set_kitty_animation_time(Some(now.into_std()));
+        if self.deadline.is_some_and(|time| time <= now) {
+            self.expire(terminal);
+        }
+        if terminal
+            .kitty_animation_deadline()
+            .is_some_and(|time| time <= now.into_std())
+        {
+            self.dirty |= terminal.advance_kitty_animations(now.into_std());
+        }
     }
     pub fn publish(&mut self, terminal: &Terminal, offset: usize, metadata: Metadata<'_>) {
         let Metadata {
@@ -150,11 +173,7 @@ impl Presentation {
             snapshot.prompt = prompt.clone();
             snapshot.connection_generation = connection;
             if !synchronized || has_new_content {
-                snapshot.search = search.snapshot(
-                    snapshot.first_stable_row,
-                    snapshot.rows.len(),
-                    snapshot.alternate,
-                );
+                snapshot.search = search.snapshot_for_frame(snapshot);
             }
         }
         let view_changed =
@@ -224,6 +243,81 @@ mod tests {
         );
     }
     #[test]
+    fn debounced_find_marks_wait_for_a_rescan_after_reflow_or_screen_reset() {
+        let (mut terminal, mut p) = fixture();
+        let mut search = Search::default();
+        let commit = |p: &mut Presentation, t: &Terminal, search: &Search| {
+            p.publish(
+                t,
+                0,
+                Metadata {
+                    status: "test",
+                    bytes: 0,
+                    search,
+                    prompt: None,
+                    connection: 0,
+                },
+            );
+        };
+        p.advance(&mut terminal, b"abcdefghijhit", 0, "test", 0);
+        search.configure("hit".into(), true, &terminal, 0);
+        commit(&mut p, &terminal, &search);
+        let initial = p.frames.load().search.as_ref().unwrap().clone();
+        assert_eq!(&*initial.match_rows, &[0]);
+
+        p.advance(&mut terminal, b"\r\nhit", 0, "test", 0);
+        commit(&mut p, &terminal, &search);
+        let unscanned = p.frames.load();
+        let previous = unscanned.search.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &previous.match_rows,
+            &initial.match_rows
+        ));
+        assert_eq!(previous.selected_row, Some(0));
+        assert_eq!(previous.total, 1);
+
+        let mut size = terminal.get_size();
+        size.cols = 8;
+        terminal.resize(size);
+        p.dirty = true;
+        commit(&mut p, &terminal, &search);
+        let scrolled = p.scrolled_view(&terminal, 1, &search);
+        for frame in [&*p.frames.load(), &*p.live.load(), &scrolled] {
+            let marks = frame.search.as_ref().unwrap();
+            assert_eq!(marks.query, "hit");
+            assert_eq!((marks.total, marks.selected), (1, Some(0)));
+            assert!(marks.match_rows.is_empty());
+            assert_eq!(marks.selected_row, None);
+        }
+
+        search.refresh(&terminal, 0);
+        commit(&mut p, &terminal, &search);
+        let reflowed = p.frames.load();
+        let fresh = reflowed.search.as_ref().unwrap();
+        assert_eq!(&*fresh.match_rows, &[1, 2]);
+        assert_eq!(fresh.selected_row, Some(1));
+
+        // Returning to the same-sized primary buffer changes its row identity.
+        p.advance(&mut terminal, b"\x1b[?1049h\x1b[?1049l", 0, "test", 0);
+        commit(&mut p, &terminal, &search);
+        assert!(
+            p.frames
+                .load()
+                .search
+                .as_ref()
+                .unwrap()
+                .match_rows
+                .is_empty()
+        );
+        search.refresh(&terminal, 0);
+        commit(&mut p, &terminal, &search);
+        assert_eq!(
+            &*p.frames.load().search.as_ref().unwrap().match_rows,
+            &[1, 2]
+        );
+    }
+
+    #[test]
     fn repeated_begins_keep_original_deadline_and_reconnect_discards_hold() {
         let (mut terminal, mut p) = fixture();
         p.advance(&mut terminal, b"\x1b[?2026hpartial", 0, "test", 0);
@@ -263,6 +357,35 @@ mod tests {
         publish(&mut p, &terminal, 0);
         assert_eq!(p.frames.load().generation, reverse.generation + 1);
         assert_eq!(p.live.load().palette, normal.palette);
+    }
+
+    #[test]
+    fn application_title_wake_waits_for_the_committed_synchronized_frame() {
+        let (mut terminal, mut p) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let inbox = crate::events::Inbox::new(move || tx.send(()).unwrap());
+        p.frames.watch_application_title(Some(&inbox));
+        publish(&mut p, &terminal, 0);
+        p.advance(
+            &mut terminal,
+            b"\x1b[?2026h\x1b]2;partial\x07",
+            0,
+            "test",
+            0,
+        );
+        publish(&mut p, &terminal, 0);
+        assert_eq!(p.frames.load().application_title(), None);
+        assert!(rx.try_recv().is_err());
+        p.advance(
+            &mut terminal,
+            b"\x1b]2;finished\x07\x1b[?2026l",
+            0,
+            "test",
+            0,
+        );
+        publish(&mut p, &terminal, 0);
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(p.frames.load().application_title(), Some("finished"));
     }
 
     #[test]

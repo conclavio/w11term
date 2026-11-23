@@ -54,6 +54,8 @@ pub struct DurableState {
     pub reference: Option<DurableReference>,
     pub detail: String,
     pub candidates: Arc<[DiscoveredSession]>,
+    /// Identifies this completed discovery result within the pane.
+    pub listing_revision: u64,
 }
 impl DurableState {
     pub fn permits(&self, action: DurableAction) -> bool {
@@ -102,6 +104,14 @@ impl DurableState {
 #[derive(Clone)]
 pub(super) struct Model(Arc<Mutex<DurableState>>);
 impl Model {
+    fn listed(&self, candidates: Vec<DiscoveredSession>, detail: String) {
+        let mut state = self.0.lock().unwrap();
+        state.listing_revision = state.listing_revision.wrapping_add(1);
+        state.candidates = candidates.into();
+        state.detail = detail;
+        state.phase = DurablePhase::Choosing;
+    }
+
     fn set(&self, phase: DurablePhase, message: impl Into<String>) {
         let mut state = self.0.lock().unwrap();
         state.phase = phase;
@@ -147,6 +157,7 @@ impl DurableControl {
             reference,
             detail: detail.into(),
             candidates: Arc::new([]),
+            listing_revision: 0,
         })));
         let (requests, receiver) = mpsc::channel(1);
         (
@@ -163,8 +174,20 @@ impl DurableControl {
     pub(crate) fn state(&self) -> DurableState {
         self.model.0.lock().unwrap().clone()
     }
-    pub(crate) fn action(&self, action: DurableAction) -> Result<()> {
+    pub(crate) fn action(
+        &self,
+        action: DurableAction,
+        listing_revision: Option<u64>,
+    ) -> Result<()> {
         let mut state = self.model.0.lock().unwrap();
+        if let Some(revision) = listing_revision {
+            ensure!(
+                state.phase == DurablePhase::Choosing
+                    && state.listing_revision == revision
+                    && matches!(action, DurableAction::Choose(_) | DurableAction::Refresh),
+                "The remote session listing changed; choose from the current results"
+            );
+        }
         ensure!(
             state.permits(action.clone()),
             "This action is unavailable for the current durable shell state"
@@ -682,10 +705,7 @@ impl Worker {
                     if matches!(program, Program::Discover) {
                         let herdr = self.model.0.lock().unwrap().herdr_browser;
                         let (entries, detail) = driver.discover_sessions(herdr).await?;
-                        let mut state = self.model.0.lock().unwrap();
-                        state.detail = detail;
-                        state.candidates = entries.into();
-                        state.phase = Choosing;
+                        self.model.listed(entries, detail);
                         Ok(())
                     } else {
                         driver.run(&program).await
@@ -703,7 +723,7 @@ impl Worker {
                 match result {
                     Ok(()) if matches!(program, Program::Discover) => {}
                     Err(error) if matches!(program, Program::Discover) => {
-                        self.model.set(Choosing, format!("{error:#}"))
+                        self.model.listed(Vec::new(), format!("{error:#}"))
                     }
                     Ok(()) if matches!(program, Program::End(_)) => {
                         self.model.0.lock().unwrap().reference = None;
@@ -799,7 +819,67 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::compatible_version;
+    use super::*;
+
+    #[test]
+    fn browser_actions_require_the_displayed_listing_and_complete_remote_identity() {
+        let (control, mut worker) = DurableControl::new(Start::Discover);
+        let row = DiscoveredSession {
+            reference: DurableReference {
+                backend: Backend::Tmux,
+                host: "example.test".into(),
+                port: 22,
+                user: "pilot".into(),
+                host_key_alias: None,
+                host_key: "test host key".into(),
+                name: "$0".into(),
+                generation: "1234".into(),
+            },
+            display_name: "Cockpit".into(),
+            command: "game".into(),
+            directory: "/srv".into(),
+            clients: 1,
+            windows: Some(1),
+        };
+        let choose = DurableAction::Choose(row.reference.clone());
+        worker.model.listed(vec![row.clone()], "1 session".into());
+        let first = control.state().listing_revision;
+        control.action(DurableAction::Refresh, Some(first)).unwrap();
+        assert!(control.action(choose.clone(), Some(first)).is_err());
+        assert_eq!(worker.requests.try_recv().unwrap(), DurableAction::Refresh);
+        worker.model.listed(vec![row.clone()], "1 session".into());
+        let current = control.state().listing_revision;
+        assert_ne!(current, first);
+        // Even an identical list must not adopt callbacks from the previous one.
+        assert!(control.action(choose.clone(), Some(first)).is_err());
+        assert!(control.action(DurableAction::Refresh, Some(first)).is_err());
+        for changed in [
+            DurableReference {
+                generation: "5678".into(),
+                ..row.reference.clone()
+            },
+            DurableReference {
+                user: "other".into(),
+                ..row.reference.clone()
+            },
+        ] {
+            assert!(
+                control
+                    .action(DurableAction::Choose(changed), Some(current))
+                    .is_err()
+            );
+        }
+        assert_eq!(control.state().phase, DurablePhase::Choosing);
+        assert!(worker.requests.try_recv().is_err());
+        control.action(choose.clone(), Some(current)).unwrap();
+        assert_eq!(worker.requests.try_recv().unwrap(), choose);
+        assert!(
+            control
+                .action(DurableAction::Refresh, Some(current))
+                .is_err()
+        );
+    }
+
     #[test]
     fn accepts_compatible_zmx_versions_after_the_first_supported_release() {
         for version in ["1.0.1", "1.0.1+distro.1", "1.0.4", "1.2.0", "1.1.0-rc.1"] {

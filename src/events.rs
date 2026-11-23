@@ -3,12 +3,14 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
+    path::Path,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
 mod inbox;
 pub use inbox::Inbox;
+pub(crate) use inbox::display_field;
 
 const CAPACITY: usize = 4096;
 #[derive(Clone, Debug, Serialize)]
@@ -30,6 +32,8 @@ struct State {
     next: u64,
     events: VecDeque<Event>,
     progress: wezterm_term::Progress,
+    recording: Option<(u64, Arc<Path>)>,
+    replay: Option<crate::session::ReplayState>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
     restart_token: Option<u64>,
@@ -87,6 +91,73 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
+    pub fn replay_state(&self) -> Option<crate::session::ReplayState> {
+        self.state.lock().unwrap().replay
+    }
+
+    pub(crate) fn set_replay_state(&self, replay: crate::session::ReplayState) {
+        let mut state = self.state.lock().unwrap();
+        if state.replay.replace(replay) != Some(replay)
+            && let Some((_, _, inbox)) = &state.inbox
+        {
+            inbox.refresh();
+        }
+    }
+
+    /// Sequence of the current recording's start, retained after journal eviction.
+    pub fn recording(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .recording
+            .as_ref()
+            .map(|(id, _)| *id)
+    }
+
+    pub fn recording_path(&self) -> Option<Arc<Path>> {
+        self.state
+            .lock()
+            .unwrap()
+            .recording
+            .as_ref()
+            .map(|(_, path)| Arc::clone(path))
+    }
+
+    pub(crate) fn recording_started(&self, path: &Path) -> u64 {
+        self.update_recording(
+            Some(path),
+            "recording-started",
+            serde_json::json!({"path": path}),
+        )
+    }
+
+    pub(crate) fn recording_stopped(&self, bytes: u64) {
+        self.update_recording(
+            None,
+            "recording-stopped",
+            serde_json::json!({"bytes": bytes}),
+        );
+    }
+
+    pub(crate) fn recording_error(&self, error: String) {
+        self.update_recording(None, "recording-error", serde_json::json!({"error": error}));
+    }
+
+    fn update_recording(&self, path: Option<&Path>, kind: &str, data: Value) -> u64 {
+        let data = Self::bounded_data(kind, data);
+        let mut state = self.state.lock().unwrap();
+        let sequence = state.next + 1;
+        let recording = path.map(|path| (sequence, Arc::from(path)));
+        if state.recording != recording {
+            state.recording = recording;
+            if let Some((_, _, inbox)) = &state.inbox {
+                inbox.refresh();
+            }
+        }
+        self.append(state, kind, data);
+        sequence
+    }
+
     pub fn restart_token(&self) -> Option<u64> {
         self.state.lock().unwrap().restart_token
     }
@@ -266,17 +337,26 @@ impl Events {
     }
 
     pub fn push(&self, kind: &str, data: Value) {
+        let data = Self::bounded_data(kind, data);
+        self.append(self.state.lock().unwrap(), kind, data);
+    }
+
+    fn bounded_data(kind: &str, data: Value) -> Value {
         let serialized = serde_json::to_string(&data).unwrap_or_default();
-        let data = if serialized.len() > 4096 {
+        if serialized.len() > 4096 {
             let mut preview = serde_json::json!({"truncated":true,"preview":serialized.chars().take(1024).collect::<String>()});
             if kind == "notification" {
                 preview["summary"] = inbox::notification_text(&data).into();
             }
+            if kind == "recording-error"
+                && let Some(reason) = data["error"].as_str()
+            {
+                preview["error"] = reason.chars().take(200).collect::<String>().into();
+            }
             preview
         } else {
             data
-        };
-        self.append(self.state.lock().unwrap(), kind, data);
+        }
     }
 
     fn append(&self, mut state: std::sync::MutexGuard<'_, State>, kind: &str, data: Value) {
@@ -336,6 +416,76 @@ impl Events {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn current_recording_survives_journal_eviction_and_wakes_only_its_own_window() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::default());
+        let counter = calls.clone();
+        let inbox = Inbox::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let pane = Events::default();
+        pane.connect_inbox(11, "Loopback", &inbox);
+        let path = std::path::Path::new("session.vt");
+        pane.recording_started(path);
+        let first = pane.recording().unwrap();
+        assert_eq!(first, pane.since(0).events[0].sequence);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        inbox.acknowledge_wake();
+        for _ in 0..CAPACITY {
+            pane.push("title", Value::Null);
+        }
+        assert!(pane.since(0).lost);
+        assert_eq!(pane.recording(), Some(first));
+        assert_eq!(pane.recording_path().as_deref(), Some(path));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // An ordinary event producer cannot change recorder ownership.
+        pane.push("recording-error", Value::Null);
+        assert_eq!(pane.recording(), Some(first));
+        pane.recording_stopped(42);
+        assert_eq!(pane.recording(), None);
+        assert!(pane.recording_path().is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        pane.recording_started(path);
+        assert!(pane.recording().unwrap() > first);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        inbox.acknowledge_wake();
+
+        let new_calls = Arc::new(AtomicUsize::default());
+        let counter = new_calls.clone();
+        let moved_to = Inbox::new(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        pane.connect_inbox(11, "Loopback", &moved_to);
+        let reason = "disk\nfull \u{202e} on D:";
+        pane.recording_error(reason.to_string());
+        assert_eq!(pane.recording(), None);
+        assert!(pane.recording_path().is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(new_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(moved_to.unread_count(), 1);
+        assert_eq!(inbox.unread_count(), 0);
+        let notice = moved_to.rows().pop().unwrap();
+        assert_eq!(notice.message, "Recording failed · disk full on D:");
+        assert!(!moved_to.acknowledge_wake());
+        let last = pane.since(0).events.pop().unwrap();
+        assert_eq!(last.kind, "recording-error");
+        assert_eq!(last.data["error"], reason);
+        assert_eq!(last.sequence, notice.sequence);
+    }
+
+    #[test]
+    fn oversized_recording_errors_keep_a_bounded_reason_when_attaching_the_inbox() {
+        let pane = Events::default();
+        pane.recording_error(format!("Disk full\n{}", "雪".repeat(5000)));
+        let inbox = Inbox::new(|| {});
+        pane.connect_inbox(3, "Loopback", &inbox);
+        let row = inbox.rows().pop().unwrap();
+        assert!(row.message.starts_with("Recording failed · Disk full 雪"));
+        assert_eq!(row.message.chars().count(), 200);
+        assert_eq!(pane.since(0).events[0].data["truncated"], true);
+    }
+
     #[test]
     fn live_progress_coalesces_wakes_without_creating_notifications_or_journal_rows() {
         use std::sync::atomic::{AtomicUsize, Ordering};

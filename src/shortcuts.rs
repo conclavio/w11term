@@ -30,14 +30,19 @@ pub enum Action {
     NewTabInCurrentDirectory,
     ZoomPane,
     RotateSplit,
+    BalancePanes,
     ClosePane,
     MovePane,
     MovePaneToExistingTab,
     CommandPalette,
     PanePicker,
+    Find,
+    FindNext,
+    FindPrevious,
     FindAllPanes,
     KeyboardHints,
     CopyMode,
+    SelectAll,
     ClearScrollback,
     NextTab,
     PreviousTab,
@@ -45,6 +50,8 @@ pub enum Action {
     MoveTabRight,
     NewTab,
     DuplicateTabLayout,
+    ReopenClosedTab,
+    ReopenClosedPane,
     CloseTab,
     SelectTab(u8),
     Workspaces,
@@ -143,6 +150,13 @@ pub const BINDINGS: &[Binding] = &[
     ),
     Binding::new(ZoomPane, "zoom_pane", "Zoom pane", 0x5a, PANE),
     Binding::new(RotateSplit, "rotate_split", "Rotate split", 0, Mods::NONE),
+    Binding::new(
+        BalancePanes,
+        "balance_panes",
+        "Balance panes",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(ClosePane, "close_pane", "Close pane", 0x57, PANE),
     Binding::new(MovePane, "move_pane", "Move pane to new tab", 0, Mods::NONE),
     Binding::new(
@@ -160,6 +174,15 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(PanePicker, "pane_picker", "Find pane", 0x50, CTRL_SHIFT),
+    Binding::new(Find, "find", "Find in scrollback", 0x46, CTRL_SHIFT),
+    Binding::new(FindNext, "find_next", "Find next", 0x72, Mods::NONE),
+    Binding::new(
+        FindPrevious,
+        "find_previous",
+        "Find previous",
+        0x72,
+        Mods::SHIFT,
+    ),
     Binding::new(
         FindAllPanes,
         "find_all_panes",
@@ -179,6 +202,13 @@ pub const BINDINGS: &[Binding] = &[
         "copy_mode",
         "Keyboard copy mode",
         0x58,
+        CTRL_SHIFT,
+    ),
+    Binding::new(
+        SelectAll,
+        "select_all",
+        "Select all terminal text",
+        0x41,
         CTRL_SHIFT,
     ),
     Binding::new(
@@ -214,6 +244,20 @@ pub const BINDINGS: &[Binding] = &[
         Mods::NONE,
     ),
     Binding::new(CloseTab, "close_tab", "Close tab", 0x57, CTRL_SHIFT),
+    Binding::new(
+        ReopenClosedTab,
+        "reopen_closed_tab",
+        "Reopen last closed tab layout",
+        0,
+        Mods::NONE,
+    ),
+    Binding::new(
+        ReopenClosedPane,
+        "reopen_closed_pane",
+        "Reopen last closed pane",
+        0,
+        Mods::NONE,
+    ),
     Binding::new(SelectTab(1), "select_tab_1", "Select tab 1", 0x31, CTRL_ALT),
     Binding::new(SelectTab(2), "select_tab_2", "Select tab 2", 0x32, CTRL_ALT),
     Binding::new(SelectTab(3), "select_tab_3", "Select tab 3", 0x33, CTRL_ALT),
@@ -254,12 +298,17 @@ impl Action {
                 | NewTabInCurrentDirectory
                 | ZoomPane
                 | RotateSplit
+                | BalancePanes
                 | ClosePane
                 | MovePane
                 | MovePaneToExistingTab
+                | Find
+                | FindNext
+                | FindPrevious
                 | DuplicateTabLayout
                 | KeyboardHints
                 | CopyMode
+                | SelectAll
                 | ClearScrollback
         )
     }
@@ -388,11 +437,10 @@ impl Chord {
         let ctrl = mods.contains(Mods::CTRL);
         let alt = mods.contains(Mods::ALT);
         let shift = mods.contains(Mods::SHIFT);
-        matches!(key, 0x72 | 0x74 | 0x7a)
+        matches!(key, 0x74 | 0x7a)
             || (alt && matches!(key, 0x73 | 0x20 | 0x09 | 0x1b))
             || (ctrl && alt && key == 0x2e)
             || (ctrl && key == 0x1b)
-            || (ctrl && shift && key == 0x46)
             || (ctrl && key == 0x56)
             || (ctrl && !alt && matches!(key, 0x43 | 0x2d | 0xbb | 0xbd | 0x30))
             || (shift && matches!(key, 0x2d | 0x21 | 0x22))
@@ -459,6 +507,14 @@ impl Shortcuts {
 }
 pub struct KeyMap(HashMap<Chord, Action>);
 impl KeyMap {
+    /// The Find box keeps window shortcuts and its own navigation while native
+    /// text editing owns the remaining keys.
+    pub fn resolve_in_find(&self, key: u32, mods: Mods, right_alt: bool) -> Option<Action> {
+        self.resolve(key, mods, true, right_alt).filter(|action| {
+            !action.requires_terminal() || matches!(action, Find | FindNext | FindPrevious)
+        })
+    }
+
     pub fn resolve(&self, key: u32, mods: Mods, terminal: bool, right_alt: bool) -> Option<Action> {
         if right_alt {
             return None;
@@ -495,6 +551,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn select_all_keeps_plain_ctrl_a_and_native_text_fields_available() {
+        let mut shortcuts = Shortcuts::default();
+        let map = shortcuts.keymap().unwrap();
+        assert_eq!(map.resolve(0x41, CTRL_SHIFT, true, false), Some(SelectAll));
+        assert_eq!(map.resolve(0x41, Mods::CTRL, true, false), None);
+        assert_eq!(map.resolve(0x41, CTRL_SHIFT, false, false), None);
+
+        shortcuts
+            .set(SelectAll, Some("F10".parse().unwrap()))
+            .unwrap();
+        let map = shortcuts.keymap().unwrap();
+        assert_eq!(map.resolve(0x41, CTRL_SHIFT, true, false), None);
+        assert_eq!(map.resolve(0x79, Mods::NONE, true, false), Some(SelectAll));
+        assert_eq!(map.resolve(0x79, Mods::NONE, false, false), None);
     }
 
     #[test]
@@ -553,23 +626,29 @@ mod tests {
     }
 
     #[test]
-    fn previous_pane_is_optional_and_can_return_from_a_utility_tab() {
-        let mut shortcuts = Shortcuts::default();
+    fn previous_pane_and_reopen_closed_tab_can_return_from_a_utility_tab() {
         let chord: Chord = "F8".parse().unwrap();
-        assert_eq!(shortcuts.get(FocusPreviousPane.binding()), None);
-        shortcuts.set(FocusPreviousPane, Some(chord)).unwrap();
-        let json = serde_json::to_string(&shortcuts).unwrap();
-        assert_eq!(json, r#"{"focus_previous_pane":"F8"}"#);
-        let map = serde_json::from_str::<Shortcuts>(&json)
-            .unwrap()
-            .keymap()
-            .unwrap();
-        for terminal in [true, false] {
-            assert_eq!(
-                map.resolve(chord.key, chord.mods, terminal, false),
-                Some(FocusPreviousPane)
-            );
-            assert_eq!(map.resolve(chord.key, chord.mods, terminal, true), None);
+        for (action, expected) in [
+            (FocusPreviousPane, r#"{"focus_previous_pane":"F8"}"#),
+            (ReopenClosedTab, r#"{"reopen_closed_tab":"F8"}"#),
+            (ReopenClosedPane, r#"{"reopen_closed_pane":"F8"}"#),
+        ] {
+            let mut shortcuts = Shortcuts::default();
+            assert_eq!(shortcuts.get(action.binding()), None);
+            shortcuts.set(action, Some(chord)).unwrap();
+            let json = serde_json::to_string(&shortcuts).unwrap();
+            assert_eq!(json, expected);
+            let map = serde_json::from_str::<Shortcuts>(&json)
+                .unwrap()
+                .keymap()
+                .unwrap();
+            for terminal in [true, false] {
+                assert_eq!(
+                    map.resolve(chord.key, chord.mods, terminal, false),
+                    Some(action)
+                );
+                assert_eq!(map.resolve(chord.key, chord.mods, terminal, true), None);
+            }
         }
     }
 
@@ -598,6 +677,7 @@ mod tests {
             SwapPaneUp,
             SwapPaneDown,
             RotateSplit,
+            BalancePanes,
             SplitRightInCurrentDirectory,
             SplitBelowInCurrentDirectory,
             NewTabInCurrentDirectory,
@@ -699,6 +779,50 @@ mod tests {
         );
     }
     #[test]
+    fn scrollback_find_bindings_can_release_function_keys_and_stay_local_to_the_find_box() {
+        let mut saved = Shortcuts::default();
+        for (action, expected, remap) in [
+            (Find, "Ctrl+Shift+F", "F6"),
+            (FindNext, "F3", "F2"),
+            (FindPrevious, "Shift+F3", "F1"),
+        ] {
+            let default = expected.parse::<Chord>().unwrap();
+            let replacement = remap.parse::<Chord>().unwrap();
+            assert_eq!(saved.get(action.binding()), Some(default));
+            saved.set(action, Some(replacement)).unwrap();
+            let keys = saved.keymap().unwrap();
+            assert_eq!(keys.resolve(default.key, default.mods, true, false), None);
+            assert_eq!(
+                keys.resolve_in_find(replacement.key, replacement.mods, false),
+                Some(action)
+            );
+            assert_eq!(
+                keys.resolve(replacement.key, replacement.mods, false, false),
+                None
+            );
+            assert_eq!(
+                keys.resolve_in_find(replacement.key, replacement.mods, true),
+                None
+            );
+        }
+        let keys = saved.keymap().unwrap();
+        assert_eq!(
+            keys.resolve_in_find(0x4b, CTRL_SHIFT, false),
+            Some(CommandPalette)
+        );
+        assert_eq!(keys.resolve_in_find(0x41, CTRL_SHIFT, false), None);
+        saved.set(FindNext, None).unwrap();
+        let json = serde_json::to_string(&saved).unwrap();
+        let mut reopened: Shortcuts = serde_json::from_str(&json).unwrap();
+        assert_eq!(reopened.get(FindNext.binding()), None);
+        reopened.restore(FindNext).unwrap();
+        assert_eq!(
+            reopened.get(FindNext.binding()),
+            Some("F3".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn invalid_chords_and_duplicate_saved_bindings_are_reported() {
         for invalid in [
             "t",
@@ -709,7 +833,6 @@ mod tests {
             "F11",
             "Alt+F4",
             "Win+K",
-            "Ctrl+Shift+F",
             "Alt+Tab",
             "F30",
         ] {

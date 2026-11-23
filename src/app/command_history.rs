@@ -1,4 +1,5 @@
 use super::*;
+use w11term::control::CommandStatus;
 use w11term::terminal::Snapshot;
 use wezterm_term::CompletedCommand;
 
@@ -6,6 +7,7 @@ pub(super) struct HistoryPage {
     pane: u64,
     selected: Option<(u64, u64)>, // Connection generation and command id.
     query: String,
+    status: CommandStatus,
     feedback: String,
 }
 
@@ -16,6 +18,7 @@ pub enum Action {
 
 pub enum HistoryAction {
     Search(String),
+    Status(CommandStatus),
     Refresh,
     Select(u64, u64),
     Copy(u64, u64, CopyPart),
@@ -37,12 +40,20 @@ impl CopyPart {
     }
 }
 
-fn matches_command(entry: &CompletedCommand, needle: &str) -> bool {
-    needle.is_empty()
-        || entry
-            .command
-            .as_ref()
-            .is_some_and(|text| text.to_lowercase().contains(needle))
+const STATUS_OPTIONS: [(CommandStatus, &str); 4] = [
+    (CommandStatus::All, "All commands"),
+    (CommandStatus::Failed, "Failed"),
+    (CommandStatus::Succeeded, "Succeeded"),
+    (CommandStatus::Unknown, "Status unknown"),
+];
+
+fn matches_command(entry: &CompletedCommand, needle: &str, status: CommandStatus) -> bool {
+    status.matches(entry.exit_code)
+        && (needle.is_empty()
+            || entry
+                .command
+                .as_ref()
+                .is_some_and(|text| text.to_lowercase().contains(needle)))
 }
 
 fn selected_command(frame: &Snapshot, selected: Option<(u64, u64)>) -> Option<&CompletedCommand> {
@@ -55,13 +66,24 @@ fn selected_command(frame: &Snapshot, selected: Option<(u64, u64)>) -> Option<&C
         .map(AsRef::as_ref)
 }
 
-fn newest(frame: &Snapshot, needle: &str) -> Option<(u64, u64)> {
+fn newest(frame: &Snapshot, needle: &str, status: CommandStatus) -> Option<(u64, u64)> {
     frame
         .command_history
         .iter()
         .rev()
-        .find(|entry| matches_command(entry, needle))
+        .find(|entry| matches_command(entry, needle, status))
         .map(|c| (frame.connection_generation, c.id))
+}
+
+impl HistoryPage {
+    fn keep_matching_selection(&mut self, frame: &Snapshot) {
+        let needle = self.query.to_lowercase();
+        if !selected_command(frame, self.selected)
+            .is_some_and(|entry| matches_command(entry, &needle, self.status))
+        {
+            self.selected = newest(frame, &needle, self.status);
+        }
+    }
 }
 
 impl TerminalApp {
@@ -117,7 +139,7 @@ impl TerminalApp {
             let label = format!("History · {}", source.label);
             let selected = self
                 .history_frame(pane)
-                .and_then(|frame| newest(&frame, ""));
+                .and_then(|frame| newest(&frame, "", CommandStatus::All));
             let existing = self.tabs.entries().iter()
                 .find(|tab| matches!(&tab.value.page, Page::CommandHistory(page) if page.pane == pane))
                 .map(|tab| tab.id);
@@ -125,6 +147,7 @@ impl TerminalApp {
                 pane,
                 selected,
                 query: String::new(),
+                status: CommandStatus::All,
                 feedback: String::new(),
             });
             if let Some(id) = existing {
@@ -160,23 +183,27 @@ impl TerminalApp {
         let Page::CommandHistory(page) = &mut self.tabs.get_mut(id).unwrap().page else {
             return;
         };
+        if matches!(&action, HistoryAction::Status(status) if *status == page.status) {
+            return;
+        }
         page.feedback.clear();
         match action {
             HistoryAction::Search(query) => {
-                let needle = query.to_lowercase();
-                if !selected_command(&frame, page.selected)
-                    .is_some_and(|c| matches_command(c, &needle))
-                {
-                    page.selected = newest(&frame, &needle);
-                }
                 page.query = query;
+                page.keep_matching_selection(&frame);
             }
-            HistoryAction::Refresh => page.selected = newest(&frame, &page.query.to_lowercase()),
+            HistoryAction::Status(status) => {
+                page.status = status;
+                page.keep_matching_selection(&frame);
+            }
+            HistoryAction::Refresh => {
+                page.selected = newest(&frame, &page.query.to_lowercase(), page.status)
+            }
             HistoryAction::Select(generation, command) => {
                 let key = Some((generation, command));
-                if selected_command(&frame, key)
-                    .is_some_and(|entry| matches_command(entry, &page.query.to_lowercase()))
-                {
+                if selected_command(&frame, key).is_some_and(|entry| {
+                    matches_command(entry, &page.query.to_lowercase(), page.status)
+                }) {
                     page.selected = key;
                 }
             }
@@ -221,7 +248,7 @@ impl TerminalApp {
             .command_history
             .iter()
             .rev()
-            .filter(|c| matches_command(c, &needle))
+            .filter(|c| matches_command(c, &needle, page.status))
             .peekable();
         let has_matches = matches.peek().is_some();
         let rows = matches.map(|entry| {
@@ -332,12 +359,31 @@ impl TerminalApp {
                             .content("Return to pane"),
                         TextBlock::new().text(&page.feedback),
                     )),
-                TextBox::new()
-                    .grid_row(2)
-                    .automation_name("Search command history")
-                    .placeholder_text("Search command history")
-                    .text(&page.query)
-                    .on_text_changed(ctx.callback(move |text| action(HistoryAction::Search(text)))),
+                StackPanel::new().grid_row(2).spacing(4.0).children((
+                    TextBox::new()
+                        .automation_name("Search command history")
+                        .placeholder_text("Search command history")
+                        .text(&page.query)
+                        .on_text_changed(
+                            ctx.callback(move |text| action(HistoryAction::Search(text))),
+                        ),
+                    ComboBox::new()
+                        .automation_name("Command status")
+                        .items_source(STATUS_OPTIONS.map(|(_, label)| label))
+                        .selected_index(
+                            STATUS_OPTIONS
+                                .iter()
+                                .position(|(status, _)| *status == page.status),
+                        )
+                        .horizontal_alignment(HorizontalAlignment::Stretch)
+                        .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                            index
+                                .and_then(|index| STATUS_OPTIONS.get(index))
+                                .map_or(Message::ControlIdle, |&(status, _)| {
+                                    action(HistoryAction::Status(status))
+                                })
+                        })),
+                )),
                 ScrollViewer::new()
                     .grid_row(3)
                     .content(StackPanel::new().spacing(4.0).keyed_children(rows)),
@@ -373,14 +419,19 @@ mod tests {
             output: Ok("archived result\r\n".into()),
             exit_code: Some(17),
         };
-        assert!(matches_command(&entry, "[ångström]"));
-        assert!(!matches_command(&entry, "archived"));
-        assert!(!matches_command(&entry, ".*"));
+        assert!(matches_command(&entry, "[ångström]", CommandStatus::Failed));
+        assert!(!matches_command(
+            &entry,
+            "[ångström]",
+            CommandStatus::Succeeded
+        ));
+        assert!(!matches_command(&entry, "archived", CommandStatus::All));
+        assert!(!matches_command(&entry, ".*", CommandStatus::All));
         assert_eq!(CopyPart::Command.text(&entry), Some(command.as_str()));
         assert_eq!(CopyPart::Output.text(&entry), Some("archived result\r\n"));
         entry.command = None;
-        assert!(matches_command(&entry, ""));
-        assert!(!matches_command(&entry, "9"));
+        assert!(matches_command(&entry, "", CommandStatus::Failed));
+        assert!(!matches_command(&entry, "9", CommandStatus::All));
         assert_eq!(CopyPart::Command.text(&entry), None);
         entry.output = Err("Unavailable");
         assert_eq!(CopyPart::Output.text(&entry), None);

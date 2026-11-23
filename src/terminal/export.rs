@@ -4,7 +4,9 @@ use wezterm_term::TerminalState;
 const MAX_TEXT: usize = 32 * 1024 * 1024;
 const TOO_LARGE: &str = "Scrollback exceeds the 32 MiB text export limit";
 
-fn capture(terminal: &TerminalState, limit: usize) -> Result<String, &'static str> {
+pub(crate) fn retained_text_rows(
+    terminal: &TerminalState,
+) -> Result<std::ops::Range<usize>, &'static str> {
     if terminal.synchronized_output() {
         return Err("Terminal output is updating; try again after the frame finishes");
     }
@@ -28,8 +30,14 @@ fn capture(terminal: &TerminalState, limit: usize) -> Result<String, &'static st
                 .any(|cell| !cell.str().trim_end().is_empty())
         })
         .map_or(cursor, |(row, _)| row);
+    Ok(first..last + 1)
+}
+
+fn capture(terminal: &TerminalState, limit: usize) -> Result<String, &'static str> {
+    let range = retained_text_rows(terminal)?;
+    let screen = terminal.screen();
     let cols = screen.physical_cols;
-    let rows = screen.physical_lines().skip(first).take(last + 1 - first);
+    let rows = screen.physical_lines().skip(range.start).take(range.len());
     plain_text(
         rows.map(|line| (line, 0..cols)),
         cols,
@@ -110,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn exports_more_than_the_clipboard_limit() {
+    fn exports_more_than_the_clipboard_limit_for_select_all() {
         let mut t = engine(500, 3_000);
         let row = "x".repeat(500);
         let line = Line::from_text(&row, &CellAttributes::default(), 1, None);
@@ -121,6 +129,14 @@ mod tests {
         assert!(text.len() > crate::clipboard::MAX_TEXT);
         assert_eq!(text.len(), row.len() * 3_000 + 2 * 2_999);
         assert!(text.split("\r\n").all(|line| line == row));
+        // A selection keeps its endpoints even for histories that are too large
+        // to copy. Only an explicit copy attempts clipboard text extraction.
+        let frame = terminal::Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+        let mode = crate::copy_mode::CopyMode::select_all(&t, 0, (&frame).into(), &frame).unwrap();
+        assert_eq!(
+            crate::copy_mode::selected_text(&t, 0, mode.screen, mode.selection().unwrap(), true),
+            Err("Selection exceeds the clipboard size limit")
+        );
     }
 
     #[tokio::test]

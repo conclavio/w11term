@@ -21,6 +21,7 @@ use w11term::{
 
 struct Peer {
     channels: HashMap<ChannelId, Channel<server::Msg>>,
+    wire: Option<tokio::sync::mpsc::UnboundedSender<in_band_resize::Wire>>,
     forwarded: HashSet<ChannelId>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
@@ -117,17 +118,22 @@ impl server::Handler for Peer {
         s.channel_success(c)?;
         Ok(())
     }
-    #[cfg(feature = "ui-smoke")]
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
         cols: u32,
         rows: u32,
-        _: u32,
-        _: u32,
+        width: u32,
+        height: u32,
         session: &mut server::Session,
     ) -> anyhow::Result<()> {
-        if self.root.join("keyboard-input.bin").exists() {
+        if let Some(wire) = &self.wire {
+            let _ = wire.send(in_band_resize::Wire::Window(
+                channel,
+                [cols, rows, width, height],
+            ));
+        }
+        if cfg!(feature = "ui-smoke") && self.root.join("keyboard-input.bin").exists() {
             session.data(
                 channel,
                 format!("\r\nssh-grid-{cols}x{rows}\r\n").into_bytes(),
@@ -166,6 +172,9 @@ impl server::Handler for Peer {
     }
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
         s.channel_success(c)?;
+        if let Some(wire) = &self.wire {
+            let _ = wire.send(in_band_resize::Wire::Shell(c, s.handle()));
+        }
         s.data(c, b"ready\r\n".as_slice())?;
         #[cfg(feature = "ui-smoke")]
         if self.root.join("copy-history.vt").is_file() {
@@ -227,6 +236,10 @@ impl server::Handler for Peer {
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
         if self.channels.contains_key(&c) {
+            if let Some(wire) = &self.wire {
+                let _ = wire.send(in_band_resize::Wire::Input(c, data.to_vec()));
+                return Ok(());
+            }
             #[cfg(feature = "ui-smoke")]
             if self.root.join("split-inputs").is_dir() {
                 fs::OpenOptions::new()
@@ -238,6 +251,11 @@ impl server::Handler for Peer {
                     b"report-foreign" => Some(b"\x1b]7;file://unrelated.invalid/srv/foreign\x1b\\\r\nforeign-reported\r\n"),
                     b"report-current" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-reported\r\n"),
                     b"report-current-again" => Some(b"\x1b]7;file://127.0.0.1/srv/Pilot%27s%20Work\x1b\\\r\ncurrent-confirmed\r\n"),
+                    b"nested-host" => Some(b"\x1b]1337;RemoteHost=test@nested.invalid\x07nested-host-seen\r\n"),
+                    b"nested-dir" => Some(b"\x1b]1337;CurrentDir=/tmp/nested-only\x07nested-dir-seen\r\n"),
+                    b"other-login" => Some(b"\x1b]1337;RemoteHost=other@127.0.0.1\x07\x1b]1337;CurrentDir=/home/other\x07other-login-seen\r\n"),
+                    b"login-host" => Some(b"\x1b]1337;RemoteHost=test@127.0.0.1\x1b\\login-host-seen\r\n"),
+                    b"literal-dir" => Some("\x1b]1337;CurrentDir=/srv/Pilot's 100%2F;#雪\x1b\\literal-dir-seen\r\n".as_bytes()),
                     _ => None,
                 };
                 if let Some(report) = report {
@@ -299,6 +317,7 @@ impl server::Handler for Peer {
             root: self.root.clone(),
             ssh: s.handle(),
             handles: HashMap::new(),
+            posix: None,
             next: 0,
         };
         tokio::spawn(async move {
@@ -315,6 +334,7 @@ struct Files {
     root: PathBuf,
     ssh: server::Handle,
     handles: HashMap<String, Opened>,
+    posix: Option<text_save::PosixMetadata>,
     next: u64,
 }
 fn status(id: u32) -> Status {
@@ -433,6 +453,12 @@ impl russh_sftp::server::Handler for Files {
     type Error = StatusCode;
     async fn init(&mut self, _: u32, _: HashMap<String, String>) -> Result<Version, StatusCode> {
         let mut version = Version::new();
+        if let Ok(value) = fs::read_to_string(self.root.join("posix-rename-version")) {
+            version
+                .extensions
+                .insert("posix-rename@openssh.com".into(), value);
+            self.posix = Some(Default::default());
+        }
         if self.root.join("small-reads").exists() {
             version
                 .extensions
@@ -444,8 +470,11 @@ impl russh_sftp::server::Handler for Files {
         &mut self,
         id: u32,
         request: String,
-        _: Vec<u8>,
+        data: Vec<u8>,
     ) -> Result<Packet, StatusCode> {
+        if request == "posix-rename@openssh.com" && self.posix.is_some() {
+            return self.posix_rename(id, data);
+        }
         if request != "limits@openssh.com" || !self.root.join("small-reads").exists() {
             return Err(StatusCode::OpUnsupported);
         }
@@ -463,13 +492,26 @@ impl russh_sftp::server::Handler for Files {
         id: u32,
         path: String,
         flags: OpenFlags,
-        _: FileAttributes,
+        attrs: FileAttributes,
     ) -> Result<Handle, StatusCode> {
         self.trace_transfer(format_args!("OPEN {path}"))?;
+        if fs::read_to_string(self.root.join("race-upload-path"))
+            .ok()
+            .as_deref()
+            == Some(&path)
+        {
+            fs::File::create_new(self.path(&path))
+                .and_then(|mut f| f.write_all(b"racing entry"))
+                .map_err(io)?;
+        }
         let file = fs::OpenOptions::from(flags)
             .open(self.path(&path))
             .map_err(io)?;
-        Ok(self.add(id, Opened::File(file)))
+        let handle = self.add(id, Opened::File(file));
+        if let Some(posix) = &mut self.posix {
+            posix.opened(&handle.handle, path, flags, attrs);
+        }
+        Ok(handle)
     }
     async fn close(&mut self, id: u32, h: String) -> Result<Status, StatusCode> {
         if matches!(self.handles.get(&h), Some(Opened::File(_))) {
@@ -477,6 +519,9 @@ impl russh_sftp::server::Handler for Files {
             self.hold_response("hold-transfer-close").await;
         }
         self.handles.remove(&h).ok_or(StatusCode::Failure)?;
+        if let Some(posix) = &mut self.posix {
+            posix.closed(&h);
+        }
         Ok(status(id))
     }
     async fn read(
@@ -558,12 +603,14 @@ impl russh_sftp::server::Handler for Files {
         Ok(status(id))
     }
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
+        self.trace_properties("STAT", &path)?;
         Ok(Attrs {
             id,
             attrs: (&fs::metadata(self.path(&path)).map_err(io)?).into(),
         })
     }
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, StatusCode> {
+        self.trace_properties("LSTAT", &path)?;
         if self.root.join("deny-rename-check").exists() {
             return Err(StatusCode::PermissionDenied);
         }
@@ -579,6 +626,9 @@ impl russh_sftp::server::Handler for Files {
             return Err(StatusCode::ConnectionLost);
         }
         let mut attrs = entry_attrs(&self.path(&path))?;
+        if let Some(posix) = &self.posix {
+            posix.stat(&path, &mut attrs);
+        }
         if self.root.join("tree-unknown-size").is_file() {
             attrs.size = None;
         }
@@ -588,16 +638,30 @@ impl russh_sftp::server::Handler for Files {
         if self.root.join("omit-lstat-permissions").is_file() {
             attrs.permissions = None;
         }
+        if let Ok(name) = fs::read_to_string(self.root.join("properties-omit-attrs"))
+            && path.rsplit('/').next() == Some(name.as_str())
+        {
+            attrs = FileAttributes::empty();
+        }
         Ok(Attrs { id, attrs })
+    }
+    async fn readlink(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        self.properties_readlink(id, &path)
     }
     async fn fstat(&mut self, id: u32, h: String) -> Result<Attrs, StatusCode> {
         if self.root.join("no-fstat").exists() {
             return Err(StatusCode::OpUnsupported);
         }
         let mut attrs = FileAttributes::from(&self.file(&h)?.metadata().map_err(io)?);
+        if let Some(posix) = &self.posix {
+            posix.fstat(&h, &mut attrs)?;
+        }
         if self.root.join("tree-unknown-size").is_file() {
             attrs.size = None;
             attrs.permissions = Some(0o600);
+        }
+        if self.root.join("fstat-nonregular").is_file() {
+            attrs.permissions = Some(0o140600);
         }
         Ok(Attrs { id, attrs })
     }
@@ -607,6 +671,7 @@ impl russh_sftp::server::Handler for Files {
         path: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        self.trace_properties("SETSTAT", &path)?;
         if let Some(size) = attrs.size {
             fs::OpenOptions::new()
                 .write(true)
@@ -623,6 +688,13 @@ impl russh_sftp::server::Handler for Files {
         h: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        self.trace_properties("FSETSTAT", &h)?;
+        if let Some(posix) = &mut self.posix {
+            if self.root.join("deny-editor-fsetstat").is_file() {
+                return Err(StatusCode::PermissionDenied);
+            }
+            posix.fsetstat(&h, &attrs)?;
+        }
         if let Some(size) = attrs.size {
             self.file(&h)?.set_len(size).map_err(io)?;
         }
@@ -765,6 +837,8 @@ impl russh_sftp::server::Handler for Files {
             id,
             files: vec![russh_sftp::protocol::File::dummy(if path == "." {
                 "/".into()
+            } else if path == "alias" && self.root.join("canonical-parent").is_dir() {
+                "/canonical-parent".into()
             } else {
                 path
             })],
@@ -789,6 +863,15 @@ async fn fixture_counting_accepts(
     connections: usize,
     accepted: Arc<AtomicUsize>,
 ) -> FixtureServer {
+    fixture_with_wire(reject, connections, accepted, None).await
+}
+
+async fn fixture_with_wire(
+    reject: bool,
+    connections: usize,
+    accepted: Arc<AtomicUsize>,
+    wire: Option<tokio::sync::mpsc::UnboundedSender<in_band_resize::Wire>>,
+) -> FixtureServer {
     use russh::keys::{Algorithm, HashAlg, PrivateKey};
     let root = tempfile::tempdir().unwrap();
     let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -811,6 +894,7 @@ async fn fixture_counting_accepts(
             let (stream, _) = listener.accept().await.unwrap();
             accepted.fetch_add(1, Ordering::Relaxed);
             let peer = Peer {
+                wire: wire.clone(),
                 channels: HashMap::new(),
                 forwarded: HashSet::new(),
                 root: root_path.clone(),
@@ -923,6 +1007,8 @@ async fn guarded_job(
 mod cancellation;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
+#[path = "sftp/in_band_resize.rs"]
+mod in_band_resize;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/keypad.rs"]
 mod keypad;
@@ -931,6 +1017,8 @@ mod local_forward;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/native_gui.rs"]
 mod native_gui;
+#[path = "sftp/properties.rs"]
+mod properties;
 #[path = "sftp/remove.rs"]
 mod remove;
 #[path = "sftp/rename.rs"]
@@ -938,6 +1026,12 @@ mod rename;
 #[cfg(feature = "ui-smoke")]
 #[path = "sftp/tab_windows.rs"]
 mod tab_windows;
+#[path = "sftp/text_preview.rs"]
+mod text_preview;
+#[path = "sftp/text_save.rs"]
+mod text_save;
+#[path = "sftp/upload_folder.rs"]
+mod upload_folder;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {
@@ -1121,6 +1215,7 @@ fn registry(session: &Session) -> Registry {
         id: 1,
         tab_id: 4,
         tab_title: None,
+        pane_name: None,
         label: "test".into(),
         active: false,
         visible: false,
@@ -1253,7 +1348,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *partial,
         TransferProgress {
             bytes: CHUNK as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     drop(partial);
@@ -1264,7 +1360,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: size as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     assert_eq!(fs::read(&destination).unwrap(), bytes);
@@ -1276,7 +1373,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: size as u64,
-            total: None
+            total: None,
+            files: None,
         }
     );
 
@@ -1299,7 +1397,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: CHUNK as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     let uploaded = remote.path().join("upload");
@@ -1322,7 +1421,8 @@ async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
         *progress.borrow(),
         TransferProgress {
             bytes: size as u64,
-            total: expected_total
+            total: expected_total,
+            files: None,
         }
     );
     assert_eq!(fs::read(uploaded).unwrap(), bytes);
@@ -1489,6 +1589,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
             Request::Record {
                 pane: 1,
                 path: Some(path.clone()),
+                timed: false,
             },
             capture.clone(),
         )
@@ -1547,6 +1648,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
             Request::Record {
                 pane: 1,
                 path: None,
+                timed: false,
             },
             capture.clone(),
         )
@@ -1560,7 +1662,8 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
             .execute(
                 Request::Record {
                     pane: 1,
-                    path: Some(path)
+                    path: Some(path),
+                    timed: false,
                 },
                 capture
             )
@@ -1659,6 +1762,26 @@ async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
         assert_eq!(fs::read(destination.join("nested/日本.bin")).unwrap(), [0, 255, 19]);
         assert_eq!(fs::read(destination.join(".marker")).unwrap(), b"complete");
         assert!(destination.join("nested/empty").is_dir());
+        let caller_dir = local.path().to_owned();
+        let output = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+                .current_dir(caller_dir)
+                .args(["--pid", &std::process::id().to_string(), "sftp", "--pane", "1",
+                    "put-dir", "local bundle", "pushed 日本"])
+                .output().unwrap()
+        }).await.unwrap();
+        assert!(output.status.success(), "put-dir failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        let uploaded: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let upload = &uploaded["result"]["sftp"];
+        assert_eq!(upload["remote"], "pushed 日本");
+        assert_eq!(upload["resolved_remote"], "/pushed 日本");
+        for field in ["files", "directories", "skipped", "bytes_transferred"] {
+            assert_eq!(upload[field], transfer[field], "{field}");
+        }
+        let pushed = root.path().join("pushed 日本");
+        assert_eq!(fs::read(pushed.join("nested/日本.bin")).unwrap(), [0, 255, 19]);
+        assert_eq!(fs::read(pushed.join(".marker")).unwrap(), b"complete");
+        assert!(pushed.join("nested/empty").is_dir());
         assert_eq!(opens.load(Ordering::Relaxed),2,"SFTP must reuse one sibling channel on the existing SSH connection");
         fs::write(root.path().join("slow"),b"slow").unwrap();
         let handle=ok(json!({"op":"open","path":"/slow","flags":["read"]})).await["handle"].as_u64().unwrap();

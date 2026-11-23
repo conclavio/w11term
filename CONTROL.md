@@ -78,6 +78,7 @@ Open a new pipe connection for each command. Write one UTF-8 JSON object followe
 {"verb":"list"}
 {"verb":"send-text","pane":1,"no_paste":true,"data_base64":"Qk9BUkQN"}
 {"verb":"get-text","pane":1}
+{"verb":"inspect","pane":1}
 {"verb":"save-text","pane":1,"path":"C:\\tests\\shell-transcript.txt","overwrite":false}
 {"verb":"screenshot","pane":1,"path":"C:\\tests\\frame.png"}
 ```
@@ -91,7 +92,25 @@ Direct protocol screenshot paths must be absolute. The CLI resolves relative pat
 
 `list.result` contains `pid` and a `sessions` array. Use each entry’s `id` as the argument to `--pane`. Its `tab_id` identifies the containing tab. Both IDs are local to the running process. The `active` flag identifies the selected terminal pane, and `visible` reports whether the layout displays it. Selecting a utility tab leaves every terminal inactive. A script can address any pane independently of visibility or native keyboard focus.
 
+Each entry’s `label` is its launch label and `title` is the application-reported terminal title when a capture is available. Explicit user names appear in separate optional fields. `pane_name` belongs to that individual pane and `tab_title` belongs to its group. Resetting either name removes its field from subsequent replies.
+
 Each entry also has a `label` and `status`. Available sessions report `title`, `cols`, `rows`, `connection_generation`, and `prompt`. An unavailable session retains its IDs and flags and reports an `error`. Prompts expose public challenge metadata only. The connection generation increases after each new SSH login. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels.
+
+## Live pane inspection
+
+`inspect --pane ID` reads the selected pane’s local terminal parser once. It works on background and read-only panes and preserves keyboard focus. During a synchronized update, `inspect` can already show the new modes while `get-text` still returns the last committed screen.
+
+```powershell
+$reply = & $ctl --pid 12345 inspect --pane $pane | ConvertFrom-Json
+if (!$reply.ok) { throw $reply.error }
+$modes = $reply.result
+"$($modes.cols) × $($modes.rows) cells, $($modes.pixel_width) × $($modes.pixel_height) pixels"
+if ($modes.in_band_resize) { 'This pane has subscribed to resize reports.' }
+```
+
+The reply includes `pane`, `connection_generation`, `cols`, `rows`, `pixel_width`, `pixel_height` and `dpi`. Pixel dimensions describe the drawable text area. An unavailable measurement is zero. The booleans `alternate_screen`, `bracketed_paste`, `synchronized_output` and `in_band_resize` reflect the modes at the time of the read.
+
+`mouse` contains the booleans `click`, `drag` and `motion`, and an `encoding` of `x10`, `utf8`, `sgr` or `sgr-pixels`. `keyboard.encoding` is `xterm`, `csi-u`, `win32` or `kitty`. `keyboard.flags` is the numeric kitty keyboard protocol bitmask, or zero for other encodings.
 
 ## Completed shell commands
 
@@ -101,6 +120,10 @@ contains `id`, `command`, `exit_code`, and `output_available`. The array is empt
 until the shell marks a completed command. A missing command line or exit status
 is JSON `null`. Listing transfers only this metadata and preserves keyboard focus
 and the scroll position.
+
+Use `--status failed` for nonzero exit codes, `--status succeeded` for zero, or
+`--status unknown` when the shell omitted the exit code. The default is `all`.
+Filtered listings keep the original IDs, generation, and newest-first order.
 
 To get the latest command’s output, pass its ID and the generation from the same
 listing. A generation of zero is valid.
@@ -122,6 +145,7 @@ Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-commands","pane":2}
+{"verb":"list-commands","pane":2,"status":"failed"}
 {"verb":"get-command","pane":2,"id":5,"connection_generation":1}
 ```
 
@@ -219,6 +243,19 @@ if ($null -ne $state.restart_token) {
 
 ## VT recording
 
+The command palette and the tab menu’s **Recordings** submenu share the
+recorder with the control pipe. **Start timed recording…** selects a new
+destination for the current SSH or local shell pane. The capture stays with
+that pane if another one becomes active while the picker is open. Its recording
+indicator shows the active path, including a capture started from the CLI.
+**Stop recording** finishes that pane’s capture. If the recorder hits a size
+limit or a disk error, the window’s notification inbox shows the reason.
+
+**Open recording…** opens a `.vt` file in a new tab and selects timed
+playback when its `.vt.jsonl` index is present. A raw capture uses its saved
+initial grid when available, or the measured pane size. Both modes in this
+viewer suppress historical desktop clipboard, sound and notification requests.
+
 ```powershell
 & $ctl --pid 12345 record --pane $pane .\bug.vt
 # Reproduce the problem, or request a repaint from the remote application.
@@ -226,24 +263,83 @@ if ($null -ne $state.restart_token) {
 .\target\release\w11term.exe --replay .\bug.vt
 ```
 
-Recordings contain exact incoming terminal-output bytes, including graphics and
-escape sequences, from the moment recording begins. Input and SSH authentication
-answers are excluded, but a server may echo typed text or display sensitive output;
-review captures before sharing. Starting mid-session does not capture previous
-terminal state or an escape sequence's already-received prefix. Trigger a remote
-full repaint when capturing a TUI bug. Timing, reconnection resets, and out-of-band
-SSH resize events are not stored; this is an output stream, not a timed video.
+Recordings contain the incoming terminal output, including image data and escape
+sequences, starting at the moment the recorder opens. A server may echo typed
+text or display sensitive information. Review the output before sharing it.
+When starting mid-session, request a full repaint from the application. The
+capture begins with a fresh parser on replay, and SSH reconnects do not
+reconstruct a previous session's state.
 
-Start creates a new file and a `<stem>.vt.json` sidecar with initial columns/rows;
-existing files are never overwritten. Replay reads that geometry unless explicit
-`--cols`/`--rows` override it. The parent must exist. Stop flushes and syncs the file,
-and returns its path and byte count. Closing the pane flushes it too. A disk error
-or 256 MiB limit stops recording and emits `recording-error`. Abrupt process death
-can lose buffered tail bytes. Keep the sidecar with the `.vt` file.
+Use a timed recording for a bug involving animation, synchronized output, or a
+window resize.
+
+```powershell
+& $ctl --pid 12345 record --pane $pane --timed .\cockpit.vt
+# Reproduce the bug, including any pane resizes.
+& $ctl --pid 12345 record --pane $pane --stop
+.\target\release\w11term.exe --replay-timed .\cockpit.vt
+```
+
+| File | Contents |
+|---|---|
+| `cockpit.vt` | Exact output bytes for either replay mode. Keyboard input and SSH authentication answers are excluded. |
+| `cockpit.vt.json` | Initial columns and rows for ordinary `--replay`. |
+| `cockpit.vt.jsonl` | The timed recording's initial geometry, output byte counts and resize events at elapsed microseconds, and a completion record with the raw file's SHA-256. |
+
+Keep the three files together when attaching a timed capture. Ordinary
+`--replay` renders the raw output in one pass. Timed replay verifies the raw
+file and timing index, then reproduces the recorded grid, pixel dimensions and
+DPI at each resize. `--cols` and `--rows` choose the initial viewing window.
+Changing that window leaves the recorded grid intact. Titles remain available
+to the pane picker and event journal. Recorded clipboard writes, desktop
+notifications and sounds are suppressed during timed playback.
+
+The destination directory must exist. Recording creates new files exclusively.
+Stopping flushes them to disk and returns the raw path and byte count. Closing
+the pane also finishes the recording. A disk error or the 256 MiB raw limit
+stops recording and emits `recording-error`. The timing index is limited to
+64 MiB and one million events. After an interrupted recording, a partial raw
+stream can still be opened with `--replay`.
 
 ```json
 {"verb":"record","pane":1,"path":"C:\\tests\\bug.vt"}
+{"verb":"record","pane":1,"path":"C:\\tests\\cockpit.vt","timed":true}
 {"verb":"record","pane":1,"path":null}
+```
+
+### Inspect one recorded update at a time
+
+Choose **Open recording paused…** in the command palette or the tab menu’s
+**Recordings** submenu to start before the first output. **Next recorded update**
+applies all output and resizes at the next distinct capture timestamp in file
+order. **Resume replay** runs at the recorded pace. **Pause replay** freezes
+the playhead, the synchronized-output timeout and kitty image animation.
+
+```powershell
+.\w11term.exe --replay-timed .\cockpit.vt --paused
+# Use the replay window's process ID and its pane ID from w11term-cli list.
+& $ctl --pid $replayPid playback --pane $pane --step
+& $ctl --pid $replayPid get-text --pane $pane
+& $ctl --pid $replayPid screenshot --pane $pane .\cockpit-update.png
+& $ctl --pid $replayPid playback --pane $pane --resume
+```
+
+`playback --pane ID` returns the pane ID, `state`, `position_us` and
+`duration_us`. The times are microseconds from the beginning of the capture.
+The duration is available after validation. States are `loading`, `playing`,
+`paused`, `complete` and `failed`. A failed replay includes an `error`.
+Control operations address a background pane without activating its tab.
+
+A step returns after its timestamp group has been processed. During a
+synchronized update, `get-text` and `screenshot` keep showing the previous
+committed screen until an end marker or the 150 ms presentation timeout.
+An interval with several recorded writes can therefore take several steps
+to produce a visible change. Stepping over trailing silence reaches the end
+of the capture.
+
+```json
+{"verb":"playback","pane":1}
+{"verb":"playback","pane":1,"action":"step"}
 ```
 
 ## SFTP
@@ -256,6 +352,7 @@ SFTP is available through a pane's **existing authenticated SSH connection**, on
 & $ctl --pid 12345 sftp --pane $pane get /tmp/output.bin .\output.bin
 & $ctl --pid 12345 sftp --pane $pane get-dir /tmp/diagnostics .\incident-042
 & $ctl --pid 12345 sftp --pane $pane put .\input.bin /tmp/input.bin
+& $ctl --pid 12345 sftp --pane $pane put-dir .\cockpit /tmp/cockpit-v2
 & $ctl --pid 12345 sftp --pane $pane mkdir /tmp/work --permissions 0750
 & $ctl --pid 12345 sftp --pane $pane rename /tmp/input.bin /tmp/work/input.bin
 & $ctl --pid 12345 sftp --pane $pane stat /tmp/work/input.bin
@@ -283,12 +380,27 @@ allows 32 levels below the root, 65,536 returned directory entries and 8 MiB of
 entry-name bytes across the transfer. The server can change files during a
 download. The result reflects the files read during the transfer.
 
+A folder upload creates the requested remote directory and requires its parent
+to exist. The destination can have a different name from the source folder.
+`remote` preserves the requested path. Once the server resolves the parent,
+`resolved_remote` gives the absolute destination used by the transfer.
+An existing destination, including an empty directory, stops the transfer.
+Empty directories and empty files are copied. Windows reparse points such as
+junctions inside the tree are counted as skipped. A reparse point supplied as
+the source root is rejected. Interruption after remote creation can leave a
+partial tree. The reply identifies the destination so you can inspect it before
+retrying. A file counts as complete once the server acknowledges all writes
+and the final close. An upload allows 32 directory levels below the root,
+65,536 entries, and 8 MiB of entry names. w11term reads each file in chunks
+and checks its length against the size reported when it opened the file.
+
 The command surface covers SFTP v3:
 
 | Commands | Arguments / result |
 | --- | --- |
 | `info` | Negotiated version, advertised extensions, open-handle count, read/write chunk limits |
 | `get-dir REMOTE NEW_LOCAL_DIRECTORY` | Recursively download a directory into the exact local path. Its parent must exist. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
+| `put-dir LOCAL NEW_REMOTE_DIRECTORY` | Recursively upload to the exact remote path. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
 | `ls [PATH]` | Collect directory entries (default `.`); maximum 8 MiB JSON, then use paged reads |
 | `opendir PATH`, `readdir --handle ID`, `close --handle ID` | Persistent opaque handle, one server page at a time, explicit `eof` |
 | `open PATH [--flags FLAGS]` | Comma-separated `read,write,append,create,truncate,exclusive`; default `read`; returns handle |
@@ -314,6 +426,7 @@ Direct pipe requests use a nested operation. All local transfer paths must be ab
 ```json
 {"verb":"sftp","pane":1,"timeout_seconds":600,"operation":{"op":"get","remote":"/tmp/output.bin","local":"C:\\tests\\output.bin","overwrite":false}}
 {"verb":"sftp","pane":1,"operation":{"op":"get-dir","remote":"/tmp/diagnostics","local":"C:\\tests\\incident-042"}}
+{"verb":"sftp","pane":1,"operation":{"op":"put-dir","local":"C:\\Projects\\cockpit","remote":"/tmp/cockpit-v2"}}
 {"verb":"sftp","pane":1,"operation":{"op":"mkdir","path":"/tmp/work","attrs":{"permissions":488}}}
 {"verb":"sftp","pane":1,"operation":{"op":"open","path":"/tmp/output.bin","flags":["read"]}}
 {"verb":"sftp","pane":1,"operation":{"op":"read","handle":7,"offset":0,"len":32768}}

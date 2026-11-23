@@ -3,6 +3,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $verifyClipboard = $env:GITHUB_ACTIONS -eq 'true' -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted'
 if ($verifyClipboard) { . (Join-Path $PSScriptRoot 'support/clipboard.ps1') }
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
@@ -23,22 +24,76 @@ function Search([string]$Text) {
     $field = Wait-Until 'command search field' { Find-Element 'Search command history' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
 }
+function Status-Box([string]$Expected) {
+    Wait-Until "command status selector showing '$Expected'" {
+        $box = Find-Element 'Command status' ([System.Windows.Automation.ControlType]::ComboBox)
+        if ($box) {
+            $items = $box.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            if ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Expected) { $box }
+        }
+    }
+}
+function Change-Status([string]$From, [string]$To) {
+    $box = Status-Box $From
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $box.GetCurrentPattern($expand).Expand()
+    $choice = Wait-Until "status option '$To'" {
+        $item = Find-Element $To ([System.Windows.Automation.ControlType]::ListItem)
+        if ($item -and $item.Current.IsEnabled -and !$item.Current.IsOffscreen) { $item }
+    }
+    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $popup = (Status-Box $To).GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+function Check-List([string]$Status, [string[]]$Expected) {
+    $request = @('list-commands','--pane',"$remote")
+    if ($Status) { $request += '--status', $Status }
+    $result = Control $request
+    $rows = @($result.commands)
+    if ($result.pane -ne $remote -or $result.connection_generation -ne $generation -or $rows.Count -ne $Expected.Count) {
+        throw "Unexpected history for '$Status': $($result | ConvertTo-Json -Depth 4 -Compress)"
+    }
+    for ($i = 0; $i -lt $Expected.Count; $i++) {
+        if ($rows[$i].command -cne $Expected[$i]) {
+            throw "Command $i with status '$Status' was '$($rows[$i].command)', expected '$($Expected[$i])'"
+        }
+    }
+}
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','70') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','history-search-ready')
+    $generation = (Control @('inspect','--pane',"$remote")).connection_generation
+    $all = @('check-status','deploy retry','deploy audit',$command)
+    Check-List '' $all
+    Check-List 'all' $all
+    Check-List 'failed' @('deploy retry',$command)
+    Check-List 'succeeded' @('check-status')
+    Check-List 'unknown' @('deploy audit')
     Run-Palette 'Command history'
-    $recent = "Selected, check-status${dot}exit 0"
-    $null = Wait-Until 'newest command selected' { Find-Element $recent $button }
-    Search $word.ToUpperInvariant()
-    $old = 'Selected, ' + $command.Substring(0,120) + $dot + 'exit 17'
-    $null = Wait-Until 'older full command found beyond its row label' {
-        (Find-Element $old $button) -and (Find-Element $command) -and !(Find-Element "check-status${dot}exit 0" $button)
+    $recent = 'check-status' + $dot + 'exit 0'
+    $old = $command.Substring(0,120) + $dot + 'exit 17'
+    $retry = 'deploy retry' + $dot + 'exit 2'
+    $unknown = 'deploy audit' + $dot + 'status unknown'
+    $null = Wait-Until 'newest command selected' { Find-Element "Selected, $recent" $button }
+    Change-Status 'All commands' 'Failed'
+    $null = Wait-Until 'both failures visible and newest failure selected' {
+        (Find-Element "Selected, $retry" $button) -and (Find-Element $old $button) -and
+            !(Find-Element $recent $button) -and !(Find-Element $unknown $button)
+    }
+    Click $old
+    Search 'DEPLOY'
+    $null = Wait-Until 'text filter kept the selected older failure' {
+        (Find-Element "Selected, $old" $button) -and (Find-Element $retry $button)
     }
     Click 'Refresh history'
-    $null = Wait-Until 'refresh selected the newest matching command' { Find-Element $old $button }
+    $null = Wait-Until 'refresh selected the newest matching failure' { Find-Element "Selected, $retry" $button }
+    Search $word.ToUpperInvariant()
+    $null = Wait-Until 'older full command found beyond its row label' {
+        (Find-Element "Selected, $old" $button) -and (Find-Element $command) -and !(Find-Element $retry $button)
+    }
     if ($verifyClipboard) {
         $before = [FixtureClipboard]::GetClipboardSequenceNumber()
         Click 'Copy command'
@@ -47,12 +102,25 @@ try {
         Click 'Copy output'
         $null = Wait-Until 'independent output on the clipboard' { [FixtureClipboard]::ContainsNewText($before, "archived deploy output`r`n") }
     }
-    Search '[not a match]'
-    $null = Wait-Until 'empty results disable both copy actions' {
+    Change-Status 'Failed' 'Succeeded'
+    $null = Wait-Until 'matching successful output alone cannot enable copy' {
         (Find-Element 'No matching commands') -and !(Find-Element 'Copy command' $button).Current.IsEnabled -and !(Find-Element 'Copy output' $button).Current.IsEnabled
     }
     Search ''
-    $null = Wait-Until 'clearing selects the most recent command' { Find-Element $recent $button }
+    $null = Wait-Until 'only the successful command is offered' {
+        (Find-Element "Selected, $recent" $button) -and !(Find-Element $unknown $button) -and
+            !(Find-Element $old $button) -and !(Find-Element $retry $button)
+    }
+    Change-Status 'Succeeded' 'Status unknown'
+    $null = Wait-Until 'only the command with no exit code is offered' {
+        (Find-Element "Selected, $unknown" $button) -and !(Find-Element $recent $button) -and
+            !(Find-Element $old $button) -and !(Find-Element $retry $button)
+    }
+    Change-Status 'Status unknown' 'All commands'
+    $null = Wait-Until 'all results restored with the same command selected' {
+        (Find-Element "Selected, $unknown" $button) -and (Find-Element $recent $button) -and
+            (Find-Element $old $button) -and (Find-Element $retry $button)
+    }
     Click 'Return to pane'
     Wait-Focus $remote
     foreach ($char in 'history-resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$char) }

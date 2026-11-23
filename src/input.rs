@@ -48,6 +48,19 @@ enum KeySlot {
     KeypadVirtual(u32),
 }
 
+impl KeySlot {
+    fn can_emit_char(self) -> bool {
+        // Scanless WM_CHAR carries Unicode, not a virtual key. For example
+        // the letter 'u' has the same number as VK_F6.
+        match self {
+            Self::PrintableScan(_) | Self::KeypadScan { .. } => true,
+            Self::Virtual(key) | Self::KeypadVirtual(key) => {
+                matches!(key, 0x08 | 0x09 | 0x0d | 0x1b | 0x20)
+            }
+        }
+    }
+}
+
 struct HeldKey {
     vk: u32,
     key: KeyCode,
@@ -68,6 +81,7 @@ struct State {
     switcher: bool,
     grid: Option<Grid>,
     search: bool,
+    find_keys: HashMap<KeySlot, FindPress>,
     picker: Option<PickerStage>,
     local_mode: Option<LocalMode>,
     // A true entry may repeat a movement first pressed in this copy-mode session.
@@ -79,9 +93,11 @@ struct State {
     modal: bool,
     drawer_pane: Option<u64>,
     drawer_focused: bool,
-    // Native buttons can close their drawer before key-up or the translated WM_CHAR.
-    drawer_keys: HashSet<KeySlot>,
-    drawer_late_char: Option<KeySlot>,
+    session_search: Option<(u64, u64, u64)>, // pane, listing revision, query revision
+    session_search_focused: bool,
+    // A native button or search field can disappear before key-up or WM_CHAR.
+    native_keys: HashSet<KeySlot>,
+    native_late_char: Option<KeySlot>,
     game_mode: bool,
     close_handler: Option<Box<dyn Fn()>>,
 }
@@ -95,6 +111,13 @@ struct Target {
 struct HeldResize {
     key: KeySlot,
     repeat: Option<(KeyModifiers, Direction)>,
+}
+
+#[derive(Clone, Copy)]
+enum FindPress {
+    Held,
+    Navigate(KeyModifiers, Shortcut),
+    Released,
 }
 
 #[derive(Default)]
@@ -154,12 +177,15 @@ pub enum Shortcut {
     TaskbarCreated,
     CaretPresentationChanged,
     DrawerFocusChanged,
+    SubmitSessionSearch(u64, u64, u64),
     NextTab,
     PreviousTab,
     MoveTabLeft,
     MoveTabRight,
     NewTab,
     DuplicateTabLayout,
+    ReopenClosedTab,
+    ReopenClosedPane,
     CloseTab,
     SplitRight,
     SplitBelow,
@@ -172,6 +198,7 @@ pub enum Shortcut {
     SwapPane(Direction),
     ZoomPane,
     RotateSplit,
+    BalancePanes,
     ClosePane,
     Select(usize),
     Copy,
@@ -197,6 +224,7 @@ pub enum Shortcut {
     KeyboardHints,
     HintKey(u32),
     CopyMode,
+    SelectAll,
     CopyKey(w11term::copy_mode::CopyKey),
     MovePane,
     MovePaneToExistingTab,
@@ -206,6 +234,7 @@ pub enum Shortcut {
 pub struct KeyboardBridge {
     scope: WindowScope,
     drawer_watch: RefCell<Option<drawer_focus::Watch>>,
+    session_search_watch: RefCell<Option<drawer_focus::Watch>>,
     bootstrap: String,
     _hooks: std::rc::Rc<ThreadHooks>,
 }
@@ -288,6 +317,7 @@ impl KeyboardBridge {
         Ok(Self {
             scope,
             drawer_watch: RefCell::default(),
+            session_search_watch: RefCell::default(),
             bootstrap: format!("w11term-window-{:032x}", rand::random::<u128>()),
             _hooks: window::install_hooks()?,
         })
@@ -420,13 +450,7 @@ impl KeyboardBridge {
         let _native = self.scope.enter();
         with_input(|i| {
             if let Some(s) = i.borrow_mut().as_mut() {
-                if visible {
-                    ime::cancel();
-                    s.release_keys();
-                    s.wheel_panes.hovered = None;
-                }
-                s.search = visible;
-                s.report_focus();
+                s.set_search(visible);
             }
         });
         ime::sync_context();
@@ -526,11 +550,14 @@ impl KeyboardBridge {
         }
         self.drawer_watch.borrow_mut().take();
         if let (Some(pane), Some(hwnd)) = (pane, hwnd) {
-            match drawer_focus::Watch::new(pane, hwnd.0 as usize) {
+            let hwnd = hwnd.0 as usize;
+            match drawer_focus::Watch::new(format!("w11term-sftp-{pane}"), move |focused| {
+                notify_drawer_focus(hwnd, pane, focused)
+            }) {
                 Ok(watch) => *self.drawer_watch.borrow_mut() = Some(watch),
                 Err(error) => {
                     log::warn!("Tracking SFTP drawer focus: {error}");
-                    notify_drawer_focus(hwnd.0 as usize, pane, true);
+                    notify_drawer_focus(hwnd, pane, true);
                 }
             }
         }
@@ -541,6 +568,52 @@ impl KeyboardBridge {
         let _native = self.scope.enter();
         if with_input_mut(|s| s.as_mut().is_some_and(|s| s.set_drawer_focus(false))) {
             ime::sync_context();
+        }
+    }
+
+    pub fn session_search_tag(&self, pane: u64) -> String {
+        format!("{}-session-search-{pane}", self.bootstrap)
+    }
+
+    pub fn watch_session_search(&self, query: Option<(u64, u64, u64)>) {
+        let _native = self.scope.enter();
+        let hwnd = self.hwnd();
+        if query.is_some() && hwnd.is_none() {
+            return;
+        }
+        let pane_changed = with_input_mut(|input| {
+            let Some(state) = input else { return false };
+            let changed =
+                state.session_search.map(|(pane, ..)| pane) != query.map(|(pane, ..)| pane);
+            state.session_search = query;
+            if changed {
+                state.session_search_focused = false;
+            }
+            changed
+        });
+        if !pane_changed {
+            return;
+        }
+        self.session_search_watch.borrow_mut().take();
+        if let (Some((pane, ..)), Some(hwnd)) = (query, hwnd) {
+            let hwnd = hwnd.0 as usize;
+            let tag = self.session_search_tag(pane);
+            match drawer_focus::Watch::new(tag, move |focused| {
+                if let Some(scope) = WindowScope::for_window(HWND(hwnd as *mut _)) {
+                    let _guard = scope.enter();
+                    with_input(|state| {
+                        if let Ok(mut state) = state.try_borrow_mut()
+                            && let Some(state) = state.as_mut()
+                            && state.session_search.is_some_and(|(id, ..)| id == pane)
+                        {
+                            state.session_search_focused = focused;
+                        }
+                    });
+                }
+            }) {
+                Ok(watch) => *self.session_search_watch.borrow_mut() = Some(watch),
+                Err(error) => log::warn!("Tracking remote session search focus: {error}"),
+            }
         }
     }
 
@@ -609,7 +682,6 @@ impl KeyboardBridge {
             ) == LRESULT(1)
         }
     }
-    #[cfg(feature = "ui-smoke")]
     pub fn has_target(&self) -> bool {
         let _native = self.scope.enter();
         with_input(|input| {
@@ -625,6 +697,7 @@ impl Drop for KeyboardBridge {
     fn drop(&mut self) {
         let _guard = self.scope.enter();
         self.drawer_watch.get_mut().take();
+        self.session_search_watch.get_mut().take();
         ime::uninstall();
         if let Some(mut state) = with_input_mut(Option::take) {
             state.release_keys();
@@ -1083,6 +1156,7 @@ impl State {
             switcher: false,
             grid: None,
             search: false,
+            find_keys: HashMap::new(),
             picker: None,
             local_mode: None,
             local_held: HashMap::new(),
@@ -1093,8 +1167,10 @@ impl State {
             modal: false,
             drawer_pane: None,
             drawer_focused: false,
-            drawer_keys: HashSet::new(),
-            drawer_late_char: None,
+            session_search: None,
+            session_search_focused: false,
+            native_keys: HashSet::new(),
+            native_late_char: None,
             game_mode: false,
             close_handler: None,
         }
@@ -1131,6 +1207,7 @@ impl State {
             .is_some_and(|(a, b)| a.sender.same_channel(&b.sender))
         {
             ime::cancel();
+            self.stop_find_repeats();
         }
         self.release_keys();
         if let Some(old) = self.target.take() {
@@ -1146,10 +1223,36 @@ impl State {
         window::active()
             && !self.search
             && !self.drawer_focused
+            && self.session_search.is_none()
             && !self.modal
             && !self.switcher
             && self.picker.is_none()
             && self.local_mode.is_none()
+    }
+
+    fn set_search(&mut self, visible: bool) {
+        if self.search == visible {
+            return;
+        }
+        self.search = visible;
+        if visible {
+            ime::cancel();
+            self.find_keys
+                .extend(self.pressed.keys().map(|&slot| (slot, FindPress::Held)));
+            self.release_keys();
+            self.wheel_panes.hovered = None;
+        } else {
+            self.stop_find_repeats();
+        }
+        self.report_focus();
+    }
+
+    fn stop_find_repeats(&mut self) {
+        for press in self.find_keys.values_mut() {
+            if matches!(press, FindPress::Navigate(..)) {
+                *press = FindPress::Held;
+            }
+        }
     }
 
     fn set_drawer_focus(&mut self, focused: bool) -> bool {
@@ -1199,26 +1302,68 @@ impl State {
             (None, Some(position)) => KeySlot::PrintableScan(position),
             (None, None) => KeySlot::Virtual(vk),
         };
-        if !self.drawer_keys.is_empty() || self.drawer_late_char.is_some() {
+        // Bind a Find key to the pane that received its first press. Windows
+        // can queue a translated character even after key-up or a focus change.
+        if !self.find_keys.is_empty() {
             match message.message {
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) == 0 => {
-                    self.drawer_late_char = None;
-                    self.drawer_keys.remove(&slot);
+                    self.find_keys
+                        .retain(|&key, press| key != slot && !matches!(press, FindPress::Released));
                 }
-                WM_KEYUP | WM_SYSKEYUP if self.drawer_keys.remove(&slot) => {
-                    self.drawer_late_char = matches!(vk, 0x09 | 0x0d | 0x20).then_some(slot);
+                WM_KEYDOWN | WM_SYSKEYDOWN if self.find_keys.contains_key(&slot) => {
+                    if let FindPress::Navigate(required, action) = self.find_keys[&slot]
+                        && self.search
+                        && !self.modal
+                        && !self.drawer_focused
+                        && self.session_search.is_none()
+                        && self.picker.is_none()
+                        && !self.switcher
+                        && self.local_mode.is_none()
+                        && modifiers() == required
+                        && !ime::native_composing(message.hwnd)
+                    {
+                        (self.shortcut)(action);
+                    }
+                    return true;
+                }
+                WM_KEYUP | WM_SYSKEYUP if self.find_keys.contains_key(&slot) => {
+                    if slot.can_emit_char() {
+                        self.find_keys.insert(slot, FindPress::Released);
+                    } else {
+                        self.find_keys.remove(&slot);
+                    }
+                    return true;
+                }
+                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
+                    let owned = slot.can_emit_char() && self.find_keys.contains_key(&slot);
+                    self.find_keys
+                        .retain(|_, press| !matches!(press, FindPress::Released));
+                    if owned {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !self.native_keys.is_empty() || self.native_late_char.is_some() {
+            match message.message {
+                WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) == 0 => {
+                    self.native_late_char = None;
+                    self.native_keys.remove(&slot);
+                }
+                WM_KEYUP | WM_SYSKEYUP if self.native_keys.remove(&slot) => {
+                    self.native_late_char = slot.can_emit_char().then_some(slot);
                     return false;
                 }
-                WM_CHAR | WM_SYSCHAR if self.drawer_late_char == Some(slot) => {
-                    self.drawer_late_char = None;
-                    return false;
+                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => {
+                    let late = self.native_late_char.take() == Some(slot);
+                    if slot.can_emit_char() && (late || self.native_keys.contains(&slot)) {
+                        return false;
+                    }
                 }
-                WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR | WM_KEYDOWN
-                | WM_SYSKEYDOWN
-                    if self.drawer_keys.contains(&slot) =>
-                {
+                WM_KEYDOWN | WM_SYSKEYDOWN if self.native_keys.contains(&slot) => {
                     // Deliver the native press, character, and release as one unit,
-                    // including when an activation closes the drawer on key-down.
+                    // including when an activation removes its control on key-down.
                     return false;
                 }
                 _ => {}
@@ -1262,6 +1407,9 @@ impl State {
                 WM_KEYUP | WM_SYSKEYUP => {
                     self.local_held.remove(&slot);
                     self.swallowed.remove(&slot);
+                    if vk == 0x0d {
+                        self.native_late_char = Some(slot);
+                    }
                     return true;
                 }
                 WM_KEYDOWN | WM_SYSKEYDOWN if message.lParam.0 & (1 << 30) != 0 => {
@@ -1287,7 +1435,20 @@ impl State {
                     }
                     self.local_held.insert(slot, mode == LocalMode::Copy);
                     if mode == LocalMode::Copy {
-                        if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, modifiers())
+                        let mods = modifiers();
+                        let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
+                        let action = self.keymap.resolve(vk, mods, true, right_alt);
+                        if action == Some(Action::Find) {
+                            self.local_held.remove(&slot);
+                            self.find_keys.insert(slot, FindPress::Held);
+                            if !repeat {
+                                (self.shortcut)(Shortcut::Find);
+                            }
+                        } else if action == Some(Action::SelectAll) {
+                            if !repeat {
+                                (self.shortcut)(Shortcut::SelectAll);
+                            }
+                        } else if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, mods)
                             && (!repeat || key.repeats())
                         {
                             if key == w11term::copy_mode::CopyKey::Cancel {
@@ -1425,39 +1586,76 @@ impl State {
         if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) && self.swallowed.remove(&slot) {
             return true;
         }
+        if let Some((pane, listing, query)) = self.session_search
+            && self.session_search_focused
+            && !self.search
+            && message.message == WM_KEYDOWN
+            && vk == 0x0d
+            && mods.is_empty()
+            && !ime::native_composing(message.hwnd)
+        {
+            self.local_held.insert(slot, false);
+            if message.lParam.0 & (1 << 30) == 0 {
+                (self.shortcut)(Shortcut::SubmitSessionSearch(pane, listing, query));
+            }
+            return true;
+        }
         if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-            if (self.target.is_some() && !self.drawer_focused) || self.search {
-                let find = if mods.contains(KeyModifiers::CTRL | KeyModifiers::SHIFT) && vk == 0x46
-                {
-                    Some(Shortcut::Find)
-                } else if vk == 0x72 || (self.search && vk == 0x0d) {
-                    Some(if mods.contains(KeyModifiers::SHIFT) {
-                        Shortcut::FindPrevious
-                    } else {
-                        Shortcut::FindNext
-                    })
-                } else if self.search && vk == 0x1b {
-                    Some(Shortcut::FindClose)
-                } else {
-                    None
-                };
-                if let Some(shortcut) = find {
-                    self.swallowed.insert(slot);
-                    (self.shortcut)(shortcut);
+            let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
+            let find_editor = self.search
+                && self.target.is_some()
+                && !self.drawer_focused
+                && self.session_search.is_none();
+            let shortcut = if find_editor {
+                match (vk, mods) {
+                    (0x0d, KeyModifiers::NONE) => Some(Shortcut::FindNext),
+                    (0x0d, KeyModifiers::SHIFT) => Some(Shortcut::FindPrevious),
+                    (0x1b, KeyModifiers::NONE) => Some(Shortcut::FindClose),
+                    _ => self
+                        .keymap
+                        .resolve_in_find(vk, mods, right_alt)
+                        .map(Shortcut::from),
+                }
+            } else {
+                self.keymap
+                    .resolve(
+                        vk,
+                        mods,
+                        self.target.is_some()
+                            && !self.drawer_focused
+                            && self.session_search.is_none(),
+                        right_alt,
+                    )
+                    .map(Shortcut::from)
+            };
+            if let Some(shortcut) = shortcut {
+                if matches!(
+                    shortcut,
+                    Shortcut::Find
+                        | Shortcut::FindNext
+                        | Shortcut::FindPrevious
+                        | Shortcut::FindClose
+                ) {
+                    if find_editor && ime::native_composing(message.hwnd) {
+                        self.native_keys.insert(slot);
+                        return false;
+                    }
+                    if message.lParam.0 & (1 << 30) == 0 {
+                        // Gate subsequent input immediately, while the UI mounts the Find box.
+                        if shortcut != Shortcut::FindClose {
+                            self.set_search(true);
+                        }
+                        let press =
+                            if matches!(shortcut, Shortcut::FindNext | Shortcut::FindPrevious) {
+                                FindPress::Navigate(mods, shortcut)
+                            } else {
+                                FindPress::Held
+                            };
+                        self.find_keys.insert(slot, press);
+                        (self.shortcut)(shortcut);
+                    }
                     return true;
                 }
-            }
-            let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
-            let shortcut = self
-                .keymap
-                .resolve(
-                    vk,
-                    mods,
-                    self.target.is_some() && !self.search && !self.drawer_focused,
-                    right_alt,
-                )
-                .map(Shortcut::from);
-            if let Some(shortcut) = shortcut {
                 if matches!(shortcut, Shortcut::NextTab | Shortcut::PreviousTab)
                     && self.preferences.tab_switcher_mode != TabSwitcherMode::Disabled
                 {
@@ -1482,8 +1680,9 @@ impl State {
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
                         self.local_mode = Some(LocalMode::Hints);
-                    } else if matches!(shortcut, Shortcut::CopyMode) {
+                    } else if matches!(shortcut, Shortcut::CopyMode | Shortcut::SelectAll) {
                         self.local_mode = Some(LocalMode::Copy);
+                        self.local_held.insert(slot, false);
                     }
                     if let Shortcut::ResizePane(direction) = shortcut {
                         self.held_resize = Some(HeldResize {
@@ -1503,13 +1702,12 @@ impl State {
                 return true;
             }
         }
-        if self.drawer_focused && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL) {
+        if (self.search || self.drawer_focused || self.session_search.is_some())
+            && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL)
+        {
             if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
-                self.drawer_keys.insert(slot);
+                self.native_keys.insert(slot);
             }
-            return false;
-        }
-        if self.search && !matches!(message.message, WM_MOUSEWHEEL | WM_POINTERWHEEL) {
             return false;
         }
         let Some(Target { sender, frames }) = &self.target else {
@@ -1780,15 +1978,20 @@ impl From<Action> for Shortcut {
             Action::NewTabInCurrentDirectory => Self::NewTabInCurrentDirectory,
             Action::ZoomPane => Self::ZoomPane,
             Action::RotateSplit => Self::RotateSplit,
+            Action::BalancePanes => Self::BalancePanes,
             Action::ClosePane => Self::ClosePane,
             Action::MovePane => Self::MovePane,
             Action::MovePaneToExistingTab => Self::MovePaneToExistingTab,
             Action::Workspaces => Self::Workspaces,
             Action::CommandPalette => Self::CommandPalette,
             Action::PanePicker => Self::PanePicker,
+            Action::Find => Self::Find,
+            Action::FindNext => Self::FindNext,
+            Action::FindPrevious => Self::FindPrevious,
             Action::FindAllPanes => Self::FindAllPanes,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
+            Action::SelectAll => Self::SelectAll,
             Action::ClearScrollback => Self::ClearScrollback,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
@@ -1796,6 +1999,8 @@ impl From<Action> for Shortcut {
             Action::MoveTabRight => Self::MoveTabRight,
             Action::NewTab => Self::NewTab,
             Action::DuplicateTabLayout => Self::DuplicateTabLayout,
+            Action::ReopenClosedTab => Self::ReopenClosedTab,
+            Action::ReopenClosedPane => Self::ReopenClosedPane,
             Action::CloseTab => Self::CloseTab,
             Action::SelectTab(number) => Self::Select(usize::from(number - 1)),
         }
@@ -1955,6 +2160,179 @@ fn special_key(vk: u32) -> Option<KeyCode> {
 mod tests {
     use super::*;
     use w11term::{options::Source, session::Session};
+
+    fn find_key(message: u32, vk: usize, scan: u32, repeat: bool) -> MSG {
+        MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(((scan << 16) | (u32::from(repeat) << 30)) as isize),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn find_selected_text_remap_owns_the_copy_mode_key_across_the_transition() {
+        let _scope = WindowScope::default().enter();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::Find, Some("F2".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            local_mode: Some(LocalMode::Copy),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |action| seen.borrow_mut().push(action))
+        };
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        state.local_mode = None;
+        state.set_search(true);
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        assert!(state.handle(&find_key(WM_KEYUP, 0x71, 0x3c, false)));
+        assert_eq!(*actions.borrow(), [Shortcut::Find]);
+    }
+
+    #[test]
+    fn remapped_find_keeps_navigation_repeats_and_late_characters_in_the_original_pane() {
+        let _scope = WindowScope::default().enter();
+        let pane = Session::start(Source::Demo);
+        let (first, mut source) = mpsc::unbounded_channel();
+        let (second, mut sibling) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::FindNext, Some("F2".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            target: Some(Target {
+                sender: first,
+                frames: pane.frames.clone(),
+            }),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |action| seen.borrow_mut().push(action))
+        };
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, false)));
+        assert!(state.search, "own typing before the Find view mounts");
+        assert!(matches!(source.try_recv().unwrap(), Command::Focus(false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        assert_eq!(*actions.borrow(), [Shortcut::FindNext, Shortcut::FindNext]);
+        state.retarget(Some(Target {
+            sender: second,
+            frames: pane.frames.clone(),
+        }));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        assert!(state.handle(&find_key(WM_KEYUP, 0x71, 0x3c, false)));
+        assert_eq!(actions.borrow().len(), 2, "repeat navigated the new pane");
+
+        assert!(!state.handle(&find_key(WM_KEYDOWN, 0x51, 0x10, false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x1b, 1, false)));
+        state.set_search(false);
+        assert!(!state.handle(&find_key(WM_KEYDOWN, 0x51, 0x10, true)));
+        assert!(!state.handle(&find_key(WM_KEYUP, 0x51, 0x10, false)));
+        assert!(!state.handle(&find_key(WM_CHAR, 'q' as usize, 0x10, false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x1b, 1, true)));
+        assert!(state.handle(&find_key(WM_KEYUP, 0x1b, 1, false)));
+        assert!(state.handle(&find_key(WM_CHAR, 0x1b, 1, false)));
+        assert_eq!(
+            *actions.borrow(),
+            [Shortcut::FindNext, Shortcut::FindNext, Shortcut::FindClose]
+        );
+        assert!(
+            std::iter::from_fn(|| sibling.try_recv().ok()).all(|m| matches!(m, Command::Focus(_)))
+        );
+        // U+0071 equals VK_F2. Scanless Unicode input must survive the remap
+        // even without a corresponding keydown, including UTF-16 pairs.
+        for c in ['q' as usize, 0xd83d, 0xde80] {
+            assert!(state.handle(&find_key(WM_CHAR, c, 0, false)));
+        }
+        assert!(matches!(sibling.try_recv(), Ok(Command::Text(s)) if s == "q"));
+        assert!(matches!(sibling.try_recv(), Ok(Command::Text(s)) if s == "🚀"));
+        // A fresh F3 now belongs to the shell; clearing the old default works.
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x72, 0x3d, false)));
+        assert!(matches!(
+            sibling.try_recv().unwrap(),
+            Command::Key { down: true, .. }
+        ));
+    }
+
+    #[test]
+    fn remapped_find_does_not_steal_native_drawer_or_discovery_input() {
+        let pane = Session::start(Source::Demo);
+        let (tx, mut input) = mpsc::unbounded_channel();
+        let mut state = State {
+            target: Some(Target {
+                sender: tx,
+                frames: pane.frames.clone(),
+            }),
+            search: true,
+            drawer_focused: true,
+            ..State::new(|s| panic!("unexpected shortcut {s:?}"))
+        };
+        let f3 = |msg| find_key(msg, 0x72, 0x3d, false);
+        assert!(!state.handle(&f3(WM_KEYDOWN)));
+        assert!(!state.handle(&f3(WM_KEYUP)));
+        state.drawer_focused = false;
+        state.session_search = Some((1, 1, 1));
+        assert!(!state.handle(&f3(WM_KEYDOWN)));
+        assert!(!state.handle(&f3(WM_KEYUP)));
+        assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn remapped_find_lets_altgr_type_and_does_not_reinterpret_the_held_shortcut_after_ctrl_release()
+    {
+        // SetKeyboardState only affects the current test thread's input queue.
+        struct RestoreKeys([u8; 256]);
+        impl Drop for RestoreKeys {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetKeyboardState(&self.0);
+                }
+            }
+        }
+        let mut original = RestoreKeys([0; 256]);
+        unsafe { GetKeyboardState(&mut original.0).unwrap() };
+        let pane = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::FindNext, Some("Ctrl+Alt+Q".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            search: true,
+            target: Some(Target {
+                sender,
+                frames: pane.frames.clone(),
+            }),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |s| seen.borrow_mut().push(s))
+        };
+        let q = |msg, repeat| find_key(msg, 0x51, 0x10, repeat);
+        let mut keys = [0; 256];
+        for key in [VK_CONTROL, VK_MENU, VK_RMENU] {
+            keys[key.0 as usize] = 0x80;
+        }
+        unsafe { SetKeyboardState(&keys).unwrap() };
+        assert!(!state.handle(&q(WM_SYSKEYDOWN, false)));
+        assert!(!state.handle(&find_key(WM_CHAR, '@' as usize, 0x10, false)));
+        assert!(!state.handle(&q(WM_SYSKEYUP, false)));
+        assert!(actions.borrow().is_empty());
+        keys[VK_RMENU.0 as usize] = 0;
+        keys[VK_LMENU.0 as usize] = 0x80;
+        unsafe { SetKeyboardState(&keys).unwrap() };
+        assert!(state.handle(&q(WM_SYSKEYDOWN, false)));
+        assert!(state.handle(&q(WM_SYSKEYDOWN, true)));
+        unsafe { SetKeyboardState(&[0; 256]).unwrap() };
+        assert!(state.handle(&q(WM_KEYDOWN, true)));
+        assert!(state.handle(&q(WM_KEYUP, false)));
+        assert!(state.handle(&find_key(WM_CHAR, 'q' as usize, 0x10, false)));
+        assert_eq!(*actions.borrow(), [Shortcut::FindNext, Shortcut::FindNext]);
+        assert!(input.try_recv().is_err());
+    }
 
     #[test]
     fn physical_printable_positions_use_the_pc101_make_code() {
@@ -2271,6 +2649,68 @@ mod tests {
     }
 
     #[test]
+    fn remapped_select_all_captures_rapid_copy_and_never_claims_a_text_field() {
+        let _scope = WindowScope::default().enter();
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::SelectAll, Some("F10".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            keymap: bindings.keymap().unwrap(),
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            read_only: Some(std::rc::Rc::new(std::cell::Cell::new(true))),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        let key = |message, vk, repeat| MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        state.search = true;
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x79, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x79, false)));
+        state.search = false;
+        state.drawer_focused = true;
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x79, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x79, false)));
+        state.drawer_focused = false;
+        assert!(state.handle(&key(WM_KEYDOWN, 0x79, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x79, true)));
+        assert!(state.handle(&key(WM_KEYUP, 0x79, false)));
+        // The UI may still be fetching the selection when the user presses y.
+        assert!(state.handle(&key(WM_KEYDOWN, 0x59, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x1b, false)));
+        let (next, mut next_input) = mpsc::unbounded_channel();
+        state.retarget(Some(Target {
+            sender: next,
+            frames: lab.frames.clone(),
+        }));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x59, true)));
+        assert!(state.handle(&key(WM_KEYUP, 0x59, false)));
+        assert!(state.handle(&key(WM_KEYUP, 0x1b, false)));
+        assert_eq!(
+            *actions.borrow(),
+            [
+                Shortcut::SelectAll,
+                Shortcut::CopyKey(w11term::copy_mode::CopyKey::Copy),
+                Shortcut::CopyKey(w11term::copy_mode::CopyKey::Cancel)
+            ]
+        );
+        assert!(matches!(input.try_recv(), Ok(Command::Focus(false))));
+        assert!(matches!(next_input.try_recv(), Ok(Command::Focus(_))));
+        assert!(input.try_recv().is_err());
+        assert!(next_input.try_recv().is_err());
+    }
+
+    #[test]
     fn remapped_palette_owns_navigation_before_the_overlay_mounts_and_after_accept() {
         let lab = Session::start(Source::Demo);
         let (sender, mut input) = mpsc::unbounded_channel();
@@ -2482,6 +2922,56 @@ mod tests {
             }));
             assert!(matches!(pending.try_recv().unwrap(), Command::Text(s) if s == "x"));
         });
+    }
+
+    #[test]
+    fn remote_session_search_keeps_native_input_local_and_submits_only_from_its_text_field() {
+        let _window = WindowScope::default().enter();
+        window::activated(true);
+        let pane = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut state = State {
+            target: Some(Target {
+                sender,
+                frames: pane.frames.clone(),
+            }),
+            session_search: Some((17, 3, 5)),
+            ..State::new(move |s| observed.borrow_mut().push(s))
+        };
+        let key = |message, vk, scan: u32, repeat: bool| MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(((scan << 16) | ((repeat as u32) << 30)) as isize),
+            ..Default::default()
+        };
+        // Enter on a native Attach or Refresh button belongs to the button.
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
+        assert!(actions.borrow().is_empty());
+        state.session_search_focused = true;
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x58, 0x2d, false)));
+        assert!(!state.handle(&key(WM_CHAR, 'x' as usize, 0x2d, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x58, 0x2d, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false)));
+        // The application can attach and retarget its terminal before this key's repeat/release.
+        state.session_search = None;
+        state.session_search_focused = false;
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, true)));
+        assert!(state.handle(&key(WM_CHAR, 0x0d, 0x1c, false)));
+        assert!(state.handle(&key(WM_KEYUP, 0x0d, 0x1c, false)));
+        assert!(!state.handle(&key(WM_CHAR, 0x0d, 0x1c, false)));
+        assert_eq!(
+            &*actions.borrow(),
+            &[Shortcut::SubmitSessionSearch(17, 3, 5)]
+        );
+        assert!(input.try_recv().is_err());
+        assert!(state.handle(&key(WM_KEYDOWN, 0x0d, 0x1c, false))); // a fresh terminal Enter
+        assert!(matches!(
+            input.try_recv().unwrap(),
+            Command::Key { down: true, .. }
+        ));
     }
 
     #[test]

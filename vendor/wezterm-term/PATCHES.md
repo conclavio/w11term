@@ -53,6 +53,9 @@ The original MIT license is preserved in `LICENSE.md`.
   The sister vendored escape parser at the same pinned revision preserves their
   control parameters. The projection uses the Unicode 6.0 diacritic indices
   published with kitty's graphics protocol. See `docs/graphics-audit.md`.
+  Timed replay supplies a per-terminal animation clock. Large jumps use the
+  current frame gaps and loop limit to find the displayed frame in time
+  proportional to the frame count. Live panes retain their wall-clock pacing.
 
 - Kitty visible deletion uses the live screen boundary for physical placements.
   The escape parser and image model support inclusive client ID ranges, including
@@ -83,6 +86,20 @@ The original MIT license is preserved in `LICENSE.md`.
   from eviction as new output arrives. This lets the UI discard an old
   scrollbar gesture after either a local clear or a remote CSI 3 J.
 
+- XTREPORTSGR reports the common SGR attributes in an active-screen
+  rectangle. It shares parameter formatting with the DECRQSS pen report.
+
+- XTPUSHSGR and XTPOPSGR use a bounded text-style stack with selective
+  restoration. A new transport starts with an empty stack.
+
+- XTSAVE and XTRESTORE preserve supported DEC private modes, including the
+  alternate-buffer selector and the mouse reporting and encoding modes. Saved
+  values are scoped to the connection and cleared by full reset.
+
+- DEC line renditions limit addressable columns, discard truncated text, and
+  retain their width and height flags when rows scroll or the grid resizes.
+  Enabling left and right margins resets live rows to single width and height.
+
 - Screen storage grows as output arrives. Resizing and rewrapping enforce
   the physical row limit supplied by the profile, including a limit of zero.
   Dropping primary rows advances their stable row indices so Find and export
@@ -91,8 +108,29 @@ The original MIT license is preserved in `LICENSE.md`.
 - A terminal may replace its input and reply writer after the previous
   transport has exited. Pending bytes on the old writer keep their original
   destination while the next shell starts in the same terminal model.
-  The embedding can track window focus locally while the peer is offline.
+  The embedding can supply a nonblocking writer to queue PTY resize requests
+  and automatic replies in order, and can track window focus locally while
+  the peer is offline.
 
 - The embedding can enable ConEmu / Windows Terminal OSC 9;9 reports for
   local Windows panes. Reported drive paths feed the same current-directory
-  state as OSC 7. SSH panes continue to use their own OSC 7 host information.
+  state as OSC 7.
+
+- A direct SSH shell can enable iTerm2 OSC 1337 `RemoteHost` and `CurrentDir`.
+  A matching user and destination authorizes literal POSIX paths until the
+  peer reports another identity, sends OSC 7, or the terminal resets. A
+  foreign or malformed identity clears the previous directory. Other pane
+  types ignore both reports.
+
+- DEC private mode 2048 reports the current text area in cells and pixels on
+  each enable and after a size change. DECRQM reports the subscription state.
+  RIS and transport reset clear it. Both immediate and asynchronous reports
+  follow the parser reply route on framed viewers.
+
+- Xterm title operations retain up to ten sets of window and icon labels per
+  terminal. An application can push or pop selected labels, access a slot
+  by index, and query stack depth. Restoring a changed window title emits
+  the same window title alert as OSC 2. A full reset clears saved labels.
+  The model tracks whether an application supplied the window title, including
+  across title saves and restores. A full reset or reconnect clears that flag.
+  Consumers can read the application window title independently of the icon.

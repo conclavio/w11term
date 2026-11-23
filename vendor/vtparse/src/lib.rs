@@ -314,6 +314,7 @@ const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC: usize = 64;
 // Covers a 32,767-UTF-16-unit Windows path even after UTF-8 conversion.
 const MAX_OSC_DIRECTORY_BYTES: usize = 128 * 1024;
+const MAX_OSC_REMOTE_HOST_BYTES: usize = 1024;
 const MAX_PARAMS: usize = 256;
 
 struct OscState {
@@ -324,20 +325,20 @@ struct OscState {
     param_indices: [usize; MAX_OSC],
     num_params: usize,
     full: bool,
-    directory_payload: bool,
+    // (selector bytes, maximum literal bytes). Other OSCs keep normal field splitting.
+    literal_field: Option<(usize, usize)>,
 }
 
 impl OscState {
     fn put(&mut self, param: char) {
-        // OSC 9;9 has one literal Windows path after its two selectors.
-        // Keep filename semicolons in that field, including beyond MAX_OSC.
         if self.full {
             return;
         }
-        if param == ';' && !self.directory_payload {
-            self.directory_payload = self.num_params == 2
-                && self.param_indices[0] == 1
-                && self.buffer.as_slice() == b"99";
+        if param == ';' && self.literal_field.is_none() {
+            if self.num_params == 2 && self.param_indices[0] == 1 && self.buffer.as_slice() == b"99"
+            {
+                self.literal_field = Some((2, MAX_OSC_DIRECTORY_BYTES));
+            }
             match self.num_params {
                 MAX_OSC => {
                     self.full = true;
@@ -348,14 +349,21 @@ impl OscState {
                 }
             }
         } else {
-            if self.directory_payload
-                && self.buffer.len() + param.len_utf8() > MAX_OSC_DIRECTORY_BYTES + 2
-            {
-                // Retain the selectors and emit an empty report at ST. A
-                // prefix of an oversized path must never select a directory.
-                self.buffer.truncate(2);
-                self.full = true;
-                return;
+            if param == '=' && self.num_params == 2 && self.param_indices[0] == 4 {
+                let limit = match self.buffer.as_slice() {
+                    b"1337CurrentDir" => Some(MAX_OSC_DIRECTORY_BYTES),
+                    b"1337RemoteHost" => Some(MAX_OSC_REMOTE_HOST_BYTES),
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    self.literal_field = Some((self.buffer.len() + 1, limit));
+                }
+            }
+            if let Some((prefix, limit)) = self.literal_field {
+                if param.is_control() || self.buffer.len() + param.len_utf8() > prefix + limit {
+                    self.discard_literal();
+                    return;
+                }
             }
             let mut buf = [0u8; 8];
             let extend_result = self
@@ -365,9 +373,7 @@ impl OscState {
             #[cfg(all(not(feature = "std"), not(feature = "alloc")))]
             {
                 if extend_result.is_err() {
-                    if self.directory_payload {
-                        self.buffer.truncate(2);
-                    }
+                    self.discard_literal();
                     self.full = true;
                     return;
                 }
@@ -378,6 +384,14 @@ impl OscState {
             if self.num_params == 0 {
                 self.num_params = 1;
             }
+        }
+    }
+
+    fn discard_literal(&mut self) {
+        if let Some((prefix, _)) = self.literal_field {
+            // Dispatch the empty report at ST, never a usable prefix.
+            self.buffer.truncate(prefix);
+            self.full = true;
         }
     }
 }
@@ -485,7 +499,7 @@ impl VTParser {
                 param_indices,
                 num_params: 0,
                 full: false,
-                directory_payload: false,
+                literal_field: None,
             },
 
             params: [CsiParam::default(); MAX_PARAMS],
@@ -557,7 +571,7 @@ impl VTParser {
                 self.ignored_excess_intermediates = false;
                 self.osc.num_params = 0;
                 self.osc.full = false;
-                self.osc.directory_payload = false;
+                self.osc.literal_field = None;
                 self.num_params = 0;
                 self.params_full = false;
                 self.current_param.take();
@@ -644,11 +658,15 @@ impl VTParser {
                 self.osc.buffer.shrink_to_fit();
                 self.osc.num_params = 0;
                 self.osc.full = false;
-                self.osc.directory_payload = false;
+                self.osc.literal_field = None;
             }
             Action::OscPut => self.osc.put(param as char),
+            Action::OscIgnore => self.osc.discard_literal(),
 
             Action::OscEnd => {
+                if !matches!(param, 0x07 | 0x1b | 0x9c) {
+                    self.osc.discard_literal();
+                }
                 if self.osc.num_params == 0 {
                     actor.osc_dispatch(&[]);
                 } else {
@@ -711,6 +729,7 @@ impl VTParser {
     fn next_utf8(&mut self, actor: &mut dyn VTActor, byte: u8) {
         struct Decoder {
             codepoint: Option<char>,
+            invalid: bool,
         }
 
         impl utf8parse::Receiver for Decoder {
@@ -719,14 +738,29 @@ impl VTParser {
             }
 
             fn invalid_sequence(&mut self) {
+                self.invalid = true;
                 self.codepoint(char::REPLACEMENT_CHARACTER);
             }
         }
 
-        let mut decoder = Decoder { codepoint: None };
+        let mut decoder = Decoder {
+            codepoint: None,
+            invalid: false,
+        };
 
         self.utf8_parser.advance(&mut decoder, byte);
         if let Some(c) = decoder.codepoint {
+            if decoder.invalid
+                && self.utf8_return_state == State::OscString
+                && self.osc.literal_field.is_some()
+            {
+                self.osc.discard_literal();
+                self.state = State::OscString;
+                if matches!(byte, 0x07 | 0x1b | 0x9c | 0x18 | 0x1a) {
+                    self.parse_byte(byte, actor);
+                }
+                return;
+            }
             // Slightly gross special cases C1 controls that were
             // encoded as UTF-8 rather than emitted as raw 8-bit.
             // If the decoded value is in the byte range, and that
@@ -740,7 +774,7 @@ impl VTParser {
                 if action == Action::Execute
                     || (state != self.utf8_return_state && state != State::Utf8Sequence)
                 {
-                    self.action(lookup_exit(self.utf8_return_state), 0, actor);
+                    self.action(lookup_exit(self.utf8_return_state), byte, actor);
                     self.action(action, byte, actor);
                     self.action(lookup_entry(state), 0, actor);
                     self.utf8_return_state = self.state;
@@ -766,16 +800,36 @@ impl VTParser {
         // table and instead use the utf-8 state table from the
         // parser.  It will drop us back into the Ground state
         // after each recognized (or invalid) codepoint.
-        if self.state == State::Utf8Sequence {
-            self.next_utf8(actor, byte);
-            return;
+        match self.state {
+            State::Utf8Sequence => {
+                self.next_utf8(actor, byte);
+                return;
+            }
+            State::OscLiteralEscape => {
+                // The ESC may have arrived at the end of a read. Commit the
+                // literal only for ST, then process this byte in Escape as usual.
+                if byte != b'\\' {
+                    self.osc.discard_literal();
+                }
+                self.action(Action::OscEnd, 0x1b, actor);
+                self.state = State::Escape;
+                self.action(lookup_entry(State::Escape), 0x1b, actor);
+            }
+            _ => {}
         }
 
         let (action, state) = lookup(self.state, byte);
 
         if state != self.state {
+            if self.state == State::OscString
+                && state == State::Escape
+                && self.osc.literal_field.is_some()
+            {
+                self.state = State::OscLiteralEscape;
+                return;
+            }
             if state != State::Utf8Sequence {
-                self.action(lookup_exit(self.state), 0, actor);
+                self.action(lookup_exit(self.state), byte, actor);
             }
             self.action(action, byte, actor);
             self.action(lookup_entry(state), byte, actor);
@@ -866,6 +920,98 @@ mod test {
                 b"hello".to_vec()
             ])]
         );
+    }
+
+    #[test]
+    fn iterm_directory_fields_are_literal_bounded_and_scoped() {
+        let path = format!("/Pilot's ;#%2F 雪{}", ";".repeat(MAX_OSC + 5));
+        let bytes =
+            format!("\x1b]1337;CurrentDir={path}\x07\x1b]1337;File=name=YQ==;inline=1:WA==\x07");
+        assert_eq!(
+            parse_as_vec(bytes.as_bytes()),
+            vec![
+                VTAction::OscDispatch(vec![
+                    b"1337".to_vec(),
+                    format!("CurrentDir={path}").into_bytes()
+                ]),
+                VTAction::OscDispatch(vec![
+                    b"1337".to_vec(),
+                    b"File=name=YQ==".to_vec(),
+                    b"inline=1:WA==".to_vec()
+                ]),
+            ]
+        );
+
+        for (name, limit) in [
+            ("CurrentDir", MAX_OSC_DIRECTORY_BYTES),
+            ("RemoteHost", MAX_OSC_REMOTE_HOST_BYTES),
+        ] {
+            let oversized = ";".repeat(limit + 1);
+            let bytes = format!("\x1b]1337;{name}={oversized}\x07\x1b]1337;RemoteHost=u@h\x07");
+            assert_eq!(
+                parse_as_vec(bytes.as_bytes()),
+                vec![
+                    VTAction::OscDispatch(vec![b"1337".to_vec(), format!("{name}=").into_bytes()]),
+                    VTAction::OscDispatch(vec![b"1337".to_vec(), b"RemoteHost=u@h".to_vec()]),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn iterm_directory_invalid_bytes_do_not_select_a_shortened_name() {
+        for suffix in [
+            &b"a\nb\x07"[..],
+            b"a\x7fb\x07",
+            b"a\x9db\x07",
+            b"a\xffb\x07",
+            b"a\xc3!\x07",
+            b"a\xc3\x07",
+        ] {
+            let mut bytes = b"\x1b]1337;CurrentDir=/".to_vec();
+            bytes.extend_from_slice(suffix);
+            bytes.extend_from_slice(b"OK");
+            assert_eq!(
+                parse_as_vec(&bytes),
+                vec![
+                    VTAction::OscDispatch(vec![b"1337".to_vec(), b"CurrentDir=".to_vec()]),
+                    VTAction::Print('O'),
+                    VTAction::Print('K'),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn literal_directory_requires_a_complete_terminator() {
+        let mut parser = VTParser::new();
+        let mut actor = CollectingVTActor::default();
+        parser.parse(b"\x1b]1337;CurrentDir=/ok\x1b", &mut actor);
+        assert!(actor.actions.is_empty());
+        parser.parse(b"\\", &mut actor);
+        assert_eq!(
+            actor.actions.first(),
+            Some(&VTAction::OscDispatch(vec![
+                b"1337".to_vec(),
+                b"CurrentDir=/ok".to_vec()
+            ]))
+        );
+        for ending in [&b"\x1b[0m"[..], b"\x18", b"\x1a"] {
+            let mut input = b"\x1b]1337;CurrentDir=/partial".to_vec();
+            input.extend_from_slice(ending);
+            input.extend_from_slice(b"\x1b]1337;RemoteHost=u@h\x9c");
+            let observed: Vec<_> = parse_as_vec(&input)
+                .into_iter()
+                .filter(|a| matches!(a, VTAction::OscDispatch(_)))
+                .collect();
+            assert_eq!(
+                observed,
+                vec![
+                    VTAction::OscDispatch(vec![b"1337".to_vec(), b"CurrentDir=".to_vec()]),
+                    VTAction::OscDispatch(vec![b"1337".to_vec(), b"RemoteHost=u@h".to_vec()]),
+                ]
+            );
+        }
     }
 
     #[test]

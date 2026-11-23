@@ -9,6 +9,33 @@ use std::sync::Arc;
 use termwiz::input::KeyboardEncoding;
 use wezterm_surface::SequenceNo;
 
+/// Horizontal scale of a DEC line rendition relative to the terminal grid.
+pub fn line_width_scale(line: &Line) -> usize {
+    if line.is_double_width() || line.is_double_height_top() || line.is_double_height_bottom() {
+        2
+    } else {
+        1
+    }
+}
+
+pub(crate) fn clip_sized_line(line: &mut Line, cols: usize, seqno: SequenceNo) {
+    let limit = (cols / line_width_scale(line)).max(1);
+    if line.len() < limit {
+        return;
+    }
+    // Drop a grapheme that overlaps the new edge along with its continuation.
+    let split = line.visible_cells().find_map(|cell| {
+        let col = cell.cell_index();
+        (col < limit && col + cell.width() > limit).then_some(col)
+    });
+    if let Some(col) = split {
+        line.fill_range(col..limit, &Cell::blank(), seqno);
+    }
+    if line.len() > limit {
+        line.resize(limit, seqno);
+    }
+}
+
 /// Holds the model of a screen.  This can either be the primary screen
 /// which includes lines of scrollback text, or the alternate screen
 /// which holds no scrollback.  The intent is to have one instance of
@@ -99,6 +126,7 @@ impl Screen {
         self.invalidate_row_coordinates();
         self.keyboard_stack.clear();
         self.command_start = None;
+        self.saved_cursor = None;
     }
 
     fn next_row_epoch() -> u64 {
@@ -209,9 +237,11 @@ impl Screen {
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
         let num_rows = self.lines.len();
-        for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
+        let mut lines = self.lines.drain(..).enumerate().peekable();
+        while let Some((phys_idx, mut line)) = lines.next() {
             line.update_last_change_seqno(seqno);
             let was_wrapped = line.last_cell_was_wrapped();
+            let sized = line_width_scale(&line) == 2;
             if let Some((row, col)) = marker {
                 if phys_idx == row {
                     logical_marker = Some(logical_line.as_ref().map_or(0, Line::len) + col);
@@ -238,39 +268,55 @@ impl Screen {
                 }
             };
 
-            if was_wrapped && phys_idx + 1 < num_rows {
+            if was_wrapped
+                && !sized
+                && lines
+                    .peek()
+                    .is_some_and(|(_, next)| line_width_scale(next) == 1)
+            {
                 logical_line.replace(line);
                 continue;
             }
 
             if let Some(x) = logical_cursor_x.take() {
-                let num_lines = x / physical_cols;
-                let last_x = x - (num_lines * physical_cols);
-                adjusted_cursor = (last_x, discarded + rewrapped.len() + num_lines);
+                if sized {
+                    adjusted_cursor = (
+                        x.min((physical_cols / 2).max(1) - 1),
+                        discarded + rewrapped.len(),
+                    );
+                } else {
+                    let num_lines = x / physical_cols;
+                    let last_x = x - (num_lines * physical_cols);
+                    adjusted_cursor = (last_x, discarded + rewrapped.len() + num_lines);
 
-                // Special case: if the cursor lands in column zero, we'll
-                // lose track of its logical association with the wrapped
-                // line and it won't resize with the line correctly.
-                // Put it back on the prior line. The cursor is now
-                // technically outside of the viewport width.
-                // A zero logical offset begins a hard-newline row, not a wrapped line.
-                if x > 0 && adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
-                    if physical_cols < self.physical_cols {
-                        // getting smaller: preserve its original position
-                        // on the prior line
-                        adjusted_cursor.0 = cursor_x;
-                    } else {
-                        // getting larger; we were most likely in column 1
-                        // or somewhere close. Jump to the end of the
-                        // prior line.
-                        adjusted_cursor.0 = physical_cols;
+                    // Special case: if the cursor lands in column zero, we'll
+                    // lose track of its logical association with the wrapped
+                    // line and it won't resize with the line correctly.
+                    // Put it back on the prior line. The cursor is now
+                    // technically outside of the viewport width.
+                    // A zero logical offset begins a hard-newline row, not a wrapped line.
+                    if x > 0 && adjusted_cursor.0 == 0 && adjusted_cursor.1 > 0 {
+                        if physical_cols < self.physical_cols {
+                            // getting smaller: preserve its original position
+                            // on the prior line
+                            adjusted_cursor.0 = cursor_x;
+                        } else {
+                            // getting larger; we were most likely in column 1
+                            // or somewhere close. Jump to the end of the
+                            // prior line.
+                            adjusted_cursor.0 = physical_cols;
+                        }
+                        adjusted_cursor.1 -= 1;
                     }
-                    adjusted_cursor.1 -= 1;
                 }
             }
 
             let first_rewrapped = rewrapped.len();
-            if line.len() <= physical_cols {
+            if sized {
+                let mut line = line;
+                clip_sized_line(&mut line, physical_cols, seqno);
+                rewrapped.push_back(line);
+            } else if line.len() <= physical_cols {
                 rewrapped.push_back(line);
             } else {
                 for line in line.wrap(physical_cols, seqno) {
@@ -299,7 +345,9 @@ impl Screen {
             if phys_idx + 1 == num_rows {
                 while rewrapped.len() > capacity
                     && discarded + rewrapped.len() > adjusted_cursor.1 + 1
-                    && rewrapped.back().is_some_and(Line::is_whitespace)
+                    && rewrapped
+                        .back()
+                        .is_some_and(|line| line_width_scale(line) == 1 && line.is_whitespace())
                 {
                     rewrapped.pop_back();
                 }
@@ -310,6 +358,7 @@ impl Screen {
             rewrapped.drain(..excess);
             discarded += excess;
         }
+        drop(lines);
         self.lines = rewrapped;
         self.stable_row_index_offset += discarded;
 
@@ -347,7 +396,11 @@ impl Screen {
         // maximized states.
         let cursor_phys = self.phys_row(cursor.y);
         for _ in cursor_phys + 1..self.lines.len() {
-            if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
+            if self
+                .lines
+                .back()
+                .is_some_and(|line| line_width_scale(line) == 1 && line.is_whitespace())
+            {
                 self.lines.pop_back();
             }
         }
@@ -367,7 +420,11 @@ impl Screen {
                 for line in &mut self.lines {
                     if physical_cols < self.physical_cols {
                         // Do a simple prune of the lines instead
-                        line.resize(physical_cols, seqno);
+                        if line_width_scale(line) == 2 {
+                            clip_sized_line(line, physical_cols, seqno);
+                        } else {
+                            line.resize(physical_cols, seqno);
+                        }
                     } else {
                         // otherwise: invalidate them
                         line.update_last_change_seqno(seqno);
@@ -470,6 +527,26 @@ impl Screen {
         &mut self.lines[idx]
     }
 
+    pub(crate) fn line_width_scale(&self, row: VisibleRowIndex) -> usize {
+        self.lines
+            .get(self.phys_row(row))
+            .map_or(1, line_width_scale)
+    }
+
+    pub(crate) fn logical_cols(&self, row: VisibleRowIndex) -> usize {
+        (self.physical_cols / self.line_width_scale(row)).max(1)
+    }
+
+    pub(crate) fn reset_visible_line_renditions(&mut self, seqno: SequenceNo) {
+        let start = self.phys_row(0);
+        for line in self.lines.iter_mut().skip(start) {
+            if line_width_scale(line) > 1 {
+                clip_sized_line(line, self.physical_cols, seqno);
+                line.set_single_width(seqno);
+            }
+        }
+    }
+
     /// Returns the number of occupied rows of scrollback
     pub fn scrollback_rows(&self) -> usize {
         self.lines.len()
@@ -516,6 +593,16 @@ impl Screen {
         let line_idx = self.phys_row(y);
         let line = self.line_mut(line_idx);
         line.update_last_change_seqno(seqno);
+        let col = right_margin.saturating_sub(2);
+        if line_width_scale(line) > 1
+            && right_margin >= 2
+            && x <= col
+            && right_margin <= line.len()
+            && line.cells_mut_for_attr_changes_only()[col].width() > 1
+        {
+            // Inserting here would push this grapheme's continuation past the margin.
+            line.fill_range(col..right_margin, &Cell::blank(), seqno);
+        }
         line.insert_cell(x, Cell::default(), right_margin, seqno);
         if line.len() > phys_cols {
             // Don't allow the line width to grow beyond

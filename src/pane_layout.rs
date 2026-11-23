@@ -1,5 +1,7 @@
 //! Geometry of the terminal panes in one tab. All coordinates are relative to the tab.
 
+mod balance;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Axis {
     /// A vertical divider, with panes arranged from left to right.

@@ -119,6 +119,10 @@ pub enum CSI {
     /// These values affect how the character is rendered.
     Sgr(Sgr),
 
+    /// Xterm's SGR stack. An empty list saves all supported attributes.
+    PushSgr(Vec<i64>),
+    PopSgr,
+
     /// CSI codes that relate to the cursor
     Cursor(Cursor),
 
@@ -220,6 +224,16 @@ impl Display for CSI {
         write!(f, "\x1b[")?;
         match self {
             CSI::Sgr(sgr) => sgr.fmt(f)?,
+            CSI::PushSgr(parameters) => {
+                for (index, value) in parameters.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ";")?;
+                    }
+                    write!(f, "{}", value)?;
+                }
+                write!(f, "#{{")?;
+            }
+            CSI::PopSgr => write!(f, "#}}")?,
             CSI::Cursor(c) => c.fmt(f)?,
             CSI::Edit(e) => e.fmt(f)?,
             CSI::Mode(mode) => mode.fmt(f)?,
@@ -533,6 +547,14 @@ impl From<MouseButton> for MouseButtons {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WindowTitleScope {
+    Both = 0,
+    Icon = 1,
+    Window = 2,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Window {
     DeIconify,
@@ -580,6 +602,24 @@ pub enum Window {
     PopIconAndWindowTitle,
     PopIconTitle,
     PopWindowTitle,
+    /// XTWINOPS direct access to a one-based slot in the range 1 through 10.
+    SaveTitleToSlot {
+        scope: WindowTitleScope,
+        slot: u8,
+    },
+    RestoreTitleFromSlot {
+        scope: WindowTitleScope,
+        slot: u8,
+    },
+    /// XTTITLEPOS request. Its parameterized response is not a request.
+    ReportTitleStackPosition,
+    /// XTREPORTSGR. The first pair defaults to the top left and the second to the bottom right.
+    ReportRectangularSgr {
+        top: OneBased,
+        left: OneBased,
+        bottom: OneBased,
+        right: OneBased,
+    },
     /// DECRQCRA; used by esctest
     ChecksumRectangularArea {
         request_id: i64,
@@ -649,6 +689,14 @@ impl Display for Window {
             Window::PopIconAndWindowTitle => write!(f, "23;0t"),
             Window::PopIconTitle => write!(f, "23;1t"),
             Window::PopWindowTitle => write!(f, "23;2t"),
+            Window::SaveTitleToSlot { scope, slot } => write!(f, "22;{};{slot}t", *scope as u8),
+            Window::RestoreTitleFromSlot { scope, slot } => {
+                write!(f, "23;{};{slot}t", *scope as u8)
+            }
+            Window::ReportTitleStackPosition => write!(f, "#S"),
+            Window::ReportRectangularSgr { top, left, bottom, right } => {
+                write!(f, "{};{};{};{}#|", top, left, bottom, right)
+            }
             Window::ChecksumRectangularArea {
                 request_id,
                 page_number,
@@ -955,6 +1003,9 @@ pub enum DecPrivateModeCode {
 
     /// <https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036>
     SynchronizedOutput = 2026,
+
+    /// In-band text area resize reports, in cells and pixels.
+    InBandResize = 2048,
 
     MinTTYApplicationEscapeKeyMode = 7727,
 
@@ -1850,6 +1901,38 @@ impl<'a> CSIParser<'a> {
                 .secondary_device_attributes(params)
                 .map(|dev| CSI::Device(Box::new(dev))),
 
+            ('p' | '{', [parameters @ .., CsiParam::P(b'#')]) if !self.parameters_truncated => {
+                let parameters = if parameters.is_empty() {
+                    Vec::new()
+                } else {
+                    parameters
+                        .split(|param| *param == CsiParam::P(b';'))
+                        .map(|param| match param {
+                            [CsiParam::Integer(value)] => Ok(*value),
+                            [] => Ok(0),
+                            _ => Err(()),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(CSI::PushSgr(parameters))
+            }
+            ('q' | '}', [CsiParam::P(b'#')]) if !self.parameters_truncated => Ok(CSI::PopSgr),
+            ('|', [parameters @ .., CsiParam::P(b'#')]) if !self.parameters_truncated => {
+                let area = Cracked::parse(parameters)?;
+                if area.len() > 4 {
+                    return Err(());
+                }
+                let far_edge = CsiParam::Integer(0);
+                Ok(CSI::Window(Box::new(Window::ReportRectangularSgr {
+                    top: OneBased::from_optional_esc_param(area.get(0))?,
+                    left: OneBased::from_optional_esc_param(area.get(1))?,
+                    bottom: OneBased::from_esc_param_with_big_default(area.get(2).unwrap_or(&far_edge))?,
+                    right: OneBased::from_esc_param_with_big_default(area.get(3).unwrap_or(&far_edge))?,
+                })))
+            }
+            ('S', [CsiParam::P(b'#')]) if !self.parameters_truncated => {
+                Ok(CSI::Window(Box::new(Window::ReportTitleStackPosition)))
+            }
             ('S', [CsiParam::P(b'?'), ..]) => XtSmGraphics::parse(params),
             ('p', [CsiParam::Integer(_), CsiParam::P(b'$')])
             | ('p', [CsiParam::P(b'?'), CsiParam::Integer(_), CsiParam::P(b'$')]) => {
@@ -2571,8 +2654,8 @@ impl<'a> CSIParser<'a> {
         }
     }
 
-    fn window(&mut self, params: &'a [CsiParam]) -> Result<Window, ()> {
-        let params = Cracked::parse(params)?;
+    fn window(&mut self, raw: &'a [CsiParam]) -> Result<Window, ()> {
+        let params = Cracked::parse(raw)?;
 
         let p = params.int(0)?;
         let arg1 = params.opt_int(1);
@@ -2632,18 +2715,38 @@ impl<'a> CSIParser<'a> {
             19 => Ok(Window::ReportScreenSizeCells),
             20 => Ok(Window::ReportIconLabel),
             21 => Ok(Window::ReportWindowTitle),
-            22 => match arg1 {
-                Some(0) => Ok(Window::PushIconAndWindowTitle),
-                Some(1) => Ok(Window::PushIconTitle),
-                Some(2) => Ok(Window::PushWindowTitle),
-                _ => Err(()),
-            },
-            23 => match arg1 {
-                Some(0) => Ok(Window::PopIconAndWindowTitle),
-                Some(1) => Ok(Window::PopIconTitle),
-                Some(2) => Ok(Window::PopWindowTitle),
-                _ => Err(()),
-            },
+            22 | 23 => {
+                // Count separators because Cracked omits the final empty field.
+                // An unsupported field must never fall back to a push or pop.
+                if self.parameters_truncated
+                    || raw.iter().filter(|p| **p == CsiParam::P(b';')).count() > 2
+                {
+                    return Err(());
+                }
+                let scope = match arg1.unwrap_or(0) {
+                    0 => WindowTitleScope::Both,
+                    1 => WindowTitleScope::Icon,
+                    2 => WindowTitleScope::Window,
+                    _ => return Err(()),
+                };
+                match (p, arg2.unwrap_or(0), scope) {
+                    (22, 0, WindowTitleScope::Both) => Ok(Window::PushIconAndWindowTitle),
+                    (22, 0, WindowTitleScope::Icon) => Ok(Window::PushIconTitle),
+                    (22, 0, WindowTitleScope::Window) => Ok(Window::PushWindowTitle),
+                    (23, 0, WindowTitleScope::Both) => Ok(Window::PopIconAndWindowTitle),
+                    (23, 0, WindowTitleScope::Icon) => Ok(Window::PopIconTitle),
+                    (23, 0, WindowTitleScope::Window) => Ok(Window::PopWindowTitle),
+                    (22, slot @ 1..=10, _) => Ok(Window::SaveTitleToSlot {
+                        scope,
+                        slot: slot as u8,
+                    }),
+                    (23, slot @ 1..=10, _) => Ok(Window::RestoreTitleFromSlot {
+                        scope,
+                        slot: slot as u8,
+                    }),
+                    _ => Err(()),
+                }
+            }
             _ => Err(()),
         }
     }

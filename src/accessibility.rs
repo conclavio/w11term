@@ -97,7 +97,7 @@ pub struct Pane<'a> {
 struct Source {
     hwnd: usize,
     id: u64,
-    name: String,
+    label: String,
     appearance: Arc<RwLock<Appearance>>,
     alive: Arc<AtomicBool>,
     frames: FrameStore,
@@ -196,7 +196,7 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
         self.source.check()?;
         Ok(match id {
             UIA_ControlTypePropertyId => UIA_DocumentControlTypeId.0.into(),
-            UIA_NamePropertyId => self.source.name.as_str().into(),
+            UIA_NamePropertyId => format!("Terminal · {}", self.source.label).as_str().into(),
             UIA_AutomationIdPropertyId => {
                 format!("w11term-pane-{}", self.source.id).as_str().into()
             }
@@ -244,7 +244,10 @@ impl ITextProvider_Impl for Provider_Impl {
         let doc = self.source.document()?;
         let row = ((p.y - f64::from(r.top) - g.padding) / g.cell_height) as usize;
         let col = ((p.x - f64::from(r.left) - g.padding) / g.cell_width) as usize;
-        let logical = doc.cell_maps.get(row).map_or(col, |map| map.logical(col));
+        let logical = doc
+            .cell_maps
+            .get(row)
+            .map_or(col, |map| map.logical_at_grid(col));
         let i = doc.position(row, logical);
         Ok(self.range(doc, i..i))
     }
@@ -378,12 +381,14 @@ impl Bridge {
         let selected = selection.filter(|s| s.active).map(|s| Selection {
             anchor: s.anchor,
             end: s.end,
+            end_exclusive: s.end_exclusive,
             block: s.block,
         });
         let mut slot = self.host.borrow_mut();
         let changed_pane = slot.as_ref().is_none_or(|h| {
             h.source.id != pane
                 || h.parent != parent
+                || h.source.label != label
                 || !h.source.input.same_channel(input)
                 || !h.source.alive.load(Ordering::Acquire)
         });
@@ -409,7 +414,7 @@ impl Bridge {
             let source = Arc::new(Source {
                 hwnd: hwnd.0 as usize,
                 id: pane,
-                name: format!("Terminal · {label}"),
+                label: label.to_owned(),
                 appearance: appearance.clone(),
                 alive: Arc::new(AtomicBool::new(true)),
                 frames: frames.clone(),

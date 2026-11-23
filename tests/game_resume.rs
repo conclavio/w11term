@@ -302,7 +302,11 @@ async fn raw(session: &Session, data: &[u8]) -> Result<()> {
 }
 async fn record(session: &Session, path: Option<PathBuf>) -> Result<()> {
     let (tx, rx) = oneshot::channel();
-    session.input.send(Command::Record { path, reply: tx })?;
+    session.input.send(Command::Record {
+        path,
+        timed: false,
+        reply: tx,
+    })?;
     rx.await?.map_err(anyhow::Error::msg)?;
     Ok(())
 }

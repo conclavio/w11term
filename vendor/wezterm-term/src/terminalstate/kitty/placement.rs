@@ -120,15 +120,20 @@ impl KittyImageState {
 }
 
 impl TerminalState {
-    pub(super) fn visible_kitty_relatives(&self, keys: &mut HashSet<Key>) {
+    pub(super) fn find_kitty_relatives(
+        &self,
+        keys: &mut HashSet<Key>,
+        rows: Range<usize>,
+        columns: Range<usize>,
+        z: Option<i32>,
+    ) {
         if self
             .kitty_img
             .projected
             .values()
             .any(|node| node.parent.is_some())
         {
-            let screen = self.screen();
-            self.project_or_find_kitty(None, screen.phys_row(0), screen.physical_rows, Some(keys));
+            self.project_or_find_kitty(None, rows.start, rows.len(), Some((keys, columns, z)));
         }
     }
 
@@ -144,7 +149,7 @@ impl TerminalState {
         lines: Option<&mut [Line]>,
         first_phys: usize,
         height: usize,
-        mut visible_relatives: Option<&mut HashSet<Key>>,
+        mut visible_relatives: Option<(&mut HashSet<Key>, Range<usize>, Option<i32>)>,
     ) -> bool {
         if self.kitty_img.projected.is_empty() {
             return false;
@@ -312,11 +317,12 @@ impl TerminalState {
             };
             x += px;
             y += py;
-            if let Some(visible) = &mut visible_relatives {
-                if x < screen.physical_cols as i64
-                    && x + i64::from(grid.cols) > 0
+            if let Some((visible, columns, z)) = &mut visible_relatives {
+                if x < columns.end as i64
+                    && x + i64::from(grid.cols) > columns.start as i64
                     && y < height as i64
                     && y + i64::from(grid.rows) > 0
+                    && z.is_none_or(|z| z == grid.z)
                 {
                     visible.insert(key);
                 }

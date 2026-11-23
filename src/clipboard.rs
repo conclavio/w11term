@@ -98,6 +98,10 @@ pub fn read() -> Result<String> {
 }
 pub fn write(text: &str) -> Result<()> {
     ensure!(text.len() <= MAX_TEXT, "Clipboard text exceeds 1 MiB");
+    #[cfg(feature = "ui-smoke")]
+    if let Some(path) = std::env::var_os("W11TERM_TEST_COPY_FILE") {
+        return std::fs::write(path, text).context("Writing the clipboard test fixture");
+    }
     let (tx, rx) = mpsc::sync_channel(1);
     service()?
         .try_send(Request::Write(text.into(), Some(tx)))

@@ -71,7 +71,7 @@ Choose **Panes → New tab in current directory** to start another shell in the 
 
 In a local PowerShell pane, change to a checkout and use either action to start a separate PowerShell process there. The bundled PowerShell integration reports the folder with OSC 7. Existing prompts can also report a drive path with Windows Terminal’s OSC 9;9, for example `ESC ] 9 ; 9 ; "C:\My Projects" BEL`. Both quoted and unquoted paths work with BEL or ST termination. A reported location such as `Env:` clears the previous directory. [Windows Terminal shell integration](https://learn.microsoft.com/en-us/windows/terminal/tutorials/shell-integration)
 
-On an ordinary SSH connection, the actions use the remote shell’s OSC 7 file URI and open a shell on the same server. The server must provide a POSIX shell and accept SSH exec requests.
+On an ordinary SSH connection, the actions use the directory reported by the remote shell and open another shell on the same server. w11term recognizes OSC 7 file URIs and the paired OSC 1337 `RemoteHost` and `CurrentDir` reports from iTerm2 shell integration. The iTerm2 report must name the SSH login and host. If you connect through an alias and the shell reports a different hostname, set `iterm2_hostname` in the remote shell to the hostname in your SSH profile. The server must provide a POSIX shell and accept SSH exec requests. [iTerm2 Bash integration](https://iterm2.com/shell_integration/bash)
 
 Saving the workspace remembers the starting directory of the new tab or split. Its next launch opens a shell there.
 
@@ -83,6 +83,10 @@ Click a pane to focus it, drag a divider to resize, or zoom one pane and restore
 
 Choose **caret → Duplicate tab layout** to open a fresh copy beside the current tab. It keeps the tab name, pane arrangement, divider positions, focused pane, zoom and read-only input locks. Each SSH pane makes an independent login, and each local shell starts a new process. The original tab keeps its jobs and scrollback. A configured local or SSH starting directory carries over. You can assign **Duplicate tab layout** a shortcut in Settings.
 
+If you close a terminal tab by accident, choose **caret → Reopen last closed tab layout** in the same window. The tab returns to its former position with its name, splits, focus, zoom and input locks. SSH panes log in again and local shells start new processes with empty scrollback. Each window remembers one eligible closed tab while the window is open. Closing Settings or a tab that runs a startup command, durable session or game attachment keeps the previous eligible layout available. The action also appears in the command palette and can be assigned a shortcut in **Settings → Keyboard**.
+
+Choose **caret → Reopen last closed pane** to recover one ordinary SSH or local shell that you closed from a split. It starts a fresh shell with the pane name and input lock, then focuses it on the original side of the divider. The other panes keep running. If those panes moved or the original split position is gone, the shell opens in its own tab. Each window remembers one eligible split pane. The action is also available in the command palette and **Settings → Keyboard**.
+
 Duplication works with ordinary SSH and interactive local shell launches. The menu explains when a workspace startup command, durable viewer, RustMUSH player session or local command makes a tab ineligible. If a profile has been edited or removed, the duplicate still uses the original pane’s connection settings.
 
 Choose **caret → Panes → Move tab to new window** to move the whole terminal tab, including every split, to another native window. The tab keeps its title, focused pane, split proportions and zoom. Each SSH channel and local shell keeps running with its scrollback. The last tab leaving a window closes that window after the destination takes ownership. Both windows share a process and control pipe. Use the pane’s `window_id` in `w11term-cli list` to find its current window.
@@ -93,9 +97,15 @@ To trade places with a neighboring pane in the same tab, choose **caret → Pane
 
 Choose **caret → Panes → Rotate split** to turn the divider next to the focused pane. Side-by-side panes become stacked, with the left pane on top. Rotate again to restore the original arrangement. In a nested layout this changes only the focused pane’s immediate split and preserves both branches, their proportions and running sessions. The action is available when the split is visible and the panes fit in the new orientation. You can assign it a shortcut under **Settings → Keyboard**.
 
+Choose **caret → Panes → Balance panes** to even out the rows and columns in the current tab. For example, splitting the right half of a tab again creates three columns of different widths. **Balance panes** gives each about a third of the available width. It accounts for the dividers and each pane’s minimum size, and keeps your focused pane, running shells and split arrangement. You can also run it from the command palette or assign a shortcut under **Settings → Keyboard**.
+
 To move a running shell beside one in another tab, choose **caret → Panes → Move pane to existing tab…**. Search for the destination by title, profile or SSH address and press Enter or click it. Press an arrow key or choose **Move left**, **Move right**, **Move above** or **Move below**. Escape cancels at either step. The moved pane keeps focus, scrollback and its control ID. SSH channels and local processes keep running. The source tab closes if its last pane moves. You can assign a shortcut in Keyboard settings.
 
-Choose **caret → Rename tab…** to give a group of panes a name such as `Production logs`. The tab strip, window title, tab switcher and pane picker use the name as you move between panes. Saving a workspace keeps the name. Choose **Use default** to return to the focused pane’s label. The control pipe’s `list` reply includes the optional `tab_title` alongside each pane’s own `label` and terminal `title`.
+By default, a tab shows its focused pane’s label. Turn on **Settings → Use application titles for tabs** to let a shell or editor name its tab. For example, when Vim saves the shell title, sets its own and restores the original on exit, the tab header follows each change. Switching between split panes shows the focused pane’s title. The window title and tab switcher follow the same setting.
+
+Choose **caret → Rename tab…** to give a group of panes a name such as `Production logs`. That name takes precedence across the tab strip, window title, tab switcher and pane picker. Saving a workspace keeps the name. Choose **Use default** to let the focused pane supply the label again. The control pipe’s `list` reply includes the optional explicit `tab_title` alongside each pane’s own `label` and terminal `title`.
+
+Choose **caret → Panes → Rename focused pane…** to tell two shells on the same host apart. For example, name one `Deploy` and the other `Logs`, then type either name in the pane picker. You can still search by the shell’s title, profile or SSH address. Your pane name follows the shell when you move it and is saved with its workspace. An unnamed tab shows its focused pane’s custom name, even when application titles are enabled. **Use default** restores the usual label for that pane.
 
 Choose **+ → Windows PowerShell · Local** to start a local shell or **caret → Panes → Split right with profile** to put it beside an SSH session. PowerShell 7 appears separately when installed. Under **Settings → New local shell profile…**, choose an executable, its arguments and an optional starting directory. Each argument is a separate value, so paths with spaces need no extra quoting. The same profiles work with `--profile`, `--tab` and `w11term-cli open --profile`.
 
@@ -105,7 +115,15 @@ History shows 0 for success and the native exit code when PowerShell supplies a 
 
 Saved workspaces record the local executable, arguments and directory. Opening the workspace launches a fresh process in that directory. Closing the pane terminates its local process tree. Remote SSH panes keep their own shell, input stream and SFTP connection.
 
-On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files, or drop files onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
+On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files. You can also drag files and folders together from Explorer onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
+
+Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
+
+Choose **Properties…** on a file, folder or symbolic link to read its current metadata. The dialog shows the remote path, entry type, size in bytes, octal permissions, numeric owner and group, and modification and access times in UTC. Unreported fields are marked **Not reported**. For a symbolic link, the dialog shows the link’s own attributes and asks the server for its target path. This also works for a dangling link.
+
+Choose **Edit** in the preview to change the text. **Save** replaces the original file. **Save as…** creates a sibling file under a new name. Editing preserves the UTF-8 byte order mark and the line endings on unchanged lines. Each pane keeps one in-memory draft when you close its editor. Use **Resume draft** in the drawer to return to it or **Discard draft…** to remove it. After an SSH reconnect, copy any edits you need, discard the old draft, and reopen the remote file to edit against its current contents. Closing the pane ends its draft.
+
+Before replacing a file, w11term compares its contents to the version you opened. If another writer changed it, your draft stays available for **Save as…**. Replacement uses the server’s OpenSSH atomic rename extension and preserves the POSIX mode, owner and group when reported. The replacement gets a new inode, which matters for hard links, ACLs and extended attributes. SFTP has no atomic compare-and-swap, so another writer can still change the file between the last check and the rename. Servers with standard SFTP v3 support **Save as…**. If the connection drops during publication, refresh the directory and preview the destination to see which version reached the server.
 
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
@@ -117,6 +135,22 @@ It stages the tree beside the destination and publishes it after the download
 finishes. An existing destination or a name Windows cannot represent stops
 the download. Use **Cancel transfer** in the drawer to stop it.
 
+Choose **Upload folder…** to copy a Windows folder into the displayed remote
+directory. Choosing `C:\Projects\cockpit` while viewing `/tmp` creates
+`/tmp/cockpit`, including nested files and empty directories. That name
+must be available. The drawer counts skipped junctions and other reparse
+points and shows confirmed progress. If you cancel or disconnect after the
+remote folder is created, inspect the partial tree at the reported path.
+
+An Explorer drop keeps the item order supplied by Windows. **Replace existing
+files** applies to individual files in that batch. Each dropped folder needs a
+new remote name. Dropping a junction or another reparse point as a top-level
+item stops the batch before it starts. w11term verifies each queued item before
+uploading it. On a volume that cannot identify files reliably, w11term keeps
+the selected item open until its turn. If w11term cannot verify an item, an
+upload fails, or you cancel, the batch stops. Earlier completed uploads stay
+in place.
+
 When a file row or drawer control has keyboard focus, use the keyboard to operate that control. For example, press **Space** on a file row to select it. Click the terminal pane, or choose **Done** in the filename filter, to resume typing into the shell while the drawer stays open.
 
 Choose **Go to folder…** to enter a remote directory directly. An absolute path such as `/var/log` works even if the starting directory could not be listed. Relative paths start in the displayed directory. The SFTP server resolves `.`, `..` and symbolic links. Enter spaces, quotes and dollar signs literally. If the folder cannot be opened, the drawer keeps the previous listing and selection.
@@ -126,6 +160,8 @@ Use **Back** and **Forward** to revisit folders opened in the current SSH pane, 
 Choose **Cancel transfer** to stop the current upload or download and skip the rest of that batch. The drawer waits for the server to acknowledge an in-flight request. A cancelled download leaves an existing local file intact. If an upload has already opened the remote file, it can leave a partial file, including when replacing an existing file. The drawer reports the remote path and acknowledged byte count. The SSH shell and subsequent transfers remain available.
 
 Choose **Filter filenames…** and type part of a name to search the entire directory listing, including later pages. Matching ignores case and treats punctuation literally. Filtering uses the listing already in memory. **Done** returns keyboard input to the terminal and keeps the results visible. **Clear filter** brings back all entries. Refresh keeps your filter in the current directory, and opening another directory starts with its full listing.
+
+Under **Sort by**, choose **Newest first** to find a recent log or capture. Folders stay first. Within each group, entries with a reported modification time appear newest to oldest, followed by entries without a timestamp. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
 
 Choose **New folder** and enter a name to create a directory under the displayed remote path. After the server confirms creation, the drawer refreshes and selects the new folder. If the name already exists, the drawer shows the server’s error. **Replace existing files** applies to file transfers.
 
@@ -159,7 +195,7 @@ The remote account needs SSH exec channels, stock SSHFS 3, `fusermount3` 3.15 or
 
 The **Inbox** button beside the tab menu shows how many bells and terminal notifications are unread across this window. The inbox keeps the newest 128 alerts, including alerts from background tabs and splits. Select a message to mark it read and focus its source pane. **Mark all read** acknowledges the remaining messages, and **Clear inbox** empties the list. Both leave the per-pane control event journals available to scripts.
 
-Choose **caret → Panes → Open files here** to open the drawer at the directory the focused shell last reported with OSC 7. For example, `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s existing SSH connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. An absent, invalid or foreign-host report opens the usual SFTP working directory.
+Choose **caret → Panes → Open files here** to open the drawer at the directory the focused SSH shell reported. For example, the OSC 7 URI `file://server.example/home/me/my%20project` opens `/home/me/my project` on that pane’s connection. The URI must specify an absolute path and either the pane’s SSH host or an empty host. With iTerm2 shell integration, the paired report supplies the absolute path as literal text. An absent, invalid or foreign-host report opens the usual SFTP working directory.
 
 To keep a remote directory for another session, open it in the SFTP drawer and choose **Bookmarks… → Bookmark this folder**. Select its path to reopen it over the current SSH connection, or choose **Remove** beside the path. Bookmarks belong to the saved profile, SSH account, host, port and verified host key. If a bookmarked directory has moved, the drawer shows the error and keeps the previous listing.
 
@@ -203,7 +239,7 @@ In a local shell profile editor, **Duplicate saved profile…** copies the saved
 
 The caret menu displays **On**/**Off** for fullscreen, mute, game mode, alternate-screen wheel keys, remote named sounds, and asset synchronization, using the active terminal’s effective settings. Terminal-only actions are disabled when a settings/form tab is selected.
 
-Choose **caret → Terminal inspector** to see the focused pane’s live cell grid, primary or alternate screen, mouse tracking and encoding, keyboard encoding and kitty flags, bracketed paste, and synchronized output. The panel follows focus across splits and tabs. It reads the local parser, so it can show a pending synchronized update while the terminal still displays the last committed frame. Close it with **×** or the caret menu.
+Choose **caret → Terminal inspector** to see the focused pane’s cell grid, text area in physical pixels, DPI, in-band resize subscription, primary or alternate screen, mouse and keyboard modes, bracketed paste and synchronized output. The panel follows focus across splits and tabs. It reads the local parser, so it can show a pending synchronized update while the terminal still displays the last committed frame. Close it with **×** or the caret menu. To inspect a background pane, run `w11term-cli inspect --pane ID`. [Control protocol and example](CONTROL.md#live-pane-inspection)
 
 Move the pointer over the focused pane to read its column and row, counted from 1 at the top-left of the visible grid, including while viewing scrollback. **Hyperlink** shows the allowed OSC 8 target or a detected URL under that cell. Moving into the padding or another pane clears the readout. Hovering leaves keyboard focus and the link destination alone.
 
@@ -262,6 +298,8 @@ In the SSH profile editor, enable **Keep the remote shell running with zmx (Linu
 
 From a fresh workspace, choose **caret → Find remote sessions → Find sessions on _profile_**. w11term authenticates to that SSH account and lists its w11term-managed zmx shells and existing tmux sessions on the account’s default socket. Each row shows the session name, backend and attached client count, plus the window count for tmux or the available command and directory for zmx. Select a row to attach in the browser tab. **Refresh** checks the host again. Discovery works with an ordinary saved SSH shell profile and keeps its usual launch behavior. You can save the selected session in a workspace or save an unselected browser to list that host again on reopen.
 
+Type in the session search box to match a name, session ID, backend, command or directory across all pages. The search also works in **Browse Herdr terminals**. Matching ignores case and treats punctuation literally, so a path such as `/srv/build[2]` can be entered directly. With one matching result, press **Enter** in the search box to attach. With several matches, choose a row. Typing filters the current listing locally. **Refresh** queries the host again and keeps your search.
+
 tmux attaches in its normal full-screen UI on an SSH PTY. Its prefix keys, windows and panes work as they do in a plain SSH attachment. Detach in tmux or use **Remote session → Detach from remote session**. Reattach and workspace restore use the same session ID even after a rename. If the tmux server restarts or the session ends, choose **Remote session → Find remote sessions again** to return to the list. Creation and termination of tmux sessions stay with the remote account. Stock tmux 3.4 on Linux is exercised in CI.
 
 Use **caret → Panes → Remote session** to detach, reattach, or end the remote session. Ending requires confirmation. w11term checks the SSH destination, account, host fingerprint and remote session generation before accepting input. If recovery fails, the pane shows the outcome and offers an explicit choice to start a new durable shell or a plain SSH shell. Ordinary game profiles that accept only shell requests can keep using direct SSH.
@@ -310,6 +348,7 @@ Example optional profile settings (all fields may be omitted):
 
 ```powershell
 cargo run -- --replay C:\path\to\capture.vt
+cargo run -- --replay-timed C:\path\to\cockpit.vt
 cargo run -- --benchmark
 cargo run -- --demo --smoke-seconds 5
 ```
@@ -320,9 +359,21 @@ Use `--cols` and `--rows` to choose an initial grid for a particular capture.
 For a restored background replay pane with unknown dimensions, showing the pane
 or sizing it with `w11term-cli resize` starts playback.
 
+To capture an animation or a resize bug, choose **Start timed recording…** in
+the command palette or the tab menu’s **Recordings** submenu. Choose **Stop
+recording** on that pane to finish. **Open recording…** opens the selected
+`.vt` in a new tab and uses its timing index when available. You can keep
+working in your original SSH or PowerShell session during playback. To inspect
+a fast animation, choose **Open recording paused…**, then **Next recorded
+update** to advance one timestamp at a time. **Pause replay** and **Resume
+replay** are available on an active timed recording.
+[Recording files and CLI commands](CONTROL.md#vt-recording)
+
 The benchmark measures **only VT parsing and scrollback**. It excludes snapshot creation, rendering, SSH, and input-to-screen latency. Debug-build results are not performance claims. Build with `cargo build --release` for performance work. The release GUI executable does not attach a console.
 
 ## Controls
+
+Press **Ctrl+Shift+A** or choose **Select all terminal text** in the command palette to select the focused pane’s retained text, including lines above the viewport. Press **Ctrl+Shift+C** to copy it as plain text, or **Esc** to cancel. Selecting leaves the clipboard untouched even when copy-on-select is on. In a full-screen application using the alternate screen, the selection covers that application’s text. For output larger than the 1 MiB clipboard limit, use **Panes → Save scrollback as text…**.
 
 **Ctrl+Shift+X** or **caret → Panes → Keyboard copy mode** lets you select text in the focused pane while its session continues running. Move with the arrow keys or **h/j/k/l**, page with **Page Up/Down**, use **Home/End** or **0/$** for the edges of a row, and **g/G** or **Ctrl+Home/End** for the ends of retained history. Press **v** for character selection or **Shift+V** for whole rows, then **y** or **Enter** to copy plain text. Soft-wrapped rows join in character and line selections. **Esc** cancels and restores your previous viewport. Inside an alternate screen the current grid is available. Remap the activation shortcut under **Settings → Keyboard**.
 
@@ -332,9 +383,9 @@ In copy mode, **w** or **Ctrl+Right** moves to the next word start, **b** or **C
 
 **Ctrl+Shift+H** or **caret → Panes → Keyboard hints** freezes the focused viewport and labels its URLs and file paths. Type the letters shown beside a target. **Enter** opens a URL or copies a path, **C** copies either, **Backspace** edits the label, and **Esc** returns to the live pane. URLs use the same link rules as Ctrl+click, including OSC 8 hyperlinks. Paths can include quoted spaces, soft wraps, and compiler-style line and column suffixes.
 
-On an SSH pane, **R** reveals a selected Unix path in the existing SFTP drawer and selects its directory entry. Relative paths use the OSC 7 directory reported by that SSH host when hints opened. Absolute paths work without a directory report. Local Windows paths and paths with no usable remote base can still be copied.
+In a local PowerShell pane, press **R** to select a file or folder on a local drive in File Explorer. For example, when a build prints `src/main.rs:12:8`, select its hint and press **R** to highlight `main.rs`. In an SSH pane, **R** reveals the selected Unix path in that pane’s SFTP drawer. Relative paths use the directory the shell reported when hints opened. Absolute paths such as `C:\work\main.rs` on Windows or `/srv/app/main.rs` on SSH work without a directory report.
 
-Use **Settings → Hint patterns** to add, edit or remove named regular expressions. For example, an **Issue** pattern with `\bOPS-[0-9]+\b` labels issue numbers such as `OPS-104`. Select its label and press **Enter** or **C** to copy exactly the matched text. When the entire match is a supported URL, **O** opens it. For a recognized remote path, **R** reveals it in SFTP.
+Use **Settings → Hint patterns** to add, edit or remove named regular expressions. For example, an **Issue** pattern with `\bOPS-[0-9]+\b` labels issue numbers such as `OPS-104`. Select its label and press **Enter** or **C** to copy exactly the matched text. When the entire match is a supported URL, **O** opens it. When it is a recognized path, **R** reveals it in File Explorer or SFTP according to the pane.
 
 Patterns match across soft wraps within a visible logical line. Explicit OSC 8 links take priority, followed by custom patterns in saved order, then automatic links and paths. Patterns use Rust regex syntax and must consume at least one character. You can save up to 16 patterns. Each invocation considers up to 512 custom matches across 256 KiB of viewport text and skips logical lines longer than 16 KiB.
 
@@ -351,6 +402,7 @@ For focus-independent automation, raw SSH input, screen text, PNG capture, and l
 | Right-click | Paste; with auto-copy disabled, copy an existing selection first |
 | Ctrl+V / Ctrl+Shift+V / Shift+Insert | Normal paste, using negotiated bracketed-paste mode |
 | Ctrl+Alt+V / caret → Paste raw | UTF-8 clipboard bytes, without bracket markers, trimming, newline conversion, or key encoding |
+| Ctrl+Shift+A | Select all retained text in the focused pane |
 | Ctrl+Shift+C / Ctrl+Insert | Copy the selection as plain Unicode text |
 | Ctrl+C with a selection | Copy; without a selection, send Ctrl+C to the remote program |
 | Ctrl++ / Ctrl+- / Ctrl+0 | Increase / decrease / reset font size (16 DIPs) |
@@ -373,15 +425,19 @@ Hold Shift to select or right-click paste when a remote TUI enables mouse report
 
 Use **Settings → Word selection delimiters…** to choose which punctuation separates words for double-click selection and screen-reader word navigation. For example, removing `/` keeps `/usr/bin` together. Leave the field empty to split on whitespace alone. **Save** updates existing panes. **Restore default delimiters** puts the original characters back in the editor so you can review them before saving.
 
-Find searches the current pane’s retained history and visible screen. It starts with a case-insensitive literal search using Unicode lowercase matching. Turn on **Regex** for patterns such as `error\s+[0-9]+`, or **Match case** to distinguish uppercase and lowercase. Matches can span a line wrapped by the terminal and stop at a hard newline. Enter and Shift+Enter move between highlighted matches. Escape closes Find and restores terminal input. Reopening Find restores that pane’s query and both options.
+Find searches the current pane’s retained history and visible screen. It starts with a case-insensitive literal search using Unicode lowercase matching. Turn on **Regex** for patterns such as `error\s+[0-9]+`, or **Match case** to distinguish uppercase and lowercase. Matches can span a line wrapped by the terminal and stop at a hard newline. Enter and Shift+Enter move between highlighted matches. Escape closes Find and restores terminal input.
+
+Select a filename or error code and open **Find in scrollback** to search for it. Mouse, keyboard copy mode, and accessibility selections work. Find uses the selected text literally, including punctuation, and keeps the pane’s **Match case** setting. A single line can wrap across several displayed rows. With no eligible selection, Find restores the pane’s previous query and options. **Find next** and **Find previous** continue the previous search.
+
+Under **Settings → Keyboard**, you can change or clear **Find in scrollback**, **Find next**, and **Find previous**. For example, clearing **Find next** gives the default F3 key back to the terminal application. The command palette shows the current assignments. Enter and Shift+Enter also navigate while the Find box is open.
 
 Queries accept up to 4,096 UTF-8 bytes. The match count refreshes as output arrives, and `+` indicates more than 10,000 matches. If a pattern is invalid, the Find bar shows the reason as you edit. Regex search skips logical lines larger than 64 KiB and shows when the results are incomplete. Ordinary scrolling stays anchored to retained rows as new output arrives.
 
-When a pane has scrollback, drag the scrollbar at its right edge to browse history, or click the track above or below the thumb to move one page. Drag to the bottom to follow new output. The scrollbar uses the pane's existing padding and preserves its column count. Assistive technology can use the focused terminal's UI Automation Scroll pattern to read the position, page through history or jump to a percentage.
+When a pane has scrollback, drag the scrollbar at its right edge to browse history, or click the track above or below the thumb to move one page. While Find is open, marks on the scrollbar show matching rows throughout the retained history. The selected match has its own color and follows Find Next and Previous. Drag to the bottom to follow new output. The scrollbar uses the pane's existing padding and preserves its column count. Assistive technology can use the focused terminal's UI Automation Scroll pattern to read the position, page through history or jump to a percentage.
 
 The alternate screen has no local scrollback. A TUI receives wheel reports when it enables mouse reporting. For other TUIs, **Alternate-screen wheel keys** enables the arrow-key fallback used by pagers. It defaults to on for standard profiles and off in game mode. Shift+wheel scrolls local primary-screen history and has no effect on the alternate screen. Find on the alternate screen searches its current contents. Returning to the primary screen restores its history position.
 
-**OSC 133 semantic prompts.** With shell integration enabled, Ctrl+Shift+Up/Down jumps between prompt starts. **Caret → Panes → Command history** opens the focused pane’s completed commands, newest first. Type in **Search command history** to match any part of the captured command line, including text beyond its shortened list label. The search ignores case and treats punctuation literally. Select a command to preview its output and exit status. **Copy command** copies the captured command line. **Copy output** copies its full plain text, joining soft wraps and preserving hard newlines. **Refresh history** selects the latest matching command, and **Return to pane** takes you back to the originating shell. **Copy last command output** remains available directly in the Panes menu.
+**OSC 133 semantic prompts.** With shell integration enabled, Ctrl+Shift+Up/Down jumps between prompt starts. **Caret → Panes → Command history** opens the focused pane’s completed commands, newest first. Type in **Search command history** to match any part of the captured command line, including text beyond its shortened list label. The search ignores case and treats punctuation literally. Use **Command status** to narrow the results to failed commands, successful commands, or commands whose shell omitted the exit status. Select a command to preview its output and exit status. **Copy command** copies the captured command line. **Copy output** copies its full plain text, joining soft wraps and preserving hard newlines. **Refresh history** selects the latest matching command, and **Return to pane** takes you back to the originating shell. **Copy last command output** remains available directly in the Panes menu.
 
 Scripts can read the same OSC 133 history with `w11term-cli list-commands` and retrieve one command’s output with `get-command`. [Command history in the control reference](CONTROL.md#completed-shell-commands)
 
@@ -448,8 +504,14 @@ from an administrator terminal; ordinary tests exercise medium/low isolation.
 This is a runnable foundation, not complete terminal conformance or a kitty/Ghostty performance result.
 
 - ANSI/DEC behavior, primary/alternate screens, scrollback/reflow, 256/true color, wide and combining text, basic mouse reporting, bracketed paste, and negotiated kitty key encoding are connected.
+- SSH games and TUIs can subscribe to pane size changes with `CSI ? 2048 h`. Each enable immediately returns `CSI 48 ; rows ; columns ; height_px ; width_px t`. Further reports follow changes to the text area, including a pixel-size change with the same cell grid. The dimensions exclude the tab bar, padding and status line. `CSI ? 2048 l` stops reports for that pane. [In-band resize protocol](https://gist.github.com/rockorager/e695fb2924d36b2bcf1fff4a3704bd83)
+- When an SSH editor saves the shell’s title on entry and restores it on exit, the pane picker and `w11term-cli get-text` show the restored title. Scripts can follow window title changes with `w11term-cli events`. w11term supports xterm’s icon and window title stack, including its ten directly addressable slots and the stack-depth query. [xterm title operations](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html) · [ncurses alternate-screen sequences](https://invisible-island.net/ncurses/terminfo.src.html#tic-xterm+alt+title)
 - The terminal displays kitty, sixel and iTerm images. Kitty supports timed or client-selected animation frames, Unicode placeholders and relative placements. `kitten icat --clear` clears visible images, and `kitten icat --clear-all` also clears named images from scrollback on the active screen. The [graphics audit](docs/graphics-audit.md) documents reference fixtures, GPU cache eviction, transfer budgets and protocol coverage.
+- Kitty indexed-color images use the pane's current palette. Charts and other static images sent as `f=8` or `f=16` follow OSC color changes and Windows theme changes without a retransmission. `f=16` also carries per-pixel opacity. [Kitty indexed color](https://sw.kovidgoyal.net/kitty/graphics-protocol/#indexed-color-data)
 - DirectWrite shapes text runs with matching attributes and supports italic, color emoji and five underline styles with independent decoration color. Bidirectional ordering uses the terminal's row direction with a left-to-right default. Selection, search highlights, URL hit testing and cursor placement share the displayed cell map. Copy and control-pipe text retain logical order. Each physical row resolves independently, including soft-wrapped rows. The replay fixture exercises mixed Hebrew and digits, Arabic joining, a Devanagari conjunct, italic and underline styles. [Replay fixture](tests/fixtures/complex-text.vt)
+- Applications can save and restore private terminal settings with XTSAVE and XTRESTORE, including bracketed paste, cursor visibility, mouse reporting, and the active screen buffer. XTPUSHSGR and XTPOPSGR save and restore text styling in nested scopes. XTREPORTSGR reports the styling shared by a rectangle on the active screen. [XTerm control sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)
+
+- DEC single-width, double-width, and double-height line renditions work in live panes and PNG captures. Doubled rows use half the normal columns for text, cursor addressing, and selection.
 - Applications can overline text and spaces with SGR 53 and clear the overline with SGR 55. The stroke follows the foreground across the full width of each grapheme. Underlines can use their own color at the same time. [ECMA-48, §8.3.117](https://ecma-international.org/publications-and-standards/standards/ecma-48/)
 - Applications can swap the pane's default foreground and background with DEC reverse-screen mode (`CSI ? 5 h`), restore them with `CSI ? 5 l`, and query the current mode with `CSI ? 5 $ p`. Explicit RGB and indexed colors keep their values. SGR 7 still swaps the colors of an individual cell. Pane previews and PNG captures use the same colors as the window. [Xterm control sequences](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html)
 - Applications can select a blinking or steady block, underline, or bar with DECSCUSR, or toggle blinking on the current shape with `CSI ? 12 h` and `CSI ? 12 l`. An editor can query the current style with DECRQSS and restore it on exit. A focused pane fills the application block cursor and draws the character in the cursor's text color. Other panes show the block as an outline, so you can see which split has keyboard focus. A blinking cursor in the focused terminal follows the Windows caret interval. Disabling caret blinking in Windows keeps it steady. Pane previews and control-pipe PNGs use the outlined block throughout its blink cycle. [Cursor-style sequences](https://ghostty.org/docs/vt/csi/decscusr) · [Windows caret timing](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getcaretblinktime)

@@ -1,20 +1,28 @@
 use super::*;
 use w11term::shortcuts::BINDINGS;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CommandId {
     Menu(String),
+    RenamePane(Option<(u64, TabId)>),
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
+    Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
+    SelectAll(Option<clipboard_paste::Origin>),
+    PaneFind(Option<clipboard_paste::Origin>, Shortcut),
+    CopySelection(Option<clipboard_paste::Origin>),
     PaneColorScheme(u64, ColorScheme),
     SharedFolders(Option<u64>),
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
     TabAction(Shortcut, Option<TabId>),
+    ReopenClosedTab(Option<TabId>),
+    ReopenClosedPane(Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
+    BalancePanes(PaneBalance),
     OpenInDirectory(
         directory_split::Destination,
         Option<directory_split::Origin>,
@@ -63,6 +71,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                 if (!enabled && key == "panes".into())
                     || (!profiles
                         && (key == "save-scrollback".into()
+                            || key == "copy-selection".into()
                             || key == "restart-exited".into()
                             || key == "shared-folders".into()
                             || key == "local-forward".into()))
@@ -140,20 +149,35 @@ impl TerminalApp {
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
         let previous = previous_pane::target(&self.tabs);
+        let recordings = self.recording_choices();
         menu_rows(
             self.caret_items(
                 exited.is_some(),
                 &arrangement,
                 directory_split.is_some(),
                 previous,
+                recordings,
             ),
             false,
             &mut rows,
         );
         let origin = self.paste_origin();
+        let rename_target = self
+            .tabs
+            .active()
+            .and_then(AppTab::pane_id)
+            .zip(self.tabs.active_group_id());
         for row in &mut rows {
             if let CommandId::Shortcut(shortcut @ (Shortcut::Paste | Shortcut::PasteRaw)) = row.id {
                 row.id = CommandId::Clipboard(origin, shortcut == Shortcut::PasteRaw);
+            }
+            if let CommandId::Menu(label) = &row.id
+                && recordings::is_command(label)
+            {
+                row.id = CommandId::Recording(recordings.target(label));
+            }
+            if matches!(&row.id, CommandId::Menu(label) if label == tab_title::RENAME_PANE) {
+                row.id = CommandId::RenamePane(rename_target);
             }
         }
         menu_rows(self.profile_items(), true, &mut rows);
@@ -214,6 +238,9 @@ impl TerminalApp {
                         Shortcut::NewTab => true,
                         Shortcut::CloseTab => tab_count > 0,
                         Shortcut::ClosePane => live.is_some(),
+                        Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => {
+                            live.is_some_and(LiveTab::find_available)
+                        }
                         Shortcut::NextTab | Shortcut::PreviousTab => tab_count > 1,
                         Shortcut::Select(index) => index < tab_count,
                         _ => false,
@@ -233,6 +260,16 @@ impl TerminalApp {
                 .map(|chord| chord.to_string())
                 .unwrap_or_default();
             match shortcut {
+                Shortcut::ReopenClosedTab => {
+                    let closed = self.closed_tab.as_ref().map(|tab| tab.group);
+                    row.enabled = closed.is_some();
+                    row.id = CommandId::ReopenClosedTab(closed);
+                }
+                Shortcut::ReopenClosedPane => {
+                    let closed = self.closed_pane.as_ref().map(|pane| pane.id);
+                    row.enabled = closed.is_some();
+                    row.id = CommandId::ReopenClosedPane(closed);
+                }
                 Shortcut::FocusPreviousPane => {
                     row.enabled = previous.is_some();
                     row.id = CommandId::FocusPreviousPane(previous);
@@ -242,6 +279,13 @@ impl TerminalApp {
                 }
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
+                }
+                Shortcut::SelectAll => {
+                    row.id = CommandId::SelectAll(origin);
+                    row.enabled = self.copy_mode_target().is_some();
+                }
+                Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => {
+                    row.id = CommandId::PaneFind(origin, shortcut);
                 }
                 Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
                     // A click queued on this row must keep its original tab even
@@ -256,6 +300,13 @@ impl TerminalApp {
                 Shortcut::RotateSplit => {
                     if let Some(target) = &arrangement.rotation {
                         row.id = CommandId::RotateSplit(target.clone());
+                    } else {
+                        row.enabled = false;
+                    }
+                }
+                Shortcut::BalancePanes => {
+                    if let Some(target) = &arrangement.balance {
+                        row.id = CommandId::BalancePanes(target.clone());
                     } else {
                         row.enabled = false;
                     }
@@ -281,19 +332,6 @@ impl TerminalApp {
         for (shortcut, label, chord, enabled) in [
             (Shortcut::Copy, "Copy selection", "Ctrl+Shift+C", selection),
             (
-                Shortcut::Find,
-                "Find in scrollback",
-                "Ctrl+Shift+F",
-                live.is_some(),
-            ),
-            (Shortcut::FindNext, "Find next", "F3", live.is_some()),
-            (
-                Shortcut::FindPrevious,
-                "Find previous",
-                "Shift+F3",
-                live.is_some(),
-            ),
-            (
                 Shortcut::Zoom(1),
                 "Increase font size",
                 "Ctrl++",
@@ -308,7 +346,11 @@ impl TerminalApp {
             (Shortcut::ResetZoom, "Reset font size", "Ctrl+0", true),
         ] {
             rows.push(Row {
-                id: CommandId::Shortcut(shortcut),
+                id: if shortcut == Shortcut::Copy {
+                    CommandId::CopySelection(origin)
+                } else {
+                    CommandId::Shortcut(shortcut)
+                },
                 label: label.into(),
                 chord: chord.into(),
                 enabled,
@@ -319,6 +361,9 @@ impl TerminalApp {
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
+            CommandId::RenamePane(target) => tab_title::show_pane(target),
+            CommandId::ReopenClosedTab(group) => Message::ReopenClosedTab(group),
+            CommandId::ReopenClosedPane(id) => Message::ReopenClosedPane(id),
             CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
             CommandId::LocalForward(origin) => local_forwards::open(origin),
@@ -333,6 +378,7 @@ impl TerminalApp {
             }
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
             CommandId::RotateSplit(target) => Message::RotateSplit(target),
+            CommandId::BalancePanes(target) => Message::BalancePanes(target),
             CommandId::SharedFolders(Some(pane)) => {
                 Message::FolderShare(folder_shares::Action::Open(pane))
             }
@@ -345,8 +391,12 @@ impl TerminalApp {
             CommandId::ClearScrollback(pane) => {
                 pane.map_or(Message::ControlIdle, Message::ClearScrollback)
             }
+            CommandId::SelectAll(origin) => Message::SelectAll(origin),
+            CommandId::PaneFind(origin, shortcut) => Message::PaneFind(origin, shortcut),
+            CommandId::CopySelection(origin) => Message::CopySelection(origin),
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),
+            CommandId::Recording(choice) => recordings::invoke(choice),
             CommandId::Shortcut(shortcut) => Message::Shortcut(shortcut),
         };
         let tab_switch = matches!(
@@ -463,6 +513,23 @@ pub(super) fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn select_all_menu_and_palette_share_the_configured_chord() {
+        let mut rows = Vec::new();
+        menu_rows(
+            vec![
+                MenuItem::item("select-all", "Select all terminal text    F10"),
+                MenuItem::item("copy-selection", "Copy selection    Ctrl+Shift+C"),
+            ],
+            false,
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 1, "Copy has a separate pane-bound palette row");
+        assert_eq!(rows[0].id, CommandId::Shortcut(Shortcut::SelectAll));
+        assert_eq!(rows[0].chord, "F10");
+        assert_eq!(rows[0].label, KeyAction::SelectAll.binding().label);
+    }
 
     #[test]
     fn profile_results_preserve_menu_order_within_each_action() {

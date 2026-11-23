@@ -1,5 +1,6 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::palette::Slot;
+use crate::terminalstate::rendition::Rendition;
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
@@ -28,54 +29,6 @@ use wezterm_escape_parser::osc::{
 use wezterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
 };
-
-/// Build a restorable SGR parameter list from the pen at the instant of the query.
-/// Only attributes set by SGR belong here; the pen can also carry links and semantic marks.
-fn sgr_parameters(pen: &CellAttributes) -> String {
-    use wezterm_cell::color::{ColorAttribute, ColorSpec};
-    use wezterm_escape_parser::csi::{Blink, Intensity, Sgr, Underline, VerticalAlign};
-
-    fn color(value: ColorAttribute) -> Option<ColorSpec> {
-        match value {
-            ColorAttribute::Default => None,
-            ColorAttribute::PaletteIndex(index) => Some(ColorSpec::PaletteIndex(index)),
-            ColorAttribute::TrueColorWithDefaultFallback(rgb)
-            | ColorAttribute::TrueColorWithPaletteFallback(rgb, _) => {
-                Some(ColorSpec::TrueColor(rgb))
-            }
-        }
-    }
-
-    let mut params = String::from("0");
-    let intensity = pen.intensity();
-    let underline = pen.underline();
-    let blink = pen.blink();
-    let align = pen.vertical_align();
-    for setting in [
-        (intensity != Intensity::Normal).then_some(Sgr::Intensity(intensity)),
-        pen.italic().then_some(Sgr::Italic(true)),
-        (underline != Underline::None).then_some(Sgr::Underline(underline)),
-        (blink != Blink::None).then_some(Sgr::Blink(blink)),
-        pen.reverse().then_some(Sgr::Inverse(true)),
-        pen.invisible().then_some(Sgr::Invisible(true)),
-        pen.strikethrough().then_some(Sgr::StrikeThrough(true)),
-        pen.overline().then_some(Sgr::Overline(true)),
-        (align != VerticalAlign::BaseLine).then_some(Sgr::VerticalAlign(align)),
-        color(pen.foreground()).map(Sgr::Foreground),
-        color(pen.background()).map(Sgr::Background),
-        color(pen.underline_color()).map(Sgr::UnderlineColor),
-    ]
-    .iter()
-    .flatten()
-    {
-        // Sgr's formatter includes the final 'm' for each standalone setting.
-        // The combined status string has one final 'm' after all parameters.
-        write!(params, ";{setting}").expect("writing to a String is infallible");
-        let final_byte = params.pop();
-        debug_assert_eq!(final_byte, Some('m'));
-    }
-    params
-}
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
 /// the terminal state and the embedding/host terminal interface
@@ -180,6 +133,17 @@ impl<'a> Performer<'a> {
             p.as_str()
         };
 
+        let row_geometry = |state: &TerminalState| {
+            let scale = state.screen().line_width_scale(state.cursor.y);
+            (
+                scale > 1,
+                state
+                    .left_and_right_margins
+                    .end
+                    .min((state.screen().physical_cols / scale).max(1)),
+            )
+        };
+        let (mut sized, mut right) = row_geometry(self.state);
         for g in Graphemes::new(text) {
             let g = self.remap_grapheme(g);
 
@@ -210,6 +174,14 @@ impl<'a> Performer<'a> {
                 }
             }
 
+            if sized
+                && self.dec_auto_wrap
+                && self.cursor.x > self.left_and_right_margins.start.min(right - 1)
+                && self.cursor.x.saturating_add(print_width) > right
+            {
+                self.wrap_next = true;
+            }
+
             if self.wrap_next {
                 // Since we're implicitly moving the cursor to the next
                 // line, we need to tag the current position as wrapped
@@ -236,23 +208,33 @@ impl<'a> Performer<'a> {
                             .last()
                             .map(|cell| makes_sense_to_wrap(cell.str()))
                             .unwrap_or(false);
-                    if should_mark_wrapped {
+                    if should_mark_wrapped && !sized {
                         screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
                     }
                 }
                 self.new_line(true);
+                (sized, right) = row_geometry(self.state);
             }
 
-            let x = self.cursor.x;
             let y = self.cursor.y;
-            let width = self.left_and_right_margins.end;
+            let x = if sized {
+                self.cursor.x.min(right - 1)
+            } else {
+                self.cursor.x
+            };
+            self.cursor.x = x;
+            if sized && print_width > right - x {
+                // A wide grapheme cannot straddle the edge of a DEC-sized row.
+                // After pre-wrapping this only occurs with wrap disabled or a one-cell row.
+                continue;
+            }
 
             let pen = self.pen.clone();
 
-            let wrappable = x + print_width >= width;
+            let wrappable = x + print_width >= right;
 
             if self.insert {
-                let margin = self.left_and_right_margins.end;
+                let margin = right;
                 let screen = self.screen_mut();
                 for _ in x..x + print_width as usize {
                     screen.insert_cell(x, y, margin, seqno);
@@ -265,7 +247,7 @@ impl<'a> Performer<'a> {
                 x,
                 y,
                 print_width,
-                width,
+                right,
                 g,
                 self.pen
             );
@@ -351,7 +333,7 @@ impl<'a> Performer<'a> {
                         // ctlseqs docs.
                         match s.data.as_slice() {
                             b"m" => {
-                                let params = sgr_parameters(&self.pen);
+                                let params = Rendition::from(&self.pen).parameters();
                                 write!(self.writer, "{DCS}1$r{params}m{ST}").ok();
                                 self.writer.flush().ok();
                             }
@@ -461,6 +443,7 @@ impl<'a> Performer<'a> {
                     self.screen_mut().dirty_line(old_y, seqno);
                     self.screen_mut().dirty_line(y, seqno);
                     self.cursor.y = y;
+                    self.cursor.x = self.constrain_line_column(self.cursor.x, y);
                     self.wrap_next = false;
                 }
                 if self.newline_mode {
@@ -500,7 +483,12 @@ impl<'a> Performer<'a> {
                     self.set_cursor_pos(&x_pos, &y_pos);
                 } else if self.reverse_wraparound_mode
                     && self.dec_auto_wrap
-                    && self.cursor.x == self.left_and_right_margins.end - 1
+                    && self.cursor.x
+                        == self
+                            .left_and_right_margins
+                            .end
+                            .min(self.screen().logical_cols(self.cursor.y))
+                            - 1
                     && self.wrap_next
                 {
                     // If the cursor is in the last column and a character was
@@ -562,6 +550,8 @@ impl<'a> Performer<'a> {
         self.flush_print();
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
+            CSI::PushSgr(parameters) => self.state.sgr_stack.push(&parameters, &self.state.pen),
+            CSI::PopSgr => self.state.sgr_stack.pop(&mut self.state.pen),
             CSI::Cursor(wezterm_escape_parser::csi::Cursor::Left(n)) => {
                 // We treat CUB (Cursor::Left) the same as Backspace as
                 // that is what xterm does.
@@ -709,21 +699,37 @@ impl<'a> Performer<'a> {
             Esc::Code(EscCode::DecSaveCursorPosition) => self.dec_save_cursor(),
             Esc::Code(EscCode::DecRestoreCursorPosition) => self.dec_restore_cursor(),
 
-            Esc::Code(EscCode::DecDoubleHeightTopHalfLine) => {
+            Esc::Code(
+                code @ (EscCode::DecDoubleHeightTopHalfLine
+                | EscCode::DecDoubleHeightBottomHalfLine
+                | EscCode::DecDoubleWidthLine
+                | EscCode::DecSingleWidthLine),
+            ) => {
+                if self.left_and_right_margin_mode && code != EscCode::DecSingleWidthLine {
+                    return;
+                }
+                let cols = self.screen.physical_cols;
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_height_top(seqno);
-            }
-            Esc::Code(EscCode::DecDoubleHeightBottomHalfLine) => {
-                let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_height_bottom(seqno);
-            }
-            Esc::Code(EscCode::DecDoubleWidthLine) => {
-                let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_width(seqno);
-            }
-            Esc::Code(EscCode::DecSingleWidthLine) => {
-                let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_single_width(seqno);
+                let line = self.screen.line_mut(idx);
+                match code {
+                    EscCode::DecDoubleHeightTopHalfLine => line.set_double_height_top(seqno),
+                    EscCode::DecDoubleHeightBottomHalfLine => line.set_double_height_bottom(seqno),
+                    EscCode::DecDoubleWidthLine => line.set_double_width(seqno),
+                    _ => {
+                        if crate::screen::line_width_scale(line) > 1 {
+                            crate::screen::clip_sized_line(line, cols, seqno);
+                        }
+                        line.set_single_width(seqno);
+                    }
+                }
+                if crate::screen::line_width_scale(line) == 2 {
+                    crate::screen::clip_sized_line(line, cols, seqno);
+                    if line.last_cell_was_wrapped() {
+                        line.set_last_cell_was_wrapped(false, seqno);
+                    }
+                }
+                let (x, y) = (self.cursor.x, self.cursor.y);
+                self.set_cursor_position_absolute(x, y);
             }
 
             Esc::Code(EscCode::DecScreenAlignmentDisplay) => {
@@ -761,6 +767,7 @@ impl<'a> Performer<'a> {
                 self.capturing_shell_input = false;
                 self.command_label = None;
                 self.current_dir = None;
+                self.forget_iterm_reported_host();
                 self.pen = Default::default();
                 self.cursor = Default::default();
                 self.wrap_next = false;
@@ -779,6 +786,7 @@ impl<'a> Performer<'a> {
                 self.bracketed_paste = false;
                 self.focus_tracking = false;
                 self.report_color_scheme_changes = false;
+                self.clear_resize_subscription();
                 self.mouse_tracking = false;
                 self.mouse_encoding = MouseEncoding::X10;
                 self.keyboard_encoding = KeyboardEncoding::Xterm;
@@ -803,6 +811,9 @@ impl<'a> Performer<'a> {
                 self.unicode_version_stack.clear();
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
+                self.saved_titles = Default::default();
+                self.saved_private_modes = Default::default();
+                self.title.from_application = false;
                 self.end_synchronized_output();
                 self.progress = Progress::default();
                 self.progress_value = 0;
@@ -852,7 +863,7 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
                 self.icon_title.take();
-                self.title = title.clone();
+                self.title.set_from_application(&title);
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::WindowTitleChanged(title.clone()));
                     handler.alert(Alert::IconTitleChanged(Some(title)));
@@ -861,7 +872,7 @@ impl<'a> Performer<'a> {
 
             OperatingSystemCommand::SetWindowTitleSun(title)
             | OperatingSystemCommand::SetWindowTitle(title) => {
-                self.title = title.clone();
+                self.title.set_from_application(&title);
                 if let Some(handler) = self.alert_handler.as_mut() {
                     handler.alert(Alert::WindowTitleChanged(title));
                 }
@@ -930,6 +941,8 @@ impl<'a> Performer<'a> {
                     self.writer.flush().ok();
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
+                ITermProprietary::RemoteHost(report) => self.iterm_remote_host(&report),
+                ITermProprietary::CurrentDir(path) => self.iterm_current_dir(&path),
                 ITermProprietary::SetUserVar { name, value } => {
                     self.user_vars.insert(name.clone(), value.clone());
                     if let Some(handler) = self.alert_handler.as_mut() {
@@ -1043,6 +1056,7 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
+                self.forget_iterm_reported_host();
                 self.set_reported_current_dir(
                     Url::parse(&url).ok().map(|parsed| (parsed, url.into())),
                 );

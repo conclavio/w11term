@@ -25,6 +25,7 @@ mod command_history;
 mod find;
 mod registry;
 mod security;
+pub use command_history::CommandStatus;
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
 
@@ -41,6 +42,8 @@ pub enum Request {
     Record {
         pane: u64,
         path: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        timed: bool,
     },
     Restart {
         pane: u64,
@@ -92,8 +95,18 @@ pub enum Request {
     GetText {
         pane: u64,
     },
+    Inspect {
+        pane: u64,
+    },
+    Playback {
+        pane: u64,
+        #[serde(default)]
+        action: crate::session::ReplayAction,
+    },
     ListCommands {
         pane: u64,
+        #[serde(default, skip_serializing_if = "CommandStatus::is_all")]
+        status: CommandStatus,
     },
     GetCommand {
         pane: u64,
@@ -183,6 +196,7 @@ pub struct Pane {
     pub id: u64,
     pub tab_id: u64,
     pub tab_title: Option<String>,
+    pub pane_name: Option<String>,
     pub label: String,
     pub active: bool,
     pub visible: bool,
@@ -212,7 +226,11 @@ impl Registry {
     }
     pub async fn execute(&self, request: Request, capture_png: CapturePng) -> Result<Value> {
         match request {
-            Request::Record { pane, path } => {
+            Request::Record { pane, path, timed } => {
+                ensure!(
+                    !timed || path.is_some(),
+                    "timed recording requires a destination path"
+                );
                 ensure!(
                     path.as_ref().is_none_or(|p| p.is_absolute()),
                     "recording path must be absolute"
@@ -220,7 +238,7 @@ impl Registry {
                 let (reply, response) = oneshot::channel();
                 self.pane(pane)?
                     .input
-                    .send(Command::Record { path, reply })
+                    .send(Command::Record { path, timed, reply })
                     .context("pane is closed")?;
                 tokio::time::timeout(TIMEOUT, response)
                     .await??
@@ -396,6 +414,9 @@ impl Registry {
                     if let Some(title) = pane.tab_title {
                         session["tab_title"] = title.into();
                     }
+                    if let Some(name) = pane.pane_name {
+                        session["pane_name"] = name.into();
+                    }
                     session["label"] = pane.label.into();
                     session["active"] = pane.active.into();
                     session["read_only"] = pane.read_only.into();
@@ -439,12 +460,42 @@ impl Registry {
                 pane,
                 all_panes,
             } => self.find_text(pattern, pane, all_panes).await,
-            Request::ListCommands { pane } => self.list_commands(pane).await,
+            Request::ListCommands { pane, status } => self.list_commands(pane, status).await,
             Request::GetCommand {
                 pane,
                 id,
                 connection_generation,
             } => self.get_command(pane, id, connection_generation).await,
+            Request::Playback { pane, action } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::Replay { action, reply })
+                    .context("pane is closed")?;
+                let status = tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("playback control timed out")?
+                    .context("pane closed during playback control")?
+                    .map_err(anyhow::Error::msg)?;
+                let mut result = serde_json::to_value(status)?;
+                result["pane"] = pane.into();
+                Ok(result)
+            }
+            Request::Inspect { pane } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::ReadModes(reply))
+                    .context("pane is closed")?;
+                let (connection_generation, modes) = tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("pane inspection timed out")?
+                    .context("pane closed before inspection")?;
+                let mut report = modes.as_json();
+                report["pane"] = pane.into();
+                report["connection_generation"] = connection_generation.into();
+                Ok(report)
+            }
             Request::GetText { pane } => {
                 let (frame, size) = Self::capture(&self.pane(pane)?).await?;
                 let lines: Vec<_> = frame

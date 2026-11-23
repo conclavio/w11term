@@ -37,23 +37,24 @@ impl fmt::Debug for Inbox {
     }
 }
 
+pub(crate) fn display_field(field: &str) -> String {
+    let prefix: String = field.chars().take(200).collect();
+    prefix
+        .split(|c: char| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(super) fn notification_text(data: &serde_json::Value) -> String {
-    let fields = ["title", "body"]
+    let message = ["title", "body"]
         .into_iter()
-        .filter_map(|field| data[field].as_str());
-    let parts = fields.map(|field| {
-        let prefix: String = field.chars().take(200).collect();
-        prefix
-            .split(|c: char| {
-                c.is_whitespace()
-                    || c.is_control()
-                    || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            })
-            .filter(|word| !word.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ")
-    });
-    let message = parts
+        .filter_map(|field| data[field].as_str())
+        .map(display_field)
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" · ");
@@ -74,6 +75,20 @@ impl Inbox {
     pub(super) fn receive(&self, pane: u64, source: &Arc<str>, event: &Event, live: bool) {
         let message = match event.kind.as_str() {
             "bell" => "Bell".to_owned(),
+            "recording-error" => {
+                let Some(error) = event.data["error"].as_str() else {
+                    return;
+                };
+                let reason = display_field(error);
+                if reason.is_empty() {
+                    "Recording failed".into()
+                } else {
+                    format!("Recording failed · {reason}")
+                        .chars()
+                        .take(200)
+                        .collect()
+                }
+            }
             "command-finished" => event.data["exit_code"].as_i64().map_or_else(
                 || "Command finished · exit status unavailable".into(),
                 |code| format!("Command finished · exit code {code}"),
@@ -102,7 +117,7 @@ impl Inbox {
         self.wake_ui(state);
     }
 
-    pub(super) fn refresh(&self) {
+    pub(crate) fn refresh(&self) {
         self.wake_ui(self.state.lock().unwrap());
     }
 

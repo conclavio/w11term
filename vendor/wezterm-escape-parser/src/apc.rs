@@ -476,6 +476,10 @@ impl KittyImageVerbosity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KittyImageFormat {
+    /// f=8
+    Indexed,
+    /// f=16
+    IndexedAlpha,
     /// f=24
     Rgb,
     /// f=32
@@ -488,6 +492,8 @@ impl KittyImageFormat {
     fn from_keys(keys: &BTreeMap<&str, &str>) -> Option<Option<Self>> {
         match get(keys, "f") {
             None => Some(None),
+            Some("8") => Some(Some(Self::Indexed)),
+            Some("16") => Some(Some(Self::IndexedAlpha)),
             Some("32") => Some(Some(Self::Rgba)),
             Some("24") => Some(Some(Self::Rgb)),
             Some("100") => Some(Some(Self::Png)),
@@ -497,6 +503,8 @@ impl KittyImageFormat {
 
     fn to_keys(&self, keys: &mut BTreeMap<&'static str, String>) {
         match self {
+            Self::Indexed => keys.insert("f", "8".to_string()),
+            Self::IndexedAlpha => keys.insert("f", "16".to_string()),
             Self::Rgb => keys.insert("f", "24".to_string()),
             Self::Rgba => keys.insert("f", "32".to_string()),
             Self::Png => keys.insert("f", "100".to_string()),
@@ -714,8 +722,14 @@ pub enum KittyImageDelete {
     AtCursorPosition { delete: bool },
 
     /// d='f' or d='F'
-    /// Delete animation frames
-    AnimationFrames { delete: bool },
+    /// Delete one animation frame, releasing the image if its last frame is
+    /// selected with uppercase F.
+    AnimationFrames {
+        image_id: Option<u32>,
+        image_number: Option<u32>,
+        frame_number: Option<u32>,
+        delete: bool,
+    },
 
     /// d='p' or d='P'
     /// Delete all placements that intersect the specified
@@ -782,7 +796,17 @@ impl KittyImageDelete {
                 delete,
             }),
             'c' | 'C' => Some(Self::AtCursorPosition { delete }),
-            'f' | 'F' => Some(Self::AnimationFrames { delete }),
+            'f' | 'F' => {
+                let optional_number = |key| {
+                    get(keys, key).map_or(Some(None), |value| value.parse::<u32>().ok().map(Some))
+                };
+                Some(Self::AnimationFrames {
+                    image_id: optional_number("i")?,
+                    image_number: optional_number("I")?,
+                    frame_number: optional_number("r")?,
+                    delete,
+                })
+            }
             'p' | 'P' => Some(Self::DeleteAt {
                 x: geti(keys, "x")?,
                 y: geti(keys, "y")?,
@@ -857,8 +881,16 @@ impl KittyImageDelete {
             Self::AtCursorPosition { delete } => {
                 keys.insert("d", d('c', delete));
             }
-            Self::AnimationFrames { delete } => {
+            Self::AnimationFrames {
+                image_id,
+                image_number,
+                frame_number,
+                delete,
+            } => {
                 keys.insert("d", d('f', delete));
+                set(keys, "i", image_id);
+                set(keys, "I", image_number);
+                set(keys, "r", frame_number);
             }
             Self::DeleteAt { x, y, delete } => {
                 keys.insert("d", d('p', delete));
@@ -1101,7 +1133,17 @@ pub enum KittyImage {
         verbosity: KittyImageVerbosity,
     },
     /// a='q'
-    Query { transmit: KittyImageTransmit },
+    Query {
+        transmit: KittyImageTransmit,
+        verbosity: KittyImageVerbosity,
+    },
+    /// a='q', e=<action>. This command has no image payload.
+    FeatureQuery {
+        image_id: u32,
+        action: char,
+        options: Vec<(&'static str, String)>,
+        verbosity: KittyImageVerbosity,
+    },
     /// a='f'
     TransmitFrame {
         transmit: KittyImageTransmit,
@@ -1119,7 +1161,8 @@ impl KittyImage {
     pub fn verbosity(&self) -> KittyImageVerbosity {
         match self {
             Self::TransmitData { verbosity, .. } => *verbosity,
-            Self::Query { .. } => KittyImageVerbosity::Verbose,
+            Self::Query { verbosity, .. } => *verbosity,
+            Self::FeatureQuery { verbosity, .. } => *verbosity,
             Self::TransmitDataAndDisplay { verbosity, .. } => *verbosity,
             Self::Display { verbosity, .. } => *verbosity,
             Self::Delete { verbosity, .. } => *verbosity,
@@ -1146,6 +1189,38 @@ impl KittyImage {
         let payload = keys_payload_iter.next().unwrap_or(b"");
         let action = get(&keys, "a").unwrap_or("t");
         let verbosity = KittyImageVerbosity::from_keys(&keys)?;
+        if let Some(feature) = get(&keys, "e") {
+            let [feature] = feature.as_bytes() else {
+                return None;
+            };
+            if action != "q" || !feature.is_ascii_graphic() || keys.contains_key("I") {
+                return None;
+            }
+            let image_id = geti::<u32>(&keys, "i").filter(|&id| id != 0)?;
+            // Restrict the kept fields to protocol keys and short scalar
+            // values. The payload is deliberately ignored even for t=f.
+            let options = [
+                "C", "H", "N", "O", "P", "Q", "S", "U", "V", "X", "Y", "c", "d", "f", "h", "o",
+                "p", "r", "s", "t", "v", "w", "x", "y", "z",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                let value = get(&keys, key)?;
+                (!value.is_empty()
+                    && value.len() <= 11
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+                .then(|| (key, value.to_owned()))
+            })
+            .collect();
+            return Some(Self::FeatureQuery {
+                image_id,
+                action: *feature as char,
+                options,
+                verbosity,
+            });
+        }
         match action {
             "t" => Some(Self::TransmitData {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
@@ -1153,6 +1228,7 @@ impl KittyImage {
             }),
             "q" => Some(Self::Query {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
+                verbosity,
             }),
             "T" => Some(Self::TransmitDataAndDisplay {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
@@ -1202,9 +1278,22 @@ impl KittyImage {
                 verbosity.to_keys(keys);
                 transmit.to_keys(keys);
             }
-            Self::Query { transmit } => {
+            Self::Query { transmit, verbosity } => {
                 keys.insert("a", "q".to_string());
+                verbosity.to_keys(keys);
                 transmit.to_keys(keys);
+            }
+            Self::FeatureQuery {
+                image_id,
+                action,
+                options,
+                verbosity,
+            } => {
+                keys.insert("a", "q".to_string());
+                keys.insert("i", image_id.to_string());
+                keys.insert("e", action.to_string());
+                keys.extend(options.iter().map(|&(key, ref value)| (key, value.clone())));
+                verbosity.to_keys(keys);
             }
             Self::TransmitDataAndDisplay {
                 transmit,
