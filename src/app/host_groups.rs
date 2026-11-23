@@ -9,6 +9,7 @@ mod compare;
 mod filter;
 mod import;
 mod live_output;
+mod membership;
 mod progress;
 mod prompt_setup;
 mod reconnect;
@@ -51,6 +52,7 @@ pub(super) struct HostGroup {
 struct MemberRoster {
     panes: BTreeSet<u64>,
     show_window: bool,
+    membership: membership::State,
 }
 
 struct DraftBackup {
@@ -335,6 +337,7 @@ pub enum Action {
     Filter(TabId, String),
     FilterWildcards(TabId, bool),
     ShowWindowRoster(TabId, bool),
+    Membership(TabId, membership::Action),
     Select(TabId, u64, bool),
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
@@ -408,6 +411,7 @@ impl TerminalApp {
                     && page.live_output.is_none()
                     && !page.comparison.is_open()
                     && !page.import.is_open()
+                    && !page.edit_membership_open()
                     && !page.prompt_setup.is_open()
                     && !page.transfer.is_open() =>
             {
@@ -675,6 +679,7 @@ impl TerminalApp {
             }
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Import(id, action) => self.handle_host_import(id, action, ctx),
+            Action::Membership(id, action) => self.handle_group_membership(id, action),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
             Action::Transfer(id, action) => self.handle_host_group_transfer(id, action, ctx),
@@ -943,6 +948,17 @@ impl TerminalApp {
         if let Some(view) = page.import.view(id, ctx) {
             return view;
         }
+        if let Some(roster) = page
+            .roster
+            .as_ref()
+            .filter(|roster| roster.membership.is_open())
+            && let Some(view) =
+                roster
+                    .membership
+                    .view(id, &roster.panes, &self.host_group_targets(), ctx)
+        {
+            return view;
+        }
         if let Some(editor) = self.saved_host_group_editor(id, &page.saved, ctx) {
             return editor;
         }
@@ -1016,7 +1032,7 @@ impl TerminalApp {
                 "empty",
                 TextBlock::new().text(if !targets.iter().any(|target| page.includes_pane(target.pane)) {
                     if page.roster.as_ref().is_some_and(|roster| !roster.show_window) {
-                        "This group has no open SSH panes. Import a host list or show the window roster."
+                        "This group has no open SSH panes. Manage live panes or import a host list."
                     } else {
                         "Open a direct SSH shell to add it to this roster."
                     }
@@ -1074,13 +1090,23 @@ impl TerminalApp {
         let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
             filter_input,
             page.roster.as_ref().map_or_else(View::empty, |roster| {
-                CheckBox::new()
-                    .automation_name("Show all window SSH panes")
-                    .is_checked(roster.show_window)
-                    .on_is_checked_changed(ctx.callback(move |show| {
-                        Message::HostGroup(Action::ShowWindowRoster(id, show))
-                    }))
-                    .content("Show all window SSH panes")
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        CheckBox::new()
+                            .automation_name("Show all window SSH panes")
+                            .is_checked(roster.show_window)
+                            .on_is_checked_changed(ctx.callback(move |show| {
+                                Message::HostGroup(Action::ShowWindowRoster(id, show))
+                            }))
+                            .content("Show all window SSH panes"),
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::Membership(id, membership::Action::Open))
+                            }))
+                            .content(membership::LABEL),
+                    ))
             }),
             filter_error.map_or_else(View::empty, |error| {
                 TextBlock::new()
@@ -1512,6 +1538,7 @@ mod tests {
             roster: Some(Box::new(MemberRoster {
                 panes: BTreeSet::from([1, 3]),
                 show_window: false,
+                ..Default::default()
             })),
             selected: BTreeSet::from([1, 3]),
             ..Default::default()

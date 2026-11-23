@@ -1079,8 +1079,12 @@ async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
     drive_gui("ssh-host-group-tabs-ui.ps1", state.path());
     for (name, _root, opens, server, responder, input) in peers {
         assert_eq!(opens.load(Ordering::Relaxed), 1, "{name}");
-        let expected = format!("{}-probe\r", name.to_ascii_lowercase());
-        assert_eq!(*input.lock().unwrap(), expected.as_bytes(), "{name}");
+        let expected = if name == "East" {
+            b"east-probe\r".as_slice()
+        } else {
+            b"west-probe\rshared-probe\r".as_slice()
+        };
+        assert_eq!(*input.lock().unwrap(), expected, "{name}");
         responder.abort();
         server.abort();
     }
