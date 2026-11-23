@@ -25,10 +25,12 @@ use tokio::{
 };
 
 mod directory;
+mod text_preview;
 pub(crate) use directory::valid_component;
 pub use directory::validate_download_name;
 
 pub const CHUNK: usize = 32 * 1024;
+pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
@@ -74,6 +76,11 @@ pub enum Operation {
         overwrite: bool,
     },
     Ls {
+        path: String,
+    },
+    /// Read the selected regular file for the native drawer on its current connection.
+    #[serde(skip)]
+    PreviewText {
         path: String,
     },
     /// The absolute path verified by SSHFS can only be opened on the source pane.
@@ -393,6 +400,7 @@ pub(crate) async fn run(
                 Operation::ListMountedFolder { .. } => {
                     Some("Missing SSH connection for this mounted folder")
                 }
+                Operation::PreviewText { .. } => Some("Missing SSH connection for text preview"),
                 _ => None,
             };
             if let Some(message) = missing {
@@ -407,6 +415,12 @@ pub(crate) async fn run(
             continue;
         }
         if reply.is_closed() && !matches!(operation, Operation::Close { .. }) {
+            continue;
+        }
+        if matches!(operation, Operation::PreviewText { .. })
+            && cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+        {
+            let _ = reply.send(Err("Text preview cancelled".into()));
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
@@ -442,6 +456,7 @@ pub(crate) async fn run(
                     confirmed: 0,
                 },
                 Operation::Put { .. } => JobStage::Upload,
+                Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
                 Operation::GetDir { .. } => JobStage::DirectoryDownload {
                     staging: None,
                     deadline,
@@ -683,6 +698,7 @@ impl Engine {
                 self.get_dir(remote, local, progress, cancel, staging, *deadline)
                     .await?
             }
+            PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
             Put {
                 local,
                 remote,
@@ -927,20 +943,24 @@ impl Engine {
     async fn read_contents(
         &self,
         h: &str,
-        file: &mut tokio::fs::File,
+        file: &mut (impl tokio::io::AsyncWrite + Unpin),
         limit: Option<(u64, &str)>,
         cancel: Option<&TransferCancel>,
         mut advanced: impl FnMut(u64) -> Result<()>,
     ) -> Result<u64> {
         let mut offset = 0u64;
         while !cancel.is_some_and(TransferCancel::is_cancelled) {
-            match self.raw.read(h, offset, self.read_size as u32).await {
+            // At a byte limit, one additional byte distinguishes an exact fit from truncation.
+            let len = limit.map_or(self.read_size as u64, |(max, _)| {
+                (max - offset).saturating_add(1).min(self.read_size as u64)
+            }) as u32;
+            match self.raw.read(h, offset, len).await {
                 Ok(data) => {
                     if cancel.is_some_and(TransferCancel::is_cancelled) {
                         break;
                     }
                     ensure!(
-                        data.data.len() <= self.read_size,
+                        data.data.len() <= len as usize,
                         "server returned more SFTP data than requested"
                     );
                     ensure!(

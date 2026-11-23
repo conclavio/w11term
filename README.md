@@ -107,6 +107,8 @@ Saved workspaces record the local executable, arguments and directory. Opening t
 
 On an SSH pane, choose **caret → Panes → SFTP files** to browse the server’s SFTP working directory. Select a directory and choose **Open folder**, or select a file and choose **Download…**. Use **Upload…** to choose one or more local files, or drop files onto the drawer to upload them into the displayed directory. Transfers show confirmed bytes and stay attached to the originating pane when you switch tabs.
 
+Select a regular file and choose **Preview text…** to read it over the pane’s existing SSH connection. You can select and copy text from the preview. It accepts UTF-8 files up to 256 KiB, including empty files. **Close preview** returns to the listing.
+
 **Copy directory path** copies the displayed remote directory to the Windows clipboard. **Copy selected path** copies the full remote path of the selected file, folder or symbolic link. Both copy plain text, preserving spaces and Unicode. A symbolic link keeps its own path.
 
 Choose **Download folder…** on a remote directory and select a Windows folder
