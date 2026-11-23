@@ -351,6 +351,7 @@ impl TerminalApp {
         })?;
         for (tab, header) in workspace.tabs.iter_mut().zip(headers) {
             tab.title = self.tabs.title_for(header.id).cloned();
+            tab.tab_color = self.tabs.group_color(header.group_id());
             tab.pinned = self.tabs.group_is_pinned(header.group_id());
         }
         Ok(workspace)
@@ -642,6 +643,7 @@ fn restore_tabs<T>(
         let (slot, source, pane_name) = first_leaf(&tab.layout);
         let entry = tabs.insert(create(slot, source, pane_name));
         tabs.set_group_title(entry, tab.title.clone());
+        tabs.set_group_color(entry, tab.tab_color);
         tabs.set_group_pinned(entry, tab.pinned);
         let mut ids = BTreeMap::new();
         restore_split(tabs, &tab.layout, entry, &mut vec![], &mut ids, &mut create);
@@ -789,6 +791,7 @@ mod tests {
             tabs: vec![
                 WorkspaceTab {
                     title: Some("Servers".to_owned().try_into().unwrap()),
+                    tab_color: None,
                     pinned: false,
                     focused: 12,
                     layout: SavedLayout::Split {
@@ -805,12 +808,38 @@ mod tests {
                 },
                 WorkspaceTab {
                     title: None,
+                    tab_color: None,
                     pinned: false,
                     focused: 14,
                     layout: demo(14),
                 },
             ],
         }
+    }
+
+    #[test]
+    fn workspace_restores_fixed_and_hidden_tab_colors() {
+        let mut workspace = nested();
+        let defaults = serde_json::to_value(&workspace).unwrap();
+        assert!(defaults["tabs"][0].get("tab_color").is_none());
+        workspace.tabs[0].tab_color = Some(TabColor::Blue);
+        workspace.tabs[1].tab_color = Some(TabColor::None);
+        let encoded = serde_json::to_value(workspace).unwrap();
+        assert_eq!(encoded["tabs"][0]["tab_color"], "blue");
+        assert_eq!(encoded["tabs"][1]["tab_color"], "none");
+        let workspace: Workspace = serde_json::from_value(encoded).unwrap();
+        let mut tabs = Tabs::default();
+        restore_tabs(&mut tabs, &workspace, |slot, _, _| slot);
+        let headers = tabs.headers();
+        assert_eq!(
+            tabs.group_color(headers[0].group_id()),
+            Some(TabColor::Blue)
+        );
+        assert_eq!(
+            tabs.group_color(headers[1].group_id()),
+            Some(TabColor::None)
+        );
+        assert_eq!(tabs.active(), Some(&12));
     }
 
     #[test]

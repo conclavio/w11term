@@ -1548,7 +1548,7 @@ async fn native_bulk_close_tabs_keeps_the_pinned_ssh_and_selected_shell() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "edits SSH and local tab colors through WinUI and checks live split headers"]
+#[ignore = "edits profile colors and live overrides through WinUI, including a saved workspace"]
 async fn native_profile_tab_colors_follow_focused_panes_and_new_launches() {
     let (Source::Ssh(ssh), _remote, opens, server) = fixture_connections(false, 2).await else {
         unreachable!()

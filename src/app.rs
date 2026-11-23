@@ -86,6 +86,7 @@ mod scrollback_export;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
+mod tab_colors;
 mod tab_title;
 mod tab_windows;
 mod taskbar;
@@ -1023,6 +1024,7 @@ pub enum Message {
     ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
     SetTabPinned(TabId, bool),
+    SetTabColor(TabId, Option<TabColor>),
     CloseTabs(bulk_tab_close::Offer),
     WindowTick,
     WindowTargetsChanged,
@@ -3191,6 +3193,10 @@ impl TerminalApp {
                 }),
             local_forwards::LABEL => local_forwards::open(forward),
             tab_title::RENAME_PANE => tab_title::show_pane(pane.zip(group)),
+            label if let Some(color) = tab_colors::from_menu(label) => group
+                .map_or(Message::ControlIdle, |group| {
+                    Message::SetTabColor(group, color)
+                }),
             label if let Some(scope) = bulk_tab_close::Scope::from_label(label) => match scope {
                 bulk_tab_close::Scope::Other => &offered_close_other,
                 bulk_tab_close::Scope::Right => &offered_close_right,
@@ -3312,10 +3318,13 @@ impl TerminalApp {
                         self.tab_label(tab.id, application_titles).as_ref(),
                         progress.get(&group).copied().unwrap_or_default(),
                     );
-                    let color = match &tab.value.page {
-                        Page::Terminal(live) => live.source.tab_color(),
-                        _ => TabColor::None,
-                    };
+                    let color =
+                        self.tabs
+                            .group_color(group)
+                            .unwrap_or_else(|| match &tab.value.page {
+                                Page::Terminal(live) => live.source.tab_color(),
+                                _ => TabColor::None,
+                            });
                     let (header, name) = tab_header_content(label, pinned, color);
                     KeyedView::new(
                         group.to_string(),
@@ -3470,6 +3479,12 @@ impl TerminalApp {
                 previous.is_some(),
             ),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
+            tab_colors::menu(
+                self.active_terminal_group().is_some(),
+                self.tabs
+                    .active_group_id()
+                    .and_then(|group| self.tabs.group_color(group)),
+            ),
             command_menu_item(
                 "pin-tab",
                 if self.active_tab_is_pinned() {
@@ -4722,6 +4737,13 @@ impl Component for TerminalApp {
                     && self.tabs.set_group_pinned(group, pinned)
                 {
                     self.sync_selection(context);
+                    self.refresh_open_commands();
+                }
+            }
+            Message::SetTabColor(group, color) => {
+                if self.active_terminal_group() == Some(group)
+                    && self.tabs.set_group_color(group, color)
+                {
                     self.refresh_open_commands();
                 }
             }
