@@ -164,6 +164,7 @@ public static class WslFixture {
     foreach ($setup in @(
         @{ Shell = 'Bash'; File = 'bash-directory.sh' }
         @{ Shell = 'Zsh'; File = 'zsh-directory.zsh' }
+        @{ Shell = 'Fish'; File = 'fish-directory.fish' }
     )) {
         Run-Palette "Copy $($setup.Shell) directory setup"
         $setupText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "../src/app/$($setup.File)")).TrimEnd()
