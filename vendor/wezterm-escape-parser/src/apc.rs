@@ -1126,6 +1126,13 @@ pub enum KittyImage {
     },
     /// a='q'
     Query { transmit: KittyImageTransmit },
+    /// a='q', e=<action>. This command has no image payload.
+    FeatureQuery {
+        image_id: u32,
+        action: char,
+        options: Vec<(&'static str, String)>,
+        verbosity: KittyImageVerbosity,
+    },
     /// a='f'
     TransmitFrame {
         transmit: KittyImageTransmit,
@@ -1144,6 +1151,7 @@ impl KittyImage {
         match self {
             Self::TransmitData { verbosity, .. } => *verbosity,
             Self::Query { .. } => KittyImageVerbosity::Verbose,
+            Self::FeatureQuery { verbosity, .. } => *verbosity,
             Self::TransmitDataAndDisplay { verbosity, .. } => *verbosity,
             Self::Display { verbosity, .. } => *verbosity,
             Self::Delete { verbosity, .. } => *verbosity,
@@ -1170,6 +1178,38 @@ impl KittyImage {
         let payload = keys_payload_iter.next().unwrap_or(b"");
         let action = get(&keys, "a").unwrap_or("t");
         let verbosity = KittyImageVerbosity::from_keys(&keys)?;
+        if let Some(feature) = get(&keys, "e") {
+            let [feature] = feature.as_bytes() else {
+                return None;
+            };
+            if action != "q" || !feature.is_ascii_graphic() || keys.contains_key("I") {
+                return None;
+            }
+            let image_id = geti::<u32>(&keys, "i").filter(|&id| id != 0)?;
+            // Restrict the kept fields to protocol keys and short scalar
+            // values. The payload is deliberately ignored even for t=f.
+            let options = [
+                "C", "H", "N", "O", "P", "Q", "S", "U", "V", "X", "Y", "c", "d", "f", "h", "o",
+                "p", "r", "s", "t", "v", "w", "x", "y", "z",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                let value = get(&keys, key)?;
+                (!value.is_empty()
+                    && value.len() <= 11
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+                .then(|| (key, value.to_owned()))
+            })
+            .collect();
+            return Some(Self::FeatureQuery {
+                image_id,
+                action: *feature as char,
+                options,
+                verbosity,
+            });
+        }
         match action {
             "t" => Some(Self::TransmitData {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
@@ -1229,6 +1269,18 @@ impl KittyImage {
             Self::Query { transmit } => {
                 keys.insert("a", "q".to_string());
                 transmit.to_keys(keys);
+            }
+            Self::FeatureQuery {
+                image_id,
+                action,
+                options,
+                verbosity,
+            } => {
+                keys.insert("a", "q".to_string());
+                keys.insert("i", image_id.to_string());
+                keys.insert("e", action.to_string());
+                keys.extend(options.iter().map(|&(key, ref value)| (key, value.clone())));
+                verbosity.to_keys(keys);
             }
             Self::TransmitDataAndDisplay {
                 transmit,

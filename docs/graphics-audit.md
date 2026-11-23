@@ -131,6 +131,13 @@ only remaining frame, while uppercase `F` removes its image and placements.
 The shared `clear-frame.vt` fixture checks these results in stock kitty and
 Direct2D. [Kitty 0.45 frame deletion](https://github.com/kovidgoyal/kitty/blob/v0.45.0/kitty/graphics.c#L1591-L1630)
 
+Applications can query an action with `a=q,i=<id>,e=<action>` and include
+the option values they need. For example, `a=q,i=31,e=T,U=1,C=1` reports
+`e=T,C=1,U=1` to confirm Unicode placeholders and cursor preservation.
+The response omits unavailable options such as file and shared-memory
+transports. Queries do not load their payload or disturb an upload in progress.
+[Kitty feature queries](https://sw.kovidgoyal.net/kitty/graphics-protocol/#querying-support-for-protocol-features)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

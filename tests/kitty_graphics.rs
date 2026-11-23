@@ -74,6 +74,101 @@ fn animation_deletion_round_trips_image_and_frame_selectors() {
     }
 }
 
+#[test]
+fn feature_query_round_trips_its_short_options_and_discards_the_payload() {
+    use termwiz::escape::{Action, KittyImage, parser::Parser};
+    let wire = b"\x1b_Ga=q,i=91,e=T,U=1,C=1,t=f;ignored-payload\xff\x1b\\";
+    let actions = Parser::new().parse_as_vec(wire);
+    let Some(Action::KittyImage(command)) = actions.first() else {
+        panic!("expected kitty feature query");
+    };
+    let KittyImage::FeatureQuery {
+        image_id,
+        action,
+        options,
+        ..
+    } = command.as_ref()
+    else {
+        panic!("expected a feature query");
+    };
+    assert_eq!((*image_id, *action), (91, 'T'));
+    assert_eq!(
+        options,
+        &[("C", "1".into()), ("U", "1".into()), ("t", "f".into())]
+    );
+    let encoded: String = actions.iter().map(ToString::to_string).collect();
+    assert_eq!(encoded, "\x1b_GC=1,U=1,a=q,e=T,i=91,t=f\x1b\\");
+    assert_eq!(Parser::new().parse_as_vec(encoded.as_bytes()), actions);
+    for malformed in [
+        "Ga=q,e=T",
+        "Ga=q,i=0,e=T",
+        "Ga=q,i=1,I=2,e=T",
+        "Ga=q,i=1,e=TT",
+        "Ga=t,i=1,e=T",
+    ] {
+        assert!(
+            KittyImage::parse_apc(malformed.as_bytes()).is_none(),
+            "{malformed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn graphics_feature_queries_only_report_options_supported_for_the_requested_action() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=q,i=31,e=T,C=1,U=1,t=f,N=1,f=8,w=3,H=-2,z=0;ignored\x1b\\",
+        "\x1b_Ga=q,i=32,e=f,r=1,X=1,f=24,U=1\x1b\\",
+        "\x1b_Ga=q,i=33,e=d,d=F,r=2,m=1\x1b\\",
+        "\x1b_Ga=q,i=34,e=c,C=1,r=3,w=1,o=z\x1b\\",
+        "\x1b_Ga=q,i=35,e=p,U=2,c=4294967296,o=z\x1b\\",
+        "\x1b_Ga=q,i=36,e=x,U=1\x1b\\",
+        "\x1b_Ga=q,i=37,e=a,s=3,c=1,v=2,z=-1\x1b\\",
+        "\x1b_Ga=q,i=38,e=t,t=d,o=z,f=32,s=1,v=1,S=4\x1b\\",
+        "\x1b_Ga=q,i=39,e=p,q=1\x1b\\",
+        "\x1b_Ga=q,i=40,e=p,q=2\x1b\\",
+        "\x1b_Ga=q,i=41,s=1,v=1,f=24;AAAA\x1b\\",
+        "\x1b[5n",
+    ));
+    let replies = read_through(&mut replies, b"\x1b[0n").await;
+    assert_eq!(
+        replies,
+        concat!(
+            "\x1b_Gi=31,e=T,C=1,H=-2,U=1,w=3;OK\x1b\\",
+            "\x1b_Gi=32,e=f,X=1,f=24,r=1;OK\x1b\\",
+            "\x1b_Gi=33,e=d,d=F,r=2;OK\x1b\\",
+            "\x1b_Gi=34,e=c,C=1,r=3,w=1;OK\x1b\\",
+            "\x1b_Gi=35,e=p;OK\x1b\\",
+            "\x1b_Gi=36;OK\x1b\\",
+            "\x1b_Gi=37,e=a,c=1,s=3,v=2,z=-1;OK\x1b\\",
+            "\x1b_Gi=38,e=t,f=32,o=z,s=1,t=d,v=1;OK\x1b\\",
+            "\x1b_Gi=41;OK\x1b\\",
+            "\x1b[0n",
+        )
+    );
+}
+
+#[tokio::test]
+async fn feature_query_has_no_effect_on_images_or_a_chunked_upload() {
+    let (mut t, mut replies) = engine();
+    transmit_red(&mut t, 11);
+    place(&mut t, 11, 1, 2, 3, 1);
+    t.advance_bytes(concat!(
+        "\x1b_Ga=T,i=31,p=1,f=32,s=1,v=1,c=1,r=1,C=1,q=2,m=1;AP8A\x1b\\",
+        "\x1b_Ga=q,i=11,e=d,d=I\x1b\\",
+        "\x1b_Ga=q,i=31,e=T,m=1,t=s;invalid payload\x1b\\",
+        "\x1b_Gm=0,q=2;/w==\x1b\\",
+        "\x1b[5n",
+    ));
+    assert_eq!(
+        read_through(&mut replies, b"\x1b[0n").await,
+        "\x1b_Gi=11,e=d,d=I;OK\x1b\\\x1b_Gi=31,e=T;OK\x1b\\\x1b[0n"
+    );
+    let committed = frame(&t, None, 0);
+    assert_eq!(pixel(&committed, 2, 1, 11), RED);
+    assert_eq!(pixel(&committed, 2, 1, 31), Some([0, 255, 0, 255]));
+}
+
 fn engine() -> (
     Terminal,
     tokio::sync::mpsc::UnboundedReceiver<TransportInput>,
