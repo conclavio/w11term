@@ -152,3 +152,7 @@ The original MIT license is preserved in `LICENSE.md`.
 - DECSACE selects a wrapped range or rectangle for DECCARA and DECRARA
   attribute edits. Changes are applied in place to preserve text, metadata
   and graphics. DECRQSS reports the selected extent.
+
+- DECIC and DECDC shift the cells in each row of the scrolling region
+  once. They insert default blanks, clip split wide glyphs, and preserve
+  the row rendition and stationary Kitty placements.
