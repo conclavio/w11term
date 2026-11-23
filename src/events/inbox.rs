@@ -1,4 +1,4 @@
-use super::Event;
+use super::{CommandLink, Event};
 use std::{
     collections::VecDeque,
     fmt,
@@ -16,6 +16,7 @@ pub struct Notice {
     pub sequence: u64,
     pub message: String,
     pub unread: bool,
+    pub command: Option<CommandLink>,
 }
 
 #[derive(Default)]
@@ -113,8 +114,22 @@ impl Inbox {
             sequence: event.sequence,
             message,
             unread: true,
+            command: event.command,
         });
         self.wake_ui(state);
+    }
+
+    pub(crate) fn command_links_changed(
+        &self,
+        pane: u64,
+        changed: impl Fn(CommandLink) -> bool,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .any(|row| row.pane == pane && row.command.is_some_and(&changed))
     }
 
     pub(crate) fn refresh(&self) {
@@ -192,6 +207,16 @@ impl Inbox {
             .rev()
             .cloned()
             .collect()
+    }
+
+    pub fn command_link(&self, pane: u64, sequence: u64) -> Option<CommandLink> {
+        self.state
+            .lock()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.pane == pane && row.sequence == sequence)?
+            .command
     }
 
     pub fn mark_read(&self, pane: u64, sequence: u64) -> bool {

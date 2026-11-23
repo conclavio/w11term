@@ -89,8 +89,8 @@ pub enum Alert {
 pub trait AlertHandler: Send + Sync {
     fn alert(&mut self, alert: Alert);
 
-    /// Live primary-screen markers, observed in parser order before history capture.
-    fn semantic_prompt(&mut self, _marker: &FinalTermSemanticPrompt) {}
+    /// Live primary-screen markers and the captured command ID, if the marker finished output.
+    fn semantic_prompt(&mut self, _marker: &FinalTermSemanticPrompt, _completed: Option<u64>) {}
     fn terminal_reset(&mut self) {}
 }
 

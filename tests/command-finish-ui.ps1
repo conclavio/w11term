@@ -24,7 +24,8 @@ function Assert-CompletionCodes([object[]]$Expected) {
     }
     for ($i = 0; $i -lt $Expected.Count; $i++) {
         $data = $events[$i].data
-        if ($data.PSObject.Properties.Name -notcontains 'exit_code' -or
+        if (@($data.PSObject.Properties.Name | Where-Object { $_ -cnotin @('exit_code','duration_ms') }).Count -gt 0 -or
+            $data.PSObject.Properties.Name -notcontains 'exit_code' -or
             ($null -ne $data.exit_code -and $data.exit_code -isnot [int] -and $data.exit_code -isnot [long]) -or
             $data.exit_code -ne $Expected[$i]) {
             throw "Unexpected completion payload: $($data | ConvertTo-Json -Compress)"
@@ -69,7 +70,16 @@ try {
     Send-PeerOutput 'not-rearmed'
     Assert-CompletionCodes @(17)
     if ((Read-ActiveShellPid 'shell-during') -ne $shellPid) { throw 'The notification interrupted PowerShell' }
-    Visit-Notification 'exit code 17'
+    $first = ((Control @('list-commands','--pane',"$remote")).commands | Where-Object exit_code -eq 17).id
+    Invoke-Button (Wait-Until 'one unread command notification' { Find-Element 'Attention inbox, 1 unread' })
+    $view = "View command $first for palette-ssh, pane $remote"
+    Invoke-Button (Wait-Until $view { Find-Element $view })
+    $selected = "Selected, build $dot exit 17"
+    $null = Wait-Until 'older failed command selected' { Find-Element $selected }
+    $null = Wait-Until 'newer success shown beside the selected command' { Find-Element "build $dot exit 0" }
+    $null = Wait-Until 'command notification acknowledged' { Find-Element 'Attention inbox, 0 unread' }
+    Invoke-Button (Wait-Until 'return from command history' { Find-Element 'Return to pane' })
+    Wait-Focus $remote
 
     Run-Palette $arm
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })

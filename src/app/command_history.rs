@@ -152,7 +152,7 @@ impl TerminalApp {
         assert_eq!(selected.exit_code, Some(0));
     }
 
-    fn history_frame(&self, pane: u64) -> Option<Arc<Snapshot>> {
+    pub(super) fn history_frame(&self, pane: u64) -> Option<Arc<Snapshot>> {
         let tab = self.tabs.get(self.tab_for_pane(pane)?)?;
         match &tab.page {
             Page::Terminal(live) => Some(live.session.frames.load()),
@@ -240,6 +240,50 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn open_command_history(
+        &mut self,
+        pane: u64,
+        target: Option<w11term::events::CommandLink>,
+        ctx: &ComponentContext<Self>,
+    ) -> bool {
+        let Some(source) = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) else {
+            return false;
+        };
+        let Some(frame) = self.history_frame(pane) else {
+            return false;
+        };
+        let label = format!("History · {}", source.label);
+        let selected = match target {
+            Some(link) if frame.has_command(link) => Some((link.generation, link.id)),
+            Some(_) => return false,
+            None => newest(&frame, "", CommandStatus::All),
+        };
+        let existing = self
+            .tabs
+            .entries()
+            .iter()
+            .find(|tab| matches!(&tab.value.page, Page::CommandHistory(page) if page.pane == pane))
+            .map(|tab| tab.id);
+        let page = Page::CommandHistory(HistoryPage {
+            pane,
+            selected,
+            query: String::new(),
+            status: CommandStatus::All,
+            feedback: String::new(),
+            save: None,
+            showing: None,
+        });
+        if let Some(id) = existing {
+            self.tabs.get_mut(id).unwrap().page = page;
+            self.tabs.select(id);
+        } else {
+            self.tabs.insert(AppTab { label, page });
+        }
+        self.sync_selection(ctx);
+        self.activate(ctx);
+        true
+    }
+
     pub(super) fn handle_history(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         if let Action::OutputShown {
             page,
@@ -288,30 +332,7 @@ impl TerminalApp {
                 return;
             };
             let Some(pane) = source.pane_id() else { return };
-            let label = format!("History · {}", source.label);
-            let selected = self
-                .history_frame(pane)
-                .and_then(|frame| newest(&frame, "", CommandStatus::All));
-            let existing = self.tabs.entries().iter()
-                .find(|tab| matches!(&tab.value.page, Page::CommandHistory(page) if page.pane == pane))
-                .map(|tab| tab.id);
-            let page = Page::CommandHistory(HistoryPage {
-                pane,
-                selected,
-                query: String::new(),
-                status: CommandStatus::All,
-                feedback: String::new(),
-                save: None,
-                showing: None,
-            });
-            if let Some(id) = existing {
-                self.tabs.get_mut(id).unwrap().page = page;
-                self.tabs.select(id);
-            } else {
-                self.tabs.insert(AppTab { label, page });
-            }
-            self.sync_selection(ctx);
-            self.activate(ctx);
+            self.open_command_history(pane, None, ctx);
             return;
         }
         let Some(id) = self.tabs.active_id() else {
