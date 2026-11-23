@@ -972,6 +972,8 @@ impl TerminalState {
                 self.capturing_shell_input = false;
             }
             let col = self.shell_column();
+            self.screen
+                .remember_command_output(self.next_command_id, (self.cursor.y, col));
             let output = self
                 .screen
                 .take_command_text(self.cursor.y, col, 1024 * 1024);
@@ -986,9 +988,18 @@ impl TerminalState {
             history.push_back(command);
             let mut bytes: usize = history.iter().map(|entry| entry.text_bytes()).sum();
             while history.len() > 64 || bytes > 4 * 1024 * 1024 {
-                bytes -= history.pop_front().unwrap().text_bytes();
+                let old = history.pop_front().unwrap();
+                bytes -= old.text_bytes();
+                self.screen.forget_command_output(old.id);
             }
         }
+    }
+
+    pub fn command_output_row(&self, id: u64) -> Option<StableRowIndex> {
+        if self.is_alt_screen_active() {
+            return None;
+        }
+        self.screen.command_output_row(id)
     }
 
     /// Returns a copy of the palette.
@@ -2793,6 +2804,7 @@ impl TerminalState {
         let keep_placements = preserve_kitty && self.kitty_img.has_physical_placements();
         let screen = self.screen_mut();
         let row = screen.phys_row(y);
+        screen.discard_erased_output(row, &cols);
         let mut saved = Vec::new();
         if keep_placements {
             let line = screen.line_mut(row);

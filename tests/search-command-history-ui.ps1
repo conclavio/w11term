@@ -29,6 +29,14 @@ function Search([string]$Text) {
     $field = Wait-Until 'command search field' { Find-Element 'Search command history' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
 }
+function Visible-TerminalText {
+    $doc = Find-Element ("Terminal" + $dot + "palette-ssh") ([System.Windows.Automation.ControlType]::Document)
+    $provider = $null
+    if ($doc -and $doc.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$provider)) {
+        $ranges = @($provider.GetVisibleRanges())
+        if ($ranges.Count) { $ranges[0].GetText(-1) }
+    }
+}
 function Find-OutputDialog {
     foreach ($handle in [FixtureDialog]::Windows($app.Id)) {
         if ([FixtureDialog]::GetWindow($handle, 4) -ne $window) { continue }
@@ -207,6 +215,22 @@ try {
     } catch {
         throw "$_ Screen: $((Control @('get-text','--pane',"$remote")).text)"
     }
+    $beforeJump = Wait-Until 'live viewport with the oldest command offscreen' { Visible-TerminalText }
+    if ($beforeJump.Contains('archived deploy output')) { throw 'The old command must begin above the viewport' }
+    $null = Control @('resize','--pane',"$remote",'--cols','84','--rows','28')
+    Run-Palette 'Command history'
+    Search $word
+    Click 'Show output in pane'
+    Wait-Focus $remote
+    $null = Wait-Until 'the selected output starts the viewport after reflow' {
+        (Visible-TerminalText) -like 'archived deploy output*'
+    }
+    Run-Palette 'Clear scrollback'
+    Run-Palette 'Command history'
+    Search $word
+    Click 'Show output in pane'
+    $missing = 'This command' + [char]0x2019 + 's output location is no longer available.'
+    $null = Wait-Until 'cleared output reports its missing location in history' { Find-Element $missing }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

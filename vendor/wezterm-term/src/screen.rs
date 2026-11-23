@@ -65,6 +65,8 @@ pub struct Screen {
     history_clear_count: u64,
     /// Start of the primary shell's current OSC 133 C/D output range.
     pub(crate) command_start: Option<(StableRowIndex, usize)>,
+    // One anchor per retained completed command whose output can be located.
+    command_outputs: Vec<(u64, StableRowIndex, usize)>,
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
@@ -116,6 +118,7 @@ impl Screen {
             placement_row_revision: 0,
             history_clear_count: 0,
             command_start: None,
+            command_outputs: Vec::new(),
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
@@ -126,6 +129,7 @@ impl Screen {
         self.invalidate_row_coordinates();
         self.keyboard_stack.clear();
         self.command_start = None;
+        self.command_outputs.clear();
         self.saved_cursor = None;
     }
 
@@ -149,6 +153,61 @@ impl Screen {
 
     pub fn history_clear_count(&self) -> u64 {
         self.history_clear_count
+    }
+
+    pub(crate) fn remember_command_output(&mut self, id: u64, end: (VisibleRowIndex, usize)) {
+        let Some((row, col)) = self.command_start else {
+            return;
+        };
+        let Some(phys) = self.stable_row_to_phys(row) else {
+            return;
+        };
+        if (row, col) > (self.visible_row_to_stable_row(end.0), end.1) {
+            return;
+        }
+        let line = &self.lines[phys];
+        // A C marker at the pending wrap boundary precedes output on the next row.
+        let (row, col) =
+            if col >= line.len() && line.last_cell_was_wrapped() && phys + 1 < self.lines.len() {
+                (row + 1, 0)
+            } else {
+                (row, col)
+            };
+        self.command_outputs.push((id, row, col));
+    }
+
+    pub(crate) fn forget_command_output(&mut self, id: u64) {
+        self.command_outputs
+            .retain(|&(command, _, _)| command != id);
+    }
+
+    pub(crate) fn command_output_row(&self, id: u64) -> Option<StableRowIndex> {
+        let &(_, row, _) = self
+            .command_outputs
+            .iter()
+            .find(|(command, _, _)| *command == id)?;
+        self.stable_row_to_phys(row).map(|_| row)
+    }
+
+    fn discard_output_rows(&mut self, rows: Range<PhysRowIndex>) {
+        let start = self.phys_to_stable_row_index(rows.start);
+        let end = self.phys_to_stable_row_index(rows.end);
+        self.command_outputs
+            .retain(|&(_, row, _)| !(start..end).contains(&row));
+    }
+
+    pub(crate) fn discard_erased_output(&mut self, row: PhysRowIndex, cols: &Range<usize>) {
+        let row = self.phys_to_stable_row_index(row);
+        let max_col = self.physical_cols - 1;
+        self.command_outputs
+            .retain(|&(_, marked, col)| marked != row || !cols.contains(&col.min(max_col)));
+    }
+
+    fn retain_output_rows(&mut self) {
+        let start = self.phys_to_stable_row_index(0);
+        let end = self.phys_to_stable_row_index(self.lines.len());
+        self.command_outputs
+            .retain(|&(_, row, _)| (start..end).contains(&row));
     }
 
     pub(crate) fn take_command_text(
@@ -233,6 +292,13 @@ impl Screen {
         let marker = self
             .command_start
             .and_then(|(row, col)| self.stable_row_to_phys(row).map(|row| (row, col)));
+        let mut outputs: Vec<_> = std::mem::take(&mut self.command_outputs)
+            .into_iter()
+            .filter_map(|(id, row, col)| self.stable_row_to_phys(row).map(|row| (row, id, col)))
+            .collect();
+        outputs.sort_unstable_by_key(|&(row, _, _)| row);
+        let mut outputs = outputs.into_iter().peekable();
+        let mut logical_outputs = Vec::new();
         let mut logical_marker = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
@@ -246,6 +312,9 @@ impl Screen {
                 if phys_idx == row {
                     logical_marker = Some(logical_line.as_ref().map_or(0, Line::len) + col);
                 }
+            }
+            while let Some((_, id, col)) = outputs.next_if(|(row, _, _)| *row == phys_idx) {
+                logical_outputs.push((Some(id), logical_line.as_ref().map_or(0, Line::len) + col));
             }
 
             if was_wrapped {
@@ -323,16 +392,24 @@ impl Screen {
                     rewrapped.push_back(line);
                 }
             }
-            if let Some(mut col) = logical_marker.take() {
+            for (id, mut col) in logical_marker
+                .take()
+                .map(|col| (None, col))
+                .into_iter()
+                .chain(logical_outputs.drain(..))
+            {
                 // Use the actual wrapped lengths: a wide grapheme can move to
                 // the next row while there is still a single column available.
                 for row in first_rewrapped..rewrapped.len() {
                     let width = rewrapped[row].len();
                     if col < width || row + 1 == rewrapped.len() {
-                        self.command_start = Some((
-                            (self.stable_row_index_offset + discarded + row) as StableRowIndex,
-                            col,
-                        ));
+                        let row =
+                            (self.stable_row_index_offset + discarded + row) as StableRowIndex;
+                        if let Some(id) = id {
+                            self.command_outputs.push((id, row, col));
+                        } else {
+                            self.command_start = Some((row, col));
+                        }
                         break;
                     }
                     col -= width;
@@ -361,6 +438,7 @@ impl Screen {
         drop(lines);
         self.lines = rewrapped;
         self.stable_row_index_offset += discarded;
+        self.retain_output_rows();
 
         adjusted_cursor
     }
@@ -404,6 +482,7 @@ impl Screen {
                 self.lines.pop_back();
             }
         }
+        self.retain_output_rows();
 
         let old_origin = self.stable_row_index_offset;
         let (cursor_x, cursor_y) = if physical_cols != self.physical_cols {
@@ -806,6 +885,9 @@ impl Screen {
         self.placement_rows_changed();
         // Need to do the slower, more complex left and right bounded scroll
         let phys_scroll = self.phys_range(scroll_region);
+        if num_rows != 0 {
+            self.discard_output_rows(phys_scroll.clone());
+        }
 
         // The scroll is really a copy + a clear operation
         let region_height = phys_scroll.end - phys_scroll.start;
@@ -894,6 +976,14 @@ impl Screen {
         self.placement_rows_changed();
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
         let insert_at_end = scroll_region.end as usize == self.physical_rows;
+        if num_rows != 0 && (!scrollback_ok || !insert_at_end) {
+            let end = if scrollback_ok {
+                self.lines.len()
+            } else {
+                phys_scroll.end
+            };
+            self.discard_output_rows(phys_scroll.start..end);
+        }
 
         debug!(
             "scroll_up {:?} num_rows={} phys_scroll={:?}",
@@ -1038,6 +1128,9 @@ impl Screen {
         debug!("scroll_down {:?} {}", scroll_region, num_rows);
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
+        if num_rows != 0 {
+            self.discard_output_rows(phys_scroll.clone());
+        }
 
         let middle = phys_scroll.end - num_rows;
 
@@ -1087,6 +1180,9 @@ impl Screen {
         // The scroll is really a copy + a clear operation
         let region_height = phys_scroll.end - phys_scroll.start;
         let num_rows = num_rows.min(region_height);
+        if num_rows != 0 {
+            self.discard_output_rows(phys_scroll.clone());
+        }
         let rows_to_copy = region_height - num_rows;
 
         if rows_to_copy > 0 {
