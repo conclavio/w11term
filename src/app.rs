@@ -46,6 +46,7 @@ fn tab_pin_command(label: &str) -> Option<bool> {
 }
 
 mod attention;
+mod bulk_tab_close;
 mod clipboard_paste;
 mod command_history;
 mod config_import;
@@ -792,6 +793,8 @@ enum UiWork {
 
 struct CaretMenuBinding {
     broadcast: Option<pane_broadcast::Action>,
+    close_other_tabs: Option<bulk_tab_close::Offer>,
+    close_tabs_right: Option<bulk_tab_close::Offer>,
     recordings: recordings::Choices,
     previous: Option<previous_pane::Target>,
     forward: Option<local_forwards::Origin>,
@@ -982,6 +985,7 @@ pub enum Message {
     ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
     SetTabPinned(TabId, bool),
+    CloseTabs(bulk_tab_close::Offer),
     WindowTick,
     WindowTargetsChanged,
     DismissWindowError,
@@ -2600,22 +2604,38 @@ impl TerminalApp {
     }
 
     fn close_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
-        let Some(group) = self.tabs.group_id(id) else {
-            return;
-        };
-        let active = self.active_group.get() == Some(group);
-        if active {
-            self.keyboard.set_target(None);
-            self.cancel_frame_tasks();
+        self.close_tabs(std::iter::once(id), context);
+    }
+
+    fn close_tabs(
+        &mut self,
+        entries: impl IntoIterator<Item = TabId>,
+        context: &ComponentContext<Self>,
+    ) {
+        let mut closed = false;
+        let mut active_closed = false;
+        for id in entries {
+            let Some(group) = self.tabs.group_id(id) else {
+                continue;
+            };
+            if self.active_group.get() == Some(group) {
+                active_closed = true;
+                self.keyboard.set_target(None);
+                self.cancel_frame_tasks();
+            }
+            self.tabs.remove_group(id);
+            self.mru_groups.retain(|g| *g != group);
+            closed = true;
         }
-        self.tabs.remove_group(id);
-        self.mru_groups.retain(|g| *g != group);
+        if !closed {
+            return;
+        }
         self.publish_panes();
         if self.tabs.entries().is_empty() {
             let _ = context.window().request_close();
         } else {
             self.sync_selection(context);
-            if active {
+            if active_closed {
                 self.activate(context);
             } else {
                 self.refresh_open_commands();
@@ -3094,8 +3114,12 @@ impl TerminalApp {
         let closed_pane = self.closed_pane.as_ref().map(|closed| closed.id);
         let forward = self.forward_origin();
         let broadcast = self.broadcast_offer();
+        let close_other_tabs = self.bulk_close_offer(bulk_tab_close::Scope::Other);
+        let close_tabs_right = self.bulk_close_offer(bulk_tab_close::Scope::Right);
         if let Some(binding) = cached.as_ref()
             && binding.broadcast == broadcast
+            && binding.close_other_tabs == close_other_tabs
+            && binding.close_tabs_right == close_tabs_right
             && binding.previous == previous
             && binding.forward == forward
             && binding.pane == pane
@@ -3115,6 +3139,8 @@ impl TerminalApp {
         let split_target = directory_split.clone();
         let offered = arrangement.clone();
         let offered_broadcast = broadcast.clone();
+        let offered_close_other = close_other_tabs.clone();
+        let offered_close_right = close_tabs_right.clone();
         let on_click = context.callback(move |label: String| match label.as_str() {
             label if pane_broadcast::is_label(label) => offered_broadcast
                 .clone()
@@ -3126,6 +3152,12 @@ impl TerminalApp {
                 }),
             local_forwards::LABEL => local_forwards::open(forward),
             tab_title::RENAME_PANE => tab_title::show_pane(pane.zip(group)),
+            label if let Some(scope) = bulk_tab_close::Scope::from_label(label) => match scope {
+                bulk_tab_close::Scope::Other => &offered_close_other,
+                bulk_tab_close::Scope::Right => &offered_close_right,
+            }
+            .clone()
+            .map_or(Message::ControlIdle, Message::CloseTabs),
             label if let Some(pinned) = tab_pin_command(label) => {
                 group.map_or(Message::ControlIdle, |id| Message::SetTabPinned(id, pinned))
             }
@@ -3165,6 +3197,8 @@ impl TerminalApp {
         });
         *cached = Some(CaretMenuBinding {
             broadcast,
+            close_other_tabs,
+            close_tabs_right,
             recordings,
             previous,
             closed_group,
@@ -3407,6 +3441,18 @@ impl TerminalApp {
                 self.active_terminal_group().is_some(),
             ),
             self.duplicate_tab_item(),
+            command_menu_item(
+                "close-other-tabs",
+                bulk_tab_close::Scope::Other.label(),
+                self.bulk_close_offer(bulk_tab_close::Scope::Other)
+                    .is_some(),
+            ),
+            command_menu_item(
+                "close-tabs-right",
+                bulk_tab_close::Scope::Right.label(),
+                self.bulk_close_offer(bulk_tab_close::Scope::Right)
+                    .is_some(),
+            ),
             self.binding_menu_enabled(
                 "reopen_closed_tab",
                 KeyAction::ReopenClosedTab.binding().label,
@@ -4639,6 +4685,7 @@ impl Component for TerminalApp {
                     self.refresh_open_commands();
                 }
             }
+            Message::CloseTabs(offer) => self.close_tabs_from_offer(offer, context),
             Message::WindowTick => self.window_tick(context),
             Message::WindowTargetsChanged => self.refresh_open_commands(),
             Message::TransferRequest(source, id) => self.accept_transfer(source, id, context),

@@ -1542,6 +1542,12 @@ async fn native_keyboard_tab_reorder_and_pin_preserve_focus_and_live_sessions() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "exercises bulk tab closing with pinned SSH, native PowerShell and Settings"]
+async fn native_bulk_close_tabs_keeps_the_pinned_ssh_and_selected_shell() {
+    run_palette_fixture("bulk-close-tabs-ui.ps1", b"before/after/", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "toggles the previously focused live SSH or PowerShell pane across splits, tabs and Settings"]
 async fn native_previous_pane_reuses_live_shells_across_tabs_and_skips_closed_panes() {
     let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
