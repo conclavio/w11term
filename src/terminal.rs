@@ -1368,6 +1368,108 @@ mod tests {
     }
 
     #[test]
+    fn xterm_private_modes_restore_named_values_without_consuming_them() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[?1;2004h\x1b[?25l");
+        // Save both set and reset values. A numerically valid unknown mode can
+        // appear anywhere in the list.
+        term.advance_bytes(b"\x1b[?1;65530;25;2004s\x1b[?1;2004l\x1b[?25h");
+        term.advance_bytes(b"\x1b[?65530;2004r");
+        assert!(term.bracketed_paste_enabled());
+        term.send_paste("saved paste").unwrap();
+        assert_eq!(receive(&mut out), b"\x1b[200~saved paste\x1b[201~");
+        term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+        assert_eq!(receive(&mut out), b"\x1b[A");
+
+        for _ in 0..2 {
+            term.advance_bytes(b"\x1b[?1l\x1b[?25h\x1b[?1;25r\x1b[?25$p");
+            assert_eq!(receive(&mut out), b"\x1b[?25;2$y");
+            term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+            assert_eq!(receive(&mut out), b"\x1bOA");
+        }
+
+        term.advance_bytes(b"\x1b[?2004l\x1b[?2004s\x1b[?2004h\x1b[?2004r");
+        term.send_paste("new saved value").unwrap();
+        assert_eq!(receive(&mut out), b"new saved value");
+    }
+
+    #[test]
+    fn xterm_private_modes_save_mouse_groups_and_preserve_both_screen_buffers() {
+        use wezterm_term::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"primary\x1b[?47s\x1b[?1049halternate");
+        term.advance_bytes(b"\x1b[?1047r\x1b[?1049$p");
+        assert_eq!(receive(&mut out), b"\x1b[?1049;2$y");
+        assert!(text(&term).starts_with("primary"));
+        term.advance_bytes(b"\x1b[?47h\x1b[?1049s\x1b[?47l\x1b[?47r");
+        assert!(term.is_alt_screen_active());
+        assert!(text(&term).starts_with("alternate"));
+
+        // Each group saves its current state, including when the named alias
+        // differs from the active reporting level or encoding.
+        term.advance_bytes(b"\x1b[?1002;1006h\x1b[?1000;1005s");
+        term.advance_bytes(b"\x1b[?1002l\x1b[?1003;1016h\x1b[?1003;1016r");
+        assert!(term.button_event_mouse_enabled());
+        assert!(!term.any_event_mouse_enabled());
+        assert_eq!(term.get_mouse_encoding(), wezterm_term::MouseEncoding::SGR);
+        term.mouse_event(MouseEvent {
+            kind: MouseEventKind::Press,
+            button: MouseButton::Left,
+            x: 2,
+            y: 3,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        assert_eq!(receive(&mut out), b"\x1b[<0;3;4M");
+    }
+
+    #[test]
+    fn xterm_private_modes_restore_cursor_and_resize_side_effects() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[5;10H\x1b[?1048s\x1b[H\x1b[?1048r\x1b[6n");
+        assert_eq!(receive(&mut out), b"\x1b[5;10R");
+        term.advance_bytes(b"\x1b[2;8r\x1b[?6h\x1b[?6s\x1b[?6l\x1b[5;10H\x1b[?6r\x1b[6n");
+        assert_eq!(receive(&mut out), b"\x1b[1;1R");
+        assert_eq!(term.cursor_pos().y, 1);
+
+        term.advance_bytes(b"\x1b[?2048h");
+        assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+        term.advance_bytes(b"\x1b[?2048s\x1b[?2048l\x1b[?2048r");
+        assert_eq!(receive(&mut out), b"\x1b[48;24;80;480;800t");
+    }
+
+    #[test]
+    fn xterm_private_modes_keep_saves_through_soft_reset_and_clear_on_full_reset() {
+        for reset_connection in [false, true] {
+            let (mut term, mut out) = engine();
+            term.advance_bytes(b"\x1b[?1;2004h\x1b[?1;2004s\x1b[!p\x1b[?2004l\x1b[?1;2004r");
+            assert!(term.bracketed_paste_enabled());
+            term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+            assert_eq!(receive(&mut out), b"\x1bOA");
+
+            term.advance_bytes(b"\x1b[5;10H\x1b[?1048s");
+            if reset_connection {
+                term.reset_connection();
+            } else {
+                term.advance_bytes(b"\x1bc");
+            }
+            term.advance_bytes(b"\x1b[?1;2004;1048r\x1b[6n");
+            assert_eq!(receive(&mut out), b"\x1b[1;1R");
+            assert!(!term.bracketed_paste_enabled());
+            term.key_down(KeyCode::UpArrow, KeyModifiers::NONE).unwrap();
+            assert_eq!(receive(&mut out), b"\x1b[A");
+
+            term.advance_bytes(b"keep\x1b[?3s\x1b[?3r\x1b[?7r");
+            assert!(text(&term).starts_with("keep"));
+            term.advance_bytes(b"\x1b[?7$p");
+            assert_eq!(receive(&mut out), b"\x1b[?7;1$y");
+        }
+    }
+
+    #[test]
     fn synchronized_output_queries_and_resets_follow_parser_state() {
         let (mut t, mut rx) = engine();
         for byte in b"\x1b[?2026h" {

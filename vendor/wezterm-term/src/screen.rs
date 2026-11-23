@@ -126,6 +126,7 @@ impl Screen {
         self.invalidate_row_coordinates();
         self.keyboard_stack.clear();
         self.command_start = None;
+        self.saved_cursor = None;
     }
 
     fn next_row_epoch() -> u64 {
