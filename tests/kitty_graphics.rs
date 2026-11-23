@@ -1050,6 +1050,30 @@ fn place(t: &mut Terminal, id: u32, placement: u32, row: usize, col: usize, heig
 }
 
 #[test]
+fn archive_display_retains_image_only_rows_and_clips_relative_images_at_the_old_edge() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "\x1b[5;3H\x1b_Ga=T,i=40,p=1,f=24,s=1,v=1,C=1,q=2;/wAA\x1b\\",
+        "\x1b_Ga=t,i=41,f=24,s=1,v=3,q=2;/wAAAP8AAAD/\x1b\\",
+        "\x1b_Ga=p,i=41,p=2,P=40,Q=1,H=1,V=2,c=1,r=3,q=2\x1b\\",
+    ));
+    let original = frame(&t, None, 0);
+    assert_eq!(pixel(&original, 2, 4, 40), RED);
+    assert_eq!(pixel(&original, 3, 6, 41), RED);
+    assert_eq!(pixel(&original, 3, 7, 41), Some([0, 255, 0, 255]));
+
+    t.advance_bytes(b"\x1b[22J");
+    let live = frame(&t, None, 0);
+    assert_eq!(pixel(&live, 3, 0, 41), None);
+    let history = frame(&t, None, usize::MAX);
+    assert_eq!(history.scroll_offset, 8);
+    assert_eq!(pixel(&history, 2, 4, 40), RED);
+    assert_eq!(pixel(&history, 3, 6, 41), RED);
+    assert_eq!(pixel(&history, 3, 7, 41), Some([0, 255, 0, 255]));
+    assert_eq!(pixel(&frame(&t, None, 4), 3, 4, 41), None);
+}
+
+#[test]
 fn text_erasure_keeps_direct_kitty_layers_and_full_screen_erase_clears_them() {
     let (mut t, _) = engine();
     t.advance_bytes(concat!(

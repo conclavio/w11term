@@ -511,6 +511,16 @@ async fn roundtrip(
         let done = echoed(&session, &mut output, b"\x1b[?2026l").await;
         assert_eq!(done.generation, old.generation + 1);
         assert!(done.rows[0].as_str().starts_with("NEW"));
+        let archived = echoed(&session, &mut output, b"\x1b[22J\x1b[HAFTER").await;
+        assert!(archived.rows[0].as_str().starts_with("AFTER"));
+        assert_eq!(archived.first_stable_row, done.first_stable_row + 1);
+        session.input.send(Command::Scroll(1)).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        assert!(session.frames.changed(archived.generation, deadline).await);
+        let history = session.frames.load();
+        assert_eq!(history.scroll_offset, 1);
+        assert!(history.rows[0].as_str().starts_with("NEW"));
+        assert!(history.rows[1].as_str().starts_with("AFTER"));
         drop(session);
         tokio::time::timeout(Duration::from_secs(2), server)
             .await

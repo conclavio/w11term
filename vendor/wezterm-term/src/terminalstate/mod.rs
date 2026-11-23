@@ -2791,6 +2791,41 @@ impl TerminalState {
         }
     }
 
+    fn archive_display(&mut self) {
+        let rows = self.screen().physical_rows;
+        if !self.is_alt_screen_active()
+            && self.top_and_bottom_margins == (0..rows as VisibleRowIndex)
+        {
+            let screen = self.screen();
+            let blank = CellAttributes::blank();
+            let last_cell_row = screen
+                .physical_lines()
+                .rev()
+                .take(rows)
+                .position(|line| {
+                    !line.is_single_width()
+                        || line
+                            .visible_cells()
+                            .any(|cell| cell.str() != " " || cell.attrs() != &blank)
+                })
+                .map_or(0, |from_bottom| rows - from_bottom);
+            let count = last_cell_row.max(self.archive_kitty_relative_rows());
+            if count != 0 {
+                let seqno = self.seqno;
+                let pen = self.pen.clone_sgr_only();
+                let bidi_mode = self.get_bidi_mode();
+                self.screen_mut().scroll_up(
+                    &(0..rows as VisibleRowIndex),
+                    count,
+                    seqno,
+                    pen,
+                    bidi_mode,
+                );
+            }
+        }
+        self.erase_in_display(EraseInDisplay::EraseDisplay);
+    }
+
     fn erase_in_display(&mut self, erase: EraseInDisplay) {
         let seqno = self.seqno;
         let cy = self.cursor.y;
@@ -3021,6 +3056,7 @@ impl TerminalState {
             Edit::ScrollLeft(n) => self.scroll_columns(n, column_edit::Shift::Left),
             Edit::ScrollRight(n) => self.scroll_columns(n, column_edit::Shift::Right),
             Edit::EraseInDisplay(erase) => self.erase_in_display(erase),
+            Edit::ArchiveDisplay => self.archive_display(),
             Edit::Repeat(n) => {
                 let mut y = self.cursor.y;
                 let mut x = self.cursor.x;

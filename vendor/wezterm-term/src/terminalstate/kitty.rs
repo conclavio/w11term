@@ -448,9 +448,14 @@ impl TerminalState {
             self.kitty_img.discard_placements(&old);
         }
         if placement.virtual_placement || parent.is_some() {
-            self.kitty_img
-                .projected
-                .insert(key, ProjectedPlacement { placement, parent });
+            self.kitty_img.projected.insert(
+                key,
+                ProjectedPlacement {
+                    placement,
+                    parent,
+                    row_limit: u32::MAX,
+                },
+            );
         } else {
             let (image_width, image_height) = img.data().dimensions()?;
 

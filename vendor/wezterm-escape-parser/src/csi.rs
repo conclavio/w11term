@@ -1377,6 +1377,8 @@ pub enum Edit {
 
     /// ED - ERASE IN PAGE (XTerm calls this Erase in Display)
     EraseInDisplay(EraseInDisplay),
+    /// Kitty's ED 22 saves the current display to scrollback before clearing it.
+    ArchiveDisplay,
     /// DECIC and DECDC.
     InsertColumns(u32),
     DeleteColumns(u32),
@@ -1439,6 +1441,7 @@ impl Display for Edit {
             Edit::ScrollLeft(n) => n.write_csi(f, " @")?,
             Edit::ScrollRight(n) => n.write_csi(f, " A")?,
             Edit::EraseInDisplay(n) => n.write_csi(f, "J")?,
+            Edit::ArchiveDisplay => write!(f, "22J")?,
             Edit::InsertColumns(n) => n.write_csi(f, "'}")?,
             Edit::DeleteColumns(n) => n.write_csi(f, "'~")?,
             Edit::SelectiveEraseInDisplay(n) => {
@@ -2038,6 +2041,9 @@ impl<'a> CSIParser<'a> {
                     _ => return Err(()),
                 };
                 Ok(CSI::Edit(Edit::CharacterProtection(protected)))
+            }
+            ('J', [CsiParam::Integer(22)]) if !self.parameters_truncated => {
+                Ok(CSI::Edit(Edit::ArchiveDisplay))
             }
             ('J', [CsiParam::P(b'?'), area @ ..]) if !self.parameters_truncated => {
                 parse!(Edit, SelectiveEraseInDisplay, area)

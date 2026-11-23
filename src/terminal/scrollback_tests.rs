@@ -27,6 +27,45 @@ fn resize(t: &mut Terminal, cols: usize, rows: usize) {
 }
 
 #[test]
+fn archive_display_preserves_stable_rows_and_rendition_without_moving_the_cursor() {
+    let mut t = terminal(12, 5, 10);
+    t.advance_bytes("\x1b[31mFIRST\x1b[m\x1b[3;1H\x1b#6THIRD\x1b[5;9H");
+    let before = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+
+    t.advance_bytes("\x1b[?22J\x1b[22;1J");
+    assert!(rows(&t)[0].starts_with("FIRST"));
+    t.advance_bytes("\x1b[22J");
+    assert_eq!(rows(&t), ["FIRST", "", "THIRD", "", "", "", "", ""]);
+    assert_eq!((t.cursor_pos().x, t.cursor_pos().y), (8, 4));
+    let history = Snapshot::capture(&t, None, 2, 3, String::new(), 0);
+    assert_eq!(history.first_stable_row, before.first_stable_row);
+    assert_eq!(
+        history.rows[0].get_cell(0).unwrap().attrs().foreground(),
+        wezterm_term::color::ColorAttribute::PaletteIndex(1),
+    );
+    assert!(history.rows[2].is_double_width());
+    t.advance_bytes("\x1b[22J");
+    assert_eq!(t.screen().scrollback_rows(), 8);
+}
+
+#[test]
+fn archive_display_obeys_the_history_limit_and_clears_regional_and_alternate_screens() {
+    let mut t = terminal(12, 4, 1);
+    t.advance_bytes("FIRST\r\nLAST\x1b[22J");
+    assert_eq!(rows(&t), ["LAST", "", "", "", ""]);
+    assert_eq!(t.screen().phys_to_stable_row_index(0), 1);
+
+    t.advance_bytes("\x1b[?1049h\x1b[HALT\x1b[22J");
+    assert_eq!(rows(&t), ["", "", "", ""]);
+    t.advance_bytes("\x1b[?1049l");
+    for margins in ["\x1b[2;4r", "\x1b[1;3r"] {
+        t.advance_bytes(format!("{margins}\x1b[HREGION\x1b[22J"));
+        assert_eq!(rows(&t), ["LAST", "", "", "", ""]);
+        assert_eq!(t.screen().phys_to_stable_row_index(0), 1);
+    }
+}
+
+#[test]
 fn retained_rows_validate_every_row_and_clamp_alignment_after_eviction() {
     let mut t = terminal(20, 4, 4);
     t.advance_bytes("a\r\nb\r\nc\r\nd");
