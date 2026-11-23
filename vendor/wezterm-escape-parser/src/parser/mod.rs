@@ -20,6 +20,9 @@ use crate::allocate::*;
 mod sixel;
 use sixel::SixelBuilder;
 
+// Enough for every column in a 1,000-column window to be a tab stop.
+const MAX_TAB_RESTORE_BYTES: usize = 8192;
+
 #[derive(Default)]
 struct GetTcapBuilder {
     current: Vec<u8>,
@@ -53,6 +56,7 @@ impl GetTcapBuilder {
 struct ParseState {
     sixel: Option<SixelBuilder>,
     dcs: Option<ShortDeviceControl>,
+    tab_restore_overflow: bool,
     get_tcap: Option<GetTcapBuilder>,
     #[cfg(feature = "tmux_cc")]
     tmux_state: Option<RefCell<crate::tmux_cc::Parser>>,
@@ -201,13 +205,8 @@ struct Performer<'a, F: FnMut(Action) + 'a> {
     state: &'a mut ParseState,
 }
 
-fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
-    if intermediates == &[b'$'] && byte == b'q' {
-        // DECRQSS
-        true
-    } else {
-        false
-    }
+fn is_short_dcs(intermediates: &[u8], byte: u8, params: &[i64]) -> bool {
+    intermediates == [b'$'] && (byte == b'q' || (byte == b't' && params == [2]))
 }
 
 impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
@@ -243,11 +242,12 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         self.state.sixel.take();
         self.state.get_tcap.take();
         self.state.dcs.take();
+        self.state.tab_restore_overflow = false;
         if byte == b'q' && intermediates.is_empty() && !ignored_extra_intermediates {
             self.state.sixel.replace(SixelBuilder::new(params));
         } else if byte == b'q' && intermediates == [b'+'] {
             self.state.get_tcap.replace(GetTcapBuilder::default());
-        } else if !ignored_extra_intermediates && is_short_dcs(intermediates, byte) {
+        } else if !ignored_extra_intermediates && is_short_dcs(intermediates, byte, params) {
             self.state.dcs.replace(ShortDeviceControl {
                 params: params.to_vec(),
                 intermediates: intermediates.to_vec(),
@@ -274,7 +274,11 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
 
     fn dcs_put(&mut self, data: u8) {
         if let Some(dcs) = self.state.dcs.as_mut() {
-            dcs.data.push(data);
+            if dcs.byte != b't' || dcs.data.len() < MAX_TAB_RESTORE_BYTES {
+                dcs.data.push(data);
+            } else {
+                self.state.tab_restore_overflow = true;
+            }
         } else if let Some(sixel) = self.state.sixel.as_mut() {
             sixel.push(data);
         } else if let Some(tcap) = self.state.get_tcap.as_mut() {
@@ -299,6 +303,18 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 return;
             }
             (self.callback)(Action::DeviceControl(DeviceControlMode::Data(data)));
+        }
+    }
+
+    fn dcs_requires_string_terminator(&self) -> bool {
+        self.state.dcs.as_ref().is_some_and(|dcs| dcs.byte == b't')
+    }
+
+    fn dcs_unhook_with_terminator(&mut self, terminated: bool) {
+        if self.dcs_requires_string_terminator() && (!terminated || self.state.tab_restore_overflow) {
+            self.state.dcs.take();
+        } else {
+            self.dcs_unhook();
         }
     }
 

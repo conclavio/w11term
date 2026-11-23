@@ -329,6 +329,7 @@ impl Performer<'_> {
         match &ctrl {
             DeviceControlMode::ShortDeviceControl(s) => {
                 match (s.byte, s.intermediates.as_slice()) {
+                    (b't', &[b'$']) if s.params == [2] => self.tabs.restore(&s.data),
                     (b'q', &[b'$']) => {
                         // DECRQSS - Request Status String
                         // https://vt100.net/docs/vt510-rm/DECRQSS.html

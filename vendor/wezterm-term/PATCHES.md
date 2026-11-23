@@ -163,3 +163,6 @@ The original MIT license is preserved in `LICENSE.md`.
   column shift at a scrolling-region edge.
 - SL and SR share the column shift and start at the left scrolling margin
   when the cursor is inside the region.
+
+- Horizontal tab stops support DEC reporting and restoration. The parser
+  bounds restore strings and applies them only after a complete ST.

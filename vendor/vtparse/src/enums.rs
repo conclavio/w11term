@@ -54,6 +54,7 @@ pub enum State {
     Anywhere = 15,
     Utf8Sequence = 16,
     OscLiteralEscape = 17,
+    DcsStringEscape = 18,
 }
 
 impl State {

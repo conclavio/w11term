@@ -14,3 +14,6 @@ OSC 1337 `RemoteHost=` and `CurrentDir=` also carry one literal field.
 The parser retains at most 1 KiB of user and host or 128 KiB of path.
 An oversized, malformed UTF-8, or control-containing field produces an
 empty report. Other iTerm2 commands keep their normal parameter handling.
+
+Actors can opt into waiting for a complete string terminator on a DCS.
+The unhook callback distinguishes ST from cancellation for those strings.
