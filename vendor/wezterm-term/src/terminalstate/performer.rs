@@ -857,6 +857,7 @@ impl<'a> Performer<'a> {
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
                 self.saved_titles = Default::default();
+                self.saved_private_modes = Default::default();
                 self.title.from_application = false;
                 self.end_synchronized_output();
                 self.progress = Progress::default();
