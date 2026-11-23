@@ -161,11 +161,16 @@ public static class WslFixture {
         Sessions | Where-Object { $_.active -and $_.label -ceq $leftLabel }
     }
     Wait-Launch $left.id $leftName
-    Run-Palette 'Copy Bash directory setup'
-    $bashSetup = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '../src/app/bash-directory.sh')).TrimEnd()
-    $null = Wait-Until 'the bundled Bash directory setup copied from a WSL pane' {
-        (Test-Path -LiteralPath $env:W11TERM_TEST_COPY_FILE) -and
-            [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $bashSetup
+    foreach ($setup in @(
+        @{ Shell = 'Bash'; File = 'bash-directory.sh' }
+        @{ Shell = 'Zsh'; File = 'zsh-directory.zsh' }
+    )) {
+        Run-Palette "Copy $($setup.Shell) directory setup"
+        $setupText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "../src/app/$($setup.File)")).TrimEnd()
+        $null = Wait-Until "the bundled $($setup.Shell) directory setup copied from a WSL pane" {
+            (Test-Path -LiteralPath $env:W11TERM_TEST_COPY_FILE) -and
+                [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $setupText
+        }
     }
     Publish-Report $left.id 'linux'
     $explorerAction = 'Open current folder in File Explorer'
