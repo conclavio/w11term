@@ -1,6 +1,8 @@
 use super::*;
 use anyhow::{Result, bail, ensure};
 
+const CLOSED_TAB_LIMIT: usize = 10;
+
 /// Duplicating or reopening a tab starts ordinary shells. Keep this check cheap enough for
 /// disabled menu/palette state; filesystem preflight happens on invocation.
 fn eligible(source: &Source, discovery: bool, startup: Option<&SshStartup>) -> Result<()> {
@@ -180,7 +182,10 @@ impl TerminalApp {
         if let Some(group) = self.tabs.group_id(id)
             && let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture)
         {
-            self.closed_tab = Some(ClosedTab { group, layout });
+            if self.closed_tabs.len() == CLOSED_TAB_LIMIT {
+                self.closed_tabs.pop_front();
+            }
+            self.closed_tabs.push_back(ClosedTab { group, layout });
         }
         self.close_tab(id, context);
     }
@@ -191,8 +196,8 @@ impl TerminalApp {
         context: &ComponentContext<Self>,
     ) -> Result<()> {
         let Some(closed) = self
-            .closed_tab
-            .as_ref()
+            .closed_tabs
+            .back()
             .filter(|closed| closed.group == group)
         else {
             return Ok(());
@@ -204,7 +209,7 @@ impl TerminalApp {
             |recipe| recipe.clone().prepare(catalog.as_ref()),
             |shell| shell.launch(osc52),
         )?;
-        self.closed_tab = None;
+        self.closed_tabs.pop_back();
         self.sync_selection(context);
         self.activate(context);
         Ok(())
