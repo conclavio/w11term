@@ -323,6 +323,7 @@ pub enum Action {
     SaveCommand(TabId, save_command::Action),
     RestoreDraft(TabId),
     CopyResults(TabId, u64),
+    SaveResults(TabId, u64),
     ViewOutput(TabId, u64, CommandLink),
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, Arc<str>, Vec<Target>),
@@ -764,6 +765,17 @@ impl TerminalApp {
                 }
             }
             Action::CopyResults(id, submission) => self.copy_host_group_results(id, submission),
+            Action::SaveResults(id, submission) => {
+                if self.export.pending.is_none()
+                    && let Some(report) = self.capture_host_group_report(id, submission)
+                {
+                    self.begin_text_export(
+                        text_export::Subject::HostGroupResults(submission),
+                        move |file| report.write_to(file),
+                        ctx,
+                    );
+                }
+            }
             Action::ViewOutput(id, pane, link) => {
                 if self.host_group_mut(id).is_some() {
                     self.open_command_history(pane, Some(link), ctx);
@@ -801,20 +813,26 @@ impl TerminalApp {
         }
     }
 
-    fn copy_host_group_results(&mut self, id: TabId, submission_id: u64) {
+    fn capture_host_group_report(&self, id: TabId, submission_id: u64) -> Option<report::Report> {
         if self.tabs.active_id() != Some(id) {
-            return;
+            return None;
         }
-        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
-            return;
+        let Page::HostGroup(page) = &self.tabs.get(id)?.page else {
+            return None;
         };
-        let Some(submission) = page.viewed_submission(submission_id) else {
-            return;
-        };
-        let copied = report::build(submission, w11term::clipboard::MAX_TEXT, |pane, link| {
+        let submission = page.viewed_submission(submission_id)?;
+        Some(report::Report::capture(submission, |pane, link| {
             self.history_frame(pane)?.command_for_link(link).cloned()
-        })
-        .and_then(|text| w11term::clipboard::write(&text));
+        }))
+    }
+
+    fn copy_host_group_results(&mut self, id: TabId, submission_id: u64) {
+        let Some(report) = self.capture_host_group_report(id, submission_id) else {
+            return;
+        };
+        let copied = report
+            .clipboard(w11term::clipboard::MAX_TEXT)
+            .and_then(|text| w11term::clipboard::write(&text));
         if let Some(page) = self.host_group_mut(id) {
             page.copy_feedback = match copied {
                 Ok(()) => "Copied results".into(),
@@ -1172,6 +1190,12 @@ impl TerminalApp {
                                 Message::HostGroup(Action::CopyResults(id, submission_id))
                             }))
                             .content("Copy results"),
+                        Button::new()
+                            .is_enabled(self.export.pending.is_none())
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::SaveResults(id, submission_id))
+                            }))
+                            .content(text_export::GROUP_REPORT_LABEL),
                         Button::new()
                             .on_click(ctx.callback(move |_| {
                                 Message::HostGroup(Action::LiveOutput(

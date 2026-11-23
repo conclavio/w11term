@@ -107,6 +107,8 @@ Choose **Save as command…** to add the draft to the shared library. Enter a na
 
 Choose **Copy results** to copy the viewed submission as plain text, including every recipient’s delivery, execution and interrupt status. The report uses full output retained in each pane and labels any preview that stands in for expired output. Large reports shorten output to fit the clipboard while retaining every host’s status.
 
+Choose **Save results…** to write a UTF-8 report of the viewed submission. It includes every recipient and all retained output from completed commands, even when the roster or result filters hide a host. A host still running appears with its status at the time you opened the Save dialog.
+
 While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its selected hosts that still report the matching command as running. The result shows Ctrl+C delivery and the command’s eventual exit status separately. w11term uses each pane’s current keyboard mode.
 
 In **SSH host group**, choose **New group**, name it, and check the saved SSH profiles to include. Choose **Open group** or search for **Open SSH group** and the group’s name in the command palette. Either route starts a fresh tab for each member and selects those panes for the next command. Unavailable profiles are reported before any member tabs open. Use **+** to open another SSH profile and add it to the live roster. Uncheck a pane to pause delivery to it. **Edit group** changes the saved name or members, and **Delete group** removes the saved group. Group definitions live with their profiles in `profiles.json`. Renaming a profile updates its group memberships, and deleting a profile removes it from those groups.

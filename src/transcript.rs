@@ -1,8 +1,21 @@
 use anyhow::{Context, Result, ensure};
-use std::{io::Write, path::Path};
+use std::{
+    fs::File,
+    io::{self, Write},
+    path::Path,
+};
 
 /// Publish complete UTF-8 text with a single rename in the destination directory.
 pub fn save(path: &Path, text: &str, overwrite: bool) -> Result<()> {
+    save_with(path, overwrite, |file| file.write_all(text.as_bytes()))
+}
+
+/// Write the export before publishing it at the selected destination.
+pub fn save_with(
+    path: &Path,
+    overwrite: bool,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<()> {
     ensure!(path.file_name().is_some(), "Choose a file name");
     let directory = path
         .parent()
@@ -10,7 +23,7 @@ pub fn save(path: &Path, text: &str, overwrite: bool) -> Result<()> {
         .unwrap_or(Path::new("."));
     let mut file = tempfile::NamedTempFile::new_in(directory)
         .with_context(|| format!("Creating a temporary file in {}", directory.display()))?;
-    file.write_all(text.as_bytes())?;
+    write(file.as_file_mut()).context("Writing text export")?;
     file.as_file().sync_all()?;
     let result = if overwrite {
         file.persist(path)
@@ -48,6 +61,21 @@ mod tests {
         fs::create_dir(&destination).unwrap();
         assert!(save(&destination, "transcript", true).is_err());
         assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn interrupted_write_keeps_the_previous_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("previous.txt");
+        fs::write(&path, "previous").unwrap();
+        let error = save_with(&path, true, |file| {
+            file.write_all(b"partial replacement")?;
+            Err(io::Error::other("interrupted"))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("interrupted"));
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
