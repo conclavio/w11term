@@ -1133,7 +1133,10 @@ pub enum KittyImage {
         verbosity: KittyImageVerbosity,
     },
     /// a='q'
-    Query { transmit: KittyImageTransmit },
+    Query {
+        transmit: KittyImageTransmit,
+        verbosity: KittyImageVerbosity,
+    },
     /// a='q', e=<action>. This command has no image payload.
     FeatureQuery {
         image_id: u32,
@@ -1158,7 +1161,7 @@ impl KittyImage {
     pub fn verbosity(&self) -> KittyImageVerbosity {
         match self {
             Self::TransmitData { verbosity, .. } => *verbosity,
-            Self::Query { .. } => KittyImageVerbosity::Verbose,
+            Self::Query { verbosity, .. } => *verbosity,
             Self::FeatureQuery { verbosity, .. } => *verbosity,
             Self::TransmitDataAndDisplay { verbosity, .. } => *verbosity,
             Self::Display { verbosity, .. } => *verbosity,
@@ -1225,6 +1228,7 @@ impl KittyImage {
             }),
             "q" => Some(Self::Query {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
+                verbosity,
             }),
             "T" => Some(Self::TransmitDataAndDisplay {
                 transmit: KittyImageTransmit::from_keys(&keys, payload)?,
@@ -1274,8 +1278,9 @@ impl KittyImage {
                 verbosity.to_keys(keys);
                 transmit.to_keys(keys);
             }
-            Self::Query { transmit } => {
+            Self::Query { transmit, verbosity } => {
                 keys.insert("a", "q".to_string());
+                verbosity.to_keys(keys);
                 transmit.to_keys(keys);
             }
             Self::FeatureQuery {

@@ -521,18 +521,18 @@ impl TerminalState {
     }
 
     fn kitty_img_inner(&mut self, img: KittyImage) -> anyhow::Result<()> {
+        let first = self.kitty_img.accumulator.first().unwrap_or(&img);
+        let probe_reply = probe_reply(first)
+            .map(|(id, initial)| (id, transfer_verbosity(initial, img.verbosity())));
         // Read the first chunk before coalescing so errors can use its address
         // even when the final chunk carries no image or frame number.
-        let frame_reply = match self.kitty_img.accumulator.first().unwrap_or(&img) {
+        let frame_reply = match first {
             KittyImage::TransmitFrame {
                 transmit,
                 frame,
                 verbosity,
             } => {
-                let quiet = match img.verbosity() {
-                    KittyImageVerbosity::Verbose => *verbosity,
-                    quiet => quiet,
-                };
+                let quiet = transfer_verbosity(*verbosity, img.verbosity());
                 Some((
                     transmit.image_id,
                     transmit.image_number,
@@ -545,6 +545,14 @@ impl TerminalState {
         let coalesced = self
             .coalesce_kitty_accumulation(img)
             .context("coalesce kitty image upload");
+        if let Some((id, verbosity)) = probe_reply {
+            let result = coalesced.and_then(|image| match image {
+                KittyImage::Query { transmit, .. } => validate_kitty_probe(transmit),
+                _ => unreachable!("first chunk identifies an upload probe"),
+            });
+            self.kitty_send_probe_result(id, verbosity, result);
+            return Ok(());
+        }
         if let Some((id, number, requested, verbosity)) = frame_reply {
             let result = coalesced.and_then(|image| match image {
                 KittyImage::TransmitFrame {
@@ -572,21 +580,53 @@ impl TerminalState {
         }
     }
 
-    pub(crate) fn kitty_img(&mut self, mut img: KittyImage) -> anyhow::Result<()> {
+    pub(crate) fn kitty_img(&mut self, img: KittyImage) -> anyhow::Result<()> {
         log::trace!("{:?}", img);
         if !self.config.enable_kitty_graphics() {
             return Ok(());
+        }
+        let probe_pending = self
+            .kitty_img
+            .accumulator
+            .first()
+            .and_then(probe_reply)
+            .is_some();
+        // A standalone probe has its own metadata. Process it independently
+        // so even a rejected probe leaves an in-flight image upload intact.
+        let mut img = match img {
+            KittyImage::Query {
+                transmit,
+                verbosity,
+            } if !probe_pending
+                || transmit.image_id.is_some()
+                || transmit.image_number.is_some() =>
+            {
+                let Some(query) = self.kitty_probe_head(transmit, verbosity) else {
+                    return Ok(());
+                };
+                query
+            }
+            other => other,
+        };
+        if probe_pending && starts_image_upload(&img) {
+            self.cancel_kitty_probe(None, "EINVAL:upload probe was interrupted");
         }
         let verbosity = img.verbosity();
         if let KittyImage::TransmitData { transmit, .. }
         | KittyImage::TransmitDataAndDisplay { transmit, .. }
         | KittyImage::TransmitFrame { transmit, .. }
-        | KittyImage::Query { transmit } = &img
+        | KittyImage::Query { transmit, .. } = &img
         {
             let bytes = match &transmit.data {
                 KittyImageData::Direct(data) => data.len(),
                 KittyImageData::DirectBin(data) => data.len(),
                 _ => {
+                    if self.cancel_kitty_probe(
+                        Some(verbosity),
+                        "ENOTSUP:w11term requires direct kitty image transport",
+                    ) {
+                        return Ok(());
+                    }
                     self.kitty_img.accumulator.clear();
                     self.kitty_img.accumulated_bytes = 0;
                     let id = transmit.image_id.filter(|&id| id != 0);
@@ -617,18 +657,48 @@ impl TerminalState {
                 .saturating_add(bytes)
                 > 48 * 1024 * 1024
             {
+                if self
+                    .cancel_kitty_probe(Some(verbosity), "ENOSPC:kitty transmission exceeds 48 MiB")
+                {
+                    return Ok(());
+                }
+                if let Some((id, verbosity)) = probe_reply(&img) {
+                    self.kitty_send_response(
+                        verbosity,
+                        false,
+                        Some(id),
+                        None,
+                        "ENOSPC:kitty transmission exceeds 48 MiB".into(),
+                    );
+                    return Ok(());
+                }
                 self.kitty_img.accumulator.clear();
                 self.kitty_img.accumulated_bytes = 0;
                 anyhow::bail!("kitty image transmission exceeds 48 MiB");
             }
             if transmit.more_data_follows {
-                if matches!(&img, KittyImage::Query { .. })
-                    || self.kitty_img.accumulator.len() + self.inactive_kitty_img.accumulator.len()
-                        >= 16384
+                if self.kitty_img.accumulator.len() + self.inactive_kitty_img.accumulator.len()
+                    >= 16384
                 {
+                    if self.cancel_kitty_probe(
+                        Some(verbosity),
+                        "ENOSPC:too many kitty transmission chunks",
+                    ) {
+                        return Ok(());
+                    }
+                    if let Some((id, verbosity)) = probe_reply(&img) {
+                        self.kitty_send_response(
+                            verbosity,
+                            false,
+                            Some(id),
+                            None,
+                            "ENOSPC:too many kitty transmission chunks".into(),
+                        );
+                        return Ok(());
+                    }
                     self.kitty_img.accumulated_bytes = 0;
                     self.kitty_img.accumulator.clear();
-                    anyhow::bail!("unsupported kitty query continuation or too many chunks");
+                    anyhow::bail!("too many kitty transmission chunks");
                 }
                 self.kitty_img.accumulated_bytes += bytes;
                 self.kitty_img.accumulator.push(img);
@@ -651,20 +721,6 @@ impl TerminalState {
                     self.writer.flush()?;
                 }
             }
-            KittyImage::Query { transmit } => {
-                let (id, number) = (transmit.image_id, transmit.image_number);
-                let stride = indexed::stride(transmit.format.as_ref());
-                let result = match stride {
-                    Some(stride) => checked_indexed_pixels(transmit, stride).map(|_| ()),
-                    None => transmit.data.load_data().map(|_| ()).map_err(Into::into),
-                };
-                let message = match &result {
-                    Ok(()) => "OK".into(),
-                    Err(err) if stride.is_some() => format!("EINVAL:{err:#}"),
-                    Err(err) => format!("ERROR:{err:#}"),
-                };
-                self.kitty_send_response(verbosity, result.is_ok(), id, number, message);
-            }
             KittyImage::Display {
                 image_id,
                 image_number,
@@ -681,7 +737,8 @@ impl TerminalState {
             }
             KittyImage::TransmitData { .. }
             | KittyImage::TransmitDataAndDisplay { .. }
-            | KittyImage::TransmitFrame { .. } => unreachable!("handled before dispatch"),
+            | KittyImage::TransmitFrame { .. }
+            | KittyImage::Query { .. } => unreachable!("handled before dispatch"),
             KittyImage::Animation {
                 image_id,
                 image_number,
@@ -742,6 +799,62 @@ impl TerminalState {
         };
 
         Ok(())
+    }
+
+    fn kitty_probe_head(
+        &mut self,
+        transmit: KittyImageTransmit,
+        verbosity: KittyImageVerbosity,
+    ) -> Option<KittyImage> {
+        let id = transmit.image_id.filter(|&id| id != 0)?;
+        let number = transmit.image_number.filter(|&number| number != 0);
+        let error = if number.is_some() {
+            "EINVAL:upload probes require an image ID alone"
+        } else if !matches!(
+            transmit.data,
+            KittyImageData::Direct(_) | KittyImageData::DirectBin(_)
+        ) {
+            "ENOTSUP:w11term requires direct kitty image transport"
+        } else if transmit.more_data_follows {
+            if self.kitty_img.accumulator.is_empty() {
+                return Some(KittyImage::Query {
+                    transmit,
+                    verbosity,
+                });
+            }
+            "EBUSY:another kitty transmission is in progress"
+        } else {
+            if !matches!(verbosity, KittyImageVerbosity::Quiet) {
+                self.kitty_send_probe_result(id, verbosity, validate_kitty_probe(transmit));
+            }
+            return None;
+        };
+        self.kitty_send_response(verbosity, false, Some(id), number, error.into());
+        None
+    }
+
+    fn cancel_kitty_probe(&mut self, last: Option<KittyImageVerbosity>, message: &str) -> bool {
+        let Some((id, initial)) = self.kitty_img.accumulator.first().and_then(probe_reply) else {
+            return false;
+        };
+        self.kitty_img.accumulator.clear();
+        self.kitty_img.accumulated_bytes = 0;
+        let verbosity = last.map_or(initial, |last| transfer_verbosity(initial, last));
+        self.kitty_send_response(verbosity, false, Some(id), None, message.into());
+        true
+    }
+
+    fn kitty_send_probe_result(
+        &mut self,
+        id: u32,
+        verbosity: KittyImageVerbosity,
+        result: anyhow::Result<()>,
+    ) {
+        let message = match &result {
+            Ok(()) => "OK".into(),
+            Err(err) => format!("EINVAL:{err:#}"),
+        };
+        self.kitty_send_response(verbosity, result.is_ok(), Some(id), None, message);
     }
 
     fn kitty_remove_placement_from_model(
@@ -1539,71 +1652,21 @@ impl TerminalState {
             return Ok((img, Some(pixels)));
         }
 
-        let data = load_pixels(transmit.data, transmit.compression)?;
-
-        let img = match transmit.format {
-            None | Some(KittyImageFormat::Rgba) | Some(KittyImageFormat::Rgb) => {
-                let (width, height) = match (transmit.width, transmit.height) {
-                    (Some(w), Some(h)) => (w, h),
-                    _ => {
-                        anyhow::bail!("missing width/height info for kitty img");
-                    }
-                };
-
-                check_image_dimensions(width, height)?;
-                anyhow::ensure!(
-                    width as u64 * height as u64 * 4 <= 32 * 1024 * 1024,
-                    "kitty image exceeds 32 MiB"
-                );
-
-                let data = match transmit.format {
-                    Some(KittyImageFormat::Rgb) => {
-                        let img = DynamicImage::ImageRgb8(
-                            RgbImage::from_vec(width, height, data)
-                                .ok_or_else(|| anyhow::anyhow!("failed to decode image"))?,
-                        );
-                        let img = img.into_rgba8();
-                        img.into_vec()
-                    }
-                    _ => data,
-                };
-
-                anyhow::ensure!(
-                    width * height * 4 == data.len() as u32,
-                    "transmit data len is {} but it doesn't match width*height*4 {}x{}x4 = {}",
-                    data.len(),
-                    width,
-                    height,
-                    width * height * 4
-                );
-
-                ImageDataType::new_single_frame(width, height, data)
-            }
-            Some(KittyImageFormat::Indexed | KittyImageFormat::IndexedAlpha) => unreachable!(),
-            Some(KittyImageFormat::Png) => {
-                let info = dimensions(&data)?;
-                check_image_dimensions(info.width, info.height)?;
-                anyhow::ensure!(
-                    info.width as u64 * info.height as u64 * 4 <= 32 * 1024 * 1024,
-                    "kitty image exceeds 32 MiB"
-                );
-                let mut reader = image::ImageReader::with_format(
-                    std::io::Cursor::new(&data),
-                    image::ImageFormat::Png,
-                );
-                let mut limits = image::Limits::default();
-                limits.max_image_width = Some(info.width);
-                limits.max_image_height = Some(info.height);
-                limits.max_alloc = Some(32 * 1024 * 1024);
-                reader.limits(limits);
-                let decoded = reader.decode().context("decode png")?;
-                let (width, height) = decoded.dimensions();
-                let data = decoded.into_rgba8().into_vec();
-                ImageDataType::new_single_frame(width, height, data)
-            }
+        let (width, height, data) = if transmit.format == Some(KittyImageFormat::Png) {
+            let image = read_kitty_png(transmit)?.into_rgba8();
+            (image.width(), image.height(), image.into_vec())
+        } else {
+            let rgb = transmit.format == Some(KittyImageFormat::Rgb);
+            let (width, height, data) = read_raw_kitty_pixels(transmit)?;
+            let data = if rgb {
+                let image = RgbImage::from_vec(width, height, data).context("invalid RGB data")?;
+                DynamicImage::ImageRgb8(image).into_rgba8().into_vec()
+            } else {
+                data
+            };
+            (width, height, data)
         };
-
-        Ok((img, None))
+        Ok((ImageDataType::new_single_frame(width, height, data), None))
     }
 
     fn kitty_img_transmit(
@@ -1730,6 +1793,7 @@ impl TerminalState {
             KittyImage::TransmitData { verbosity, .. }
             | KittyImage::TransmitDataAndDisplay { verbosity, .. }
             | KittyImage::TransmitFrame { verbosity, .. } => *verbosity = final_verbosity,
+            KittyImage::Query { .. } => {}
             _ => unreachable!(),
         }
         Ok(first)
@@ -1750,6 +1814,59 @@ fn load_pixels(
     }
 }
 
+fn validate_kitty_probe(transmit: KittyImageTransmit) -> anyhow::Result<()> {
+    if let Some(stride) = indexed::stride(transmit.format.as_ref()) {
+        checked_indexed_pixels(transmit, stride)?;
+    } else if transmit.format == Some(KittyImageFormat::Png) {
+        read_kitty_png(transmit)?;
+    } else {
+        read_raw_kitty_pixels(transmit)?;
+    }
+    Ok(())
+}
+
+fn read_raw_kitty_pixels(transmit: KittyImageTransmit) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    let width = transmit.width.context("missing kitty image width")?;
+    let height = transmit.height.context("missing kitty image height")?;
+    check_kitty_rgba_size(width, height)?;
+    let channels = if transmit.format == Some(KittyImageFormat::Rgb) {
+        3
+    } else {
+        4
+    };
+    let expected = width as usize * height as usize * channels;
+    let data = load_pixels(transmit.data, transmit.compression)?;
+    anyhow::ensure!(
+        data.len() == expected,
+        "expected {expected} bytes of raw kitty pixels but received {}",
+        data.len()
+    );
+    Ok((width, height, data))
+}
+
+fn read_kitty_png(transmit: KittyImageTransmit) -> anyhow::Result<DynamicImage> {
+    let data = load_pixels(transmit.data, transmit.compression)?;
+    let info = dimensions(&data)?;
+    check_kitty_rgba_size(info.width, info.height)?;
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(&data), image::ImageFormat::Png);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(info.width);
+    limits.max_image_height = Some(info.height);
+    limits.max_alloc = Some(32 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().context("decode png")
+}
+
+fn check_kitty_rgba_size(width: u32, height: u32) -> anyhow::Result<()> {
+    check_image_dimensions(width, height)?;
+    anyhow::ensure!(
+        u64::from(width) * u64::from(height) * 4 <= 32 * 1024 * 1024,
+        "kitty image exceeds 32 MiB"
+    );
+    Ok(())
+}
+
 fn checked_indexed_pixels(
     transmit: KittyImageTransmit,
     stride: usize,
@@ -1762,8 +1879,44 @@ fn transmission(img: &mut KittyImage) -> Option<&mut KittyImageTransmit> {
     match img {
         KittyImage::TransmitData { transmit, .. }
         | KittyImage::TransmitDataAndDisplay { transmit, .. }
-        | KittyImage::TransmitFrame { transmit, .. } => Some(transmit),
+        | KittyImage::TransmitFrame { transmit, .. }
+        | KittyImage::Query { transmit, .. } => Some(transmit),
         _ => None,
+    }
+}
+
+fn probe_reply(image: &KittyImage) -> Option<(u32, KittyImageVerbosity)> {
+    match image {
+        KittyImage::Query {
+            transmit,
+            verbosity,
+        } => Some((transmit.image_id.filter(|&id| id != 0)?, *verbosity)),
+        _ => None,
+    }
+}
+
+fn transfer_verbosity(
+    initial: KittyImageVerbosity,
+    last: KittyImageVerbosity,
+) -> KittyImageVerbosity {
+    match last {
+        KittyImageVerbosity::Verbose => initial,
+        last => last,
+    }
+}
+
+fn starts_image_upload(image: &KittyImage) -> bool {
+    match image {
+        KittyImage::TransmitData { transmit, .. } => {
+            transmit.image_id.is_some()
+                || transmit.image_number.is_some()
+                || transmit.width.is_some()
+                || transmit.height.is_some()
+                || transmit.format.is_some()
+                || transmit.compression != KittyImageCompression::None
+        }
+        KittyImage::TransmitDataAndDisplay { .. } | KittyImage::TransmitFrame { .. } => true,
+        _ => false,
     }
 }
 
