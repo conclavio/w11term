@@ -25,7 +25,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         };
         match arg.as_str() {
             "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
-            | "save-text" | "restart" | "list-commands" | "get-command"
+            | "save-text" | "restart" | "list-commands" | "get-command" | "inspect"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -159,6 +159,28 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspect_requires_a_pane_and_accepts_the_optional_process_id() {
+        let parse_line = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("--pid 42 inspect --pane 7").unwrap(),
+            (Some(42), Request::Inspect { pane: 7 })
+        ));
+        assert!(matches!(
+            parse_line("--pane 7 inspect").unwrap(),
+            (None, Request::Inspect { pane: 7 })
+        ));
+        for line in [
+            "inspect",
+            "inspect --pane a",
+            "inspect --pane 1 --all-panes",
+            "inspect --pane 1 extra",
+            "inspect --pane 2 --stdin",
+        ] {
+            assert!(parse_line(line).is_err(), "{line}");
+        }
+    }
 
     #[test]
     fn command_history_requires_the_listed_pane_id_and_generation_for_lookup() {

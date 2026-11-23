@@ -92,6 +92,9 @@ pub enum Request {
     GetText {
         pane: u64,
     },
+    Inspect {
+        pane: u64,
+    },
     ListCommands {
         pane: u64,
     },
@@ -445,6 +448,21 @@ impl Registry {
                 id,
                 connection_generation,
             } => self.get_command(pane, id, connection_generation).await,
+            Request::Inspect { pane } => {
+                let (reply, response) = oneshot::channel();
+                self.pane(pane)?
+                    .input
+                    .send(Command::ReadModes(reply))
+                    .context("pane is closed")?;
+                let (connection_generation, modes) = tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("pane inspection timed out")?
+                    .context("pane closed before inspection")?;
+                let mut report = modes.as_json();
+                report["pane"] = pane.into();
+                report["connection_generation"] = connection_generation.into();
+                Ok(report)
+            }
             Request::GetText { pane } => {
                 let (frame, size) = Self::capture(&self.pane(pane)?).await?;
                 let lines: Vec<_> = frame

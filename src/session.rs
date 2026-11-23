@@ -51,6 +51,8 @@ pub enum Command {
     Events(tokio::sync::oneshot::Sender<crate::events::Events>),
     Frames(tokio::sync::oneshot::Sender<FrameStore>),
     Inspect(bool),
+    /// One read of the live model and its connection generation, even between paints.
+    ReadModes(tokio::sync::oneshot::Sender<(u64, terminal::TerminalModes)>),
     Sftp(crate::sftp::Job),
     Key {
         key: KeyCode,
@@ -742,6 +744,12 @@ async fn run(
                         if !enabled { frames.set_inspection(None); }
                         Ok(())
                     },
+                    Some(Command::ReadModes(reply)) => {
+                        if !reply.is_closed() {
+                            let _ = reply.send((connection_generation, terminal::TerminalModes::read(&terminal)));
+                        }
+                        Ok(())
+                    }
                     Some(Command::Sftp(job)) => {
                         if is_ssh {
                             if let Err(error) = writer.send(TransportInput::Sftp(job))

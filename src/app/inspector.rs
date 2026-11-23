@@ -94,6 +94,14 @@ fn mouse_label(modes: TerminalModes) -> String {
     format!("{reporting} ({encoding})")
 }
 
+fn text_area_label(width: usize, height: usize, dpi: u32) -> String {
+    match (width, height, dpi) {
+        (0, _, _) | (_, 0, _) => "Text area   Awaiting measurement".into(),
+        (_, _, 0) => format!("Text area   {width} × {height} px"),
+        _ => format!("Text area   {width} × {height} px at {dpi} DPI"),
+    }
+}
+
 impl Inspection {
     pub(super) fn clear_pointer(&mut self) {
         self.pointer = Default::default();
@@ -149,11 +157,13 @@ impl Inspection {
                 };
                 let rows = [
                     format!("Grid   {} × {}", modes.cols, modes.rows),
+                    text_area_label(modes.pixel_width, modes.pixel_height, modes.dpi),
                     format!("Screen   {screen}"),
                     format!("Mouse reporting   {}", mouse_label(modes)),
                     format!("Keyboard   {}", keyboard_label(modes.keyboard)),
                     format!("Bracketed paste   {}", on_off(modes.bracketed_paste)),
                     format!("Synchronized output   {}", on_off(modes.synchronized)),
+                    format!("In-band resize   {}", on_off(modes.in_band_resize)),
                 ];
                 self.readout = StackPanel::new().spacing(3.0).keyed_children(
                     rows.into_iter().enumerate().map(|(i, row)| {
@@ -248,6 +258,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_area_displays_available_measurements() {
+        assert_eq!(
+            text_area_label(0, 480, 96),
+            "Text area   Awaiting measurement"
+        );
+        assert_eq!(
+            text_area_label(800, 0, 0),
+            "Text area   Awaiting measurement"
+        );
+        assert_eq!(text_area_label(800, 480, 0), "Text area   800 × 480 px");
+        assert_eq!(
+            text_area_label(800, 480, 144),
+            "Text area   800 × 480 px at 144 DPI"
+        );
+    }
+
+    #[test]
     fn viewport_cells_use_pane_dips_and_resolve_the_visible_scrollback_frame() {
         let (input, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut inspector = Inspection {
@@ -331,6 +358,9 @@ mod tests {
         let modes = TerminalModes {
             cols: 80,
             rows: 24,
+            pixel_width: 640,
+            pixel_height: 480,
+            dpi: 96,
             alternate: false,
             mouse_click: false,
             mouse_drag: false,
@@ -339,6 +369,7 @@ mod tests {
             keyboard: KeyboardEncoding::Xterm,
             bracketed_paste: false,
             synchronized: false,
+            in_band_resize: false,
         };
         inspector.refresh(Some(modes));
         assert_eq!(inspector.modes, Some(modes));
