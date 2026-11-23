@@ -209,6 +209,35 @@ try {
         [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "$summary`n")
     }
     Write-Output "Verified local reveal ($evidence). $diagnostics"
+    # The new folder has never been opened, so an observable view proves
+    # that the folder command opens the reported directory itself.
+    if (Find-HintText '^(Type a hint label|Enter copy|Reveal failed)') { Press-Key 27 }
+    Close-FixtureViews
+    $leaf += '-folder'
+    $fixtureDir = Join-Path $env:W11TERM_HINT_CWD $leaf
+    $null = [IO.Directory]::CreateDirectory($fixtureDir)
+    [IO.File]::WriteAllText((Join-Path $fixtureDir $proof), '')
+    Send-PowerShellLine ('Set-Location -LiteralPath (Join-Path $env:W11TERM_HINT_CWD "{0}")' -f $leaf)
+    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15',"$leaf>")
+    $menu = [System.Windows.Automation.ControlType]::MenuItem
+    Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
+    $panes = Wait-Until 'Panes submenu' { Find-Element 'Panes' $menu }
+    $panes.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    Invoke-Button (Wait-Until 'enabled Explorer folder action' {
+        $entry = Find-Element 'Open current folder in File Explorer' $menu
+        if ($entry -and $entry.Current.IsEnabled) { $entry }
+    })
+    $trace = Wait-Until 'Explorer folder handoff for the reported PowerShell directory' {
+        $result = [IO.File]::ReadAllText($env:W11TERM_TEST_EXPLORER_TRACE) | ConvertFrom-Json
+        if ($result.action -eq 'explore') { $result }
+    }
+    if (!$trace.path -or ![IO.File]::Exists((Join-Path $trace.path $proof))) {
+        throw "Explorer received the wrong folder: $($trace | ConvertTo-Json -Compress)"
+    }
+    if (!$allowHandoff) {
+        if ($trace.hresult -lt 0) { throw "Explorer rejected the folder: $($trace.hresult)" }
+        $null = Wait-Until 'Explorer displays the reported folder itself' { @(Get-FixtureViews).Count -gt 0 }
+    }
     $null = Control @('send-text','--pane',"$remote",'--no-paste','ssh-neighbor-ok')
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','ssh-neighbor-ok')
 } finally {
