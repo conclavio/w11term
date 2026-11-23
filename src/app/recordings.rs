@@ -1,16 +1,30 @@
 use super::*;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
+use w11term::session::{ReplayAction, ReplayState};
 
 pub(super) const START: &str = "Start timed recording…";
 pub(super) const STOP: &str = "Stop recording";
 pub(super) const OPEN: &str = "Open recording…";
+pub(super) const OPEN_PAUSED: &str = "Open recording paused…";
+const PAUSE: &str = "Pause replay";
+const RESUME: &str = "Resume replay";
+const STEP: &str = "Next recorded update";
+
+pub(super) fn is_command(label: &str) -> bool {
+    matches!(
+        label,
+        START | STOP | OPEN | OPEN_PAUSED | PAUSE | RESUME | STEP
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
     Start(u64),
     Stop { pane: u64, id: u64 },
     Open,
+    OpenPaused,
+    Playback(u64, ReplayAction),
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -18,6 +32,7 @@ pub(super) struct Choices {
     start: Option<u64>,
     stop: Option<(u64, u64)>,
     open: bool,
+    playback: Option<(u64, ReplayState)>,
 }
 
 impl Choices {
@@ -26,20 +41,38 @@ impl Choices {
             START => self.start.map(Choice::Start),
             STOP => self.stop.map(|(pane, id)| Choice::Stop { pane, id }),
             OPEN if self.open => Some(Choice::Open),
+            OPEN_PAUSED if self.open => Some(Choice::OpenPaused),
+            PAUSE | RESUME | STEP => {
+                let (pane, state) = self.playback?;
+                let action = match (label, state) {
+                    (PAUSE, ReplayState::Playing) => ReplayAction::Pause,
+                    (RESUME, ReplayState::Paused) => ReplayAction::Resume,
+                    (STEP, ReplayState::Playing | ReplayState::Paused) => ReplayAction::Step,
+                    _ => return None,
+                };
+                Some(Choice::Playback(pane, action))
+            }
             _ => None,
         }
     }
 
     pub(super) fn menu(self) -> MenuItem {
-        MenuItem::submenu(
-            "recordings",
-            "Recordings",
-            [
-                command_menu_item("start-recording", START, self.start.is_some()),
-                command_menu_item("stop-recording", STOP, self.stop.is_some()),
-                command_menu_item("open-recording", OPEN, self.open),
-            ],
-        )
+        let mut items = vec![
+            command_menu_item("start-recording", START, self.start.is_some()),
+            command_menu_item("stop-recording", STOP, self.stop.is_some()),
+            command_menu_item("open-recording", OPEN, self.open),
+            command_menu_item("open-recording-paused", OPEN_PAUSED, self.open),
+        ];
+        if self.playback.is_some() {
+            for (id, label) in [
+                ("pause-replay", PAUSE),
+                ("resume-replay", RESUME),
+                ("step-replay", STEP),
+            ] {
+                items.push(command_menu_item(id, label, self.target(label).is_some()));
+            }
+        }
+        MenuItem::submenu("recordings", "Recordings", items)
     }
 }
 
@@ -57,6 +90,7 @@ pub(super) struct Recordings {
 
 pub enum Outcome {
     Started,
+    Playback,
     Stopped { pane: u64, path: PathBuf },
     Opened(Box<Source>),
 }
@@ -67,10 +101,10 @@ pub enum Action {
     Dismiss,
 }
 
-fn worker_reply(
+fn worker_reply<T>(
     worker: &mpsc::UnboundedSender<Command>,
-    request: impl FnOnce(oneshot::Sender<Result<serde_json::Value, String>>) -> Command,
-) -> anyhow::Result<serde_json::Value> {
+    request: impl FnOnce(oneshot::Sender<Result<T, String>>) -> Command,
+) -> anyhow::Result<T> {
     let (reply, result) = oneshot::channel();
     worker
         .send(request(reply))
@@ -88,11 +122,22 @@ impl Choice {
         pick: impl FnOnce(file_picker::Purpose) -> anyhow::Result<Option<PathBuf>>,
     ) -> anyhow::Result<Option<Outcome>> {
         let outcome = match self {
-            Self::Open => {
+            Self::Open | Self::OpenPaused => {
                 let Some(path) = pick(file_picker::Purpose::OpenRecording)? else {
                     return Ok(None);
                 };
-                Outcome::Opened(Box::new(Source::open_recording(path)?))
+                let source = Source::open_recording(path)?;
+                let source = if self == Self::OpenPaused {
+                    source.start_paused()?
+                } else {
+                    source
+                };
+                Outcome::Opened(Box::new(source))
+            }
+            Self::Playback(_, action) => {
+                let worker = worker.context("The replay pane has closed")?;
+                worker_reply(worker, |reply| Command::Replay { action, reply })?;
+                Outcome::Playback
             }
             Self::Start(_) => {
                 let worker = worker.context("The pane has closed")?;
@@ -146,6 +191,11 @@ impl TerminalApp {
         }) = self.tabs.active()
         {
             let pane = live.session.pane_id;
+            result.playback = live
+                .session
+                .events
+                .replay_state()
+                .map(|state| (pane, state));
             if let Some(id) = live.session.events.recording() {
                 result.stop = Some((pane, id));
             } else if matches!(live.source, Source::Ssh(_) | Source::Local(_))
@@ -176,8 +226,10 @@ impl TerminalApp {
         match action {
             Action::Invoke(choice) if self.recordings.pending.is_none() => {
                 let pane = match choice {
-                    Choice::Start(pane) | Choice::Stop { pane, .. } => Some(pane),
-                    Choice::Open => None,
+                    Choice::Start(pane) | Choice::Stop { pane, .. } | Choice::Playback(pane, _) => {
+                        Some(pane)
+                    }
+                    Choice::Open | Choice::OpenPaused => None,
                 };
                 let worker = pane
                     .and_then(|p| self.recording_pane(p))
@@ -210,7 +262,7 @@ impl TerminalApp {
             Action::Finished(choice, result) if self.recordings.pending == Some(choice) => {
                 self.recordings.pending = None;
                 match result {
-                    Ok(Some(Outcome::Started)) => {
+                    Ok(Some(Outcome::Started | Outcome::Playback)) => {
                         self.recordings.status = None;
                     }
                     Ok(Some(Outcome::Stopped { pane, path })) => {
@@ -251,7 +303,24 @@ mod tests {
             receiver.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert!(Choice::Open.run(None, |_| Ok(None)).unwrap().is_none());
+        for choice in [Choice::Open, Choice::OpenPaused] {
+            assert!(choice.run(None, |_| Ok(None)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn opening_paused_requires_a_timing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.vt");
+        std::fs::write(&path, b"shell prompt").unwrap();
+        let pick = |_| Ok(Some(path.clone()));
+        assert!(matches!(Choice::Open.run(None, pick).unwrap(),
+            Some(Outcome::Opened(source)) if matches!(*source, Source::ViewRecording(_))));
+        assert!(
+            Choice::OpenPaused
+                .run(None, pick)
+                .is_err_and(|e| e.to_string().contains("requires a timed recording"))
+        );
     }
 
     #[test]
@@ -268,6 +337,48 @@ mod tests {
         let result = Choice::Start(7).run(Some(&sender), |_| Ok(Some("cockpit.vt".into())));
         assert!(result.is_err_and(|e| e.to_string() == "Pane has exited"));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn playback_choices_match_the_active_pane_state_and_keep_the_original_target() {
+        let playing = Choices {
+            playback: Some((41, ReplayState::Playing)),
+            open: true,
+            ..Default::default()
+        };
+        let paused = Choices {
+            playback: Some((42, ReplayState::Paused)),
+            ..playing
+        };
+        assert_eq!(
+            playing.target(PAUSE),
+            Some(Choice::Playback(41, ReplayAction::Pause))
+        );
+        assert!(playing.target(RESUME).is_none());
+        assert_eq!(
+            paused.target(RESUME),
+            Some(Choice::Playback(42, ReplayAction::Resume))
+        );
+        assert_eq!(
+            paused.target(STEP),
+            Some(Choice::Playback(42, ReplayAction::Step))
+        );
+        assert_eq!(paused.target(OPEN_PAUSED), Some(Choice::OpenPaused));
+        for state in [
+            ReplayState::Loading,
+            ReplayState::Failed,
+            ReplayState::Complete,
+        ] {
+            let idle = Choices {
+                playback: Some((41, state)),
+                ..playing
+            };
+            assert!(
+                [STEP, PAUSE, RESUME]
+                    .into_iter()
+                    .all(|label| idle.target(label).is_none())
+            );
+        }
     }
 
     #[test]

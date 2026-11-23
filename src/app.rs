@@ -1028,7 +1028,9 @@ fn source_label(source: &Source) -> String {
         Source::Replay(path) | Source::ViewRecording(path) => {
             format!("Replay · {}", path.display())
         }
-        Source::TimedReplay(path) => format!("Timed replay · {}", path.display()),
+        Source::TimedReplay(path) | Source::PausedReplay(path) => {
+            format!("Timed replay · {}", path.display())
+        }
         Source::Ssh(ssh) => format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
     }
 }
@@ -2796,9 +2798,7 @@ impl TerminalApp {
                 Message::FolderShare(folder_shares::Action::Open(id))
             }),
             scrollback_export::LABEL => Message::Export(scrollback_export::Action::Start(pane)),
-            value @ (recordings::START | recordings::STOP | recordings::OPEN) => {
-                recordings::invoke(recordings.target(value))
-            }
+            value if recordings::is_command(value) => recordings::invoke(recordings.target(value)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
             "Paste" => Message::Clipboard(clipboard_paste::Action::Start(paste, false)),
             "Paste raw (no bracketed paste)" => {
@@ -4569,7 +4569,7 @@ impl Component for TerminalApp {
                     return;
                 };
                 if matches!(self.tabs.get(tab_id).map(|tab| &tab.page),
-                    Some(Page::Terminal(tab)) if matches!(tab.source, Source::TimedReplay(_)))
+                    Some(Page::Terminal(tab)) if matches!(tab.source, Source::TimedReplay(_) | Source::PausedReplay(_)))
                 {
                     let _ = reply.send(Err(
                         "The recording controls this pane’s grid during timed replay".into(),

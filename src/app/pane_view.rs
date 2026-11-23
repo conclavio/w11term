@@ -510,9 +510,18 @@ impl TerminalApp {
             tab.surface.invalidator.invalidate();
         }
         let focused = tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input);
+        let caret_interval = match tab.source {
+            Source::TimedReplay(_) | Source::PausedReplay(_)
+                if tab.session.events.replay_state()
+                    != Some(w11term::session::ReplayState::Playing) =>
+            {
+                None
+            }
+            _ => self.caret_interval,
+        };
         tab.surface.cursor_blink.borrow_mut().set_focus(
             focused,
-            self.caret_interval,
+            caret_interval,
             &tab.surface.invalidator,
         );
         tab.surface

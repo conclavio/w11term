@@ -413,6 +413,7 @@ pub struct TerminalState {
 
     kitty_img: KittyImageState,
     inactive_kitty_img: KittyImageState,
+    kitty_animation_time: Option<std::time::Instant>,
     seqno: SequenceNo,
 
     synchronized_output: bool,
@@ -680,6 +681,7 @@ impl TerminalState {
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
             inactive_kitty_img: Default::default(),
+            kitty_animation_time: None,
             synchronized_output: false,
             seqno,
             unicode_version,
@@ -1047,6 +1049,9 @@ impl TerminalState {
     fn activate_screen(&mut self, alternate: bool) {
         if self.screen.is_alt_screen_active() != alternate {
             std::mem::swap(&mut self.kitty_img, &mut self.inactive_kitty_img);
+            if let Some(now) = self.kitty_animation_time {
+                self.advance_kitty_animations(now);
+            }
         }
         if alternate {
             self.screen.activate_alt_screen(self.seqno);

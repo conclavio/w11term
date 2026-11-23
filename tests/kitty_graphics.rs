@@ -189,6 +189,103 @@ fn playback_uses_frame_gaps_and_finished_animation_has_no_timer() {
     assert!(t.kitty_animation_deadline().is_none());
 }
 
+#[test]
+fn virtual_time_skips_whole_laps_and_preserves_live_pane_pacing() {
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    let start = Instant::now() + Duration::from_secs(3600);
+    let (mut t, _) = engine();
+    let (mut live, _) = engine();
+    t.set_kitty_animation_time(Some(start));
+    t.advance_bytes(ANIMATION);
+    t.advance_bytes(b"\x1b_Ga=a,i=8,v=80000002,q=2\x1b\\");
+    live.advance_bytes(ANIMATION);
+    let live_due = live.kitty_animation_deadline().unwrap();
+    assert!(live_due < start);
+    assert_eq!(t.kitty_animation_deadline(), Some(start + ms(23)));
+
+    // Root, green and blue occupy [0,23), [23,60) and [60,111) within a lap.
+    let last_lap = start + ms(80_000_000 * 111);
+    let step = last_lap + ms(35);
+    t.set_kitty_animation_time(Some(step));
+    assert!(t.advance_kitty_animations(step));
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 8), Some([0, 255, 0, 255]));
+    assert_eq!(t.kitty_animation_deadline(), Some(last_lap + ms(60)));
+    assert!(!t.advance_kitty_animations(step));
+    assert_eq!(live.kitty_animation_frame(Some(8)), 0);
+    // A late wake on an ordinary pane still shows the next frame for its whole gap.
+    assert!(live.advance_kitty_animations(live_due + ms(10_000)));
+    assert_eq!(live.kitty_animation_frame(Some(8)), 1);
+    assert_eq!(live.kitty_animation_deadline(), Some(live_due + ms(10_037)));
+    let end = last_lap + ms(111);
+    assert!(t.advance_kitty_animations(end - ms(1)));
+    assert_eq!(t.kitty_animation_deadline(), Some(end));
+    assert!(!t.advance_kitty_animations(end));
+    assert_eq!(t.kitty_animation_frame(Some(8)), 2);
+    assert_eq!(t.kitty_animation_deadline(), None);
+}
+
+#[test]
+fn virtual_time_rechecks_active_frame_edits_and_resumes_loading_at_the_recorded_timestamp() {
+    use std::time::{Duration, Instant};
+    let ms = Duration::from_millis;
+    let start = Instant::now() + Duration::from_secs(7200);
+    let (mut t, _) = engine();
+    t.set_kitty_animation_time(Some(start));
+    t.advance_bytes(ANIMATION);
+    t.advance_bytes(b"\x1b_Ga=a,i=8,v=1,q=2\x1b\\");
+    let edit = start + ms(50);
+    t.set_kitty_animation_time(Some(edit));
+    assert!(t.advance_kitty_animations(edit));
+    // Green has already been shown for 27 ms; shorten it to 10 ms and replace
+    // its pixels with yellow. The change first takes effect at the edit time.
+    t.advance_bytes(b"\x1b_Ga=f,i=8,f=32,s=1,v=1,r=2,z=10,q=2;//8A/w==\x1b\\");
+    assert_eq!(
+        pixel(&frame(&t, None, 0), 0, 0, 8),
+        Some([255, 255, 0, 255])
+    );
+    assert_eq!(t.kitty_animation_deadline(), Some(edit));
+    assert!(t.advance_kitty_animations(edit));
+    assert_eq!(t.kitty_animation_frame(Some(8)), 2);
+    assert_eq!(t.kitty_animation_deadline(), Some(edit + ms(51)));
+
+    t.advance_bytes(b"\x1b_Ga=a,i=8,r=1,z=-1,q=2\x1b\\\x1b_Ga=a,i=8,r=2,z=-1,q=2\x1b\\\x1b_Ga=a,i=8,r=3,z=-1,s=2,c=1,q=2\x1b\\");
+    assert_eq!(t.kitty_animation_deadline(), None);
+    let arrival = start + Duration::from_secs(90_000);
+    t.set_kitty_animation_time(Some(arrival));
+    t.advance_bytes(b"\x1b_Ga=f,i=8,f=32,s=1,v=1,z=17,q=2;/wAA/w==\x1b\\");
+    assert_eq!(t.kitty_animation_deadline(), Some(arrival));
+    assert!(t.advance_kitty_animations(arrival));
+    assert_eq!(t.kitty_animation_frame(Some(8)), 3);
+    assert_eq!(
+        t.kitty_animation_deadline(),
+        None,
+        "loading holds the last frame"
+    );
+    let next = arrival + ms(500);
+    t.set_kitty_animation_time(Some(next));
+    t.advance_bytes(b"\x1b_Ga=f,i=8,f=32,s=1,v=1,z=31,q=2;AP8A/w==\x1b\\");
+    assert_eq!(t.kitty_animation_deadline(), Some(next + ms(17)));
+    assert!(t.advance_kitty_animations(next + ms(17)));
+    assert_eq!(t.kitty_animation_frame(Some(8)), 4);
+    assert_eq!(t.kitty_animation_deadline(), None);
+}
+
+#[test]
+fn restored_screen_uses_its_replay_timestamp_before_the_next_graphics_command() {
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let (mut t, _) = engine();
+    t.set_kitty_animation_time(Some(start));
+    t.advance_bytes(ANIMATION);
+    t.advance_bytes(b"\x1b[?1049h");
+    let later = start + Duration::from_secs(86_400);
+    t.set_kitty_animation_time(Some(later));
+    t.advance_bytes(b"\x1b[?1049l\x1b_Ga=a,i=8,s=1,q=2\x1b\\");
+    assert_eq!(t.kitty_animation_deadline(), None);
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 8), Some([0, 0, 255, 255]));
+}
+
 #[tokio::test]
 async fn ancestry_errors_preserve_good_placements_and_normal_parent_reanchors() {
     let (mut t, mut replies) = engine();

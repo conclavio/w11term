@@ -108,6 +108,7 @@ impl Launcher {
             Source::Replay(_)
             | Source::ViewRecording(_)
             | Source::TimedReplay(_)
+            | Source::PausedReplay(_)
             | Source::Demo => {
                 unreachable!("only live transports are launched")
             }

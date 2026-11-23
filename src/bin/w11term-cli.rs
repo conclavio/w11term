@@ -26,6 +26,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         match arg.as_str() {
             "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
             | "save-text" | "restart" | "list-commands" | "get-command" | "inspect"
+            | "playback"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -159,6 +160,41 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_requires_one_pane_and_at_most_one_action() {
+        use w11term::session::ReplayAction;
+        let cli = |line: &str| parse(line.split_ascii_whitespace().map(str::to_owned));
+        for (tail, expected) in [
+            ("", ReplayAction::Status),
+            ("--pause", ReplayAction::Pause),
+            ("--resume", ReplayAction::Resume),
+            ("--step", ReplayAction::Step),
+        ] {
+            assert!(
+                matches!(cli(&format!("--pid 42 playback --pane 7 {tail}")).unwrap(),
+                (Some(42), Request::Playback { pane: 7, action }) if action == expected)
+            );
+        }
+        for args in [
+            "playback",
+            "playback --pane 1 --step --step",
+            "playback --pane 1 --step --resume",
+            "playback --pane 1 --all-panes",
+            "playback --pane 1 32",
+            "inspect --pane 1 --pause",
+        ] {
+            assert!(cli(args).is_err(), "{args}");
+        }
+        let request: Request = serde_json::from_str(r#"{"verb":"playback","pane":7}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::Playback {
+                pane: 7,
+                action: ReplayAction::Status
+            }
+        ));
+    }
 
     #[test]
     fn inspect_requires_a_pane_and_accepts_the_optional_process_id() {

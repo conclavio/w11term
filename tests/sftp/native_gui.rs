@@ -1,6 +1,8 @@
 use super::*;
 #[path = "recording_ui.rs"]
 mod recording_ui;
+#[path = "replay_controls.rs"]
+mod replay_controls;
 #[path = "../support/native_gui.rs"]
 mod shared;
 use shared::run_gui;
@@ -693,6 +695,10 @@ fn drive_mixed_gui(script: &str, ssh: &SshOptions, state: &std::path::Path) {
         .unwrap(),
     )
     .unwrap();
+    drive_gui(script, state);
+}
+
+fn drive_gui(script: &str, state: &std::path::Path) {
     fs::write(
         state.join("appearance.json"),
         br#"{"shortcuts":{"command_palette":"F7","select_tab_1":"F8","copy_mode":"F9"}}"#,

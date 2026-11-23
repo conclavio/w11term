@@ -160,10 +160,7 @@ impl TerminalApp {
                 row.id = CommandId::Clipboard(origin, shortcut == Shortcut::PasteRaw);
             }
             if let CommandId::Menu(label) = &row.id
-                && matches!(
-                    label.as_str(),
-                    recordings::START | recordings::STOP | recordings::OPEN
-                )
+                && recordings::is_command(label)
             {
                 row.id = CommandId::Recording(recordings.target(label));
             }
