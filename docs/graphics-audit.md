@@ -157,9 +157,10 @@ rendered Direct2D pixels. [Kitty indexed color](https://sw.kovidgoyal.net/kitty/
 
 An addressed upload or placement returns one status reply after it is
 processed. Placement replies include the requested placement ID, when
-present. A chunked upload replies on the final chunk. Clients can set
-`q=1` to receive only errors or `q=2` to silence all replies.
-An identified request for an unsupported local transport gets an error.
+present. A multipart upload inherits quiet mode from its first chunk and
+accepts `q=1` or `q=2` on its final chunk. A malformed continuation, an
+unsupported transport, or a transmission limit reports the original image
+and placement or frame when those identifiers are present.
 [Kitty placement replies](https://sw.kovidgoyal.net/kitty/graphics-protocol/#display-images-on-screen)
 
 Animation frame uploads acknowledge the one-based frame number that was
