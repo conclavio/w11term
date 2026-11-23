@@ -18,7 +18,7 @@ mod kitty;
 mod retained_rows;
 pub use retained_rows::RetainedRows;
 mod scrollback_view;
-pub use scrollback_view::{ScrollbackTarget, ScrollbackView};
+pub use scrollback_view::{CommandContext, ScrollbackTarget, ScrollbackView};
 #[cfg(test)]
 mod program_status_tests;
 #[cfg(test)]
@@ -555,6 +555,7 @@ pub struct Snapshot {
     application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
     pub failed_command_rows: Arc<[isize]>,
+    pub command_context: Option<CommandContext>,
     pub reported_directory: Option<Arc<str>>,
     pub status: String,
     pub bytes_received: u64,
@@ -755,6 +756,12 @@ impl Snapshot {
             }),
             command_history: terminal.command_history().clone(),
             failed_command_rows: scrollback_view::failed_command_rows(terminal, previous),
+            command_context: scrollback_view::command_context(
+                terminal,
+                first_stable_row,
+                offset,
+                previous,
+            ),
             reported_directory: terminal.reported_current_dir().cloned(),
             status,
             bytes_received,
@@ -849,6 +856,7 @@ impl Snapshot {
             && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)
             && self.failed_command_rows == old.failed_command_rows
+            && self.command_context == old.command_context
             && self.reported_directory == old.reported_directory
             && self.status == old.status
             && self.bytes_received / 1024 == old.bytes_received / 1024

@@ -2,6 +2,38 @@ use super::{Snapshot, Terminal};
 use crate::session::Command;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandContext {
+    pub start: isize,
+    pub label: Arc<str>,
+}
+
+pub(super) fn command_context(
+    terminal: &wezterm_term::TerminalState,
+    top: isize,
+    offset: usize,
+    previous: Option<&Snapshot>,
+) -> Option<CommandContext> {
+    if offset == 0 {
+        return None;
+    }
+    let (start, command) = terminal.command_context(top)?;
+    let label = crate::events::display_field(command);
+    if label.is_empty() {
+        return None;
+    }
+    if let Some(old) = previous.and_then(|frame| frame.command_context.as_ref())
+        && old.start == start
+        && old.label.as_ref() == label
+    {
+        return Some(old.clone());
+    }
+    Some(CommandContext {
+        start,
+        label: label.into(),
+    })
+}
+
 pub(super) fn failed_command_rows(
     terminal: &wezterm_term::TerminalState,
     previous: Option<&Snapshot>,
@@ -37,6 +69,16 @@ pub struct ScrollbackView {
 }
 
 impl Snapshot {
+    pub fn command_context_target(&self) -> Option<ScrollbackTarget> {
+        let start = self.command_context.as_ref()?.start;
+        let view = self.scrollback_view()?;
+        Some(ScrollbackTarget {
+            view,
+            top: Some(start),
+            require_retained: true,
+        })
+    }
+
     pub fn adjacent_failed_command(&self, older: bool) -> Option<(ScrollbackView, isize)> {
         let view = self.scrollback_view()?;
         let rows = self.failed_command_rows.iter().copied();
@@ -96,7 +138,11 @@ impl ScrollbackView {
 
     /// None follows the newest output, even if output arrived after the gesture began.
     pub fn target(&self, top: Option<isize>) -> ScrollbackTarget {
-        ScrollbackTarget { view: *self, top }
+        ScrollbackTarget {
+            view: *self,
+            top,
+            require_retained: false,
+        }
     }
 
     pub fn scroll_to(&self, top: Option<isize>) -> Command {
@@ -108,11 +154,19 @@ impl ScrollbackView {
 pub struct ScrollbackTarget {
     view: ScrollbackView,
     top: Option<isize>,
+    require_retained: bool,
 }
 
 impl ScrollbackTarget {
     pub(crate) fn offset(&self, term: &Terminal, connection: u64) -> Option<usize> {
         let max = self.view.max_offset(term, connection)?;
+        if self.require_retained
+            && self
+                .top
+                .is_some_and(|top| term.screen().stable_row_to_phys(top).is_none())
+        {
+            return None;
+        }
         let live = term.screen().visible_row_to_stable_row(0);
         Some(
             self.top

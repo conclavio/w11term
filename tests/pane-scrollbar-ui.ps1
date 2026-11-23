@@ -75,6 +75,24 @@ try {
         $top = Top-WireRow $document
         $top -gt 60 -and $top -lt 130 -and [Math]::Abs($scroll.Current.VerticalScrollPercent - 50) -le 1
     }
+    $contextLabel = 'Jump to command output ' + [char]0xb7 + ' fixture build'
+    $contextButton = [System.Windows.Automation.ControlType]::Button
+    Invoke-Button (Wait-Until 'command context for the numbered output' {
+        Find-Element $contextLabel $contextButton
+    })
+    $null = Wait-Until 'command context jumps to the beginning without changing the grid' {
+        (Top-WireRow $document) -eq 0 -and !(Find-Element $contextLabel $contextButton)
+    }
+    if ((Geometry) -cne $geometry) { throw 'Command context resized or moved a pane' }
+    $scroll.SetScrollPercent(-1, 90)
+    $null = Wait-Until 'viewport beyond the completed command has no header' {
+        (Top-WireRow $document) -gt 145 -and !(Find-Element $contextLabel $contextButton)
+    }
+    $scroll.SetScrollPercent(-1, 50)
+    $null = Wait-Until 'scrolled command context is restored' {
+        [Math]::Abs($scroll.Current.VerticalScrollPercent - 50) -le 1 -and
+            (Find-Element $contextLabel $contextButton)
+    }
     $anchored = Visible $document
     [IO.File]::Delete($gate)
     $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','15','wire-202')

@@ -66,7 +66,7 @@ pub struct Screen {
     /// Start of the primary shell's current OSC 133 C/D output range.
     pub(crate) command_start: Option<(StableRowIndex, usize)>,
     // One anchor per retained completed command whose output can be located.
-    command_outputs: Vec<(u64, StableRowIndex, usize)>,
+    command_outputs: Vec<CommandOutput>,
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
@@ -84,6 +84,23 @@ pub struct Screen {
     pub dpi: u32,
 
     pub(crate) saved_cursor: Option<SavedCursor>,
+}
+
+type CommandPosition = (StableRowIndex, usize);
+
+#[derive(Debug, Clone)]
+struct CommandOutput {
+    id: u64,
+    start: CommandPosition,
+    // The end is exclusive. Edits can invalidate the range while leaving its
+    // start available to the command history's existing jump action.
+    end: Option<CommandPosition>,
+}
+
+#[derive(Clone, Copy)]
+enum CommandAnchor {
+    Start(usize),
+    End(usize),
 }
 
 impl Screen {
@@ -162,7 +179,8 @@ impl Screen {
         let Some(phys) = self.stable_row_to_phys(row) else {
             return;
         };
-        if (row, col) > (self.visible_row_to_stable_row(end.0), end.1) {
+        let end = (self.visible_row_to_stable_row(end.0), end.1);
+        if (row, col) > end {
             return;
         }
         let line = &self.lines[phys];
@@ -173,19 +191,24 @@ impl Screen {
             } else {
                 (row, col)
             };
-        self.command_outputs.push((id, row, col));
+        self.command_outputs.push(CommandOutput {
+            id,
+            start: (row, col),
+            end: Some(end),
+        });
     }
 
     pub(crate) fn forget_command_output(&mut self, id: u64) {
-        self.command_outputs
-            .retain(|&(command, _, _)| command != id);
+        self.command_outputs.retain(|command| command.id != id);
     }
 
     pub(crate) fn command_output_row(&self, id: u64) -> Option<StableRowIndex> {
-        let &(_, row, _) = self
+        let row = self
             .command_outputs
             .iter()
-            .find(|(command, _, _)| *command == id)?;
+            .find(|command| command.id == id)?
+            .start
+            .0;
         self.stable_row_to_phys(row).map(|_| row)
     }
 
@@ -193,29 +216,55 @@ impl Screen {
     pub fn command_output_rows(&self) -> impl Iterator<Item = (u64, StableRowIndex)> + '_ {
         self.command_outputs
             .iter()
-            .filter(move |&&(_, row, _)| self.stable_row_to_phys(row).is_some())
-            .map(|&(id, row, _)| (id, row))
+            .filter(move |command| self.stable_row_to_phys(command.start.0).is_some())
+            .map(|command| (command.id, command.start.0))
+    }
+
+    pub(crate) fn command_output_covering(
+        &self,
+        row: StableRowIndex,
+    ) -> Option<(u64, StableRowIndex)> {
+        self.command_outputs.iter().rev().find_map(|command| {
+            let start = command.start.0;
+            (start < row
+                && command.end.is_some_and(|end| (row, 0) < end)
+                && self.stable_row_to_phys(start).is_some())
+            .then_some((command.id, start))
+        })
     }
 
     fn discard_output_rows(&mut self, rows: Range<PhysRowIndex>) {
         let start = self.phys_to_stable_row_index(rows.start);
         let end = self.phys_to_stable_row_index(rows.end);
-        self.command_outputs
-            .retain(|&(_, row, _)| !(start..end).contains(&row));
+        self.command_outputs.retain_mut(|command| {
+            if command.start.0 < end && command.end.is_some_and(|p| (start, 0) < p) {
+                command.end = None;
+            }
+            !(start..end).contains(&command.start.0)
+        });
     }
 
     pub(crate) fn discard_erased_output(&mut self, row: PhysRowIndex, cols: &Range<usize>) {
         let row = self.phys_to_stable_row_index(row);
         let max_col = self.physical_cols - 1;
-        self.command_outputs
-            .retain(|&(_, marked, col)| marked != row || !cols.contains(&col.min(max_col)));
+        self.command_outputs.retain_mut(|command| {
+            if cols.start < cols.end
+                && (row, cols.end) > command.start
+                && command.end.is_some_and(|end| (row, cols.start) < end)
+            {
+                command.end = None;
+            }
+            command.start.0 != row || !cols.contains(&command.start.1.min(max_col))
+        });
     }
 
     fn retain_output_rows(&mut self) {
         let start = self.phys_to_stable_row_index(0);
         let end = self.phys_to_stable_row_index(self.lines.len());
-        self.command_outputs
-            .retain(|&(_, row, _)| (start..end).contains(&row));
+        self.command_outputs.retain_mut(|command| {
+            command.end = command.end.filter(|p| (start..end).contains(&p.0));
+            (start..end).contains(&command.start.0)
+        });
     }
 
     pub(crate) fn take_command_text(
@@ -300,10 +349,19 @@ impl Screen {
         let marker = self
             .command_start
             .and_then(|(row, col)| self.stable_row_to_phys(row).map(|row| (row, col)));
-        let mut outputs: Vec<_> = std::mem::take(&mut self.command_outputs)
-            .into_iter()
-            .filter_map(|(id, row, col)| self.stable_row_to_phys(row).map(|row| (row, id, col)))
-            .collect();
+        let commands = std::mem::take(&mut self.command_outputs);
+        let mut remapped = vec![(None, None); commands.len()];
+        let mut outputs = Vec::new();
+        for (index, command) in commands.iter().enumerate() {
+            if let Some(row) = self.stable_row_to_phys(command.start.0) {
+                outputs.push((row, CommandAnchor::Start(index), command.start.1));
+                if let Some((end, col)) = command.end {
+                    if let Some(row) = self.stable_row_to_phys(end) {
+                        outputs.push((row, CommandAnchor::End(index), col));
+                    }
+                }
+            }
+        }
         outputs.sort_unstable_by_key(|&(row, _, _)| row);
         let mut outputs = outputs.into_iter().peekable();
         let mut logical_outputs = Vec::new();
@@ -321,8 +379,11 @@ impl Screen {
                     logical_marker = Some(logical_line.as_ref().map_or(0, Line::len) + col);
                 }
             }
-            while let Some((_, id, col)) = outputs.next_if(|(row, _, _)| *row == phys_idx) {
-                logical_outputs.push((Some(id), logical_line.as_ref().map_or(0, Line::len) + col));
+            while let Some((_, anchor, col)) = outputs.next_if(|(row, _, _)| *row == phys_idx) {
+                logical_outputs.push((
+                    Some(anchor),
+                    logical_line.as_ref().map_or(0, Line::len) + col,
+                ));
             }
 
             if was_wrapped {
@@ -400,7 +461,7 @@ impl Screen {
                     rewrapped.push_back(line);
                 }
             }
-            for (id, mut col) in logical_marker
+            for (anchor, mut col) in logical_marker
                 .take()
                 .map(|col| (None, col))
                 .into_iter()
@@ -413,10 +474,12 @@ impl Screen {
                     if col < width || row + 1 == rewrapped.len() {
                         let row =
                             (self.stable_row_index_offset + discarded + row) as StableRowIndex;
-                        if let Some(id) = id {
-                            self.command_outputs.push((id, row, col));
-                        } else {
-                            self.command_start = Some((row, col));
+                        match anchor {
+                            Some(CommandAnchor::Start(index)) => {
+                                remapped[index].0 = Some((row, col))
+                            }
+                            Some(CommandAnchor::End(index)) => remapped[index].1 = Some((row, col)),
+                            None => self.command_start = Some((row, col)),
                         }
                         break;
                     }
@@ -446,6 +509,17 @@ impl Screen {
         drop(lines);
         self.lines = rewrapped;
         self.stable_row_index_offset += discarded;
+        self.command_outputs = commands
+            .into_iter()
+            .zip(remapped)
+            .filter_map(|(old, (start, end))| {
+                Some(CommandOutput {
+                    id: old.id,
+                    start: start?,
+                    end,
+                })
+            })
+            .collect();
         self.retain_output_rows();
 
         adjusted_cursor
@@ -1129,13 +1203,19 @@ impl Screen {
                 None
             }
         };
-        self.command_outputs.retain_mut(|(_, row, _)| {
-            if let Some(survivor) = surviving_row(*row) {
-                *row = survivor;
-                true
-            } else {
-                false
+        self.command_outputs.retain_mut(|command| {
+            let Some(start) = surviving_row(command.start.0) else {
+                return false;
+            };
+            if let Some((row, col)) = command.end {
+                command.end = if command.start.0 < end_row && (start_row, 0) < (row, col) {
+                    None
+                } else {
+                    surviving_row(row).map(|row| (row, col))
+                };
             }
+            command.start.0 = start;
+            true
         });
         self.command_start = self
             .command_start
