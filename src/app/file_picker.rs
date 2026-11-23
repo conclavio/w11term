@@ -43,7 +43,7 @@ fn local_folder(dialog: &IFileDialog, folder: &Path) -> bool {
     let drive = [u16::from(letter), b':' as u16, b'\\' as u16, 0];
     unsafe {
         // A typed UNC path or disconnected mapped drive is not a starting folder.
-        if !matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) {
+        if !matches!(GetDriveTypeW(PCWSTR(drive.as_ptr())), 2 | 3) || !folder.is_dir() {
             return false;
         }
         let wide: Vec<_> = folder.as_os_str().encode_wide().chain(Some(0)).collect();

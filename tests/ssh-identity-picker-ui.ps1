@@ -77,8 +77,9 @@ try {
     Click 'Tab menu'
     Click 'Settings' $menu
     Click 'Edit profile fixture'
-    (Key-Field).SetValue('')
-    $null = Wait-Until 'empty profile key path' { (Key-Field).Current.Value -ceq '' }
+    $null = Wait-Until 'profile key has an unavailable starting folder' {
+        (Key-Field).Current.Value -like '*missing-key-folder*'
+    }
     Pick-Key 'home key'
     if (![FixtureDialog]::SameFile($homeKey, (Key-Field).Current.Value)) { throw 'The profile editor did not use the selected path' }
     Click 'Save profile changes'
