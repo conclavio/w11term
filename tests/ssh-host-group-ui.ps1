@@ -67,6 +67,38 @@ function Submit([string]$Text, [string]$ButtonName) {
 function Outcome([string]$Target, [string]$Status) {
     $null = Wait-Until "$Target $Status" { Find-Element "$Target$dot$Status" }
 }
+function Result-FilterPopup([string]$Expected) {
+    Wait-Until "submission result filter '$Expected'" {
+        $entry = Find-Element 'Filter submission results' ([System.Windows.Automation.ControlType]::ComboBox)
+        $provider = $null
+        $selection = $null
+        if ($entry -and $entry.TryGetCurrentPattern(
+                [System.Windows.Automation.SelectionPattern]::Pattern, [ref]$selection
+            ) -and $entry.TryGetCurrentPattern(
+                [System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$provider
+            )) {
+            $items = $selection.Current.GetSelection()
+            if (!$Expected -or ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Expected)) { $provider }
+        }
+    }
+}
+function Set-ResultFilter([string]$Name) {
+    (Result-FilterPopup '').Expand()
+    $choice = Wait-Until "result filter '$Name'" {
+        $entry = Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
+        $provider = $null
+        if ($entry -and $entry.Current.IsEnabled -and !$entry.Current.IsOffscreen -and
+            $entry.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$provider)) {
+            $provider
+        }
+    }
+    $choice.Select()
+    $popup = Result-FilterPopup $Name
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+function Result-Progress([string]$Caption) {
+    $null = Wait-Until 'submission progress counts' { Find-Element $Caption }
+}
 function Click([string]$Name) {
     $invoke = Wait-Until "enabled '$Name'" {
         $entry = Find-Element $Name $button
@@ -133,9 +165,16 @@ try {
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Running'
     $null = Wait-Until 'East output in the group' { Find-Element 'east-accepted both' }
+    Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
+    Set-ResultFilter 'Running'
+    $null = Wait-Until 'show the running result only' {
+        (Find-Element "Focus result pane $west" $button) -and !(Find-Element "Focus result pane $east" $button)
+    }
+    Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
     Submit 'while-slow' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName "Not sent${dot}Waiting for a fresh prompt"
+    Result-Progress "2 of 2 settled${dot}0 waiting${dot}0 running${dot}1 succeeded${dot}1 needs attention"
     Set-HostFilter 'east'
     $null = Wait-Until 'West has left the roster' { !(Find-Element "Focus pane $west" $button) }
     $null = Wait-Until 'the full East output is retained' { Find-Element "View output for pane $east" $button }
@@ -155,6 +194,11 @@ try {
     [IO.File]::WriteAllText((Join-Path $State 'release-west-result'), '')
     Outcome $westName 'Exit 17'
     $null = Wait-Until 'distinct West output in the earlier submission' { Find-Element 'west-accepted both' }
+    Result-Progress "2 of 2 settled${dot}0 waiting${dot}0 running${dot}1 succeeded${dot}1 needs attention"
+    Set-ResultFilter 'Needs attention'
+    $null = Wait-Until 'show only the failed result' {
+        (Find-Element "Focus result pane $west" $button) -and !(Find-Element "Focus result pane $east" $button)
+    }
     Click 'Copy results'
     $null = Wait-Until 'the earlier report contains its own outputs and exit statuses' {
         $report = Read-ClipboardFixture
@@ -204,6 +248,13 @@ try {
     Submit 'interrupt-pair' 'Send to 2 hosts'
     Outcome $eastName 'Running'
     Outcome $westName 'Running'
+    Set-ResultFilter 'Succeeded'
+    $null = Wait-Until 'the empty result filter disables interrupt' {
+        $interrupt = Find-Element 'Interrupt selected' $button
+        (Find-Element 'No recipients match this result filter.') -and $interrupt -and !$interrupt.Current.IsEnabled
+    }
+    Result-Progress "0 of 2 settled${dot}0 waiting${dot}2 running${dot}0 succeeded${dot}0 need attention"
+    Set-ResultFilter 'All results'
     Set-HostFilter "test@127.0.0.1:$($profileData.West.port)"
     $null = Wait-Until 'East is selected and hidden' {
         Find-Element '1 selected host is hidden by the filter.'

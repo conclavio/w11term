@@ -85,6 +85,8 @@ Use **Host filter** to find SSH panes by profile, pane name, or address. **Selec
 
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.
 
+The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status. Result filters apply to **Interrupt selected**. **Copy results** includes the full submission.
+
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.
 
 Choose **Saved commands…** in the group editor to browse the same command library managed in **Settings → Saved commands**. You can also search by name in the command palette while the group is active. Choosing a command fills the draft for review. **Restore draft** is available here too.

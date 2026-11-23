@@ -4,6 +4,7 @@ use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
 use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, PromptToken, ShellPrompt,
 };
+mod progress;
 mod report;
 mod save_command;
 mod saved;
@@ -25,6 +26,7 @@ pub(super) struct HostGroup {
     viewing: u64,
     next_submission: u64,
     copy_feedback: String,
+    result_filter: progress::Filter,
 }
 
 struct Submission {
@@ -198,6 +200,7 @@ impl HostGroup {
     fn submit(&mut self, text: Arc<str>, results: Vec<Delivery>) {
         self.next_submission += 1;
         self.viewing = self.next_submission;
+        self.result_filter = progress::Filter::All;
         self.previous_draft = None;
         self.copy_feedback.clear();
         self.submissions.push_back(Submission {
@@ -253,6 +256,7 @@ pub enum Action {
     SelectShown(TabId, Vec<u64>, bool),
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
+    FilterResults(TabId, u64, progress::Filter),
     LoadCommand(TabId, u64),
     OpenSavedCommands(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
@@ -434,7 +438,9 @@ impl TerminalApp {
             .filter(|&(pane, link)| {
                 eligible.contains(&pane)
                     && run.results.iter().any(|delivery| {
-                        delivery.target.pane == pane && delivery.interrupt_target() == Some(link)
+                        delivery.target.pane == pane
+                            && page.result_filter.includes(progress::Outcome::of(delivery))
+                            && delivery.interrupt_target() == Some(link)
                     })
             })
             .collect();
@@ -575,7 +581,15 @@ impl TerminalApp {
                     && page.submissions.iter().any(|item| item.id == submission)
                 {
                     page.viewing = submission;
+                    page.result_filter = progress::Filter::All;
                     page.copy_feedback.clear();
+                }
+            }
+            Action::FilterResults(id, submission, filter) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && page.viewed_submission(submission).is_some()
+                {
+                    page.result_filter = filter;
                 }
             }
             Action::LoadCommand(id, submission) => {
@@ -877,8 +891,17 @@ impl TerminalApp {
         };
         let submission = &page.submissions[index];
         let submission_id = submission.id;
-        let interrupt_targets: Vec<_> = submission
+        let mut summary = progress::Summary::default();
+        let shown: Vec<_> = submission
             .results
+            .iter()
+            .filter(|delivery| {
+                let outcome = progress::Outcome::of(delivery);
+                summary.add(outcome);
+                page.result_filter.includes(outcome)
+            })
+            .collect();
+        let interrupt_targets: Vec<_> = shown
             .iter()
             .filter(|delivery| selected_shown.contains(&delivery.target.pane))
             .filter_map(|delivery| {
@@ -917,6 +940,13 @@ impl TerminalApp {
                     .font_size(18.0)
                     .text(format!("Submitted · {}", submission.text))
                     .text_trimming(TextTrimming::CharacterEllipsis),
+                TextBlock::new()
+                    .text(summary.caption())
+                    .text_wrapping(TextWrapping::Wrap),
+                ProgressBar::new()
+                    .automation_name("SSH group submission progress")
+                    .maximum(summary.total().max(1) as f64)
+                    .value(summary.settled() as f64),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
@@ -948,6 +978,22 @@ impl TerminalApp {
                             .content("Copy results"),
                         interrupt,
                     )),
+                ComboBox::new()
+                    .automation_name("Filter submission results")
+                    .items_source(progress::FILTERS.map(|(_, label)| label))
+                    .selected_index(
+                        progress::FILTERS
+                            .iter()
+                            .position(|&(filter, _)| filter == page.result_filter),
+                    )
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index.and_then(|index| progress::FILTERS.get(index)).map_or(
+                            Message::ControlIdle,
+                            |&(filter, _)| {
+                                Message::HostGroup(Action::FilterResults(id, submission_id, filter))
+                            },
+                        )
+                    })),
                 if page.copy_feedback.is_empty() {
                     View::empty()
                 } else {
@@ -958,7 +1004,13 @@ impl TerminalApp {
                 },
             )),
         ));
-        details.extend(submission.results.iter().map(|delivery| {
+        if shown.is_empty() {
+            details.push(KeyedView::new(
+                "results-empty",
+                TextBlock::new().text("No recipients match this result filter."),
+            ));
+        }
+        details.extend(shown.into_iter().map(|delivery| {
             KeyedView::new(
                 format!("delivery-{}-{}", submission.id, delivery.target.pane),
                 self.host_group_result_row(id, delivery, ctx),
