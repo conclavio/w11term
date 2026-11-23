@@ -275,7 +275,7 @@ impl ScreenOrAlt {
 
     pub fn activate_alt_screen(&mut self, seqno: SequenceNo) {
         if !self.alt_screen_is_active {
-            self.alt_screen.invalidate_row_coordinates();
+            self.alt_screen.invalidate_visible_rows();
         }
         self.alt_screen_is_active = true;
         self.dirty_top_phys_rows(seqno);
@@ -283,7 +283,7 @@ impl ScreenOrAlt {
 
     pub fn activate_primary_screen(&mut self, seqno: SequenceNo) {
         if self.alt_screen_is_active {
-            self.screen.invalidate_row_coordinates();
+            self.screen.invalidate_visible_rows();
         }
         self.alt_screen_is_active = false;
         self.dirty_top_phys_rows(seqno);
@@ -1084,6 +1084,7 @@ impl TerminalState {
                 self.screen.command_start = None;
                 self.capturing_shell_input = false;
             }
+            self.notify_live_shell_output(true);
             let col = self.shell_column();
             self.screen
                 .remember_command_output(self.next_command_id, (self.cursor.y, col));
@@ -1106,6 +1107,25 @@ impl TerminalState {
                 self.screen.forget_command_output(old.id);
             }
         }
+    }
+
+    pub fn notify_running_shell_output(&mut self) {
+        self.notify_live_shell_output(false);
+    }
+
+    fn notify_live_shell_output(&mut self, finishing: bool) {
+        if self.is_alt_screen_active() || self.capturing_shell_input {
+            return;
+        }
+        let col = self.shell_column();
+        let (Some(output), Some(handler)) = (
+            self.screen
+                .live_command_output(self.cursor.y, col, finishing),
+            self.alert_handler.as_mut(),
+        ) else {
+            return;
+        };
+        handler.live_shell_output(self.next_command_id, self.command_label.as_deref(), output);
     }
 
     pub fn command_output_row(&self, id: u64) -> Option<StableRowIndex> {

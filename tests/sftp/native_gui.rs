@@ -829,6 +829,8 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         };
         let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
         let peer_trace = trace.clone();
+        let release_preview = state.path().join("release-west-preview");
+        let release_paused = state.path().join("release-west-paused");
         let release_slow = state.path().join("release-west-result");
         let responder = tokio::spawn(async move {
             use in_band_resize::Wire;
@@ -916,13 +918,23 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                         prompt,
                                     ]
                                     .concat();
+                                    let preview_gate = release_preview.clone();
+                                    let paused_gate = release_paused.clone();
                                     let gate = release_slow.clone();
                                     let handle = handle.clone();
                                     tokio::spawn(async move {
-                                        while !gate.is_file() {
-                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        for (gate, text) in [
+                                            (preview_gate, b"west live first\r\n".as_slice()),
+                                            (paused_gate, b"west while paused\r\n".as_slice()),
+                                            (gate, finish.as_slice()),
+                                        ] {
+                                            while !gate.is_file() {
+                                                tokio::time::sleep(Duration::from_millis(20)).await;
+                                            }
+                                            if handle.data(id, text.to_vec()).await.is_err() {
+                                                break;
+                                            }
                                         }
-                                        let _ = handle.data(id, finish).await;
                                     });
                                     continue;
                                 }

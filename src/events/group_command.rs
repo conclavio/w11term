@@ -1,7 +1,10 @@
-use super::{CommandLink, application_id};
+use super::{CommandLink, GroupTranscriptHost, application_id};
 use std::sync::Arc;
 use tokio::sync::watch;
-use wezterm_term::{CompletedCommand, FinalTermPromptKind, FinalTermSemanticPrompt};
+use wezterm_term::{
+    CompletedCommand, FinalTermPromptKind, FinalTermSemanticPrompt, LiveCommandOutput,
+    LiveOutputCursor,
+};
 
 const PREVIEW_BYTES: usize = 8192;
 const PREVIEW_LINES: usize = 32;
@@ -62,6 +65,8 @@ pub(super) struct GroupRun {
     expected: Arc<str>,
     status: watch::Sender<GroupExecution>,
     started: Option<Started>,
+    transcript: GroupTranscriptHost,
+    output_cursor: LiveOutputCursor,
 }
 
 #[derive(Debug)]
@@ -75,12 +80,32 @@ impl GroupRun {
         target: GroupInterruptTarget,
         expected: Arc<str>,
         status: watch::Sender<GroupExecution>,
+        transcript: GroupTranscriptHost,
     ) -> Self {
         Self {
             target,
             expected,
             status,
             started: None,
+            transcript,
+            output_cursor: LiveOutputCursor::default(),
+        }
+    }
+
+    pub(super) fn live_output(
+        &mut self,
+        id: u64,
+        label: Option<&str>,
+        output: LiveCommandOutput<'_>,
+    ) {
+        if self
+            .started
+            .as_ref()
+            .is_some_and(|started| started.id == id)
+            && label == Some(self.expected.as_ref())
+            && self.is_running(self.target)
+        {
+            self.transcript.append(output.read(&mut self.output_cursor));
         }
     }
 

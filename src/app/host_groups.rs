@@ -2,8 +2,10 @@ use super::*;
 use std::{borrow::Cow, collections::BTreeSet};
 use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
 use w11term::events::{
-    CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, PromptToken, ShellPrompt,
+    CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
+    ShellPrompt,
 };
+mod live_output;
 mod progress;
 mod report;
 mod save_command;
@@ -27,12 +29,14 @@ pub(super) struct HostGroup {
     next_submission: u64,
     copy_feedback: String,
     result_filter: progress::Filter,
+    live_output: Option<live_output::State>,
 }
 
 struct Submission {
     id: u64,
     text: Arc<str>,
     results: Vec<Delivery>,
+    transcript: GroupTranscript,
 }
 
 #[derive(Clone)]
@@ -218,7 +222,7 @@ impl HostGroup {
         })
     }
 
-    fn submit(&mut self, text: Arc<str>, results: Vec<Delivery>) {
+    fn submit(&mut self, text: Arc<str>, results: Vec<Delivery>, transcript: GroupTranscript) {
         self.next_submission += 1;
         self.viewing = self.next_submission;
         self.result_filter = progress::Filter::All;
@@ -228,6 +232,7 @@ impl HostGroup {
             id: self.viewing,
             text,
             results,
+            transcript,
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -278,6 +283,7 @@ pub enum Action {
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
+    LiveOutput(TabId, u64, live_output::Action),
     FilterResults(TabId, u64, progress::Filter),
     LoadCommand(TabId, u64),
     OpenSavedCommands(TabId),
@@ -311,7 +317,9 @@ impl TerminalApp {
     pub(super) fn host_group_command_target(&self) -> Option<TabId> {
         let id = self.tabs.active_id()?;
         match &self.tabs.get(id)?.page {
-            Page::HostGroup(page) if !page.saved.is_editing() => Some(id),
+            Page::HostGroup(page) if !page.saved.is_editing() && page.live_output.is_none() => {
+                Some(id)
+            }
             _ => None,
         }
     }
@@ -406,7 +414,12 @@ impl TerminalApp {
             .collect()
     }
 
-    fn dispatch_to_host(&self, target: Target, text: Arc<str>) -> Delivery {
+    fn dispatch_to_host(
+        &self,
+        target: Target,
+        text: Arc<str>,
+        transcript: &GroupTranscript,
+    ) -> Delivery {
         let mut execution = None;
         let status = match target.state {
             TargetState::Ready(prompt) | TargetState::Matched(prompt) => {
@@ -433,6 +446,7 @@ impl TerminalApp {
                                 text,
                                 reply,
                                 execution: observe,
+                                transcript: transcript.host(target.pane),
                             })
                             .is_ok()
                         {
@@ -616,6 +630,11 @@ impl TerminalApp {
                     page.copy_feedback.clear();
                 }
             }
+            Action::LiveOutput(id, submission, action) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.update_live_output(submission, action);
+                }
+            }
             Action::FilterResults(id, submission, filter) => {
                 if let Some(page) = self.host_group_mut(id)
                     && page.viewed_submission(submission).is_some()
@@ -684,12 +703,13 @@ impl TerminalApp {
                 {
                     return;
                 }
+                let transcript = GroupTranscript::default();
                 let results = targets
                     .into_iter()
-                    .map(|target| self.dispatch_to_host(target, text.clone()))
+                    .map(|target| self.dispatch_to_host(target, text.clone(), &transcript))
                     .collect();
                 if let Some(page) = self.host_group_mut(id) {
-                    page.submit(text, results);
+                    page.submit(text, results, transcript);
                 }
             }
         }
@@ -725,6 +745,11 @@ impl TerminalApp {
     ) -> View {
         if let Some(editor) = self.saved_host_group_editor(id, &page.saved, ctx) {
             return editor;
+        }
+        if let Some(output) = &page.live_output
+            && let Some(submission) = page.viewed_submission(output.submission)
+        {
+            return self.host_group_live_output(id, output, submission, ctx);
         }
         let targets = self.host_group_targets();
         let shown: Vec<_> = page.shown(&targets).collect();
@@ -1021,6 +1046,15 @@ impl TerminalApp {
                                 Message::HostGroup(Action::CopyResults(id, submission_id))
                             }))
                             .content("Copy results"),
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::LiveOutput(
+                                    id,
+                                    submission_id,
+                                    live_output::Action::Open,
+                                ))
+                            }))
+                            .content("Live output…"),
                         interrupt,
                     )),
                 ComboBox::new()
@@ -1189,7 +1223,11 @@ mod tests {
     fn submission_history_retains_the_latest_eight_and_selects_the_newest() {
         let mut group = HostGroup::default();
         for id in 1..=10 {
-            group.submit(format!("command {id}").into(), Vec::new());
+            group.submit(
+                format!("command {id}").into(),
+                Vec::new(),
+                GroupTranscript::default(),
+            );
         }
         assert_eq!(group.submissions.len(), SUBMISSION_LIMIT);
         assert_eq!(group.submissions.front().unwrap().id, 3);
@@ -1204,8 +1242,16 @@ mod tests {
             filter: "east".into(),
             ..Default::default()
         };
-        group.submit("show  inventory".into(), Vec::new());
-        group.submit("show revision".into(), Vec::new());
+        group.submit(
+            "show  inventory".into(),
+            Vec::new(),
+            GroupTranscript::default(),
+        );
+        group.submit(
+            "show revision".into(),
+            Vec::new(),
+            GroupTranscript::default(),
+        );
 
         assert!(!group.load_command(1));
         assert_eq!(group.draft, "in progress");
@@ -1223,7 +1269,11 @@ mod tests {
         assert_eq!(group.draft, "in progress");
         assert!(!group.restore_draft());
         assert!(group.load_command(2));
-        group.submit("show revision".into(), Vec::new());
+        group.submit(
+            "show revision".into(),
+            Vec::new(),
+            GroupTranscript::default(),
+        );
         assert!(!group.restore_draft());
     }
 }
