@@ -101,6 +101,103 @@ def check_bash(executable, directory):
     print("Bash directory setup preserves hooks and status and reports encoded OSC 7 paths.")
 
 
+def check_bash_integration(executable, directory):
+    command = [executable, "--noprofile", "--norc"]
+    setup = "\n".join((SCRIPTS / script).read_text(encoding="utf-8") for script in (
+        "bash-directory.sh", "bash-integration.sh",
+    ))
+    startup = r"""set -u
+PS1='fixture:$? > '
+PS0='existing-ps0:'
+fixture_prompt() {
+    builtin printf 'existing-prompt=%s pipe=%s\n' "$1" "$2"
+    PS1=$fixture_prompt_text
+    PS0='existing-ps0:'
+}
+fixture_prompt_text=$PS1
+trap ':' DEBUG
+"""
+    tail = r"""builtin printf 'recording-started\n'
+cd -- "$W11TERM_TEST_SHELL_DIRECTORY" || exit 73
+builtin printf 'directory=<%s>\n' "$PWD"
+false | true
+true | false
+builtin printf 'previous=%s\n' "$?"
+
+fixture_prompt_text='changed:$? > '
+set +o history
+(exit 23)
+trap -p DEBUG
+builtin printf 'hooks=<%s><%s>\n' "${PROMPT_COMMAND[2]-}" "${PROMPT_COMMAND[9]-}"
+exit 0
+"""
+    existing = 'fixture_prompt "$?" "${PIPESTATUS[*]}"'
+    for prompt_hooks in (
+        "PROMPT_COMMAND='" + existing + "'",
+        "PROMPT_COMMAND=([2]='" + existing + "' [9]='builtin printf \"second-hook=%s\\n\" \"$?\"')",
+    ):
+        output, _ = run(
+            command,
+            "\n".join((startup, prompt_hooks, setup, setup, tail)),
+            {"W11TERM_TEST_SHELL_DIRECTORY": str(directory)},
+            merge_output=True,
+        )
+        assert b"command not found" not in output and b"unbound variable" not in output, output
+        assert output.count(b"w11term command recording is enabled") == 1, output
+        assert output.count(b"w11term directory reporting is enabled") == 1, output
+        cycle = output.split(b"recording-started\n", 1)[1]
+        check_directory_report(REPORT.findall(cycle), cycle)
+        assert b"\x1b]133;A\x07fixture:1 > \x1b]133;B\x07" in cycle, cycle
+        assert b"\x1b]133;A\x07changed:23 > \x1b]133;B\x07" in cycle, cycle
+        assert b"\x1b]133;D;0\x07existing-prompt=0 pipe=1 0\n" in cycle, cycle
+        assert b"\x1b]133;D;1\x07existing-prompt=1 pipe=0 1\n" in cycle, cycle
+        assert b"previous=1\n" in cycle and b"trap -- ':' DEBUG\n" in cycle, cycle
+        if "[9]" in prompt_hooks:
+            assert b"second-hook=1\n" in cycle, cycle
+            assert b"hooks=<" + existing.encode() + b"><builtin printf" in cycle, cycle
+        marks = [mark for mark in MARK.findall(cycle) if mark.startswith((b"C", b"D"))]
+        assert marks == [
+            b"D;0",
+            b"C", b"D;0",  # cd
+            b"C", b"D;0",  # print the new directory
+            b"C", b"D;0",  # false | true
+            b"C", b"D;1",  # true | false
+            b"C", b"D;0",  # print the previous status
+            b"C", b"D;0",  # change the prompt
+            b"C", b"D;0",  # disable shell history
+            b"C", b"D;23",
+            b"C", b"D;0",  # inspect the existing trap
+            b"C", b"D;0",  # inspect hook indices
+            b"C",          # exit doesn't return to a prompt
+        ], marks
+        assert cycle.count(b"existing-ps0:\x1b]133;C\x07") == marks.count(b"C"), cycle
+
+    for startup, diagnostic in [
+        ("shopt -u promptvars", b"requires the promptvars option"),
+        ("readonly PS0='existing'", b"needs writable prompts and PROMPT_COMMAND"),
+        ("readonly PROMPT_COMMAND=':'", b"needs writable prompts and PROMPT_COMMAND"),
+        (r"PS1='\[\e]633;A\a\]other> '", b"already supplies semantic markers"),
+    ]:
+        stdout, stderr = run(command, "\n".join((startup, setup, "exit 0\n")))
+        assert diagnostic in stderr and not MARK.search(stdout + stderr), (stdout, stderr)
+    stdout, stderr = run(command, setup, interactive=False)
+    assert not stdout and not stderr, (stdout, stderr)
+    output, _ = run(
+        command,
+        "\n".join(("PS0='existing:'; PROMPT_COMMAND='PS0+=.'", setup, r"""shopt -u promptvars
+builtin printf 'without-promptvars\n'
+shopt -s promptvars
+builtin printf 'with-promptvars\n'
+exit 0
+""")),
+        merge_output=True,
+    )
+    assert b"\x1b]133;C\x07without-promptvars" not in output, output
+    assert b"\x1b]133;C\x07with-promptvars\n\x1b]133;D;0\x07" in output, output
+    assert MARK.findall(output).count(b"C") == 3, output
+    print("Bash command marks preserve PS0, existing hooks and pipeline status.")
+
+
 def check_zsh(executable, directory):
     command = [executable, "-f"]
     setup = (SCRIPTS / "zsh-directory.zsh").read_text(encoding="utf-8")
@@ -291,6 +388,7 @@ def main():
         directory.mkdir()
         if args.shell in ("all", "bash"):
             check_bash(args.bash, directory)
+            check_bash_integration(args.bash, directory)
         if args.shell in ("all", "zsh"):
             check_zsh(args.zsh, directory)
             check_zsh_integration(args.zsh, directory)
