@@ -1,6 +1,14 @@
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
 use w11term::terminal::{self, Snapshot, TransportInput};
-use wezterm_term::{TerminalSize, image::ImageDataType};
+use wezterm_term::{Clipboard, ClipboardSelection, TerminalSize, image::ImageDataType};
+
+struct ReplayClipboard;
+
+impl Clipboard for ReplayClipboard {
+    fn set_contents(&self, _: ClipboardSelection, _: Option<String>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 
 fn grid(rows: usize, cols: usize) -> TerminalSize {
     TerminalSize {
@@ -19,6 +27,10 @@ async fn real_remote_mux_frames_survive_input_and_resize() {
     for case in ["zellij", "venti-default", "venti-sixel"] {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut term = terminal::create(grid(30, 100), tx);
+        // These captures used the default live SSH capability. Mirror its replies
+        // without writing to the system clipboard during fixture replay.
+        let clipboard: Arc<dyn Clipboard> = Arc::new(ReplayClipboard);
+        term.set_clipboard(&clipboard);
         let mut previous = None;
         for (stage, label) in [("first", "W11FIRST "), ("moved", "W11MOVED ")] {
             if stage == "moved" {

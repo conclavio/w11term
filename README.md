@@ -485,6 +485,8 @@ printf '\033]52;c;%s\a' "$(printf '%s' 'Copied from the remote host 🌍' | base
 
 OSC 52 writes are plain text and are capped at 1 MiB and four remote writes per second across the process. Clipboard-read queries receive no response. Background sessions can write by default. Turn on **Limit OSC 52 to the foreground pane** in Settings to accept writes only from the selected pane in the foreground w11term window. The app checks again when it writes to the clipboard. Turn off **Allow remote clipboard copy (OSC 52)** to disable remote writes entirely. Normal UI paste remains distinct from the control CLI's `send-text --no-paste`, which always sends raw bytes. For bytes that cannot be represented as Windows clipboard text, use `--file`, `--stdin`, or `--base64` through the CLI.
 
+The primary device attributes reply (DA1) includes attribute 52 when the pane supports OSC 52 writes. Foreground-only panes advertise support and enforce focus when a write arrives. Disabling remote writes removes attribute 52 on the next query. [Windows Terminal's DA1 extension](https://github.com/microsoft/terminal/pull/19034)
+
 ## Architecture
 
 - `terminal.rs`: pinned WezTerm VT engine adapter, keyboard encoding, immutable screen snapshots, and protocol tests. Kitty's full input encoder comes from `wezterm-input-types`; `Terminal::key_down` alone does not implement that protocol.
