@@ -550,6 +550,7 @@ pub struct Snapshot {
     pub title: String,
     application_title: Option<Arc<ApplicationTitle>>,
     pub command_history: Arc<std::collections::VecDeque<Arc<wezterm_term::CompletedCommand>>>,
+    pub failed_command_rows: Arc<[isize]>,
     pub reported_directory: Option<Arc<str>>,
     pub status: String,
     pub bytes_received: u64,
@@ -749,6 +750,7 @@ impl Snapshot {
                     })
             }),
             command_history: terminal.command_history().clone(),
+            failed_command_rows: scrollback_view::failed_command_rows(terminal, previous),
             reported_directory: terminal.reported_current_dir().cloned(),
             status,
             bytes_received,
@@ -842,6 +844,7 @@ impl Snapshot {
             && self.title == old.title
             && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)
+            && self.failed_command_rows == old.failed_command_rows
             && self.reported_directory == old.reported_directory
             && self.status == old.status
             && self.bytes_received / 1024 == old.bytes_received / 1024

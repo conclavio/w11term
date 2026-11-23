@@ -1,5 +1,27 @@
 use super::{Snapshot, Terminal};
 use crate::session::Command;
+use std::sync::Arc;
+
+pub(super) fn failed_command_rows(
+    terminal: &wezterm_term::TerminalState,
+    previous: Option<&Snapshot>,
+) -> Arc<[isize]> {
+    let rows = || {
+        let history = terminal.command_history();
+        terminal
+            .screen()
+            .command_output_rows()
+            .filter_map(move |(id, row)| {
+                let entry = &history[history.binary_search_by_key(&id, |entry| entry.id).ok()?];
+                entry.exit_code.is_some_and(|code| code != 0).then_some(row)
+            })
+    };
+    if let Some(old) = previous.filter(|old| rows().eq(old.failed_command_rows.iter().copied())) {
+        old.failed_command_rows.clone()
+    } else {
+        rows().collect()
+    }
+}
 
 /// The primary viewport in stable row coordinates, including the newest possible top row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +37,19 @@ pub struct ScrollbackView {
 }
 
 impl Snapshot {
+    pub fn adjacent_failed_command(&self, older: bool) -> Option<(ScrollbackView, isize)> {
+        let view = self.scrollback_view()?;
+        let rows = self.failed_command_rows.iter().copied();
+        let target = if older {
+            rows.filter(|&row| row < view.top).max()?
+        } else {
+            // Rows within the live viewport share the same scroll position.
+            (view.top < view.live).then_some(())?;
+            rows.filter(|&row| row > view.top).min()?
+        };
+        Some((view, target))
+    }
+
     pub fn scrollback_view(&self) -> Option<ScrollbackView> {
         let live = self
             .first_stable_row

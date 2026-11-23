@@ -10,6 +10,8 @@ use wezterm_term::MouseEventKind;
 use windows_canvas::{Brush, ColorF, DrawContext, DrawingSession, Rect};
 use windows_reactor::PointerEventInfo;
 
+const FAILURE_MARK_WIDTH: f32 = 3.0;
+
 #[derive(Clone, Copy)]
 struct Rail {
     view: ScrollbackView,
@@ -45,6 +47,10 @@ impl Rail {
     fn hit(self, x: f32, y: f32) -> bool {
         (self.width - PADDING..self.width).contains(&x)
             && (PADDING..PADDING + self.height).contains(&y)
+    }
+
+    fn failure_lane(self) -> Range<f32> {
+        (self.width - PADDING)..(self.width - PADDING + FAILURE_MARK_WIDTH)
     }
 
     fn thumb(self) -> (f32, f32) {
@@ -170,6 +176,8 @@ struct Drag {
 pub(super) struct ScrollBar {
     enabled: Cell<bool>,
     find_open: Cell<bool>,
+    show_failures: Cell<bool>,
+    failure_rows: RefCell<Option<Arc<[isize]>>>,
     marks: RefCell<Option<MarkBands>>,
     shown: Cell<Option<Rail>>,
     owns_press: Cell<bool>,
@@ -177,16 +185,20 @@ pub(super) struct ScrollBar {
 }
 
 impl ScrollBar {
-    pub(super) fn configure(&self, enabled: bool, find_open: bool) -> bool {
+    pub(super) fn configure(&self, enabled: bool, find_open: bool, show_failures: bool) -> bool {
         let was_enabled = self.enabled.replace(enabled);
         let had_find = self.find_open.replace(find_open);
+        let had_failures = self.show_failures.replace(show_failures);
+        if !enabled || !show_failures {
+            self.failure_rows.borrow_mut().take();
+        }
         if !enabled {
             self.present(None);
         }
         if !enabled || !find_open {
             self.marks.borrow_mut().take();
         }
-        was_enabled != enabled || had_find != find_open
+        was_enabled != enabled || had_find != find_open || had_failures != show_failures
     }
 
     pub(super) fn cancel(&self) {
@@ -200,6 +212,9 @@ impl ScrollBar {
             && !rail.is_some_and(|new| drag.rail.compatible(new))
         {
             self.cancel();
+        }
+        if rail.is_none() {
+            self.failure_rows.borrow_mut().take();
         }
         self.shown.set(rail);
     }
@@ -248,6 +263,12 @@ impl ScrollBar {
             ctx.fill_rect(&Rect::from_xywh(x, PADDING, w, rail.height), brush);
             brush.set_color(ColorF::new(0.56, 0.60, 0.65, 1.0));
             ctx.fill_rect(&Rect::from_xywh(x, top, w, height), brush);
+            if self.show_failures.get() && !frame.failed_command_rows.is_empty() {
+                self.paint_failures(ctx, rail, brush, &frame.failed_command_rows);
+                *self.failure_rows.borrow_mut() = Some(frame.failed_command_rows.clone());
+            } else {
+                self.failure_rows.borrow_mut().take();
+            }
             if let Some(search) = frame
                 .search
                 .as_ref()
@@ -261,6 +282,47 @@ impl ScrollBar {
             self.marks.borrow_mut().take();
         }
         Ok(())
+    }
+
+    fn paint_failures(&self, ctx: &DrawingSession<'_>, rail: Rail, brush: &Brush, rows: &[isize]) {
+        let scale = MarkScale::new(rail);
+        let pixel_top = (PADDING * rail.scale).round();
+        brush.set_color(ColorF::new(1.0, 104.0 / 255.0, 123.0 / 255.0, 1.0));
+        for band in rows
+            .iter()
+            .filter_map(|&row| scale.band(row, scale.thickness))
+        {
+            ctx.fill_rect(
+                &Rect::from_xywh(
+                    rail.failure_lane().start,
+                    (pixel_top + band.start as f32) / rail.scale,
+                    FAILURE_MARK_WIDTH,
+                    (band.end - band.start) as f32 / rail.scale,
+                ),
+                brush,
+            );
+        }
+    }
+
+    fn failed_command_at(&self, rail: Rail, x: f32, y: f32) -> Option<isize> {
+        if !rail.failure_lane().contains(&x) {
+            return None;
+        }
+        let rows = self.failure_rows.borrow();
+        let scale = MarkScale::new(rail);
+        let pixel = (y * rail.scale - (PADDING * rail.scale).round()).max(0.0);
+        // The separate lane gives small marks a forgiving vertical target.
+        // When distant rows share a pixel, pick the newer retained row.
+        rows.as_ref()?
+            .iter()
+            .filter_map(|&row| {
+                let band = scale.band(row, scale.thickness)?;
+                let center = (band.start as f32 + band.end as f32) / 2.0;
+                let distance = (pixel - center).abs();
+                (distance <= 3.0_f32.max(scale.thickness as f32 / 2.0)).then_some((distance, row))
+            })
+            .min_by(|(a, first), (b, second)| a.total_cmp(b).then_with(|| second.cmp(first)))
+            .map(|(_, row)| row)
     }
 
     fn paint_marks(
@@ -304,7 +366,7 @@ impl ScrollBar {
         &self,
         pointer: PointerEventInfo,
         kind: MouseEventKind,
-        current: impl FnOnce() -> Option<ScrollbackView>,
+        current: impl FnOnce(Option<isize>) -> Option<ScrollbackView>,
         mut scroll: impl FnMut(ScrollbackView, Option<isize>),
     ) -> bool {
         let x = pointer.x as f32;
@@ -314,11 +376,14 @@ impl ScrollBar {
             self.cancel();
             self.owns_press.set(hit.is_some());
             let Some(rail) = hit else { return false };
+            let failed = self.failed_command_at(rail, x, y);
             if pointer.is_left_button_pressed
-                && current().is_some_and(|view| rail.view.same_screen(&view))
+                && current(failed).is_some_and(|view| rail.view.same_screen(&view))
             {
                 let (top, height) = rail.thumb();
-                if (top..top + height).contains(&y) {
+                if let Some(row) = failed {
+                    scroll(rail.view, Some(row));
+                } else if (top..top + height).contains(&y) {
                     if pointer.capture_succeeded {
                         self.drag.set(Some(Drag {
                             rail,
@@ -338,7 +403,7 @@ impl ScrollBar {
         if self.owns_press.get() && (any_button || kind == MouseEventKind::Release) {
             if let Some(mut drag) = self.drag.take()
                 && y.is_finite()
-                && current().is_some_and(|view| drag.rail.view.same_screen(&view))
+                && current(None).is_some_and(|view| drag.rail.view.same_screen(&view))
             {
                 let target = drag.rail.drag_target(y, drag.grab);
                 if target != drag.last_target {
@@ -411,11 +476,41 @@ mod tests {
             assert!(bar.pointer(
                 point(WIDTH - 6.0, y, kind == MouseEventKind::Press),
                 kind,
-                || Some(rail.view),
+                |_| Some(rail.view),
                 |_, target| sent.push(target)
             ));
         }
         sent
+    }
+
+    #[test]
+    fn failure_hit_uses_its_own_lane_and_rechecks_the_current_frame() {
+        let mut term = terminal();
+        term.advance_bytes(b"x\r\n".repeat(200));
+        let rail = rail(&term, 0);
+        let row = rail.view.oldest + 40;
+        let scale = MarkScale::new(rail);
+        let band = scale.band(row, scale.thickness).unwrap();
+        let y = PADDING + (band.start as f32 + band.end as f32) / 2.0 / rail.scale;
+        let bar = ScrollBar::default();
+        bar.configure(true, false, true);
+        bar.present(Some(rail));
+        *bar.failure_rows.borrow_mut() = Some(Arc::from([row]));
+        let lane = rail.failure_lane();
+        let x = (lane.start + lane.end) / 2.0;
+        assert_eq!(bar.failed_command_at(rail, x, y), Some(row));
+        assert_eq!(bar.failed_command_at(rail, WIDTH - 6.0, y), None);
+        assert!(bar.pointer(
+            point(x, y, true),
+            MouseEventKind::Press,
+            |target| {
+                assert_eq!(target, Some(row));
+                None // The output was erased after this mark was drawn.
+            },
+            |_, _| panic!("would scroll to a stale command")
+        ));
+        assert!(bar.configure(true, false, false));
+        assert_eq!(bar.failed_command_at(rail, x, y), None);
     }
 
     #[test]
@@ -479,11 +574,11 @@ mod tests {
             [0..2, 249..251, 498..500]
         );
         let bar = ScrollBar::default();
-        bar.configure(true, true);
+        bar.configure(true, true, true);
         *bar.marks.borrow_mut() = cache;
-        assert!(!bar.configure(true, true));
+        assert!(!bar.configure(true, true, true));
         assert!(bar.marks.borrow().is_some());
-        assert!(bar.configure(true, false));
+        assert!(bar.configure(true, false, true));
         assert!(bar.marks.borrow().is_none());
     }
 
@@ -545,7 +640,7 @@ mod tests {
         assert!(bar.pointer(
             point(WIDTH - 6.0, PADDING + grab, true),
             MouseEventKind::Press,
-            || Some(first.view),
+            |_| Some(first.view),
             |_, _| panic!("thumb press scrolled")
         ));
         term.advance_bytes(b"new\r\n".repeat(100));
@@ -562,7 +657,7 @@ mod tests {
             assert!(bar.pointer(
                 point(-80.0, y, kind == MouseEventKind::Move),
                 kind,
-                || Some(grown.view),
+                |_| Some(grown.view),
                 |_, target| sent.push(target)
             ));
         }
@@ -576,7 +671,7 @@ mod tests {
         assert!(!bar.pointer(
             point(-80.0, halfway, true),
             MouseEventKind::Move,
-            || panic!(),
+            |_| panic!(),
             |_, _| panic!()
         ));
     }
@@ -600,7 +695,7 @@ mod tests {
             assert!(bar.pointer(
                 press,
                 MouseEventKind::Press,
-                || Some(oldest.view),
+                |_| Some(oldest.view),
                 |_, _| panic!()
             ));
             let mut current = Some(oldest.view);
@@ -623,7 +718,7 @@ mod tests {
                 assert!(bar.pointer(
                     point(50.0, 155.0, kind == MouseEventKind::Move),
                     kind,
-                    || current,
+                    |_| current,
                     |_, _| panic!("{cause} left the drag active")
                 ));
             }
@@ -634,7 +729,7 @@ mod tests {
             assert!(!bar.pointer(
                 point(WIDTH - 6.0, 50.0, kind == MouseEventKind::Move),
                 kind,
-                || panic!(),
+                |_| panic!(),
                 |_, _| panic!()
             ));
         }

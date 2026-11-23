@@ -65,7 +65,8 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - `screen.rs` and `terminalstate/` retain a primary-screen OSC 133 command's
   output boundaries across scrolling and reflow. On completion they expose
-  bounded plain text and the numeric exit status. The sibling escape parser
+  bounded plain text and the numeric exit status. The screen exposes the stable
+  output rows by command ID for scrollbar marks. The sibling escape parser
   preserves the distinction between a missing status and exit code zero.
   OSC 7 retains the original URI alongside the parsed URL so the embedding can
   validate the authority before using it for the pane's SFTP drawer.

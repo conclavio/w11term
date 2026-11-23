@@ -230,6 +230,63 @@ fn scrollback_limit_survives_height_changes_alt_screen_and_transport_reset() {
 }
 
 #[test]
+fn failed_command_marks_follow_retained_output_only() {
+    let mut term = terminal(16, 3, 36);
+    let capture = |term: &Terminal, previous: Option<&Snapshot>, offset| {
+        Snapshot::capture(term, previous, 0, offset, String::new(), 0)
+    };
+    term.advance_bytes(concat!(
+        "a long heading\r\n",
+        "\x1b]133;C\x07failed-a\x1b]133;D;9\x07\r\n",
+        "\x1b]133;C\x07okay\x1b]133;D;0\x07\r\n",
+        "\x1b]133;C\x07unknown\x1b]133;D\x07\r\n",
+        "\x1b]133;C\x07failed-b\x1b]133;D;1\x07\r\n",
+        "more output\r\nsecond line\r\nlast line\r\n"
+    ));
+    let live = capture(&term, None, 0);
+    assert_eq!(&*live.failed_command_rows, &[1, 4]);
+    let (view, second) = live.adjacent_failed_command(true).unwrap();
+    assert_eq!(second, 4);
+    assert!(live.adjacent_failed_command(false).is_none());
+    let at_second = capture(&term, Some(&live), view.live.abs_diff(second));
+    assert_eq!(at_second.adjacent_failed_command(true).unwrap().1, 1);
+    let first = capture(&term, Some(&at_second), view.live.abs_diff(1));
+    assert_eq!(first.adjacent_failed_command(false).unwrap().1, second);
+    assert!(first.adjacent_failed_command(true).is_none());
+    assert!(Arc::ptr_eq(
+        &first.failed_command_rows,
+        &live.failed_command_rows
+    ));
+
+    resize(&mut term, 8, 3);
+    let reflowed = capture(&term, Some(&live), 0);
+    let start = term.screen().phys_to_stable_row_index(0);
+    let expected: Vec<_> = rows(&term)
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| text.starts_with("failed-"))
+        .map(|(row, _)| start + row as isize)
+        .collect();
+    assert_ne!(expected, [1, 4]);
+    assert_eq!(&*reflowed.failed_command_rows, expected);
+    term.advance_bytes(b"\x1b[?1049h");
+    assert!(
+        capture(&term, Some(&reflowed), 0)
+            .failed_command_rows
+            .is_empty()
+    );
+    term.advance_bytes(b"\x1b[?1049l");
+    assert_eq!(&*capture(&term, None, 0).failed_command_rows, expected);
+    term.advance_bytes(b"\x1b[3J");
+    assert!(
+        capture(&term, Some(&reflowed), 0)
+            .failed_command_rows
+            .is_empty()
+    );
+    assert_eq!(term.command_history().len(), 4);
+}
+
+#[test]
 fn scrollback_reflow_keeps_only_command_markers_on_retained_rows() {
     let mut term = terminal(12, 3, 1);
     term.advance_bytes("old1\r\nold2\r\nold3\r\nabcdefghijkl\r\nmnopqrstuvwx\r\n\x1b]133;C\x07ok");

@@ -208,7 +208,7 @@ impl PaneSurface {
 
     pub(super) fn release(&self) {
         self.pause_cursor();
-        self.scrollbar.configure(false, false);
+        self.scrollbar.configure(false, false, false);
         self.canvas.borrow_mut().take();
     }
 
@@ -534,11 +534,15 @@ impl TerminalApp {
                 .borrow()
                 .as_ref()
                 .is_some_and(|m| m.pane == id);
-        if tab
-            .surface
-            .scrollbar
-            .configure(show_scrollbar, tab.find.open)
-        {
+        if tab.surface.scrollbar.configure(
+            show_scrollbar,
+            tab.find.open,
+            self.appearance
+                .read()
+                .unwrap()
+                .interaction
+                .failed_command_marks,
+        ) {
             tab.surface.invalidator.invalidate();
         }
         let focused = tab.error.is_none() && self.keyboard.terminal_focused(&tab.session.input);

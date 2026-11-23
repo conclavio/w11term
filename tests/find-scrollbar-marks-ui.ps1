@@ -22,27 +22,36 @@ function Read-Rail([int]$Pane) {
     $png = [Drawing.Bitmap]::new((Join-Path $State 'rail.png'))
     try {
         $stripes = [Collections.Generic.List[object]]::new()
+        $failures = [Collections.Generic.List[object]]::new()
+        $lastFailed = $false
         $trackRows = 0
         $prior = ''
         for ($y = 0; $y -lt $png.Height; $y++) {
             $kind = ''
             $track = $false
+            $failed = $false
             for ($x = 0; $x -lt $png.Width; $x++) {
                 $c = $png.GetPixel($x,$y)
                 # The rail painter uses yellow #FFD84C and orange #FF7B29.
                 if ($c.R -ge 251 -and [math]::Abs($c.G-216) -le 3 -and [math]::Abs($c.B-76) -le 3 -and !$kind) { $kind = 'hit' }
                 if ($c.R -ge 251 -and [math]::Abs($c.G-123) -le 3 -and [math]::Abs($c.B-41) -le 3) { $kind = 'current' }
+                if ($c.R -ge 251 -and [math]::Abs($c.G-104) -le 3 -and [math]::Abs($c.B-123) -le 3) { $failed = $true }
                 if (([math]::Abs($c.R-41) -le 2 -and [math]::Abs($c.G-46) -le 2 -and [math]::Abs($c.B-54) -le 2) -or
                     ([math]::Abs($c.R-143) -le 2 -and [math]::Abs($c.G-153) -le 2 -and [math]::Abs($c.B-166) -le 2)) { $track = $true }
             }
             if ($track) { $trackRows++ }
+            if ($failed) {
+                if (!$lastFailed) { $failures.Add([pscustomobject]@{ Top=$y; Bottom=$y }) }
+                else { $failures[$failures.Count-1].Bottom = $y }
+            }
+            $lastFailed = $failed
             if ($kind) {
                 if ($prior -cne $kind) { $stripes.Add([pscustomobject]@{ Kind=$kind; Top=$y; Bottom=$y }) }
                 else { $stripes[$stripes.Count-1].Bottom = $y }
             }
             $prior = $kind
         }
-        return [pscustomobject]@{ Height=$png.Height; TrackRows=$trackRows; Stripes=$stripes.ToArray() }
+        return [pscustomobject]@{ Height=$png.Height; TrackRows=$trackRows; Stripes=$stripes.ToArray(); Failures=$failures.ToArray() }
     } finally { $png.Dispose() }
 }
 function Assert-Marks([int]$Pane, [int]$Current) {
@@ -66,10 +75,37 @@ function Assert-Marks([int]$Pane, [int]$Current) {
 function Assert-Unmarked([int]$Pane, [bool]$HasHistory) {
     $rail = Read-Rail $Pane
     if ($rail.Stripes.Count -ne 0 -or
+        (!$HasHistory -and $rail.Failures.Count -gt 0) -or
         ($HasHistory -and $rail.TrackRows -lt $rail.Height / 2) -or
         (!$HasHistory -and $rail.TrackRows -gt 0)) {
         throw "Unexpected rail for pane $Pane (scrollable $HasHistory): $($rail | ConvertTo-Json -Compress)"
     }
+}
+function Assert-Failures([int]$Pane) {
+    $rail = Read-Rail $Pane
+    if ($rail.Failures.Count -ne 2) { throw "Expected two failure marks: $($rail | ConvertTo-Json -Compress)" }
+    $expected = @(0.20,0.675)
+    for ($i = 0; $i -lt 2; $i++) {
+        $mark = $rail.Failures[$i]
+        $actual = ($mark.Top + $mark.Bottom + 1) / (2.0 * $rail.Height)
+        if ([math]::Abs($actual-$expected[$i]) -gt 0.04) { throw "Failure mark $i rendered at $actual" }
+    }
+    return $rail.Failures
+}
+function Top-Of-Ssh {
+    $document = Find-Element ('Terminal ' + [char]0xb7 + ' palette-ssh') ([System.Windows.Automation.ControlType]::Document)
+    if ($document) {
+        $pattern = $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+        return ($pattern.GetVisibleRanges()[0].GetText(-1) -split '\r?\n')[0].TrimEnd()
+    }
+}
+function Click-Failure([int]$Pane, $Mark) {
+    $pending = Join-Path $State 'staged-pointer'
+    $request = Join-Path $State 'rail-pointer'
+    $center = [int][math]::Floor(($Mark.Top + $Mark.Bottom) / 2.0)
+    [IO.File]::WriteAllText($pending, "$Pane failure:$center")
+    [IO.File]::Move($pending, $request)
+    $null = Wait-Until 'click on failed command mark' { ![IO.File]::Exists($request) }
 }
 function Status {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -94,8 +130,17 @@ try {
     Send-Bytes $localPane ('$global:markPid=$PID; 1..90 | % { "neighbor-row-$_" }; "neighbor-ready-" + $PID' + [char]13)
     $pidFrame = Control @('wait-for-text','--pane',"$localPane",'--regex','--timeout','15','neighbor-ready-([0-9]+)')
     $localPid = [regex]::Match($pidFrame.text,'neighbor-ready-([0-9]+)').Groups[1].Value
+    $failures = @(Assert-Failures $ssh)
+    if ((Read-Rail $localPane).Failures.Count -ne 0) { throw 'Failure marks leaked into PowerShell' }
+    Click-Failure $ssh $failures[0]
+    Wait-Focus $localPane
     Press-Key 0x73 # F4 focuses SSH.
     Wait-Focus $ssh
+    $null = Wait-Until 'clicked marker aligns the old failure' { (Top-Of-Ssh) -ceq 'line 040 failed' }
+    Run-Palette 'Next failed command'
+    $null = Wait-Until 'palette skips the success to the next failure' { (Top-Of-Ssh) -ceq 'line 135 failed' }
+    Run-Palette 'Previous failed command'
+    $null = Wait-Until 'palette returns to the first failure' { (Top-Of-Ssh) -ceq 'line 040 failed' }
     Assert-Unmarked $ssh $true
     Press-Key 0x75 # F6 opens Find.
     $field = Wait-Until 'Find field' { Find-Element 'Find in scrollback' $edit }
@@ -123,6 +168,7 @@ try {
         if (!(Control @('get-text','--pane',"$ssh")).alternate_screen -and (Status) -match '^([1-3]) / 3$') { [int]$Matches[1] }
     })
     Assert-Marks $ssh $restored
+    $null = Assert-Failures $ssh
     Press-Key 27
     $null = Wait-Until 'Find closed' { !(Find-Element 'Find in scrollback' $edit) }
     Assert-Unmarked $ssh $true
