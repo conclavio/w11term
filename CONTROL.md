@@ -42,6 +42,7 @@ if ($screen.result.text -notmatch 'fps=') { throw 'HUD missing' }
 & $ctl --pid 12345 find-text --pane $pane 'connection reset'
 $found = & $ctl --pid 12345 find-text --all-panes 'connection reset' | ConvertFrom-Json
 $found.result.panes | Where-Object { !$_.error -and $_.count -gt 0 }
+& $ctl --pid 12345 find-text --all-panes --regex --match-case 'ERROR\s+[0-9]+'
 
 & $ctl --pid 12345 screenshot --pane $pane .\frame.png
 & $ctl --pid 12345 save-text --pane $pane .\shell-transcript.txt
@@ -164,9 +165,11 @@ After a reconnect, list again to see the new session’s history.
 
 ## Waiting, geometry, tabs, and events
 
-`find-text` searches each selected pane’s retained scrollback and visible screen once. Use `--pane ID` for one pane or `--all-panes` for every pane in the process, across all its windows. Matching uses a case-insensitive Unicode literal, joins soft wraps, and stops at hard line breaks. Text can be up to 4,096 UTF-8 bytes. Use `--` before a pattern beginning with two hyphens. An alternate-screen pane searches its current screen.
+`find-text` searches each selected pane’s retained scrollback and visible screen once. Use `--pane ID` for one pane or `--all-panes` for every pane in the process, across all its windows. The default is a case-insensitive Unicode literal. Use `--regex` for Rust regex syntax and `--match-case` to select case-sensitive matching. Both modes join soft wraps and stop at hard line breaks. Patterns can be up to 4,096 UTF-8 bytes. Use `--` before a pattern beginning with two hyphens. An alternate-screen pane searches its current screen.
 
 The JSON `panes` array is sorted by pane ID. Each row includes `pane`, `tab_id`, `window_id`, `count`, `truncated`, and `first`. A match includes a plain-text `excerpt`, a stable buffer `row` and a zero-based cell `column`. An empty result has a count of zero and `first: null`. A count of 10,000 with `truncated: true` means there are additional matches. The coordinates describe the buffer at search time and can go stale after output, resize or reconnection.
+
+Successful regex rows also include `incomplete`. It is true when the scan skipped a logical line larger than 64 KiB. An invalid pattern fails the entire request before any panes are searched.
 
 All-pane results retain a row with an `error` for a closed, timed-out or mid-synchronized-frame pane. Other panes still return their results. A failure for an explicitly selected pane returns a CLI error. Searching preserves focus, scroll positions and any open Find queries.
 

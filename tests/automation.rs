@@ -47,6 +47,8 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
         pattern: "missing".into(),
         pane,
         all_panes,
+        regex: false,
+        match_case: false,
     };
     let result = registry
         .execute(request(None, true), capture.clone())
@@ -81,6 +83,66 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
             .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scrollback_regex_is_case_configurable_and_reports_incomplete_results() {
+    let state = tempfile::tempdir().unwrap();
+    let path = state.path().join("regex.vt");
+    std::fs::write(
+        &path,
+        format!("{}\r\nApp-78\r\napp-79\r\nsearch-ready", "z".repeat(66_000)),
+    )
+    .unwrap();
+    let session = Session::start(Source::Replay(path));
+    let registry = Registry::default();
+    registry.replace([Pane {
+        id: 1,
+        tab_id: 10,
+        tab_title: None,
+        pane_name: None,
+        label: "replay".into(),
+        active: false,
+        visible: false,
+        read_only: true,
+        input: session.input.clone(),
+    }]);
+    let capture: w11term::control::CapturePng = Arc::new(|_, _, _| anyhow::bail!("unused"));
+    registry
+        .execute(
+            Request::WaitForText {
+                pane: 1,
+                pattern: "search-ready".into(),
+                regex: false,
+                timeout_seconds: 5,
+            },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    let find = |pattern: &str, regex, match_case| {
+        registry.execute(
+            Request::FindText {
+                pane: Some(1),
+                all_panes: false,
+                pattern: pattern.into(),
+                regex,
+                match_case,
+            },
+            capture.clone(),
+        )
+    };
+    let insensitive = find(r"App-\d+", true, false).await.unwrap();
+    assert_eq!(insensitive["panes"][0]["count"], 2);
+    assert_eq!(insensitive["panes"][0]["incomplete"], true);
+    let sensitive = find(r"App-\d+", true, true).await.unwrap();
+    assert_eq!(sensitive["panes"][0]["count"], 1);
+    assert_eq!(sensitive["panes"][0]["first"]["excerpt"], "App-78");
+    let literal = find("APP-78", false, true).await.unwrap();
+    assert_eq!(literal["panes"][0]["count"], 0);
+    assert!(literal["panes"][0].get("incomplete").is_none());
+    let invalid = find("[", true, false).await.unwrap_err();
+    assert!(invalid.to_string().contains("invalid regular expression"));
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_is_event_driven_matches_live_screen_during_scrollback_and_times_out() {

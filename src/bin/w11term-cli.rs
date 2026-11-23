@@ -286,18 +286,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(pid, Some(42));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({"verb":"find-text","pane":7,"all_panes":false,"pattern":"--Some Text"})
+        );
         assert!(
-            matches!(request, Request::FindText { pattern, pane: Some(7), all_panes: false } if pattern == "--Some Text")
+            matches!(request, Request::FindText { pattern, pane: Some(7), all_panes: false, regex: false, match_case: false } if pattern == "--Some Text")
         );
         assert!(matches!(
             parse_args(&["find-text", "--all-panes", "  x "]).unwrap().1,
-            Request::FindText { pattern, pane: None, all_panes: true } if pattern == "  x "
+            Request::FindText { pattern, pane: None, all_panes: true, .. } if pattern == "  x "
+        ));
+        assert!(matches!(
+            parse_args(&["find-text", "--all-panes", "--match-case", "--regex", "--", "--Err[0-9]+"]).unwrap().1,
+            Request::FindText { pattern, pane: None, all_panes: true, regex: true, match_case: true } if pattern == "--Err[0-9]+"
         ));
         for args in [
             &["find-text", "x"][..],
             &["find-text", "--pane", "7", "--all-panes", "x"],
             &["find-text", "--all-panes", ""],
-            &["find-text", "--all-panes", "--regex", "x"],
+            &["find-text", "--all-panes", "--regex"],
+            &["wait-for-text", "--pane", "7", "--match-case", "x"],
         ] {
             assert!(parse_args(args).is_err(), "{args:?}");
         }

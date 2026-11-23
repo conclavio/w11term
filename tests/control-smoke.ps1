@@ -123,6 +123,20 @@ try {
         throw "find-text did not locate the offscreen SSH line in its original pane: $($all | ConvertTo-Json -Depth 5)"
     }
     $one = Invoke-Control @('find-text', '--pane', '1', 'search-archive')
+    $regex = Invoke-Control @('find-text', '--all-panes', '--regex', 'SEARCH-ARCHIVE\s+this\s+SSH\s+line')
+    $regexHits = @($regex.panes | Where-Object count -gt 0)
+    if ($regex.panes.Count -ne 3 -or $regexHits.Count -ne 1 -or $regexHits[0].pane -ne 1 -or
+        $regexHits[0].count -ne 1 -or $regexHits[0].incomplete -ne $false -or
+        $regexHits[0].first.row -ne $found[0].first.row -or $regexHits[0].first.column -ne $found[0].first.column) {
+        throw 'find-text regex did not report the same offscreen SSH match'
+    }
+    $sensitive = Invoke-Control @('find-text', '--pane', '1', '--match-case', 'SEARCH-ARCHIVE')
+    $both = Invoke-Control @('find-text', '--pane', '1', '--regex', '--match-case', 'search-archive\s+this SSH line')
+    if ($sensitive.panes[0].count -ne 0 -or $both.panes[0].count -ne 1) { throw 'find-text case mode failed' }
+    $badRegex = & $ctl --pid $terminal.Id find-text --all-panes --regex '[' | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $badRegex.ok -or $badRegex.error -notmatch 'invalid regular expression') {
+        throw 'find-text invalid regex should fail with JSON'
+    }
     if ($one.panes.Count -ne 1 -or $one.panes[0].first.row -ne $found[0].first.row -or
         (Invoke-Control @('get-text', '--pane', '1')).text -cne $liveSearch.text -or
         -not (Invoke-Control @('list')).sessions[1].active) { throw 'find-text changed the live screen or active pane' }
