@@ -35,6 +35,15 @@ function Name-Group([string]$Name) {
     }
     $value.SetValue($Name)
 }
+function Filter-Roster([string]$Query) {
+    $value = Wait-Until 'host filter editor' {
+        $field = Find-Element 'Host filter' $edit
+        $provider = $null
+        if ($field -and $field.TryGetCurrentPattern(
+                [System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider)) { $provider }
+    }
+    $value.SetValue($Query)
+}
 function Launch-Window {
     $launchArgs = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
     $script:app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -150,6 +159,43 @@ try {
         throw 'The deletion changed unrelated profile data or left the group behind'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'Editing or deleting the group changed its running sessions' }
+
+    $saveSelection = 'Save selection as group' + [char]0x2026
+    $eastPane = ($sessions | Where-Object label -ceq 'East').id
+    $westPane = ($sessions | Where-Object label -ceq 'West').id
+    $withProfiles = [IO.File]::ReadAllBytes($profiles)
+    $changed = Catalog
+    $changed.profiles.PSObject.Properties.Remove('East')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click $saveSelection
+    $null = Wait-CheckBox 'Group member West' On
+    $null = Wait-Until 'a selected pane has lost its saved profile' {
+        Find-Element '1 selected pane has no available saved SSH profile.'
+    }
+    Click 'Cancel'
+    $null = Wait-Until 'selection draft canceled' { Find-Element $saveSelection $button }
+    if ((Catalog).ssh_host_groups) { throw 'Canceling the selection draft saved a group' }
+    [IO.File]::WriteAllBytes($profiles, $withProfiles)
+    Filter-Roster 'west'
+    $null = Wait-Until 'East is hidden from the selectable roster' {
+        (Find-Element "Focus pane $westPane" $button) -and !(Find-Element "Focus pane $eastPane" $button)
+    }
+    Click $saveSelection
+    $null = Wait-CheckBox 'Group member West' On
+    $null = Wait-CheckBox 'Group member East' Off
+    Name-Group 'Selected West'
+    Click 'Save group'
+    $null = Wait-Until 'new group saved from the roster' { Find-Element 'SSH group saved' }
+    if (((Catalog).ssh_host_groups.'Selected West' -join ',') -cne 'West' -or
+        @((Control @('list')).sessions).Count -ne 3) {
+        throw 'Saving the visible selection changed the running panes or saved the wrong membership'
+    }
+    Filter-Roster ''
+    foreach ($name in 'East','West') {
+        $pane = ($sessions | Where-Object label -ceq $name).id
+        $port = (Catalog).profiles.$name.port
+        $null = Wait-CheckBox "$name${dot}test@127.0.0.1:${port}${dot}Pane $pane" On
+    }
 } catch {
     $failure = $_
     $groups = (Catalog).ssh_host_groups | ConvertTo-Json -Depth 4 -Compress
