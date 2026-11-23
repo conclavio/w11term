@@ -482,6 +482,9 @@ impl Session {
         }));
         let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         match &source {
+            Source::Local(shell) if shell.wsl_distribution().is_some() => {
+                terminal.enable_wsl_directory_reports();
+            }
             Source::Local(_) => terminal.enable_conemu_directory_reports(),
             Source::Ssh(ssh) if direct_ssh_shell => {
                 terminal.enable_iterm_directory_reports(&ssh.user, &ssh.host);

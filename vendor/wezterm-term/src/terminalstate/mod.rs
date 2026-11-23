@@ -287,6 +287,12 @@ impl CompletedCommand {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ConEmuDirectoryReports {
+    Drive,
+    Wsl,
+}
+
 /// Manages the state for the terminal
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
@@ -406,7 +412,7 @@ pub struct TerminalState {
     // Keep the wire authority, since URL normalization maps file://localhost
     // to an empty host. The SSH client must validate the reported destination.
     current_dir: Option<(Url, Arc<str>)>,
-    conemu_directory_reports: bool,
+    conemu_directory_reports: Option<ConEmuDirectoryReports>,
     iterm_directory_peer: Option<iterm::DirectoryPeer>,
     command_history: Arc<VecDeque<Arc<CompletedCommand>>>,
     next_command_id: u64,
@@ -683,7 +689,7 @@ impl TerminalState {
             alert_handler: None,
             download_handler: None,
             current_dir: None,
-            conemu_directory_reports: false,
+            conemu_directory_reports: None,
             iterm_directory_peer: None,
             command_history: Arc::default(),
             next_command_id: 1,
@@ -880,7 +886,12 @@ impl TerminalState {
 
     /// A local Windows pseudoconsole may report drive paths using OSC 9;9.
     pub fn enable_conemu_directory_reports(&mut self) {
-        self.conemu_directory_reports = true;
+        self.conemu_directory_reports = Some(ConEmuDirectoryReports::Drive);
+    }
+
+    /// A local WSL pseudoconsole may also report a WSL share path.
+    pub fn enable_wsl_directory_reports(&mut self) {
+        self.conemu_directory_reports = Some(ConEmuDirectoryReports::Wsl);
     }
 
     fn set_reported_current_dir(&mut self, report: Option<(Url, Arc<str>)>) {

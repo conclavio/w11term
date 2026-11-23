@@ -6,6 +6,7 @@ use w11term::{options::PlayerOptions, ssh::ConnectionShare, workspace::SshStartu
 enum Directory {
     Ssh(String),
     Local(PathBuf),
+    Wsl(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,7 +69,7 @@ fn child_options(
 fn local_directory(report: &str, computer: Option<&str>) -> Option<PathBuf> {
     // Reuse the SSH file-URI decoder for strict percent escapes and authority
     // matching. Build only a Windows drive-letter path, never a UNC/device path.
-    let (authority, _) = report.split_once("://")?.1.split_once('/')?;
+    let authority = file_authority(report)?;
     let host = if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
         "localhost"
     } else {
@@ -93,6 +94,39 @@ pub(super) fn reported_local_directory(report: Option<&str>) -> Option<PathBuf> 
     local_directory(report?, std::env::var("COMPUTERNAME").ok().as_deref())
 }
 
+fn file_authority(report: &str) -> Option<&str> {
+    Some(report.split_once("://")?.1.split_once('/')?.0)
+}
+
+fn wsl_directory(report: &str, distribution: &str, computer: Option<&str>) -> Option<String> {
+    let authority = file_authority(report)?;
+    if authority.eq_ignore_ascii_case("wsl.localhost") || authority.eq_ignore_ascii_case("wsl$") {
+        let path = file_drawer::shell_directory(Some(report), authority)?;
+        let path = path.strip_prefix('/')?;
+        let (reported_distribution, suffix) = path.split_once('/').unwrap_or((path, ""));
+        if reported_distribution.eq_ignore_ascii_case(distribution) && !suffix.starts_with('/') {
+            return Some(format!("/{suffix}"));
+        }
+        return None;
+    }
+    if let Some(windows) = local_directory(report, computer) {
+        // WSL accepts an absolute Windows drive path as its --cd argument.
+        return windows.into_os_string().into_string().ok();
+    }
+    let host = if authority.eq_ignore_ascii_case("localhost") {
+        "localhost"
+    } else {
+        computer.unwrap_or_default()
+    };
+    let path = file_drawer::shell_directory(Some(report), host)?;
+    // A malformed Windows drive report cannot fall back to a Linux path.
+    let first = path.strip_prefix('/')?.split('/').next()?;
+    if matches!(first.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(path)
+}
+
 impl LiveTab {
     fn ssh_directory_split(&self) -> Option<(Origin, ConnectionShare)> {
         if !self.session.is_direct_ssh_shell() {
@@ -115,16 +149,25 @@ impl LiveTab {
     }
 
     fn local_directory_split(&self) -> Option<Origin> {
+        let Source::Local(shell) = &self.source else {
+            return None;
+        };
         let frame = self.session.frames.load();
         if !self.can_report_split_directory(frame.connection_generation) {
             return None;
         }
+        let report = frame.reported_directory.as_deref()?;
+        let computer = std::env::var("COMPUTERNAME").ok();
+        let directory = match shell.wsl_distribution() {
+            Some(distribution) => {
+                Directory::Wsl(wsl_directory(report, distribution, computer.as_deref())?)
+            }
+            None => Directory::Local(local_directory(report, computer.as_deref())?),
+        };
         Some(Origin {
             pane: self.session.pane_id,
             generation: frame.connection_generation,
-            directory: Directory::Local(reported_local_directory(
-                frame.reported_directory.as_deref(),
-            )?),
+            directory,
             listing_revision: None,
         })
     }
@@ -132,7 +175,8 @@ impl LiveTab {
     pub(super) fn can_report_split_directory(&self, generation: u64) -> bool {
         match &self.source {
             Source::Local(shell) => {
-                LocalOptions::supports_powershell_integration(&shell.executable, &shell.args)
+                (LocalOptions::supports_powershell_integration(&shell.executable, &shell.args)
+                    || shell.wsl_distribution().is_some())
                     && self.session.events.shell_generation() == Some(generation)
             }
             _ => self.session.ssh_connection_at(generation).is_some(),
@@ -177,23 +221,24 @@ impl TerminalApp {
         else {
             return None;
         };
-        if let Directory::Local(cwd) = &target.directory {
-            let Source::Local(shell) = &tab.source else {
-                return None;
-            };
+        if let Source::Local(shell) = &tab.source {
             if tab.local_directory_split().as_ref() != Some(&target) {
                 return None;
             }
-            let child = Source::Local(LocalOptions {
-                cwd: Some(cwd.clone()),
-                color_scheme: tab.color_scheme,
-                ..shell.clone()
-            });
+            let mut shell = match target.directory {
+                Directory::Local(cwd) => LocalOptions {
+                    cwd: Some(cwd),
+                    ..shell.clone()
+                },
+                Directory::Wsl(cwd) => shell.wsl_in_directory(cwd)?,
+                Directory::Ssh(_) => return None,
+            };
+            shell.color_scheme = tab.color_scheme;
             // Saved local panes carry their full launch settings as well as
             // their profile name. Keep the new directory out of the catalog.
             let child = live_tab(
                 label.clone(),
-                child,
+                Source::Local(shell),
                 self.appearance
                     .read()
                     .unwrap()
@@ -311,6 +356,42 @@ mod tests {
             assert!(
                 local_directory(invalid, Some("desk")).is_none(),
                 "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_reports_resolve_only_local_paths_or_the_selected_distribution() {
+        for (uri, expected) in [
+            ("file:///", "/"),
+            (
+                "file://desk/home/dev/100%25%20%23%20%E9%9B%AA",
+                "/home/dev/100% # 雪",
+            ),
+            ("file://localhost/mnt/c/work%20tree", "/mnt/c/work tree"),
+            ("file://wsl.localhost/qa%20LINUX/home/dev/", "/home/dev/"),
+            ("file://wsl$/QA%20Linux", "/"),
+            ("file:///C:/work%20tree", r"C:\work tree"),
+        ] {
+            assert_eq!(
+                wsl_directory(uri, "QA Linux", Some("desk")).as_deref(),
+                Some(expected),
+                "{uri}"
+            );
+        }
+        for uri in [
+            "file://host.example/home/dev",
+            "file://wsl.localhost/Ubuntu/home/dev",
+            "file://wsl.localhost/QA%20Linux//another/share",
+            "file://wsl.localhost/QA%20Linux/home/%2e%2e/another",
+            "file://wsl.localhost/QA%20Linux%2Fother/home",
+            "file:////server/share",
+            "file:///C:/bad%2Fchild",
+            "file:///C:/NUL.txt",
+        ] {
+            assert!(
+                wsl_directory(uri, "QA Linux", Some("desk")).is_none(),
+                "{uri}"
             );
         }
     }

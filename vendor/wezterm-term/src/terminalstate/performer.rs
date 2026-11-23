@@ -3,7 +3,8 @@ use crate::terminalstate::column_edit::Index;
 use crate::terminalstate::palette::Slot;
 use crate::terminalstate::rendition::Rendition;
 use crate::terminalstate::{
-    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
+    default_color_map, CharSet, ConEmuDirectoryReports, MouseEncoding, TabStop,
+    UnicodeVersionStackEntry,
 };
 use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
 use finl_unicode::grapheme_clusters::Graphemes;
@@ -1080,8 +1081,8 @@ impl Performer<'_> {
                 );
             }
             OperatingSystemCommand::ConEmuWorkingDirectory(path) => {
-                if self.conemu_directory_reports {
-                    self.set_reported_current_dir(conemu_directory_url(&path).map(|url| {
+                if let Some(mode) = self.conemu_directory_reports {
+                    self.set_reported_current_dir(conemu_directory_url(&path, mode).map(|url| {
                         let raw = url.as_str().into();
                         (url, raw)
                     }));
@@ -1210,25 +1211,43 @@ fn selection_to_selection(sel: Selection) -> ClipboardSelection {
         _ => ClipboardSelection::Clipboard,
     }
 }
-/// Convert a quoted or unquoted Windows drive path into a file URI. Push each
+/// Convert a quoted or unquoted Windows directory report into a file URI. Push each
 /// segment as literal text so percent signs and URL delimiters survive intact.
-fn conemu_directory_url(payload: &str) -> Option<Url> {
+fn conemu_directory_url(payload: &str, mode: ConEmuDirectoryReports) -> Option<Url> {
     let path = payload
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
         .unwrap_or(payload);
-    let bytes = path.as_bytes();
-    if !matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
-        || path.contains('"')
-        || path.chars().any(char::is_control)
-    {
+    if path.contains('"') || path.chars().any(char::is_control) {
         return None;
     }
-    let mut url = Url::parse("file:///").ok()?;
+    let (mut url, root, tail) = if matches!(path.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
+    {
+        (Url::parse("file:///").ok()?, &path[..2], &path[3..])
+    } else if matches!(mode, ConEmuDirectoryReports::Wsl) {
+        let unc = path
+            .strip_prefix(r"\\")
+            .or_else(|| path.strip_prefix("//"))?;
+        let (host, share) = unc.split_once(['\\', '/'])?;
+        if !(host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$")) {
+            return None;
+        }
+        let (distribution, tail) = share.split_once(['\\', '/']).unwrap_or((share, ""));
+        if distribution.is_empty() || matches!(distribution, "." | "..") {
+            return None;
+        }
+        (
+            Url::parse("file://wsl.localhost/").ok()?,
+            distribution,
+            tail,
+        )
+    } else {
+        return None;
+    };
     {
         let mut segments = url.path_segments_mut().ok()?;
-        segments.clear().push(&path[..2]);
-        for part in path[3..].split(['\\', '/']) {
+        segments.clear().push(root);
+        for part in tail.split(['\\', '/']) {
             if matches!(part, "." | "..") {
                 return None;
             }
