@@ -627,6 +627,27 @@ fn directory_entries(reply: &Value, order: SortOrder) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
+fn listing_size_label(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let power = bytes.ilog2() / 10;
+    let scale = 1_u128 << (power * 10);
+    let tenths = (u128::from(bytes) * 10 + scale / 2) / scale;
+    let (power, tenths) = if tenths == 10240 {
+        (power + 1, 10)
+    } else {
+        (power, tenths)
+    };
+    let unit = UNITS[power as usize];
+    if tenths.is_multiple_of(10) {
+        format!("{} {unit}", tenths / 10)
+    } else {
+        format!("{}.{} {unit}", tenths / 10, tenths % 10)
+    }
+}
+
 fn dialog_filename(remote: &str) -> &str {
     let leaf = remote.rsplit('/').next().unwrap_or("");
     if validate_download_name(leaf).is_ok() {
@@ -1615,9 +1636,35 @@ impl FileDrawer {
                 };
                 let active = self.selected.as_ref() == Some(&name);
                 let entry_action = Choose(pane, generation, listed(Some(entry)));
+                let filename = TextBlock::new()
+                    .text(&label)
+                    .text_wrapping(TextWrapping::Wrap);
+                let content: View = if let Some(bytes) = entry.size {
+                    let spoken_size = if bytes == 1 {
+                        "Size 1 byte".to_owned()
+                    } else {
+                        format!("Size {bytes} bytes")
+                    };
+                    Grid::new()
+                        .columns([GridLength::Star(1.0), GridLength::Auto])
+                        .column_spacing(8.0)
+                        .children((
+                            filename,
+                            TextBlock::new()
+                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .automation_id("sftp-entry-size")
+                                .automation_name(spoken_size)
+                                .text(listing_size_label(bytes)),
+                        ))
+                        .into()
+                } else {
+                    filename.into()
+                };
                 KeyedView::new(
                     entry.name.as_str(),
                     Button::new()
+                        .automation_name(label)
                         .is_enabled(ready)
                         .style(if active {
                             ButtonStyle::Accent
@@ -1625,12 +1672,9 @@ impl FileDrawer {
                             ButtonStyle::Subtle
                         })
                         .horizontal_alignment(HorizontalAlignment::Stretch)
+                        .horizontal_content_alignment(HorizontalAlignment::Stretch)
                         .on_click(context.callback(move |_| Message::Files(entry_action.clone())))
-                        .content(
-                            TextBlock::new()
-                                .text(label)
-                                .text_wrapping(TextWrapping::Wrap),
-                        ),
+                        .content(content),
                 )
             })
             .collect();
@@ -2960,6 +3004,23 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_sizes_round_to_short_binary_units_without_losing_zero() {
+        for (size, label) in [
+            (0, "0 B"),
+            (1, "1 B"),
+            (1023, "1023 B"),
+            (1024, "1 KiB"),
+            (1536, "1.5 KiB"),
+            ((1 << 20) - 52, "1023.9 KiB"),
+            ((1 << 20) - 51, "1 MiB"),
+            (5 << 30, "5 GiB"),
+            (u64::MAX, "16 EiB"),
+        ] {
+            assert_eq!(listing_size_label(size), label);
+        }
+    }
     use serde_json::json;
 
     fn listing() -> Vec<Entry> {
