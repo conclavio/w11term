@@ -148,3 +148,7 @@ The original MIT license is preserved in `LICENSE.md`.
 - DECCRA copies styled cells within the active screen. One row of scratch
   storage and overlap-aware traversal keep the source intact during a copy.
   Destination line rendition and independent Kitty placements stay in place.
+
+- DECSACE selects a wrapped range or rectangle for DECCARA and DECRARA
+  attribute edits. Changes are applied in place to preserve text, metadata
+  and graphics. DECRQSS reports the selected extent.

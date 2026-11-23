@@ -152,6 +152,7 @@ impl server::Handler for Peer {
                     "\x1b7\x1b[3;1H\x1b[1\"qprotected header\x1b[0\"q transient\x1b[?2K",
                     "\x1b[4;1HLaXXXXfR\x1b[35;4;3;4;6$x\x1b[4;4;4;4$z",
                     "\x1b[4;1;4;8;1;5;2;1$v",
+                    "\x1b[2*x\x1b[5;2;5;4;1;4$r\x1b[5;2;5;4#|\x1bP$q*x\x1b\\",
                     "\x1b[1\"q\x1bP$q\"q\x1b\\\x1b8",
                 )
                 .as_bytes(),
@@ -270,6 +271,14 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
         assert_eq!(
             next(&mut observed, &session).await,
             Observed::Data(b"\x1b[0;1;34m".to_vec())
+        );
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(b"\x1b[0;1;4m".to_vec())
+        );
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(b"\x1bP1$r2*x\x1b\\".to_vec())
         );
         assert_eq!(
             next(&mut observed, &session).await,

@@ -361,6 +361,11 @@ impl Performer<'_> {
                                 write!(self.writer, "{DCS}1$r{protected}\"q{ST}").ok();
                                 self.writer.flush().ok();
                             }
+                            b"*x" => {
+                                let extent = self.attribute_extent;
+                                write!(self.writer, "{DCS}1$r{extent}*x{ST}").ok();
+                                self.writer.flush().ok();
+                            }
                             &[b'"', b'p'] => {
                                 // DECSCL - select conformance level
                                 write!(self.writer, "{}1$r65;1\"p{}", DCS, ST).ok();
@@ -822,6 +827,7 @@ impl Performer<'_> {
                 self.accumulating_title.take();
                 self.saved_titles = Default::default();
                 self.saved_private_modes = Default::default();
+                self.attribute_extent = 0;
                 self.title.from_application = false;
                 self.end_synchronized_output();
                 self.progress = Progress::default();

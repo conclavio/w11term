@@ -2989,6 +2989,91 @@ mod tests {
     }
 
     #[test]
+    fn dec_range_attributes_follow_stream_then_rectangle_without_changing_the_pen() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"ABCDEF\r\nabcdef\r\n012345\x1b[4;8H\x1b[3;31m");
+        term.advance_bytes(b"\x1b[1;4;3;2;1;4$r");
+        let first = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        for (row, styled) in [(0, 3..6), (1, 0..6), (2, 0..2)] {
+            for col in 0..6 {
+                let cell = first.rows[row].get_cell(col).unwrap();
+                assert_eq!(
+                    cell.attrs().intensity() == wezterm_term::Intensity::Bold,
+                    styled.contains(&col)
+                );
+                assert_eq!(
+                    cell.attrs().underline() == wezterm_term::Underline::Single,
+                    styled.contains(&col)
+                );
+            }
+        }
+        term.advance_bytes(b"\x1b[2*x\x1b[2;2;3;4;1;7$t");
+        let toggled = Snapshot::capture(&term, Some(&first), 2, 0, String::new(), 0);
+        for row in [1, 2] {
+            for col in 0..6 {
+                let before = first.rows[row].get_cell(col).unwrap();
+                let after = toggled.rows[row].get_cell(col).unwrap();
+                let selected = (1..4).contains(&col);
+                assert_eq!(after.attrs().reverse(), selected);
+                assert_eq!(
+                    after.attrs().intensity() == wezterm_term::Intensity::Bold,
+                    (before.attrs().intensity() == wezterm_term::Intensity::Bold) ^ selected
+                );
+                assert_eq!(after.attrs().underline(), before.attrs().underline());
+            }
+        }
+        assert!(text(&term).starts_with("ABCDEF\nabcdef\n012345\n"));
+        assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (7, 3));
+        assert!(term.pen().italic());
+        assert_eq!(
+            term.pen().foreground(),
+            wezterm_term::color::ColorAttribute::PaletteIndex(1)
+        );
+    }
+
+    #[test]
+    fn dec_rectangle_attributes_restyle_complete_glyphs_and_extend_into_blanks() {
+        let (mut term, _) = engine();
+        term.advance_bytes("\x1b[1\"q\x1b[44;4:3m界\x1b[0m\x1b[0\"q!");
+        term.advance_bytes(b"\x1b[1;4;1;5;4$r");
+        let stream = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(stream.rows[0].get_cell(4).is_none());
+        term.advance_bytes(b"\x1b[2*x\x1b[1;2;1;5;0;4;7$r\x1b[1;2;1;5;7;7$t");
+        let rect = Snapshot::capture(&term, Some(&stream), 2, 0, String::new(), 0);
+        let wide = rect.rows[0].get_cell(0).unwrap();
+        assert_eq!(wide.str(), "界");
+        assert_eq!(wide.width(), 2);
+        assert!(wide.attrs().protected());
+        assert_eq!(
+            wide.attrs().background(),
+            wezterm_term::color::ColorAttribute::PaletteIndex(4)
+        );
+        for col in [0, 2, 3, 4] {
+            let cell = rect.rows[0].get_cell(col).unwrap();
+            assert_eq!(cell.attrs().underline(), wezterm_term::Underline::Single);
+            assert!(cell.attrs().reverse());
+        }
+    }
+
+    #[test]
+    fn dec_attribute_extent_is_queryable_and_resettable() {
+        let (mut term, mut replies) = engine();
+        for (command, extent) in [
+            ("", 0),
+            ("\x1b[2*x\x1b[9*x", 2),
+            ("\x1b[1*x", 1),
+            ("\x1b[2*x\x1b[!p", 0),
+            ("\x1b[2*x\x1bc", 0),
+        ] {
+            term.advance_bytes(format!("{command}\x1bP$q*x\x1b\\"));
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1bP1$r{extent}*x\x1b\\").as_bytes()
+            );
+        }
+    }
+
+    #[test]
     fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(
