@@ -857,16 +857,54 @@ impl Performer<'_> {
         }
     }
 
+    fn semantic_prompt(&mut self, marker: FinalTermSemanticPrompt) {
+        let primary = !self.is_alt_screen_active();
+        let pending =
+            (primary && !self.capturing_shell_input && self.screen.command_start.is_some())
+                .then_some(self.next_command_id);
+        match &marker {
+            FinalTermSemanticPrompt::FreshLine => self.fresh_line(),
+            FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. } => {
+                self.next_shell_prompt();
+                self.fresh_line();
+                self.pen.set_semantic_type(SemanticType::Prompt);
+            }
+            FinalTermSemanticPrompt::StartPrompt(_) => {
+                self.pen.set_semantic_type(SemanticType::Prompt);
+            }
+            FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. } => {
+                self.next_shell_prompt();
+                self.fresh_line();
+                self.pen.set_semantic_type(SemanticType::Prompt);
+            }
+            FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker { .. } => {
+                self.begin_command_input();
+                self.pen.set_semantic_type(SemanticType::Input);
+            }
+            FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilEndOfLine { .. } => {
+                self.begin_command_input();
+                self.pen.set_semantic_type(SemanticType::Input);
+                self.clear_semantic_attribute_on_newline = true;
+            }
+            FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { command, .. } => {
+                self.begin_command_output(command.clone());
+                self.pen.set_semantic_type(SemanticType::Output);
+            }
+            FinalTermSemanticPrompt::CommandStatus { status, .. } => {
+                self.finish_command_output(*status)
+            }
+        }
+        let completed = pending.filter(|&id| id != self.next_command_id);
+        if primary {
+            if let Some(handler) = self.alert_handler.as_mut() {
+                handler.semantic_prompt(&marker, completed);
+            }
+        }
+    }
+
     fn osc_dispatch(&mut self, osc: OperatingSystemCommand) {
         self.pop_tmux_title_state();
         self.flush_print();
-        if let OperatingSystemCommand::FinalTermSemanticPrompt(ref marker) = osc {
-            if !self.is_alt_screen_active() {
-                if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.semantic_prompt(marker);
-                }
-            }
-        }
         match osc {
             OperatingSystemCommand::SetIconNameSun(title)
             | OperatingSystemCommand::SetIconName(title) => {
@@ -996,51 +1034,9 @@ impl Performer<'_> {
                 }
             },
 
-            OperatingSystemCommand::FinalTermSemanticPrompt(FinalTermSemanticPrompt::FreshLine) => {
-                self.fresh_line();
+            OperatingSystemCommand::FinalTermSemanticPrompt(marker) => {
+                self.semantic_prompt(marker);
             }
-            OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. },
-            ) => {
-                self.next_shell_prompt();
-                self.fresh_line();
-                self.pen.set_semantic_type(SemanticType::Prompt);
-            }
-            OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::StartPrompt(_),
-            ) => {
-                self.pen.set_semantic_type(SemanticType::Prompt);
-            }
-            OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfCommandWithFreshLine { .. },
-            ) => {
-                self.next_shell_prompt();
-                self.fresh_line();
-                self.pen.set_semantic_type(SemanticType::Prompt);
-            }
-            OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker { .. },
-            ) => {
-                self.begin_command_input();
-                self.pen.set_semantic_type(SemanticType::Input);
-            }
-            OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilEndOfLine { .. },
-            ) => {
-                self.begin_command_input();
-                self.pen.set_semantic_type(SemanticType::Input);
-                self.clear_semantic_attribute_on_newline = true;
-            }
-            OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { command, .. },
-            ) => {
-                self.begin_command_output(command);
-                self.pen.set_semantic_type(SemanticType::Output);
-            }
-
-            OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::CommandStatus { status, .. },
-            ) => self.finish_command_output(status),
 
             OperatingSystemCommand::SystemNotification(message) => {
                 if let Some(handler) = self.alert_handler.as_mut() {

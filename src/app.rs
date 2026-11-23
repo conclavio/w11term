@@ -2405,9 +2405,11 @@ impl TerminalApp {
                 let Page::Terminal(tab) = &entry.value.page else {
                     return None;
                 };
-                tab.session
-                    .frames
-                    .watch_application_title(titles.contains(&entry.id).then_some(&self.inbox));
+                tab.session.frames.watch_window(Some((
+                    &self.inbox,
+                    tab.session.pane_id,
+                    titles.contains(&entry.id),
+                )));
                 tab.session.events.connect_inbox(
                     tab.session.pane_id,
                     &entry.value.label,

@@ -21,6 +21,7 @@ pub enum Action {
     WatchCommand(bool),
     LongCommands(clipboard_paste::Origin, bool),
     Visit { pane: u64, sequence: u64 },
+    ViewCommand { pane: u64, sequence: u64 },
     MarkAllRead,
     Clear,
 }
@@ -80,6 +81,14 @@ impl TerminalApp {
                     self.find(true, None, ctx);
                 }
             }
+            Action::ViewCommand { pane, sequence } => {
+                if let Some(link) = self.inbox.command_link(pane, sequence)
+                    && self.open_command_history(pane, Some(link), ctx)
+                {
+                    self.inbox.mark_read(pane, sequence);
+                }
+                return;
+            }
             Action::MarkAllRead => {
                 self.inbox.mark_all_read();
                 return;
@@ -124,20 +133,43 @@ impl TerminalApp {
                     );
                     let status = if row.unread { "Unread" } else { "Read" };
                     let label = format!("{status} · {source} · Pane {pane} · {}", row.message);
-                    KeyedView::new(
-                        format!("{pane}/{sequence}"),
-                        Button::new()
-                            .automation_name(label.clone())
-                            .is_enabled(tab.is_some())
-                            .on_click(ctx.callback(move |_| {
-                                Message::Attention(Action::Visit { pane, sequence })
-                            }))
-                            .content(
-                                TextBlock::new()
-                                    .text(label)
-                                    .text_wrapping(TextWrapping::Wrap),
-                            ),
-                    )
+                    let visit = Button::new()
+                        .automation_name(label.clone())
+                        .is_enabled(tab.is_some())
+                        .on_click(ctx.callback(move |_| {
+                            Message::Attention(Action::Visit { pane, sequence })
+                        }))
+                        .content(
+                            TextBlock::new()
+                                .text(label)
+                                .text_wrapping(TextWrapping::Wrap),
+                        );
+                    let command = row.command.filter(|&link| {
+                        self.history_frame(pane)
+                            .is_some_and(|frame| frame.has_command(link))
+                    });
+                    let content: View = if let Some(command) = command {
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .column_spacing(8.0)
+                            .children((
+                                visit,
+                                Button::new()
+                                    .grid_column(1)
+                                    .style(ButtonStyle::Subtle)
+                                    .automation_name(format!(
+                                        "View command {} for {source}, pane {pane}",
+                                        command.id
+                                    ))
+                                    .on_click(ctx.callback(move |_| {
+                                        Message::Attention(Action::ViewCommand { pane, sequence })
+                                    }))
+                                    .content("View command"),
+                            ))
+                    } else {
+                        visit
+                    };
+                    KeyedView::new(format!("{pane}/{sequence}"), content)
                 }),
             ))
         };

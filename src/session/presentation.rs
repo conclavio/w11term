@@ -364,7 +364,7 @@ mod tests {
         let (mut terminal, mut p) = fixture();
         let (tx, rx) = std::sync::mpsc::channel();
         let inbox = crate::events::Inbox::new(move || tx.send(()).unwrap());
-        p.frames.watch_application_title(Some(&inbox));
+        p.frames.watch_window(Some((&inbox, 1, true)));
         publish(&mut p, &terminal, 0);
         p.advance(
             &mut terminal,

@@ -589,6 +589,14 @@ struct ApplicationTitle {
 }
 
 impl Snapshot {
+    pub fn has_command(&self, link: crate::events::CommandLink) -> bool {
+        self.connection_generation == link.generation
+            && self
+                .command_history
+                .iter()
+                .any(|command| command.id == link.id)
+    }
+
     /// A bounded single-line caption from the application's window title.
     /// A shell that has only set an icon title still uses its profile label.
     pub fn application_title(&self) -> Option<&str> {
@@ -865,7 +873,14 @@ pub struct FrameStore(Arc<(Mutex<ViewState>, Condvar, tokio::sync::Notify)>);
 struct ViewState {
     frame: Arc<Snapshot>,
     inspection: Option<TerminalModes>,
-    title_inbox: Option<crate::events::Inbox>,
+    inbox: Option<WindowInbox>,
+}
+
+#[derive(Debug)]
+struct WindowInbox {
+    inbox: crate::events::Inbox,
+    pane: u64,
+    follows_title: bool,
 }
 
 impl FrameStore {
@@ -874,7 +889,7 @@ impl FrameStore {
             Mutex::new(ViewState {
                 frame: Arc::new(frame),
                 inspection: None,
-                title_inbox: None,
+                inbox: None,
             }),
             Condvar::new(),
             tokio::sync::Notify::new(),
@@ -884,25 +899,38 @@ impl FrameStore {
         self.0.0.lock().unwrap().frame.clone()
     }
     pub fn publish(&self, frame: Snapshot) {
-        let title_inbox = {
+        let inbox = {
             let mut state = self.0.0.lock().unwrap();
             let inbox = state
-                .title_inbox
+                .inbox
                 .as_ref()
-                .filter(|_| frame.application_title() != state.frame.application_title())
-                .cloned();
+                .filter(|owner| {
+                    let old = &state.frame;
+                    (owner.follows_title && frame.application_title() != old.application_title())
+                        || ((frame.connection_generation != old.connection_generation
+                            || !Arc::ptr_eq(&frame.command_history, &old.command_history))
+                            && owner.inbox.command_links_changed(owner.pane, |link| {
+                                frame.has_command(link) != old.has_command(link)
+                            }))
+                })
+                .map(|owner| owner.inbox.clone());
             state.frame = Arc::new(frame);
             inbox
         };
         self.0.1.notify_all();
         self.0.2.notify_waiters();
-        if let Some(inbox) = title_inbox {
+        if let Some(inbox) = inbox {
             inbox.refresh();
         }
     }
-    /// Wake a window with inactive tabs only when a committed caption changes.
-    pub fn watch_application_title(&self, inbox: Option<&crate::events::Inbox>) {
-        self.0.0.lock().unwrap().title_inbox = inbox.cloned();
+
+    /// Wake the owning window when a committed caption or inbox link changes.
+    pub fn watch_window(&self, owner: Option<(&crate::events::Inbox, u64, bool)>) {
+        self.0.0.lock().unwrap().inbox = owner.map(|(inbox, pane, follows_title)| WindowInbox {
+            inbox: inbox.clone(),
+            pane,
+            follows_title,
+        });
     }
     pub async fn changed(&self, generation: u64, deadline: tokio::time::Instant) -> bool {
         let changed = self.0.2.notified();
@@ -1041,6 +1069,13 @@ mod tests {
             completions(&events),
             [serde_json::json!({"exit_code":null})]
         );
+        assert!(
+            events
+                .since(0)
+                .events
+                .iter()
+                .all(|entry| entry.command.is_none())
+        );
         for end in [b"\x1b]133;A\x07".as_slice(), b"\x1b]133;D\x07"] {
             assert!(events.set_command_watch(true));
             term.advance_bytes(b"\x1b]133;C\x07");
@@ -1049,6 +1084,26 @@ mod tests {
         assert_eq!(
             completions(&events),
             vec![serde_json::json!({"exit_code":null}); 3]
+        );
+        let links: Vec<_> = events
+            .since(0)
+            .events
+            .into_iter()
+            .filter_map(|entry| entry.command)
+            .collect();
+        let history = term.command_history();
+        assert_eq!(
+            links,
+            [
+                crate::events::CommandLink {
+                    generation: 1,
+                    id: history[history.len() - 2].id
+                },
+                crate::events::CommandLink {
+                    generation: 1,
+                    id: history.back().unwrap().id
+                },
+            ]
         );
     }
 
@@ -2730,6 +2785,55 @@ mod tests {
     }
 
     #[test]
+    fn inbox_command_link_refreshes_on_commit_and_expiration() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut term, events) = watched_terminal();
+        let frame = |term: &Terminal, generation| {
+            let mut frame = Snapshot::capture(term, None, 0, 0, String::new(), 0);
+            frame.connection_generation = generation;
+            frame
+        };
+        let store = FrameStore::new(frame(&term, 7));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let inbox = crate::events::Inbox::new({
+            let wakes = wakes.clone();
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        store.watch_window(Some((&inbox, 42, false)));
+        events.connect_inbox(42, "fixture", &inbox);
+        events.command_stream(Some(7));
+        assert!(events.set_command_watch(true));
+        term.advance_bytes(b"\x1b]133;C\x07first result\x1b]133;D;17\x07");
+        let notice = &inbox.rows()[0];
+        let link = inbox.command_link(42, notice.sequence).unwrap();
+        assert_eq!(link.generation, 7);
+        let first = term.command_history().front().unwrap();
+        assert_eq!(link.id, first.id);
+        assert_eq!(first.output.as_deref(), Ok("first result"));
+        assert!(!store.load().has_command(link));
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        inbox.acknowledge_wake();
+
+        store.publish(frame(&term, 7));
+        assert!(store.load().has_command(link));
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        inbox.acknowledge_wake();
+
+        term.advance_bytes(b"\x1b]133;C\x07next result\x1b]133;D;0\x07");
+        store.publish(frame(&term, 7));
+        assert!(store.load().has_command(link));
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+
+        // Even a still-retained ID is invalid when the connection changes.
+        store.publish(frame(&term, 8));
+        assert!(!store.load().has_command(link));
+        assert_eq!(wakes.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
     fn application_title_refreshes_only_the_subscribed_window_after_publication() {
         let (mut term, _) = engine();
         let frame = |term: &Terminal| Snapshot::capture(term, None, 0, 0, String::new(), 0);
@@ -2747,7 +2851,7 @@ mod tests {
         };
         let first = observe("first");
         let second = observe("second");
-        store.watch_application_title(Some(&first));
+        store.watch_window(Some((&first, 1, true)));
         term.advance_bytes(b"\x1b]1;background icon\x07");
         store.publish(frame(&term));
         assert!(observed.lock().unwrap().is_empty());
@@ -2756,10 +2860,10 @@ mod tests {
         first.acknowledge_wake();
         term.advance_bytes(b"more output\x1b]2;  building  \x07");
         store.publish(frame(&term));
-        store.watch_application_title(Some(&second));
+        store.watch_window(Some((&second, 1, true)));
         term.advance_bytes(b"\x1bc");
         store.publish(frame(&term));
-        store.watch_application_title(None);
+        store.watch_window(None);
         term.advance_bytes(b"\x1b]0;unwatched\x07");
         store.publish(frame(&term));
         assert_eq!(
