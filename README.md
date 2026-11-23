@@ -405,6 +405,8 @@ Use **Settings → Word selection delimiters…** to choose which punctuation se
 
 Find searches the current pane’s retained history and visible screen. It starts with a case-insensitive literal search using Unicode lowercase matching. Turn on **Regex** for patterns such as `error\s+[0-9]+`, or **Match case** to distinguish uppercase and lowercase. Matches can span a line wrapped by the terminal and stop at a hard newline. Enter and Shift+Enter move between highlighted matches. Escape closes Find and restores terminal input. Reopening Find restores that pane’s query and both options.
 
+Under **Settings → Keyboard**, you can change or clear **Find in scrollback**, **Find next**, and **Find previous**. For example, clearing **Find next** gives the default F3 key back to the terminal application. The command palette shows the current assignments. Enter and Shift+Enter also navigate while the Find box is open.
+
 Queries accept up to 4,096 UTF-8 bytes. The match count refreshes as output arrives, and `+` indicates more than 10,000 matches. If a pattern is invalid, the Find bar shows the reason as you edit. Regex search skips logical lines larger than 64 KiB and shows when the results are incomplete. Ordinary scrolling stays anchored to retained rows as new output arrives.
 
 When a pane has scrollback, drag the scrollbar at its right edge to browse history, or click the track above or below the thumb to move one page. Drag to the bottom to follow new output. The scrollbar uses the pane's existing padding and preserves its column count. Assistive technology can use the focused terminal's UI Automation Scroll pattern to read the position, page through history or jump to a percentage.

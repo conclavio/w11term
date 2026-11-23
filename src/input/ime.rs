@@ -562,6 +562,49 @@ pub(crate) mod smoke {
 mod tests {
     use super::*;
     #[test]
+    fn remapped_find_and_enter_leave_composition_and_its_key_release_to_the_native_edit() {
+        let _window = WindowScope::default().enter();
+        let hwnd = HWND::default();
+        let pane = w11term::session::Session::start(w11term::options::Source::Demo);
+        let (sender, mut input) = tokio::sync::mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut bindings = super::super::Shortcuts::default();
+        bindings
+            .set(super::super::Action::FindNext, Some("F2".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            search: true,
+            target: Some(super::super::Target {
+                sender,
+                frames: pane.frames.clone(),
+            }),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |s| seen.borrow_mut().push(s))
+        };
+        for vk in [0x0d, 0x1b, 0x71] {
+            let key = |message| MSG {
+                hwnd,
+                message,
+                wParam: WPARAM(vk),
+                ..Default::default()
+            };
+            handle(hwnd, WM_IME_STARTCOMPOSITION, WPARAM(0), LPARAM(0));
+            assert!(!state.handle(&key(WM_KEYDOWN)));
+            handle(hwnd, WM_IME_ENDCOMPOSITION, WPARAM(0), LPARAM(0));
+            assert!(!state.handle(&key(WM_KEYUP)));
+        }
+        assert!(actions.borrow().is_empty());
+        assert!(input.try_recv().is_err());
+        assert!(state.handle(&MSG {
+            hwnd,
+            message: WM_KEYDOWN,
+            wParam: WPARAM(0x71),
+            ..Default::default()
+        }));
+        assert_eq!(*actions.borrow(), [Shortcut::FindNext]);
+    }
+    #[test]
     fn remote_session_search_enter_commits_native_composition_before_submitting_a_query() {
         let _window = WindowScope::default().enter();
         let hwnd = HWND::default();

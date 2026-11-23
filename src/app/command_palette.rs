@@ -226,6 +226,12 @@ impl TerminalApp {
                         Shortcut::NewTab => true,
                         Shortcut::CloseTab => tab_count > 0,
                         Shortcut::ClosePane => live.is_some(),
+                        Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => live
+                            .is_some_and(|tab| {
+                                !tab.device_busy
+                                    && !tab.browsing_sessions()
+                                    && tab.session.frames.load().prompt.is_none()
+                            }),
                         Shortcut::NextTab | Shortcut::PreviousTab => tab_count > 1,
                         Shortcut::Select(index) => index < tab_count,
                         _ => false,
@@ -301,19 +307,6 @@ impl TerminalApp {
         }
         for (shortcut, label, chord, enabled) in [
             (Shortcut::Copy, "Copy selection", "Ctrl+Shift+C", selection),
-            (
-                Shortcut::Find,
-                "Find in scrollback",
-                "Ctrl+Shift+F",
-                live.is_some(),
-            ),
-            (Shortcut::FindNext, "Find next", "F3", live.is_some()),
-            (
-                Shortcut::FindPrevious,
-                "Find previous",
-                "Shift+F3",
-                live.is_some(),
-            ),
             (
                 Shortcut::Zoom(1),
                 "Increase font size",
