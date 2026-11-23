@@ -185,13 +185,17 @@ impl TerminalApp {
         if self.tabs.group_is_pinned(group) {
             return;
         }
+        self.remember_closed_tab(group);
+        self.close_tab(id, context);
+    }
+
+    pub(in crate::app) fn remember_closed_tab(&mut self, group: TabId) {
         if let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture) {
             if self.closed_tabs.len() == CLOSED_TAB_LIMIT {
                 self.closed_tabs.pop_front();
             }
             self.closed_tabs.push_back(ClosedTab { group, layout });
         }
-        self.close_tab(id, context);
     }
 
     pub(in crate::app) fn reopen_closed_tab(
