@@ -326,6 +326,8 @@ const MAX_OSC: usize = 64;
 // Covers a 32,767-UTF-16-unit Windows path even after UTF-8 conversion.
 const MAX_OSC_DIRECTORY_BYTES: usize = 128 * 1024;
 const MAX_OSC_REMOTE_HOST_BYTES: usize = 1024;
+// OSC 7501 has a 4096-byte wire limit including its introducer and ST.
+const MAX_OSC_PROGRAM_STATUS_BYTES: usize = 4096 - b"\x1b]7501;\x1b\\".len();
 pub const MAX_REPORTED_COMMAND_BYTES: usize = 4096;
 const MAX_PARAMS: usize = 256;
 
@@ -350,6 +352,9 @@ impl OscState {
         }
         if param == ';' && self.literal_field.is_none() {
             self.command_field = None;
+            if self.num_params == 1 && self.buffer.as_slice() == b"7501" {
+                self.literal_field = Some((4, MAX_OSC_PROGRAM_STATUS_BYTES));
+            }
             if self.num_params == 2 && self.param_indices[0] == 1 && self.buffer.as_slice() == b"99"
             {
                 self.literal_field = Some((2, MAX_OSC_DIRECTORY_BYTES));

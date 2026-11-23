@@ -41,6 +41,7 @@ struct State {
     next: u64,
     events: VecDeque<Event>,
     progress: wezterm_term::Progress,
+    program_status: Option<Arc<wezterm_term::ProgramStatus>>,
     recording: Option<(u64, Arc<Path>)>,
     replay: Option<crate::session::ReplayState>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
@@ -385,10 +386,26 @@ impl Events {
         self.state.lock().unwrap().progress
     }
 
-    pub(crate) fn set_progress(&self, progress: wezterm_term::Progress) {
+    /// Both indicators belong to the same pane state and change together.
+    pub fn terminal_activity(
+        &self,
+    ) -> (
+        wezterm_term::Progress,
+        Option<Arc<wezterm_term::ProgramStatus>>,
+    ) {
+        let state = self.state.lock().unwrap();
+        (state.progress, state.program_status.clone())
+    }
+
+    pub(crate) fn set_terminal_activity(
+        &self,
+        progress: wezterm_term::Progress,
+        status: Option<Arc<wezterm_term::ProgramStatus>>,
+    ) {
         let mut state = self.state.lock().unwrap();
-        if state.progress != progress {
+        if state.progress != progress || state.program_status != status {
             state.progress = progress;
+            state.program_status = status;
             if let Some((_, _, inbox)) = &state.inbox {
                 inbox.refresh();
             }
@@ -582,16 +599,16 @@ mod tests {
         let pane = Events::default();
         pane.connect_inbox(11, "Loopback", &inbox);
         for value in 1..=100 {
-            pane.set_progress(Progress::Percentage(value));
+            pane.set_terminal_activity(Progress::Percentage(value), None);
         }
         assert_eq!(pane.progress(), Progress::Percentage(100));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(inbox.unread_count(), 0);
         assert!(pane.since(0).events.is_empty());
         inbox.acknowledge_wake();
-        pane.set_progress(Progress::Percentage(100));
+        pane.set_terminal_activity(Progress::Percentage(100), None);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        pane.set_progress(Progress::None);
+        pane.set_terminal_activity(Progress::None, None);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 

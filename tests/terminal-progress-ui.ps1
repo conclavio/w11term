@@ -12,12 +12,15 @@ $tabType = [System.Windows.Automation.ControlType]::TabItem
 function Wait-Header([string]$Label) {
     $null = Wait-Until "native tab header '$Label'" { Find-Element $Label $tabType }
 }
-function Set-SshProgress([int]$Pane, [string]$Value, [string]$Expected) {
+function Set-SshReport([int]$Pane, [string]$Payload, [string]$Expected) {
     # OSC only. The background terminal has no printable output to trigger a repaint.
-    $osc = [Text.Encoding]::ASCII.GetBytes("$([char]27)]9;4;$Value$([char]7)")
+    $osc = [Text.Encoding]::ASCII.GetBytes("$([char]27)]$Payload$([char]7)")
     $null = Control @('send-text','--pane',"$Pane",'--no-paste','--base64',[Convert]::ToBase64String($osc))
     Wait-Header $Expected
     Wait-Focus $local
+}
+function Set-SshProgress([int]$Pane, [string]$Value, [string]$Expected) {
+    Set-SshReport $Pane "9;4;$Value" $Expected
 }
 function Type-Line([string]$Command) {
     foreach ($c in $Command.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
@@ -64,6 +67,12 @@ try {
     Wait-Header 'palette-ssh'
     Set-SshProgress $right '1;77' "77% $dot palette-ssh"
     Set-SshProgress $right '0' 'palette-ssh'
+    Set-SshReport $left '7501;state=working:progress=24' "24% $dot palette-ssh"
+    Set-SshReport $right '7501;state=blocked:kind=permission:msg=Q29udGludWU/' "Needs approval $dot palette-ssh"
+    Set-SshReport $left '7501;state=done' "Needs approval $dot palette-ssh"
+    Set-SshReport $right '133;A' "Done $dot palette-ssh"
+    Set-SshProgress $left '1;99' "Done $dot palette-ssh"
+    Set-SshReport $left '7501;state=clear' 'palette-ssh'
     Wait-Focus $local
     Wait-Header 'Palette PowerShell'
     if ((Read-ShellPid 'after') -ne $shellPid) { throw 'Background SSH progress interrupted PowerShell' }

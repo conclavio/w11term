@@ -1149,7 +1149,18 @@ async fn native_terminal_progress_updates_background_tab_and_resets_on_reconnect
     for state in ["1;42", "4;68", "2", "0", "3", "0", "1;31"] {
         expected.extend_from_slice(format!("\x1b]9;4;{state}\x07").as_bytes());
     }
-    expected.extend_from_slice(b"\x04\x1b]9;4;1;77\x07\x1b]9;4;0\x07ssh-alive");
+    expected.extend_from_slice(b"\x04\x1b]9;4;1;77\x07\x1b]9;4;0\x07");
+    for report in [
+        "7501;state=working:progress=24",
+        "7501;state=blocked:kind=permission:msg=Q29udGludWU/",
+        "7501;state=done",
+        "133;A",
+        "9;4;1;99",
+        "7501;state=clear",
+    ] {
+        expected.extend(format!("\x1b]{report}\x07").bytes());
+    }
+    expected.extend_from_slice(b"ssh-alive");
     assert_eq!(fs::read(trace).unwrap(), expected);
     assert_eq!(
         opens.load(Ordering::Relaxed),
