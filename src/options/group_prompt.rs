@@ -1,21 +1,26 @@
 use anyhow::{Context as _, Result, ensure};
 use regex::{Regex, RegexBuilder};
+use std::sync::Arc;
 
 /// The complete visible prompt prefix for a direct SSH profile.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct GroupPromptPattern {
+pub struct GroupPromptPattern(Arc<CompiledPattern>);
+
+#[derive(Debug)]
+struct CompiledPattern {
     source: String,
     regex: Regex,
 }
 
 impl GroupPromptPattern {
     pub fn as_str(&self) -> &str {
-        &self.source
+        &self.0.source
     }
 
     pub(crate) fn matches(&self, text: &str) -> bool {
-        self.regex
+        self.0
+            .regex
             .find(text)
             .is_some_and(|m| m.start() == 0 && m.end() == text.len())
     }
@@ -23,7 +28,7 @@ impl GroupPromptPattern {
 
 impl PartialEq for GroupPromptPattern {
     fn eq(&self, other: &Self) -> bool {
-        self.source == other.source
+        self.as_str() == other.as_str()
     }
 }
 
@@ -43,13 +48,13 @@ impl TryFrom<String> for GroupPromptPattern {
             !regex.is_match(""),
             "A group prompt pattern must match visible text"
         );
-        Ok(Self { source, regex })
+        Ok(Self(Arc::new(CompiledPattern { source, regex })))
     }
 }
 
 impl From<GroupPromptPattern> for String {
     fn from(pattern: GroupPromptPattern) -> Self {
-        pattern.source
+        pattern.as_str().to_owned()
     }
 }
 
