@@ -22,6 +22,13 @@ pub struct ProfileStore {
 
 const SHARE_TOKEN: &str = "folder_share_id";
 const SHARE_EPOCH: &str = "folder_share_epoch";
+const STARTUP_PROFILE: &str = "startup_profile";
+
+#[derive(Default)]
+struct CatalogEdit {
+    order: Option<Vec<String>>,
+    startup: Option<Option<String>>, // None leaves the setting untouched.
+}
 
 #[derive(Clone)]
 pub struct LocalProfileSnapshot {
@@ -79,6 +86,14 @@ fn order_after_edit(
     Some(order)
 }
 
+fn profile_identity_edit(catalog: &Profiles, old: Option<&str>, new: Option<&str>) -> CatalogEdit {
+    CatalogEdit {
+        order: order_after_edit(catalog, old, new),
+        startup: (old.is_some() && old != new && catalog.startup_profile.as_deref() == old)
+            .then(|| new.map(str::to_owned)),
+    }
+}
+
 impl ProfileStore {
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -99,6 +114,29 @@ impl ProfileStore {
 
     pub fn catalog(&self) -> Result<crate::options::Profiles> {
         load_profiles(&self.path)
+    }
+
+    pub fn set_startup_profile(
+        &self,
+        name: Option<&str>,
+        expected: Option<&str>,
+    ) -> Result<Profiles> {
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.startup_profile.as_deref() == expected,
+                "The startup profile changed on disk; choose again"
+            );
+            if let Some(name) = name {
+                ensure!(
+                    catalog.profiles.contains_key(name) || catalog.local.contains_key(name),
+                    "Profile {name} is no longer available"
+                );
+            }
+            Ok(CatalogEdit {
+                startup: Some(name.map(str::to_owned)),
+                ..Default::default()
+            })
+        })
     }
 
     /// Move one position relative to the catalog shown to the user. Validate
@@ -128,7 +166,10 @@ impl ProfileStore {
                 .filter(|&next| next < order.len())
                 .context("This profile is already at the end in that direction")?;
             order.swap(index, next);
-            Ok(Some(order))
+            Ok(CatalogEdit {
+                order: Some(order),
+                ..Default::default()
+            })
         })
     }
 
@@ -191,9 +232,9 @@ impl ProfileStore {
             profiles.remove(&base.name);
             // A discovered profile comes back in the same position after its override is removed.
             Ok(if installed {
-                None
+                CatalogEdit::default()
             } else {
-                order_after_edit(catalog, Some(&base.name), None)
+                profile_identity_edit(catalog, Some(&base.name), None)
             })
         })
     }
@@ -265,7 +306,7 @@ impl ProfileStore {
                 profiles.remove(&base.name);
             }
             profiles.insert(name.into(), entry);
-            Ok(order_after_edit(
+            Ok(profile_identity_edit(
                 catalog,
                 original.map(|base| base.name.as_str()),
                 Some(name),
@@ -334,7 +375,7 @@ impl ProfileStore {
                 "Profile changed on disk; reopen the editor before deleting"
             );
             profiles.remove(&base.name);
-            Ok(order_after_edit(catalog, Some(&base.name), None))
+            Ok(profile_identity_edit(catalog, Some(&base.name), None))
         })
         .map(|_| ())
     }
@@ -473,7 +514,7 @@ impl ProfileStore {
                 profiles.remove(original);
             }
             profiles.insert(name.into(), value);
-            Ok(order_after_edit(catalog, original, Some(name)))
+            Ok(profile_identity_edit(catalog, original, Some(name)))
         })
         .map(|_| ())
     }
@@ -506,7 +547,7 @@ impl ProfileStore {
         change: impl FnOnce(
             &mut serde_json::Map<String, serde_json::Value>,
             &Profiles,
-        ) -> Result<Option<Vec<String>>>,
+        ) -> Result<CatalogEdit>,
     ) -> Result<Profiles> {
         let _lock = self.lock()?;
         self.modify_locked(change)
@@ -517,7 +558,7 @@ impl ProfileStore {
         change: impl FnOnce(
             &mut serde_json::Map<String, serde_json::Value>,
             &Profiles,
-        ) -> Result<Option<Vec<String>>>,
+        ) -> Result<CatalogEdit>,
     ) -> Result<Profiles> {
         let parent = self
             .path
@@ -532,12 +573,25 @@ impl ProfileStore {
         let catalog = crate::options::parse_profiles(bytes, &self.path)?;
         let mut document: serde_json::Value =
             serde_json::from_slice(bytes).context("Reading existing profiles")?;
-        let profiles = document
+        let fields = document
+            .as_object_mut()
+            .context("Configuration must be an object")?;
+        let profiles = fields
             .get_mut("profiles")
             .and_then(|v| v.as_object_mut())
             .context("Configuration must contain a profiles object")?;
-        if let Some(order) = change(profiles, &catalog)? {
-            document["profile_order"] = serde_json::to_value(order)?;
+        let edit = change(profiles, &catalog)?;
+        if let Some(order) = edit.order {
+            fields.insert("profile_order".into(), serde_json::to_value(order)?);
+        }
+        match edit.startup {
+            Some(Some(name)) => {
+                fields.insert(STARTUP_PROFILE.into(), name.into());
+            }
+            Some(None) => {
+                fields.remove(STARTUP_PROFILE);
+            }
+            None => {}
         }
         // Return the catalog from the exact document being committed.
         let result = crate::options::parse_profiles(&serde_json::to_vec(&document)?, &self.path)?;
@@ -629,6 +683,47 @@ mod order_tests {
 
     fn disk(store: &ProfileStore) -> Value {
         serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn startup_profile_follows_renames_and_clears_when_deleted() {
+        let (_dir, store) = fixture();
+        store.set_startup_profile(Some("Alpha"), None).unwrap();
+        let first = disk(&store);
+        assert_eq!(first[STARTUP_PROFILE], "Alpha");
+        assert_eq!(first["theme"]["tone"], "dark");
+        assert!(store.set_startup_profile(Some("Zulu"), None).is_err());
+        assert!(
+            store
+                .set_startup_profile(Some("missing"), Some("Alpha"))
+                .is_err()
+        );
+        assert_eq!(disk(&store), first);
+
+        let base = store.inspect("Alpha").unwrap().1;
+        store.duplicate(&base, "Alpha copy", &base.options).unwrap();
+        assert_eq!(disk(&store)[STARTUP_PROFILE], "Alpha");
+        store
+            .edit("Alpha", "Renamed", &base.options, &base.options)
+            .unwrap();
+        assert_eq!(
+            store.catalog().unwrap().startup_profile.as_deref(),
+            Some("Renamed")
+        );
+        store.delete(&store.inspect("Renamed").unwrap().1).unwrap();
+        assert!(disk(&store).get(STARTUP_PROFILE).is_none());
+
+        store.set_startup_profile(Some("Lima"), None).unwrap();
+        let base = store.inspect_local("Lima").unwrap();
+        store
+            .save_local(Some(&base), "Renamed local", &base.options)
+            .unwrap();
+        assert_eq!(disk(&store)[STARTUP_PROFILE], "Renamed local");
+        let catalog = store
+            .remove_local(&store.inspect_local("Renamed local").unwrap())
+            .unwrap();
+        assert!(catalog.startup_profile.is_none());
+        assert!(disk(&store).get(STARTUP_PROFILE).is_none());
     }
 
     #[test]

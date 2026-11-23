@@ -848,7 +848,7 @@ pub struct TerminalApp {
     catalog: Profiles,
     store: ProfileStore,
     profile_error: Option<String>,
-    profile_move_error: Option<String>,
+    profile_action_error: Option<String>,
     width: f64,
     selection_pending: bool,
     selection_epoch: u64,
@@ -970,6 +970,10 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     MoveProfile(String, isize, Arc<[String]>),
+    StartupProfile {
+        selected: Option<String>,
+        expected: Option<String>,
+    },
     WindowActivation(bool),
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
@@ -1963,6 +1967,46 @@ impl TerminalApp {
         let mut profiles: Vec<View> =
             vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
         let order: Arc<[String]> = self.catalog.profile_order.as_slice().into();
+        let startup = self.catalog.startup_profile.clone();
+        let startup_index = order
+            .iter()
+            .position(|name| Some(name) == startup.as_ref())
+            .map_or(0, |index| index + 1);
+        let startup_names = std::iter::once(LAB.to_owned()).chain(order.iter().map(|name| {
+            let backend = if self.catalog.profiles.contains_key(name) {
+                "SSH"
+            } else {
+                "Local"
+            };
+            format!("{name} · {backend}")
+        }));
+        let choices = order.clone();
+        profiles.push(TextBlock::new().text("Startup profile").into());
+        profiles.push(
+            ComboBox::new()
+                .width(360.0)
+                .automation_name("Startup profile")
+                .is_enabled(self.profile_error.is_none())
+                .items_source(startup_names)
+                .selected_index(Some(startup_index))
+                .on_selection_changed(context.callback(move |index: Option<usize>| {
+                    let selected = match index {
+                        Some(0) => None,
+                        Some(index) => {
+                            let Some(name) = choices.get(index - 1) else {
+                                return Message::ControlIdle;
+                            };
+                            Some(name.clone())
+                        }
+                        None => return Message::ControlIdle,
+                    };
+                    Message::StartupProfile {
+                        selected,
+                        expected: startup.clone(),
+                    }
+                }))
+                .into(),
+        );
         let mut rows = Vec::with_capacity(order.len());
         for (index, name) in order.iter().enumerate() {
             let edit_name = name.clone();
@@ -2025,7 +2069,7 @@ impl TerminalApp {
                 )
                 .content("New local shell profile…"),
         );
-        for error in self.profile_error.iter().chain(&self.profile_move_error) {
+        for error in self.profile_error.iter().chain(&self.profile_action_error) {
             profiles.push(
                 TextBlock::new()
                     .text(error)
@@ -4254,7 +4298,7 @@ impl Component for TerminalApp {
             catalog,
             store,
             profile_error,
-            profile_move_error: None,
+            profile_action_error: None,
             width: client_size.0,
             window_height: client_size.1,
             client_size,
@@ -5605,13 +5649,32 @@ impl Component for TerminalApp {
                     Ok(catalog) => {
                         self.catalog = catalog;
                         self.profile_error = None;
-                        self.profile_move_error = None;
+                        self.profile_action_error = None;
                     }
                     Err(error) => {
                         self.refresh_profiles();
-                        self.profile_move_error = Some(format!(
+                        self.profile_action_error = Some(format!(
                             "Could not move {name}: {error:#}. Review the current order and try again."
                         ));
+                    }
+                }
+            }
+            Message::StartupProfile { selected, expected } => {
+                if selected != self.catalog.startup_profile {
+                    match self
+                        .store
+                        .set_startup_profile(selected.as_deref(), expected.as_deref())
+                    {
+                        Ok(catalog) => {
+                            self.catalog = catalog;
+                            self.profile_error = None;
+                            self.profile_action_error = None;
+                        }
+                        Err(error) => {
+                            self.refresh_profiles();
+                            self.profile_action_error =
+                                Some(format!("Could not set startup profile. {error:#}"));
+                        }
                     }
                 }
             }

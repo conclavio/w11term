@@ -382,6 +382,7 @@ pub struct Profiles {
     pub local: BTreeMap<String, LocalOptions>,
     /// Each available name once, including discovered local shells.
     pub profile_order: Vec<String>,
+    pub startup_profile: Option<String>,
     pub(crate) has_explicit_order: bool,
 }
 
@@ -392,6 +393,7 @@ impl Default for Profiles {
             profile_order: local.keys().cloned().collect(),
             profiles: BTreeMap::new(),
             local,
+            startup_profile: None,
             has_explicit_order: false,
         }
     }
@@ -449,6 +451,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         profiles: BTreeMap<String, serde_json::Value>,
         #[serde(default)]
         profile_order: Option<serde_json::Value>,
+        #[serde(default)]
+        startup_profile: Option<String>,
     }
     let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
@@ -459,6 +463,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         .context("profile_order must be an array of profile names")?;
     let mut profiles = Profiles {
         has_explicit_order: explicit_order.is_some(),
+        startup_profile: document.startup_profile,
         ..Profiles::default()
     };
     for (name, value) in document.profiles {
@@ -755,7 +760,7 @@ impl Options {
             || authentication.is_some()
             || host_key.is_some()
             || host_key_alias.is_some();
-        let initial_profile = profile.clone().filter(|_| !ssh_override);
+        let mut initial_profile = profile.clone().filter(|_| !ssh_override);
         if !extra_profiles.is_empty() {
             let profiles = load_profiles(&profiles_path)?;
             for name in &extra_profiles {
@@ -766,6 +771,17 @@ impl Options {
             source = load_profiles(&profiles_path)?
                 .source(&name)
                 .with_context(|| format!("unknown profile {name}; use --list-profiles"))?;
+        } else if !explicit_source
+            && !ssh_override
+            && workspace_name.is_none()
+            && !benchmark
+            && smoke_seconds.is_none()
+            && let Ok(profiles) = load_profiles(&profiles_path)
+            && let Some(name) = &profiles.startup_profile
+            && let Some(startup) = profiles.source(name)
+        {
+            source = startup;
+            initial_profile = Some(name.clone());
         }
         if let Source::Ssh(ssh) = &mut source {
             if let Some(port) = port {
@@ -1009,6 +1025,60 @@ mod tests {
                     .contains("profile_order must be an array of profile names")
             );
         }
+    }
+
+    #[test]
+    fn startup_profile_applies_only_to_implicit_launch_and_falls_back_when_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let mut doc = serde_json::json!({
+            "profiles":{
+                "Remote":{"host":"ssh.test","user":"pilot","auth":"none"},
+                "Local":{"backend":"local","executable":"cmd.exe"}
+            },
+            "startup_profile":"Remote"
+        });
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                ["--profiles", path.to_str().unwrap()]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .map(str::to_owned),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let implicit = parse(&["--cols", "100", "--rows", "30"]);
+        assert!(matches!(implicit.source, Source::Ssh(ssh) if ssh.host == "ssh.test"));
+        assert_eq!(implicit.initial_profile.as_deref(), Some("Remote"));
+        assert_eq!((implicit.cols, implicit.rows), (Some(100), Some(30)));
+        assert!(matches!(
+            parse(&["--profile", "Local"]).source,
+            Source::Local(_)
+        ));
+        for args in [
+            &["--demo"][..],
+            &["--tab", "Local"],
+            &["--workspace", "desk"],
+            &["--smoke-seconds", "1"],
+            &["--benchmark"],
+        ] {
+            assert_eq!(parse(args).source, Source::Demo);
+        }
+        assert_eq!(
+            parse(&["--replay", "sample.vt"]).source,
+            Source::Replay("sample.vt".into())
+        );
+
+        doc["startup_profile"] = "Local".into();
+        std::fs::write(&path, doc.to_string()).unwrap();
+        assert!(matches!(parse(&[]).source, Source::Local(_)));
+        doc["startup_profile"] = "unavailable".into();
+        std::fs::write(&path, doc.to_string()).unwrap();
+        assert_eq!(parse(&[]).source, Source::Demo);
+        std::fs::write(&path, b"{").unwrap();
+        assert_eq!(parse(&[]).source, Source::Demo);
     }
 
     #[test]

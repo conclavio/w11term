@@ -35,7 +35,7 @@ cargo run -- ssh user@example.com --port 2222 --host-key SHA256:verified-fingerp
 cargo run -- ssh play@conclav.io --port 6789 --auth none
 ```
 
-Without arguments, the app opens a **local terminal lab**, not a shell. Its ANSI colors, Unicode text, and kitty image are actual VT traffic processed by the same engine used for SSH. Typing in the lab only exercises local echo.
+Without a launch target, the app opens the **local terminal lab** until you choose a startup profile. The lab’s ANSI colors, Unicode text, and kitty image are actual VT traffic processed by the same engine used for SSH. Typing in the lab exercises local echo. Use `--demo` to open the lab directly.
 
 `profiles.json` contains the three initial targets. `root` uses the local `hostinger` key; both `play` profiles use SSH `none` authentication, without contacting the agent or offering a private key. The key is excluded by `.gitignore`. Profiles load from the current working directory, then beside the executable or up to two parent directories (for development builds), or from an explicit `--profiles C:\path\to\profiles.json`. Relative identity paths resolve beside that configuration file. CLI SSH options can override a profile.
 
@@ -48,6 +48,8 @@ To change an open pane, choose **Panes → Color scheme** or search for **Set pa
 Terminal applications can request the pane's light or dark preference with `CSI ? 996 n`. w11term answers `CSI ? 997 ; 2 n` for One Half Light and `CSI ? 997 ; 1 n` for the dark schemes. An application that enables `CSI ? 2031 h` also receives a report when the effective palette changes, including when a pane follows Windows from light to dark. It can stop notifications with `CSI ? 2031 l`. The preference follows the user's selection even if an editor sets its own RGB background or requests reverse screen. [Contour theme reporting](https://contour-terminal.org/vt-extensions/color-palette-update-notifications/)
 
 In **Settings → Profiles**, use **Move up** and **Move down** to arrange SSH and local shell profiles together. The **+** menu, split submenus, command palette, and remote session browser use that order. Changes are saved immediately in `profiles.json` and appear in other open windows when you switch to them.
+
+In the same section, set **Startup profile** to a saved SSH or local shell profile. The choice is saved in the current profile catalog and applies on the next launch without a target. Explicit profile, workspace and replay launches use their requested target. Choose **Terminal lab** to restore the default.
 
 In an SSH or local profile editor, **Scrollback lines** sets how many rows the terminal can keep above the primary screen. The default is 10,000. Set it to zero to keep only the current screen, or enter up to 32,767 for longer build logs. A wrapped line can occupy several rows. Find and **Save scrollback as text…** use the retained rows. Open a new pane from the edited profile to use its limit. Reconnecting or restarting a shell in an existing pane keeps that pane’s limit. The JSON setting is `"scrollback_lines": 2000`.
 

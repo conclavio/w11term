@@ -192,7 +192,7 @@ impl ProfileStore {
             } else {
                 fields.insert(FIELD.into(), serde_json::to_value(groups)?);
             }
-            Ok(None)
+            Ok(super::CatalogEdit::default())
         })?;
         Ok(current)
     }

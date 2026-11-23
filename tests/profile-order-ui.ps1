@@ -23,6 +23,33 @@ function Settings {
     Click 'Tab menu' $button
     Click 'Settings' $menuItem
 }
+function Select-StartupProfile([string]$Choice) {
+    $comboType = [System.Windows.Automation.ControlType]::ComboBox
+    $box = Wait-Until 'Startup profile selector' { Find-Element 'Startup profile' $comboType }
+    $box.SetFocus()
+    $expand = $box.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $expand.Expand()
+    $item = Wait-Until "visible startup choice '$Choice'" {
+        $entry = Find-Element $Choice ([System.Windows.Automation.ControlType]::ListItem)
+        if ($entry -and !$entry.Current.IsOffscreen) { $entry }
+    }
+    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until "Startup profile persisted for $localName" {
+        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $file = [IO.File]::Open($profiles, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+        $reader = [IO.StreamReader]::new($file)
+        try { ($reader.ReadToEnd() | ConvertFrom-Json).startup_profile -ceq $localName } finally { $reader.Dispose() }
+    }
+    $box = Wait-Until "Startup selector shows '$Choice'" {
+        $field = Find-Element 'Startup profile' $comboType
+        if ($field) {
+            $current = @($field.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection())
+            if ($current.Count -eq 1 -and $current[0].Current.Name -ceq $Choice) { $field }
+        }
+    }
+    $expand = $box.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    if ($expand.Current.ExpandCollapseState -eq 'Expanded') { $expand.Collapse() }
+}
 function Wait-SettingsOrder([string]$First, [string]$Second) {
     $null = Wait-Until "Settings to show '$First', '$Second', and disabled end controls" {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -63,7 +90,9 @@ for ($launch = 1; $launch -le 2; $launch++) {
     # Only the saved catalog is shared between launches.
     $env:W11TERM_DATA_DIR = Join-Path $State "data-$launch"
     $env:W11TERM_SETTINGS_PATH = Join-Path $State "appearance-$launch.json"
-    $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+    $arguments = @('--profiles',('"' + $profiles + '"'))
+    if ($launch -eq 1) { $arguments += '--demo' }
+    $app = Start-Process -FilePath $Gui -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
     try {
         $window = Wait-InputWindow
         $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
@@ -92,7 +121,12 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Wait-SettingsOrder $sshName $localName
             if ([IO.File]::ReadAllText($profiles) -cne $external) { throw 'The stale move rewrote the catalog' }
             Click "Move $sshName down" $button
+            Wait-SettingsOrder $localName $sshName
+            Select-StartupProfile $localLabel
         } else {
+            $startup = Active-Pane $localName
+            $null = Control @('wait-for-text','--pane',"$startup",'--timeout','15','PS ')
+            if (@((Control @('list')).sessions).Count -ne 1) { throw 'Expected only the startup profile on implicit launch' }
             Settings
         }
         Wait-SettingsOrder $localName $sshName
