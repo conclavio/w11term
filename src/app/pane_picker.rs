@@ -648,6 +648,9 @@ impl TerminalApp {
             self.finish_switcher(false, ctx);
         }
         let (matches, commands) = if mode.has_commands() {
+            if mode == Mode::Commands(None) {
+                self.refresh_profiles();
+            }
             self.reload_saved_commands();
             (vec![], self.picker_command_rows(mode, ""))
         } else if mode == Mode::Text {
