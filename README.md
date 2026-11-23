@@ -81,6 +81,8 @@ Choose **caret → SSH host group** or search for it in the command palette to s
 
 For an appliance SSH shell, set **SSH group prompt regex** in its profile and open a new pane from that profile. For example, `rack-[12]>>` matches the visible prompt on either rack. The regex matches the full line up to the cursor with trailing spaces removed. A fresh match reports **Ready · prompt match**, and the next match after a submission reports **Prompt returned · exit status unavailable**. Inspect the pane for command output. OSC 133 and OSC 633 take precedence when present. Choose a pattern specific to the prompt because matching output can also mark the pane ready.
 
+Use **Host filter** to find SSH panes by profile, pane name, or address. **Select shown** and **Deselect shown** change the visible rows. The filter preserves hidden selections and scopes **Send** and **Interrupt selected** to the shown hosts. Prior submission results remain visible.
+
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.
 
 While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its selected hosts that still report the matching command as running. The result shows Ctrl+C delivery and the command’s eventual exit status separately. w11term uses each pane’s current keyboard mode.

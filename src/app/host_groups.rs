@@ -14,6 +14,7 @@ const SUBMISSION_LIMIT: usize = 8;
 pub(super) struct HostGroup {
     saved: saved::SavedUi,
     selected: BTreeSet<u64>,
+    filter: String,
     draft: String,
     submissions: VecDeque<Submission>,
     viewing: u64,
@@ -30,6 +31,7 @@ struct Submission {
 pub struct Target {
     pane: u64,
     name: String,
+    profile: Option<String>,
     connected: bool,
     state: TargetState,
 }
@@ -127,6 +129,27 @@ impl Delivery {
 }
 
 impl HostGroup {
+    fn shown<'a>(&self, targets: &'a [Target]) -> impl Iterator<Item = &'a Target> {
+        let query = self.filter.trim().to_lowercase();
+        targets.iter().filter(move |target| {
+            if query.is_empty() {
+                return true;
+            }
+            let name = target.name.to_lowercase();
+            let profile = target.profile.as_deref().unwrap_or_default().to_lowercase();
+            query
+                .split_whitespace()
+                .all(|term| name.contains(term) || profile.contains(term))
+        })
+    }
+
+    fn selected_shown(&self, targets: &[Target]) -> BTreeSet<u64> {
+        self.shown(targets)
+            .map(|target| target.pane)
+            .filter(|pane| self.selected.contains(pane))
+            .collect()
+    }
+
     fn sending(&self) -> bool {
         self.submissions.back().is_some_and(|submission| {
             submission
@@ -155,7 +178,9 @@ pub enum Action {
     Saved(TabId, saved::Action),
     Tick,
     Edit(TabId, String),
+    Filter(TabId, String),
     Select(TabId, u64, bool),
+    SelectShown(TabId, Vec<u64>, bool),
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
     ViewOutput(TabId, u64, CommandLink),
@@ -246,6 +271,7 @@ impl TerminalApp {
                         "{label} · {}@{host}:{} · Pane {pane}",
                         options.user, options.port
                     ),
+                    profile: live.profile_name.clone(),
                     connected,
                     state,
                 })
@@ -308,6 +334,7 @@ impl TerminalApp {
         submission: u64,
         targets: Vec<(u64, GroupInterruptTarget)>,
     ) {
+        let roster = self.host_group_targets();
         let Some(page) = self
             .host_group_mut(id)
             .filter(|page| page.viewing == submission)
@@ -317,10 +344,11 @@ impl TerminalApp {
         let Some(run) = page.submissions.iter().find(|run| run.id == submission) else {
             return;
         };
+        let eligible = page.selected_shown(&roster);
         let selected: Vec<_> = targets
             .into_iter()
             .filter(|&(pane, link)| {
-                page.selected.contains(&pane)
+                eligible.contains(&pane)
                     && run.results.iter().any(|delivery| {
                         delivery.target.pane == pane && delivery.interrupt_target() == Some(link)
                     })
@@ -421,12 +449,31 @@ impl TerminalApp {
                     page.draft = text;
                 }
             }
+            Action::Filter(id, query) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.filter = query;
+                }
+            }
             Action::Select(id, pane, selected) => {
                 if let Some(page) = self.host_group_mut(id) {
                     if selected {
                         page.selected.insert(pane);
                     } else {
                         page.selected.remove(&pane);
+                    }
+                }
+            }
+            Action::SelectShown(id, shown, selected) => {
+                let roster = self.host_group_targets();
+                if let Some(page) = self.host_group_mut(id) {
+                    let visible: BTreeSet<_> =
+                        page.shown(&roster).map(|target| target.pane).collect();
+                    for pane in shown.into_iter().filter(|pane| visible.contains(pane)) {
+                        if selected {
+                            page.selected.insert(pane);
+                        } else {
+                            page.selected.remove(&pane);
+                        }
                     }
                 }
             }
@@ -455,12 +502,14 @@ impl TerminalApp {
                 self.interrupt_hosts(id, submission, targets)
             }
             Action::Send(id, text, targets) => {
+                let roster = self.host_group_targets();
                 let Some(page) = self.host_group_mut(id) else {
                     return;
                 };
                 let selection: BTreeSet<_> = targets.iter().map(|target| target.pane).collect();
                 if page.sending()
-                    || page.selected != selection
+                    || selection.is_empty()
+                    || page.selected_shown(&roster) != selection
                     || page.draft != text.as_ref()
                     || !w11term::saved_commands::valid_command_text(&text)
                 {
@@ -487,8 +536,10 @@ impl TerminalApp {
             return editor;
         }
         let targets = self.host_group_targets();
-        let selected = targets
+        let shown: Vec<_> = page.shown(&targets).collect();
+        let selected: Vec<_> = shown
             .iter()
+            .copied()
             .filter(|target| page.selected.contains(&target.pane))
             .cloned()
             .collect::<Vec<_>>();
@@ -507,8 +558,8 @@ impl TerminalApp {
             selected.len(),
             if selected.len() == 1 { "host" } else { "hosts" }
         );
-        let mut details: Vec<KeyedView> = targets
-            .into_iter()
+        let mut details: Vec<KeyedView> = shown
+            .iter()
             .map(|target| {
                 let pane = target.pane;
                 let state = if target.connected {
@@ -544,13 +595,50 @@ impl TerminalApp {
                 )
             })
             .collect();
-        if details.is_empty() {
+        if shown.is_empty() {
             details.push(KeyedView::new(
                 "empty",
-                TextBlock::new().text("Open a direct SSH shell to add it to this roster."),
+                TextBlock::new().text(if targets.is_empty() {
+                    "Open a direct SSH shell to add it to this roster."
+                } else {
+                    "No SSH panes match this filter."
+                }),
             ));
         }
-        self.host_group_results(id, page, ctx, &mut details);
+        let selected_shown: BTreeSet<_> = selected.iter().map(|target| target.pane).collect();
+        self.host_group_results(id, page, ctx, &selected_shown, &mut details);
+        let hidden_count = targets
+            .iter()
+            .filter(|target| {
+                page.selected.contains(&target.pane) && !selected_shown.contains(&target.pane)
+            })
+            .count();
+        let shown_ids: Vec<_> = shown.iter().map(|target| target.pane).collect();
+        let bulk = |label, select, enabled| {
+            let panes = shown_ids.clone();
+            Button::new()
+                .is_enabled(enabled)
+                .on_click(ctx.callback(move |_| {
+                    Message::HostGroup(Action::SelectShown(id, panes.clone(), select))
+                }))
+                .content(label)
+        };
+        let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
+            TextBox::new()
+                .automation_name("Host filter")
+                .placeholder_text("Filter by profile, pane, or SSH address")
+                .text(&page.filter)
+                .on_text_changed(
+                    ctx.callback(move |query| Message::HostGroup(Action::Filter(id, query))),
+                ),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    bulk("Select shown", true, selected.len() < shown.len()),
+                    bulk("Deselect shown", false, !selected.is_empty()),
+                )),
+        ));
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes."
         } else {
@@ -568,9 +656,25 @@ impl TerminalApp {
                 Message::HostGroup(Action::Send(id, text.clone(), selected.clone()))
             }))
             .content(send_label);
+        let hidden_selection = if hidden_count == 0 {
+            View::empty()
+        } else {
+            let hosts = if hidden_count == 1 {
+                "host is"
+            } else {
+                "hosts are"
+            };
+            TextBlock::new()
+                .text(format!(
+                    "{hidden_count} selected {hosts} hidden by the filter."
+                ))
+                .text_wrapping(TextWrapping::Wrap)
+                .into()
+        };
         Grid::new()
             .margin(Thickness::uniform(16.0))
             .rows([
+                GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
@@ -579,15 +683,17 @@ impl TerminalApp {
             .children((
                 TextBlock::new().font_size(24.0).text(LABEL),
                 self.saved_host_group_toolbar(id, &page.saved, ctx),
-                StackPanel::new().grid_row(2).spacing(7.0).children((
+                filter,
+                StackPanel::new().grid_row(3).spacing(7.0).children((
                     entry,
                     send,
+                    hidden_selection,
                     TextBlock::new()
                         .text(instructions)
                         .text_wrapping(TextWrapping::Wrap),
                 )),
                 ScrollViewer::new()
-                    .grid_row(3)
+                    .grid_row(4)
                     .content(StackPanel::new().spacing(10.0).keyed_children(details)),
             ))
     }
@@ -597,6 +703,7 @@ impl TerminalApp {
         id: TabId,
         page: &HostGroup,
         ctx: &ViewContext<Self>,
+        selected_shown: &BTreeSet<u64>,
         details: &mut Vec<KeyedView>,
     ) {
         let Some(index) = page
@@ -611,7 +718,7 @@ impl TerminalApp {
         let interrupt_targets: Vec<_> = submission
             .results
             .iter()
-            .filter(|delivery| page.selected.contains(&delivery.target.pane))
+            .filter(|delivery| selected_shown.contains(&delivery.target.pane))
             .filter_map(|delivery| {
                 delivery
                     .interrupt_target()
@@ -784,6 +891,38 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_filter_matches_profile_pane_and_address_and_scopes_selection() {
+        let roster = [
+            Target {
+                pane: 7,
+                name: "Primary database · ops@db.example:2222 · Pane 7".into(),
+                profile: Some("East Prod".into()),
+                connected: false,
+                state: TargetState::Offline,
+            },
+            Target {
+                pane: 8,
+                name: "Replica · ops@db.example:22 · Pane 8".into(),
+                profile: Some("West Prod".into()),
+                connected: false,
+                state: TargetState::Offline,
+            },
+        ];
+        let mut group = HostGroup {
+            selected: BTreeSet::from([7, 8]),
+            ..Default::default()
+        };
+        for query in [" EAST    PRIMARY ", "ops@db.example:2222", "pane 7"] {
+            group.filter = query.into();
+            assert_eq!(group.selected_shown(&roster), BTreeSet::from([7]));
+        }
+        group.filter = "missing".into();
+        assert!(group.selected_shown(&roster).is_empty());
+        group.filter.clear();
+        assert_eq!(group.selected_shown(&roster), BTreeSet::from([7, 8]));
+    }
 
     #[test]
     fn submission_history_retains_the_latest_eight_and_selects_the_newest() {
