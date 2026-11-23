@@ -1607,6 +1607,13 @@ fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
     drive_gui("ssh-identity-picker-ui.ps1", state.path());
 }
 
+#[test]
+#[ignore = "discovers test WSL registrations and opens them as native ConPTY panes"]
+fn native_wsl_profiles_launch_from_the_menu_and_restore_a_workspace() {
+    let state = tempfile::tempdir().unwrap();
+    drive_gui("wsl-profiles-ui.ps1", state.path());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits profile colors and live overrides through WinUI, including a saved workspace"]
 async fn native_profile_tab_colors_follow_focused_panes_and_new_launches() {

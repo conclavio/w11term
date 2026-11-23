@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod wsl;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalOptions {
     pub executable: PathBuf,
@@ -120,15 +122,9 @@ impl LocalOptions {
         let mut shells = BTreeMap::new();
         let mut add = |label: &str, path: PathBuf| {
             if path.is_absolute() && path.is_file() {
-                shells.entry(label.into()).or_insert(Self {
-                    executable: path,
-                    args: vec![],
-                    cwd: None,
-                    scrollback_lines: Default::default(),
-                    color_scheme: ColorScheme::default(),
-                    tab_color: Default::default(),
-                    powershell_integration: false,
-                });
+                shells
+                    .entry(label.into())
+                    .or_insert_with(|| Self::discovered(path, Vec::new()));
             }
         };
         if let Some(windows) = std::env::var_os("SystemRoot") {
@@ -148,7 +144,20 @@ impl LocalOptions {
                 add("PowerShell 7", dir.join("pwsh.exe"));
             }
         }
+        shells.extend(wsl::installed());
         shells
+    }
+
+    fn discovered(executable: PathBuf, args: Vec<String>) -> Self {
+        Self {
+            executable,
+            args,
+            cwd: None,
+            scrollback_lines: Default::default(),
+            color_scheme: ColorScheme::default(),
+            tab_color: Default::default(),
+            powershell_integration: false,
+        }
     }
 }
 
