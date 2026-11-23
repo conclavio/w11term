@@ -1571,7 +1571,7 @@ mod tests {
         tabs.cycle(-1);
         assert_eq!(tabs.active_id(), Some(b));
         assert!(!tabs.reorder(&[a, a]));
-        assert!(!tabs.reorder(&[a, 99]));
+        assert!(!tabs.reorder(&[a, next_id()]));
         assert_eq!(tabs.entries().len(), 2);
     }
 
