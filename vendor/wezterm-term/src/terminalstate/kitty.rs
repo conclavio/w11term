@@ -522,48 +522,34 @@ impl TerminalState {
 
     fn kitty_img_inner(&mut self, img: KittyImage) -> anyhow::Result<()> {
         let first = self.kitty_img.accumulator.first().unwrap_or(&img);
-        let probe_reply = probe_reply(first)
-            .map(|(id, initial)| (id, transfer_verbosity(initial, img.verbosity())));
-        // Read the first chunk before coalescing so errors can use its address
-        // even when the final chunk carries no image or frame number.
-        let frame_reply = match first {
-            KittyImage::TransmitFrame {
+        let address = transmission_address(first);
+        let verbosity = transfer_verbosity(first.verbosity(), img.verbosity());
+        let image = match self.coalesce_kitty_accumulation(img) {
+            Ok(image) => image,
+            Err(err) => {
+                if let Some(address) = address {
+                    self.kitty_send_reply(
+                        verbosity,
+                        false,
+                        &address,
+                        &format!("EINVAL:invalid kitty upload chunk: {err:#}"),
+                    );
+                }
+                return Ok(());
+            }
+        };
+        match image {
+            KittyImage::Query {
                 transmit,
-                frame,
                 verbosity,
             } => {
-                let quiet = transfer_verbosity(*verbosity, img.verbosity());
-                Some((
-                    transmit.image_id,
-                    transmit.image_number,
-                    frame.frame_number,
-                    quiet,
-                ))
+                if let Some(id) = transmit.image_id.filter(|&id| id != 0) {
+                    if !matches!(verbosity, KittyImageVerbosity::Quiet) {
+                        self.kitty_send_probe_result(id, verbosity, validate_kitty_probe(transmit));
+                    }
+                }
+                Ok(())
             }
-            _ => None,
-        };
-        let coalesced = self
-            .coalesce_kitty_accumulation(img)
-            .context("coalesce kitty image upload");
-        if let Some((id, verbosity)) = probe_reply {
-            let result = coalesced.and_then(|image| match image {
-                KittyImage::Query { transmit, .. } => validate_kitty_probe(transmit),
-                _ => unreachable!("first chunk identifies an upload probe"),
-            });
-            self.kitty_send_probe_result(id, verbosity, result);
-            return Ok(());
-        }
-        if let Some((id, number, requested, verbosity)) = frame_reply {
-            let result = coalesced.and_then(|image| match image {
-                KittyImage::TransmitFrame {
-                    transmit, frame, ..
-                } => self.kitty_frame_transmit(transmit, frame),
-                _ => unreachable!("first chunk identifies a frame upload"),
-            });
-            self.kitty_send_animation_result(verbosity, id, number, requested, result.map(Some));
-            return Ok(());
-        }
-        match coalesced? {
             KittyImage::TransmitData {
                 transmit,
                 verbosity,
@@ -576,7 +562,24 @@ impl TerminalState {
                 log::trace!("TransmitDataAndDisplay {:#?} {:#?}", transmit, placement);
                 self.kitty_img_transmit(transmit, Some(placement), verbosity)
             }
-            _ => anyhow::bail!("impossible KittImage variant"),
+            KittyImage::TransmitFrame {
+                transmit,
+                frame,
+                verbosity,
+            } => {
+                let (id, number, requested) =
+                    (transmit.image_id, transmit.image_number, frame.frame_number);
+                let result = self.kitty_frame_transmit(transmit, frame);
+                self.kitty_send_animation_result(
+                    verbosity,
+                    id,
+                    number,
+                    requested,
+                    result.map(Some),
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!("impossible KittyImage variant"),
         }
     }
 
@@ -609,44 +612,17 @@ impl TerminalState {
             other => other,
         };
         if probe_pending && starts_image_upload(&img) {
-            self.cancel_kitty_probe(None, "EINVAL:upload probe was interrupted");
+            self.cancel_kitty_probe("EINVAL:upload probe was interrupted");
         }
-        let verbosity = img.verbosity();
-        if let KittyImage::TransmitData { transmit, .. }
-        | KittyImage::TransmitDataAndDisplay { transmit, .. }
-        | KittyImage::TransmitFrame { transmit, .. }
-        | KittyImage::Query { transmit, .. } = &img
-        {
+        if let Some(transmit) = transmission(&mut img) {
             let bytes = match &transmit.data {
                 KittyImageData::Direct(data) => data.len(),
                 KittyImageData::DirectBin(data) => data.len(),
                 _ => {
-                    if self.cancel_kitty_probe(
-                        Some(verbosity),
+                    self.reject_kitty_transmission(
+                        &img,
                         "ENOTSUP:w11term requires direct kitty image transport",
-                    ) {
-                        return Ok(());
-                    }
-                    self.kitty_img.accumulator.clear();
-                    self.kitty_img.accumulated_bytes = 0;
-                    let id = transmit.image_id.filter(|&id| id != 0);
-                    let number = transmit.image_number.filter(|&n| n != 0);
-                    if id.is_some() || number.is_some() {
-                        let placement = match &img {
-                            KittyImage::TransmitDataAndDisplay { placement, .. } => {
-                                placement.placement_id.filter(|&p| p != 0)
-                            }
-                            _ => None,
-                        };
-                        self.kitty_send_placement_response(
-                            verbosity,
-                            false,
-                            id,
-                            number,
-                            placement,
-                            "ENOTSUP:w11term requires direct kitty image transport",
-                        );
-                    }
+                    );
                     return Ok(());
                 }
             };
@@ -657,56 +633,24 @@ impl TerminalState {
                 .saturating_add(bytes)
                 > 48 * 1024 * 1024
             {
-                if self
-                    .cancel_kitty_probe(Some(verbosity), "ENOSPC:kitty transmission exceeds 48 MiB")
-                {
-                    return Ok(());
-                }
-                if let Some((id, verbosity)) = probe_reply(&img) {
-                    self.kitty_send_response(
-                        verbosity,
-                        false,
-                        Some(id),
-                        None,
-                        "ENOSPC:kitty transmission exceeds 48 MiB".into(),
-                    );
-                    return Ok(());
-                }
-                self.kitty_img.accumulator.clear();
-                self.kitty_img.accumulated_bytes = 0;
-                anyhow::bail!("kitty image transmission exceeds 48 MiB");
+                self.reject_kitty_transmission(&img, "ENOSPC:kitty transmission exceeds 48 MiB");
+                return Ok(());
             }
             if transmit.more_data_follows {
                 if self.kitty_img.accumulator.len() + self.inactive_kitty_img.accumulator.len()
                     >= 16384
                 {
-                    if self.cancel_kitty_probe(
-                        Some(verbosity),
+                    self.reject_kitty_transmission(
+                        &img,
                         "ENOSPC:too many kitty transmission chunks",
-                    ) {
-                        return Ok(());
-                    }
-                    if let Some((id, verbosity)) = probe_reply(&img) {
-                        self.kitty_send_response(
-                            verbosity,
-                            false,
-                            Some(id),
-                            None,
-                            "ENOSPC:too many kitty transmission chunks".into(),
-                        );
-                        return Ok(());
-                    }
-                    self.kitty_img.accumulated_bytes = 0;
-                    self.kitty_img.accumulator.clear();
-                    anyhow::bail!("too many kitty transmission chunks");
+                    );
+                    return Ok(());
                 }
                 self.kitty_img.accumulated_bytes += bytes;
                 self.kitty_img.accumulator.push(img);
                 return Ok(());
             }
-            if transmission(&mut img).is_some() {
-                return self.kitty_img_inner(img);
-            }
+            return self.kitty_img_inner(img);
         }
         match img {
             KittyImage::FeatureQuery {
@@ -833,15 +777,24 @@ impl TerminalState {
         None
     }
 
-    fn cancel_kitty_probe(&mut self, last: Option<KittyImageVerbosity>, message: &str) -> bool {
-        let Some((id, initial)) = self.kitty_img.accumulator.first().and_then(probe_reply) else {
-            return false;
+    fn cancel_kitty_probe(&mut self, message: &str) {
+        let Some((id, verbosity)) = self.kitty_img.accumulator.first().and_then(probe_reply) else {
+            return;
         };
         self.kitty_img.accumulator.clear();
         self.kitty_img.accumulated_bytes = 0;
-        let verbosity = last.map_or(initial, |last| transfer_verbosity(initial, last));
         self.kitty_send_response(verbosity, false, Some(id), None, message.into());
-        true
+    }
+
+    fn reject_kitty_transmission(&mut self, incoming: &KittyImage, message: &str) {
+        let first = self.kitty_img.accumulator.first().unwrap_or(incoming);
+        let address = transmission_address(first).or_else(|| transmission_address(incoming));
+        let verbosity = transfer_verbosity(first.verbosity(), incoming.verbosity());
+        self.kitty_img.accumulator.clear();
+        self.kitty_img.accumulated_bytes = 0;
+        if let Some(address) = address {
+            self.kitty_send_reply(verbosity, false, &address, message);
+        }
     }
 
     fn kitty_send_probe_result(
@@ -1792,8 +1745,10 @@ impl TerminalState {
         match &mut first {
             KittyImage::TransmitData { verbosity, .. }
             | KittyImage::TransmitDataAndDisplay { verbosity, .. }
-            | KittyImage::TransmitFrame { verbosity, .. } => *verbosity = final_verbosity,
-            KittyImage::Query { .. } => {}
+            | KittyImage::TransmitFrame { verbosity, .. }
+            | KittyImage::Query { verbosity, .. } => {
+                *verbosity = transfer_verbosity(*verbosity, final_verbosity);
+            }
             _ => unreachable!(),
         }
         Ok(first)
@@ -1883,6 +1838,28 @@ fn transmission(img: &mut KittyImage) -> Option<&mut KittyImageTransmit> {
         | KittyImage::Query { transmit, .. } => Some(transmit),
         _ => None,
     }
+}
+
+fn transmission_address(image: &KittyImage) -> Option<[(&'static str, Option<u32>); 3]> {
+    let (transmit, suffix) = match image {
+        KittyImage::TransmitData { transmit, .. } | KittyImage::Query { transmit, .. } => {
+            (transmit, ("p", None))
+        }
+        KittyImage::TransmitDataAndDisplay {
+            transmit,
+            placement,
+            ..
+        } => (transmit, ("p", placement.placement_id)),
+        KittyImage::TransmitFrame {
+            transmit, frame, ..
+        } => (transmit, ("r", frame.frame_number)),
+        _ => return None,
+    };
+    let id = transmit.image_id.filter(|&id| id != 0);
+    let number = transmit.image_number.filter(|&number| number != 0);
+    let (key, extra) = suffix;
+    let suffix = (key, extra.filter(|&value| value != 0));
+    (id.is_some() || number.is_some()).then_some([("I", number), ("i", id), suffix])
 }
 
 fn probe_reply(image: &KittyImage) -> Option<(u32, KittyImageVerbosity)> {

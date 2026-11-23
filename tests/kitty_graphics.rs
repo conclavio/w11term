@@ -410,6 +410,78 @@ async fn kitty_upload_and_placement_errors_report_the_request_identifiers() {
     assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 7), RED);
 }
 
+#[tokio::test]
+async fn multipart_uploads_inherit_quiet_mode_and_allow_final_chunk_overrides() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=T,i=7,p=3,f=32,s=1,v=1,c=1,r=1,C=1,q=2,m=1;/wAA\x1b\\",
+        "\x1b_Gm=0;/w==\x1b\\",
+        "\x1b[1;2H\x1b_Ga=T,I=80,p=4,f=32,s=1,v=1,c=1,r=1,C=1,q=1,m=1;AP8A\x1b\\",
+        "\x1b_Gm=0;/w==\x1b\\",
+        "\x1b[1;3H\x1b_Ga=T,i=9,p=5,f=32,s=1,v=1,c=1,r=1,C=1,m=1;AAD/\x1b\\",
+        "\x1b_Gm=0,q=1;/w==\x1b\\",
+        "\x1b[5n",
+    ));
+    assert_eq!(read_through(&mut replies, b"\x1b[0n").await, "\x1b[0n");
+    let snapshot = frame(&t, None, 0);
+    assert_eq!(pixel(&snapshot, 0, 0, 7), RED);
+    assert_eq!(pixel(&snapshot, 1, 0, 8), Some([0, 255, 0, 255]));
+    assert_eq!(pixel(&snapshot, 2, 0, 9), Some([0, 0, 255, 255]));
+}
+
+#[tokio::test]
+async fn malformed_upload_chunks_reply_with_the_original_image_and_placement() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=T,i=7,p=3,f=24,s=1,v=1,c=1,r=1,C=1,q=2;/wAA\x1b\\",
+        "\x1b_Ga=T,i=7,p=3,f=32,s=1,v=1,c=1,r=1,C=1,q=1,m=1;AAD/\x1b\\",
+        "\x1b_Gm=0;A\x1b\\",
+        "\x1b_Ga=T,I=81,p=4,f=32,s=1,v=1,c=1,r=1,C=1,q=2,m=1;AAD/\x1b\\",
+        "\x1b_Gm=0,q=1;A\x1b\\",
+        "\x1b_Ga=T,i=8,p=5,f=32,s=1,v=1,c=1,r=1,C=1,m=1;AAD/\x1b\\",
+        "\x1b_Gm=0,q=2;A\x1b\\",
+        "\x1b_Ga=T,i=9,p=6,f=32,s=1,v=1,c=1,r=1,C=1,m=1;AAD/\x1b\\",
+        "\x1b_Gm=0,t=f;ZmFrZS1wYXRo\x1b\\",
+        "\x1b_Ga=f,i=7,r=1,f=32,s=1,v=1,m=1;AAD/\x1b\\",
+        "\x1b_Ga=f,m=0;A\x1b\\",
+        "\x1b[5n",
+    ));
+    let response = read_through(&mut replies, b"\x1b[0n").await;
+    let received: Vec<_> = response
+        .strip_suffix("\x1b[0n")
+        .unwrap()
+        .split_terminator("\x1b\\")
+        .collect();
+    let expected = [
+        "\x1b_Gi=7,p=3;EINVAL:",
+        "\x1b_GI=81,p=4;EINVAL:",
+        "\x1b_Gi=9,p=6;ENOTSUP:",
+        "\x1b_Gi=7,r=1;EINVAL:",
+    ];
+    assert_eq!(received.len(), expected.len(), "{response:?}");
+    for (actual, expected) in received.iter().zip(expected) {
+        assert!(actual.starts_with(expected), "{actual:?} vs {expected:?}");
+    }
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 7), RED);
+}
+
+#[tokio::test]
+async fn upload_chunk_limit_replies_to_the_original_id_and_allows_recovery() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(b"\x1b_Ga=T,i=7,p=3,f=24,s=1,v=1,m=1;AAAA\x1b\\");
+    for _ in 0..16384 {
+        t.advance_bytes(b"\x1b_Gm=1;\x1b\\");
+    }
+    t.advance_bytes(b"\x1b_Ga=T,i=8,p=4,f=24,s=1,v=1,c=1,r=1,C=1;/wAA\x1b\\\x1b[5n");
+    assert_eq!(
+        read_through(&mut replies, b"\x1b[0n").await,
+        "\x1b_Gi=7,p=3;ENOSPC:too many kitty transmission chunks\x1b\\\x1b_Gi=8,p=4;OK\x1b\\\x1b[0n",
+    );
+    let snapshot = frame(&t, None, 0);
+    assert_eq!(pixel(&snapshot, 0, 0, 7), None);
+    assert_eq!(pixel(&snapshot, 0, 0, 8), RED);
+}
+
 #[test]
 fn indexed_images_follow_palette_changes_and_keep_old_snapshots_intact() {
     let (mut t, _) = engine();
