@@ -674,6 +674,41 @@ impl TerminalApp {
         } else {
             content
         };
+        let mut layers = vec![KeyedView::new("pane-content", content)];
+        if show_scrollbar
+            && self
+                .appearance
+                .read()
+                .unwrap()
+                .interaction
+                .sticky_command_context
+        {
+            let frame = tab.session.frames.load();
+            if let Some(command) = &frame.command_context
+                && let Some(target) = frame.command_context_target()
+            {
+                layers.push(KeyedView::new(
+                    "command-context",
+                    Button::new()
+                        .automation_name(format!("Jump to command output · {}", command.label))
+                        .horizontal_alignment(HorizontalAlignment::Stretch)
+                        .horizontal_content_alignment(HorizontalAlignment::Left)
+                        .vertical_alignment(VerticalAlignment::Top)
+                        .height(28.0)
+                        .margin(Thickness::new(4.0, 4.0, 18.0, 0.0))
+                        .on_click(
+                            context.callback(move |_| Message::JumpToCommandContext(id, target)),
+                        )
+                        .content(
+                            TextBlock::new()
+                                .font_size(12.0)
+                                .text_trimming(TextTrimming::CharacterEllipsis)
+                                .text(format!("↑  {}", command.label)),
+                        ),
+                ));
+            }
+        }
+        let content = Grid::new().keyed_children(layers);
         if decorate {
             let color = if self.tabs.active_id() == Some(id) {
                 Color::rgb(104, 166, 213)

@@ -1082,6 +1082,36 @@ impl TerminalState {
         self.screen.command_output_row(id)
     }
 
+    /// The command whose output began above this row and still covers it.
+    pub fn command_context(&self, row: StableRowIndex) -> Option<(StableRowIndex, &str)> {
+        if self.is_alt_screen_active() {
+            return None;
+        }
+        let screen = self.screen();
+        if let (false, Some((start, _)), Some(label)) = (
+            self.capturing_shell_input,
+            screen.command_start,
+            self.command_label.as_deref(),
+        ) {
+            if start < row
+                && screen.stable_row_to_phys(start).is_some()
+                && (row, 0)
+                    < (
+                        screen.visible_row_to_stable_row(self.cursor.y),
+                        self.shell_column(),
+                    )
+            {
+                return Some((start, label));
+            }
+        }
+        let (id, start) = screen.command_output_covering(row)?;
+        let index = self
+            .command_history
+            .binary_search_by_key(&id, |entry| entry.id)
+            .ok()?;
+        Some((start, self.command_history[index].command.as_deref()?))
+    }
+
     /// Returns a copy of the palette.
     /// By default we don't keep a copy in the terminal state,
     /// preferring to take the config values from the users

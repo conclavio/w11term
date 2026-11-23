@@ -360,6 +360,7 @@ struct TabSwitcher {
 pub enum InteractionField {
     ApplicationTabTitles,
     FailedCommandMarks,
+    StickyCommandContext,
     CopyOnSelect,
     LargePasteWarning,
     TrimBlock,
@@ -1123,6 +1124,7 @@ pub enum Message {
     Durability(durable_view::Action),
     Discovery(session_browser::Action),
     FrameReady(TabId, u64),
+    JumpToCommandContext(TabId, w11term::terminal::ScrollbackTarget),
     CloseWindow,
     Select(Option<usize>, u64, bool),
     CloseTab(String),
@@ -2340,6 +2342,11 @@ impl TerminalApp {
                 InteractionField::FailedCommandMarks,
                 "Mark failed commands on the scrollbar",
                 appearance.interaction.failed_command_marks,
+            ),
+            (
+                InteractionField::StickyCommandContext,
+                "Show command context in scrollback",
+                appearance.interaction.sticky_command_context,
             ),
             (
                 InteractionField::ScrollZoom,
@@ -5739,6 +5746,17 @@ impl Component for TerminalApp {
                 let _ = context.window().request_close();
             }
             Message::PaneFocus(id) => self.focus_pane(id, context),
+            Message::JumpToCommandContext(id, target) => {
+                if self.tabs.visible(id)
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.get(id)
+                {
+                    let _ = tab.session.input.send(Command::ScrollViewport(target));
+                    self.focus_pane(id, context);
+                }
+            }
             Message::FocusPreviousPane(target) => {
                 if previous_pane::target(&self.tabs) == Some(target) {
                     self.focus_previous_pane(target, context);
@@ -6237,6 +6255,9 @@ impl Component for TerminalApp {
                     InteractionField::ScrollZoom => &mut appearance.interaction.scroll_to_zoom,
                     InteractionField::FailedCommandMarks => {
                         &mut appearance.interaction.failed_command_marks
+                    }
+                    InteractionField::StickyCommandContext => {
+                        &mut appearance.interaction.sticky_command_context
                     }
                     InteractionField::DetectUrls => &mut appearance.interaction.detect_urls,
                     InteractionField::Osc52 => &mut appearance.interaction.osc52,

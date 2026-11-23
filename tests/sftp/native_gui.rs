@@ -410,7 +410,16 @@ async fn native_pane_scrollbar_tracks_async_ssh_output_without_moving_its_neighb
         unreachable!()
     };
     let state = tempfile::tempdir().unwrap();
-    let numbered: Vec<_> = (0..200).map(|i| format!("wire-{i:03}")).collect();
+    let numbered: Vec<_> = (0..200)
+        .map(|i| {
+            let marker = match i {
+                0 => "\x1b]633;E;fixture build\x07\x1b]633;C\x07",
+                145 => "\x1b]633;D;0\x07",
+                _ => "",
+            };
+            format!("{marker}wire-{i:03}")
+        })
+        .collect();
     let initial = format!("\x1b[2J\x1b[H\x1b[3J{}", numbered.join("\r\n"));
     fs::write(remote.path().join("copy-history.vt"), initial).unwrap();
     fs::write(

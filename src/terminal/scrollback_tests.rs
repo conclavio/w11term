@@ -344,6 +344,93 @@ fn scrollback_limit_survives_height_changes_alt_screen_and_transport_reset() {
 }
 
 #[test]
+fn command_context_covers_running_and_completed_output_and_excludes_the_next_row() {
+    let mut term = terminal(20, 4, 20);
+    term.advance_bytes(concat!(
+        "\x1b]133;C;cmdline_url=build%0A%20%20logs\x07",
+        "zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\n",
+    ));
+    let live = term.screen().visible_row_to_stable_row(0);
+    let middle = Snapshot::capture(&term, None, 1, (live - 1) as usize, String::new(), 0);
+    assert_eq!(
+        middle
+            .command_context
+            .as_ref()
+            .map(|context| (context.start, context.label.as_ref())),
+        Some((0, "build logs"))
+    );
+    assert_eq!(
+        middle.command_context_target().unwrap().offset(&term, 0),
+        Some(live as usize)
+    );
+    assert!(
+        Snapshot::capture(&term, None, 1, 0, String::new(), 0)
+            .command_context
+            .is_none()
+    );
+    assert!(term.command_context(0).is_none());
+
+    term.advance_bytes("\x1b]133;D;0\x07outside\r\nlater\r\nnext\r\nlast\r\n");
+    assert_eq!(term.command_context(5), Some((0, "build\n  logs")));
+    assert!(term.command_context(6).is_none());
+    term.advance_bytes("\x1b[?1049h");
+    assert!(term.command_context(1).is_none());
+    term.advance_bytes("\x1b[?1049l");
+    assert!(term.command_context(1).is_some());
+
+    for _ in 0..30 {
+        term.advance_bytes("new\r\n");
+    }
+    assert!(
+        middle
+            .command_context_target()
+            .unwrap()
+            .offset(&term, 0)
+            .is_none()
+    );
+}
+
+#[test]
+fn command_context_remaps_both_output_boundaries_on_reflow() {
+    let mut term = terminal(24, 4, 30);
+    term.advance_bytes(concat!(
+        "heading\r\n",
+        "\x1b]633;E;build\x07\x1b]633;C\x07",
+        "abcdefghijklmnopqrstuv\r\nsecond-line\r\n",
+        "\x1b]633;D;2\x07OUTSIDE\r\nmore\r\nlast\r\n",
+    ));
+    let id = term.last_command().unwrap().id;
+    assert_eq!(term.command_context(2), Some((1, "build")));
+    assert!(term.command_context(3).is_none());
+    resize(&mut term, 8, 4);
+    let start = term.command_output_row(id).unwrap();
+    let outside = term
+        .screen()
+        .physical_lines()
+        .enumerate()
+        .find(|(_, line)| line.as_str().starts_with("OUTSIDE"))
+        .map(|(index, _)| term.screen().phys_to_stable_row_index(index))
+        .unwrap();
+    assert_eq!(term.command_context(start + 1), Some((start, "build")));
+    assert_eq!(term.command_context(outside - 1), Some((start, "build")));
+    assert!(term.command_context(outside).is_none());
+}
+
+#[test]
+fn erasing_output_invalidates_command_context_and_preserves_the_earlier_jump() {
+    let mut term = terminal(16, 5, 10);
+    term.advance_bytes(
+        "\x1b]633;E;compile\x07\x1b]633;C\x07start\r\nmiddle\r\nlast\r\n\x1b]633;D;0\x07",
+    );
+    let id = term.last_command().unwrap().id;
+    assert_eq!(term.command_context(1), Some((0, "compile")));
+    term.advance_bytes("\x1b[2;1H\x1b[2K");
+    assert!(term.command_context(1).is_none());
+    assert!(term.command_context(2).is_none());
+    assert_eq!(term.command_output_row(id), Some(0));
+}
+
+#[test]
 fn failed_command_marks_follow_retained_output_only() {
     let mut term = terminal(16, 3, 36);
     let capture = |term: &Terminal, previous: Option<&Snapshot>, offset| {
