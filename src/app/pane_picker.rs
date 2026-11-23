@@ -224,11 +224,17 @@ impl Choice {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
-    Commands,
+    Commands(Option<TabId>),
     Focus,
     Text,
     Destination { source: TabId },
     Placement { source: TabId, target: TabId },
+}
+
+impl Mode {
+    fn has_commands(self) -> bool {
+        matches!(self, Self::Commands(_))
+    }
 }
 
 pub(super) struct Picker {
@@ -265,7 +271,7 @@ impl Picker {
         if self.placement().is_some() || self.text.revealing {
             return;
         }
-        let count = if self.mode == Mode::Commands {
+        let count = if self.mode.has_commands() {
             self.commands.len()
         } else if self.mode == Mode::Text {
             self.text.rows.len()
@@ -282,12 +288,13 @@ impl Picker {
         if self.mode == Mode::Text {
             return self.text_view(app, ctx);
         }
-        if self.mode == Mode::Commands {
+        if let Mode::Commands(group_library) = self.mode {
             return command_palette::view(
                 &self.commands,
                 self.selected,
                 &self.query,
                 &self.input,
+                group_library.is_some(),
                 app,
                 ctx,
             );
@@ -547,14 +554,29 @@ impl TerminalApp {
             }
             return;
         }
-        self.start_picker(Mode::Commands, ctx);
+        self.start_picker(Mode::Commands(None), ctx);
+    }
+
+    pub(super) fn open_group_command_library(
+        &mut self,
+        group: TabId,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.start_picker(Mode::Commands(Some(group)), ctx);
+    }
+
+    fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
+        match mode {
+            Mode::Commands(Some(group)) => self.group_saved_command_rows(group, query),
+            _ => self.command_rows(query),
+        }
     }
 
     pub(super) fn refresh_open_commands(&mut self) {
-        let Some(picker) = self.picker.as_ref().filter(|p| p.mode == Mode::Commands) else {
+        let Some(picker) = self.picker.as_ref().filter(|p| p.mode.has_commands()) else {
             return;
         };
-        let commands = self.command_rows(&picker.query);
+        let commands = self.picker_command_rows(picker.mode, &picker.query);
         let selected = picker
             .commands
             .get(picker.selected)
@@ -571,12 +593,11 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         let Some(picker) = &self.picker else { return };
-        if picker.mode != Mode::Commands || !picker.commands.iter().any(|r| r.id == id && r.enabled)
-        {
+        if !picker.mode.has_commands() || !picker.commands.iter().any(|r| r.id == id && r.enabled) {
             return;
         }
         // A profile, pane, selection, or remote connection can change while the palette is open.
-        let rows = self.command_rows(&picker.query);
+        let rows = self.picker_command_rows(picker.mode, &picker.query);
         if rows.iter().any(|r| r.id == id && r.enabled) {
             self.close_picker(ctx);
             self.run_palette_command(id, ctx);
@@ -626,9 +647,9 @@ impl TerminalApp {
         if self.switcher.is_some() {
             self.finish_switcher(false, ctx);
         }
-        let (matches, commands) = if mode == Mode::Commands {
+        let (matches, commands) = if mode.has_commands() {
             self.reload_saved_commands();
-            (vec![], self.command_rows(""))
+            (vec![], self.picker_command_rows(mode, ""))
         } else if mode == Mode::Text {
             (vec![], vec![])
         } else {
@@ -651,7 +672,7 @@ impl TerminalApp {
             preview: None,
         });
         self.sync_picker_preview(ctx);
-        self.keyboard.set_picker(Some(if mode == Mode::Commands {
+        self.keyboard.set_picker(Some(if mode.has_commands() {
             PickerStage::Commands
         } else {
             PickerStage::Search
@@ -685,8 +706,8 @@ impl TerminalApp {
         if picker.placement().is_some() || picker.query == query || picker.mode == Mode::Text {
             return;
         }
-        if picker.mode == Mode::Commands {
-            let rows = self.command_rows(&query);
+        if picker.mode.has_commands() {
+            let rows = self.picker_command_rows(picker.mode, &query);
             let picker = self.picker.as_mut().unwrap();
             picker.commands = rows;
             picker.query = query;
@@ -768,7 +789,7 @@ impl TerminalApp {
             return;
         }
         if let Some(picker) = &self.picker
-            && picker.mode == Mode::Commands
+            && picker.mode.has_commands()
         {
             if let Some(row) = picker.commands.get(picker.selected) {
                 self.choose_command(row.id.clone(), ctx);

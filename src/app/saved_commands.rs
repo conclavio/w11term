@@ -54,13 +54,20 @@ impl TerminalApp {
         if self.saved_command_origin() != Some(origin) {
             return;
         }
+        if self.confirm_saved_command(&entry) {
+            self.paste_saved_text(origin, entry.text, ctx);
+        }
+    }
+
+    pub(super) fn confirm_saved_command(&mut self, entry: &Entry) -> bool {
         if let Some(error) = self.reload_saved_commands() {
             self.window_error = Some(error);
-        } else if self.saved_commands.entries().contains(&entry) {
-            self.paste_saved_text(origin, entry.text, ctx);
+        } else if self.saved_commands.entries().contains(entry) {
+            return true;
         } else {
             self.window_error = Some("This saved command changed. Open the palette again.".into());
         }
+        false
     }
 
     pub(super) fn edit_saved_commands(&mut self, action: Edit) {
