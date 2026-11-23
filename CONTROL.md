@@ -122,6 +122,10 @@ until the shell marks a completed command. A missing command line or exit status
 is JSON `null`. Listing transfers only this metadata and preserves keyboard focus
 and the scroll position.
 
+The command comes from the shell’s OSC 133 C `cmdline_url` field when
+available, including whitespace and line breaks. Otherwise it comes from
+visible text between the B and C markers.
+
 Use `--status failed` for nonzero exit codes, `--status succeeded` for zero, or
 `--status unknown` when the shell omitted the exit code. The default is `all`.
 Filtered listings keep the original IDs, generation, and newest-first order.

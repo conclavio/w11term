@@ -46,11 +46,26 @@ if [ -n "${ZSH_VERSION-}" ] && [[ -o interactive ]]; then
         }
 
         __w11term_zsh_preexec() {
+            emulate -L zsh
+            unsetopt multibyte
             if [[ ${(t)PS1} != *readonly* ]]; then
                 PS1=${PS1%"$__w11term_zsh_input_mark"}
             fi
             __w11term_zsh_running=1
-            builtin printf '\033]133;C\007'
+            local LC_ALL=C line=${1-} encoded= byte i
+            if [[ -z $line ]] || (( ${#line} > 4096 )); then
+                builtin printf '\033]133;C\007'
+                return 0
+            fi
+            for ((i = 1; i <= ${#line}; i++)); do
+                byte=${line[i]}
+                case $byte in
+                    [a-zA-Z0-9._~-]) ;;
+                    *) builtin printf -v byte '%%%02X' "'$byte" ;;
+                esac
+                encoded+=$byte
+            done
+            builtin printf '\033]133;C;cmdline_url=%s\007' "$encoded"
         }
 
         autoload -Uz add-zsh-hook

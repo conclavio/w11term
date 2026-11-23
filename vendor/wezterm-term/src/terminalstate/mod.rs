@@ -934,9 +934,12 @@ impl TerminalState {
         }
     }
 
-    fn begin_command_output(&mut self) {
+    fn begin_command_output(&mut self, reported_command: Option<String>) {
         if !self.is_alt_screen_active() {
-            self.command_label = if self.capturing_shell_input {
+            self.command_label = reported_command.or_else(|| {
+                if !self.capturing_shell_input {
+                    return None;
+                }
                 let col = self.shell_column();
                 self.screen
                     .take_command_text(self.cursor.y, col, 4096)
@@ -945,9 +948,7 @@ impl TerminalState {
                         text.truncate(text.trim_end_matches(['\r', '\n']).len());
                         (!text.is_empty()).then_some(text)
                     })
-            } else {
-                None
-            };
+            });
             self.capturing_shell_input = false;
             self.mark_shell_position();
         }

@@ -1124,6 +1124,76 @@ mod tests {
     }
 
     #[test]
+    fn reported_command_text_preserves_the_original_utf8_and_line_breaks() {
+        let marker = termwiz::escape::osc::OperatingSystemCommand::parse(&[
+            b"133",
+            b"C",
+            b"aid=shell",
+            b"cmdline_url=%20printf%20%E9%9B%AA+%3B%0Atrue%09%25%20",
+        ]);
+        assert_eq!(
+            marker.to_string(),
+            "\x1b]133;C;aid=shell;cmdline_url=%20printf%20%E9%9B%AA%2B%3B%0Atrue%09%25%20\x1b\\"
+        );
+        let (mut term, _) = engine();
+        let stream = b"\x1b]133;A\x07$ \x1b]133;B\x07displayed continuation prompt\r\n\
+            \x1b]133;C;cmdline_url=%20printf%20%E9%9B%AA+%3B%0Atrue%09%25%20;aid=shell\x1b\\\
+            result\x1b]133;D;23;aid=shell\x07";
+        for byte in stream {
+            term.advance_bytes([*byte]);
+        }
+        let entry = term.last_command().unwrap();
+        assert_eq!(entry.command.as_deref(), Some(" printf 雪+;\ntrue\t% "));
+        assert_eq!(entry.output.as_deref(), Ok("result"));
+        assert_eq!(entry.exit_code, Some(23));
+
+        let maximum = "%21".repeat(4096);
+        term.advance_bytes(format!(
+            "\x1b]133;A\x07$ \x1b]133;C;cmdline_url={maximum}\x07\x1b]133;D;0\x07"
+        ));
+        assert_eq!(
+            term.last_command().unwrap().command.as_deref(),
+            Some("!".repeat(4096).as_str())
+        );
+    }
+
+    #[test]
+    fn invalid_reported_commands_fall_back_to_visible_input_and_keep_the_status() {
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(1));
+        let too_long = "%41".repeat(4097);
+        for (index, report) in [
+            "",
+            "%",
+            "%4Z",
+            "%FF",
+            "%1B",
+            "%C2%85",
+            "%0D",
+            "%20%0A",
+            "split\x01text",
+            &too_long,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(events.set_command_watch(true));
+            term.advance_bytes(format!(
+                "\x1b]133;A\x07$ \x1b]133;B\x07visible input\r\n\
+                 \x1b]133;C;cmdline_url={report};aid=shell\x1b\\\
+                 result\x1b]133;D;17;aid=shell\x07"
+            ));
+            let entry = term.last_command().unwrap();
+            assert_eq!(entry.command.as_deref(), Some("visible input"));
+            assert_eq!(entry.output.as_deref(), Ok("result"));
+            assert_eq!(entry.exit_code, Some(17));
+            let recorded = completions(&events);
+            assert_eq!(recorded.len(), index + 1);
+            assert_eq!(recorded[index], serde_json::json!({"exit_code": 17}));
+        }
+    }
+
+    #[test]
     fn command_history_is_bounded_and_frozen_across_eviction_and_reset() {
         let (mut term, _) = engine();
         term.advance_bytes(b"\x1b]133;B\x07cancelled\x1b]133;A\x07");

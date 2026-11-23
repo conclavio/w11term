@@ -315,6 +315,7 @@ const MAX_OSC: usize = 64;
 // Covers a 32,767-UTF-16-unit Windows path even after UTF-8 conversion.
 const MAX_OSC_DIRECTORY_BYTES: usize = 128 * 1024;
 const MAX_OSC_REMOTE_HOST_BYTES: usize = 1024;
+pub const MAX_REPORTED_COMMAND_BYTES: usize = 4096;
 const MAX_PARAMS: usize = 256;
 
 struct OscState {
@@ -327,6 +328,8 @@ struct OscState {
     full: bool,
     // (selector bytes, maximum literal bytes). Other OSCs keep normal field splitting.
     literal_field: Option<(usize, usize)>,
+    // (value offset, discarded). A following parameter is still parsed.
+    command_field: Option<(usize, bool)>,
 }
 
 impl OscState {
@@ -335,6 +338,7 @@ impl OscState {
             return;
         }
         if param == ';' && self.literal_field.is_none() {
+            self.command_field = None;
             if self.num_params == 2 && self.param_indices[0] == 1 && self.buffer.as_slice() == b"99"
             {
                 self.literal_field = Some((2, MAX_OSC_DIRECTORY_BYTES));
@@ -349,6 +353,25 @@ impl OscState {
                 }
             }
         } else {
+            if param == '='
+                && self.num_params >= 3
+                && self.param_indices[..2] == [3, 4]
+                && self.buffer.starts_with(b"133C")
+                && &self.buffer[self.param_indices[self.num_params - 2]..] == b"cmdline_url"
+            {
+                self.command_field = Some((self.buffer.len() + 1, false));
+            }
+            if let Some((offset, discarded)) = self.command_field {
+                if discarded {
+                    return;
+                }
+                if !param.is_ascii_graphic()
+                    || self.buffer.len() + 1 > offset + 3 * MAX_REPORTED_COMMAND_BYTES
+                {
+                    self.discard_command();
+                    return;
+                }
+            }
             if param == '=' && self.num_params == 2 && self.param_indices[0] == 4 {
                 let limit = match self.buffer.as_slice() {
                     b"1337CurrentDir" => Some(MAX_OSC_DIRECTORY_BYTES),
@@ -373,6 +396,7 @@ impl OscState {
             #[cfg(all(not(feature = "std"), not(feature = "alloc")))]
             {
                 if extend_result.is_err() {
+                    self.discard_command();
                     self.discard_literal();
                     self.full = true;
                     return;
@@ -384,6 +408,13 @@ impl OscState {
             if self.num_params == 0 {
                 self.num_params = 1;
             }
+        }
+    }
+
+    fn discard_command(&mut self) {
+        if let Some((offset, discarded)) = &mut self.command_field {
+            self.buffer.truncate(*offset);
+            *discarded = true;
         }
     }
 
@@ -500,6 +531,7 @@ impl VTParser {
                 num_params: 0,
                 full: false,
                 literal_field: None,
+                command_field: None,
             },
 
             params: [CsiParam::default(); MAX_PARAMS],
@@ -572,6 +604,7 @@ impl VTParser {
                 self.osc.num_params = 0;
                 self.osc.full = false;
                 self.osc.literal_field = None;
+                self.osc.command_field = None;
                 self.num_params = 0;
                 self.params_full = false;
                 self.current_param.take();
@@ -659,12 +692,17 @@ impl VTParser {
                 self.osc.num_params = 0;
                 self.osc.full = false;
                 self.osc.literal_field = None;
+                self.osc.command_field = None;
             }
             Action::OscPut => self.osc.put(param as char),
-            Action::OscIgnore => self.osc.discard_literal(),
+            Action::OscIgnore => {
+                self.osc.discard_command();
+                self.osc.discard_literal();
+            }
 
             Action::OscEnd => {
                 if !matches!(param, 0x07 | 0x1b | 0x9c) {
+                    self.osc.discard_command();
                     self.osc.discard_literal();
                 }
                 if self.osc.num_params == 0 {
