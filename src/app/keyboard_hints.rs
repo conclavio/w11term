@@ -1,5 +1,8 @@
 use super::*;
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 use w11term::{
     hints::{self, Hint, Target},
     terminal::Snapshot,
@@ -12,19 +15,68 @@ pub(super) struct Hints {
     prefix: String,
     selected: Option<usize>,
     backend: HintBackend,
-    opening_explorer: Option<Arc<()>>,
+    opening_explorer: Option<PendingExplore>,
     message: Option<String>,
 }
 
 enum HintBackend {
     Ssh(Option<String>),
     Local(Option<PathBuf>),
+    Wsl {
+        executable: PathBuf,
+        distribution: String,
+        directory: Option<String>,
+    },
     Other,
 }
 
 enum Reveal {
     Sftp(String, Option<String>),
-    Explorer(PathBuf),
+    Explorer(ExplorerReveal),
+}
+
+enum ExplorerReveal {
+    Location(explorer::Location),
+    Wsl {
+        executable: PathBuf,
+        distribution: String,
+        directory: Option<String>,
+        path: String,
+    },
+}
+
+impl ExplorerReveal {
+    fn open(self, cancelled: impl Fn() -> bool) -> anyhow::Result<()> {
+        let location = match self {
+            Self::Location(location) => location,
+            Self::Wsl {
+                executable,
+                distribution,
+                directory,
+                path,
+            } => {
+                let translated = wsl_path::translate(
+                    &executable,
+                    &distribution,
+                    directory.as_deref(),
+                    wsl_path::Direction::ToWindows,
+                    &path,
+                    Instant::now() + Duration::from_secs(8),
+                    &cancelled,
+                )?;
+                explorer::Location::translated_from_wsl(&distribution, &translated).context(
+                    "wslpath must return a local drive or a path in the pane’s distribution",
+                )?
+            }
+        };
+        anyhow::ensure!(!cancelled(), "The Explorer request was cancelled");
+        location.reveal()
+    }
+}
+
+struct PendingExplore {
+    request: Arc<()>,
+    task: ComponentTask,
 }
 
 impl HintBackend {
@@ -34,10 +86,49 @@ impl HintBackend {
             Self::Ssh(cwd) => {
                 reveal_path(path, cwd.as_deref()).map(|(dir, name)| Reveal::Sftp(dir, name))
             }
-            Self::Local(cwd) => explorer::resolve(path, cwd.as_deref()).map(Reveal::Explorer),
+            Self::Local(cwd) => drive_hint(path, cwd.as_deref()),
+            Self::Wsl {
+                executable,
+                distribution,
+                directory,
+            } => {
+                if let Some(drive) = drive_hint(path, None) {
+                    return Some(drive);
+                }
+                if path.starts_with(r"\\") {
+                    let location = explorer::Location::translated_from_wsl(distribution, path)?;
+                    return Some(Reveal::Explorer(ExplorerReveal::Location(location)));
+                }
+                if path.contains('\\') {
+                    return drive_hint(path, directory.as_deref().map(Path::new));
+                }
+                if path.starts_with('~') || path.starts_with("//") || !wsl_path::safe_text(path) {
+                    return None;
+                }
+                let (directory, path) = if path.starts_with('/') {
+                    (None, path.to_owned())
+                } else {
+                    // Prefix relative paths so a filename beginning with a
+                    // dash is passed to wslpath as a path, not as an option.
+                    (Some(directory.as_ref()?.clone()), format!("./{path}"))
+                };
+                Some(Reveal::Explorer(ExplorerReveal::Wsl {
+                    executable: executable.clone(),
+                    distribution: distribution.clone(),
+                    directory,
+                    path,
+                }))
+            }
             Self::Other => None,
         }
     }
+}
+
+fn drive_hint(path: &str, cwd: Option<&Path>) -> Option<Reveal> {
+    let path = explorer::resolve(path, cwd)?;
+    Some(Reveal::Explorer(ExplorerReveal::Location(
+        explorer::Location::Drive(path),
+    )))
 }
 
 // Only SFTP on this pane interprets the path. Its server resolves "." and "..",
@@ -152,6 +243,13 @@ impl TerminalApp {
         let report = frame.reported_directory.as_deref();
         let backend = match &tab.source {
             Source::Ssh(ssh) => HintBackend::Ssh(file_drawer::shell_directory(report, &ssh.host)),
+            Source::Local(shell) if let Some(distribution) = shell.wsl_distribution() => {
+                HintBackend::Wsl {
+                    executable: shell.executable.clone(),
+                    distribution: distribution.into(),
+                    directory: directory_split::reported_wsl_directory(report, distribution),
+                }
+            }
             Source::Local(_) => {
                 HintBackend::Local(directory_split::reported_local_directory(report))
             }
@@ -176,6 +274,9 @@ impl TerminalApp {
 
     pub(super) fn close_hints(&mut self) {
         if let Some(hints) = self.hints.borrow_mut().take() {
+            if let Some(pending) = hints.opening_explorer {
+                pending.task.cancel();
+            }
             self.keyboard.set_hints(false);
             if let Some(AppTab {
                 page: Page::Terminal(tab),
@@ -246,23 +347,26 @@ impl TerminalApp {
                 }
             }
             (0x52, _) => match h.backend.resolve(target) {
-                Some(Reveal::Explorer(path)) => {
+                Some(Reveal::Explorer(explorer)) => {
                     let request = Arc::new(());
-                    h.opening_explorer = Some(request.clone());
                     h.message = Some("Opening File Explorer… · Esc close".into());
                     let rejected = Message::HintRevealed(
                         request.clone(),
                         Err("File Explorer is unavailable".into()),
                     );
-                    context.spawn_background_with_rejection(
-                        move |_| {
+                    let result_request = request.clone();
+                    let task = context.spawn_background_with_rejection(
+                        move |cancel| {
                             Message::HintRevealed(
-                                request,
-                                explorer::reveal(&path).map_err(|e| format!("{e:#}")),
+                                result_request,
+                                explorer
+                                    .open(|| cancel.is_cancelled())
+                                    .map_err(|e| format!("{e:#}")),
                             )
                         },
                         rejected,
                     );
+                    h.opening_explorer = Some(PendingExplore { request, task });
                     return;
                 }
                 Some(Reveal::Sftp(dir, name)) => {
@@ -294,7 +398,7 @@ impl TerminalApp {
         if !h
             .opening_explorer
             .as_ref()
-            .is_some_and(|pending| Arc::ptr_eq(pending, &request))
+            .is_some_and(|pending| Arc::ptr_eq(&pending.request, &request))
         {
             return;
         }
@@ -311,6 +415,53 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_hint_paths_use_the_captured_distribution_and_directory() {
+        let backend = HintBackend::Wsl {
+            executable: r"C:\Windows\System32\wsl.exe".into(),
+            distribution: "QA Linux".into(),
+            directory: Some("/home/dev/build tree".into()),
+        };
+        let path = |text: &str| Target::Path(text.into());
+        assert!(matches!(
+            backend.resolve(&path("../src/main.rs")),
+            Some(Reveal::Explorer(ExplorerReveal::Wsl {
+                executable, distribution, directory: Some(directory), path,
+            })) if executable == Path::new(r"C:\Windows\System32\wsl.exe")
+                && distribution == "QA Linux" && directory == "/home/dev/build tree"
+                && path == "./../src/main.rs"
+        ));
+        assert!(matches!(
+            backend.resolve(&path("/home/dev/main.rs")),
+            Some(Reveal::Explorer(ExplorerReveal::Wsl { directory: None, path, .. }))
+                if path == "/home/dev/main.rs"
+        ));
+        assert!(matches!(
+            backend.resolve(&path("-a/file.txt")),
+            Some(Reveal::Explorer(ExplorerReveal::Wsl { path, .. })) if path == "./-a/file.txt"
+        ));
+        assert!(matches!(
+            backend.resolve(&path(r"\\wsl$\QA Linux\home\dev\main.rs")),
+            Some(Reveal::Explorer(ExplorerReveal::Location(explorer::Location::Wsl(path))))
+                if path == Path::new(r"\\wsl.localhost\QA Linux\home\dev\main.rs")
+        ));
+        for invalid in [
+            "//host/share",
+            r"\\host\share",
+            "~/file.txt",
+            "/home/file\nnext",
+        ] {
+            assert!(backend.resolve(&path(invalid)).is_none(), "{invalid:?}");
+        }
+        let unreported = HintBackend::Wsl {
+            executable: "wsl.exe".into(),
+            distribution: "QA Linux".into(),
+            directory: None,
+        };
+        assert!(unreported.resolve(&path("src/main.rs")).is_none());
+        assert!(unreported.resolve(&path("/etc/profile")).is_some());
+    }
     #[test]
     fn path_actions_follow_the_pane_that_produced_the_text() {
         let local = HintBackend::Local(Some(PathBuf::from(r"C:\build")));
@@ -320,7 +471,7 @@ mod tests {
             text: "src/main.rs".into(),
         };
         assert!(
-            matches!(local.resolve(&path), Some(Reveal::Explorer(p)) if p == std::path::Path::new(r"C:\build\src\main.rs"))
+            matches!(local.resolve(&path), Some(Reveal::Explorer(ExplorerReveal::Location(explorer::Location::Drive(p)))) if p == Path::new(r"C:\build\src\main.rs"))
         );
         assert!(
             matches!(remote.resolve(&path), Some(Reveal::Sftp(dir, Some(name))) if dir == "/srv/build/src" && name == "main.rs")
