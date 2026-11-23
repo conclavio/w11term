@@ -25,6 +25,8 @@ use tokio::{
 };
 
 mod directory;
+mod group_upload;
+pub use group_upload::{GroupUploadFile, validate_group_upload_path};
 mod drop_source;
 mod editor;
 mod text_preview;
@@ -90,6 +92,12 @@ pub enum Operation {
         source: DropSource,
         remote: String,
         overwrite: bool,
+    },
+    /// A file selected once for several generation-bound native uploads.
+    #[serde(skip)]
+    PutGroupFile {
+        source: GroupUploadFile,
+        remote: String,
     },
     Put {
         local: PathBuf,
@@ -458,6 +466,9 @@ pub(crate) async fn run(
                 }
                 Operation::PreviewText { .. } => Some("Missing SSH connection for text preview"),
                 Operation::PutDrop { .. } => Some("Missing SSH connection for this dropped upload"),
+                Operation::PutGroupFile { .. } => {
+                    Some("Missing SSH connection for this group upload")
+                }
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
                 }
@@ -487,6 +498,12 @@ pub(crate) async fn run(
                 _ => "Text preview cancelled",
             };
             let _ = reply.send(Err(message.into()));
+            continue;
+        }
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+            && let Operation::PutGroupFile { source, remote } = &operation
+        {
+            let _ = reply.send(Ok(cancelled_transfer(source.path(), remote, 0, false)));
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
@@ -541,11 +558,13 @@ pub(crate) async fn run(
                         deadline,
                     ))
                 }
-                Operation::PutDrop { remote, .. } => JobStage::NativeUpload {
-                    remote: remote.clone(),
-                    open_dispatched: false,
-                    confirmed: 0,
-                },
+                Operation::PutDrop { remote, .. } | Operation::PutGroupFile { remote, .. } => {
+                    JobStage::NativeUpload {
+                        remote: remote.clone(),
+                        open_dispatched: false,
+                        confirmed: 0,
+                    }
+                }
                 Operation::PutDir { remote, .. } => JobStage::DirectoryUpload(
                     upload_directory::UploadState::new(remote.clone(), deadline),
                 ),
@@ -854,6 +873,20 @@ impl Engine {
                     }
                     _ => bail!("dropped item has an unexpected type"),
                 }
+            }
+            PutGroupFile { source, remote } => {
+                validate_group_upload_path(&remote)?;
+                let local = source.path().to_owned();
+                let file = tokio::task::spawn_blocking(move || source.reader()).await??;
+                self.put(
+                    (local, tokio::fs::File::from_std(file)),
+                    remote,
+                    false,
+                    progress,
+                    cancel,
+                    stage,
+                )
+                .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
             EntryProperties { path } => {

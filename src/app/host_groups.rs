@@ -14,6 +14,7 @@ mod report;
 mod retry;
 mod save_command;
 mod saved;
+mod upload;
 
 pub(super) const LABEL: &str = "SSH host group";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -38,6 +39,7 @@ pub(super) struct HostGroup {
     reconnect_feedback: String,
     retry_feedback: String,
     prompt_setup: prompt_setup::State,
+    upload: upload::State,
 }
 
 struct DraftBackup {
@@ -320,6 +322,7 @@ pub enum Action {
     LoadCommand(TabId, u64),
     PrepareRetry(TabId, u64, BTreeSet<u64>),
     PromptSetup(TabId, prompt_setup::Action),
+    Upload(TabId, upload::Action),
     OpenSavedCommands(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
     SaveCommand(TabId, save_command::Action),
@@ -355,7 +358,8 @@ impl TerminalApp {
                 if !page.saved.is_editing()
                     && page.live_output.is_none()
                     && !page.import.is_open()
-                    && !page.prompt_setup.is_open() =>
+                    && !page.prompt_setup.is_open()
+                    && !page.upload.is_open() =>
             {
                 Some(id)
             }
@@ -623,6 +627,7 @@ impl TerminalApp {
             Action::Import(id, action) => self.handle_host_import(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
+            Action::Upload(id, action) => self.handle_host_group_upload(id, action, ctx),
             Action::Tick => {
                 let Some(id) = self.tabs.active_id() else {
                     return;
@@ -830,6 +835,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &ViewContext<Self>,
     ) -> View {
+        if let Some(view) = page.upload.view(id, ctx) {
+            return view;
+        }
         if let Some(view) = page.prompt_setup.view(id, ctx) {
             return view;
         }
@@ -956,6 +964,7 @@ impl TerminalApp {
                         .content("Save selection as group…"),
                 )),
             reconnect::selection_controls(id, page, &shown, ctx),
+            upload::button(id, &selected, ctx),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes.".into()
