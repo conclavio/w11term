@@ -18,6 +18,8 @@ RustMUSH cockpit reattachment follows the general-purpose roadmap. A Windows mac
 
 The [Windows folder sharing roadmap](#mount-selected-windows-folders-on-a-linux-ssh-host) covers read-only mounts and per-folder write access.
 
+The [SSH host groups roadmap](#ssh-host-groups) covers running the same command across live remote shells from a single Windows tab.
+
 ## Current capabilities
 
 Each terminal tab has its own session, scrollback, search state and programmable control surface. Scripts can target a background session by ID, write raw bytes, wait for a regex, read committed screen text, capture PNGs and record VT output. The same authenticated SSH connection also supports SFTP. Profiles already support creation, editing and renaming, plus key, agent, password and keyboard-interactive authentication. [Current features](../README.md#tabs-and-profiles) · [Control and SFTP API](../CONTROL.md)
@@ -103,6 +105,18 @@ Use a separate SSH exec channel on the authenticated connection, without a PTY. 
 Bind each share to the verified host and SSH account. Refuse drive roots and use a user-owned, empty Linux mount point with SSHFS’s default owner-only access. Programs running as that Linux user can access the mount. Enforce read-only mode and containment on Windows for every operation, including rename and link handling. Path traversal, Windows device paths, alternate data streams and junctions must never give the remote host access outside the selected tree. On unmount or connection loss, close the export and invalidate its handles. A reconnect may remount configured folders after host verification. An interrupted write must surface an error and must never be silently replayed.
 
 **Acceptance.** Mount a temporary Windows folder on a real Linux FUSE host. Read a file through the mount, verify that a sibling folder stays inaccessible even through a junction, and verify that read-only mode rejects changes. Enable writes for that folder and exercise create, rename and delete from Linux. Drop the SSH connection during I/O, reconnect, and check that old handles fail, the configured share remounts and the terminal still accepts input. Also exercise explicit unmount and a host without SSHFS.
+
+## SSH host groups
+
+Polysh keeps an interactive SSH shell on each host. Its prompt summarizes which shells are ready, its roster lets the operator add hosts and change the active set, and its output identifies the originating host. Each shell keeps its working directory and environment across commands. [Polysh prompt, output and host controls](https://github.com/innogames/polysh#prompt)
+
+Add a native **SSH host group** tab. Start with live SSH panes across the current window and use their profile and `user@host:port` to identify each target. Give the group a single-line command field, a checkbox per target and an explicit **Send to _n_ hosts** action. Keep each terminal independently focusable for authentication, interactive applications and host-specific follow-up. The command field sends on submission, and each pane retains its own shell and scrollback.
+
+1. **Select and send.** Show connection and prompt state separately. Use observed OSC 133 or OSC 633 shell markers for prompt readiness and command completion. Recheck the exact pane and connection generation in the session worker before writing, along with read-only, authentication and alternate-screen state. Require a known idle prompt with an empty input line for the first version. Show hosts with no observed markers as **Prompt unverified**. Report rejects by host and leave a reconnected shell waiting for an explicit new submission.
+2. **Follow results.** Keep a bounded, host-labeled command view in the group tab. Show delivery, running, completion and exit status independently. Treat successful delivery to the SSH channel as separate from remote command completion. Use existing command history for marked output and link each result to its original terminal. A slow or disconnected host leaves the other shells usable.
+3. **Recall and extend groups.** Save named groups by SSH profile and open their shells together. Add and pause individual members during a session. Consider a per-profile prompt matcher for equipment shells that lack shell integration and a group interrupt for selected running commands. Reuse the existing native SSH transport, host verification and authentication for every member.
+
+**Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
 ## Subsequent features for RustMUSH
 
