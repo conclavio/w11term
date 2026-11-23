@@ -24,31 +24,15 @@ function Settings {
     Click 'Settings' $menuItem
 }
 function Select-StartupProfile([string]$Choice) {
-    $comboType = [System.Windows.Automation.ControlType]::ComboBox
-    $box = Wait-Until 'Startup profile selector' { Find-Element 'Startup profile' $comboType }
-    $box.SetFocus()
-    $expand = $box.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    $expand.Expand()
-    $item = Wait-Until "visible startup choice '$Choice'" {
-        $entry = Find-Element $Choice ([System.Windows.Automation.ControlType]::ListItem)
-        if ($entry -and !$entry.Current.IsOffscreen) { $entry }
-    }
-    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Startup profile, Terminal lab' $button
+    Click $Choice $menuItem
     $null = Wait-Until "Startup profile persisted for $localName" {
         $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
         $file = [IO.File]::Open($profiles, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
         $reader = [IO.StreamReader]::new($file)
         try { ($reader.ReadToEnd() | ConvertFrom-Json).startup_profile -ceq $localName } finally { $reader.Dispose() }
     }
-    $box = Wait-Until "Startup selector shows '$Choice'" {
-        $field = Find-Element 'Startup profile' $comboType
-        if ($field) {
-            $current = @($field.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection())
-            if ($current.Count -eq 1 -and $current[0].Current.Name -ceq $Choice) { $field }
-        }
-    }
-    $expand = $box.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    if ($expand.Current.ExpandCollapseState -eq 'Expanded') { $expand.Collapse() }
+    $null = Wait-Until "Startup selector shows '$Choice'" { Find-Element "Startup profile, $Choice" $button }
 }
 function Wait-SettingsOrder([string]$First, [string]$Second) {
     $null = Wait-Until "Settings to show '$First', '$Second', and disabled end controls" {

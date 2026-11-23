@@ -1968,44 +1968,54 @@ impl TerminalApp {
             vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
         let order: Arc<[String]> = self.catalog.profile_order.as_slice().into();
         let startup = self.catalog.startup_profile.clone();
-        let startup_index = order
+        let startup_choices: Vec<_> = std::iter::once((None, LAB.to_owned()))
+            .chain(order.iter().map(|name| {
+                let backend = if self.catalog.profiles.contains_key(name) {
+                    "SSH"
+                } else {
+                    "Local"
+                };
+                (Some(name.clone()), format!("{name} · {backend}"))
+            }))
+            .collect();
+        let startup_label = startup_choices
             .iter()
-            .position(|name| Some(name) == startup.as_ref())
-            .map_or(0, |index| index + 1);
-        let startup_names = std::iter::once(LAB.to_owned()).chain(order.iter().map(|name| {
-            let backend = if self.catalog.profiles.contains_key(name) {
-                "SSH"
-            } else {
-                "Local"
-            };
-            format!("{name} · {backend}")
-        }));
-        let choices = order.clone();
+            .find(|(name, _)| *name == startup)
+            .map_or(LAB, |(_, label)| label.as_str());
+        let startup_items = startup_choices
+            .iter()
+            .enumerate()
+            .map(|(index, (_, label))| {
+                MenuItem::item(format!("startup-profile-{index}"), label.clone())
+            })
+            .collect::<Vec<_>>();
         profiles.push(TextBlock::new().text("Startup profile").into());
         profiles.push(
-            ComboBox::new()
-                .width(360.0)
-                .automation_name("Startup profile")
+            Button::new()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .automation_name(format!("Startup profile, {startup_label}"))
                 .is_enabled(self.profile_error.is_none())
-                .items_source(startup_names)
-                .selected_index(Some(startup_index))
-                .on_selection_changed(context.callback(move |index: Option<usize>| {
-                    let selected = match index {
-                        Some(0) => None,
-                        Some(index) => {
-                            let Some(name) = choices.get(index - 1) else {
-                                return Message::ControlIdle;
-                            };
-                            Some(name.clone())
-                        }
-                        None => return Message::ControlIdle,
-                    };
-                    Message::StartupProfile {
-                        selected,
-                        expected: startup.clone(),
-                    }
-                }))
-                .into(),
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            TextBlock::new().text(startup_label),
+                            FontIcon::new().glyph("\u{e70d}"),
+                        )),
+                )
+                .menu(Menu::new(
+                    startup_items,
+                    context.callback(move |label: String| {
+                        startup_choices
+                            .iter()
+                            .find(|(_, choice)| *choice == label)
+                            .map_or(Message::ControlIdle, |(name, _)| Message::StartupProfile {
+                                selected: name.clone(),
+                                expected: startup.clone(),
+                            })
+                    }),
+                )),
         );
         let mut rows = Vec::with_capacity(order.len());
         for (index, name) in order.iter().enumerate() {
