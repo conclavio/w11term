@@ -5,6 +5,7 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt,
 };
+mod compare;
 mod filter;
 mod import;
 mod live_output;
@@ -36,6 +37,7 @@ pub(super) struct HostGroup {
     copy_feedback: String,
     result_filter: progress::Filter,
     live_output: Option<live_output::State>,
+    comparison: compare::State,
     import: import::State,
     reconnect_feedback: String,
     retry_feedback: String,
@@ -311,6 +313,7 @@ pub enum Action {
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
     LiveOutput(TabId, u64, live_output::Action),
+    Compare(TabId, u64, compare::Action),
     Import(TabId, import::Action),
     Reconnect(TabId, reconnect::Request),
     FilterResults(TabId, u64, progress::Filter),
@@ -353,6 +356,7 @@ impl TerminalApp {
             Page::HostGroup(page)
                 if !page.saved.is_editing()
                     && page.live_output.is_none()
+                    && !page.comparison.is_open()
                     && !page.import.is_open()
                     && !page.prompt_setup.is_open()
                     && !page.transfer.is_open() =>
@@ -696,7 +700,8 @@ impl TerminalApp {
                 }
             }
             Action::ViewSubmission(id, submission) => {
-                if let Some(page) = self.host_group_mut(id)
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
                     && page.submissions.iter().any(|item| item.id == submission)
                 {
                     page.viewing = submission;
@@ -705,9 +710,17 @@ impl TerminalApp {
                 }
             }
             Action::LiveOutput(id, submission, action) => {
+                if matches!(action, live_output::Action::Open)
+                    && self.host_group_command_target() != Some(id)
+                {
+                    return;
+                }
                 if let Some(page) = self.host_group_mut(id) {
                     page.update_live_output(submission, action);
                 }
+            }
+            Action::Compare(id, submission, action) => {
+                self.handle_host_group_comparison(id, submission, action, ctx);
             }
             Action::FilterResults(id, submission, filter) => {
                 if let Some(page) = self.host_group_mut(id)
@@ -858,6 +871,9 @@ impl TerminalApp {
         }
         if let Some(editor) = self.saved_host_group_editor(id, &page.saved, ctx) {
             return editor;
+        }
+        if let Some(comparison) = self.host_group_comparison(id, page, ctx) {
+            return comparison;
         }
         if let Some(output) = &page.live_output
             && let Some(submission) = page.viewed_submission(output.submission)
@@ -1229,6 +1245,15 @@ impl TerminalApp {
                             },
                         )
                     })),
+                Button::new()
+                    .on_click(ctx.callback(move |_| {
+                        Message::HostGroup(Action::Compare(
+                            id,
+                            submission_id,
+                            compare::Action::Open,
+                        ))
+                    }))
+                    .content("Compare results…"),
                 retry::button(
                     id,
                     page,

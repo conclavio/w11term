@@ -295,6 +295,10 @@ impl TerminalApp {
                 !page.transfer.is_open(),
                 "Return from the group transfer before opening another group."
             );
+            ensure!(
+                !page.comparison.is_open(),
+                "Return from the comparison before opening another group."
+            );
         }
         let catalog = self.store.catalog()?;
         ensure!(
