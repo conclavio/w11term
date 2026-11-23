@@ -156,6 +156,14 @@ present. A chunked upload replies on the final chunk. Clients can set
 An identified request for an unsupported local transport gets an error.
 [Kitty placement replies](https://sw.kovidgoyal.net/kitty/graphics-protocol/#display-images-on-screen)
 
+Animation frame uploads acknowledge the one-based frame number that was
+edited or appended. Multipart frame uploads retain their first chunk's
+address and reply after the final chunk. Frame composition acknowledges
+the result and checks the source and destination rectangles before changing
+the destination. Successful playback controls run silently. Image and
+frame errors follow the requested quiet mode.
+[Kitty animation reference](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty_tests/graphics.py#L1694-L1873)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

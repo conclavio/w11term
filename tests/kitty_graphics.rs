@@ -356,6 +356,106 @@ fn indexed_images_follow_palette_changes_and_keep_old_snapshots_intact() {
     );
 }
 
+#[tokio::test]
+async fn kitty_animation_replies_identify_committed_frames_and_keep_playback_silent() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=T,i=7,f=32,s=1,v=1,c=1,r=1,C=1,q=2;/wAA/w==\x1b\\",
+        "\x1b_Ga=f,i=7,f=32,s=1,v=1,m=1;AP8A\x1b\\",
+        "\x1b[5n",
+    ));
+    assert_eq!(read_through(&mut replies, b"\x1b[0n").await, "\x1b[0n");
+    t.advance_bytes(concat!(
+        "\x1b_Ga=f,m=0;/w==\x1b\\",
+        "\x1b_Ga=f,i=7,r=90,f=24,s=1,v=1;AAD/\x1b\\",
+        "\x1b_Ga=c,i=7,r=2,c=3\x1b\\",
+        "\x1b_Ga=f,i=7,r=1,f=32,s=1,v=1,q=2,m=1;AAD/\x1b\\",
+        "\x1b_Gm=0;/w==\x1b\\",
+        "\x1b_Ga=a,i=7,c=3\x1b\\",
+        "\x1b_Ga=t,I=91,f=24,s=1,v=1,q=2;/wAA\x1b\\",
+        "\x1b_Ga=f,I=91,r=0,f=24,s=1,v=1;AP8A\x1b\\",
+        "\x1b_Ga=c,I=91,r=1,c=2\x1b\\",
+        "\x1b[2;1H\x1b_Ga=T,i=9,f=24,s=2,v=1,c=2,r=1,C=1,q=2;/wAAAAD/\x1b\\",
+        "\x1b_Ga=c,i=9,r=1,c=1,x=1,w=1,h=1\x1b\\",
+        "\x1b[5n",
+    ));
+    assert_eq!(
+        read_through(&mut replies, b"\x1b[0n").await,
+        concat!(
+            "\x1b_Gi=7,r=2;OK\x1b\\",
+            "\x1b_Gi=7,r=3;OK\x1b\\",
+            "\x1b_Gi=7;OK\x1b\\",
+            "\x1b_GI=91,r=2;OK\x1b\\",
+            "\x1b_GI=91;OK\x1b\\",
+            "\x1b_Gi=9;OK\x1b\\",
+            "\x1b[0n",
+        ),
+    );
+    let composed = frame(&t, None, 0);
+    assert_eq!(pixel(&composed, 0, 0, 7), Some([0, 255, 0, 255]));
+    assert_eq!(pixel(&composed, 1, 1, 9), RED);
+    t.advance_bytes(b"\x1b_Ga=a,i=7,c=1,q=2\x1b\\");
+    assert_eq!(
+        pixel(&frame(&t, Some(&composed), 0), 0, 0, 7),
+        Some([0, 0, 255, 255])
+    );
+}
+
+#[tokio::test]
+async fn kitty_animation_errors_identify_the_failed_request_and_keep_committed_pixels() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=T,i=7,f=24,s=1,v=1,c=1,r=1,C=1,q=2;/wAA\x1b\\",
+        "\x1b_Ga=f,i=7,f=24,s=1,v=1,q=2;AP8A\x1b\\",
+        "\x1b_Ga=f,i=7,r=2,f=32,s=1,v=1,q=1,m=1;A\x1b\\",
+        "\x1b_Gm=0;/w==\x1b\\",
+        "\x1b_Ga=c,i=7,r=3,c=2,q=1\x1b\\",
+        "\x1b_Ga=c,i=7,r=1,c=2,x=4294967295,q=1\x1b\\",
+        "\x1b_Ga=c,i=7,r=2,c=2,q=1\x1b\\",
+        "\x1b_Ga=f,I=99,r=4,f=24,s=1,v=1,q=1;AAD/\x1b\\",
+        "\x1b_Ga=a,i=99,r=2,z=9,q=1\x1b\\",
+        "\x1b_Ga=c,i=7,r=1,c=99,q=2\x1b\\",
+        "\x1b_Ga=a,i=7,c=2,q=2\x1b\\",
+        "\x1b[5n",
+    ));
+    let response = read_through(&mut replies, b"\x1b[0n").await;
+    let received: Vec<_> = response
+        .strip_suffix("\x1b[0n")
+        .unwrap()
+        .split_terminator("\x1b\\")
+        .collect();
+    for (actual, expected) in received.iter().zip([
+        "\x1b_Gi=7,r=2;EINVAL:",
+        "\x1b_Gi=7;ENOENT:",
+        "\x1b_Gi=7;EINVAL:animation composition rectangle is out of bounds",
+        "\x1b_Gi=7;EINVAL:animation composition rectangles overlap",
+        "\x1b_GI=99,r=4;ENOENT:",
+        "\x1b_Gi=99,r=2;ENOENT:",
+    ]) {
+        assert!(actual.starts_with(expected), "{actual:?} vs {expected:?}");
+    }
+    assert_eq!(received.len(), 6, "{response:?}");
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 7), Some([0, 255, 0, 255]));
+}
+
+#[tokio::test]
+async fn kitty_animation_reports_a_full_frame_table_and_can_still_edit_existing_frames() {
+    let (mut t, mut replies) = engine();
+    transmit_red(&mut t, 7);
+    for _ in 1..256 {
+        t.advance_bytes(b"\x1b_Ga=f,i=7,f=24,s=1,v=1,q=2;AP8A\x1b\\");
+    }
+    t.advance_bytes(concat!(
+        "\x1b_Ga=f,i=7,f=24,s=1,v=1;AAD/\x1b\\",
+        "\x1b_Ga=f,i=7,r=256,f=24,s=1,v=1;AAD/\x1b\\",
+        "\x1b[5n",
+    ));
+    assert_eq!(
+        read_through(&mut replies, b"\x1b[0n").await,
+        "\x1b_Gi=7;ENOSPC:animation storage limit reached\x1b\\\x1b_Gi=7,r=256;OK\x1b\\\x1b[0n",
+    );
+}
+
 #[test]
 fn anonymous_and_named_indexed_images_follow_palette_across_screen_switches() {
     let (mut t, _) = engine();
