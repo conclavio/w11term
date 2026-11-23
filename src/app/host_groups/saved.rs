@@ -234,6 +234,7 @@ impl TerminalApp {
         self.tabs.select(id);
         if let Some(page) = self.host_group_mut(id) {
             page.selected = selected;
+            page.filter.clear();
             page.saved.selected = Some(name.into());
             page.saved.feedback = format!("Opened {} SSH panes for {name}", expected.len());
         }

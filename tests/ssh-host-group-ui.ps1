@@ -21,6 +21,15 @@ function Target-Name([string]$Name, [uint64]$Pane) {
 function Send-Raw([uint64]$Pane, [string]$Text) {
     $null = Control @('send-text','--pane',"$Pane",'--no-paste',$Text)
 }
+function Set-HostFilter([string]$Query) {
+    $field = Wait-Until 'host filter editor' {
+        $element = Find-Element 'Host filter' $edit
+        $provider = $null
+        if ($element -and $element.TryGetCurrentPattern(
+                [System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider)) { $provider }
+    }
+    $field.SetValue($Query)
+}
 function Submit([string]$Text, [string]$ButtonName) {
     $field = Wait-Until 'group command editor' {
         $element = Find-Element 'Group command' $edit
@@ -68,11 +77,33 @@ try {
     if (Find-Element "Focus pane $local" $button) { throw 'The local shell appeared in the SSH roster' }
     $eastName = Target-Name East $east
     $westName = Target-Name West $west
-    (Wait-CheckBox $eastName Off).Toggle()
+    Click 'Select shown'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
+    Set-HostFilter 'no-such-host'
+    $null = Wait-Until 'no matching SSH panes' { Find-Element 'No SSH panes match this filter.' }
+    $null = Wait-Until 'an empty filter result cannot send' {
+        $entry = Find-Element 'Send to 0 hosts' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    $eastAddress = "EaST 127.0.0.1:$($profileData.East.port)"
+    Set-HostFilter $eastAddress
+    $null = Wait-Until 'only East is shown' {
+        (Find-Element "Focus pane $east" $button) -and !(Find-Element "Focus pane $west" $button)
+    }
+    $null = Wait-Until 'the hidden selection is disclosed' {
+        Find-Element '1 selected host is hidden by the filter.'
+    }
     Submit 'one' 'Send to 1 host'
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
-    (Wait-CheckBox $westName Off).Toggle()
+    Click 'Deselect shown'
+    $null = Wait-CheckBox $eastName Off
+    Set-HostFilter ''
+    $null = Wait-CheckBox $westName On
+    $null = Wait-CheckBox $eastName Off
+    Click 'Select shown'
+    $null = Wait-CheckBox $eastName On
     Submit 'both' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName 'Sent to SSH channel'
@@ -129,13 +160,22 @@ try {
     Submit 'interrupt-pair' 'Send to 2 hosts'
     Outcome $eastName 'Running'
     Outcome $westName 'Running'
-    (Wait-CheckBox $eastName On).Toggle()
-    $null = Wait-CheckBox $eastName Off
+    Set-HostFilter "test@127.0.0.1:$($profileData.West.port)"
+    $null = Wait-Until 'East is selected and hidden' {
+        Find-Element '1 selected host is hidden by the filter.'
+    }
     Click 'Interrupt selected'
     Outcome $westName 'Ctrl+C sent'
     Outcome $westName 'Exit 130'
     Outcome $eastName 'Running'
-    $null = Wait-Until 'only unselected East remains running' {
+    $null = Wait-Until 'only hidden East remains running' {
+        $entry = Find-Element 'Interrupt selected' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    Set-HostFilter ''
+    (Wait-CheckBox $eastName On).Toggle()
+    $null = Wait-CheckBox $eastName Off
+    $null = Wait-Until 'unselected East cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
     }
