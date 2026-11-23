@@ -159,3 +159,5 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - DECBI and DECFI move the cursor across the current row or reuse the
   column shift at a scrolling-region edge.
+- SL and SR share the column shift and start at the left scrolling margin
+  when the cursor is inside the region.

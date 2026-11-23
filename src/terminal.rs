@@ -3135,6 +3135,34 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_scroll_starts_at_the_left_margin_and_preserves_the_cursor() {
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"ABCDEFGH\r\nabcdefgh\r\n12345678\r\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[3;5H\x1b[2 @\x1b[6n");
+        assert_eq!(text(&term), "ABCDEFGH\nabef  gh\n1256  78\nIJKLMNOP");
+        assert_eq!(receive(&mut replies), b"\x1b[3;5R");
+        term.advance_bytes(b"\x1b[ A\x1b[6n");
+        assert_eq!(text(&term), "ABCDEFGH\nab ef gh\n12 56 78\nIJKLMNOP");
+        assert_eq!(receive(&mut replies), b"\x1b[3;5R");
+        term.advance_bytes(b"\x1b[0 @");
+        assert_eq!(text(&term), "ABCDEFGH\nabef  gh\n1256  78\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[1;5H\x1b[ A\x1b[3;1H\x1b[ @");
+        assert_eq!(text(&term), "ABCDEFGH\nabef  gh\n1256  78\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[3;5H\x1b[1;2 A");
+        assert_eq!(text(&term), "ABCDEFGH\nabef  gh\n1256  78\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[4294967295 A");
+        assert_eq!(text(&term), "ABCDEFGH\nab    gh\n12    78\nIJKLMNOP");
+    }
+
+    #[test]
     fn dec_horizontal_index_moves_the_cursor_and_scrolls_at_horizontal_margins() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(

@@ -1262,6 +1262,17 @@ fn kitty_character_insert_and_delete_keep_direct_tiles_at_the_original_columns()
     assert!(indexed_forward.rows[0].as_str().starts_with("ABCD"));
     assert!(indexed_forward.rows[1].as_str().starts_with("abcd"));
     check(&indexed_forward);
+
+    t.advance_bytes(b"\x1b[1;3H\x1b[2 A");
+    let scrolled_right = frame(&t, Some(&indexed_forward), 0);
+    assert!(scrolled_right.rows[0].as_str().starts_with("  ABCD"));
+    assert!(scrolled_right.rows[1].as_str().starts_with("  abcd"));
+    check(&scrolled_right);
+    t.advance_bytes(b"\x1b[2 @");
+    let scrolled_left = frame(&t, Some(&scrolled_right), 0);
+    assert!(scrolled_left.rows[0].as_str().starts_with("ABCD"));
+    assert!(scrolled_left.rows[1].as_str().starts_with("abcd"));
+    check(&scrolled_left);
 }
 
 #[test]

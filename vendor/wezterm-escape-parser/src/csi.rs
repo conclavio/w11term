@@ -1365,6 +1365,10 @@ pub enum Edit {
     /// presentation position is not affected by this control function.
     ScrollUp(u32),
 
+    /// SL and SR shift columns within the scrolling region.
+    ScrollLeft(u32),
+    ScrollRight(u32),
+
     /// ED - ERASE IN PAGE (XTerm calls this Erase in Display)
     EraseInDisplay(EraseInDisplay),
     /// DECIC and DECDC.
@@ -1426,6 +1430,8 @@ impl Display for Edit {
             Edit::InsertLine(n) => n.write_csi(f, "L")?,
             Edit::ScrollDown(n) => n.write_csi(f, "T")?,
             Edit::ScrollUp(n) => n.write_csi(f, "S")?,
+            Edit::ScrollLeft(n) => n.write_csi(f, " @")?,
+            Edit::ScrollRight(n) => n.write_csi(f, " A")?,
             Edit::EraseInDisplay(n) => n.write_csi(f, "J")?,
             Edit::InsertColumns(n) => n.write_csi(f, "'}")?,
             Edit::DeleteColumns(n) => n.write_csi(f, "'~")?,
@@ -1999,6 +2005,14 @@ macro_rules! parse {
 impl<'a> CSIParser<'a> {
     fn parse_next(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
         match (self.control, self.orig_params) {
+            ('@' | 'A', [count @ .., CsiParam::P(b' ')]) if !self.parameters_truncated => {
+                let count = u32::parse_params(count)?;
+                Ok(CSI::Edit(if self.control == '@' {
+                    Edit::ScrollLeft(count)
+                } else {
+                    Edit::ScrollRight(count)
+                }))
+            }
             ('}' | '~', [count @ .., CsiParam::P(b'\'')]) if !self.parameters_truncated => {
                 let count = u32::parse_params(count)?;
                 Ok(CSI::Edit(if self.control == '}' {
