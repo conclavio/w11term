@@ -775,7 +775,7 @@ impl Snapshot {
         usize::try_from(self.cursor.y)
             .ok()
             .and_then(|row| self.cell_map(row))
-            .map_or(self.cursor.x, |map| map.visual(self.cursor.x))
+            .map_or(self.cursor.x, |map| map.visual_grid(self.cursor.x))
     }
 
     pub fn cell_maps(&self) -> &Arc<[crate::text_layout::CellMap]> {
@@ -2512,6 +2512,114 @@ mod tests {
             .map(|l| l.as_str().trim_end().to_owned())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 11,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+
+        // The full-width row contains a wide grapheme straddling the new edge.
+        term.advance_bytes("ABCD界GHIJK\x1b#6\x1b[6n");
+        let doubled = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(doubled.rows[0].as_str().trim_end(), "ABCD");
+        assert!(doubled.rows[0].is_double_width());
+        assert_eq!(doubled.cell_map(0).unwrap().logical_cols(), 5);
+        assert_eq!(doubled.visual_cursor_column(), 8);
+        assert_eq!(receive(&mut replies), b"\x1b[1;5R");
+
+        term.advance_bytes(b"\r123456\x1b[11G\x1b[A\x1b[6n\r\t\x1b[6n");
+        assert_eq!(receive(&mut replies), b"\x1b[1;5R");
+        assert_eq!(receive(&mut replies), b"\x1b[1;5R");
+        let wrapped = Snapshot::capture(&term, Some(&doubled), 2, 0, String::new(), 0);
+        assert_eq!(wrapped.rows[0].as_str().trim_end(), "12345");
+        assert_eq!(wrapped.rows[1].as_str().trim_end(), "6");
+
+        term.advance_bytes(b"\x1b#5\x1b[1;11HX");
+        let restored = Snapshot::capture(&term, Some(&wrapped), 3, 0, String::new(), 0);
+        assert_eq!(restored.rows[0].as_str().trim_end(), "12345     X");
+        assert!(!restored.rows[0].is_double_width());
+        assert_eq!(restored.cell_map(0).unwrap().logical_cols(), 11);
+
+        term.advance_bytes("\x1b[3;1H\x1b#6abc界\x1b[3;1H\x1b[@\x1b#5");
+        let edited = Snapshot::capture(&term, None, 4, 0, String::new(), 0);
+        assert_eq!(edited.rows[2].as_str().trim_end(), " abc");
+    }
+
+    #[test]
+    fn dec_line_renditions_reset_while_horizontal_margin_mode_is_enabled() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 10,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"\x1b#312345\r\n\x1b#412345");
+        let pair = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(pair.rows[0].is_double_height_top());
+        assert!(pair.rows[1].is_double_height_bottom());
+
+        term.advance_bytes(b"\x1b[?69hZ\x1b#6\x1b[3;1H\x1b#3\x1b[4;1H\x1b#4");
+        let margins = Snapshot::capture(&term, Some(&pair), 2, 0, String::new(), 0);
+        assert!(margins.cell_maps().iter().all(|map| map.width_scale() == 1));
+        assert_eq!(margins.rows[0].as_str().trim_end(), "12345");
+        assert_eq!(margins.rows[1].as_str().trim_end(), "1234Z");
+        assert!(margins.rows[2].as_str().trim_end().is_empty());
+
+        term.advance_bytes(b"\x1b[?69l\x1b#6");
+        let normal = Snapshot::capture(&term, Some(&margins), 3, 0, String::new(), 0);
+        assert!(normal.rows[3].is_double_width());
+    }
+
+    #[test]
+    fn dec_line_halves_survive_resize_and_keep_their_own_text() {
+        for alternate in [false, true] {
+            let size = TerminalSize {
+                cols: 12,
+                rows: 6,
+                ..Default::default()
+            };
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut term = create(size, tx);
+            if alternate {
+                term.advance_bytes(b"\x1b[?1049h");
+            }
+            term.advance_bytes(b"abcdefghijkl_\x1b[2;1H\x1b#3TopABC\r\n\x1b#4BotDEF");
+            term.resize(TerminalSize {
+                cols: 8,
+                rows: 8,
+                ..size
+            });
+            let screen = term.screen();
+            let lines: Vec<_> = screen.physical_lines().collect();
+            let top = lines
+                .iter()
+                .position(|line| line.is_double_height_top())
+                .unwrap();
+            assert!(lines[top + 1].is_double_height_bottom());
+            assert_eq!(lines[top].as_str().trim_end(), "TopA");
+            assert_eq!(lines[top + 1].as_str().trim_end(), "BotD");
+            assert_eq!(term.cursor_pos().x, 3);
+
+            term.advance_bytes(b"\x1b[S");
+            let visible = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+            let top = visible
+                .rows
+                .iter()
+                .position(|line| line.is_double_height_top())
+                .unwrap();
+            assert!(visible.rows[top + 1].is_double_height_bottom());
+        }
     }
 
     #[test]

@@ -77,8 +77,11 @@ impl Document {
                 d.paragraphs.push(d.len());
             }
             let mut col = 0;
+            let row_cols = frame
+                .cell_map(row)
+                .map_or(frame.cols, CellMap::logical_cols);
             for cell in line.visible_cells() {
-                if cell.cell_index() >= frame.cols {
+                if cell.cell_index() >= row_cols {
                     break;
                 }
                 while col < cell.cell_index() {

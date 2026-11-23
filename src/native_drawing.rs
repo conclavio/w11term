@@ -142,13 +142,13 @@ impl NativeDrawing {
         x: f32,
         y: f32,
         rgba: [f32; 4],
-        scale_x: f32,
+        scale: (f32, f32),
     ) -> windows_canvas::Result<()> {
         self.draw_text(
             layout,
             (x, y),
             rgba,
-            scale_x,
+            scale,
             D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
         )
     }
@@ -159,9 +159,9 @@ impl NativeDrawing {
         layout: &TextLayout,
         origin: (f32, f32),
         rgba: [f32; 4],
-        scale_x: f32,
+        scale: (f32, f32),
     ) -> windows_canvas::Result<()> {
-        self.draw_text(layout, origin, rgba, scale_x, D2D1_DRAW_TEXT_OPTIONS_NONE)
+        self.draw_text(layout, origin, rgba, scale, D2D1_DRAW_TEXT_OPTIONS_NONE)
     }
 
     /// The clip is expressed in terminal grid coordinates, before scaling a glyph run.
@@ -185,7 +185,7 @@ impl NativeDrawing {
         layout: &TextLayout,
         (x, y): (f32, f32),
         rgba: [f32; 4],
-        scale_x: f32,
+        scale: (f32, f32),
         options: windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS,
     ) -> windows_canvas::Result<()> {
         let raw = layout.raw().as_raw();
@@ -195,8 +195,10 @@ impl NativeDrawing {
             let mut previous = windows_numerics::Matrix3x2::default();
             self.context.GetTransform(&mut previous);
             let mut transform = previous;
-            transform.M11 *= scale_x;
-            transform.M12 *= scale_x;
+            transform.M11 *= scale.0;
+            transform.M12 *= scale.0;
+            transform.M21 *= scale.1;
+            transform.M22 *= scale.1;
             transform.M31 += x * previous.M11 + y * previous.M21;
             transform.M32 += x * previous.M12 + y * previous.M22;
             self.context.SetTransform(&transform);
@@ -332,7 +334,7 @@ mod tests {
                 target
                     .draw(|ctx| {
                         ctx.clear(windows_canvas::ColorF::BLACK);
-                        NativeDrawing::new(ctx)?.text(&layout, 0.0, 0.0, [1.0; 4], 1.0)
+                        NativeDrawing::new(ctx)?.text(&layout, 0.0, 0.0, [1.0; 4], (1.0, 1.0))
                     })
                     .unwrap();
                 (

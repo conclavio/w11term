@@ -249,10 +249,12 @@ impl CopyMode {
         let height = frame.rows.len().max(1) as isize;
         let last_top = frame.first_stable_row + frame.scroll_offset as isize;
         let last_row = last_top + height - 1;
-        let last_col = frame.cols.saturating_sub(1);
-        let line = usize::try_from(self.cursor.row - frame.first_stable_row)
-            .ok()
-            .and_then(|i| frame.rows.get(i));
+        let row = usize::try_from(self.cursor.row - frame.first_stable_row).ok();
+        let last_col = row
+            .and_then(|i| frame.cell_map(i))
+            .map_or(frame.cols, |map| map.logical_cols())
+            .saturating_sub(1);
+        let line = row.and_then(|i| frame.rows.get(i));
         match key {
             Left | Right => {
                 let mut next = if key == Left {
@@ -294,11 +296,16 @@ impl CopyMode {
         }
         let height = frame.rows.len().max(1) as isize;
         let last_top = frame.first_stable_row + frame.scroll_offset as isize;
+        let row = point
+            .row
+            .clamp(frame.oldest_stable_row, last_top + height - 1);
+        let cols = usize::try_from(row - frame.first_stable_row)
+            .ok()
+            .and_then(|i| frame.cell_map(i))
+            .map_or(frame.cols, |map| map.logical_cols());
         self.cursor = Point {
-            row: point
-                .row
-                .clamp(frame.oldest_stable_row, last_top + height - 1),
-            col: point.col.min(frame.cols.saturating_sub(1)),
+            row,
+            col: point.col.min(cols.saturating_sub(1)),
         };
         self.top = self
             .top

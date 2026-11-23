@@ -1432,13 +1432,22 @@ impl TerminalState {
         }
     }
 
-    /// Sets the cursor position to precisely the x and values provided
+    /// Limit the cursor to the addressable columns of a DEC-sized row.
+    fn constrain_line_column(&self, x: usize, y: VisibleRowIndex) -> usize {
+        if self.screen().line_width_scale(y) == 1 {
+            x
+        } else {
+            x.min(self.screen().logical_cols(y) - 1)
+        }
+    }
+
+    /// Set the cursor position in visible screen coordinates.
     fn set_cursor_position_absolute(&mut self, x: usize, y: VisibleRowIndex) {
         if self.cursor.y != y {
             self.clear_semantic_attribute_due_to_movement();
         }
         self.cursor.y = y;
-        self.cursor.x = x;
+        self.cursor.x = self.constrain_line_column(x, y);
         self.cursor.seqno = self.seqno;
         self.wrap_next = false;
     }
@@ -1527,6 +1536,7 @@ impl TerminalState {
             bidi_mode,
         );
         self.finish_kitty_tile_update(graphics);
+        self.cursor.x = self.constrain_line_column(self.cursor.x, self.cursor.y);
     }
 
     fn scroll_down(&mut self, num_rows: usize) {
@@ -1551,6 +1561,7 @@ impl TerminalState {
             bidi_mode,
         );
         self.finish_kitty_tile_update(graphics);
+        self.cursor.x = self.constrain_line_column(self.cursor.x, self.cursor.y);
     }
 
     /// Defined by FinalTermSemanticPrompt; a fresh-line is a NOP if the
@@ -1637,7 +1648,11 @@ impl TerminalState {
             Some(x) => x,
             None => self.left_and_right_margins.end - 1,
         };
-        self.cursor.x = x.min(self.left_and_right_margins.end - 1);
+        let right = self
+            .left_and_right_margins
+            .end
+            .min(self.screen().logical_cols(self.cursor.y));
+        self.cursor.x = x.min(right - 1);
         self.cursor.seqno = seqno;
     }
 
@@ -1991,6 +2006,16 @@ impl TerminalState {
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::LeftRightMarginMode,
             )) => {
+                if !self.left_and_right_margin_mode {
+                    if self.screen().line_width_scale(self.cursor.y) > 1 {
+                        self.wrap_next = false;
+                    }
+                    // DECLRMM restores the live pages to single-width, single-height.
+                    self.screen.screen.reset_visible_line_renditions(self.seqno);
+                    self.screen
+                        .alt_screen
+                        .reset_visible_line_renditions(self.seqno);
+                }
                 self.left_and_right_margin_mode = true;
             }
 
@@ -2716,7 +2741,10 @@ impl TerminalState {
                 let x = self.cursor.x;
 
                 if x >= self.left_and_right_margins.start && x < self.left_and_right_margins.end {
-                    let right_margin = self.left_and_right_margins.end;
+                    let right_margin = self
+                        .left_and_right_margins
+                        .end
+                        .min(self.screen().logical_cols(y));
                     let limit = (x + n as usize).min(right_margin);
 
                     let blank_attr = self.pen.clone_sgr_only();
@@ -2756,7 +2784,7 @@ impl TerminalState {
             Edit::EraseCharacter(n) => {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
-                let limit = (x + n as usize).min(self.screen().physical_cols);
+                let limit = (x + n as usize).min(self.screen().logical_cols(y));
                 {
                     let blank = Cell::blank_with_attrs(self.pen.clone_sgr_only());
                     let screen = self.screen_mut();
@@ -2770,7 +2798,7 @@ impl TerminalState {
                 let cx = self.cursor.x;
                 let cy = self.cursor.y;
                 let pen = self.pen.clone_sgr_only();
-                let cols = self.screen().physical_cols;
+                let cols = self.screen().logical_cols(cy);
                 let range = match erase {
                     // If wrap_next is true, then cx is effectively 1 column to the right.
                     // It feels wrong to handle this here, but in trying to centralize
@@ -2797,7 +2825,10 @@ impl TerminalState {
                 if self.top_and_bottom_margins.contains(&y)
                     && self.left_and_right_margins.contains(&x)
                 {
-                    let margin = self.left_and_right_margins.end;
+                    let margin = self
+                        .left_and_right_margins
+                        .end
+                        .min(self.screen().logical_cols(y));
                     let graphics = self.prepare_kitty_text_edit(&(y..y + 1), &(x..margin), false);
                     let screen = self.screen_mut();
                     for _ in 0..n as usize {
@@ -2866,15 +2897,19 @@ impl TerminalState {
                 };
 
                 for _ in 0..n {
-                    {
+                    let right = left_and_right_margins
+                        .end
+                        .min(self.screen().logical_cols(y));
+                    x = self.constrain_line_column(x, y);
+                    let sized = self.screen().line_width_scale(y) > 1;
+                    let width = if sized { cell.width() } else { 1 };
+                    if !sized || x.saturating_add(width) <= right {
                         let screen = self.screen_mut();
                         let line_idx = screen.phys_row(y);
-                        let line = screen.line_mut(line_idx);
-
-                        line.set_cell(x, cell.clone(), seqno);
+                        screen.line_mut(line_idx).set_cell(x, cell.clone(), seqno);
                     }
-                    x += 1;
-                    if x > left_and_right_margins.end - 1 {
+                    x += width;
+                    if x >= right {
                         x = left_and_right_margins.start;
                         if y == top_and_bottom_margins.end - 1 {
                             self.scroll_up(1);
@@ -2886,7 +2921,7 @@ impl TerminalState {
                         }
                     }
                 }
-                self.cursor.x = x;
+                self.cursor.x = self.constrain_line_column(x, y);
                 self.cursor.y = y;
             }
         }
@@ -2988,7 +3023,7 @@ impl TerminalState {
                     (self.cursor.x + n as usize).min(self.left_and_right_margins.end - 1)
                 };
 
-                self.cursor.x = new_x;
+                self.cursor.x = self.constrain_line_column(new_x, self.cursor.y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -3013,6 +3048,7 @@ impl TerminalState {
                 let new_y = new_y.max(0);
 
                 self.cursor.y = new_y;
+                self.cursor.x = self.constrain_line_column(self.cursor.x, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -3029,6 +3065,7 @@ impl TerminalState {
                 };
 
                 self.cursor.y = new_y;
+                self.cursor.x = self.constrain_line_column(self.cursor.x, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -3050,7 +3087,7 @@ impl TerminalState {
                 } else {
                     col
                 };
-                self.cursor.x = col.min(self.screen().physical_cols - 1);
+                self.cursor.x = col.min(self.screen().logical_cols(self.cursor.y) - 1);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -3086,7 +3123,8 @@ impl TerminalState {
                 };
 
                 self.cursor.y = new_y;
-                self.cursor.x = self.left_and_right_margins.start;
+                self.cursor.x =
+                    self.constrain_line_column(self.left_and_right_margins.start, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -3109,7 +3147,8 @@ impl TerminalState {
                 let new_y = new_y.max(0);
 
                 self.cursor.y = new_y;
-                self.cursor.x = self.left_and_right_margins.start;
+                self.cursor.x =
+                    self.constrain_line_column(self.left_and_right_margins.start, new_y);
                 self.cursor.seqno = seqno;
                 self.wrap_next = false;
             }
@@ -3130,7 +3169,7 @@ impl TerminalState {
                     (self
                         .cursor
                         .x
-                        .min(self.screen().physical_cols - 1)
+                        .min(self.screen().logical_cols(self.cursor.y) - 1)
                         .saturating_sub(if self.dec_origin_mode {
                             self.left_and_right_margins.start
                         } else {
