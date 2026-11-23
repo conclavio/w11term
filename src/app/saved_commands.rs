@@ -22,6 +22,38 @@ pub enum Edit {
     Cancel,
 }
 
+pub(super) fn create(entry: Entry) -> anyhow::Result<Commands> {
+    Commands::path().and_then(|path| Commands::update(&path, None, Some(entry)))
+}
+
+pub(super) fn name_form(
+    name: &str,
+    edit: Callback<String>,
+    save: Callback<()>,
+    cancel: Callback<()>,
+) -> View {
+    StackPanel::new().spacing(6.0).children((
+        TextBox::new()
+            .automation_name("Saved command name")
+            .placeholder_text("Saved command name")
+            .text(name)
+            .on_text_changed(edit),
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((
+                Button::new()
+                    .is_enabled(!name.trim().is_empty())
+                    .on_click(save)
+                    .content("Save to commands"),
+                Button::new()
+                    .automation_name("Cancel saving command")
+                    .on_click(cancel)
+                    .content("Cancel"),
+            )),
+    ))
+}
+
 impl TerminalApp {
     pub(super) fn reload_saved_commands(&mut self) -> Option<String> {
         self.saved_commands = Commands::default();

@@ -39,9 +39,9 @@ function Set-HostFilter([string]$Query) {
     }
     $field.SetValue($Query)
 }
-function Command-Editor {
-    Wait-Until 'group command editor' {
-        $element = Find-Element 'Group command' $edit
+function Command-Editor([string]$Name = 'Group command') {
+    Wait-Until "command editor '$Name'" {
+        $element = Find-Element $Name $edit
         $provider = $null
         if ($element -and $element.TryGetCurrentPattern(
                 [System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider)) { $provider }
@@ -282,6 +282,39 @@ try {
     Wait-CommandDraft 'show  fleet-health'
     Click 'Send to 1 host'
     $null = Wait-Until 'the saved command was explicitly submitted' { Find-Element "Submitted${dot}show  fleet-health" }
+    Outcome $westName 'Exit 17'
+    $saveButton = 'Save as command' + [char]0x2026
+    (Command-Editor).SetValue('snapshot  status')
+    Click $saveButton
+    (Command-Editor 'Saved command name').SetValue('Discarded name')
+    Click 'Cancel saving command'
+    $null = Wait-Until 'canceled naming form is gone' { !(Find-Element 'Saved command name' $edit) }
+    $entries = Get-Content -LiteralPath $library -Raw | ConvertFrom-Json
+    if ($entries.Count -ne 2 -or
+        (Command-Editor).Current.Value -cne 'snapshot  status') {
+        throw 'Canceling save changed the draft or command library'
+    }
+    Click $saveButton
+    $null = Wait-Until 'save form shows the exact captured draft' { Find-Element 'snapshot  status' }
+    (Command-Editor).SetValue('new unsent notes')
+    (Command-Editor 'Saved command name').SetValue('Fleet health')
+    Click 'Save to commands'
+    $null = Wait-Until 'duplicate command name is reported' { Find-Element 'A command named Fleet health already exists.' }
+    (Command-Editor 'Saved command name').SetValue('Fleet snapshot')
+    Click 'Save to commands'
+    $null = Wait-Until 'group command was saved' { Find-Element "Saved command${dot}Fleet snapshot" }
+    $entries = Get-Content -LiteralPath $library -Raw | ConvertFrom-Json
+    if ($entries.Count -ne 3 -or
+        ($entries | Where-Object name -ceq 'Fleet health').text -cne 'show  fleet-health' -or
+        ($entries | Where-Object name -ceq 'Fleet snapshot').text -cne 'snapshot  status' -or
+        (Command-Editor).Current.Value -cne 'new unsent notes') {
+        throw 'Saving did not preserve the captured command, existing entry, and current draft'
+    }
+    Click $libraryButton
+    Click "Load group command${dot}Fleet snapshot"
+    Wait-CommandDraft 'snapshot  status'
+    Click 'Send to 1 host'
+    $null = Wait-Until 'the new library entry was explicitly submitted' { Find-Element "Submitted${dot}snapshot  status" }
     Outcome $westName 'Exit 17'
     Set-HostFilter ''
     $null = Wait-CheckBox $eastName On

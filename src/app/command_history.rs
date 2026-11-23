@@ -2,7 +2,7 @@ use super::*;
 use regex::{Regex, RegexBuilder};
 use std::{collections::HashMap, ops::Range, sync::Weak};
 use w11term::control::CommandStatus;
-use w11term::saved_commands::{Commands, Entry, valid_command_text};
+use w11term::saved_commands::{Entry, valid_command_text};
 use w11term::session::history_text_allowed;
 use w11term::terminal::Snapshot;
 use wezterm_term::CompletedCommand;
@@ -538,9 +538,7 @@ impl TerminalApp {
                         name: draft.name.clone(),
                         text: text.into(),
                     };
-                    match Commands::path()
-                        .and_then(|path| Commands::update(&path, None, Some(entry)))
-                    {
+                    match saved_commands::create(entry) {
                         Ok(_) => {
                             page.save = None;
                             page.feedback = "Saved command".into();
@@ -685,45 +683,22 @@ impl TerminalApp {
         let show_target = page
             .selected
             .filter(|_| selected.is_some() && !frame.alternate && page.showing.is_none());
-        let save =
-            match (&page.save, save_target) {
-                (Some(draft), Some(target)) if draft.target == target => {
-                    StackPanel::new().spacing(6.0).children((
-                        TextBox::new()
-                            .automation_name("Saved command name")
-                            .placeholder_text("Saved command name")
-                            .text(&draft.name)
-                            .on_text_changed(ctx.callback(move |name| {
-                                action(HistoryAction::SaveName(target, name))
-                            })),
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .spacing(8.0)
-                            .children((
-                                Button::new()
-                                    .is_enabled(!draft.name.trim().is_empty())
-                                    .on_click(
-                                        ctx.callback(move |_| action(HistoryAction::Save(target))),
-                                    )
-                                    .content("Save to commands"),
-                                Button::new()
-                                    .automation_name("Cancel saving command")
-                                    .on_click(ctx.callback(move |_| {
-                                        action(HistoryAction::CancelSave(target))
-                                    }))
-                                    .content("Cancel"),
-                            )),
-                    ))
-                }
-                (_, target) => Button::new()
-                    .is_enabled(target.is_some())
-                    .on_click(ctx.callback(move |_| {
-                        target.map_or(Message::ControlIdle, |target| {
-                            action(HistoryAction::BeginSave(target))
-                        })
-                    }))
-                    .content("Save as command…"),
-            };
+        let save = match (&page.save, save_target) {
+            (Some(draft), Some(target)) if draft.target == target => saved_commands::name_form(
+                &draft.name,
+                ctx.callback(move |name| action(HistoryAction::SaveName(target, name))),
+                ctx.callback(move |_| action(HistoryAction::Save(target))),
+                ctx.callback(move |_| action(HistoryAction::CancelSave(target))),
+            ),
+            (_, target) => Button::new()
+                .is_enabled(target.is_some())
+                .on_click(ctx.callback(move |_| {
+                    target.map_or(Message::ControlIdle, |target| {
+                        action(HistoryAction::BeginSave(target))
+                    })
+                }))
+                .content("Save as command…"),
+        };
         Grid::new()
             .margin(16.0)
             .row_spacing(8.0)
