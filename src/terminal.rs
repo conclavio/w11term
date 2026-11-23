@@ -1368,6 +1368,86 @@ mod tests {
     }
 
     #[test]
+    fn xterm_report_sgr_returns_common_text_attributes_and_colors() {
+        let (mut term, mut out) = engine();
+        term.advance_bytes(b"\x1b[1;3;4:3;31;48;5;220mA\x1b[32mB\r\n\x1b[24;31mCD");
+        term.advance_bytes(b"\x1b[3;1H\x1b[0;38;2;11;22;33;58;5;32mEFG\x1b[0m");
+        let before = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        for (query, expected) in [
+            ("\x1b[1;1;2;2#|", "\x1b[0;1;3;48:5:220m"),
+            ("\x1b[1;1;1;1#|", "\x1b[0;1;3;4:3;31;48:5:220m"),
+            ("\x1b[3;2;3;3#|", "\x1b[0;38:2::11:22:33;58:5:32m"),
+            ("\x1b[1;1;3;3#|", "\x1b[0m"),
+        ] {
+            for byte in query.bytes() {
+                term.advance_bytes([byte]);
+            }
+            assert_eq!(receive(&mut out), expected.as_bytes(), "{query:?}");
+        }
+        term.advance_bytes(b"\x1bP$qm\x1b\\\x1b[6n");
+        assert_eq!(receive(&mut out), b"\x1bP1$r0m\x1b\\");
+        assert_eq!(receive(&mut out), b"\x1b[3;4R");
+        let after = Snapshot::capture(&term, Some(&before), 2, 0, String::new(), 0);
+        assert!(
+            before
+                .rows
+                .iter()
+                .zip(after.rows.iter())
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        );
+    }
+
+    #[test]
+    fn xterm_report_sgr_uses_origin_margins_for_defaults_and_clamping() {
+        let (tx, mut out) = mpsc::unbounded_channel();
+        let size = TerminalSize {
+            cols: 7,
+            rows: 4,
+            ..Default::default()
+        };
+        let mut term = create(size, tx);
+        term.advance_bytes(b"\x1b[1;31m\x1b[2;3Habc\x1b[3;3Hdef\x1b[0m");
+        term.advance_bytes(b"\x1b[2;3r\x1b[?69h\x1b[3;5s\x1b[?6h");
+        for (query, expected) in [
+            ("\x1b[#|", "\x1b[0;1;31m"),
+            ("\x1b[0;0;0;0#|", "\x1b[0;1;31m"),
+            ("\x1b[1;1;4294967295;999#|", "\x1b[0;1;31m"),
+            ("\x1b[999;999;999;999#|", "\x1b[0;1;31m"),
+            ("\x1b[2;3;1;1#|", "\x1b[0m"),
+        ] {
+            term.advance_bytes(query);
+            assert_eq!(receive(&mut out), expected.as_bytes(), "{query:?}");
+        }
+        term.advance_bytes(b"\x1b[1:2;1;1;1#|\x1b[?6l\x1b[#|");
+        assert_eq!(receive(&mut out), b"\x1b[0m");
+        assert!(out.try_recv().is_err());
+    }
+
+    #[test]
+    fn xterm_report_sgr_covers_wide_cells_and_the_active_screen() {
+        let (tx, mut out) = mpsc::unbounded_channel();
+        let size = TerminalSize {
+            cols: 8,
+            rows: 3,
+            ..Default::default()
+        };
+        let mut term = create(size, tx);
+        term.advance_bytes("\x1b#6\x1b[34m界X \x1b[0m");
+        for (query, expected) in [
+            ("\x1b[1;2;1;2#|", "\x1b[0;34m"),
+            ("\x1b[1;1;1;4#|", "\x1b[0;34m"),
+            ("\x1b[1;1;1;5#|", "\x1b[0m"),
+            ("\x1b[2;1;2;1#|", "\x1b[0m"),
+        ] {
+            term.advance_bytes(query);
+            assert_eq!(receive(&mut out), expected.as_bytes(), "{query:?}");
+        }
+        term.advance_bytes(b"\x1b[?1049h\x1b[1;2;1;2#|\x1b[?1049l\x1b[1;2;1;2#|");
+        assert_eq!(receive(&mut out), b"\x1b[0m");
+        assert_eq!(receive(&mut out), b"\x1b[0;34m");
+    }
+
+    #[test]
     fn xterm_sgr_stack_restores_text_style_while_leaving_the_current_link() {
         use wezterm_term::{Intensity, Underline};
 

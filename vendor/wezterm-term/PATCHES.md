@@ -86,6 +86,9 @@ The original MIT license is preserved in `LICENSE.md`.
   from eviction as new output arrives. This lets the UI discard an old
   scrollbar gesture after either a local clear or a remote CSI 3 J.
 
+- XTREPORTSGR reports the common SGR attributes in an active-screen
+  rectangle. It shares parameter formatting with the DECRQSS pen report.
+
 - XTPUSHSGR and XTPOPSGR use a bounded text-style stack with selective
   restoration. A new transport starts with an empty stack.
 

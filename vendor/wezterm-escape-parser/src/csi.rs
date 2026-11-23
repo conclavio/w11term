@@ -613,6 +613,13 @@ pub enum Window {
     },
     /// XTTITLEPOS request. Its parameterized response is not a request.
     ReportTitleStackPosition,
+    /// XTREPORTSGR. The first pair defaults to the top left and the second to the bottom right.
+    ReportRectangularSgr {
+        top: OneBased,
+        left: OneBased,
+        bottom: OneBased,
+        right: OneBased,
+    },
     /// DECRQCRA; used by esctest
     ChecksumRectangularArea {
         request_id: i64,
@@ -687,6 +694,9 @@ impl Display for Window {
                 write!(f, "23;{};{slot}t", *scope as u8)
             }
             Window::ReportTitleStackPosition => write!(f, "#S"),
+            Window::ReportRectangularSgr { top, left, bottom, right } => {
+                write!(f, "{};{};{};{}#|", top, left, bottom, right)
+            }
             Window::ChecksumRectangularArea {
                 request_id,
                 page_number,
@@ -1907,6 +1917,19 @@ impl<'a> CSIParser<'a> {
                 Ok(CSI::PushSgr(parameters))
             }
             ('q' | '}', [CsiParam::P(b'#')]) if !self.parameters_truncated => Ok(CSI::PopSgr),
+            ('|', [parameters @ .., CsiParam::P(b'#')]) if !self.parameters_truncated => {
+                let area = Cracked::parse(parameters)?;
+                if area.len() > 4 {
+                    return Err(());
+                }
+                let far_edge = CsiParam::Integer(0);
+                Ok(CSI::Window(Box::new(Window::ReportRectangularSgr {
+                    top: OneBased::from_optional_esc_param(area.get(0))?,
+                    left: OneBased::from_optional_esc_param(area.get(1))?,
+                    bottom: OneBased::from_esc_param_with_big_default(area.get(2).unwrap_or(&far_edge))?,
+                    right: OneBased::from_esc_param_with_big_default(area.get(3).unwrap_or(&far_edge))?,
+                })))
+            }
             ('S', [CsiParam::P(b'#')]) if !self.parameters_truncated => {
                 Ok(CSI::Window(Box::new(Window::ReportTitleStackPosition)))
             }

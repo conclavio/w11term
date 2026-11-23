@@ -33,6 +33,7 @@ mod kitty;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod rendition;
 mod sgr_stack;
 mod sixel;
 mod title;
@@ -2611,6 +2612,14 @@ impl TerminalState {
                 }
             }
 
+            Window::ReportRectangularSgr {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                self.report_rectangular_sgr(top, left, bottom, right);
+            }
             Window::ChecksumRectangularArea {
                 request_id,
                 top,
