@@ -118,6 +118,15 @@ public static class WslFixture {
     }
     Wait-Launch $left.id $leftName
     Publish-Report $left.id 'linux'
+    $explorerAction = 'Open current folder in File Explorer'
+    $search = Open-Palette $explorerAction
+    $search.GetCurrentPattern($value).SetValue($explorerAction)
+    $null = Wait-Until 'Explorer opens reported folders for named WSL panes' {
+        $row = Find-Element $explorerAction $button
+        $row -and $row.Current.IsEnabled
+    }
+    Press-Key 27
+    $null = Wait-Until 'command palette dismissed' { !(Find-Element 'Search commands') }
     Run-Palette 'New tab in current directory'
     $newTab = Wait-Until 'WSL tab opens in the reported Linux directory' {
         Sessions | Where-Object { $_.active -and $_.label -ceq $leftLabel -and $_.tab_id -ne $left.tab_id }
@@ -137,6 +146,14 @@ public static class WslFixture {
     $search.GetCurrentPattern($value).SetValue($action)
     $null = Wait-Until 'a report for another distribution leaves the action disabled' {
         $row = Find-Element $action $button
+        $row -and !$row.Current.IsEnabled
+    }
+    Press-Key 27
+    $null = Wait-Until 'command palette dismissed' { !(Find-Element 'Search commands') }
+    $search = Open-Palette $explorerAction
+    $search.GetCurrentPattern($value).SetValue($explorerAction)
+    $null = Wait-Until 'Explorer rejects a folder reported for another WSL distribution' {
+        $row = Find-Element $explorerAction $button
         $row -and !$row.Current.IsEnabled
     }
     Press-Key 27

@@ -2,6 +2,8 @@ use super::*;
 use std::path::PathBuf;
 use w11term::{options::PlayerOptions, ssh::ConnectionShare, workspace::SshStartup};
 
+pub(super) const OPEN_EXPLORER: &str = "Open current folder in File Explorer";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Directory {
     Ssh(String),
@@ -47,6 +49,12 @@ pub(super) fn message(destination: Destination, target: Option<&Origin>) -> Mess
     target.cloned().map_or(Message::ControlIdle, |origin| {
         Message::OpenInDirectory(destination, origin)
     })
+}
+
+pub(super) fn explorer_message(target: Option<&Origin>) -> Message {
+    target
+        .cloned()
+        .map_or(Message::ControlIdle, Message::OpenExplorer)
 }
 
 fn child_options(
@@ -193,6 +201,42 @@ impl TerminalApp {
             Source::Local(_) => tab.local_directory_split(),
             _ => tab.ssh_directory_split().map(|(origin, _)| origin),
         }
+    }
+
+    fn explorer_folder(&self, origin: &Origin) -> Option<explorer::Folder> {
+        let Page::Terminal(tab) = &self.tabs.active()?.page else {
+            return None;
+        };
+        let Source::Local(shell) = &tab.source else {
+            return None;
+        };
+        if tab.local_directory_split().as_ref()? != origin {
+            return None;
+        }
+        match &origin.directory {
+            Directory::Local(path) => Some(explorer::Folder::Drive(path.clone())),
+            Directory::Wsl(path) if path.starts_with('/') => {
+                explorer::Folder::wsl(shell.wsl_distribution()?, path)
+            }
+            Directory::Wsl(path) => Some(explorer::Folder::Drive(PathBuf::from(path))),
+            Directory::Ssh(_) => None,
+        }
+    }
+
+    pub(super) fn can_open_explorer(&self, origin: Option<&Origin>) -> bool {
+        origin
+            .and_then(|origin| self.explorer_folder(origin))
+            .is_some()
+    }
+
+    pub(super) fn open_explorer(&mut self, origin: Origin, ctx: &ComponentContext<Self>) {
+        let Some(folder) = self.explorer_folder(&origin) else {
+            return;
+        };
+        ctx.spawn_background_with_rejection(
+            move |_| Message::ExplorerOpened(folder.open().map_err(|error| format!("{error:#}"))),
+            Message::ExplorerOpened(Err("The Explorer request could not start.".into())),
+        );
     }
 
     pub(super) fn open_in_directory(

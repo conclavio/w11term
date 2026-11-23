@@ -610,7 +610,7 @@ async fn native_powershell_shell_integration_records_history_and_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reveals a PowerShell diagnostic in the native File Explorer beside a live SSH pane"]
+#[ignore = "opens the reported PowerShell folder and reveals a diagnostic file beside a live SSH pane"]
 async fn native_local_path_hint_selects_the_file_in_explorer() {
     run_palette_fixture("reveal-local-path-ui.ps1", b"ssh-neighbor-ok", None).await;
 }

@@ -1030,6 +1030,8 @@ pub enum Message {
     AccessibleSelection(crate::accessibility::SelectionRequest),
     SplitPane(Axis, Option<String>),
     OpenInDirectory(directory_split::Destination, directory_split::Origin),
+    OpenExplorer(directory_split::Origin),
+    ExplorerOpened(Result<(), String>),
     PaneNeighbor(Direction),
     FocusPreviousPane(previous_pane::Target),
     SwapPanes(PaneSwap),
@@ -3267,6 +3269,9 @@ impl TerminalApp {
             local_forwards::LABEL => local_forwards::open(forward),
             tab_title::RENAME_PANE => tab_title::show_pane(pane.zip(group)),
             live_profile::SAVE => live_profile::open(paste),
+            directory_split::OPEN_EXPLORER => {
+                directory_split::explorer_message(split_target.as_ref())
+            }
             label if let Some(color) = tab_colors::from_menu(label) => group
                 .map_or(Message::ControlIdle, |group| {
                     Message::SetTabColor(group, color)
@@ -3436,7 +3441,7 @@ impl TerminalApp {
                 self.caret_items(
                     exited.is_some(),
                     &arrangement,
-                    directory_split.is_some(),
+                    directory_split.as_ref(),
                     previous,
                     recordings,
                 ),
@@ -3516,7 +3521,7 @@ impl TerminalApp {
         &self,
         can_restart: bool,
         arrangement: &PaneArrangement,
-        can_split_directory: bool,
+        directory: Option<&directory_split::Origin>,
         previous: Option<previous_pane::Target>,
         recordings: recordings::Choices,
     ) -> Vec<MenuItem> {
@@ -3547,12 +3552,7 @@ impl TerminalApp {
                 "Command palette…",
                 KeyAction::CommandPalette,
             ),
-            self.pane_menu(
-                can_restart,
-                arrangement,
-                can_split_directory,
-                previous.is_some(),
-            ),
+            self.pane_menu(can_restart, arrangement, directory, previous.is_some()),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
             tab_colors::menu(
                 self.active_terminal_group().is_some(),
@@ -3760,7 +3760,7 @@ impl TerminalApp {
         &self,
         can_restart: bool,
         arrangement: &PaneArrangement,
-        can_split_directory: bool,
+        directory: Option<&directory_split::Origin>,
         can_focus_previous: bool,
     ) -> MenuItem {
         let binding = KeyAction::FocusPreviousPane.binding();
@@ -3789,6 +3789,7 @@ impl TerminalApp {
         } else {
             MenuItem::disabled(binding.id, binding.label)
         };
+        let can_split_directory = directory.is_some();
         let mut items = vec![
             self.binding_menu("split-right", "Split right", KeyAction::SplitRight),
             self.binding_menu("split-below", "Split below", KeyAction::SplitBelow),
@@ -3837,6 +3838,13 @@ impl TerminalApp {
         {
             items.push(MenuItem::item("files", "SFTP files"));
             items.push(MenuItem::item("files-here", "Open files here"));
+        } else if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Local(_)))
+        {
+            items.push(command_menu_item(
+                "open-explorer-folder",
+                directory_split::OPEN_EXPLORER,
+                self.can_open_explorer(directory),
+            ));
         }
         if let Some(AppTab {
             page: Page::Terminal(live),
@@ -5682,6 +5690,11 @@ impl Component for TerminalApp {
             Message::OpenInDirectory(destination, origin) => {
                 self.open_in_directory(destination, origin, context)
             }
+            Message::OpenExplorer(origin) => self.open_explorer(origin, context),
+            Message::ExplorerOpened(Err(error)) => {
+                self.window_error = Some(format!("Couldn’t open the current folder. {error}"));
+            }
+            Message::ExplorerOpened(Ok(())) => {}
             Message::SyncSelection(epoch) => {
                 if self.selection_epoch == epoch {
                     self.selection_pending = false;

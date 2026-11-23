@@ -6,11 +6,61 @@ use std::{
 use windows::{
     Win32::{
         Storage::FileSystem::GetDriveTypeW,
-        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
-        UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName},
+        System::{
+            Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
+            SystemServices::{SFGAO_FILESYSTEM, SFGAO_FOLDER},
+        },
+        UI::{
+            Shell::{
+                Common::ITEMIDLIST, SEE_MASK_FLAG_NO_UI, SEE_MASK_IDLIST, SEE_MASK_NOASYNC,
+                SHELLEXECUTEINFOW, SHOpenFolderAndSelectItems, SHParseDisplayName, ShellExecuteExW,
+            },
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
     },
-    core::PCWSTR,
+    core::{PCWSTR, w},
 };
+
+pub(super) enum Folder {
+    Drive(PathBuf),
+    Wsl(PathBuf),
+}
+
+impl Folder {
+    pub(super) fn wsl(distribution: &str, linux_path: &str) -> Option<Self> {
+        w11term::sftp::validate_download_name(distribution).ok()?;
+        let mut folder = PathBuf::from(format!(r"\\wsl.localhost\{distribution}\"));
+        let tail = linux_path.strip_prefix('/')?;
+        if tail.starts_with('/') {
+            return None;
+        }
+        let tail = tail.strip_suffix('/').unwrap_or(tail);
+        if !tail.is_empty() {
+            for component in tail.split('/') {
+                w11term::sftp::validate_download_name(component).ok()?;
+                folder.push(component);
+            }
+        }
+        Some(Self::Wsl(folder))
+    }
+
+    pub(super) fn open(&self) -> Result<()> {
+        let path = match self {
+            Self::Drive(path) => {
+                check_drive(path)?;
+                path
+            }
+            Self::Wsl(path) => path,
+        };
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("Cannot read the folder {}", path.display()))?;
+        ensure!(
+            metadata.is_dir(),
+            "The path must identify a filesystem folder"
+        );
+        shell_item(path, ShellAction::Explore)
+    }
+}
 
 fn drive_path(text: &str) -> Option<(PathBuf, &str)> {
     let [letter, b':', b'\\' | b'/', ..] = text.as_bytes() else {
@@ -63,7 +113,7 @@ pub(super) fn resolve(hint: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     Some(path)
 }
 
-fn check_item(path: &Path) -> Result<()> {
+fn check_drive(path: &Path) -> Result<()> {
     let (root, _) = path
         .to_str()
         .and_then(drive_path)
@@ -77,14 +127,41 @@ fn check_item(path: &Path) -> Result<()> {
         ),
         "The path must be on a local drive"
     );
-    // Check the directory entry itself, so links retain their own names and missing
-    // leaves never turn a reveal into merely opening their nearest existing parent.
+    Ok(())
+}
+
+fn check_item(path: &Path) -> Result<()> {
+    check_drive(path)?;
+    // Check the directory entry itself, so links retain their own names.
     std::fs::symlink_metadata(path).with_context(|| format!("Cannot find {}", path.display()))?;
     Ok(())
 }
 
 pub(super) fn reveal(path: &Path) -> Result<()> {
     check_item(path)?;
+    shell_item(path, ShellAction::Select)
+}
+
+#[derive(Clone, Copy)]
+enum ShellAction {
+    Select,
+    Explore,
+}
+
+fn explore(item: *mut ITEMIDLIST) -> windows::core::Result<()> {
+    let mut request = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        // This worker has no message loop and its STA ends when the call returns.
+        fMask: SEE_MASK_IDLIST | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: w!("explore"),
+        lpIDList: item.cast(),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut request) }
+}
+
+fn shell_item(path: &Path, action: ShellAction) -> Result<()> {
     // The caller runs on the Windows thread pool; give the Shell its own STA.
     std::thread::scope(|scope| {
         std::thread::Builder::new()
@@ -94,37 +171,64 @@ pub(super) fn reveal(path: &Path) -> Result<()> {
                 unsafe {
                     CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
                     let mut item = std::ptr::null_mut();
-                    let result =
-                        SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut item, 0, None)
-                            .and_then(|()| {
-                                // With zero children the absolute PIDL identifies the item
-                                // to select in its parent, for both files and directories.
-                                let selected = SHOpenFolderAndSelectItems(item, None, 0);
-                                #[cfg(feature = "ui-smoke")]
-                                if let Err(error) = trace_selection(item, &selected) {
-                                    log::warn!(
-                                        "Recording Explorer selection for the fixture: {error:#}"
-                                    );
-                                }
-                                selected
-                            });
+                    let required = match action {
+                        ShellAction::Select => 0,
+                        ShellAction::Explore => (SFGAO_FILESYSTEM | SFGAO_FOLDER).0,
+                    };
+                    let mut attributes = 0;
+                    let result = SHParseDisplayName(
+                        PCWSTR(wide.as_ptr()),
+                        None,
+                        &mut item,
+                        required,
+                        Some(&mut attributes),
+                    )
+                    .context("Resolving the Explorer item")
+                    .and_then(|()| {
+                        ensure!(
+                            !item.is_null() && attributes & required == required,
+                            "The path must identify a filesystem folder"
+                        );
+                        let opened = match action {
+                            // With zero children the PIDL identifies the item
+                            // to select in its parent.
+                            ShellAction::Select => SHOpenFolderAndSelectItems(item, None, 0),
+                            ShellAction::Explore => explore(item),
+                        };
+                        #[cfg(feature = "ui-smoke")]
+                        if let Err(error) = trace_action(item, action, &opened) {
+                            log::warn!("Recording the Explorer action for the fixture: {error:#}");
+                        }
+                        opened.context(match action {
+                            ShellAction::Select => "Selecting the item",
+                            ShellAction::Explore => "Opening the folder",
+                        })
+                    });
                     CoTaskMemFree(Some(item.cast()));
                     CoUninitialize();
-                    result.with_context(|| format!("Selecting {} in File Explorer", path.display()))
+                    result.with_context(|| match action {
+                        ShellAction::Select => {
+                            format!("Selecting {} in File Explorer", path.display())
+                        }
+                        ShellAction::Explore => {
+                            format!("Opening {} in File Explorer", path.display())
+                        }
+                    })
                 }
             })
-            .context("Starting File Explorer selection")?
+            .context("Starting File Explorer")?
             .join()
-            .map_err(|_| anyhow!("File Explorer selection stopped"))?
+            .map_err(|_| anyhow!("File Explorer stopped"))?
     })
 }
 
 // A runner can have Shell32 without an observable Explorer desktop. Let the
 // native fixture verify the item parsed by Shell32 and the selection call's result.
 #[cfg(feature = "ui-smoke")]
-fn trace_selection(
-    item: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
-    selected: &windows::core::Result<()>,
+fn trace_action(
+    item: *const ITEMIDLIST,
+    action: ShellAction,
+    opened: &windows::core::Result<()>,
 ) -> Result<()> {
     use windows::Win32::UI::Shell::{SHGetNameFromIDList, SIGDN_FILESYSPATH};
 
@@ -137,12 +241,16 @@ fn trace_selection(
         CoTaskMemFree(Some(wide.0.cast()));
         path?
     };
-    let hresult = selected.as_ref().err().map_or(0, |e| e.code().0);
+    let hresult = opened.as_ref().err().map_or(0, |e| e.code().0);
+    let action = match action {
+        ShellAction::Select => "select",
+        ShellAction::Explore => "explore",
+    };
     let output = Path::new(&output);
     let file = tempfile::NamedTempFile::new_in(output.parent().context("Trace directory")?)?;
     serde_json::to_writer(
         file.as_file(),
-        &serde_json::json!({ "path": path, "hresult": hresult }),
+        &serde_json::json!({ "path": path, "hresult": hresult, "action": action }),
     )?;
     file.persist(output)?;
     Ok(())
@@ -151,6 +259,42 @@ fn trace_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_folder_action_refuses_a_regular_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = Folder::Drive(file.path().into()).open().unwrap_err();
+        assert!(format!("{error:#}").contains("The path must identify a filesystem folder"));
+    }
+
+    #[test]
+    fn wsl_folders_are_restricted_to_unambiguous_names_inside_the_selected_distribution() {
+        for (linux, expected) in [
+            ("/", r"\\wsl.localhost\QA Linux\"),
+            (
+                "/home/雪 [pilot] 100% #/",
+                r"\\wsl.localhost\QA Linux\home\雪 [pilot] 100% #",
+            ),
+        ] {
+            let Some(Folder::Wsl(folder)) = Folder::wsl("QA Linux", linux) else {
+                panic!("expected a WSL folder for {linux}");
+            };
+            assert_eq!(folder, Path::new(expected));
+        }
+        for (distro, linux) in [
+            ("", "/"),
+            ("..", "/home"),
+            (r"dev\other", "/home"),
+            ("dev", "/../other"),
+            ("dev", "//"),
+            ("dev", "//host/share"),
+            ("dev", "/home//other"),
+            ("dev", "/home/file:stream"),
+            ("dev", "/home/rewrite. "),
+        ] {
+            assert!(Folder::wsl(distro, linux).is_none(), "{distro} {linux}");
+        }
+    }
 
     #[test]
     fn resolves_absolute_and_relative_paths_with_literal_names() {

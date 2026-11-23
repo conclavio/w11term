@@ -85,6 +85,8 @@ On an ordinary SSH connection, the actions use the directory reported by the rem
 
 In a named WSL shell, the same actions open another shell in the distribution using the reported directory. The shell can send an OSC 7 file URI such as `file:///home/dev/my%20project`, or an OSC 9;9 path from `wslpath -w "$PWD"`. For example, follow the Bash or Zsh instructions for reporting the working directory. Duplicate and Reopen start fresh WSL processes using each pane’s saved launch directory. [WSL prompt examples](https://learn.microsoft.com/windows/terminal/tutorials/new-tab-same-directory#bash)
 
+Choose **Panes → Open current folder in File Explorer**, or search for it in the command palette, to browse the folder reported by the focused PowerShell or named WSL shell. For Linux paths, Explorer opens the folder through that distribution’s Windows share. The action becomes available after the shell reports a supported directory. [WSL file access from Windows](https://learn.microsoft.com/en-us/windows/dev-environment/wsl-interop#access-linux-files-from-windows)
+
 Saving the workspace remembers the starting directory of the new tab or split. Its next launch opens a shell there.
 
 Windows PowerShell 5.1 can treat square brackets in its starting directory as a wildcard. For those paths, w11term restores the literal directory if PowerShell opens at `$PSHOME` or a matching sibling. A profile that intentionally selects that same fallback directory will also start in the requested folder.

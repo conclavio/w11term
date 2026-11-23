@@ -37,6 +37,7 @@ pub enum CommandId {
         directory_split::Destination,
         Option<directory_split::Origin>,
     ),
+    OpenExplorer(Option<directory_split::Origin>),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -168,7 +169,7 @@ impl TerminalApp {
             self.caret_items(
                 exited.is_some(),
                 &arrangement,
-                directory_split.is_some(),
+                directory_split.as_ref(),
                 previous,
                 recordings,
             ),
@@ -210,6 +211,10 @@ impl TerminalApp {
             }
             if matches!(&row.id, CommandId::Menu(label) if label == live_profile::SAVE) {
                 row.id = CommandId::SaveLiveProfile(self.saveable_ssh_origin());
+            }
+            if matches!(&row.id, CommandId::Menu(label) if label == directory_split::OPEN_EXPLORER)
+            {
+                row.id = CommandId::OpenExplorer(directory_split.clone());
             }
             if let CommandId::Menu(label) = &row.id
                 && let Some(pinned) = tab_pin_command(label)
@@ -426,6 +431,7 @@ impl TerminalApp {
             CommandId::OpenInDirectory(destination, target) => {
                 directory_split::message(destination, target.as_ref())
             }
+            CommandId::OpenExplorer(target) => directory_split::explorer_message(target.as_ref()),
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
             }
