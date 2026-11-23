@@ -205,14 +205,12 @@ pub(super) fn view(id: TabId, draft: &Draft, context: &ViewContext<TerminalApp>)
                     .content("Cancel"),
             )),
     ));
-    ScrollViewer::new()
-        .content(
-            StackPanel::new()
-                .margin(20.0)
-                .spacing(14.0)
-                .max_width(520.0)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .keyed_children(fields),
-        )
-        .into()
+    ScrollViewer::new().content(
+        StackPanel::new()
+            .margin(20.0)
+            .spacing(14.0)
+            .max_width(520.0)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .keyed_children(fields),
+    )
 }
