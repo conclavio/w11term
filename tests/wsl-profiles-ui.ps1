@@ -183,6 +183,12 @@ public static class WslFixture {
                 [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $setupText
         }
     }
+    Run-Palette 'Copy Zsh shell integration'
+    $zshSetup = ([IO.File]::ReadAllText((Join-Path $PSScriptRoot '../src/app/zsh-directory.zsh')) +
+        [char]10 + [IO.File]::ReadAllText((Join-Path $PSScriptRoot '../src/app/zsh-integration.zsh'))).TrimEnd()
+    $null = Wait-Until 'both parts of the Zsh shell integration were copied' {
+        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $zshSetup
+    }
     Publish-Report $left.id 'linux'
     Press-Key 0x70 # F1 copies the reported directory.
     $null = Wait-Until 'the reported Linux directory was copied' {

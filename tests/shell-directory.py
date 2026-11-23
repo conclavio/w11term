@@ -11,13 +11,15 @@ from urllib.parse import quote_from_bytes
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "src/app"
 REPORT = re.compile(rb"\x1b\]7;([^\x07]*)\x07")
+MARK = re.compile(rb"\x1b\]133;([^\x07]*)\x07")
 
 
-def run(command, commands, environment=None, *, interactive=True, cwd=None):
+def run(command, commands, environment=None, *, interactive=True, cwd=None, merge_output=False):
     result = subprocess.run(
         [*command, "-i"] if interactive else command,
         input=commands.encode("utf-8"),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_output else subprocess.PIPE,
         env={**os.environ, "TERM": "dumb", **(environment or {})},
         cwd=cwd,
         timeout=20,
@@ -131,6 +133,70 @@ typeset -gra precmd_functions=(original)
     print("Zsh directory setup preserves hooks and status and reports encoded OSC 7 paths.")
 
 
+def check_zsh_integration(executable, directory):
+    command = [executable, "-f"]
+    setup = "\n".join((SCRIPTS / script).read_text(encoding="utf-8") for script in (
+        "zsh-directory.zsh", "zsh-integration.zsh",
+    ))
+    startup = r"""PS1='fixture:%? > '
+PROMPT_EOL_MARK=''
+fixture_precmd() { builtin printf 'existing-prompt=%s\n' "$?"; }
+fixture_preexec() { builtin printf 'existing-preexec\n'; }
+precmd_functions=(fixture_precmd)
+preexec_functions=(fixture_preexec)
+setopt KSH_ARRAYS
+"""
+    tail = r"""builtin printf 'recording-started\n'
+cd -- "$W11TERM_TEST_SHELL_DIRECTORY" || exit 73
+builtin printf 'directory=<%s>\n' "$PWD"
+(exit 23)
+builtin printf 'previous=%s\n' "$?"
+
+PS1='changed:%? > '
+builtin printf 'raw-prompt=<%s>\n' "$PS1"
+exit 0
+"""
+    output, _ = run(
+        command,
+        "\n".join((startup, setup, setup, tail)),
+        {"W11TERM_TEST_SHELL_DIRECTORY": str(directory)},
+        merge_output=True,
+    )
+    assert b"command not found" not in output, output
+    assert output.count(b"w11term command recording is enabled") == 1, output
+    assert output.count(b"w11term directory reporting is enabled") == 1, output
+    cycle = output.split(b"recording-started\n", 1)[1]
+    check_directory_report(REPORT.findall(cycle), cycle)
+    assert b"\x1b]133;A\x07fixture:23 > \x1b]133;B\x07" in cycle, cycle
+    assert b"\x1b]133;A\x07changed:0 > \x1b]133;B\x07" in cycle, cycle
+    assert b"raw-prompt=<changed:%? > >\n" in cycle, cycle
+    assert b"previous=23\n" in cycle and b"existing-prompt=23\n" in cycle, cycle
+    assert b"existing-preexec\n\x1b]133;C\x07" in cycle, cycle
+    assert b"\x1b]133;D;23\x07existing-prompt=23\n" in cycle, cycle
+    commands = [mark for mark in MARK.findall(cycle) if mark.startswith((b"C", b"D"))]
+    assert commands == [
+        b"D;0",
+        b"C", b"D;0",  # cd
+        b"C", b"D;0",  # print the new directory
+        b"C", b"D;23",
+        b"C", b"D;0",  # print the previous status
+        b"C", b"D;0",  # replace PS1
+        b"C", b"D;0",  # inspect PS1
+        b"C",          # exit doesn't return to a prompt
+    ], commands
+
+    for startup, diagnostic in [
+        ("unsetopt PROMPT_PERCENT", b"requires the PROMPT_PERCENT option"),
+        ("typeset -gra preexec_functions=()", b"needs a writable prompt and prompt hooks"),
+        (r"PS1=$'%{\033]633;A\007%}other> '", b"already supplies semantic markers"),
+    ]:
+        stdout, stderr = run(command, "\n".join((startup, setup, "exit 0\n")))
+        assert diagnostic in stderr and not MARK.search(stdout + stderr), (stdout, stderr)
+    stdout, stderr = run(command, setup, interactive=False)
+    assert not stdout and not stderr, (stdout, stderr)
+    print("Zsh shell integration pairs command starts and exits and preserves prompt hooks.")
+
+
 def check_fish(executable, directory):
     setup = (SCRIPTS / "fish-directory.fish").read_text(encoding="utf-8")
     # A forced interactive shell handles explicit prompt events even with
@@ -213,6 +279,7 @@ def main():
             check_bash(args.bash, directory)
         if args.shell in ("all", "zsh"):
             check_zsh(args.zsh, directory)
+            check_zsh_integration(args.zsh, directory)
         if args.shell in ("all", "fish"):
             check_fish(args.fish, directory)
 

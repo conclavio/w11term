@@ -64,7 +64,7 @@ mod local_profile;
 mod pane_drop;
 mod pattern_settings;
 mod saved_commands;
-mod shell_directory_setup;
+mod shell_setup;
 mod word_delimiters;
 mod wsl_path;
 use file_drawer::{FileAction, FileDrawer};
@@ -753,8 +753,8 @@ fn tab_menu_message(label: String) -> Message {
         }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
-        command if let Some(shell) = shell_directory_setup::Shell::from_label(command) => {
-            Message::CopyShellDirectorySetup(shell)
+        command if let Some(setup) = shell_setup::Setup::from_label(command) => {
+            Message::CopyShellSetup(setup)
         }
         "Clear scrollback" => Message::Shortcut(Shortcut::ClearScrollback),
         "Command history" => Message::History(command_history::Action::Open),
@@ -1094,7 +1094,7 @@ pub enum Message {
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
     CopyLastCommand,
-    CopyShellDirectorySetup(shell_directory_setup::Shell),
+    CopyShellSetup(shell_setup::Setup),
     History(command_history::Action),
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
@@ -3874,7 +3874,7 @@ impl TerminalApp {
             if live.session.is_direct_ssh_shell()
                 || matches!(&live.source, Source::Local(shell) if shell.wsl_distribution().is_some())
             {
-                items.extend(shell_directory_setup::Shell::menu_items());
+                items.extend(shell_setup::Setup::menu_items());
             }
             items.push(command_menu_item(
                 "rename-pane",
@@ -4893,11 +4893,9 @@ impl Component for TerminalApp {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
-            Message::CopyShellDirectorySetup(shell) => {
-                if let Err(error) = shell.copy() {
-                    self.window_error = Some(format!(
-                        "Couldn’t copy the shell directory setup. {error:#}"
-                    ));
+            Message::CopyShellSetup(setup) => {
+                if let Err(error) = setup.copy() {
+                    self.window_error = Some(format!("Couldn’t copy the shell setup. {error:#}"));
                 }
             }
             Message::History(action) => self.handle_history(action, context),
