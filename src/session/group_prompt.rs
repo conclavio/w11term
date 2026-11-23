@@ -187,7 +187,12 @@ mod tests {
         assert!(matcher.still_matches(&terminal));
         assert!(events.claim_shell_prompt(token));
         let (status, execution) = watch::channel(GroupExecution::AwaitingPrompt);
-        events.observe_group_command(1, "show".into(), status);
+        events.observe_group_command(
+            1,
+            "show".into(),
+            status,
+            crate::events::GroupTranscript::default().host(1),
+        );
         for bytes in [
             b" ".as_slice(),
             b"\x1b[1C\x1b[1D",

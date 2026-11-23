@@ -1212,7 +1212,12 @@ mod tests {
         events.command_stream(Some(1));
         term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
-        events.observe_group_command(1, "echo east".into(), notice);
+        events.observe_group_command(
+            1,
+            "echo east".into(),
+            notice,
+            crate::events::GroupTranscript::default().host(1),
+        );
         term.advance_bytes(b"echo east\r\n\x1b]133;C\x07");
         let GroupExecution::Running(target) = *outcome.borrow() else {
             panic!("expected running command")
@@ -1245,7 +1250,12 @@ mod tests {
 
         term.advance_bytes(b"\x1b]633;A\x07$ \x1b]633;B\x07");
         let (notice, late) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
-        events.observe_group_command(1, "echo west".into(), notice);
+        events.observe_group_command(
+            1,
+            "echo west".into(),
+            notice,
+            crate::events::GroupTranscript::default().host(1),
+        );
         term.advance_bytes(b"\r\n\x1b]633;C\x07west result\r\n");
         assert!(matches!(*late.borrow(), GroupExecution::AwaitingMarkers));
         term.advance_bytes(b"\x1b]633;E;echo west\x07");
@@ -1256,12 +1266,91 @@ mod tests {
 
         term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         let (notice, prompt_only) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
-        events.observe_group_command(1, "next".into(), notice);
+        events.observe_group_command(
+            1,
+            "next".into(),
+            notice,
+            crate::events::GroupTranscript::default().host(1),
+        );
         term.advance_bytes(b"next\r\n\x1b]133;C\x07output\r\n\x1b]133;A\x07");
         assert!(
             matches!(&*prompt_only.borrow(), GroupExecution::Finished(result)
             if result.exit_code.is_none())
         );
+    }
+
+    #[test]
+    fn live_group_output_waits_for_the_verified_line_and_publishes_each_rendered_line_once() {
+        use crate::events::{GroupExecution, GroupTranscript};
+
+        let (mut term, events) = watched_terminal();
+        let transcript = GroupTranscript::default();
+        let lines = || {
+            transcript
+                .snapshot()
+                .lines
+                .into_iter()
+                .map(|line| line.text.to_string())
+                .collect::<Vec<_>>()
+        };
+        events.command_stream(Some(1));
+        term.advance_bytes(b"\x1b]633;A\x07$ \x1b]633;B\x07");
+        let (notice, result) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+        events.observe_group_command(1, "show".into(), notice, transcript.host(42));
+        term.advance_bytes(b"\r\n\x1b]633;C\x07\x1b[31mfirst\x1b[0m\r\nunfinished");
+        term.notify_running_shell_output();
+        assert!(lines().is_empty());
+        term.advance_bytes(b"\x1b]633;E;show\x07");
+        term.notify_running_shell_output();
+        term.notify_running_shell_output();
+        assert_eq!(lines(), ["first"]);
+        term.advance_bytes(b"\x1b[?1049halternate\r\n");
+        term.notify_running_shell_output();
+        assert_eq!(lines(), ["first"]);
+        term.advance_bytes(
+            b"\x1b[?1049l\x1b]633;D;0\x07\r\n\x1b]633;A\x07new prompt\x1b]633;B\x07",
+        );
+        term.notify_running_shell_output();
+        assert!(matches!(*result.borrow(), GroupExecution::Finished(_)));
+        assert_eq!(lines(), ["first", "unfinished"]);
+        assert!(
+            transcript
+                .snapshot()
+                .lines
+                .iter()
+                .all(|line| line.pane == 42)
+        );
+    }
+
+    #[test]
+    fn live_group_output_resumes_after_reflow_and_bounds_wrapped_unicode_lines() {
+        use crate::events::{GroupExecution, GroupTranscript};
+
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(1));
+        term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let transcript = GroupTranscript::default();
+        let (notice, _result) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+        events.observe_group_command(1, "run".into(), notice, transcript.host(1));
+        term.advance_bytes(b"run\r\n\x1b]133;C\x07before resize\r\n");
+        term.notify_running_shell_output();
+        term.resize(TerminalSize {
+            cols: 20,
+            rows: 12,
+            ..TerminalSize::default()
+        });
+        term.notify_running_shell_output();
+
+        let text = format!("{}\r\nafter resize\r\n", "雪".repeat(400));
+        term.advance_bytes(text.as_bytes());
+        term.notify_running_shell_output();
+        let snapshot = transcript.snapshot();
+        assert_eq!(snapshot.lines.len(), 4);
+        assert_eq!(&*snapshot.lines[0].text, "before resize");
+        assert!(snapshot.lines[1].text.contains("was skipped"));
+        assert!(snapshot.lines[2].shortened);
+        assert_eq!(&*snapshot.lines[2].text, "雪".repeat(341));
+        assert_eq!(&*snapshot.lines[3].text, "after resize");
     }
 
     #[test]
@@ -1273,7 +1362,12 @@ mod tests {
         for _ in 0..2 {
             term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
             let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
-            events.observe_group_command(1, "run".into(), notice);
+            events.observe_group_command(
+                1,
+                "run".into(),
+                notice,
+                crate::events::GroupTranscript::default().host(1),
+            );
             term.advance_bytes(b"run\r\n\x1b]133;C\x07");
             let GroupExecution::Running(target) = *outcome.borrow() else {
                 panic!("expected running command")
@@ -1306,13 +1400,23 @@ mod tests {
         ] {
             term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
             let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
-            events.observe_group_command(1, "run".into(), notice);
+            events.observe_group_command(
+                1,
+                "run".into(),
+                notice,
+                crate::events::GroupTranscript::default().host(1),
+            );
             term.advance_bytes(tail);
             assert!(matches!(*outcome.borrow(), GroupExecution::Unavailable(_)));
         }
         term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
         let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
-        events.observe_group_command(1, "run".into(), notice);
+        events.observe_group_command(
+            1,
+            "run".into(),
+            notice,
+            crate::events::GroupTranscript::default().host(1),
+        );
         term.advance_bytes(b"run\r\n\x1b]133;C\x07");
         let GroupExecution::Running(link) = *outcome.borrow() else {
             panic!("expected running command")

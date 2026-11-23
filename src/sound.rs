@@ -34,6 +34,15 @@ impl wezterm_term::AlertHandler for Alerts {
         self.events.group_command_line(id, label);
     }
 
+    fn live_shell_output(
+        &mut self,
+        id: u64,
+        label: Option<&str>,
+        output: wezterm_term::LiveCommandOutput<'_>,
+    ) {
+        self.events.live_shell_output(id, label, output);
+    }
+
     fn alert(&mut self, alert: wezterm_term::Alert) {
         use wezterm_term::Alert;
         match alert {

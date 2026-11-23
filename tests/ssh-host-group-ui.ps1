@@ -166,6 +166,37 @@ try {
     Outcome $westName 'Running'
     $null = Wait-Until 'East output in the group' { Find-Element 'east-accepted both' }
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
+    $liveButton = 'Live output' + [char]0x2026
+    Click $liveButton
+    $null = Wait-Until 'completed East output in the live feed' {
+        (Find-Element 'SSH group live output') -and
+            (Find-Element 'east-accepted both') -and (Find-Element "Focus output pane $east" $button)
+    }
+    [IO.File]::WriteAllText((Join-Path $State 'release-west-preview'), '')
+    $null = Wait-Until 'running West output appears above the earlier East output' {
+        $westLine = Find-Element 'west live first'
+        $eastLine = Find-Element 'east-accepted both'
+        $westLine -and $eastLine -and $westLine.Current.BoundingRectangle.Top -lt $eastLine.Current.BoundingRectangle.Top
+    }
+    Click 'Pause output'
+    $null = Wait-Until 'output is paused' { Find-Element 'Resume output' $button }
+    [IO.File]::WriteAllText((Join-Path $State 'release-west-paused'), '')
+    $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west while paused')
+    $until = [DateTime]::UtcNow.AddMilliseconds(650)
+    do {
+        if (Find-Element 'west while paused') { throw 'Output changed while paused' }
+        Start-Sleep -Milliseconds 120
+    } while ([DateTime]::UtcNow -lt $until)
+    Click 'Resume output'
+    $null = Wait-Until 'output received while paused is available on resume' { Find-Element 'west while paused' }
+    Click "Focus output pane $west"
+    Wait-Focus $west
+    Run-Palette 'SSH host group'
+    $null = Wait-Until 'the same output view returns after focusing its source pane' {
+        (Find-Element 'SSH group live output') -and (Find-Element 'west while paused')
+    }
+    Click 'Back to results'
+    Outcome $westName 'Running'
     Set-ResultFilter 'Running'
     $null = Wait-Until 'show the running result only' {
         (Find-Element "Focus result pane $west" $button) -and !(Find-Element "Focus result pane $east" $button)
@@ -214,7 +245,11 @@ try {
     Outcome $westName 'Running'
     [IO.File]::WriteAllText((Join-Path $State 'release-west-result'), '')
     Outcome $westName 'Exit 17'
-    $null = Wait-Until 'distinct West output in the earlier submission' { Find-Element 'west-accepted both' }
+    Click $liveButton
+    $null = Wait-Until 'completed West output in the earlier live feed' {
+        (Find-Element 'west-accepted both') -and (Find-Element 'west while paused')
+    }
+    Click 'Back to results'
     Result-Progress "2 of 2 settled${dot}0 waiting${dot}0 running${dot}1 succeeded${dot}1 needs attention"
     Set-ResultFilter 'Needs attention'
     $null = Wait-Until 'show only the failed result' {
@@ -226,6 +261,7 @@ try {
         $report -and $report.StartsWith("Submitted${dot}both") -and
             $report.Contains("  Exit 0") -and $report.Contains('east-accepted both') -and
             $report.Contains("  Exit 17") -and $report.Contains('west-accepted both') -and
+            $report.Contains('west while paused') -and
             !$report.Contains('east-report-tail')
     }
     Click "View output for pane $west"

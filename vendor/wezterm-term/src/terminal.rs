@@ -104,6 +104,13 @@ pub trait AlertHandler: Send + Sync {
     }
     /// A shell may report the command line after marking the start of its output.
     fn shell_command_line(&mut self, _id: u64, _label: Option<&str>) {}
+    fn live_shell_output(
+        &mut self,
+        _id: u64,
+        _label: Option<&str>,
+        _output: crate::LiveCommandOutput<'_>,
+    ) {
+    }
     fn terminal_reset(&mut self) {}
 }
 

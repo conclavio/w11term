@@ -9,9 +9,11 @@ use std::{
 };
 use tokio::sync::Notify;
 mod group_command;
+mod group_transcript;
 mod inbox;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
+pub use group_transcript::{GroupTranscript, GroupTranscriptHost, GroupTranscriptSnapshot};
 pub use inbox::Inbox;
 pub(crate) use inbox::display_field;
 
@@ -361,6 +363,7 @@ impl Events {
         generation: u64,
         text: Arc<str>,
         status: tokio::sync::watch::Sender<GroupExecution>,
+        transcript: GroupTranscriptHost,
     ) {
         let mut state = self.state.lock().unwrap();
         state.group_serial += 1;
@@ -368,8 +371,20 @@ impl Events {
             generation,
             serial: state.group_serial,
         };
-        if let Some(previous) = state.group_run.replace(GroupRun::new(target, text, status)) {
+        let run = GroupRun::new(target, text, status, transcript);
+        if let Some(previous) = state.group_run.replace(run) {
             previous.abandon("The pane began a new group submission.");
+        }
+    }
+
+    pub(crate) fn live_shell_output(
+        &self,
+        id: u64,
+        label: Option<&str>,
+        output: wezterm_term::LiveCommandOutput<'_>,
+    ) {
+        if let Some(run) = &mut self.state.lock().unwrap().group_run {
+            run.live_output(id, label, output);
         }
     }
 

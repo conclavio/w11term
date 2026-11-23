@@ -9,6 +9,11 @@ use std::sync::Arc;
 use termwiz::input::KeyboardEncoding;
 use wezterm_surface::SequenceNo;
 
+mod live_command_output;
+pub use live_command_output::{
+    LiveCommandOutput, LiveOutputBatch, LiveOutputCursor, LiveOutputLine,
+};
+
 /// Horizontal scale of a DEC line rendition relative to the terminal grid.
 pub fn line_width_scale(line: &Line) -> usize {
     if line.is_double_width() || line.is_double_height_top() || line.is_double_height_bottom() {
@@ -59,6 +64,9 @@ pub struct Screen {
     /// Identifies one interpretation of stable row coordinates. Ordinary output
     /// and natural history eviction preserve it.
     row_epoch: u64,
+    // Buffer coordinates change on reflow, while a screen switch only
+    // invalidates consumers that track whichever buffer is visible.
+    command_output_revision: u64,
     /// Insertion rectangles are valid until a row is moved, reflowed or discarded.
     pub(crate) placement_row_revision: u64,
     /// Identifies an explicit history erasure, which preserves surviving row coordinates.
@@ -132,6 +140,7 @@ impl Screen {
             physical_cols,
             stable_row_index_offset: 0,
             row_epoch: Self::next_row_epoch(),
+            command_output_revision: 0,
             placement_row_revision: 0,
             history_clear_count: 0,
             command_start: None,
@@ -156,6 +165,11 @@ impl Screen {
     }
 
     pub(crate) fn invalidate_row_coordinates(&mut self) {
+        self.command_output_revision = self.command_output_revision.wrapping_add(1);
+        self.invalidate_visible_rows();
+    }
+
+    pub(crate) fn invalidate_visible_rows(&mut self) {
         self.row_epoch = Self::next_row_epoch();
         self.placement_rows_changed();
     }

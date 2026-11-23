@@ -157,6 +157,7 @@ mod tests {
         let submission = Submission {
             id: 1,
             text: "show".into(),
+            transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
                 captured(8, "missing tail".into(), true),
@@ -194,6 +195,7 @@ mod tests {
         let submission = Submission {
             id: 1,
             text: "show".into(),
+            transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),
                 captured(8, "月".repeat(400), false),

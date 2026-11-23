@@ -97,6 +97,7 @@ pub enum Command {
         text: Arc<str>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
         execution: tokio::sync::watch::Sender<crate::events::GroupExecution>,
+        transcript: crate::events::GroupTranscriptHost,
     },
     InterruptGroupCommand {
         target: crate::events::GroupInterruptTarget,
@@ -949,7 +950,7 @@ async fn run(
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
                     Some(Command::MirroredKeyboard(_)) => unreachable!("mirrored input was unwrapped above"),
-                    Some(Command::SendGroupCommand { prompt, text, reply, execution }) => {
+                    Some(Command::SendGroupCommand { prompt, text, reply, execution, transcript }) => {
                         let kind = terminal::ScopedInput::GroupCommand;
                         let ready = match events.shell_prompt() {
                             Some(ShellPrompt::Ready(current)) => current == prompt && terminal.at_shell_input_start(),
@@ -979,7 +980,7 @@ async fn run(
                         match terminal::group_command_bytes(&terminal, &text) {
                             Ok(bytes) => {
                                 if write_group_input(&writer, prompt.connection, bytes, reply, kind) {
-                                    events.observe_group_command(prompt.connection, text, execution);
+                                    events.observe_group_command(prompt.connection, text, execution, transcript);
                                 }
                             }
                             Err(error) => { let _ = reply.send(Err(error.to_string())); }
@@ -1427,6 +1428,9 @@ async fn run(
                             let program_before = terminal.program_status().cloned();
                             let seq_before = terminal.current_seqno();
                             scroll_offset = presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                            if group_shell {
+                                terminal.notify_running_shell_output();
+                            }
                             if let Some(matcher) = &mut prompt_matcher
                                 && connection_generation != 0
                                 && prompts.current().is_none()
@@ -1543,6 +1547,7 @@ fn resize_model(
     scroll_offset: &mut usize,
 ) {
     terminal.resize(size);
+    terminal.notify_running_shell_output();
     if !terminal.is_alt_screen_active() {
         *scroll_offset = (*scroll_offset).min(crate::search::max_offset(terminal));
     }
