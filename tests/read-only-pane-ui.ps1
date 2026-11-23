@@ -74,6 +74,29 @@ try {
     Run-Palette 'Disable read-only pane input'
     foreach ($c in 'resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','resumed')
+
+    Picker-Query 'Palette PowerShell'
+    Press-Key 13
+    Wait-Focus $local
+    $button = [System.Windows.Automation.ControlType]::Button
+    $stop = 'Stop broadcasting typing'
+    Run-Palette 'Broadcast typing to panes'
+    $null = Wait-Until 'broadcast indicator' { Find-Element $stop $button }
+    foreach ($c in "'fanout-' + (40+7)".ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
+    Press-Key 13
+    $null = Control @('wait-for-text','--pane',"$local",'--timeout','10','fanout-47')
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','fanout-')
+
+    $null = Control @('send-text','--pane',"$remote",'--no-paste','raw-only')
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','raw-only')
+    if ((Control @('get-text','--pane',"$local")).text -match 'raw-only') { throw 'Targeted control input leaked into PowerShell' }
+
+    Run-Palette 'Enable read-only pane input'
+    $null = Wait-Until 'broadcast stops when a pane is locked' { !(Find-Element $stop $button) }
+    Run-Palette 'Disable read-only pane input'
+    foreach ($c in "'after-fanout-' + (8+1)".ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
+    Press-Key 13
+    $null = Control @('wait-for-text','--pane',"$local",'--timeout','10','after-fanout-9')
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

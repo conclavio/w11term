@@ -670,9 +670,14 @@ async fn native_clear_scrollback_preserves_the_ssh_prompt_and_neighboring_powers
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "locks and unlocks input in a live SSH and PowerShell split through the native UI"]
+#[ignore = "locks, unlocks, and broadcasts input in a live SSH and PowerShell split through the native UI"]
 async fn native_read_only_input_is_per_pane_in_a_mixed_split() {
-    run_palette_fixture("read-only-pane-ui.ps1", b"resumed", None).await;
+    run_palette_fixture(
+        "read-only-pane-ui.ps1",
+        b"resumed'fanout-' + (40+7)\rraw-only",
+        None,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

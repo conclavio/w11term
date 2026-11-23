@@ -65,11 +65,19 @@ struct HeldKey {
     vk: u32,
     key: KeyCode,
     details: Option<KeyDetails>,
+    mirrored: bool,
+}
+
+impl HeldKey {
+    fn peers<'a>(&self, peers: &'a [BroadcastTarget]) -> &'a [BroadcastTarget] {
+        if self.mirrored { peers } else { &[] }
+    }
 }
 
 struct State {
     read_only: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     target: Option<Target>,
+    broadcast: Vec<BroadcastTarget>,
     shortcut: Box<dyn Fn(Shortcut)>,
     swallowed: HashSet<KeySlot>,
     pressed: HashMap<KeySlot, HeldKey>,
@@ -100,6 +108,12 @@ struct State {
     native_late_char: Option<KeySlot>,
     game_mode: bool,
     close_handler: Option<Box<dyn Fn()>>,
+}
+
+pub(crate) struct BroadcastTarget {
+    pub(crate) sender: mpsc::UnboundedSender<Command>,
+    pub(crate) events: w11term::events::Events,
+    pub(crate) connection: u64,
 }
 
 struct Target {
@@ -332,6 +346,20 @@ impl KeyboardBridge {
             }
         });
         ime::sync_context();
+    }
+
+    pub(crate) fn set_broadcast(&self, peers: Vec<BroadcastTarget>) {
+        let _native = self.scope.enter();
+        ime::cancel();
+        with_input_mut(|input| {
+            if let Some(state) = input {
+                state
+                    .local_held
+                    .extend(state.pressed.keys().map(|&slot| (slot, false)));
+                state.release_keys();
+                state.broadcast = peers;
+            }
+        });
     }
 
     pub fn set_read_only(
@@ -641,11 +669,20 @@ impl KeyboardBridge {
         let _native = self.scope.enter();
         let owns_input = with_input_mut(|input| {
             if let Some(s) = input
-                && s.target
-                    .as_ref()
-                    .is_some_and(|target| target.sender.same_channel(sender))
+                && let Some(target) = &s.target
+                && target.sender.same_channel(sender)
             {
-                s.pressed.clear();
+                // Other panes may still own presses from the old connection.
+                for (_, held) in s.pressed.drain() {
+                    let release = key_command(
+                        held.key,
+                        held.details.as_ref(),
+                        KeyModifiers::NONE,
+                        false,
+                        None,
+                    );
+                    mirror_keyboard(&target.sender, held.peers(&s.broadcast), &release);
+                }
                 s.surrogate = None;
                 return true;
             }
@@ -1004,16 +1041,15 @@ pub fn modifiers() -> KeyModifiers {
     mods
 }
 
-fn emit_key(
-    sender: &mpsc::UnboundedSender<Command>,
+fn key_command(
     key: KeyCode,
     details: Option<&KeyDetails>,
     mut modifiers: KeyModifiers,
     down: bool,
     repeat_scan: Option<(u32, u32)>,
-) {
+) -> Command {
     let repeat = repeat_scan.is_some();
-    let command = if let Some(details) = details {
+    if let Some(details) = details {
         let mut details = details.clone();
         if details.altgr
             && modifiers.contains(KeyModifiers::CTRL | KeyModifiers::ALT)
@@ -1062,9 +1098,66 @@ fn emit_key(
             down,
             repeat,
         }
-    };
-    let _ = sender.send(command);
+    }
 }
+
+fn emit_key(
+    sender: &mpsc::UnboundedSender<Command>,
+    peers: &[BroadcastTarget],
+    key: KeyCode,
+    details: Option<&KeyDetails>,
+    modifiers: KeyModifiers,
+    down: bool,
+    repeat_scan: Option<(u32, u32)>,
+) -> bool {
+    send_keyboard(
+        sender,
+        peers,
+        key_command(key, details, modifiers, down, repeat_scan),
+    )
+}
+
+fn mirror_keyboard(
+    sender: &mpsc::UnboundedSender<Command>,
+    peers: &[BroadcastTarget],
+    command: &Command,
+) -> bool {
+    if !peers.iter().any(|peer| peer.sender.same_channel(sender)) {
+        return false;
+    }
+    let release = matches!(
+        command,
+        Command::Key { down: false, .. } | Command::DetailedKey { down: false, .. }
+    );
+    if !release
+        && peers
+            .iter()
+            .any(|peer| peer.events.shell_generation() != Some(peer.connection))
+    {
+        return false;
+    }
+    let mut mirrored = false;
+    for peer in peers
+        .iter()
+        .filter(|peer| !peer.sender.same_channel(sender))
+    {
+        if let Some(command) = command.mirrored_keyboard(peer.connection) {
+            mirrored |= peer.sender.send(command).is_ok();
+        }
+    }
+    mirrored
+}
+
+fn send_keyboard(
+    sender: &mpsc::UnboundedSender<Command>,
+    peers: &[BroadcastTarget],
+    command: Command,
+) -> bool {
+    let mirrored = mirror_keyboard(sender, peers, &command);
+    let _ = sender.send(command);
+    mirrored
+}
+
 fn clear_command_modifiers(keyboard: &mut [u8; 256]) {
     for modifier in [
         VK_CONTROL,
@@ -1142,6 +1235,7 @@ impl State {
     fn new(shortcut: impl Fn(Shortcut) + 'static) -> Self {
         Self {
             target: None,
+            broadcast: Vec::new(),
             shortcut: Box::new(shortcut),
             swallowed: HashSet::new(),
             read_only: None,
@@ -1186,6 +1280,7 @@ impl State {
             for (_, held) in self.pressed.drain() {
                 emit_key(
                     &target.sender,
+                    held.peers(&self.broadcast),
                     held.key,
                     held.details.as_ref(),
                     KeyModifiers::NONE,
@@ -1788,6 +1883,7 @@ impl State {
                     if !self.game_mode {
                         emit_key(
                             sender,
+                            held.peers(&self.broadcast),
                             held.key,
                             held.details.as_ref(),
                             mods,
@@ -1862,8 +1958,24 @@ impl State {
                         });
                     }
                     (self.shortcut)(Shortcut::ClearSelection);
-                    emit_key(sender, key, details.as_ref(), mods, true, None);
-                    self.pressed.insert(slot, HeldKey { vk, key, details });
+                    let mirrored = emit_key(
+                        sender,
+                        &self.broadcast,
+                        key,
+                        details.as_ref(),
+                        mods,
+                        true,
+                        None,
+                    );
+                    self.pressed.insert(
+                        slot,
+                        HeldKey {
+                            vk,
+                            key,
+                            details,
+                            mirrored,
+                        },
+                    );
                     true
                 } else {
                     // Modifiers/dead keys must not trigger WinUI keyboard navigation.
@@ -1872,7 +1984,15 @@ impl State {
             }
             WM_KEYUP | WM_SYSKEYUP => {
                 if let Some(held) = self.pressed.remove(&slot) {
-                    emit_key(sender, held.key, held.details.as_ref(), mods, false, None);
+                    emit_key(
+                        sender,
+                        held.peers(&self.broadcast),
+                        held.key,
+                        held.details.as_ref(),
+                        mods,
+                        false,
+                        None,
+                    );
                     return true;
                 }
                 false
@@ -1893,7 +2013,7 @@ impl State {
                     .map(|high| vec![high, unit])
                     .unwrap_or_else(|| vec![unit]);
                 let text = String::from_utf16_lossy(&units);
-                let _ = sender.send(Command::Text(text));
+                send_keyboard(sender, &self.broadcast, Command::Text(text));
                 true
             }
             WM_MOUSEWHEEL | WM_POINTERWHEEL => {
@@ -2871,6 +2991,7 @@ mod tests {
                     HeldKey {
                         vk: 0x58,
                         key: KeyCode::Char('x'),
+                        mirrored: false,
                         details: Some(KeyDetails {
                             base: Some('x'),
                             ..KeyDetails::default()
@@ -3050,6 +3171,7 @@ mod tests {
                 HeldKey {
                     vk: 0x58,
                     key: KeyCode::Char('x'),
+                    mirrored: false,
                     details: None,
                 },
             )]),

@@ -79,7 +79,15 @@ impl Composition {
         let Some(surface) = &self.surface else { return };
         if let Some(text) = result {
             if !text.is_empty() {
-                let _ = surface.sender.send(Command::Composed(text));
+                let command = Command::Composed(text);
+                with_input(|input| {
+                    if let Ok(state) = input.try_borrow()
+                        && let Some(state) = state.as_ref()
+                    {
+                        mirror_keyboard(&surface.sender, &state.broadcast, &command);
+                    }
+                });
+                let _ = surface.sender.send(command);
             }
             self.preedit = Preedit::default();
             self.offset = 0;
