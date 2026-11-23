@@ -997,6 +997,17 @@ impl TerminalState {
         }
     }
 
+    /// The cursor is still at the primary screen's last reported input boundary.
+    pub fn at_shell_input_start(&self) -> bool {
+        !self.is_alt_screen_active()
+            && self.capturing_shell_input
+            && self.screen.command_start
+                == Some((
+                    self.screen().visible_row_to_stable_row(self.cursor.y),
+                    self.shell_column(),
+                ))
+    }
+
     fn mark_shell_position(&mut self) {
         if !self.is_alt_screen_active() {
             self.screen.command_start = Some((

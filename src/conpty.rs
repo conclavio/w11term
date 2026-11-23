@@ -58,12 +58,15 @@ fn write_input(
             TransportInput::Data(bytes) | TransportInput::Automatic(bytes) => {
                 pipe.write_all(&bytes).context("write local input")?
             }
-            TransportInput::Clipboard {
-                connection, reply, ..
+            TransportInput::Scoped {
+                connection,
+                reply,
+                kind,
+                ..
             } if connection != generation => {
-                let _ = reply.send(Err(crate::terminal::STALE_PASTE.into()));
+                let _ = reply.send(Err(kind.stale_error().into()));
             }
-            TransportInput::Raw(bytes, reply) | TransportInput::Clipboard { bytes, reply, .. } => {
+            TransportInput::Raw(bytes, reply) | TransportInput::Scoped { bytes, reply, .. } => {
                 let result = pipe.write_all(&bytes);
                 let _ = reply.send(
                     result

@@ -90,6 +90,11 @@ pub enum Command {
     ClipboardPaste(ClipboardPaste, ClipboardReply),
     Text(String),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
+    SendGroupCommand {
+        prompt: crate::events::PromptToken,
+        text: Arc<str>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
     /// Capture immutable UTF-8 text on this worker. The caller owns all file I/O.
     ExportText(tokio::sync::oneshot::Sender<Result<String, &'static str>>),
@@ -633,6 +638,8 @@ async fn run(
     // A durable backend may reconstruct an old screen at any time. Its OSC
     // 133 bytes cannot be used to announce a newly completed command.
     let live_commands = sharing.durable.is_none() && can_watch_commands(&source);
+    let group_shell =
+        direct_ssh_shell(&source, sharing.durable.is_some(), sharing.startup.as_ref());
     let restartable = can_restart(live_commands, sharing.startup.as_ref());
     let mut launch =
         launch::Launcher::new(source.clone(), sharing, prompts.clone(), events.clone());
@@ -873,6 +880,7 @@ async fn run(
                 let command = if phase != Phase::Running || queued_offline {
                     match command {
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("No active terminal connection; clipboard text was not sent".into())); continue; }
+                        Some(Command::SendGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
@@ -884,6 +892,7 @@ async fn run(
                 let command = if read_only {
                     match command {
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("Pane input is read-only".into())); continue; }
+                        Some(Command::SendGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
                         Some(Command::Raw(_, reply)) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
@@ -894,11 +903,61 @@ async fn run(
                         other => other,
                     }
                 } else { command };
+                if group_shell && matches!(events.shell_prompt(), Some(
+                    crate::events::ShellPrompt::Ready(_) | crate::events::ShellPrompt::Opening
+                )) && match &command {
+                    Some(Command::Key { key, modifiers, down, repeat }) =>
+                        terminal::encode_key_input(&terminal, *key, *modifiers, *down, *repeat, &Default::default())
+                            .is_ok_and(|wire| !wire.is_empty()),
+                    Some(Command::DetailedKey { key, modifiers, down, repeat, details }) =>
+                        terminal::encode_key_input(&terminal, *key, *modifiers, *down, *repeat, details)
+                            .is_ok_and(|wire| !wire.is_empty()),
+                    Some(Command::Paste(text) | Command::Text(text) | Command::Composed(text)) => !text.is_empty(),
+                    Some(Command::Raw(bytes, _)) => !bytes.is_empty(),
+                    Some(Command::Mouse(_) | Command::MouseLeave { .. } | Command::Wheel(..)) => terminal.is_mouse_grabbed(),
+                    Some(Command::Focus(_)) => terminal.focus_tracking_enabled(),
+                    _ => false,
+                } {
+                    events.invalidate_shell_prompt();
+                }
                 let mut changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
                 let old_offset=scroll_offset;
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
                     Some(Command::MirroredKeyboard(_)) => unreachable!("mirrored input was unwrapped above"),
+                    Some(Command::SendGroupCommand { prompt, text, reply }) => {
+                        let kind = terminal::ScopedInput::GroupCommand;
+                        let rejected = if !group_shell || player.read().unwrap().rustmush {
+                            Some("Group commands require a direct SSH shell.")
+                        } else if connection_generation != prompt.connection {
+                            Some(kind.stale_error())
+                        } else if prompts.current().is_some() {
+                            Some("The host requires authentication.")
+                        } else if terminal.is_alt_screen_active() {
+                            Some("The host is on the alternate screen.")
+                        } else if !crate::saved_commands::valid_command_text(&text) {
+                            Some("Enter one command line of up to 4096 bytes.")
+                        } else if !terminal.at_shell_input_start() || !events.claim_shell_prompt(prompt) {
+                            Some("The verified prompt changed before the command was sent.")
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = rejected {
+                            let _ = reply.send(Err(reason.into()));
+                            continue;
+                        }
+                        match terminal::group_command_bytes(&terminal, &text) {
+                            Ok(bytes) => {
+                                if let Err(error) = writer.send(TransportInput::Scoped {
+                                    connection: prompt.connection, bytes, reply, kind,
+                                }) && let TransportInput::Scoped { reply, .. } = error.0 {
+                                    let _ = reply.send(Err("The host connection closed.".into()));
+                                }
+                            }
+                            Err(error) => { let _ = reply.send(Err(error.to_string())); }
+                        }
+                        Ok(())
+                    }
                     Some(Command::ClipboardPaste(request, reply)) => {
                         use clipboard::Decision;
                         if let ClipboardPaste::InsertHistory { connection, command, text } = &request {
@@ -924,6 +983,9 @@ async fn run(
                             Ok(Decision::Confirm(pending)) => { let _ = reply.send(Ok(Some(pending))); }
                             Ok(Decision::Send { text, .. }) if text.is_empty() => { let _ = reply.send(Ok(None)); }
                             Ok(Decision::Send { text, raw }) if interactive => {
+                                if group_shell {
+                                    events.invalidate_shell_prompt();
+                                }
                                 let bytes = if raw { text.into_bytes() } else {
                                     scroll_offset = 0;
                                     terminal.encode_paste(&text).into_bytes()
@@ -1310,6 +1372,11 @@ async fn run(
                             let before = terminal.get_progress();
                             let program_before = terminal.program_status().cloned();
                             scroll_offset = presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                            if group_shell && !terminal.at_shell_input_start()
+                                && matches!(events.shell_prompt(), Some(crate::events::ShellPrompt::Ready(_)))
+                            {
+                                events.invalidate_shell_prompt();
+                            }
                             if show_progress && (before != terminal.get_progress()
                                 || program_before.as_ref() != terminal.program_status())
                             {

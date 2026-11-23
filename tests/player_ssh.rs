@@ -16,7 +16,7 @@ use w11term::{
     prompts::{Answer, Prompts, Question},
     session::{Command, Session},
     ssh::{self, Event},
-    terminal::TransportInput,
+    terminal::{ScopedInput, TransportInput},
 };
 #[derive(Clone, Debug, PartialEq)]
 enum Seen {
@@ -882,10 +882,11 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
     let (reply, clipboard_response) = oneshot::channel();
     client
         .input
-        .send(TransportInput::Clipboard {
+        .send(TransportInput::Scoped {
             connection: 1,
             bytes: b"OFFLINE_PASTE".to_vec(),
             reply,
+            kind: ScopedInput::Clipboard,
         })
         .unwrap();
     client
@@ -906,14 +907,26 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
         let (reply, response) = oneshot::channel();
         client
             .input
-            .send(TransportInput::Clipboard {
+            .send(TransportInput::Scoped {
                 connection: generation,
                 bytes: paste.as_bytes().into(),
                 reply,
+                kind: ScopedInput::Clipboard,
             })
             .unwrap();
         assert_eq!(response.await.unwrap().is_ok(), accepted);
     }
+    let (reply, response) = oneshot::channel();
+    client
+        .input
+        .send(TransportInput::Scoped {
+            connection: 1,
+            bytes: b"STALE_GROUP_COMMAND\r".to_vec(),
+            reply,
+            kind: ScopedInput::GroupCommand,
+        })
+        .unwrap();
+    assert!(response.await.unwrap().unwrap_err().contains("reconnected"));
     client
         .input
         .send(TransportInput::Data(b"quit".to_vec()))
@@ -949,6 +962,7 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
     assert!(!observations.contains(&Seen::Data(b"MUST_NOT_REPLAY".to_vec())));
     assert!(!observations.contains(&Seen::Data(b"OFFLINE_PASTE".to_vec())));
     assert!(!observations.contains(&Seen::Data(b"STALE_PASTE".to_vec())));
+    assert!(!observations.contains(&Seen::Data(b"STALE_GROUP_COMMAND\r".to_vec())));
     let paste = Seen::Data(b"CURRENT_PASTE".to_vec());
     assert_eq!(observations.iter().filter(|e| **e == paste).count(), 1);
     assert!(

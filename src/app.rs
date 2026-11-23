@@ -56,6 +56,7 @@ mod file_picker;
 mod folder_revoke;
 mod folder_shares;
 mod folder_sharing_state;
+mod host_groups;
 mod identity_picker;
 mod keyboard_settings;
 mod live_profile;
@@ -382,6 +383,7 @@ enum Page {
     SharedFolders(folder_shares::Panel),
     Attention,
     CommandHistory(command_history::HistoryPage),
+    HostGroup(host_groups::HostGroup),
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
@@ -763,6 +765,7 @@ fn tab_menu_message(label: String) -> Message {
     match command.split(": ").next().unwrap_or(command) {
         "Terminal inspector" => Message::ToggleInspector,
         "Attention inbox" => Message::Attention(attention::Action::Open),
+        host_groups::LABEL => Message::HostGroup(host_groups::Action::Open),
         "Rename tab…" => Message::TabTitle(tab_title::Action::Show),
         "Duplicate tab layout" => Message::Shortcut(Shortcut::DuplicateTabLayout),
         "Reopen last closed tab layout" => Message::Shortcut(Shortcut::ReopenClosedTab),
@@ -973,6 +976,7 @@ pub struct TerminalApp {
     incoming: Option<Rc<tab_windows::Transfer>>,
     outgoing: Option<Rc<tab_windows::Transfer>>,
     window_timer: Option<crate::ui_timer::RetryTimer>,
+    host_group_timer: Option<crate::ui_timer::RetryTimer>,
     native_bound: bool,
     window_error: Option<String>,
     pending_directory_copy: Option<directory_split::PendingCopy>,
@@ -1120,6 +1124,7 @@ pub enum Message {
     CopyLastCommand,
     CopyShellSetup(shell_setup::Setup),
     History(command_history::Action),
+    HostGroup(host_groups::Action),
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
     Discovery(session_browser::Action),
@@ -2604,6 +2609,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.update_host_group_timer(context);
         if self.pointer_over.is_some_and(|id| !self.tabs.visible(id)) {
             self.change_pointer_pane(None);
         }
@@ -3731,6 +3737,7 @@ impl TerminalApp {
                 KeyAction::FindAllPanes,
             ),
             MenuItem::item("inbox", "Attention inbox"),
+            MenuItem::item("ssh-host-group", host_groups::LABEL),
             recordings.menu(),
             command_menu_item("paste", "Paste", can_paste),
             command_menu_item("paste-raw", "Paste raw (no bracketed paste)", can_paste),
@@ -4705,6 +4712,7 @@ impl Component for TerminalApp {
             incoming: input.transfer.clone(),
             outgoing: None,
             window_timer: None,
+            host_group_timer: None,
             native_bound: false,
             window_error: None,
             pending_directory_copy: None,
@@ -4842,6 +4850,7 @@ impl Component for TerminalApp {
                     session_browser::Action::Query(..) | session_browser::Action::Focus(..)
                 )
                 | Message::PaneText(..)
+                | Message::HostGroup(host_groups::Action::Tick | host_groups::Action::Edit(..))
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
@@ -5025,6 +5034,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::History(action) => self.handle_history(action, context),
+            Message::HostGroup(action) => self.handle_host_group(action, context),
             Message::PaletteChoose(id) => self.choose_command(id, context),
             Message::PickerQuery(query) => self.filter_picker(query, context),
             Message::PaneText(action) => self.pane_text_action(action, context),
@@ -6744,6 +6754,7 @@ impl Component for TerminalApp {
                 }
                 Page::Attention => self.attention_view(context),
                 Page::CommandHistory(page) => self.history_view(page, context),
+                Page::HostGroup(page) => self.host_group_view(id, page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),
                 Page::LocalForwards(page) => self.forward_view(id, page, context),
                 Page::Settings(Some(SettingsEditor::Keyboard(page))) => {
