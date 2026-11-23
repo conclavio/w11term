@@ -97,7 +97,7 @@ pub struct Pane<'a> {
 struct Source {
     hwnd: usize,
     id: u64,
-    name: String,
+    label: String,
     appearance: Arc<RwLock<Appearance>>,
     alive: Arc<AtomicBool>,
     frames: FrameStore,
@@ -196,7 +196,7 @@ impl IRawElementProviderSimple_Impl for Provider_Impl {
         self.source.check()?;
         Ok(match id {
             UIA_ControlTypePropertyId => UIA_DocumentControlTypeId.0.into(),
-            UIA_NamePropertyId => self.source.name.as_str().into(),
+            UIA_NamePropertyId => format!("Terminal · {}", self.source.label).as_str().into(),
             UIA_AutomationIdPropertyId => {
                 format!("w11term-pane-{}", self.source.id).as_str().into()
             }
@@ -385,6 +385,7 @@ impl Bridge {
         let changed_pane = slot.as_ref().is_none_or(|h| {
             h.source.id != pane
                 || h.parent != parent
+                || h.source.label != label
                 || !h.source.input.same_channel(input)
                 || !h.source.alive.load(Ordering::Acquire)
         });
@@ -410,7 +411,7 @@ impl Bridge {
             let source = Arc::new(Source {
                 hwnd: hwnd.0 as usize,
                 id: pane,
-                name: format!("Terminal · {label}"),
+                label: label.to_owned(),
                 appearance: appearance.clone(),
                 alive: Arc::new(AtomicBool::new(true)),
                 frames: frames.clone(),

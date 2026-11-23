@@ -2,19 +2,68 @@ use super::*;
 use std::{borrow::Cow, collections::BTreeSet};
 use w11term::tabs::TabTitle;
 
+pub(super) const RENAME_PANE: &str = "Rename focused pane…";
+
 pub enum Action {
     Show,
-    Edit(TabId, String),
-    Finish(TabId, ContentDialogResult),
+    ShowPane(u64, TabId),
+    Edit(u64, String),
+    Finish(u64, ContentDialogResult),
+}
+
+pub(super) fn show_pane(target: Option<(u64, TabId)>) -> Message {
+    target.map_or(Message::ControlIdle, |(pane, group)| {
+        Message::TabTitle(Action::ShowPane(pane, group))
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Group(TabId),
+    Pane { pane: u64, group: TabId },
+}
+
+impl Target {
+    fn matches_focus(self, actual_pane: u64, actual_group: TabId) -> bool {
+        match self {
+            Self::Group(group) => group == actual_group,
+            Self::Pane { pane, group } => pane == actual_pane && group == actual_group,
+        }
+    }
+
+    fn apply(self, tabs: &mut Tabs<AppTab>, title: Option<TabTitle>) {
+        match self {
+            Self::Group(group) => tabs.set_group_title(group, title),
+            Self::Pane { .. } => {
+                if let (Some(active), Some(group)) = (tabs.active_id(), tabs.active_group_id())
+                    && let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = tabs.get_mut(active)
+                    && self.matches_focus(live.session.pane_id, group)
+                    && live.session.prompts.current().is_none()
+                    && live.session.frames.load().prompt.is_none()
+                {
+                    live.pane_name = title;
+                }
+            }
+        }
+    }
 }
 
 pub(super) struct Editor {
-    group: TabId,
+    target: Target,
+    serial: u64,
     text: String,
     has_title: bool,
+    reopen: Option<Target>,
 }
 
 impl Editor {
+    pub(super) fn key(&self) -> String {
+        format!("rename-title-{}", self.serial)
+    }
+
     fn title(&self) -> Result<Option<TabTitle>, &'static str> {
         let value = self.text.trim();
         if value.is_empty() {
@@ -24,28 +73,36 @@ impl Editor {
     }
 
     pub(super) fn view(&self, ctx: &ViewContext<TerminalApp>) -> View {
-        let group = self.group;
+        let serial = self.serial;
+        let (heading, label, placeholder) = match self.target {
+            Target::Group(_) => ("Rename tab", "Tab name", "Use the default tab title"),
+            Target::Pane { .. } => (
+                "Rename focused pane",
+                "Pane name",
+                "Use the default pane name",
+            ),
+        };
         let title = self.title();
         let mut fields = vec![KeyedView::new(
             "title",
             TextBox::new()
-                .automation_name("Tab name")
-                .placeholder_text("Use the default tab title")
+                .automation_name(label)
+                .placeholder_text(placeholder)
                 .text(&self.text)
-                .on_text_changed(ctx.callback(move |s| Message::TabTitle(Action::Edit(group, s)))),
+                .on_text_changed(ctx.callback(move |s| Message::TabTitle(Action::Edit(serial, s)))),
         )];
         if let Err(error) = title {
             fields.push(KeyedView::new("error", TextBlock::new().text(error)));
         }
         ContentDialog::new()
-            .title("Rename tab")
+            .title(heading)
             .primary_button_text("Save")
             .is_primary_button_enabled(title.is_ok())
             .secondary_button_text("Use default")
             .is_secondary_button_enabled(self.has_title)
             .close_button_text("Cancel")
             .is_open(true)
-            .on_closed(ctx.callback(move |r| Message::TabTitle(Action::Finish(group, r))))
+            .on_closed(ctx.callback(move |r| Message::TabTitle(Action::Finish(serial, r))))
             .content(
                 StackPanel::new()
                     .spacing(8.0)
@@ -57,11 +114,12 @@ impl Editor {
 
 fn display_label<'a>(
     renamed: Option<&'a TabTitle>,
+    pane_name: Option<&'a TabTitle>,
     fallback: &'a str,
     follow_application: bool,
     application_title: impl FnOnce() -> Option<String>,
 ) -> Cow<'a, str> {
-    if let Some(title) = renamed {
+    if let Some(title) = renamed.or(pane_name) {
         return Cow::Borrowed(title.as_str());
     }
     if follow_application && let Some(title) = application_title() {
@@ -71,14 +129,18 @@ fn display_label<'a>(
 }
 
 /// A hidden tab still follows its last focused pane. A sibling cannot change
-/// its group's title, and a named group needs no title-change wake at all.
-pub(super) fn followed_headers<T>(tabs: &Tabs<T>, enabled: bool) -> BTreeSet<TabId> {
+/// its group's title, and an explicitly named group or pane needs no wake.
+pub(super) fn followed_headers<T>(
+    tabs: &Tabs<T>,
+    enabled: bool,
+    named: impl Fn(&T) -> bool,
+) -> BTreeSet<TabId> {
     if !enabled {
         return BTreeSet::new();
     }
     tabs.headers()
         .into_iter()
-        .filter(|entry| tabs.title_for(entry.id).is_none())
+        .filter(|entry| tabs.title_for(entry.id).is_none() && !named(&entry.value))
         .map(|entry| entry.id)
         .collect()
 }
@@ -94,6 +156,7 @@ impl TerminalApp {
         };
         display_label(
             self.tabs.title_for(entry),
+            tab.pane_name(),
             &tab.label,
             follow_application,
             || {
@@ -109,50 +172,82 @@ impl TerminalApp {
         )
     }
 
+    fn show_title_editor(&mut self, target: Target) {
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let Some(AppTab {
+            page: Page::Terminal(live),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let group = self.tabs.group_id(id).expect("pane has a tab");
+        if !target.matches_focus(live.session.pane_id, group)
+            || live.session.frames.load().prompt.is_some()
+            || live.session.prompts.current().is_some()
+            || live.files.entry_dialog_open()
+            || self.clipboard.is_open()
+        {
+            return;
+        }
+        if let Some(editor) = &mut self.title_editor {
+            // WinUI can accept another menu click after hiding the dialog but
+            // before delivering Closed. Finish the original edit first.
+            editor.reopen = Some(target);
+            return;
+        }
+        let title = match target {
+            Target::Pane { .. } => live.pane_name.as_ref(),
+            Target::Group(_) => self.tabs.title_for(id),
+        };
+        self.name_edit_serial = self.name_edit_serial.wrapping_add(1);
+        self.title_editor = Some(Editor {
+            target,
+            serial: self.name_edit_serial,
+            text: title.map_or_else(String::new, |t| t.as_str().to_owned()),
+            has_title: title.is_some(),
+            reopen: None,
+        });
+        self.keyboard.set_modal(true);
+    }
+
     pub(super) fn edit_tab_title(&mut self, action: Action) {
         match action {
             Action::Show => {
-                let Some(id) = self.tabs.active_id() else {
-                    return;
-                };
-                if self.title_editor.is_some()
-                    || !matches!(self.tabs.get(id), Some(AppTab { page: Page::Terminal(tab), .. })
-                        if tab.session.frames.load().prompt.is_none())
-                {
-                    return;
+                if let Some(group) = self.tabs.active_group_id() {
+                    self.show_title_editor(Target::Group(group));
                 }
-                let title = self.tabs.title_for(id);
-                self.title_editor = Some(Editor {
-                    group: self.tabs.group_id(id).expect("pane has a tab"),
-                    text: title.map_or_else(String::new, |t| t.as_str().to_owned()),
-                    has_title: title.is_some(),
-                });
-                self.keyboard.set_modal(true);
             }
-            Action::Edit(group, text) => {
+            Action::ShowPane(pane, group) => self.show_title_editor(Target::Pane { pane, group }),
+            Action::Edit(serial, text) => {
                 if let Some(editor) = &mut self.title_editor
-                    && editor.group == group
+                    && editor.serial == serial
                 {
                     editor.text = text;
                 }
             }
-            Action::Finish(group, result) => {
-                if !self.title_editor.as_ref().is_some_and(|e| e.group == group) {
+            Action::Finish(serial, result) => {
+                let Some(editor) = self.title_editor.take_if(|e| e.serial == serial) else {
                     return;
-                }
-                let editor = self.title_editor.take().unwrap();
+                };
                 let change = match result {
                     ContentDialogResult::Primary => editor.title().ok(),
                     ContentDialogResult::Secondary => Some(None),
                     _ => None,
                 };
                 if let Some(title) = change {
-                    self.tabs.set_group_title(group, title);
+                    editor.target.apply(&mut self.tabs, title);
+                    self.header.borrow_mut().take();
                     self.publish_panes();
                 }
                 self.keyboard.set_modal(false);
                 if let Some(id) = self.tabs.active_id() {
                     self.connection_ui(id);
+                }
+                if let Some(target) = editor.reopen {
+                    self.show_title_editor(target);
                 }
             }
         }
@@ -166,17 +261,27 @@ mod tests {
     #[test]
     fn application_tab_title_obeys_opt_in_and_custom_name_precedence() {
         let renamed = TabTitle::try_from("Incident response".to_owned()).unwrap();
+        let pane_name = TabTitle::try_from("Tail logs".to_owned()).unwrap();
         let no_read = || -> Option<String> { panic!("unused frames should not be read") };
-        assert_eq!(display_label(None, "Game", false, no_read), "Game");
+        assert_eq!(display_label(None, None, "Game", false, no_read), "Game");
         assert_eq!(
-            display_label(Some(&renamed), "Game", true, no_read),
+            display_label(Some(&renamed), Some(&pane_name), "Game", true, no_read),
             "Incident response"
         );
         assert_eq!(
-            display_label(None, "Game", true, || Some("Cockpit".to_owned())),
+            display_label(None, None, "Game", true, || Some("Cockpit".to_owned())),
             "Cockpit"
         );
-        assert_eq!(display_label(None, "Settings", true, || None), "Settings");
+        assert_eq!(
+            display_label(None, None, "Settings", true, || None),
+            "Settings"
+        );
+        for application_titles in [false, true] {
+            assert_eq!(
+                display_label(None, Some(&pane_name), "Game", application_titles, no_read),
+                "Tail logs"
+            );
+        }
     }
 
     #[test]
@@ -185,15 +290,88 @@ mod tests {
         let ssh = tabs.insert("SSH");
         let shell = tabs.split(ssh, "PowerShell", Axis::Columns).unwrap();
         let log = tabs.insert("Log");
-        assert_eq!(followed_headers(&tabs, false), BTreeSet::new());
-        assert_eq!(followed_headers(&tabs, true), BTreeSet::from([shell, log]));
+        assert_eq!(followed_headers(&tabs, false, |_| false), BTreeSet::new());
+        assert_eq!(
+            followed_headers(&tabs, true, |_| false),
+            BTreeSet::from([shell, log])
+        );
         tabs.select(ssh);
         tabs.select(log);
-        assert_eq!(followed_headers(&tabs, true), BTreeSet::from([ssh, log]));
+        assert_eq!(
+            followed_headers(&tabs, true, |_| false),
+            BTreeSet::from([ssh, log])
+        );
+        assert_eq!(
+            followed_headers(&tabs, true, |label| *label == "SSH"),
+            BTreeSet::from([log])
+        );
         tabs.set_group_title(ssh, Some("Operations".to_owned().try_into().unwrap()));
-        assert_eq!(followed_headers(&tabs, true), BTreeSet::from([log]));
+        assert_eq!(
+            followed_headers(&tabs, true, |_| false),
+            BTreeSet::from([log])
+        );
         tabs.set_group_title(ssh, None);
-        assert_eq!(followed_headers(&tabs, true), BTreeSet::from([ssh, log]));
+        assert_eq!(
+            followed_headers(&tabs, true, |_| false),
+            BTreeSet::from([ssh, log])
+        );
+    }
+
+    #[test]
+    fn pane_editor_requires_the_same_session_and_group_and_validates_only_the_name() {
+        let target = Target::Pane { pane: 11, group: 7 };
+        assert!(!target.matches_focus(12, 7), "focus moved to a sibling");
+        assert!(!target.matches_focus(11, 8), "the original pane moved");
+        assert!(
+            !target.matches_focus(22, 7),
+            "a replacement reused a layout position"
+        );
+        assert!(target.matches_focus(11, 7));
+        let mut editor = Editor {
+            target,
+            serial: 4,
+            text: "   ".into(),
+            has_title: true,
+            reopen: None,
+        };
+        assert_eq!(editor.title().unwrap(), None);
+        editor.text = "  Build 雪  ".into();
+        assert_eq!(editor.title().unwrap().unwrap().as_str(), "Build 雪");
+        editor.text = "a\nb".into();
+        assert!(editor.title().is_err());
+        editor.text = "z".repeat(129);
+        assert!(editor.title().is_err());
+    }
+
+    #[test]
+    fn pane_rename_survives_moves_and_ignores_a_finish_for_a_different_focus_or_group() {
+        let mut tabs = Tabs::default();
+        let first = live_tab("shell".into(), Source::Demo, false);
+        let pane = first.pane_id().unwrap();
+        let first = tabs.insert(first);
+        let other = tabs
+            .split(
+                first,
+                live_tab("shell".into(), Source::Demo, false),
+                Axis::Rows,
+            )
+            .unwrap();
+        let target = Target::Pane { pane, group: first };
+        let name = TabTitle::try_from("Build".to_owned()).unwrap();
+
+        target.apply(&mut tabs, Some(name.clone()));
+        assert!(tabs.get(other).unwrap().pane_name().is_none());
+        tabs.select(first);
+        target.apply(&mut tabs, Some(name.clone()));
+        assert_eq!(tabs.get(first).unwrap().pane_name(), Some(&name));
+        assert!(tabs.title_for(first).is_none());
+        assert!(tabs.move_active_to_new_tab());
+        target.apply(&mut tabs, None);
+        assert_eq!(tabs.get(first).unwrap().pane_name(), Some(&name));
+        let group = tabs.active_group_id().unwrap();
+        Target::Pane { pane, group }.apply(&mut tabs, None);
+        assert!(tabs.get(first).unwrap().pane_name().is_none());
+        assert_eq!(tabs.get(first).unwrap().label, "shell");
     }
 
     #[test]

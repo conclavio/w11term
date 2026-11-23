@@ -766,6 +766,35 @@ async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manua
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "names one of two identical SSH splits, navigates by name and reopens its workspace"]
+async fn native_pane_names_identify_one_ssh_split_and_survive_workspace_restore() {
+    let (Source::Ssh(ssh), remote, shells, server) = fixture_connections(false, 4).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        remote.path().join("copy-history.vt"),
+        b"\x1b]2;shared-application\x07",
+    )
+    .unwrap();
+    let trace = remote.path().join("keyboard-input.bin");
+    fs::write(&trace, []).unwrap();
+
+    drive_mixed_gui("pane-display-name-ui.ps1", &ssh, state.path());
+
+    assert_eq!(
+        fs::read(trace).unwrap(),
+        b"named-input/\x1b]2;changed-by-shell\x07restored-input/"
+    );
+    assert_eq!(
+        shells.load(Ordering::Relaxed),
+        4,
+        "original pair and restored pair only"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "verifies normal and raw clipboard paste decisions through WinUI and a reconnecting loopback peer"]
 async fn native_clipboard_paste_confirms_original_bytes_for_the_original_pane() {
     let accepted = Arc::new(AtomicUsize::new(0));

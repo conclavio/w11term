@@ -1215,6 +1215,7 @@ fn registry(session: &Session) -> Registry {
         id: 1,
         tab_id: 4,
         tab_title: None,
+        pane_name: None,
         label: "test".into(),
         active: false,
         visible: false,
