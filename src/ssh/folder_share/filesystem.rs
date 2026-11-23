@@ -10,10 +10,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, ErrorKind},
     mem::{offset_of, size_of},
-    os::windows::{
-        fs::OpenOptionsExt,
-        io::{AsRawHandle, FromRawHandle},
-    },
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
     path::Path,
     sync::{
         Arc,
@@ -21,25 +18,21 @@ use std::{
     },
 };
 use windows::{
-    Wdk::{
-        Foundation::OBJECT_ATTRIBUTES,
-        Storage::FileSystem::{
-            FILE_LINK_ENTRY_INFORMATION, FILE_LINKS_INFORMATION, FILE_NAMES_INFORMATION, FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileHardLinkInformation,
-            FileNamesInformation, NtCreateFile, NtQueryDirectoryFile, NtQueryInformationFile,
-        },
+    Wdk::Storage::FileSystem::{
+        FILE_LINK_ENTRY_INFORMATION, FILE_LINKS_INFORMATION, FILE_NAMES_INFORMATION, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileHardLinkInformation,
+        FileNamesInformation, NtQueryDirectoryFile, NtQueryInformationFile,
     },
     Win32::{
         Foundation::{
-            HANDLE, NTSTATUS, OBJ_DONT_REPARSE, RtlNtStatusToDosError,
-            STATUS_IO_REPARSE_TAG_NOT_HANDLED, STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE,
-            STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_STOPPED_ON_SYMLINK, STATUS_SUCCESS,
-            UNICODE_STRING,
+            HANDLE, NTSTATUS, RtlNtStatusToDosError, STATUS_IO_REPARSE_TAG_NOT_HANDLED,
+            STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_REPARSE_POINT_ENCOUNTERED,
+            STATUS_STOPPED_ON_SYMLINK, STATUS_SUCCESS,
         },
         Storage::FileSystem::*,
         System::IO::IO_STATUS_BLOCK,
     },
-    core::{PCWSTR, PWSTR},
+    core::PCWSTR,
 };
 mod write;
 pub(super) use write::PendingWrite;
@@ -86,14 +79,19 @@ fn win_error(error: windows::core::Error) -> io::Error {
 }
 
 fn nt_result(status: NTSTATUS) -> io::Result<()> {
+    if status == STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(nt_error(status))
+    }
+}
+
+fn nt_error(status: NTSTATUS) -> io::Error {
     match status {
-        STATUS_SUCCESS => Ok(()),
         STATUS_REPARSE_POINT_ENCOUNTERED
         | STATUS_STOPPED_ON_SYMLINK
-        | STATUS_IO_REPARSE_TAG_NOT_HANDLED => Err(excluded()),
-        _ => Err(io::Error::from_raw_os_error(
-            unsafe { RtlNtStatusToDosError(status) } as i32,
-        )),
+        | STATUS_IO_REPARSE_TAG_NOT_HANDLED => excluded(),
+        _ => io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32),
     }
 }
 
@@ -197,40 +195,8 @@ fn open_relative(
     disposition: windows::Wdk::Storage::FileSystem::NTCREATEFILE_CREATE_DISPOSITION,
     options: windows::Wdk::Storage::FileSystem::NTCREATEFILE_CREATE_OPTIONS,
 ) -> io::Result<File> {
-    // All callers validate the component, including entries returned by NTFS.
-    let mut wide: Vec<u16> = name.encode_utf16().collect();
-    let length = (wide.len() * 2) as u16;
-    let unicode = UNICODE_STRING {
-        Length: length,
-        MaximumLength: length,
-        Buffer: PWSTR(wide.as_mut_ptr()),
-    };
-    let object = OBJECT_ATTRIBUTES {
-        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: handle(parent),
-        ObjectName: &unicode,
-        Attributes: OBJ_DONT_REPARSE,
-        ..Default::default()
-    };
-    let mut opened = HANDLE::default();
-    let mut status = IO_STATUS_BLOCK::default();
-    // The parent, name, IOSB and out handle remain live through NtCreateFile.
-    nt_result(unsafe {
-        NtCreateFile(
-            &mut opened,
-            rights | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            &object,
-            &mut status,
-            None,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            share,
-            disposition,
-            options,
-            None,
-            0,
-        )
-    })?;
-    Ok(unsafe { File::from_raw_handle(opened.0) })
+    crate::windows_dirs::open_relative(parent, name, rights, share, disposition, options)
+        .map_err(nt_error)
 }
 
 fn describe(file: &File, name: &str) -> io::Result<Entry> {

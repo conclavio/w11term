@@ -350,6 +350,7 @@ SFTP is available through a pane's **existing authenticated SSH connection**, on
 & $ctl --pid 12345 sftp --pane $pane get /tmp/output.bin .\output.bin
 & $ctl --pid 12345 sftp --pane $pane get-dir /tmp/diagnostics .\incident-042
 & $ctl --pid 12345 sftp --pane $pane put .\input.bin /tmp/input.bin
+& $ctl --pid 12345 sftp --pane $pane put-dir .\cockpit /tmp/cockpit-v2
 & $ctl --pid 12345 sftp --pane $pane mkdir /tmp/work --permissions 0750
 & $ctl --pid 12345 sftp --pane $pane rename /tmp/input.bin /tmp/work/input.bin
 & $ctl --pid 12345 sftp --pane $pane stat /tmp/work/input.bin
@@ -377,12 +378,27 @@ allows 32 levels below the root, 65,536 returned directory entries and 8 MiB of
 entry-name bytes across the transfer. The server can change files during a
 download. The result reflects the files read during the transfer.
 
+A folder upload creates the requested remote directory and requires its parent
+to exist. The destination can have a different name from the source folder.
+`remote` preserves the requested path. Once the server resolves the parent,
+`resolved_remote` gives the absolute destination used by the transfer.
+An existing destination, including an empty directory, stops the transfer.
+Empty directories and empty files are copied. Windows reparse points such as
+junctions inside the tree are counted as skipped. A reparse point supplied as
+the source root is rejected. Interruption after remote creation can leave a
+partial tree. The reply identifies the destination so you can inspect it before
+retrying. A file counts as complete once the server acknowledges all writes
+and the final close. An upload allows 32 directory levels below the root,
+65,536 entries, and 8 MiB of entry names. w11term reads each file in chunks
+and checks its length against the size reported when it opened the file.
+
 The command surface covers SFTP v3:
 
 | Commands | Arguments / result |
 | --- | --- |
 | `info` | Negotiated version, advertised extensions, open-handle count, read/write chunk limits |
 | `get-dir REMOTE NEW_LOCAL_DIRECTORY` | Recursively download a directory into the exact local path. Its parent must exist. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
+| `put-dir LOCAL NEW_REMOTE_DIRECTORY` | Recursively upload to the exact remote path. Success returns `files`, `directories` (including the root), `skipped`, and `bytes_transferred`. |
 | `ls [PATH]` | Collect directory entries (default `.`); maximum 8 MiB JSON, then use paged reads |
 | `opendir PATH`, `readdir --handle ID`, `close --handle ID` | Persistent opaque handle, one server page at a time, explicit `eof` |
 | `open PATH [--flags FLAGS]` | Comma-separated `read,write,append,create,truncate,exclusive`; default `read`; returns handle |
@@ -408,6 +424,7 @@ Direct pipe requests use a nested operation. All local transfer paths must be ab
 ```json
 {"verb":"sftp","pane":1,"timeout_seconds":600,"operation":{"op":"get","remote":"/tmp/output.bin","local":"C:\\tests\\output.bin","overwrite":false}}
 {"verb":"sftp","pane":1,"operation":{"op":"get-dir","remote":"/tmp/diagnostics","local":"C:\\tests\\incident-042"}}
+{"verb":"sftp","pane":1,"operation":{"op":"put-dir","local":"C:\\Projects\\cockpit","remote":"/tmp/cockpit-v2"}}
 {"verb":"sftp","pane":1,"operation":{"op":"mkdir","path":"/tmp/work","attrs":{"permissions":488}}}
 {"verb":"sftp","pane":1,"operation":{"op":"open","path":"/tmp/output.bin","flags":["read"]}}
 {"verb":"sftp","pane":1,"operation":{"op":"read","handle":7,"offset":0,"len":32768}}

@@ -9,7 +9,7 @@ use w11term::{
 pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   info | limits\n\
   get REMOTE LOCAL [--overwrite] [--max-bytes N] | put LOCAL REMOTE [--overwrite]\n\
-  get-dir REMOTE NEW_LOCAL_DIRECTORY\n\
+  get-dir REMOTE NEW_LOCAL_DIRECTORY | put-dir LOCAL NEW_REMOTE_DIRECTORY\n\
   ls [PATH] | opendir PATH | readdir --handle ID | close --handle ID\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
@@ -21,8 +21,9 @@ pub const HELP: &str = "w11term-cli [--pid PID] sftp --pane ID [--timeout SECOND
   fstat --handle ID | fsetstat --handle ID [ATTRS] | fsync --handle ID\n\
 ATTRS: --size N --uid N --gid N --permissions OCTAL --atime UNIX_SECONDS --mtime UNIX_SECONDS\n\
 Underscore spellings (remove_file, remove_dir) are accepted. Use -- before paths starting with --.\n\
-Transfers stream through the GUI's existing SSH connection. Destinations are exclusive unless\n\
---overwrite is supplied. Upload failures can leave partial remote files. Handles are pane-local\n\
+Transfers stream through the GUI's existing SSH connection. Folder transfers require a new\n\
+destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
+file or folder after interruption. Handles are pane-local\n\
 and expire after five idle minutes, timeout, or disconnect. Replies contain result.sftp.";
 
 pub fn parse(
@@ -82,22 +83,20 @@ pub fn parse(
     let mut paths = positional.into_iter();
     let mut path = || paths.next().context("missing path argument");
     match command.as_str() {
-        "get-dir" => {
-            fields.insert("remote".into(), json!(path()?));
-            fields.insert("local".into(), json!(std::path::absolute(path()?)?));
-        }
-        "get" | "put" => {
+        "get" | "get-dir" | "put" | "put-dir" => {
             let first = path()?;
             let second = path()?;
-            let (remote, local) = if command == "get" {
+            let (remote, local) = if matches!(command.as_str(), "get" | "get-dir") {
                 (first, second)
             } else {
                 (second, first)
             };
             fields.insert("remote".into(), json!(remote));
             fields.insert("local".into(), json!(std::path::absolute(local)?));
-            fields.insert("overwrite".into(), json!(overwrite));
-            overwrite = false;
+            if matches!(command.as_str(), "get" | "put") {
+                fields.insert("overwrite".into(), json!(overwrite));
+                overwrite = false;
+            }
             if command == "get"
                 && let Some(limit) = opts.remove("--max-bytes")
             {
@@ -219,6 +218,53 @@ mod tests {
     use super::*;
     fn p(s: &[&str]) -> Result<(Option<u32>, Request)> {
         parse(s.iter().map(|s| s.to_string()), None, None)
+    }
+
+    #[test]
+    fn folder_upload_resolves_the_local_source_and_requires_a_new_remote_name() {
+        for command in ["put-dir", "put_dir"] {
+            let (
+                Some(42),
+                Request::Sftp {
+                    pane: 7,
+                    timeout_seconds: 90,
+                    operation: Operation::PutDir { local, remote },
+                },
+            ) = p(&[
+                "--pid",
+                "42",
+                "--pane",
+                "7",
+                "--timeout",
+                "90",
+                command,
+                "--",
+                "--pack 雪",
+                "new packs/v1",
+            ])
+            .unwrap()
+            else {
+                panic!("expected a directory upload")
+            };
+            assert_eq!(local, std::path::absolute("--pack 雪").unwrap());
+            assert_eq!(remote, "new packs/v1");
+        }
+        for args in [
+            &["put-dir", "--pane", "7", "pack"][..],
+            &["put-dir", "--pane", "7", "pack", "remote", "extra"],
+            &["put-dir", "--pane", "7", "pack", "remote", "--overwrite"],
+            &[
+                "put-dir",
+                "--pane",
+                "7",
+                "pack",
+                "remote",
+                "--max-bytes",
+                "8",
+            ],
+        ] {
+            assert!(p(args).is_err(), "{args:?}");
+        }
     }
     #[test]
     fn transfers_handles_attributes_and_validation() {

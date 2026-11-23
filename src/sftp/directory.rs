@@ -11,9 +11,9 @@ use windows::{
     core::HSTRING,
 };
 
-const MAX_DEPTH: usize = 32;
-const MAX_ENTRIES: usize = 65_536;
-const MAX_NAME_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_DEPTH: usize = 32;
+pub(super) const MAX_ENTRIES: usize = 65_536;
+pub(super) const MAX_NAME_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn validate_download_name(name: &str) -> Result<()> {
     ensure!(

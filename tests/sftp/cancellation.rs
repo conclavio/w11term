@@ -100,7 +100,7 @@ async fn folder_download_timeout_removes_staging_and_publication_refuses_a_racin
     server.abort();
 }
 
-async fn wait_for_packet(log: &Path, packet: &str) {
+pub(super) async fn wait_for_packet(log: &Path, packet: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !fs::read_to_string(log)
             .unwrap()
@@ -126,13 +126,21 @@ async fn cancelled_before_admission_never_opens_a_channel_or_changes_either_file
     let cancel = TransferCancel::default();
     cancel.cancel();
     cancel.cancel();
-    for operation in [upload(&path), download(&path)] {
+    for operation in [
+        upload(&path),
+        download(&path),
+        Operation::PutDir {
+            local: local.path().into(),
+            remote: "/new tree".into(),
+        },
+    ] {
         let reply = start(&pane, operation, &cancel).await.unwrap().unwrap();
         assert_eq!(reply["cancelled"], true);
         assert_eq!(reply["bytes_transferred"], 0);
         assert_eq!(reply["remote_may_be_partial"], false);
     }
     assert_eq!(opens.load(Ordering::Relaxed), shell_channels);
+    assert!(!remote.path().join("new tree").exists());
     assert_eq!(fs::read(path).unwrap(), b"keep local");
     assert_eq!(fs::read(destination).unwrap(), b"keep remote");
     assert_eq!(fs::read_dir(local.path()).unwrap().count(), 1);

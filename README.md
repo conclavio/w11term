@@ -129,6 +129,13 @@ It stages the tree beside the destination and publishes it after the download
 finishes. An existing destination or a name Windows cannot represent stops
 the download. Use **Cancel transfer** in the drawer to stop it.
 
+Choose **Upload folder…** to copy a Windows folder into the displayed remote
+directory. Choosing `C:\Projects\cockpit` while viewing `/tmp` creates
+`/tmp/cockpit`, including nested files and empty directories. That name
+must be available. The drawer counts skipped junctions and other reparse
+points and shows confirmed progress. If you cancel or disconnect after the
+remote folder is created, inspect the partial tree at the reported path.
+
 When a file row or drawer control has keyboard focus, use the keyboard to operate that control. For example, press **Space** on a file row to select it. Click the terminal pane, or choose **Done** in the filename filter, to resume typing into the shell while the drawer stays open.
 
 Choose **Go to folder…** to enter a remote directory directly. An absolute path such as `/var/log` works even if the starting directory could not be listed. Relative paths start in the displayed directory. The SFTP server resolves `.`, `..` and symbolic links. Enter spaces, quotes and dollar signs literally. If the folder cannot be opened, the drawer keeps the previous listing and selection.
