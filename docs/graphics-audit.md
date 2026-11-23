@@ -177,6 +177,11 @@ Rows may enter primary-screen scrollback during a bounded scroll. The image
 tiles clipped by the margin stay out of those rows.
 [Kitty scrolling reference](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty_tests/graphics.py#L1423-L1500)
 
+Inserting or deleting characters or lines leaves direct kitty placements
+at their original positions. Images displayed through Unicode placeholders
+follow the edited text.
+[Kitty text editing implementation](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty/screen.c#L2889-L3009)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

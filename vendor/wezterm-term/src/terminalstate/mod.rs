@@ -1526,7 +1526,7 @@ impl TerminalState {
             blank_attr,
             bidi_mode,
         );
-        self.finish_kitty_margin_scroll(graphics);
+        self.finish_kitty_tile_update(graphics);
     }
 
     fn scroll_down(&mut self, num_rows: usize) {
@@ -1550,7 +1550,7 @@ impl TerminalState {
             blank_attr,
             bidi_mode,
         );
-        self.finish_kitty_margin_scroll(graphics);
+        self.finish_kitty_tile_update(graphics);
     }
 
     /// Defined by FinalTermSemanticPrompt; a fresh-line is a NOP if the
@@ -2720,10 +2720,13 @@ impl TerminalState {
                     let limit = (x + n as usize).min(right_margin);
 
                     let blank_attr = self.pen.clone_sgr_only();
+                    let graphics =
+                        self.prepare_kitty_text_edit(&(y..y + 1), &(x..right_margin), false);
                     let screen = self.screen_mut();
                     for _ in x..limit as usize {
                         screen.erase_cell(x, y, right_margin, seqno, blank_attr.clone());
                     }
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::DeleteLine(n) => {
@@ -2734,6 +2737,11 @@ impl TerminalState {
                     let left_and_right_margins = self.left_and_right_margins.clone();
                     let blank_attr = self.pen.clone_sgr_only();
                     let bidi_mode = self.get_bidi_mode();
+                    let graphics = self.prepare_kitty_text_edit(
+                        &top_and_bottom_margins,
+                        &left_and_right_margins,
+                        true,
+                    );
                     self.screen_mut().scroll_up_within_margins(
                         &top_and_bottom_margins,
                         &left_and_right_margins,
@@ -2742,6 +2750,7 @@ impl TerminalState {
                         blank_attr,
                         bidi_mode,
                     );
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::EraseCharacter(n) => {
@@ -2789,10 +2798,12 @@ impl TerminalState {
                     && self.left_and_right_margins.contains(&x)
                 {
                     let margin = self.left_and_right_margins.end;
+                    let graphics = self.prepare_kitty_text_edit(&(y..y + 1), &(x..margin), false);
                     let screen = self.screen_mut();
                     for _ in 0..n as usize {
                         screen.insert_cell(x, y, margin, seqno);
                     }
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::InsertLine(n) => {
@@ -2803,6 +2814,11 @@ impl TerminalState {
                     let top_and_bottom_margins = self.cursor.y..self.top_and_bottom_margins.end;
                     let left_and_right_margins = self.left_and_right_margins.clone();
                     let blank_attr = self.pen.clone_sgr_only();
+                    let graphics = self.prepare_kitty_text_edit(
+                        &top_and_bottom_margins,
+                        &left_and_right_margins,
+                        false,
+                    );
                     self.screen_mut().scroll_down_within_margins(
                         &top_and_bottom_margins,
                         &left_and_right_margins,
@@ -2811,6 +2827,7 @@ impl TerminalState {
                         blank_attr,
                         bidi_mode,
                     );
+                    self.finish_kitty_tile_update(graphics);
                 }
             }
             Edit::ScrollDown(n) => self.scroll_down(n as usize),
