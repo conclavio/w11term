@@ -37,7 +37,6 @@ const LAB: &str = "Terminal lab";
 const RESTART_EXITED_PANE: &str = "Restart exited pane";
 const PIN_TAB: &str = "Pin tab";
 const UNPIN_TAB: &str = "Unpin tab";
-const COPY_BASH_DIRECTORY_SETUP: &str = "Copy Bash directory setup";
 
 fn tab_pin_command(label: &str) -> Option<bool> {
     match label {
@@ -65,6 +64,7 @@ mod local_profile;
 mod pane_drop;
 mod pattern_settings;
 mod saved_commands;
+mod shell_directory_setup;
 mod word_delimiters;
 mod wsl_path;
 use file_drawer::{FileAction, FileDrawer};
@@ -753,7 +753,9 @@ fn tab_menu_message(label: String) -> Message {
         }
         "Open files here" => Message::Files(FileAction::OpenHere),
         "Copy last command output" => Message::CopyLastCommand,
-        COPY_BASH_DIRECTORY_SETUP => Message::CopyBashDirectorySetup,
+        command if let Some(shell) = shell_directory_setup::Shell::from_label(command) => {
+            Message::CopyShellDirectorySetup(shell)
+        }
         "Clear scrollback" => Message::Shortcut(Shortcut::ClearScrollback),
         "Command history" => Message::History(command_history::Action::Open),
         "Notify when command finishes" => Message::Attention(attention::Action::WatchCommand(true)),
@@ -1088,7 +1090,7 @@ pub enum Message {
     KeyGenerated(TabId, Result<w11term::keys::DeviceKey, String>),
     CopyPublicKey(TabId),
     CopyLastCommand,
-    CopyBashDirectorySetup,
+    CopyShellDirectorySetup(shell_directory_setup::Shell),
     History(command_history::Action),
     DraftPlayer(TabId, String, bool),
     Durability(durable_view::Action),
@@ -3858,10 +3860,7 @@ impl TerminalApp {
             if live.session.is_direct_ssh_shell()
                 || matches!(&live.source, Source::Local(shell) if shell.wsl_distribution().is_some())
             {
-                items.push(MenuItem::item(
-                    "copy-bash-directory",
-                    COPY_BASH_DIRECTORY_SETUP,
-                ));
+                items.extend(shell_directory_setup::Shell::menu_items());
             }
             items.push(command_menu_item(
                 "rename-pane",
@@ -4873,11 +4872,11 @@ impl Component for TerminalApp {
                     log::warn!("Copy last command output: {error:#}");
                 }
             }
-            Message::CopyBashDirectorySetup => {
-                let script = include_str!("app/bash-directory.sh").trim_end();
-                if let Err(error) = w11term::clipboard::write(script) {
-                    self.window_error =
-                        Some(format!("Couldn’t copy the Bash directory setup. {error:#}"));
+            Message::CopyShellDirectorySetup(shell) => {
+                if let Err(error) = shell.copy() {
+                    self.window_error = Some(format!(
+                        "Couldn’t copy the shell directory setup. {error:#}"
+                    ));
                 }
             }
             Message::History(action) => self.handle_history(action, context),
