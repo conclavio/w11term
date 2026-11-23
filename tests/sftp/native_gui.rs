@@ -1531,11 +1531,11 @@ async fn native_sftp_filename_filter_searches_all_pages_without_remote_requests(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "moves a mixed SSH/PowerShell tab and Settings with keyboard shortcuts in a real window"]
-async fn native_keyboard_tab_reorder_preserves_focused_pane_and_live_sessions() {
+#[ignore = "moves and pins a mixed SSH/PowerShell tab with keyboard shortcuts in a real window"]
+async fn native_keyboard_tab_reorder_and_pin_preserve_focus_and_live_sessions() {
     run_palette_fixture(
         "keyboard-tab-reorder-ui.ps1",
-        b"before;after-right;after-select",
+        b"before;after-right;after-select;while-pinned;last-pane",
         None,
     )
     .await;

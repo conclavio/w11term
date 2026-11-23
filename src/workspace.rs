@@ -385,6 +385,8 @@ impl SavedLayout {
 pub struct WorkspaceTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<TabTitle>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
     pub focused: u64,
     pub layout: SavedLayout,
 }
@@ -454,6 +456,7 @@ impl Workspace {
                 .context("Focused pane missing from workspace")?;
             saved.tabs.push(WorkspaceTab {
                 title: None,
+                pinned: false,
                 focused,
                 layout,
             });

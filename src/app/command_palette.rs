@@ -24,6 +24,7 @@ pub enum CommandId {
         w11term::saved_commands::Entry,
     ),
     TabAction(Shortcut, Option<TabId>),
+    SetTabPinned(Option<TabId>, bool),
     ReopenClosedTab(Option<TabId>),
     ReopenClosedPane(Option<TabId>),
     SwapPanes(PaneSwap),
@@ -200,6 +201,11 @@ impl TerminalApp {
             if matches!(&row.id, CommandId::Menu(label) if label == tab_title::RENAME_PANE) {
                 row.id = CommandId::RenamePane(rename_target);
             }
+            if let CommandId::Menu(label) = &row.id
+                && let Some(pinned) = tab_pin_command(label)
+            {
+                row.id = CommandId::SetTabPinned(self.active_terminal_group(), pinned);
+            }
         }
         menu_rows(self.profile_items(), true, &mut rows);
         let live = self.tabs.active().and_then(|tab| match &tab.page {
@@ -257,8 +263,8 @@ impl TerminalApp {
                     // Pane commands absent from the native menu require a different layout or source.
                     let enabled = match shortcut {
                         Shortcut::NewTab => true,
-                        Shortcut::CloseTab => tab_count > 0,
-                        Shortcut::ClosePane => live.is_some(),
+                        Shortcut::CloseTab => tab_count > 0 && !self.active_tab_is_pinned(),
+                        Shortcut::ClosePane => self.can_close_active_pane(),
                         Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => {
                             live.is_some_and(LiveTab::find_available)
                         }
@@ -408,6 +414,9 @@ impl TerminalApp {
             CommandId::TabAction(shortcut, group) => {
                 bind_tab_action(Message::Shortcut(shortcut), group)
             }
+            CommandId::SetTabPinned(group, pinned) => group.map_or(Message::ControlIdle, |group| {
+                Message::SetTabPinned(group, pinned)
+            }),
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
             CommandId::RotateSplit(target) => Message::RotateSplit(target),
             CommandId::BalancePanes(target) => Message::BalancePanes(target),

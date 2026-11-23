@@ -5,7 +5,8 @@ $ErrorActionPreference = 'Stop'
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $keymap = @{ shortcuts = @{
-    command_palette='F7'; focus_left='F4'; move_tab_left='F6'; move_tab_right='F10'
+    command_palette='F7'; focus_left='F4'; focus_right='F3'; move_tab_left='F6'; move_tab_right='F10'
+    close_tab='F2'; close_pane='F5'
     select_tab_1='F8'; select_tab_2='F9'
 } }
 [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($keymap | ConvertTo-Json))
@@ -106,6 +107,37 @@ try {
     if ($panes.Count -ne 2 -or !$remote.active -or !$local.visible -or
         $remote.tab_id -ne $origin.tab_id -or $local.tab_id -ne $origin.tab_id -or
         $remote.connection_generation -ne $origin.connection_generation) { throw 'The original SSH/PowerShell split changed' }
+
+    Press-Key 0x79
+    Wait-Strip 'Settings' 'palette-ssh' 'palette-ssh'
+    Run-Palette 'Pin tab'
+    Wait-Strip 'Pinned: palette-ssh' 'Settings' 'Pinned: palette-ssh'
+    Wait-Focus $ssh
+    Press-Key 0x79 # F10 cannot move the pin into unpinned tabs
+    Press-Key 0x71 # F2 cannot close the pinned tab
+    Type-Text ';while-pinned'
+    $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','12',';while-pinned')
+    Wait-Strip 'Pinned: palette-ssh' 'Settings' 'Pinned: palette-ssh'
+
+    Press-Key 0x72 # F3 focuses PowerShell in the pinned tab
+    Wait-Focus $localPane
+    Press-Key 0x74 # F5 can close a split if the pinned tab remains open
+    $null = Wait-Until 'the original SSH pane to outlast the closed PowerShell split' {
+        $remaining = @((Control @('list')).sessions)
+        $remaining.Count -eq 1 -and $remaining[0].id -eq $ssh -and $remaining[0].active
+    }
+    Press-Key 0x74 # F5 cannot close the last pane of a pinned tab
+    Type-Text ';last-pane'
+    $null = Control @('wait-for-text','--pane',"$ssh",'--timeout','12',';last-pane')
+    Wait-Strip 'Pinned: palette-ssh' 'Settings' 'Pinned: palette-ssh'
+
+    Invoke-Button (Wait-Until 'tab menu to unpin the tab' { Find-Element 'Tab menu' $button })
+    Invoke-Button (Wait-Until 'Unpin tab menu item' { Find-Element 'Unpin tab' $menu })
+    Wait-Strip 'palette-ssh' 'Settings' 'palette-ssh'
+    Press-Key 0x71
+    $null = Wait-Until 'the unpinned SSH tab to close while Settings remains' {
+        @((Control @('list')).sessions).Count -eq 0 -and (Find-Element 'Settings' $tabItem)
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

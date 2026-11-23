@@ -34,6 +34,16 @@ use windows_reactor::*;
 const NEW_PROFILE: &str = "New Profile…";
 const LAB: &str = "Terminal lab";
 const RESTART_EXITED_PANE: &str = "Restart exited pane";
+const PIN_TAB: &str = "Pin tab";
+const UNPIN_TAB: &str = "Unpin tab";
+
+fn tab_pin_command(label: &str) -> Option<bool> {
+    match label {
+        PIN_TAB => Some(true),
+        UNPIN_TAB => Some(false),
+        _ => None,
+    }
+}
 
 mod attention;
 mod clipboard_paste;
@@ -971,6 +981,7 @@ pub enum Message {
     ReopenClosedTab(Option<TabId>),
     ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
+    SetTabPinned(TabId, bool),
     WindowTick,
     WindowTargetsChanged,
     DismissWindowError,
@@ -2347,6 +2358,29 @@ impl TerminalApp {
             Message::SyncSelection(epoch)
         });
     }
+
+    fn active_terminal_group(&self) -> Option<TabId> {
+        match &self.tabs.active()?.page {
+            Page::Terminal(_) => self.tabs.active_group_id(),
+            _ => None,
+        }
+    }
+
+    fn active_tab_is_pinned(&self) -> bool {
+        self.tabs
+            .active_group_id()
+            .is_some_and(|group| self.tabs.group_is_pinned(group))
+    }
+
+    fn can_close_active_pane(&self) -> bool {
+        self.active_terminal_group().is_some()
+            && (!self.active_tab_is_pinned()
+                || matches!(
+                    self.tabs.active_layout(),
+                    Some(w11term::pane_layout::Layout::Split { .. })
+                ))
+    }
+
     fn cancel_frame_tasks(&mut self) {
         self.watch_epoch += 1;
         self.rotation_hover = None;
@@ -3092,6 +3126,9 @@ impl TerminalApp {
                 }),
             local_forwards::LABEL => local_forwards::open(forward),
             tab_title::RENAME_PANE => tab_title::show_pane(pane.zip(group)),
+            label if let Some(pinned) = tab_pin_command(label) => {
+                group.map_or(Message::ControlIdle, |id| Message::SetTabPinned(id, pinned))
+            }
             folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
                 Message::FolderShare(folder_shares::Action::Open(id))
             }),
@@ -3196,15 +3233,24 @@ impl TerminalApp {
             .collection_slot(
                 TabViewSlot::TabItems,
                 self.tabs.headers().into_iter().map(|tab| {
+                    let group = tab.group_id();
+                    let pinned = self.tabs.group_is_pinned(group);
+                    let label = taskbar::tab_header(
+                        self.tab_label(tab.id, application_titles).as_ref(),
+                        progress.get(&group).copied().unwrap_or_default(),
+                    );
+                    let (header, name) = if pinned {
+                        (format!("📌 {label}"), format!("Pinned: {label}"))
+                    } else {
+                        (label.clone(), label)
+                    };
                     KeyedView::new(
-                        self.tabs.group_id(tab.id).unwrap().to_string(),
+                        group.to_string(),
                         TabViewItem::new()
-                            .header(taskbar::tab_header(
-                                self.tab_label(tab.id, application_titles).as_ref(),
-                                progress.get(&tab.group_id()).copied().unwrap_or_default(),
-                            ))
+                            .header(header)
+                            .automation_name(name)
                             .tag(tab.id.to_string())
-                            .is_closable(true),
+                            .is_closable(!pinned),
                     )
                 }),
             );
@@ -3351,6 +3397,15 @@ impl TerminalApp {
                 previous.is_some(),
             ),
             command_menu_item("rename-tab", "Rename tab…", self.move_source().is_some()),
+            command_menu_item(
+                "pin-tab",
+                if self.active_tab_is_pinned() {
+                    UNPIN_TAB
+                } else {
+                    PIN_TAB
+                },
+                self.active_terminal_group().is_some(),
+            ),
             self.duplicate_tab_item(),
             self.binding_menu_enabled(
                 "reopen_closed_tab",
@@ -3733,7 +3788,12 @@ impl TerminalApp {
                 },
                 KeyAction::ZoomPane,
             ));
-            items.push(self.binding_menu("close-pane", "Close pane", KeyAction::ClosePane));
+            items.push(self.binding_menu_enabled(
+                "close-pane",
+                "Close pane",
+                KeyAction::ClosePane,
+                self.can_close_active_pane(),
+            ));
             items.push(self.binding_menu("move-pane", "Move pane to new tab", KeyAction::MovePane));
         }
         MenuItem::submenu("panes", "Panes", items)
@@ -4566,6 +4626,14 @@ impl Component for TerminalApp {
             Message::MoveTab(group, direction) => {
                 if self.tabs.active_group_id() == Some(group)
                     && self.tabs.move_active_tab(direction)
+                {
+                    self.sync_selection(context);
+                    self.refresh_open_commands();
+                }
+            }
+            Message::SetTabPinned(group, pinned) => {
+                if self.active_terminal_group() == Some(group)
+                    && self.tabs.set_group_pinned(group, pinned)
                 {
                     self.sync_selection(context);
                     self.refresh_open_commands();
