@@ -83,6 +83,8 @@ For an appliance SSH shell, set **SSH group prompt regex** in its profile and op
 
 Use **Host filter** to find SSH panes by profile, pane name, or address. **Select shown** and **Deselect shown** change the visible rows. The filter preserves hidden selections and scopes **Send** and **Interrupt selected** to the shown hosts. Prior submission results remain visible.
 
+The command editor shows how many selected, visible hosts are ready. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.
+
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.
 
 The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status. Result filters apply to **Interrupt selected**. **Copy results** includes the full submission.

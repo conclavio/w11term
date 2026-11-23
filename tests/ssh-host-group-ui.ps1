@@ -171,6 +171,27 @@ try {
         (Find-Element "Focus result pane $west" $button) -and !(Find-Element "Focus result pane $east" $button)
     }
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
+    $readyButton = 'Select only ready shown'
+    $null = Wait-Until 'only one selected host is ready' { Find-Element '1 of 2 selected hosts ready' }
+    Click $readyButton
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName Off
+    $null = Wait-Until 'the ready selection matches the send scope' {
+        (Find-Element '1 of 1 selected host ready') -and (Find-Element 'Send to 1 host' $button)
+    }
+    Outcome $westName 'Running'
+    Click 'Select shown'
+    Set-HostFilter 'west'
+    $null = Wait-Until 'selected East stays hidden' {
+        (Find-Element '1 selected host is hidden by the filter.') -and
+            (Find-Element '0 of 1 selected host ready')
+    }
+    Click $readyButton
+    $null = Wait-CheckBox $westName Off
+    Set-HostFilter ''
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName Off
+    Click 'Select shown'
     Submit 'while-slow' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName "Not sent${dot}Waiting for a fresh prompt"
