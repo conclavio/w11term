@@ -199,7 +199,21 @@ function Open-Palette([string]$Command) {
 function Run-Palette([string]$Command) {
     $field = Open-Palette $Command
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
-    Invoke-Button (Wait-Until $Command { Find-Element $Command ([System.Windows.Automation.ControlType]::Button) })
+    # UI Automation can expose the button name while WinUI is replacing its
+    # provider after filtering. Reacquire the row until it is invokable.
+    $invoke = Wait-Until "invoke provider for palette command '$Command'" {
+        try {
+            $row = Find-Element $Command ([System.Windows.Automation.ControlType]::Button)
+            $provider = $null
+            if ($row -and $row.Current.IsEnabled -and
+                $row.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$provider)) {
+                $provider
+            }
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            # A subsequent probe can read the replacement row.
+        }
+    }
+    $invoke.Invoke()
     $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
 }
 function Wait-Focus([int]$Pane) {
