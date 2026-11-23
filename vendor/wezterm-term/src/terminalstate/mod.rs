@@ -348,6 +348,7 @@ pub struct TerminalState {
     any_event_mouse: bool,
     focus_tracking: bool,
     report_color_scheme_changes: bool,
+    report_text_area_resize: bool,
     /// X10 (legacy), SGR, and SGR-Pixels style mouse tracking and
     /// reporting is enabled
     mouse_encoding: MouseEncoding,
@@ -586,7 +587,22 @@ impl TerminalState {
         term_version: &str,
         writer: Box<dyn std::io::Write + Send>,
     ) -> TerminalState {
-        let writer: Box<dyn std::io::Write + Send> = Box::new(ThreadedWriter::new(writer));
+        Self::with_nonblocking_writer(
+            size,
+            config,
+            term_program,
+            term_version,
+            Box::new(ThreadedWriter::new(writer)),
+        )
+    }
+
+    pub(crate) fn with_nonblocking_writer(
+        size: TerminalSize,
+        config: Arc<dyn TerminalConfiguration>,
+        term_program: &str,
+        term_version: &str,
+        writer: Box<dyn std::io::Write + Send>,
+    ) -> TerminalState {
         let seqno = 1;
         let screen = ScreenOrAlt::new(size, &config, seqno, config.bidi_mode());
 
@@ -621,6 +637,7 @@ impl TerminalState {
             bracketed_paste: false,
             focus_tracking: false,
             report_color_scheme_changes: false,
+            report_text_area_resize: false,
             mouse_encoding: MouseEncoding::X10,
             keyboard_encoding: KeyboardEncoding::Xterm,
             sixel_scrolls_right: false,
@@ -704,6 +721,11 @@ impl TerminalState {
         self.report_color_scheme_changes = false;
     }
 
+    /// Stop asynchronous size reports when the program that requested them disconnects.
+    pub fn clear_resize_subscription(&mut self) {
+        self.report_text_area_resize = false;
+    }
+
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
         let notify = self.report_color_scheme_changes
             && (self.config.prefers_light_colors() != config.prefers_light_colors()
@@ -772,7 +794,13 @@ impl TerminalState {
     /// Replace the input/reply sink when the host launches a new transport.
     /// Bytes still queued on the old writer remain bound to the old sink.
     pub fn replace_writer(&mut self, writer: Box<dyn std::io::Write + Send>) {
-        self.writer = BufWriter::new(Box::new(ThreadedWriter::new(writer)));
+        self.replace_nonblocking_writer(Box::new(ThreadedWriter::new(writer)));
+    }
+
+    /// Replace a queue-backed sink without another thread reordering writes
+    /// relative to resize requests on the same transport queue.
+    pub fn replace_nonblocking_writer(&mut self, writer: Box<dyn std::io::Write + Send>) {
+        self.writer = BufWriter::new(writer);
         self.parser_reply_writer = None;
     }
 
@@ -1237,6 +1265,9 @@ impl TerminalState {
     /// We need to resize both the primary and alt screens, adjusting
     /// the cursor positions of both accordingly.
     pub fn resize(&mut self, size: TerminalSize) {
+        let previous = self
+            .report_text_area_resize
+            .then(|| self.text_area_dimensions());
         self.increment_seqno();
         let (cursor_main, cursor_alt) = if self.screen.alt_screen_is_active {
             (
@@ -1298,6 +1329,30 @@ impl TerminalState {
                 saved.wrap_next = false;
             }
         }
+
+        if let Some(previous) = previous {
+            let current = self.text_area_dimensions();
+            if current != previous {
+                // Resizes happen outside parser dispatch. Preserve the separate
+                // automatic-reply channel on a framed session.
+                let reply = self
+                    .parser_reply_writer
+                    .as_mut()
+                    .unwrap_or(&mut self.writer);
+                Self::write_resize_report(reply, current);
+            }
+        }
+    }
+
+    /// Mode 2048 uses height before width, first in cells and then in pixels.
+    fn text_area_dimensions(&self) -> [usize; 4] {
+        let size = self.get_size();
+        [size.rows, size.cols, size.pixel_height, size.pixel_width]
+    }
+
+    fn write_resize_report(writer: &mut impl Write, [rows, cols, height, width]: [usize; 4]) {
+        write!(writer, "\x1b[48;{rows};{cols};{height};{width}t").ok();
+        writer.flush().ok();
     }
 
     pub fn get_size(&self) -> TerminalSize {
@@ -1816,6 +1871,17 @@ impl TerminalState {
 
     fn perform_csi_mode(&mut self, mode: Mode) {
         match mode {
+            Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::InBandResize)) => {
+                self.report_text_area_resize = true;
+                let dimensions = self.text_area_dimensions();
+                Self::write_resize_report(&mut self.writer, dimensions);
+            }
+            Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::InBandResize)) => {
+                self.clear_resize_subscription();
+            }
+            Mode::QueryDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::InBandResize)) => {
+                self.decqrm_response(mode, true, self.report_text_area_resize);
+            }
             Mode::SetDecPrivateMode(DecPrivateMode::Unspecified(2031)) => {
                 self.report_color_scheme_changes = true;
             }

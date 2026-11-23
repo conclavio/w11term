@@ -91,7 +91,9 @@ The original MIT license is preserved in `LICENSE.md`.
 - A terminal may replace its input and reply writer after the previous
   transport has exited. Pending bytes on the old writer keep their original
   destination while the next shell starts in the same terminal model.
-  The embedding can track window focus locally while the peer is offline.
+  The embedding can supply a nonblocking writer to queue PTY resize requests
+  and automatic replies in order, and can track window focus locally while
+  the peer is offline.
 
 - The embedding can enable ConEmu / Windows Terminal OSC 9;9 reports for
   local Windows panes. Reported drive paths feed the same current-directory
@@ -102,3 +104,8 @@ The original MIT license is preserved in `LICENSE.md`.
   peer reports another identity, sends OSC 7, or the terminal resets. A
   foreign or malformed identity clears the previous directory. Other pane
   types ignore both reports.
+
+- DEC private mode 2048 reports the current text area in cells and pixels on
+  each enable and after a size change. DECRQM reports the subscription state.
+  RIS and transport reset clear it. Both immediate and asynchronous reports
+  follow the parser reply route on framed viewers.
