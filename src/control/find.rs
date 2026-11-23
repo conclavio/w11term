@@ -1,4 +1,5 @@
 use super::*;
+use crate::search::PaneSearchQuery;
 use tokio::{task::JoinSet, time::Instant};
 
 const PARALLEL_PANES: usize = 4;
@@ -10,6 +11,8 @@ impl Registry {
         pattern: String,
         pane: Option<u64>,
         all_panes: bool,
+        regex: bool,
+        match_case: bool,
     ) -> Result<Value> {
         ensure!(
             all_panes != pane.is_some(),
@@ -21,6 +24,8 @@ impl Registry {
             "search text exceeds {} UTF-8 bytes",
             crate::search::MAX_QUERY_BYTES
         );
+        let query = PaneSearchQuery::new(pattern, match_case, regex)
+            .map_err(|error| anyhow::anyhow!("invalid regular expression: {error}"))?;
         // A move between windows keeps the session sender and its pane ID.
         // Report the window and tab at the instant the search was requested.
         let mut targets = self.listing();
@@ -36,14 +41,14 @@ impl Registry {
             // Long-running panes may complete in any order. Limit concurrent
             // scans while allowing ready siblings to make progress.
             for (window_id, target) in targets.by_ref().take(PARALLEL_PANES - workers.len()) {
-                let query = pattern.clone();
+                let query = query.clone();
                 let pane_deadline = if all_panes {
                     deadline.min(Instant::now() + PANE_TIMEOUT)
                 } else {
                     deadline
                 };
                 workers.spawn(async move {
-                    let result = search_pane(&target, query, pane_deadline).await;
+                    let result = search_pane(&target, query, regex, pane_deadline).await;
                     (window_id, target, result)
                 });
             }
@@ -65,15 +70,17 @@ impl Registry {
     }
 }
 
-async fn search_pane(target: &Pane, query: String, deadline: Instant) -> Result<Value> {
+async fn search_pane(
+    target: &Pane,
+    query: PaneSearchQuery,
+    regex: bool,
+    deadline: Instant,
+) -> Result<Value> {
     ensure!(Instant::now() < deadline, "scrollback search timed out");
     let (reply, response) = oneshot::channel();
     target
         .input
-        .send(Command::SearchPreview {
-            query: query.into(),
-            reply,
-        })
+        .send(Command::SearchPreview { query, reply })
         .context("pane is closed")?;
     let preview = tokio::time::timeout_at(deadline, response)
         .await
@@ -87,5 +94,10 @@ async fn search_pane(target: &Pane, query: String, deadline: Instant) -> Result<
         let start = anchor.start();
         json!({"row": start.row, "column": start.col, "excerpt": excerpt})
     });
-    Ok(json!({"count": preview.total, "truncated": preview.truncated, "first": first}))
+    let mut result =
+        json!({"count": preview.total, "truncated": preview.truncated, "first": first});
+    if regex {
+        result["incomplete"] = preview.incomplete.into();
+    }
+    Ok(result)
 }

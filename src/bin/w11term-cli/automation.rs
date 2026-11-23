@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{CommandStatus, Request};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -15,6 +15,7 @@ pub fn parse(
     let mut activate = false;
     let mut all_panes = false;
     let mut regex = false;
+    let mut match_case = false;
     let mut timeout = None;
     let mut since = None;
     let mut text = None;
@@ -43,7 +44,8 @@ pub fn parse(
             }
             "--profile" if verb == "open" => profile = Some(value(&mut args)?),
             "--activate" if verb == "open" => activate = true,
-            "--regex" if verb == "wait-for-text" => regex = true,
+            "--regex" if matches!(verb, "find-text" | "wait-for-text") => regex = true,
+            "--match-case" if verb == "find-text" => match_case = true,
             "--timeout" if matches!(verb, "wait-for-text" | "events") => {
                 timeout = Some(value(&mut args)?.parse()?)
             }
@@ -110,7 +112,7 @@ pub fn parse(
                 all_panes != pane.is_some(),
                 "specify --pane ID or --all-panes"
             );
-            let pattern = text.context("literal search text is required")?;
+            let pattern = text.context("search text or regular expression is required")?;
             ensure!(!pattern.is_empty(), "search text is empty");
             ensure!(
                 pattern.len() <= w11term::search::MAX_QUERY_BYTES,
@@ -121,6 +123,8 @@ pub fn parse(
                 pattern,
                 pane,
                 all_panes,
+                regex,
+                match_case,
             }
         }
         "wait-for-text" => Request::WaitForText {

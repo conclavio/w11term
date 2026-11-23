@@ -118,6 +118,10 @@ pub enum Request {
         pane: Option<u64>,
         #[serde(default)]
         all_panes: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        regex: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        match_case: bool,
     },
     SaveText {
         pane: u64,
@@ -459,7 +463,12 @@ impl Registry {
                 pattern,
                 pane,
                 all_panes,
-            } => self.find_text(pattern, pane, all_panes).await,
+                regex,
+                match_case,
+            } => {
+                self.find_text(pattern, pane, all_panes, regex, match_case)
+                    .await
+            }
             Request::ListCommands { pane, status } => self.list_commands(pane, status).await,
             Request::GetCommand {
                 pane,
