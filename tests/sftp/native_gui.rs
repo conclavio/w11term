@@ -415,6 +415,24 @@ async fn native_pane_scrollbar_tracks_async_ssh_output_without_moving_its_neighb
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reads back actual Direct2D Find marks in a live SSH and PowerShell split"]
+async fn native_find_scrollbar_marks_show_the_current_result_and_clear_with_find() {
+    let lines = (0..201)
+        .map(|row| match row {
+            20 | 100 | 175 => format!("line {row:03} has a rail-witness"),
+            _ => format!("line {row:03}"),
+        })
+        .collect::<Vec<_>>();
+    let history = format!("\x1b[H\x1b[2J\x1b[3J{}", lines.join("\r\n"));
+    run_palette_fixture(
+        "find-scrollbar-marks-ui.ps1",
+        b"\x1b[?1049h\x1b[Halt-screen-ready\x1b[?1049lmark-search-closed",
+        Some(&history),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits word delimiters and verifies UIA words and double-click selection in a live SSH pane"]
 async fn native_word_delimiters_update_reader_and_pointer_selection_in_running_ssh() {
     run_palette_fixture(

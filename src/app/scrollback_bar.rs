@@ -1,8 +1,13 @@
 use crate::renderer::{Metrics, PADDING, STATUS_HEIGHT};
-use std::cell::Cell;
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    sync::Arc,
+};
+use w11term::search::SearchSnapshot;
 use w11term::terminal::{ScrollbackView, Snapshot};
 use wezterm_term::MouseEventKind;
-use windows_canvas::{Brush, ColorF, DrawContext, Rect};
+use windows_canvas::{Brush, ColorF, DrawContext, DrawingSession, Rect};
 use windows_reactor::PointerEventInfo;
 
 #[derive(Clone, Copy)]
@@ -16,7 +21,12 @@ struct Rail {
 impl Rail {
     fn new(view: ScrollbackView, width: f32, height: f32, scale: f32) -> Option<Self> {
         let height = height - STATUS_HEIGHT - 2.0 * PADDING;
-        (width > 2.0 * PADDING && height >= 4.0 && width.is_finite() && height.is_finite())
+        (width > 2.0 * PADDING
+            && height >= 4.0
+            && width.is_finite()
+            && height.is_finite()
+            && scale.is_finite()
+            && scale > 0.0)
             .then_some(Self {
                 view,
                 width,
@@ -65,6 +75,89 @@ impl Rail {
     }
 }
 
+/// Project a stable row onto the full retained buffer in physical pixels.
+/// The viewport top moves the thumb independently of the result marks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MarkScale {
+    oldest: isize,
+    last: isize,
+    pixels: u32,
+    thickness: u32,
+}
+
+impl MarkScale {
+    fn new(rail: Rail) -> Self {
+        let top = (PADDING * rail.scale).round() as u32;
+        let end = ((PADDING + rail.height) * rail.scale).round() as u32;
+        let pixels = end.saturating_sub(top).max(1);
+        Self {
+            oldest: rail.view.oldest,
+            last: rail
+                .view
+                .live
+                .saturating_add_unsigned(rail.view.rows.saturating_sub(1)),
+            pixels,
+            thickness: ((2.0 * rail.scale).round() as u32).clamp(1, pixels),
+        }
+    }
+
+    fn band(self, row: isize, thickness: u32) -> Option<Range<u32>> {
+        if !(self.oldest..=self.last).contains(&row) {
+            return None;
+        }
+        let fraction =
+            self.oldest.abs_diff(row) as f64 / self.oldest.abs_diff(self.last).max(1) as f64;
+        let center = (fraction * f64::from(self.pixels - 1)).round() as u32;
+        let start = center
+            .saturating_sub(thickness / 2)
+            .min(self.pixels - thickness);
+        Some(start..start + thickness)
+    }
+}
+
+struct MarkBands {
+    rows: Arc<[isize]>,
+    scale: MarkScale,
+    bands: Vec<Range<u32>>,
+}
+
+impl MarkBands {
+    fn new(rows: &Arc<[isize]>, scale: MarkScale) -> Self {
+        let mut bands: Vec<Range<u32>> = Vec::new();
+        for band in rows
+            .iter()
+            .filter_map(|&row| scale.band(row, scale.thickness))
+        {
+            if let Some(last) = bands.last_mut()
+                && band.start <= last.end
+            {
+                last.end = last.end.max(band.end);
+            } else {
+                bands.push(band);
+            }
+        }
+        Self {
+            rows: rows.clone(),
+            scale,
+            bands,
+        }
+    }
+
+    fn project<'a>(
+        cache: &'a mut Option<Self>,
+        rows: &Arc<[isize]>,
+        scale: MarkScale,
+    ) -> &'a [Range<u32>] {
+        if !cache
+            .as_ref()
+            .is_some_and(|old| old.scale == scale && Arc::ptr_eq(&old.rows, rows))
+        {
+            *cache = Some(Self::new(rows, scale));
+        }
+        &cache.as_ref().unwrap().bands
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Drag {
     // Use the stable-row interval at press, even when new output arrives mid-drag.
@@ -76,18 +169,24 @@ struct Drag {
 #[derive(Default)]
 pub(super) struct ScrollBar {
     enabled: Cell<bool>,
+    find_open: Cell<bool>,
+    marks: RefCell<Option<MarkBands>>,
     shown: Cell<Option<Rail>>,
     owns_press: Cell<bool>,
     drag: Cell<Option<Drag>>,
 }
 
 impl ScrollBar {
-    pub(super) fn set_enabled(&self, enabled: bool) -> bool {
-        let changed = self.enabled.replace(enabled) != enabled;
+    pub(super) fn configure(&self, enabled: bool, find_open: bool) -> bool {
+        let was_enabled = self.enabled.replace(enabled);
+        let had_find = self.find_open.replace(find_open);
         if !enabled {
             self.present(None);
         }
-        changed
+        if !enabled || !find_open {
+            self.marks.borrow_mut().take();
+        }
+        was_enabled != enabled || had_find != find_open
     }
 
     pub(super) fn cancel(&self) {
@@ -115,12 +214,24 @@ impl ScrollBar {
         if ctx.device_changed() {
             *brush = None;
         }
+        self.paint(ctx, frame, ctx.width, ctx.height, metrics, brush)
+    }
+
+    pub(super) fn paint(
+        &self,
+        ctx: &DrawingSession<'_>,
+        frame: &Snapshot,
+        width: f32,
+        height: f32,
+        metrics: Metrics,
+        brush: &mut Option<Brush>,
+    ) -> windows_canvas::Result<()> {
         let geometry_matches =
             self.enabled.get() && frame.cols == metrics.cols && frame.rows.len() == metrics.rows;
         let rail = if geometry_matches {
             frame
                 .scrollback_view()
-                .and_then(|view| Rail::new(view, ctx.width, ctx.height, metrics.scale))
+                .and_then(|view| Rail::new(view, width, height, metrics.scale))
         } else {
             None
         };
@@ -137,8 +248,56 @@ impl ScrollBar {
             ctx.fill_rect(&Rect::from_xywh(x, PADDING, w, rail.height), brush);
             brush.set_color(ColorF::new(0.56, 0.60, 0.65, 1.0));
             ctx.fill_rect(&Rect::from_xywh(x, top, w, height), brush);
+            if let Some(search) = frame
+                .search
+                .as_ref()
+                .filter(|s| self.find_open.get() && !s.match_rows.is_empty())
+            {
+                self.paint_marks(ctx, rail, brush, search);
+            } else {
+                self.marks.borrow_mut().take();
+            }
+        } else {
+            self.marks.borrow_mut().take();
         }
         Ok(())
+    }
+
+    fn paint_marks(
+        &self,
+        ctx: &DrawingSession<'_>,
+        rail: Rail,
+        brush: &Brush,
+        search: &SearchSnapshot,
+    ) {
+        let scale = MarkScale::new(rail);
+        let pixel_top = (PADDING * rail.scale).round();
+        let fill = |band: &Range<u32>, width: f32| {
+            let y = (pixel_top + band.start as f32) / rail.scale;
+            ctx.fill_rect(
+                &Rect::from_xywh(
+                    rail.width - 2.0 - width,
+                    y,
+                    width,
+                    (band.end - band.start) as f32 / rail.scale,
+                ),
+                brush,
+            );
+        };
+        // Keep the left edge of the thumb visible even for dense results.
+        brush.set_color(ColorF::new(1.0, 216.0 / 255.0, 76.0 / 255.0, 1.0));
+        let mut cache = self.marks.borrow_mut();
+        for band in MarkBands::project(&mut cache, &search.match_rows, scale) {
+            fill(band, 3.0);
+        }
+        let selected_height = ((4.0 * rail.scale).round() as u32).clamp(1, scale.pixels);
+        if let Some(band) = search
+            .selected_row
+            .and_then(|row| scale.band(row, selected_height))
+        {
+            brush.set_color(ColorF::new(1.0, 123.0 / 255.0, 41.0 / 255.0, 1.0));
+            fill(&band, 7.0);
+        }
     }
 
     pub(super) fn pointer(
@@ -257,6 +416,75 @@ mod tests {
             ));
         }
         sent
+    }
+
+    #[test]
+    fn marks_cover_every_retained_row_including_the_bottom_of_the_live_screen() {
+        let mut term = terminal();
+        term.advance_bytes(b"x\r\n".repeat(200));
+        let mut rail = rail(&term, 0);
+        rail.view.oldest = 100;
+        rail.view.live = 297;
+        rail.view.rows = 4;
+        rail.height = 96.0;
+        rail.scale = 1.25;
+        let scale = MarkScale::new(rail);
+        assert_eq!((scale.pixels, scale.thickness, scale.last), (120, 3, 300));
+        assert_eq!(scale.band(100, 3), Some(0..3));
+        assert_eq!(scale.band(200, 3), Some(59..62));
+        assert_eq!(scale.band(200, 5), Some(58..63));
+        assert_eq!(scale.band(300, 3), Some(117..120));
+        assert_eq!(scale.band(301, 3), None);
+        assert_eq!(scale.band(99, 3), None);
+
+        rail.view.top = 175;
+        rail.width += 20.0;
+        assert_eq!(MarkScale::new(rail), scale);
+        rail.scale = 1.5;
+        assert_eq!(MarkScale::new(rail).pixels, 144);
+        assert!(Rail::new(rail.view, WIDTH, HEIGHT, f32::NAN).is_none());
+    }
+
+    #[test]
+    fn dense_marks_share_bands_and_invalidate_on_a_new_result_set_or_geometry() {
+        let all: Arc<[isize]> = (0..10_000).collect();
+        let sparse: Arc<[isize]> = Arc::from([-1, 0, 5_000, 9_999, 10_000]);
+        let scale = MarkScale {
+            oldest: 0,
+            last: 9_999,
+            pixels: 1_000,
+            thickness: 2,
+        };
+        let mut cache = None;
+        let [dense] = MarkBands::project(&mut cache, &all, scale) else {
+            panic!("dense results should coalesce into a single band");
+        };
+        assert_eq!(*dense, 0..1_000);
+        let first = cache.as_ref().unwrap().bands.as_ptr();
+        // A repaint or selecting a different match in this result set shares the projection.
+        assert_eq!(
+            MarkBands::project(&mut cache, &all.clone(), scale).as_ptr(),
+            first
+        );
+        assert_eq!(
+            MarkBands::project(&mut cache, &sparse, scale),
+            [0..2, 499..501, 998..1_000]
+        );
+        let shorter = MarkScale {
+            pixels: 500,
+            ..scale
+        };
+        assert_eq!(
+            MarkBands::project(&mut cache, &sparse, shorter),
+            [0..2, 249..251, 498..500]
+        );
+        let bar = ScrollBar::default();
+        bar.configure(true, true);
+        *bar.marks.borrow_mut() = cache;
+        assert!(!bar.configure(true, true));
+        assert!(bar.marks.borrow().is_some());
+        assert!(bar.configure(true, false));
+        assert!(bar.marks.borrow().is_none());
     }
 
     #[test]
