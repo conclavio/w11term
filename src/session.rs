@@ -133,7 +133,7 @@ pub enum Command {
     ),
     SearchClose,
     SearchPreview {
-        query: String,
+        query: crate::search::PaneSearchQuery,
         reply: tokio::sync::oneshot::Sender<crate::search::PaneSearchPreview>,
     },
     SearchReveal {

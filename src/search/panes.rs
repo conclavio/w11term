@@ -1,5 +1,6 @@
-use super::{LIMIT, MAX_QUERY_BYTES, Match, Search, literal};
+use super::{Cell, LIMIT, MAX_QUERY_BYTES, Match, Search, compile_regex, literal, scan_regex};
 use crate::interaction::Point;
+use regex::Regex;
 use std::sync::Arc;
 use wezterm_term::{Line, Terminal};
 
@@ -7,8 +8,50 @@ use wezterm_term::{Line, Terminal};
 pub struct PaneSearchPreview {
     pub total: usize,
     pub truncated: bool,
+    pub incomplete: bool,
     pub updating: bool,
     pub first: Option<(String, PaneSearchAnchor)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaneSearchQuery {
+    text: String,
+    sensitive: bool,
+    pattern: Option<Regex>,
+}
+
+impl PaneSearchQuery {
+    pub fn new(text: String, sensitive: bool, regex: bool) -> Result<Self, String> {
+        if text.len() > MAX_QUERY_BYTES {
+            return Err(format!("Search text exceeds {MAX_QUERY_BYTES} UTF-8 bytes"));
+        }
+        let pattern = regex.then(|| compile_regex(&text, sensitive)).transpose()?;
+        Ok(Self {
+            text,
+            sensitive,
+            pattern,
+        })
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl From<String> for PaneSearchQuery {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            sensitive: false,
+            pattern: None,
+        }
+    }
+}
+
+impl From<&str> for PaneSearchQuery {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
 }
 
 /// A hit in one connection's active buffer. The row revisions catch rewrites
@@ -16,7 +59,7 @@ pub struct PaneSearchPreview {
 #[derive(Clone, Debug)]
 pub struct PaneSearchAnchor {
     origin: Arc<()>,
-    query: String,
+    query: PaneSearchQuery,
     cols: usize,
     rows: usize,
     alternate: bool,
@@ -39,7 +82,7 @@ impl PaneSearchAnchor {
     ) -> Option<(Search, usize)> {
         let screen = terminal.screen();
         if !Arc::ptr_eq(origin, &self.origin)
-            || query != self.query
+            || query != self.query.text
             || self.cols != screen.physical_cols
             || self.rows != screen.physical_rows
             || self.alternate != terminal.is_alt_screen_active()
@@ -59,10 +102,13 @@ impl PaneSearchAnchor {
         let mut search = Search {
             open: true,
             query,
+            sensitive: self.query.sensitive,
+            regex: self.query.pattern.is_some(),
+            compiled: self.query.pattern,
             alternate: self.alternate,
             ..Search::default()
         };
-        search.collect_literal(terminal, &cancelled);
+        search.collect_matches(terminal, &cancelled);
         if cancelled() {
             return None;
         }
@@ -84,11 +130,11 @@ impl PaneSearchPreview {
     pub(crate) fn scan(
         terminal: &Terminal,
         origin: &Arc<()>,
-        query: String,
+        query: PaneSearchQuery,
         cancelled: impl Fn() -> bool,
     ) -> Self {
         let mut preview = Self::default();
-        if query.is_empty() || query.len() > MAX_QUERY_BYTES || cancelled() {
+        if query.text.is_empty() || query.text.len() > MAX_QUERY_BYTES || cancelled() {
             return preview;
         }
         if terminal.synchronized_output() {
@@ -96,16 +142,22 @@ impl PaneSearchPreview {
             return preview;
         }
         let mut first = None;
-        preview.truncated = literal::scan(terminal, &query, false, &cancelled, |cells| {
-            if preview.total == LIMIT {
-                return false;
-            }
-            preview.total += 1;
-            if first.is_none() {
-                first = Match::from_cells(cells.iter());
-            }
-            true
-        });
+        (preview.truncated, preview.incomplete) = if let Some(pattern) = &query.pattern {
+            scan_regex(terminal, pattern, &cancelled, |cells| {
+                add_preview_hit(&mut preview.total, &mut first, cells.iter())
+            })
+        } else {
+            (
+                literal::scan(
+                    terminal,
+                    &query.text,
+                    query.sensitive,
+                    &cancelled,
+                    |cells| add_preview_hit(&mut preview.total, &mut first, cells.iter()),
+                ),
+                false,
+            )
+        };
         if let Some(matched) = first
             && !cancelled()
         {
@@ -113,7 +165,7 @@ impl PaneSearchPreview {
             let rows = hit_rows(terminal, &matched).unwrap().inspect(|line| {
                 revisions.push(line.current_seqno());
             });
-            let text = snippet(rows, &matched, &query);
+            let text = snippet(rows, &matched);
             let screen = terminal.screen();
             preview.first = Some((
                 text,
@@ -132,12 +184,28 @@ impl PaneSearchPreview {
     }
 }
 
-fn snippet<'a>(rows: impl Iterator<Item = &'a Line>, hit: &Match, query: &str) -> String {
+fn add_preview_hit<'a>(
+    total: &mut usize,
+    first: &mut Option<Match>,
+    cells: impl Iterator<Item = &'a Cell>,
+) -> bool {
+    if *total == LIMIT {
+        return false;
+    }
+    *total += 1;
+    if first.is_none() {
+        *first = Match::from_cells(cells);
+    }
+    true
+}
+
+fn snippet<'a>(rows: impl Iterator<Item = &'a Line>, hit: &Match) -> String {
     // Keep the original spelling of the match and a little context on either
     // side. A single terminal cell can contain arbitrarily many combining
     // marks, so bound bytes as well as columns before copying to the UI.
     const CONTEXT: usize = 24;
     const MAX_CONTEXT_BYTES: usize = CONTEXT * 4;
+    const MAX_MATCH_BYTES: usize = MAX_QUERY_BYTES * 4;
     let mut before = String::new();
     let mut body = String::new();
     let mut after = String::new();
@@ -162,10 +230,10 @@ fn snippet<'a>(rows: impl Iterator<Item = &'a Line>, hit: &Match, query: &str) -
                     }
                 }
             } else if col < *right {
-                if !oversize && body.len() + text.len() <= MAX_QUERY_BYTES * 4 {
-                    body.push_str(text);
-                } else {
-                    oversize = true;
+                if !oversize {
+                    let end = text.floor_char_boundary(MAX_MATCH_BYTES - body.len());
+                    body.push_str(&text[..end]);
+                    oversize = end < text.len();
                 }
             } else if after.len() < MAX_CONTEXT_BYTES {
                 let end = text.floor_char_boundary(MAX_CONTEXT_BYTES - after.len());
@@ -174,9 +242,10 @@ fn snippet<'a>(rows: impl Iterator<Item = &'a Line>, hit: &Match, query: &str) -
         }
     }
     format!(
-        "{}{}{}",
+        "{}{}{}{}",
         before.trim_start(),
-        if oversize { query } else { &body },
+        body,
+        if oversize { "…" } else { "" },
         after.trim_end()
     )
 }
@@ -204,6 +273,51 @@ mod tests {
 
     fn scan(t: &Terminal, id: &Arc<()>, query: &str) -> PaneSearchPreview {
         PaneSearchPreview::scan(t, id, query.into(), || false)
+    }
+
+    #[test]
+    fn regex_preview_and_reveal_share_case_wrapping_and_hard_newline_rules() {
+        let id = Arc::new(());
+        let term = screen(8, 6, "prefix RX-12\r\nrx-34\r\nRX-\r\n56");
+        let query = r"RX-\d+";
+        let sensitive = PaneSearchQuery::new(query.into(), true, true).unwrap();
+        let preview = PaneSearchPreview::scan(&term, &id, sensitive, || false);
+        assert_eq!(preview.total, 1);
+        let (excerpt, anchor) = preview.first.unwrap();
+        assert!(excerpt.contains("RX-12"));
+        assert_eq!(anchor.matched.spans.len(), 2);
+        let (find, _) = anchor
+            .prepare_reveal(&term, &id, query.into(), 0, || false)
+            .unwrap();
+        assert!(find.regex && find.sensitive);
+        assert_eq!(find.matches.len(), 1);
+        assert_eq!(find.selected, Some(0));
+
+        let insensitive = PaneSearchQuery::new(query.into(), false, true).unwrap();
+        assert_eq!(
+            PaneSearchPreview::scan(&term, &id, insensitive, || false).total,
+            2
+        );
+        let whole_word = PaneSearchQuery::new("rx".into(), true, false).unwrap();
+        assert_eq!(
+            PaneSearchPreview::scan(&term, &id, whole_word, || false).total,
+            1
+        );
+        assert!(PaneSearchQuery::new("[".into(), false, true).is_err());
+    }
+
+    #[test]
+    fn regex_preview_reports_skipped_lines_and_keeps_a_bounded_excerpt() {
+        let id = Arc::new(());
+        let skipped = "b".repeat(super::super::MAX_REGEX_LINE_BYTES + 1);
+        let shown = "a".repeat(MAX_QUERY_BYTES * 4 + 1);
+        let term = screen(512, 4, &format!("{skipped}\r\n{shown}"));
+        let query = PaneSearchQuery::new("[ab]+".into(), false, true).unwrap();
+        let preview = PaneSearchPreview::scan(&term, &id, query, || false);
+        assert!(preview.incomplete);
+        assert_eq!(preview.total, 1);
+        let (excerpt, _) = preview.first.unwrap();
+        assert_eq!(excerpt, format!("{}…", "a".repeat(MAX_QUERY_BYTES * 4)));
     }
 
     #[test]

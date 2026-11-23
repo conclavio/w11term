@@ -53,7 +53,7 @@ function Set-Anchor([string]$Label, [string]$Anchor) {
     Close-LocalFind
     return Viewport $Label $Anchor
 }
-function Wait-Results {
+function Wait-Results([int]$SshCount = 2) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,$buttonType)
     $last = [ref]''
@@ -63,7 +63,7 @@ function Wait-Results {
             $labels = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition) |
                 ForEach-Object { $_.Current.Name } | Where-Object { $_ -match '^Pane [0-9]+ ' })
             $last.Value = $labels -join ' / '
-            if ($labels.Count -eq 2 -and $labels[0] -like "Pane $remote *palette-ssh*2 matches*ssh-first Fleet.Target north*" -and
+            if ($labels.Count -eq 2 -and $labels[0] -like "Pane $remote *palette-ssh*$SshCount match*ssh-first Fleet.Target north*" -and
                 $labels[1] -like "Pane $local *Palette PowerShell*1 match*local-only Fleet.Target east*") { $labels }
         }
     } catch { throw "$_ Last result rows: $($last.Value)" }
@@ -161,6 +161,32 @@ try {
     Type-Terminal 'Write-Output ("global-local-ok-" + $global:FindAnswer)'
     Press-Key 13
     $null = Control @('wait-for-text','--pane',"$local",'--timeout','15','global-local-ok-42')
+
+    Press-Key 0x75 # Find in all panes from PowerShell again.
+    $null = Find-Edit 'Find in all panes'
+    (Wait-CheckBox 'Regular expression in all panes' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $all = Find-Edit 'Find in all panes'
+    $all.GetCurrentPattern($valuePattern).SetValue('[')
+    $status = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'pane-search-status')
+    $null = Wait-Until 'invalid regex diagnostic' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $node = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $status)
+        $node -and $node.Current.Name -like 'Invalid regex*'
+    }
+    $regex = 'Fleet[.]Target (north|south|east)'
+    $all.GetCurrentPattern($valuePattern).SetValue($regex)
+    $null = Wait-Results
+    (Wait-CheckBox 'Match case in all panes' ([System.Windows.Automation.ToggleState]::Off)).Toggle()
+    $null = Find-Edit 'Find in all panes'
+    $null = Wait-Results 1
+    Press-Key 13
+    Wait-Focus $remote
+    $field = Find-Edit 'Find in scrollback'
+    Assert-Query $field $regex
+    $null = Wait-CheckBox 'Regular expression' ([System.Windows.Automation.ToggleState]::On)
+    $null = Wait-CheckBox 'Match case' ([System.Windows.Automation.ToggleState]::On)
+    Wait-LocalStatus '1 / 1'
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

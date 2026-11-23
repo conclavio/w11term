@@ -38,7 +38,7 @@ async fn scrollback_search_reports_every_window_and_distinguishes_an_unavailable
         let Some(Command::SearchPreview { query, reply }) = requests.recv().await else {
             panic!("expected a read-only search")
         };
-        assert_eq!(query, "missing");
+        assert_eq!(query.text(), "missing");
         reply.send(Default::default()).unwrap();
     });
     let capture: w11term::control::CapturePng =

@@ -70,7 +70,10 @@ async fn search_pane(target: &Pane, query: String, deadline: Instant) -> Result<
     let (reply, response) = oneshot::channel();
     target
         .input
-        .send(Command::SearchPreview { query, reply })
+        .send(Command::SearchPreview {
+            query: query.into(),
+            reply,
+        })
         .context("pane is closed")?;
     let preview = tokio::time::timeout_at(deadline, response)
         .await

@@ -2,7 +2,7 @@ use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use w11term::copy_mode::ScreenId;
-use w11term::search::{MAX_QUERY_BYTES, PaneSearchAnchor, PaneSearchPreview};
+use w11term::search::{MAX_QUERY_BYTES, PaneSearchAnchor, PaneSearchPreview, PaneSearchQuery};
 
 // Limit the number of terminal workers scanning history at the same time.
 const PARALLEL_PANES: usize = 4;
@@ -11,8 +11,10 @@ static NEXT_QUERY: AtomicU64 = AtomicU64::new(1);
 
 pub enum Action {
     Edit(u64, String),
+    Option(u64, FindOption, bool),
     Start(u64),
     Ready(u64, Report),
+    Invalid(u64, String),
     Choose(u64, u64),
     Revealed(u64, u64, ScreenId, bool),
     Unavailable(u64),
@@ -37,12 +39,14 @@ pub(super) struct Row {
 pub struct Report {
     rows: Vec<Row>,
     updating: usize,
+    incomplete: usize,
     closed: usize,
 }
 
 impl Report {
     fn add(&mut self, target: Target, preview: PaneSearchPreview) {
         self.updating += usize::from(preview.updating);
+        self.incomplete += usize::from(preview.incomplete);
         if let Some((excerpt, anchor)) = preview.first {
             let plus = if preview.truncated { "+" } else { "" };
             let unit = if preview.total == 1 {
@@ -64,7 +68,7 @@ impl Report {
     }
 }
 
-async fn scan(targets: Vec<Target>, query: &str) -> Report {
+async fn scan(targets: Vec<Target>, query: PaneSearchQuery) -> Report {
     let mut report = Report::default();
     let mut remaining = targets.into_iter();
     let mut pending = tokio::task::JoinSet::new();
@@ -77,7 +81,7 @@ async fn scan(targets: Vec<Target>, query: &str) -> Report {
             if target
                 .input
                 .send(Command::SearchPreview {
-                    query: query.into(),
+                    query: query.clone(),
                     reply,
                 })
                 .is_ok()
@@ -123,6 +127,8 @@ pub(super) struct Results {
     epoch: u64,
     pub(super) rows: Vec<Row>,
     status: String,
+    sensitive: bool,
+    regex: bool,
     task: Option<ComponentTask>,
     stop: Option<oneshot::Sender<()>>,
     pub(super) revealing: bool,
@@ -136,6 +142,8 @@ impl Default for Results {
             epoch: instance,
             rows: vec![],
             status: String::new(),
+            sensitive: false,
+            regex: false,
             task: None,
             stop: None,
             revealing: false,
@@ -168,6 +176,17 @@ impl Results {
         if report.closed != 0 {
             self.status
                 .push_str(&format!(" · {} unavailable", report.closed));
+        }
+        if report.incomplete != 0 {
+            let unit = if report.incomplete == 1 {
+                "pane"
+            } else {
+                "panes"
+            };
+            self.status.push_str(&format!(
+                " · {} {unit} with lines too long for regex",
+                report.incomplete
+            ));
         }
     }
 }
@@ -218,7 +237,30 @@ impl Picker {
                     .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerCancel)))
                     .content("×"),
             ));
-        let page = ((app.window_height - 165.0) / 40.0).clamp(1.0, 8.0) as usize;
+        let options = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(12.0)
+            .children((
+                CheckBox::new()
+                    .min_width(0.0)
+                    .is_enabled(!self.text.revealing)
+                    .automation_name("Match case in all panes")
+                    .is_checked(self.text.sensitive)
+                    .on_is_checked_changed(ctx.callback(move |checked| {
+                        Message::PaneText(Action::Option(instance, FindOption::Case, checked))
+                    }))
+                    .content("Match case"),
+                CheckBox::new()
+                    .min_width(0.0)
+                    .is_enabled(!self.text.revealing)
+                    .automation_name("Regular expression in all panes")
+                    .is_checked(self.text.regex)
+                    .on_is_checked_changed(ctx.callback(move |checked| {
+                        Message::PaneText(Action::Option(instance, FindOption::Regex, checked))
+                    }))
+                    .content("Regex"),
+            ));
+        let page = ((app.window_height - 205.0) / 40.0).clamp(1.0, 8.0) as usize;
         let first = self.selected / page * page;
         let mut results = vec![];
         for (i, row) in self.text.rows.iter().enumerate().skip(first).take(page) {
@@ -262,12 +304,13 @@ impl Picker {
         }
         let list = StackPanel::new().spacing(4.0).keyed_children(results);
         let status = TextBlock::new()
+            .automation_id("pane-search-status")
             .text(&self.text.status)
             .automation_name(&self.text.status);
         Self::overlay(
             StackPanel::new()
                 .spacing(6.0)
-                .children((query, status, list)),
+                .children((query, options, status, list)),
             (app.width - 32.0).clamp(1.0, 780.0),
         )
     }
@@ -359,8 +402,11 @@ impl TerminalApp {
         };
         let epoch = picker.text.epoch;
         let current = match &action {
-            Action::Edit(instance, _) => *instance == picker.text.instance,
+            Action::Edit(instance, _) | Action::Option(instance, ..) => {
+                *instance == picker.text.instance
+            }
             Action::Start(e)
+            | Action::Invalid(e, _)
             | Action::Refresh(e)
             | Action::Unavailable(e)
             | Action::Ready(e, _)
@@ -376,12 +422,26 @@ impl TerminalApp {
                     self.edit_text_query(query, ctx);
                 }
             }
+            Action::Option(_, choice, checked) => {
+                let option = match choice {
+                    FindOption::Case => &mut picker.text.sensitive,
+                    FindOption::Regex => &mut picker.text.regex,
+                };
+                if !picker.text.revealing && *option != checked {
+                    *option = checked;
+                    let query = picker.query.clone();
+                    self.edit_text_query(query, ctx);
+                    self.focus_picker_input(0, ctx);
+                }
+            }
             Action::Refresh(_) => {
                 let query = picker.query.clone();
                 self.edit_text_query(query, ctx);
             }
             Action::Start(_) => {
                 let query = picker.query.clone();
+                let sensitive = picker.text.sensitive;
+                let regex = picker.text.regex;
                 let targets = self
                     .picker_choices(Mode::Text)
                     .into_iter()
@@ -405,7 +465,11 @@ impl TerminalApp {
                 state.stop = Some(stop);
                 state.task = Some(ctx.spawn_background_with_rejection(
                     move |_| {
-                        Message::PaneText(match wait_for_query(scan(targets, &query), cancelled) {
+                        let query = match PaneSearchQuery::new(query, sensitive, regex) {
+                            Ok(query) => query,
+                            Err(error) => return Message::PaneText(Action::Invalid(epoch, error)),
+                        };
+                        Message::PaneText(match wait_for_query(scan(targets, query), cancelled) {
                             Some(report) => Action::Ready(epoch, report),
                             None => Action::Unavailable(epoch),
                         })
@@ -417,6 +481,12 @@ impl TerminalApp {
                 picker.text.task.take();
                 picker.text.stop.take();
                 picker.text.set_report(report);
+                self.announce_text_selection();
+            }
+            Action::Invalid(_, error) => {
+                picker.text.cancel();
+                picker.text.status =
+                    format!("Invalid regex — {error}. Edit the pattern or turn off Regex.");
                 self.announce_text_selection();
             }
             Action::Unavailable(_) => {
@@ -485,6 +555,8 @@ impl TerminalApp {
                 picker.text.stop.take();
                 picker.text.task.take();
                 let query = picker.query.clone();
+                let sensitive = picker.text.sensitive;
+                let regex = picker.text.regex;
                 let Some(id) = self
                     .search_target(pane)
                     .filter(|(_, live)| {
@@ -507,8 +579,8 @@ impl TerminalApp {
                 live.find.epoch += 1;
                 live.find.open = true;
                 live.find.query = query;
-                live.find.sensitive = false;
-                live.find.regex = false;
+                live.find.sensitive = sensitive;
+                live.find.regex = regex;
                 live.find.pending = false;
                 self.tabs.select(id);
                 self.sync_selection(ctx);
@@ -558,7 +630,7 @@ mod tests {
                 input: input.clone(),
             })
             .collect();
-        let scanning = tokio::spawn(async move { scan(targets, "needle").await });
+        let scanning = tokio::spawn(async move { scan(targets, "needle".into()).await });
         let mut stalled = vec![];
         for _ in 0..PARALLEL_PANES {
             let Some(Command::SearchPreview { reply, .. }) = commands.recv().await else {
