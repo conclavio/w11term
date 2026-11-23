@@ -244,7 +244,10 @@ impl ITextProvider_Impl for Provider_Impl {
         let doc = self.source.document()?;
         let row = ((p.y - f64::from(r.top) - g.padding) / g.cell_height) as usize;
         let col = ((p.x - f64::from(r.left) - g.padding) / g.cell_width) as usize;
-        let logical = doc.cell_maps.get(row).map_or(col, |map| map.logical(col));
+        let logical = doc
+            .cell_maps
+            .get(row)
+            .map_or(col, |map| map.logical_at_grid(col));
         let i = doc.position(row, logical);
         Ok(self.range(doc, i..i))
     }

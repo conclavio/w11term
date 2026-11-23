@@ -4,21 +4,25 @@ use std::ops::Range;
 use wezterm_bidi::{
     BidiClass, BidiContext, Direction, ParagraphDirectionHint, bidi_class_for_char,
 };
-use wezterm_term::Line;
+use wezterm_term::{Line, line_width_scale};
 
 #[derive(Debug, Default, Clone)]
 pub struct CellMap {
     cols: usize,
+    width_scale: usize,
     visual: Vec<usize>,
     logical: Vec<usize>,
     rtl: Vec<bool>,
 }
 
 impl CellMap {
-    pub fn new(line: &Line, cols: usize) -> Self {
+    pub fn new(line: &Line, grid_cols: usize) -> Self {
+        let width_scale = line_width_scale(line);
+        let cols = (grid_cols / width_scale).max(grid_cols.min(1));
         let (enabled, hint) = line.bidi_info();
         let identity = Self {
             cols,
+            width_scale,
             ..Self::default()
         };
         if !enabled || cols == 0 {
@@ -67,6 +71,7 @@ impl CellMap {
         bidi.resolve_paragraph(&chars, hint);
         let mut map = Self {
             cols,
+            width_scale,
             visual: vec![usize::MAX; cols],
             logical: Vec::with_capacity(cols),
             rtl: vec![false; cols],
@@ -96,8 +101,30 @@ impl CellMap {
         self.visual.get(logical).copied().unwrap_or(logical)
     }
 
-    pub fn logical(&self, visual: usize) -> usize {
+    fn logical(&self, visual: usize) -> usize {
         self.logical.get(visual).copied().unwrap_or(visual)
+    }
+
+    pub fn width_scale(&self) -> usize {
+        self.width_scale.max(1)
+    }
+
+    pub fn logical_cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn visual_grid(&self, col: usize) -> usize {
+        self.visual(col) * self.width_scale()
+    }
+
+    pub fn logical_at_grid(&self, col: usize) -> usize {
+        let scale = self.width_scale();
+        let visual = if scale > 1 {
+            (col / scale).min(self.cols.saturating_sub(1))
+        } else {
+            col
+        };
+        self.logical(visual)
     }
 
     pub fn rtl(&self, logical: usize) -> bool {
@@ -110,7 +137,10 @@ impl CellMap {
             return Vec::new();
         }
         if self.visual.is_empty() {
-            return std::iter::once(logical).collect();
+            return std::iter::once(
+                logical.start * self.width_scale()..logical.end * self.width_scale(),
+            )
+            .collect();
         }
         let mut spans: Vec<Range<usize>> = Vec::new();
         for (visual, col) in self.logical.iter().enumerate() {
@@ -123,6 +153,10 @@ impl CellMap {
                     spans.push(visual..visual + 1);
                 }
             }
+        }
+        for span in &mut spans {
+            span.start *= self.width_scale();
+            span.end *= self.width_scale();
         }
         spans
     }

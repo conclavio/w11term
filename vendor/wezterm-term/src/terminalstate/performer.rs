@@ -180,6 +180,17 @@ impl<'a> Performer<'a> {
             p.as_str()
         };
 
+        let row_geometry = |state: &TerminalState| {
+            let scale = state.screen().line_width_scale(state.cursor.y);
+            (
+                scale > 1,
+                state
+                    .left_and_right_margins
+                    .end
+                    .min((state.screen().physical_cols / scale).max(1)),
+            )
+        };
+        let (mut sized, mut right) = row_geometry(self.state);
         for g in Graphemes::new(text) {
             let g = self.remap_grapheme(g);
 
@@ -210,6 +221,14 @@ impl<'a> Performer<'a> {
                 }
             }
 
+            if sized
+                && self.dec_auto_wrap
+                && self.cursor.x > self.left_and_right_margins.start.min(right - 1)
+                && self.cursor.x.saturating_add(print_width) > right
+            {
+                self.wrap_next = true;
+            }
+
             if self.wrap_next {
                 // Since we're implicitly moving the cursor to the next
                 // line, we need to tag the current position as wrapped
@@ -236,23 +255,33 @@ impl<'a> Performer<'a> {
                             .last()
                             .map(|cell| makes_sense_to_wrap(cell.str()))
                             .unwrap_or(false);
-                    if should_mark_wrapped {
+                    if should_mark_wrapped && !sized {
                         screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
                     }
                 }
                 self.new_line(true);
+                (sized, right) = row_geometry(self.state);
             }
 
-            let x = self.cursor.x;
             let y = self.cursor.y;
-            let width = self.left_and_right_margins.end;
+            let x = if sized {
+                self.cursor.x.min(right - 1)
+            } else {
+                self.cursor.x
+            };
+            self.cursor.x = x;
+            if sized && print_width > right - x {
+                // A wide grapheme cannot straddle the edge of a DEC-sized row.
+                // After pre-wrapping this only occurs with wrap disabled or a one-cell row.
+                continue;
+            }
 
             let pen = self.pen.clone();
 
-            let wrappable = x + print_width >= width;
+            let wrappable = x + print_width >= right;
 
             if self.insert {
-                let margin = self.left_and_right_margins.end;
+                let margin = right;
                 let screen = self.screen_mut();
                 for _ in x..x + print_width as usize {
                     screen.insert_cell(x, y, margin, seqno);
@@ -265,7 +294,7 @@ impl<'a> Performer<'a> {
                 x,
                 y,
                 print_width,
-                width,
+                right,
                 g,
                 self.pen
             );
@@ -461,6 +490,7 @@ impl<'a> Performer<'a> {
                     self.screen_mut().dirty_line(old_y, seqno);
                     self.screen_mut().dirty_line(y, seqno);
                     self.cursor.y = y;
+                    self.cursor.x = self.constrain_line_column(self.cursor.x, y);
                     self.wrap_next = false;
                 }
                 if self.newline_mode {
@@ -500,7 +530,12 @@ impl<'a> Performer<'a> {
                     self.set_cursor_pos(&x_pos, &y_pos);
                 } else if self.reverse_wraparound_mode
                     && self.dec_auto_wrap
-                    && self.cursor.x == self.left_and_right_margins.end - 1
+                    && self.cursor.x
+                        == self
+                            .left_and_right_margins
+                            .end
+                            .min(self.screen().logical_cols(self.cursor.y))
+                            - 1
                     && self.wrap_next
                 {
                     // If the cursor is in the last column and a character was
@@ -709,21 +744,34 @@ impl<'a> Performer<'a> {
             Esc::Code(EscCode::DecSaveCursorPosition) => self.dec_save_cursor(),
             Esc::Code(EscCode::DecRestoreCursorPosition) => self.dec_restore_cursor(),
 
-            Esc::Code(EscCode::DecDoubleHeightTopHalfLine) => {
+            Esc::Code(
+                code @ (EscCode::DecDoubleHeightTopHalfLine
+                | EscCode::DecDoubleHeightBottomHalfLine
+                | EscCode::DecDoubleWidthLine
+                | EscCode::DecSingleWidthLine),
+            ) => {
+                let cols = self.screen.physical_cols;
                 let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_height_top(seqno);
-            }
-            Esc::Code(EscCode::DecDoubleHeightBottomHalfLine) => {
-                let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_height_bottom(seqno);
-            }
-            Esc::Code(EscCode::DecDoubleWidthLine) => {
-                let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_double_width(seqno);
-            }
-            Esc::Code(EscCode::DecSingleWidthLine) => {
-                let idx = self.screen.phys_row(self.cursor.y);
-                self.screen.line_mut(idx).set_single_width(seqno);
+                let line = self.screen.line_mut(idx);
+                match code {
+                    EscCode::DecDoubleHeightTopHalfLine => line.set_double_height_top(seqno),
+                    EscCode::DecDoubleHeightBottomHalfLine => line.set_double_height_bottom(seqno),
+                    EscCode::DecDoubleWidthLine => line.set_double_width(seqno),
+                    _ => {
+                        if crate::screen::line_width_scale(line) > 1 {
+                            crate::screen::clip_sized_line(line, cols, seqno);
+                        }
+                        line.set_single_width(seqno);
+                    }
+                }
+                if crate::screen::line_width_scale(line) == 2 {
+                    crate::screen::clip_sized_line(line, cols, seqno);
+                    if line.last_cell_was_wrapped() {
+                        line.set_last_cell_was_wrapped(false, seqno);
+                    }
+                }
+                let (x, y) = (self.cursor.x, self.cursor.y);
+                self.set_cursor_position_absolute(x, y);
             }
 
             Esc::Code(EscCode::DecScreenAlignmentDisplay) => {

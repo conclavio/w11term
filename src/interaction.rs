@@ -301,6 +301,8 @@ pub(crate) fn plain_text<'a>(
         }
         hard_break =
             shape != TextShape::Linear || range.end != cols || !line.last_cell_was_wrapped();
+        let row_cols = (cols / wezterm_term::line_width_scale(line)).max(cols.min(1));
+        let range = range.start.min(row_cols)..range.end.min(row_cols);
         let trim = hard_break && shape != TextShape::PaddedBlock;
         let last_text = if trim {
             // Locate the last non-whitespace cell before allocating. A large

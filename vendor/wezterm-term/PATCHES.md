@@ -86,6 +86,9 @@ The original MIT license is preserved in `LICENSE.md`.
   from eviction as new output arrives. This lets the UI discard an old
   scrollbar gesture after either a local clear or a remote CSI 3 J.
 
+- DEC line renditions limit addressable columns, discard truncated text, and
+  retain their width and height flags when rows scroll or the grid resizes.
+
 - Screen storage grows as output arrives. Resizing and rewrapping enforce
   the physical row limit supplied by the profile, including a limit of zero.
   Dropping primary rows advances their stable row indices so Find and export

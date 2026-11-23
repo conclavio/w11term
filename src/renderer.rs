@@ -62,7 +62,7 @@ impl CellHit {
             row: frame.first_stable_row + self.row as isize,
             col: frame
                 .cell_map(self.row)
-                .map_or(self.col, |map| map.logical(self.col)),
+                .map_or(self.col, |map| map.logical_at_grid(self.col)),
         }
     }
 }
@@ -115,6 +115,7 @@ struct TextRun<'a> {
     cols: usize,
     fg: [f32; 4],
     shape: bool,
+    scale: (f32, f32),
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +200,17 @@ fn run_extent(
         count += 1;
     }
     (count, Some(kind))
+}
+
+/// Both halves use the same double-height baseline and are clipped to their own row.
+fn glyph_row(line: &wezterm_term::Line, top: f32, cell_height: f32) -> (f32, f32) {
+    if line.is_double_height_top() {
+        (top, 2.0)
+    } else if line.is_double_height_bottom() {
+        (top - cell_height, 2.0)
+    } else {
+        (top, 1.0)
+    }
 }
 
 fn draw_ink_lines(
@@ -332,7 +344,7 @@ impl Renderer {
         &mut self,
         native: &NativeDrawing,
         run: TextRun<'_>,
-    ) -> windows_canvas::Result<Option<(&TextLayout, f32)>> {
+    ) -> windows_canvas::Result<Option<(&TextLayout, (f32, f32))>> {
         let TextRun {
             text,
             style,
@@ -341,6 +353,7 @@ impl Renderer {
             cols,
             fg,
             shape,
+            mut scale,
         } = run;
         if text.trim_end_matches(' ').is_empty() {
             return Ok(None);
@@ -369,11 +382,9 @@ impl Renderer {
         let cached = &self.layouts[&key];
         // Anchor each shaped run to its occupied grid columns even when DirectWrite
         // chose a proportional fallback font or the grid was snapped to physical pixels.
-        let scale = if shape && cached.natural_width > 0.0 {
-            cols as f32 * self.metrics.cell_width / cached.natural_width
-        } else {
-            1.0
-        };
+        if shape && cached.natural_width > 0.0 {
+            scale.0 *= cols as f32 * self.metrics.cell_width / cached.natural_width;
+        }
         native.text(&cached.layout, x, y, fg, scale)?;
         Ok(Some((&cached.layout, scale)))
     }
@@ -442,7 +453,7 @@ impl Renderer {
         for hint in hints.filter(|h| h.row < rows) {
             let col = frame
                 .cell_map(hint.row)
-                .map_or(hint.col, |map| map.visual(hint.col));
+                .map_or(hint.col, |map| map.visual_grid(hint.col));
             if col >= cols {
                 continue;
             }
@@ -603,7 +614,9 @@ impl Renderer {
                 let col = usize::try_from(row)
                     .ok()
                     .and_then(|r| frame.cell_map(r))
-                    .map_or(point.col, |map| map.visual(point.col));
+                    .map_or(point.col, |map| {
+                        map.visual_grid(point.col.min(map.logical_cols().saturating_sub(1)))
+                    });
                 (row, col, true, CursorShape::SteadyBlock)
             },
         );
@@ -674,10 +687,11 @@ impl Renderer {
         let mut live = HashSet::new();
         let mut tiles = Vec::new();
         for (row, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
-            for cell in line
-                .visible_cells()
-                .take_while(|c| c.cell_index() < self.metrics.cols)
-            {
+            let map = frame.cell_map(row).expect("row belongs to the snapshot");
+            let cols = map
+                .logical_cols()
+                .min((self.metrics.cols / map.width_scale()).max(1));
+            for cell in line.visible_cells().take_while(|c| c.cell_index() < cols) {
                 if let Some(images) = cell.attrs().images() {
                     for tile in images {
                         let data = tile.image_data();
@@ -717,8 +731,8 @@ impl Renderer {
             let map = frame.cell_map(y).expect("row belongs to the snapshot");
             for cell in line
                 .visible_cells()
-                .take_while(|cell| cell.cell_index() < frame.cols)
-                .filter(|cell| map.visual(cell.cell_index()) < self.metrics.cols)
+                .take_while(|cell| cell.cell_index() < map.logical_cols())
+                .filter(|cell| map.visual_grid(cell.cell_index()) < self.metrics.cols)
             {
                 let (_, bg) = colors(cell.attrs(), &frame.palette);
                 if bg != background
@@ -727,11 +741,13 @@ impl Renderer {
                             || cell.attrs().reverse()))
                 {
                     brush.set_color(color(bg));
+                    let col = map.visual_grid(cell.cell_index());
+                    let cols = (cell.width() * map.width_scale()).min(self.metrics.cols - col);
                     ctx.fill_rect(
                         &Rect::from_xywh(
-                            PADDING + map.visual(cell.cell_index()) as f32 * cw,
+                            PADDING + col as f32 * cw,
                             PADDING + y as f32 * ch,
-                            cw * cell.width() as f32,
+                            cw * cols as f32,
                             ch,
                         ),
                         &brush,
@@ -753,7 +769,7 @@ impl Renderer {
                     CursorShape::Default | CursorShape::SteadyBlock | CursorShape::BlinkingBlock
                 )
         });
-        let mut block_extent = block.map(|cursor| (cursor.col, 1));
+        let mut block_extent = None;
         let mut block_decorations = (Underline::None, false, false);
         let mut cursor_ink = None;
         for (y, line) in frame.rows.iter().take(self.metrics.rows).enumerate() {
@@ -761,19 +777,28 @@ impl Renderer {
             let block_col = block
                 .filter(|cursor| cursor.row == y)
                 .map(|cursor| cursor.col);
+            let width_scale = map.width_scale();
+            let row_cw = cw * width_scale as f32;
+            let row_top = PADDING + y as f32 * ch;
+            let (glyph_top, height_scale) = glyph_row(line, row_top, ch);
+            let glyph_height = ch * height_scale;
             let cells: Vec<_> = line
                 .visible_cells()
-                .take_while(|c| c.cell_index() < frame.cols)
-                .filter(|c| map.visual(c.cell_index()) < self.metrics.cols)
+                .take_while(|c| c.cell_index() < map.logical_cols())
+                .filter(|c| map.visual_grid(c.cell_index()) < self.metrics.cols)
                 .collect();
             if let Some(col) = block_col {
                 // visible_cells omits the continuation of a wide grapheme.
-                let logical = map.logical(col);
+                block_extent = Some((col, width_scale));
+                let logical = map.logical_at_grid(col);
                 let end = cells.partition_point(|cell| cell.cell_index() <= logical);
                 if let Some(cell) = cells[..end].last()
                     && logical < cell.cell_index() + cell.width()
                 {
-                    block_extent = Some((map.visual(cell.cell_index()), cell.width()));
+                    block_extent = Some((
+                        map.visual_grid(cell.cell_index()),
+                        cell.width() * width_scale,
+                    ));
                     if !cell.attrs().invisible() {
                         let attrs = cell.attrs();
                         block_decorations =
@@ -781,108 +806,133 @@ impl Renderer {
                     }
                 }
             }
-            let y = PADDING + y as f32 * ch;
-            let mut next_run = 0;
-            for (index, cell) in cells.iter().enumerate() {
-                let col = cell.cell_index();
-                let attrs = cell.attrs();
-                if attrs.invisible() {
-                    continue;
-                }
-                let visual = map.visual(col);
-                let x = PADDING + visual as f32 * cw;
-                let (fg, _) = colors(attrs, &frame.palette);
-                // Kitty marks the image's placement in the text grid with U+10EEEE.
-                if index >= next_run && !cell.str().starts_with('\u{10eeee}') {
-                    let rtl = map.rtl(col);
-                    let (count, kind) = run_extent(&cells[index..], map, self.ligatures);
-                    next_run = index + count;
-                    let run_cells = &cells[index..next_run];
-                    let mut joined = String::new();
-                    let text = if run_cells.len() == 1 {
-                        cell.str()
-                    } else {
-                        for member in run_cells {
-                            joined.push_str(member.str());
-                        }
-                        &joined
-                    };
-                    let last = run_cells.last().unwrap();
-                    let mut cols = last.cell_index() + last.width() - col;
-                    let left = visual.min(map.visual(last.cell_index()));
-                    let text = if kind == Some(RunKind::Ascii) && !rtl {
-                        let trimmed = text.trim_end_matches(' ');
-                        cols -= text.len() - trimmed.len();
-                        trimmed
-                    } else {
-                        text
-                    };
-                    let origin = (PADDING + left as f32 * cw, y);
-                    let layout = self.text(
-                        &native,
-                        TextRun {
-                            text,
-                            style: TextStyle {
-                                bold: attrs.intensity() == Intensity::Bold,
-                                italic: attrs.italic(),
-                                rtl,
+            let row_width = (map.logical_cols() * width_scale).min(self.metrics.cols);
+            let mut draw_row = || -> windows_canvas::Result<()> {
+                let mut next_run = 0;
+                for (index, cell) in cells.iter().enumerate() {
+                    let col = cell.cell_index();
+                    let attrs = cell.attrs();
+                    if attrs.invisible() {
+                        continue;
+                    }
+                    let visual = map.visual(col);
+                    let x = PADDING + visual as f32 * row_cw;
+                    let (fg, _) = colors(attrs, &frame.palette);
+                    // Kitty marks the image's placement in the text grid with U+10EEEE.
+                    if index >= next_run && !cell.str().starts_with('\u{10eeee}') {
+                        let rtl = map.rtl(col);
+                        let (count, kind) = run_extent(&cells[index..], map, self.ligatures);
+                        next_run = index + count;
+                        let run_cells = &cells[index..next_run];
+                        let mut joined = String::new();
+                        let text = if run_cells.len() == 1 {
+                            cell.str()
+                        } else {
+                            for member in run_cells {
+                                joined.push_str(member.str());
+                            }
+                            &joined
+                        };
+                        let last = run_cells.last().unwrap();
+                        let mut cols = last.cell_index() + last.width() - col;
+                        let left = visual.min(map.visual(last.cell_index()));
+                        let text = if kind == Some(RunKind::Ascii) && !rtl {
+                            let trimmed = text.trim_end_matches(' ');
+                            cols -= text.len() - trimmed.len();
+                            trimmed
+                        } else {
+                            text
+                        };
+                        let origin = (PADDING + left as f32 * row_cw, glyph_top);
+                        let layout = self.text(
+                            &native,
+                            TextRun {
+                                text,
+                                style: TextStyle {
+                                    bold: attrs.intensity() == Intensity::Bold,
+                                    italic: attrs.italic(),
+                                    rtl,
+                                },
+                                x: origin.0,
+                                y: origin.1,
+                                cols,
+                                fg,
+                                shape: kind.is_some(),
+                                scale: (width_scale as f32, height_scale),
                             },
-                            x: origin.0,
-                            y,
-                            cols,
-                            fg,
-                            shape: kind.is_some(),
-                        },
-                    )?;
-                    if block_col.is_some_and(|col| (left..left + cols).contains(&col))
-                        && let Some((layout, scale)) = layout
-                    {
-                        // Keep the complete shaped run at its original origin. Drawing the
-                        // cursor cell alone would break ligatures and joining scripts.
-                        cursor_ink = Some((layout.clone(), origin, scale));
+                        )?;
+                        if block_col
+                            .is_some_and(|col| (left..left + cols).contains(&(col / width_scale)))
+                            && let Some((layout, scale)) = layout
+                        {
+                            // Keep the complete shaped run at its original origin. Drawing the
+                            // cursor cell alone would break ligatures and joining scripts.
+                            cursor_ink = Some((layout.clone(), origin, scale));
+                        }
+                    }
+                    if attrs.underline() != Underline::None {
+                        let underline = if attrs.underline_color()
+                            == wezterm_term::color::ColorAttribute::Default
+                        {
+                            fg
+                        } else {
+                            rgba(frame.palette.resolve_fg(attrs.underline_color()))
+                        };
+                        brush.set_color(color(underline));
+                        draw_underline(
+                            ctx,
+                            &brush,
+                            attrs.underline(),
+                            Rect::from_xywh(
+                                x,
+                                glyph_top,
+                                cell.width() as f32 * row_cw,
+                                glyph_height,
+                            ),
+                            self.metrics.scale,
+                        );
+                    }
+                    if attrs.overline() || attrs.strikethrough() {
+                        brush.set_color(color(fg));
+                        draw_ink_lines(
+                            ctx,
+                            &brush,
+                            Rect::from_xywh(
+                                x,
+                                glyph_top,
+                                row_cw * cell.width() as f32,
+                                glyph_height,
+                            ),
+                            self.metrics.scale,
+                            attrs.overline(),
+                            attrs.strikethrough(),
+                        );
                     }
                 }
-                if attrs.underline() != Underline::None {
-                    let underline = if attrs.underline_color()
-                        == wezterm_term::color::ColorAttribute::Default
-                    {
-                        fg
-                    } else {
-                        rgba(frame.palette.resolve_fg(attrs.underline_color()))
-                    };
-                    brush.set_color(color(underline));
-                    draw_underline(
-                        ctx,
-                        &brush,
-                        attrs.underline(),
-                        Rect::from_xywh(x, y, cell.width() as f32 * cw, ch),
-                        self.metrics.scale,
-                    );
-                }
-                if attrs.overline() || attrs.strikethrough() {
-                    brush.set_color(color(fg));
-                    draw_ink_lines(
-                        ctx,
-                        &brush,
-                        Rect::from_xywh(x, y, cw * cell.width() as f32, ch),
-                        self.metrics.scale,
-                        attrs.overline(),
-                        attrs.strikethrough(),
-                    );
-                }
+                Ok(())
+            };
+            if width_scale > 1 {
+                let bounds = Rect::from_xywh(PADDING, row_top, row_width as f32 * cw, ch);
+                native.with_clip(bounds, draw_row)?;
+            } else {
+                draw_row()?;
             }
         }
         self.draw_images(&native, frame, &tiles[under_text..])?;
         if let Some(cursor) = cursor {
             let x = PADDING + cursor.col as f32 * cw;
             let y = PADDING + cursor.row as f32 * ch;
+            let width_scale = frame
+                .cell_map(cursor.row)
+                .map_or(1, |map| map.width_scale());
+            let cursor_width = cw * width_scale.min(self.metrics.cols - cursor.col) as f32;
             brush.set_color(color(rgba(frame.palette.cursor_bg)));
             match cursor.shape {
                 CursorShape::SteadyBar | CursorShape::BlinkingBar => {
                     ctx.fill_rect(&Rect::from_xywh(x, y, 2.0, ch), &brush)
                 }
                 CursorShape::SteadyUnderline | CursorShape::BlinkingUnderline => {
-                    ctx.fill_rect(&Rect::from_xywh(x, y + ch - 2.0, cw, 2.0), &brush)
+                    ctx.fill_rect(&Rect::from_xywh(x, y + ch - 2.0, cursor_width, 2.0), &brush)
                 }
                 _ if let Some((left, cols)) = block_extent => {
                     let cols = cols.min(self.metrics.cols - left);
@@ -896,13 +946,28 @@ impl Renderer {
                         let (underline, overline, strike) = block_decorations;
                         if underline != Underline::None || overline || strike {
                             brush.set_color(color(ink));
-                            draw_underline(ctx, &brush, underline, rect, self.metrics.scale);
-                            draw_ink_lines(ctx, &brush, rect, self.metrics.scale, overline, strike);
+                            let (glyph_top, height_scale) =
+                                glyph_row(&frame.rows[cursor.row], y, ch);
+                            let glyph_rect = Rect::from_xywh(
+                                PADDING + left as f32 * cw,
+                                glyph_top,
+                                cols as f32 * cw,
+                                ch * height_scale,
+                            );
+                            draw_underline(ctx, &brush, underline, glyph_rect, self.metrics.scale);
+                            draw_ink_lines(
+                                ctx,
+                                &brush,
+                                glyph_rect,
+                                self.metrics.scale,
+                                overline,
+                                strike,
+                            );
                         }
                         Ok(())
                     })?;
                 }
-                _ => ctx.draw_rect(&Rect::from_xywh(x, y, cw, ch), &brush, 1.0),
+                _ => ctx.draw_rect(&Rect::from_xywh(x, y, cursor_width, ch), &brush, 1.0),
             }
         }
         brush.set_color(ColorF::new(0.09, 0.10, 0.12, 1.0));
@@ -992,12 +1057,15 @@ impl Renderer {
                 continue;
             }
             let (pl, pt, pr, pb) = tile.padding();
+            let width_scale = frame.cell_map(row).map_or(1, |map| map.width_scale());
+            let grid_col = column * width_scale;
             let cw = self.metrics.cell_width;
             let ch = self.metrics.cell_height;
+            let tile_width = cw * width_scale.min(self.metrics.cols - grid_col) as f32;
             let dest = Rect::from_xywh(
-                PADDING + column as f32 * cw + pl as f32 / self.metrics.scale,
+                PADDING + grid_col as f32 * cw + pl as f32 / self.metrics.scale,
                 PADDING + row as f32 * ch + pt as f32 / self.metrics.scale,
-                (cw - (pl as f32 + pr as f32) / self.metrics.scale).max(0.0),
+                (tile_width - (pl as f32 + pr as f32) / self.metrics.scale).max(0.0),
                 (ch - (pt as f32 + pb as f32) / self.metrics.scale).max(0.0),
             );
             native.draw_image(&cached.bitmap, Rect::new(left, top, right, bottom), dest);
@@ -1373,6 +1441,102 @@ mod tests {
     }
 
     #[test]
+    fn dec_line_renditions_scale_and_clip_glyphs_and_address_both_halves_of_a_cell() {
+        let _com = Apartment::new();
+        let mut renderer = Renderer::with_font("Cascadia Mono", false).unwrap();
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let (width, height) = (360, 240);
+        let target = device.create_render_target(width, height).unwrap();
+        let reference = device.create_render_target(width, height).unwrap();
+        let metrics = renderer.measure(width as f32, height as f32, 1.0);
+        let (cw, ch) = (metrics.cell_width, metrics.cell_height);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let size = wezterm_term::TerminalSize {
+            cols: metrics.cols,
+            rows: metrics.rows,
+            dpi: 96,
+            ..Default::default()
+        };
+        let mut term = w11term::terminal::create(size, tx);
+        term.advance_bytes(b"\x1b[?25l\x1b#3T\r\n\x1b#4T\r\n\x1b#6T\x1b[48;2;255;0;0m \x1b[0m");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        target
+            .draw(|ctx| {
+                NativeDrawing::new(ctx)?.set_dpi(96.0);
+                renderer.paint(
+                    ctx,
+                    width as f32,
+                    height as f32,
+                    false,
+                    &frame,
+                    CursorDisplay::Static,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Use one unclipped double-height glyph as a reference for the two halves.
+        reference
+            .draw(|ctx| {
+                let native = NativeDrawing::new(ctx)?;
+                native.set_dpi(96.0);
+                ctx.clear(color(rgba(frame.palette.background)));
+                let layout = TextLayout::new("T", &renderer.normal, cw + 4.0, ch)?;
+                renderer.typography.apply(&layout, false, false)?;
+                native.text(
+                    &layout,
+                    PADDING,
+                    PADDING,
+                    rgba(frame.palette.foreground),
+                    (2.0, 2.0),
+                )?;
+                native.text(
+                    &layout,
+                    PADDING,
+                    PADDING + 2.0 * ch,
+                    rgba(frame.palette.foreground),
+                    (2.0, 1.0),
+                )
+            })
+            .unwrap();
+
+        let pixels = target.read_pixels().unwrap();
+        let expected = reference.read_pixels().unwrap();
+        let pad = PADDING as usize;
+        let (cw, ch) = (cw as usize, ch as usize);
+        let pixel = |x, y| 4 * (y * width as usize + x);
+        let background = &pixels[0..4];
+        for row in 0..3 {
+            let mut ink = 0;
+            for y in pad + row * ch..pad + (row + 1) * ch {
+                let span = pixel(pad, y)..pixel(pad + 2 * cw, y);
+                assert_eq!(&pixels[span.clone()], &expected[span.clone()]);
+                ink += pixels[span]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| *p != background)
+                    .count();
+            }
+            assert!(ink > 0, "row {row} must contain part of the glyph");
+        }
+        let y = pad + 2 * ch;
+        for col in [2, 3] {
+            let start = pixel(pad + col * cw, y);
+            assert_eq!(&pixels[start..start + 4], &[0, 0, 255, 255]);
+            let hit = metrics.hit((pad + col * cw) as f64 + 0.5, y as f64 + 0.5);
+            assert_eq!(hit.point(&frame).col, 1);
+        }
+        assert_eq!(
+            frame.cell_map(2).unwrap().visual_ranges(1..2),
+            std::slice::from_ref(&(2..4))
+        );
+        let mut copy = w11term::copy_mode::CopyMode::new(&frame);
+        copy.navigate(w11term::copy_mode::CopyKey::End, &frame);
+        assert_eq!(copy.cursor.col, frame.cols / 2 - 1);
+    }
+
+    #[test]
     fn complex_text_fixture_matches_native_word_shaping_and_decoration_masks() {
         let _com = Apartment::new();
         let mut renderer = Renderer::with_font("Cascadia Mono", false).unwrap();
@@ -1436,7 +1600,7 @@ mod tests {
                         PADDING,
                         PADDING + (row * ch) as f32,
                         rgba(frame.palette.foreground),
-                        grid / natural,
+                        (grid / natural, 1.0),
                     )?;
                 }
                 Ok(())
