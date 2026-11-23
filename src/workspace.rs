@@ -1,7 +1,7 @@
 //! Named workspace recipes. Slot IDs are scoped to a single saved layout.
 
 use crate::durable::DurableReference;
-use crate::options::{Authentication, Source, SshOptions};
+use crate::options::{Authentication, Source, SshOptions, TabColor};
 use crate::pane_layout::{Axis, Layout};
 use crate::tabs::TabTitle;
 use anyhow::{Context, Result, ensure};
@@ -385,6 +385,8 @@ impl SavedLayout {
 pub struct WorkspaceTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<TabTitle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_color: Option<TabColor>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
     pub focused: u64,
@@ -456,6 +458,7 @@ impl Workspace {
                 .context("Focused pane missing from workspace")?;
             saved.tabs.push(WorkspaceTab {
                 title: None,
+                tab_color: None,
                 pinned: false,
                 focused,
                 layout,

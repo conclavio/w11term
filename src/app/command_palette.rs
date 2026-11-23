@@ -25,6 +25,7 @@ pub enum CommandId {
     ),
     TabAction(Shortcut, Option<TabId>),
     SetTabPinned(Option<TabId>, bool),
+    SetTabColor(TabId, Option<TabColor>),
     CloseTabs(Option<bulk_tab_close::Offer>),
     ReopenClosedTab(Option<TabId>),
     ReopenClosedPane(Option<TabId>),
@@ -206,6 +207,12 @@ impl TerminalApp {
                 && let Some(pinned) = tab_pin_command(label)
             {
                 row.id = CommandId::SetTabPinned(self.active_terminal_group(), pinned);
+            }
+            if let CommandId::Menu(label) = &row.id
+                && let Some(color) = tab_colors::from_menu(label)
+                && let Some(group) = self.active_terminal_group()
+            {
+                row.id = CommandId::SetTabColor(group, color);
             }
             if let CommandId::Menu(label) = &row.id
                 && let Some(scope) = bulk_tab_close::Scope::from_label(label)
@@ -423,6 +430,7 @@ impl TerminalApp {
             CommandId::SetTabPinned(group, pinned) => group.map_or(Message::ControlIdle, |group| {
                 Message::SetTabPinned(group, pinned)
             }),
+            CommandId::SetTabColor(group, color) => Message::SetTabColor(group, color),
             CommandId::CloseTabs(offer) => offer.map_or(Message::ControlIdle, Message::CloseTabs),
             CommandId::SwapPanes(target) => Message::SwapPanes(target),
             CommandId::RotateSplit(target) => Message::RotateSplit(target),

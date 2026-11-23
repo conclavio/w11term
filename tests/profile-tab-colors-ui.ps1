@@ -4,6 +4,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 . (Join-Path $PSScriptRoot 'support/profile-scheme-editor.ps1')
 
 $tab = [System.Windows.Automation.ControlType]::TabItem
+$menu = [System.Windows.Automation.ControlType]::MenuItem
 
 function Select-TabColor([string]$Name) {
     $field = Wait-Until 'tab color selector' { Find-Element 'Tab color' $combo }
@@ -76,6 +77,37 @@ try {
     Wait-Focus $new
     Wait-Text $new 'ready'
     Selected-Tab 'palette-ssh (Red tab)'
+
+    Press-Key 0x77 # Select the original mixed tab again
+    Wait-Focus $original
+    Run-Palette 'Set tab color to Purple'
+    Selected-Tab 'palette-ssh (Purple tab)'
+    Press-Key 0x71 # F2 focuses the local PowerShell pane
+    Wait-Focus $local
+    Selected-Tab 'Palette PowerShell (Purple tab)'
+
+    Click 'Tab menu'
+    $menuItem = Wait-Until 'Tab color submenu' { Find-Element 'Tab color' $menu }
+    $menuItem.GetCurrentPattern($expand).Expand()
+    $null = Wait-Until 'current tab color shown in the menu' { Find-Element 'Set tab color to Purple (current)' $menu }
+    Invoke-Button (Wait-Until 'Hide tab color action' { Find-Element 'Hide tab color' $menu })
+    Selected-Tab 'Palette PowerShell'
+
+    Click 'Tab menu'
+    Invoke-Button (Wait-Until 'Workspaces menu action' { Find-Element ('Workspaces' + [char]0x2026) $menu })
+    $name = Wait-Until 'workspace name field' { Find-Element 'Workspace name' ([System.Windows.Automation.ControlType]::Edit) }
+    $name.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('tab-colors')
+    Click 'Save workspace'
+    $null = Wait-Until 'workspace captured from the live tabs' { Find-Element 'Saved tab-colors' }
+    $workspace = ([IO.File]::ReadAllText((Join-Path $env:W11TERM_DATA_DIR 'workspaces.json')) | ConvertFrom-Json).workspaces.'tab-colors'
+    if ($workspace.tabs[0].tab_color -cne 'none' -or $workspace.tabs[1].PSObject.Properties.Name -contains 'tab_color') {
+        throw 'The workspace did not distinguish the hidden marker from a profile-derived marker'
+    }
+
+    Press-Key 0x77
+    Wait-Focus $local
+    Run-Palette 'Use profile tab color'
+    Selected-Tab 'Palette PowerShell (Green tab)'
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

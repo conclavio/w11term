@@ -1,4 +1,5 @@
 //! Ordered tab headers, each with a split layout and a remembered focused entry.
+use crate::options::TabColor;
 use crate::pane_layout::{Axis, Direction, Layout};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,6 +134,7 @@ impl<T> Tab<T> {
 struct Group {
     id: TabId,
     title: Option<TabTitle>,
+    color: Option<TabColor>,
     pinned: bool,
     focused: TabId,
     layout: Layout,
@@ -252,6 +254,22 @@ impl<T> Tabs<T> {
         if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
             g.title = title;
         }
+    }
+
+    /// No override follows the focused pane's profile. An explicit None color hides it.
+    pub fn group_color(&self, group: TabId) -> Option<TabColor> {
+        self.groups.iter().find(|g| g.id == group)?.color
+    }
+
+    pub fn set_group_color(&mut self, group: TabId, color: Option<TabColor>) -> bool {
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == group) else {
+            return false;
+        };
+        if group.color == color {
+            return false;
+        }
+        group.color = color;
+        true
     }
 
     pub fn group_is_pinned(&self, group: TabId) -> bool {
@@ -527,6 +545,7 @@ impl<T> Tabs<T> {
             Group {
                 id,
                 title: source_group.title,
+                color: source_group.color,
                 pinned: false,
                 focused: focused.expect("the focused entry belongs to this layout"),
                 layout,
@@ -547,6 +566,7 @@ impl<T> Tabs<T> {
         self.groups.push(Group {
             id,
             title: None,
+            color: None,
             pinned: false,
             focused: entry_id,
             layout: Layout::Leaf(entry_id),
@@ -835,6 +855,34 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_color_override_follows_the_group_and_its_layout_recipe() {
+        let mut tabs = Tabs::default();
+        let group = tabs.insert("SSH");
+        let local = tabs.split(group, "PowerShell", Axis::Columns).unwrap();
+        assert!(tabs.set_group_color(group, Some(TabColor::Purple)));
+        assert_eq!(
+            tabs.group_color(tabs.group_id(local).unwrap()),
+            Some(TabColor::Purple)
+        );
+        assert!(!tabs.set_group_color(group, Some(TabColor::Purple)));
+        let duplicate = tabs
+            .duplicate_active_group(|name| Ok::<_, ()>(*name), |name| name)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tabs.group_color(duplicate), Some(TabColor::Purple));
+
+        let mut other = Tabs::default();
+        other.restore_group(tabs.take_group(group).unwrap(), 0, true);
+        assert_eq!(other.active_id(), Some(local));
+        assert_eq!(other.group_color(group), Some(TabColor::Purple));
+        assert!(other.set_group_color(group, Some(TabColor::None)));
+        assert_eq!(other.group_color(group), Some(TabColor::None));
+        assert!(other.set_group_color(group, None));
+        assert_eq!(other.group_color(group), None);
+        assert_eq!(tabs.group_color(duplicate), Some(TabColor::Purple));
+    }
 
     #[test]
     fn pinned_groups_stay_in_front_during_moves_reorder_transfer_and_duplicate() {
