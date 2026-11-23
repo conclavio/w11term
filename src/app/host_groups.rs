@@ -43,6 +43,7 @@ enum TargetState {
     Unverified,
     InUse,
     Ready(PromptToken),
+    Matched(PromptToken),
 }
 
 impl TargetState {
@@ -55,6 +56,7 @@ impl TargetState {
             Self::Unverified => "Prompt unverified",
             Self::InUse => "Waiting for a fresh prompt",
             Self::Ready(_) => "Ready",
+            Self::Matched(_) => "Ready · prompt match",
         }
     }
 }
@@ -224,6 +226,7 @@ impl TerminalApp {
                 } else {
                     match live.session.events.shell_prompt() {
                         Some(ShellPrompt::Ready(prompt)) => TargetState::Ready(prompt),
+                        Some(ShellPrompt::Matched(prompt)) => TargetState::Matched(prompt),
                         Some(ShellPrompt::Opening | ShellPrompt::InUse) => TargetState::InUse,
                         _ => TargetState::Unverified,
                     }
@@ -253,7 +256,7 @@ impl TerminalApp {
     fn dispatch_to_host(&self, target: Target, text: Arc<str>) -> Delivery {
         let mut execution = None;
         let status = match target.state {
-            TargetState::Ready(prompt) => {
+            TargetState::Ready(prompt) | TargetState::Matched(prompt) => {
                 match self
                     .tab_for_pane(target.pane)
                     .and_then(|id| self.tabs.get(id))
@@ -263,7 +266,12 @@ impl TerminalApp {
                         ..
                     }) if live.session.is_direct_ssh_shell() => {
                         let (reply, received) = oneshot::channel();
-                        let (observe, observed) = watch::channel(GroupExecution::AwaitingMarkers);
+                        let (observe, observed) =
+                            watch::channel(if matches!(target.state, TargetState::Matched(_)) {
+                                GroupExecution::AwaitingPrompt
+                            } else {
+                                GroupExecution::AwaitingMarkers
+                            });
                         if live
                             .session
                             .input
@@ -488,9 +496,12 @@ impl TerminalApp {
         let valid_text = w11term::saved_commands::valid_command_text(&text);
         let enabled = valid_text
             && !page.sending()
-            && selected
-                .iter()
-                .any(|target| matches!(target.state, TargetState::Ready(_)));
+            && selected.iter().any(|target| {
+                matches!(
+                    target.state,
+                    TargetState::Ready(_) | TargetState::Matched(_)
+                )
+            });
         let send_label = format!(
             "Send to {} {}",
             selected.len(),
@@ -543,7 +554,7 @@ impl TerminalApp {
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes."
         } else {
-            "Select the panes to receive the command. A fresh shell integration prompt is required."
+            "Select panes with a fresh shell marker or a configured prompt match."
         };
         let entry = TextBox::new()
             .automation_name("Group command")
@@ -683,7 +694,11 @@ impl TerminalApp {
             let name = &delivery.target.name;
             let caption = match &result {
                 GroupExecution::AwaitingMarkers => "Waiting for shell markers".into(),
+                GroupExecution::AwaitingPrompt => "Waiting for a matching prompt".into(),
                 GroupExecution::Running(_) => "Running".into(),
+                GroupExecution::PromptReturned => {
+                    "Prompt returned · exit status unavailable".into()
+                }
                 GroupExecution::Unavailable(reason) => format!("Result unavailable · {reason}"),
                 GroupExecution::Finished(result) => result.exit_code.map_or_else(
                     || "Completed · exit status unavailable".into(),

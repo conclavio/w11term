@@ -3,7 +3,7 @@ use crate::terminalstate::column_edit::Index;
 use crate::terminalstate::palette::Slot;
 use crate::terminalstate::rendition::Rendition;
 use crate::terminalstate::{
-    default_color_map, CharSet, ConEmuDirectoryReports, MouseEncoding, TabStop,
+    default_color_map, CharSet, ConEmuDirectoryReports, MouseEncoding, PrimaryPrint, TabStop,
     UnicodeVersionStackEntry, VscodeCommand,
 };
 use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
@@ -151,6 +151,8 @@ impl Performer<'_> {
             )
         };
         let (mut sized, mut right) = row_geometry(self.state);
+        let track = self.track_primary_prints && !self.is_alt_screen_active();
+        let mut last_print = None;
         for g in Graphemes::new(text) {
             let g = self.remap_grapheme(g);
 
@@ -260,6 +262,15 @@ impl Performer<'_> {
             );
             self.screen_mut()
                 .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            if track && g != " " {
+                let screen = self.screen();
+                last_print = Some(PrimaryPrint {
+                    seqno,
+                    row_epoch: screen.row_epoch(),
+                    row: screen.visible_row_to_stable_row(y),
+                    end_col: x + print_width,
+                });
+            }
 
             if !wrappable {
                 self.cursor.x += print_width;
@@ -269,6 +280,9 @@ impl Performer<'_> {
             }
         }
 
+        if last_print.is_some() {
+            self.last_primary_print = last_print;
+        }
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
     }

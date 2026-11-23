@@ -239,6 +239,7 @@ impl Fixture {
                 proxy_jump: vec![],
                 local_forwards: vec![],
                 durable: false,
+                group_prompt: None,
                 player: PlayerOptions {
                     rustmush: true,
                     ..Default::default()

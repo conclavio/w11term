@@ -63,6 +63,7 @@ struct CommandWatch {
     armed: bool,
     running: Option<RunningCommand>,
     prompt: ShellPrompt,
+    saw_markers: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +77,7 @@ pub enum ShellPrompt {
     Unverified,
     Opening,
     Ready(PromptToken),
+    Matched(PromptToken),
     InUse,
 }
 
@@ -86,11 +88,14 @@ impl CommandWatch {
             armed: false,
             running: None,
             prompt: ShellPrompt::Unverified,
+            saw_markers: false,
         }
     }
 
     fn reset(&mut self) {
+        let saw_markers = self.saw_markers;
         *self = Self::new(self.generation);
+        self.saw_markers = saw_markers;
     }
 }
 
@@ -299,9 +304,42 @@ impl Events {
 
     pub(crate) fn invalidate_shell_prompt(&self) {
         if let Some(watch) = &mut self.state.lock().unwrap().command_watch
-            && matches!(watch.prompt, ShellPrompt::Opening | ShellPrompt::Ready(_))
+            && matches!(
+                watch.prompt,
+                ShellPrompt::Opening | ShellPrompt::Ready(_) | ShellPrompt::Matched(_)
+            )
         {
             watch.prompt = ShellPrompt::InUse;
+        }
+    }
+
+    pub(crate) fn invalidate_matched_shell_prompt(&self) {
+        if let Some(watch) = &mut self.state.lock().unwrap().command_watch
+            && matches!(watch.prompt, ShellPrompt::Matched(_))
+        {
+            watch.prompt = ShellPrompt::InUse;
+        }
+    }
+
+    pub(crate) fn observe_matched_shell_prompt(&self) {
+        let mut state = self.state.lock().unwrap();
+        let Some(watch) = &state.command_watch else {
+            return;
+        };
+        if watch.saw_markers || matches!(watch.prompt, ShellPrompt::Matched(_)) {
+            return;
+        }
+        let connection = watch.generation;
+        state.next_prompt += 1;
+        let token = PromptToken {
+            connection,
+            serial: state.next_prompt,
+        };
+        if let Some(watch) = &mut state.command_watch {
+            watch.prompt = ShellPrompt::Matched(token);
+        }
+        if let Some(run) = state.group_run.take() {
+            run.prompt_returned();
         }
     }
 
@@ -310,7 +348,8 @@ impl Events {
         let Some(watch) = &mut state.command_watch else {
             return false;
         };
-        if watch.prompt != ShellPrompt::Ready(token) {
+        if !matches!(watch.prompt, ShellPrompt::Ready(current) | ShellPrompt::Matched(current) if current == token)
+        {
             return false;
         }
         watch.prompt = ShellPrompt::InUse;
@@ -448,6 +487,15 @@ impl Events {
             return;
         };
         use wezterm_term::FinalTermPromptKind;
+        if !matches!(
+            marker,
+            FreshLine | StartPrompt(FinalTermPromptKind::RightSide)
+        ) {
+            watch.saw_markers = true;
+            if matches!(watch.prompt, ShellPrompt::Matched(_)) {
+                watch.prompt = ShellPrompt::InUse;
+            }
+        }
         match marker {
             FreshLineAndStartPrompt { .. } | StartPrompt(FinalTermPromptKind::Initial) => {
                 watch.prompt = ShellPrompt::Opening;

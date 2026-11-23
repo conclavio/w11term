@@ -205,6 +205,7 @@ fn options() -> Result<SshOptions> {
         tab_color: Default::default(),
         terminal_type: Default::default(),
         durable: false,
+        group_prompt: None,
         player: crate::options::PlayerOptions {
             reconnect: false,
             ..Default::default()

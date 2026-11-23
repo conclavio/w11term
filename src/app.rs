@@ -490,6 +490,7 @@ struct ProfileDraft {
     identity: String,
     fingerprint: String,
     host_key_alias: String,
+    group_prompt: String,
     authentication: usize,
     error: Option<String>,
     player: w11term::options::PlayerOptions,
@@ -519,6 +520,7 @@ impl Default for ProfileDraft {
             identity: String::new(),
             fingerprint: String::new(),
             host_key_alias: String::new(),
+            group_prompt: String::new(),
             authentication: 0,
             error: None,
             player: Default::default(),
@@ -562,6 +564,9 @@ impl ProfileDraft {
             player: self.player.clone(),
             proxy_jump: self.proxy_jump.clone(),
             local_forwards: self.local_forwards.clone(),
+            group_prompt: (!self.group_prompt.trim().is_empty())
+                .then(|| self.group_prompt.clone().try_into())
+                .transpose()?,
             durable: self.durable,
         })
     }
@@ -608,6 +613,11 @@ impl ProfileDraft {
             identity,
             fingerprint: options.host_key.clone().unwrap_or_default(),
             host_key_alias: options.host_key_alias.clone().unwrap_or_default(),
+            group_prompt: options
+                .group_prompt
+                .as_ref()
+                .map_or("", |pattern| pattern.as_str())
+                .into(),
             authentication,
             player: options.player.clone(),
             ..Default::default()
@@ -871,6 +881,7 @@ pub enum Field {
     Identity,
     Fingerprint,
     HostKeyAlias,
+    GroupPrompt,
 }
 
 enum UiWork {
@@ -4195,6 +4206,12 @@ impl TerminalApp {
                 &draft.host_key_alias,
                 "Name used to verify this server in known_hosts",
             ),
+            (
+                Field::GroupPrompt,
+                "SSH group prompt regex (optional)",
+                &draft.group_prompt,
+                "Full appliance prompt, for example racadm>>",
+            ),
         ] {
             fields.push(
                 StackPanel::new().spacing(5.0).children((
@@ -6500,6 +6517,7 @@ impl Component for TerminalApp {
                         Field::Identity => &mut draft.identity,
                         Field::Fingerprint => &mut draft.fingerprint,
                         Field::HostKeyAlias => &mut draft.host_key_alias,
+                        Field::GroupPrompt => &mut draft.group_prompt,
                     };
                     let changed = *target != text;
                     *target = text;
@@ -7971,6 +7989,7 @@ mod profile_ui_tests {
                 authentication,
                 host_key: Some("SHA256:test".into()),
                 host_key_alias: Some("cockpit.example".into()),
+                group_prompt: Some("rack-[12]>>".to_owned().try_into().unwrap()),
                 proxy_jump: Vec::new(),
                 local_forwards: Vec::new(),
                 durable: false,
@@ -7980,7 +7999,7 @@ mod profile_ui_tests {
                     ..Default::default()
                 },
             };
-            let draft = ProfileDraft::from_options("existing".into(), &options);
+            let mut draft = ProfileDraft::from_options("existing".into(), &options);
             assert_eq!(draft.authentication, expected);
             assert_eq!(draft.port, "6792");
             assert_eq!(draft.scrollback_lines, "0");
@@ -7988,6 +8007,15 @@ mod profile_ui_tests {
             assert_eq!(draft.fingerprint, "SHA256:test");
             assert_eq!(draft.host, "test.invalid");
             assert_eq!(draft.host_key_alias, "cockpit.example");
+            assert_eq!(draft.group_prompt, "rack-[12]>>");
+            assert_eq!(
+                draft.ssh_options().unwrap().group_prompt,
+                options.group_prompt
+            );
+            draft.group_prompt = "[".into();
+            assert!(draft.ssh_options().is_err());
+            draft.group_prompt.clear();
+            assert!(draft.ssh_options().unwrap().group_prompt.is_none());
             assert!(draft.player.mute && draft.player.game_mode);
             assert_eq!(draft.name, "existing");
         }

@@ -9,7 +9,9 @@ const PREVIEW_LINES: usize = 32;
 #[derive(Clone, Debug)]
 pub enum GroupExecution {
     AwaitingMarkers,
+    AwaitingPrompt,
     Running(GroupInterruptTarget),
+    PromptReturned,
     Finished(Arc<GroupCommandResult>),
     Unavailable(&'static str),
 }
@@ -85,6 +87,10 @@ impl GroupRun {
     pub(super) fn abandon(self, reason: &'static str) {
         self.status
             .send_replace(GroupExecution::Unavailable(reason));
+    }
+
+    pub(super) fn prompt_returned(self) {
+        self.status.send_replace(GroupExecution::PromptReturned);
     }
 
     pub(super) fn identify(&self, id: u64, label: Option<&str>) {
