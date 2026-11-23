@@ -3640,6 +3640,76 @@ mod tests {
     }
 
     #[test]
+    fn tab_stop_controls_edit_the_shared_table_and_restore_defaults() {
+        let (mut terminal, mut replies) = engine();
+        let size = terminal.get_size();
+        terminal.resize(TerminalSize {
+            cols: 32,
+            rows: 4,
+            ..size
+        });
+        terminal.advance_bytes(b"\x1bP2$t3/11/29\x1b\\\x1b[2;6H\x1b[W\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u3/6/11/29\x1b\\");
+        assert_eq!((terminal.cursor_pos().x, terminal.cursor_pos().y), (5, 1));
+        terminal.advance_bytes(b"\x1b[2W\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u3/11/29\x1b\\");
+
+        terminal.advance_bytes(b"\x1b[5;1;0W\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u6\x1b\\");
+        terminal.advance_bytes(b"\x1b[5;99W\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u6\x1b\\");
+        terminal.advance_bytes(b"\x1b[9G\x1b[5;W\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u9\x1b\\");
+        terminal.advance_bytes(b"\x1b[4W\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u\x1b\\");
+        terminal.advance_bytes(b"\x1b[0W\x1b[5g\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u\x1b\\");
+
+        terminal.advance_bytes(b"\x1bP2$t3/27\x1b\\");
+        terminal.resize(TerminalSize {
+            cols: 7,
+            rows: 4,
+            ..size
+        });
+        terminal.advance_bytes(b"\x1b[?5W\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u\x1b\\");
+        terminal.resize(TerminalSize {
+            cols: 33,
+            rows: 4,
+            ..size
+        });
+        terminal.advance_bytes(b"\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u9/17/25/33\x1b\\");
+    }
+
+    #[test]
+    fn tab_stop_moves_are_bounded_by_the_line_and_origin_margins() {
+        let (mut terminal, _) = engine();
+        let size = terminal.get_size();
+        terminal.resize(TerminalSize {
+            cols: 32,
+            rows: 4,
+            ..size
+        });
+        terminal.advance_bytes(b"\x1bP2$t3/7/11/17/25\x1b\\\x1b[?69h\x1b[5;19s\x1b[?6h");
+        for (control, column) in [
+            (b"\x1b[2I".as_slice(), 11),
+            (b"\x1b[Z", 7),
+            (b"\x1b[Z", 5),
+            (b"\x1b[4294967295I", 19),
+            (b"\x1b[4294967295Z", 5),
+        ] {
+            terminal.advance_bytes(control);
+            assert_eq!(terminal.cursor_pos().x, column - 1);
+            assert_eq!(terminal.cursor_pos().y, 0);
+        }
+        terminal.advance_bytes(b"\x1b[?6l\x1b[?69l\x1b#6\x1b[4294967295I");
+        assert_eq!(terminal.cursor_pos().x, 15);
+        terminal.advance_bytes(b"\x1b[4294967295Z");
+        assert_eq!(terminal.cursor_pos().x, 0);
+    }
+
+    #[test]
     fn tab_stop_report_round_trips_custom_and_empty_tables() {
         let (mut terminal, mut replies) = engine();
         let query = b"\x1b[2$w";
