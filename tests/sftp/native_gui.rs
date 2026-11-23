@@ -1090,6 +1090,43 @@ async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "previews an SSH range and opens only reviewed saved and one-time sessions through WinUI"]
+async fn native_ssh_host_list_import_checks_profiles_and_opens_only_reviewed_hosts() {
+    let state = tempfile::tempdir().unwrap();
+    let (Source::Ssh(east), _east_root, east_opens, east_server) = fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(west), _west_root, west_opens, west_server) = fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(direct), _direct_root, direct_opens, direct_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    fs::write(state.path().join("one-time-port"), direct.port.to_string()).unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({ "profiles": {
+            "East": east,
+            "East alternative": east,
+            "West": west,
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-list-import-ui.ps1", state.path());
+    assert_eq!(east_opens.load(Ordering::Relaxed), 0);
+    assert_eq!(west_opens.load(Ordering::Relaxed), 1);
+    assert_eq!(direct_opens.load(Ordering::Relaxed), 1);
+    for server in [east_server, west_server, direct_server] {
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks actual tab and window titles while native Settings, SSH and PowerShell change the active title"]
 async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manual_name() {
     let input = concat!(

@@ -2660,12 +2660,13 @@ impl TerminalApp {
         let group_changed = previous_group != group;
         if group_changed
             && let Some(previous) = previous_group
-            && let Some(AppTab {
-                page: Page::NewProfile(draft),
-                ..
-            }) = self.tabs.get_mut(previous)
+            && let Some(tab) = self.tabs.get_mut(previous)
         {
-            draft.folder_revoke.cancel_confirmation();
+            match &mut tab.page {
+                Page::NewProfile(draft) => draft.folder_revoke.cancel_confirmation(),
+                Page::HostGroup(group) => group.deactivated(),
+                _ => {}
+            }
         }
         if profile != self.window_profile {
             if let Some(previous) = self.window_profile.take() {
