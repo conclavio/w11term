@@ -7,6 +7,7 @@ pub(super) const RENAME_PANE: &str = "Rename focused pane…";
 pub enum Action {
     Show,
     ShowPane(u64, TabId),
+    SaveProfile(clipboard_paste::Origin),
     Edit(u64, String),
     Finish(u64, ContentDialogResult),
 }
@@ -21,6 +22,7 @@ pub(super) fn show_pane(target: Option<(u64, TabId)>) -> Message {
 enum Target {
     Group(TabId),
     Pane { pane: u64, group: TabId },
+    Profile(clipboard_paste::Origin),
 }
 
 impl Target {
@@ -28,6 +30,7 @@ impl Target {
         match self {
             Self::Group(group) => group == actual_group,
             Self::Pane { pane, group } => pane == actual_pane && group == actual_group,
+            Self::Profile(origin) => origin.pane == actual_pane && origin.group == actual_group,
         }
     }
 
@@ -47,6 +50,7 @@ impl Target {
                     live.pane_name = title;
                 }
             }
+            Self::Profile(_) => unreachable!("profile edits use the profile store"),
         }
     }
 }
@@ -57,6 +61,7 @@ pub(super) struct Editor {
     text: String,
     has_title: bool,
     reopen: Option<Target>,
+    error: Option<String>,
 }
 
 impl Editor {
@@ -81,8 +86,15 @@ impl Editor {
                 "Pane name",
                 "Use the default pane name",
             ),
+            Target::Profile(_) => (
+                "Save SSH connection as profile",
+                "Profile name",
+                "Profile name",
+            ),
         };
-        let title = self.title();
+        let profile = matches!(self.target, Target::Profile(_));
+        let title_error = if profile { None } else { self.title().err() };
+        let can_save = title_error.is_none() && (!profile || !self.text.trim().is_empty());
         let mut fields = vec![KeyedView::new(
             "title",
             TextBox::new()
@@ -91,24 +103,34 @@ impl Editor {
                 .text(&self.text)
                 .on_text_changed(ctx.callback(move |s| Message::TabTitle(Action::Edit(serial, s)))),
         )];
-        if let Err(error) = title {
-            fields.push(KeyedView::new("error", TextBlock::new().text(error)));
+        if let Some(error) = self.error.as_deref().or(title_error) {
+            fields.push(KeyedView::new(
+                "error",
+                TextBlock::new()
+                    .text(error)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
         }
-        ContentDialog::new()
+        let dialog = ContentDialog::new()
             .title(heading)
-            .primary_button_text("Save")
-            .is_primary_button_enabled(title.is_ok())
-            .secondary_button_text("Use default")
-            .is_secondary_button_enabled(self.has_title)
+            .primary_button_text(if profile { "Save profile" } else { "Save" })
+            .is_primary_button_enabled(can_save)
             .close_button_text("Cancel")
             .is_open(true)
-            .on_closed(ctx.callback(move |r| Message::TabTitle(Action::Finish(serial, r))))
-            .content(
-                StackPanel::new()
-                    .spacing(8.0)
-                    .min_width(300.0)
-                    .keyed_children(fields),
-            )
+            .on_closed(ctx.callback(move |r| Message::TabTitle(Action::Finish(serial, r))));
+        let dialog = if profile {
+            dialog
+        } else {
+            dialog
+                .secondary_button_text("Use default")
+                .is_secondary_button_enabled(self.has_title)
+        };
+        dialog.content(
+            StackPanel::new()
+                .spacing(8.0)
+                .min_width(300.0)
+                .keyed_children(fields),
+        )
     }
 }
 
@@ -185,6 +207,7 @@ impl TerminalApp {
         };
         let group = self.tabs.group_id(id).expect("pane has a tab");
         if !target.matches_focus(live.session.pane_id, group)
+            || matches!(target, Target::Profile(origin) if self.saveable_ssh_origin() != Some(origin))
             || live.session.frames.load().prompt.is_some()
             || live.session.prompts.current().is_some()
             || live.files.entry_dialog_open()
@@ -201,6 +224,7 @@ impl TerminalApp {
         let title = match target {
             Target::Pane { .. } => live.pane_name.as_ref(),
             Target::Group(_) => self.tabs.title_for(id),
+            Target::Profile(_) => None,
         };
         self.name_edit_serial = self.name_edit_serial.wrapping_add(1);
         self.title_editor = Some(Editor {
@@ -209,11 +233,12 @@ impl TerminalApp {
             text: title.map_or_else(String::new, |t| t.as_str().to_owned()),
             has_title: title.is_some(),
             reopen: None,
+            error: None,
         });
         self.keyboard.set_modal(true);
     }
 
-    pub(super) fn edit_tab_title(&mut self, action: Action) {
+    pub(super) fn edit_tab_title(&mut self, action: Action, context: &ComponentContext<Self>) {
         match action {
             Action::Show => {
                 if let Some(group) = self.tabs.active_group_id() {
@@ -221,23 +246,39 @@ impl TerminalApp {
                 }
             }
             Action::ShowPane(pane, group) => self.show_title_editor(Target::Pane { pane, group }),
+            Action::SaveProfile(origin) => self.show_title_editor(Target::Profile(origin)),
             Action::Edit(serial, text) => {
                 if let Some(editor) = &mut self.title_editor
                     && editor.serial == serial
+                    && editor.text != text
                 {
                     editor.text = text;
+                    editor.error = None;
                 }
             }
             Action::Finish(serial, result) => {
-                let Some(editor) = self.title_editor.take_if(|e| e.serial == serial) else {
+                let Some(mut editor) = self.title_editor.take_if(|e| e.serial == serial) else {
                     return;
                 };
-                let change = match result {
+                if let Target::Profile(origin) = editor.target {
+                    if result == ContentDialogResult::Primary {
+                        match self.save_live_ssh_profile(origin, editor.text.trim(), context) {
+                            Ok(()) => return,
+                            Err(error) if self.saveable_ssh_origin() == Some(origin) => {
+                                self.name_edit_serial = self.name_edit_serial.wrapping_add(1);
+                                editor.serial = self.name_edit_serial;
+                                editor.error = Some(format!("{error:#}"));
+                                self.title_editor = Some(editor);
+                                return;
+                            }
+                            Err(error) => self.window_error = Some(format!("{error:#}")),
+                        }
+                    }
+                } else if let Some(title) = match result {
                     ContentDialogResult::Primary => editor.title().ok(),
                     ContentDialogResult::Secondary => Some(None),
                     _ => None,
-                };
-                if let Some(title) = change {
+                } {
                     editor.target.apply(&mut self.tabs, title);
                     self.header.borrow_mut().take();
                     self.publish_panes();
@@ -333,6 +374,7 @@ mod tests {
             text: "   ".into(),
             has_title: true,
             reopen: None,
+            error: None,
         };
         assert_eq!(editor.title().unwrap(), None);
         editor.text = "  Build 雪  ".into();

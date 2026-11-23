@@ -1572,6 +1572,30 @@ async fn native_quick_connect_verifies_the_host_without_saving_a_profile() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "saves an unsaved SSH pane as a reusable profile without replacing its connection"]
+async fn native_saving_an_ssh_profile_keeps_the_original_live_pane() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), _remote, opens, server) =
+        fixture_counting_accepts(false, 3, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("save-live-ssh-profile-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "original and fresh profile"
+    );
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        2,
+        "one login per live pane"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits profile colors and live overrides through WinUI, including a saved workspace"]
 async fn native_profile_tab_colors_follow_focused_panes_and_new_launches() {
     let (Source::Ssh(ssh), _remote, opens, server) = fixture_connections(false, 2).await else {

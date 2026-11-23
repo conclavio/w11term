@@ -348,10 +348,15 @@ impl ProfileStore {
     }
 
     pub fn add(&self, name: &str, options: &SshOptions) -> Result<()> {
+        self.add_to_catalog(name, options).map(|_| ())
+    }
+    /// Return the catalog committed by the same locked update.
+    pub fn add_to_catalog(&self, name: &str, options: &SshOptions) -> Result<Profiles> {
         self.write(None, name, options, None, None)
     }
     pub fn update(&self, name: &str, options: &SshOptions) -> Result<()> {
         self.write(Some(name), name, options, None, None)
+            .map(|_| ())
     }
     /// Edit/rename only the version loaded by the editor, preserving unrelated JSON.
     pub fn edit(
@@ -362,6 +367,7 @@ impl ProfileStore {
         expected: &SshOptions,
     ) -> Result<()> {
         self.write(Some(original), name, options, Some(expected), None)
+            .map(|_| ())
     }
 
     pub fn duplicate(
@@ -371,6 +377,7 @@ impl ProfileStore {
         options: &SshOptions,
     ) -> Result<()> {
         self.write(None, name, options, Some(&base.options), Some(base))
+            .map(|_| ())
     }
 
     pub fn delete(&self, base: &ProfileSnapshot) -> Result<()> {
@@ -391,7 +398,7 @@ impl ProfileStore {
         options: &SshOptions,
         expected: Option<&SshOptions>,
         copy: Option<&ProfileSnapshot>,
-    ) -> Result<()> {
+    ) -> Result<Profiles> {
         ensure!(
             crate::assets::name(&options.player.bell),
             "Bell must be system, off, or a sound name (letters, digits, _ and -)"
@@ -524,7 +531,6 @@ impl ProfileStore {
             profiles.insert(name.into(), value);
             Ok(profile_identity_edit(catalog, original, Some(name)))
         })
-        .map(|_| ())
     }
 
     pub(crate) fn lock(&self) -> Result<std::fs::File> {

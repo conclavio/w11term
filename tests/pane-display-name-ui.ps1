@@ -38,9 +38,11 @@ function Open-Editor([string]$Action, [string]$Label, [switch]$Palette) {
     else { Menu-Route @($Action) }
     (Wait-Until "$Label edit field" { Find-Element $Label $edit }).GetCurrentPattern($value)
 }
-function Finish-Editor([string]$Action, [string]$Label) {
+function Finish-Editor([string]$Action, [string]$Label, [int]$Pane) {
     Click $Action
     $null = Wait-Until "closed $Label dialog" { !(Find-Element $Label $edit) }
+    # The native dialog may disappear before its Closed callback reaches the host.
+    Document-Name $Pane
 }
 function Caption([string]$Name) {
     $expected = 'w11term ' + [char]0xb7 + " $Name"
@@ -55,9 +57,9 @@ function Document-Name([int]$Pane, [string]$Name) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $id = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, "w11term-pane-$Pane")
     $expected = 'Terminal ' + [char]0xb7 + " $Name"
-    $null = Wait-Until "accessible Document for pane $Pane named '$expected'" {
+    $null = Wait-Until "accessible Document for pane $Pane" {
         $doc = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $id)
-        $doc -and $doc.Current.ControlType -eq [System.Windows.Automation.ControlType]::Document -and $doc.Current.Name -ceq $expected
+        $doc -and $doc.Current.ControlType -eq [System.Windows.Automation.ControlType]::Document -and (!$Name -or $doc.Current.Name -ceq $expected)
     }
 }
 function Marker([int]$Pane, [int]$Neighbor, [string]$Text) {
@@ -96,7 +98,7 @@ try {
 
     $field = Open-Editor $paneRename 'Pane name' -Palette
     $field.SetValue($alias)
-    Finish-Editor 'Save' 'Pane name'
+    Finish-Editor 'Save' 'Pane name' $right
     Wait-Names $right $left $alias $shared
     Caption $alias
     Document-Name $right $alias
@@ -125,11 +127,11 @@ try {
 
     $field = Open-Editor $tabRename 'Tab name'
     $field.SetValue('Manual tab')
-    Finish-Editor 'Save' 'Tab name'
+    Finish-Editor 'Save' 'Tab name' $right
     Caption 'Manual tab'
     Wait-Names $right $left $alias 'changed-by-shell'
     $null = Open-Editor $tabRename 'Tab name'
-    Finish-Editor 'Use default' 'Tab name'
+    Finish-Editor 'Use default' 'Tab name' $right
     Caption $alias
 
     Menu-Route @($workspaces)
@@ -148,11 +150,11 @@ try {
     $field = Open-Editor $paneRename 'Pane name'
     if ($field.Current.Value -cne $alias) { throw 'The editor did not load the saved pane name' }
     $field.SetValue('Discarded')
-    Finish-Editor 'Cancel' 'Pane name'
+    Finish-Editor 'Cancel' 'Pane name' $right
     Wait-Names $right $left $alias 'changed-by-shell'
     $field = Open-Editor $paneRename 'Pane name'
     if ($field.Current.Value -cne $alias) { throw 'Cancelling persisted the pending name' }
-    Finish-Editor 'Use default' 'Pane name'
+    Finish-Editor 'Use default' 'Pane name' $right
     Wait-Names $right $left '' 'changed-by-shell'
     Caption 'palette-ssh'
     Document-Name $right 'palette-ssh'

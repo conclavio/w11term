@@ -7,6 +7,7 @@ pub enum CommandId {
     MoveTabToExistingWindow(Option<TabId>, u64),
     BroadcastTyping(pane_broadcast::Action),
     RenamePane(Option<(u64, TabId)>),
+    SaveLiveProfile(Option<clipboard_paste::Origin>),
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
     Recording(Option<recordings::Choice>),
@@ -206,6 +207,9 @@ impl TerminalApp {
             }
             if matches!(&row.id, CommandId::Menu(label) if label == tab_title::RENAME_PANE) {
                 row.id = CommandId::RenamePane(rename_target);
+            }
+            if matches!(&row.id, CommandId::Menu(label) if label == live_profile::SAVE) {
+                row.id = CommandId::SaveLiveProfile(self.saveable_ssh_origin());
             }
             if let CommandId::Menu(label) = &row.id
                 && let Some(pinned) = tab_pin_command(label)
@@ -413,6 +417,7 @@ impl TerminalApp {
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
             CommandId::RenamePane(target) => tab_title::show_pane(target),
+            CommandId::SaveLiveProfile(origin) => live_profile::open(origin),
             CommandId::ReopenClosedTab(group) => Message::ReopenClosedTab(group),
             CommandId::ReopenClosedPane(id) => Message::ReopenClosedPane(id),
             CommandId::FocusPreviousPane(target) => previous_pane::message(target),
