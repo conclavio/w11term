@@ -924,8 +924,8 @@ mod test {
 
         assert_eq!(
             parse_as(
-                "\x1b_Ga=q,s=1,v=1,i=1;YWJjZA==\x1b\\",
-                "\x1b_Ga=q,i=1,s=1,v=1;YWJjZA==\x1b\\"
+                "\x1b_Ga=q,s=1,v=1,i=1,q=1;YWJjZA==\x1b\\",
+                "\x1b_Ga=q,i=1,q=1,s=1,v=1;YWJjZA==\x1b\\"
             ),
             vec![
                 Action::KittyImage(Box::new(KittyImage::Query {
@@ -939,6 +939,7 @@ mod test {
                         compression: KittyImageCompression::None,
                         more_data_follows: false,
                     },
+                    verbosity: KittyImageVerbosity::OnlyErrors,
                 })),
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
             ]
@@ -964,6 +965,7 @@ mod test {
                         compression: KittyImageCompression::None,
                         more_data_follows: false,
                     },
+                    verbosity: KittyImageVerbosity::Verbose,
                 })),
                 Action::Esc(Esc::Code(EscCode::StringTerminator)),
             ]

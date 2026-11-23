@@ -44,7 +44,7 @@ transmissions to 48 MiB encoded / 32 MiB inflated, limits decoded kitty frames t
 are pruned when the table exceeds 32 MiB. Remote SSH peers cannot request local
 file, temporary-file, or shared-memory kitty transports. These limits cover direct
 replacement; they do not establish a global RAM limit for sixel, iTerm images,
-images retained in primary scrollback or other image protocols. APC buffers are capped at 48 MiB; oversized strings are discarded through their terminator. Kitty animations are capped at 256 frames / 32 MiB and accounted in the 64 MiB table. The separate CPU dedup cache retains at most 4 MiB, and clears on deletion, reset and animation edits. Chunked animation frames share the direct transmission budget. Chunked queries are unsupported.
+images retained in primary scrollback or other image protocols. APC buffers are capped at 48 MiB; oversized strings are discarded through their terminator. Kitty animations are capped at 256 frames / 32 MiB and accounted in the 64 MiB table. The separate CPU dedup cache retains at most 4 MiB, and clears on deletion, reset and animation edits. Chunked animation frames and upload probes share the direct transmission budget.
 Large graphics or unused table entries may be rejected or evicted.
 
 DA1 includes attribute 4 and XTVERSION identifies `w11term <package-version>`.
@@ -137,6 +137,12 @@ the option values they need. For example, `a=q,i=31,e=T,U=1,C=1` reports
 The response omits unavailable options such as file and shared-memory
 transports. Queries do not load their payload or disturb an upload in progress.
 [Kitty feature queries](https://sw.kovidgoyal.net/kitty/graphics-protocol/#querying-support-for-protocol-features)
+
+An upload probe with an image ID and a payload checks the same format,
+dimensions, compression and byte counts as an upload. Probe data stays
+out of the image table. A multipart probe replies after its final chunk,
+and a standalone probe can run during an in-flight upload.
+[Kitty upload probes](https://sw.kovidgoyal.net/kitty/graphics-protocol/#querying-support-and-available-transmission-mediums)
 
 Indexed uploads use either one palette index per pixel or an index followed
 by alpha. Each indexed image counts both its source indices and expanded

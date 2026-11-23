@@ -174,6 +174,112 @@ async fn feature_query_has_no_effect_on_images_or_a_chunked_upload() {
     assert_eq!(pixel(&committed, 2, 1, 31), Some([0, 255, 0, 255]));
 }
 
+#[tokio::test]
+async fn upload_probes_validate_pixels_and_leave_the_image_table_untouched() {
+    let (mut t, mut replies) = engine();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(1, 1)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let encoded_png = STANDARD.encode(png.get_ref());
+    let header_only = STANDARD.encode(&png.get_ref()[..33]);
+
+    t.advance_bytes(format!(
+        "\x1b_Ga=T,i=7,p=1,f=24,s=1,v=1,c=1,r=1,C=1,q=2;/wAA\x1b\\\
+         \x1b_Ga=q,i=7,f=24,s=1,v=1;AP8A\x1b\\\
+         \x1b_Ga=q,i=999,f=100;{encoded_png}\x1b\\\
+         \x1b_Ga=q,i=11,f=100;{header_only}\x1b\\\
+         \x1b_Ga=q,i=12,f=24,s=1,v=1;AAAAAA==\x1b\\\
+         \x1b_Ga=q,i=13,f=32,s=1,v=1;AAAA\x1b\\\
+         \x1b_Ga=q,i=14,f=24,s=1,v=1,o=z;AAAA\x1b\\\
+         \x1b_Ga=q,i=15,f=24;AAAA\x1b\\\
+         \x1b_Ga=q,i=16,f=24,s=8192,v=8192;AAAA\x1b\\\
+         \x1b_Ga=q,i=17,f=24,s=4,v=4,o=z;eJxjYCANAAAAMAAB\x1b\\\
+         \x1b_Ga=q,i=18,f=24,s=1,v=1,q=1;AAAA\x1b\\\
+         \x1b_Ga=q,i=19,f=24,s=1,v=1,q=2;AA==\x1b\\\
+         \x1b_Ga=q,f=24,s=1,v=1;AAAA\x1b\\\
+         \x1b_Ga=q,i=20,I=30,f=24,s=1,v=1;AAAA\x1b\\\
+         \x1b[1;2H\x1b_Ga=T,I=80,p=1,f=24,s=1,v=1,c=1,r=1,C=1;AAD/\x1b\\\
+         \x1b[5n"
+    ));
+    let response = read_through(&mut replies, b"\x1b[0n").await;
+    let received: Vec<_> = response
+        .strip_suffix("\x1b[0n")
+        .unwrap()
+        .split_terminator("\x1b\\")
+        .collect();
+    let expected = [
+        "\x1b_Gi=7;OK",
+        "\x1b_Gi=999;OK",
+        "\x1b_Gi=11;EINVAL:",
+        "\x1b_Gi=12;EINVAL:",
+        "\x1b_Gi=13;EINVAL:",
+        "\x1b_Gi=14;EINVAL:",
+        "\x1b_Gi=15;EINVAL:",
+        "\x1b_Gi=16;EINVAL:",
+        "\x1b_Gi=17;OK",
+        "\x1b_GI=30,i=20;EINVAL:",
+        "\x1b_GI=80,i=8,p=1;OK",
+    ];
+    assert_eq!(received.len(), expected.len(), "{response:?}");
+    for (actual, expected) in received.iter().zip(expected) {
+        assert!(actual.starts_with(expected), "{actual:?} vs {expected:?}");
+    }
+    let snapshot = frame(&t, None, 0);
+    assert_eq!(pixel(&snapshot, 0, 0, 7), RED);
+    assert_eq!(pixel(&snapshot, 1, 0, 8), Some([0, 0, 255, 255]));
+    assert_eq!(pixel(&snapshot, 0, 0, 999), None);
+}
+
+#[tokio::test]
+async fn upload_probe_chunks_reply_once_and_preserve_other_transfers() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=q,i=7,f=32,s=1,v=1,m=1;AP8A\x1b\\",
+        "\x1b_Ga=q,e=t,i=70,f=24\x1b\\",
+        "\x1b[5n",
+    ));
+    assert_eq!(
+        read_through(&mut replies, b"\x1b[0n").await,
+        "\x1b_Gi=70,e=t,f=24;OK\x1b\\\x1b[0n",
+    );
+    t.advance_bytes(concat!(
+        "\x1b_Gm=0;/w==\x1b\\",
+        "\x1b_Ga=q,i=8,f=24,s=1,v=1,q=1,m=1;A\x1b\\",
+        "\x1b_Gm=0;AA==\x1b\\",
+        "\x1b_Ga=T,i=9,p=1,f=32,s=1,v=1,c=1,r=1,C=1,q=2,m=1;/wAA\x1b\\",
+        "\x1b_Ga=q,i=71,f=24,s=1,v=1;AAAA\x1b\\",
+        "\x1b_Ga=q,i=72,t=f,f=24,s=1,v=1;ZmFrZS1wYXRo\x1b\\",
+        "\x1b_Ga=q,i=73,m=1,f=24,s=1,v=1;AAAA\x1b\\",
+        "\x1b_Gm=0,q=2;/w==\x1b\\",
+        "\x1b_Ga=q,i=74,f=32,s=1,v=1,m=1;AA==\x1b\\",
+        "\x1b[1;2H\x1b_Ga=T,i=10,p=1,f=24,s=1,v=1,c=1,r=1,C=1;AAD/\x1b\\",
+        "\x1b[5n",
+    ));
+    let response = read_through(&mut replies, b"\x1b[0n").await;
+    let received: Vec<_> = response
+        .strip_suffix("\x1b[0n")
+        .unwrap()
+        .split_terminator("\x1b\\")
+        .collect();
+    let expected = [
+        "\x1b_Gi=7;OK",
+        "\x1b_Gi=8;EINVAL:",
+        "\x1b_Gi=71;OK",
+        "\x1b_Gi=72;ENOTSUP:",
+        "\x1b_Gi=73;EBUSY:",
+        "\x1b_Gi=74;EINVAL:upload probe was interrupted",
+        "\x1b_Gi=10,p=1;OK",
+    ];
+    assert_eq!(received.len(), expected.len(), "{response:?}");
+    for (actual, expected) in received.iter().zip(expected) {
+        assert!(actual.starts_with(expected), "{actual:?} vs {expected:?}");
+    }
+    let snapshot = frame(&t, None, 0);
+    assert_eq!(pixel(&snapshot, 0, 0, 9), RED);
+    assert_eq!(pixel(&snapshot, 1, 0, 10), Some([0, 0, 255, 255]));
+}
+
 fn engine() -> (
     Terminal,
     tokio::sync::mpsc::UnboundedReceiver<TransportInput>,
