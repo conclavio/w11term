@@ -33,6 +33,7 @@ mod kitty;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod rectangle;
 mod rendition;
 mod selective_erase;
 mod sgr_stack;
@@ -2630,6 +2631,26 @@ impl TerminalState {
                 for row in rows {
                     self.selectively_erase_line(row as VisibleRowIndex, cols.clone());
                 }
+            }
+            Window::EraseRectangle {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                let area = self.screen_rectangle(top, left, bottom, right);
+                self.paint_rectangle(area, &Cell::blank());
+            }
+            Window::FillRectangle {
+                character,
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                let area = self.screen_rectangle(top, left, bottom, right);
+                let cell = self.rectangle_fill_cell(character);
+                self.paint_rectangle(area, &cell);
             }
             Window::ChecksumRectangularArea {
                 request_id,

@@ -116,40 +116,7 @@ impl Rendition {
     }
 }
 
-fn rectangle_axis(start: OneBased, end: OneBased, limits: Range<usize>) -> Range<usize> {
-    if limits.is_empty() {
-        return limits;
-    }
-    let first = (start.as_zero_based() as usize).min(limits.len() - 1);
-    let last = (end.as_one_based() as usize).min(limits.len());
-    limits.start + first..limits.start + last
-}
-
 impl TerminalState {
-    pub(super) fn screen_rectangle(
-        &self,
-        top: OneBased,
-        left: OneBased,
-        bottom: OneBased,
-        right: OneBased,
-    ) -> (Range<usize>, Range<usize>) {
-        let screen = self.screen();
-        let (row_limits, col_limits) = if self.dec_origin_mode {
-            (
-                self.top_and_bottom_margins.start as usize
-                    ..(self.top_and_bottom_margins.end as usize).min(screen.physical_rows),
-                self.left_and_right_margins.start
-                    ..self.left_and_right_margins.end.min(screen.physical_cols),
-            )
-        } else {
-            (0..screen.physical_rows, 0..screen.physical_cols)
-        };
-        (
-            rectangle_axis(top, bottom, row_limits),
-            rectangle_axis(left, right, col_limits),
-        )
-    }
-
     pub(super) fn report_rectangular_sgr(
         &mut self,
         top: OneBased,
