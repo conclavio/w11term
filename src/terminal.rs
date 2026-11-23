@@ -2790,6 +2790,398 @@ mod tests {
     }
 
     #[test]
+    fn dec_selective_erase_keeps_fields_and_uses_the_requested_line_or_display_extent() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"a\x1b[1\"qA\x1b[0mB\x1b[2\"qc\r\n");
+        term.advance_bytes(b"d\x1b[1\"qCD\x1b[\"qe\r\nplain");
+        term.advance_bytes(b"\x1b[2;2H\x1b[?1J");
+        assert!(text(&term).starts_with(" AB\n CDe\nplain\n"));
+        term.advance_bytes(b"\x1b[2;4H\x1b[?K");
+        assert!(text(&term).starts_with(" AB\n CD\nplain\n"));
+        term.advance_bytes(b"\x1b[2;1H\x1b[?J");
+        assert!(text(&term).starts_with(" AB\n CD\n\n"));
+        term.advance_bytes(b"\x1b[1;1HX\x1b[1;1H\x1b[?1K");
+        assert!(text(&term).starts_with(" AB\n CD\n\n"));
+        term.advance_bytes(b"\x1b[2K\x1b[?2J");
+        assert!(text(&term).starts_with("\n CD\n\n"));
+    }
+
+    #[test]
+    fn dec_selective_rectangle_preserves_wide_protected_glyphs_and_cell_rendition() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes("\x1b#6\x1b[1\"q界\x1b[0\"q\x1b[4:3;44m語\x1b[0mZ");
+        term.advance_bytes(b"\x1b[1;2;1;2${\x1b[1;4;1;4${\x1b[6n");
+        assert_eq!(receive(&mut replies), b"\x1b[1;6R");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let row = &frame.rows[0];
+        assert!(row.is_double_width());
+        assert_eq!(row.as_str().trim_end(), "界  Z");
+        assert!(row.get_cell(0).unwrap().attrs().protected());
+        for col in 2..4 {
+            let cell = row.get_cell(col).unwrap();
+            assert_eq!(cell.attrs().underline(), wezterm_term::Underline::Curly);
+            assert_eq!(
+                cell.attrs().background(),
+                wezterm_term::color::ColorAttribute::PaletteIndex(4)
+            );
+        }
+    }
+
+    #[test]
+    fn dec_character_protection_is_saved_with_the_cursor_and_has_a_status_reply() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes(b"\x1b[1\"q\x1b7\x1b[2\"q\x1bP$q\"q\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0\"q\x1b\\");
+        term.advance_bytes(b"\x1b8\x1b[9\"q\x1bP$q\"q\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r1\"q\x1b\\");
+        // Ordinary erasure inserts unprotected blanks even while the pen is protected.
+        term.advance_bytes(b"AB\r\x1b[X");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(!frame.rows[0].get_cell(0).unwrap().attrs().protected());
+        assert!(frame.rows[0].get_cell(1).unwrap().attrs().protected());
+        term.advance_bytes(b"\x1b[!p\x1bP$q\"q\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0\"q\x1b\\");
+    }
+
+    #[test]
+    fn dec_selective_protection_follows_the_wrapped_cells_between_screen_edits() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 5,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"..\x1b[1\"qprotected\x1b[0\"q..");
+        let size = TerminalSize {
+            cols: 16,
+            ..term.get_size()
+        };
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?1049hdiscard\x1b[?2J\x1b[?1049l");
+        term.advance_bytes(b"\x1b[1;1H\x1b[@\x1b[?2J");
+        assert!(text(&term).starts_with("   protected\n"));
+    }
+
+    #[test]
+    fn dec_rectangle_fill_uses_the_pen_and_ordinary_erase_clears_protection() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes(b"ABCDEF\r\nabcdef\r\n012345\x1b[4;9H");
+        term.advance_bytes(b"\x1b[1;4:3;44m\x1b[1\"q\x1b[42;1;2;2;5$x");
+        term.advance_bytes(b"\x1b[2;3;3;4$z\x1b[6n");
+        assert_eq!(receive(&mut replies), b"\x1b[4;9R");
+        assert!(text(&term).starts_with("A****F\na*  *f\n01  45\n"));
+
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let fill = frame.rows[1].get_cell(1).unwrap();
+        assert!(fill.attrs().protected());
+        assert_eq!(fill.attrs().underline(), wezterm_term::Underline::Curly);
+        assert_eq!(
+            fill.attrs().background(),
+            wezterm_term::color::ColorAttribute::PaletteIndex(4)
+        );
+        let blank = frame.rows[1].get_cell(2).unwrap();
+        assert!(!blank.attrs().protected());
+        assert_eq!(blank.attrs().underline(), wezterm_term::Underline::None);
+        assert_eq!(
+            blank.attrs().background(),
+            wezterm_term::color::ColorAttribute::Default
+        );
+        // The active protection setting still applies to text after the edit.
+        term.advance_bytes(b"Z\x1b[?2J");
+        assert!(text(&term).starts_with(" ****\n *  *\n\n        Z\n"));
+    }
+
+    #[test]
+    fn dec_rectangle_edit_coordinates_follow_origin_and_handle_invalid_or_default_borders() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 6,
+                rows: 3,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"ABCDEF\r\nabcdef\r\n012345");
+        term.advance_bytes(b"\x1b[?69h\x1b[2;5s\x1b[2;3r\x1b[?6h\x1b[46;1;1;99;99$x");
+        assert_eq!(text(&term), "ABCDEF\na....f\n0....5");
+        term.advance_bytes(b"\x1b[?6l\x1b[100;100;99;99$z\x1b[127;1;1;3;6$x");
+        assert_eq!(text(&term), "ABCDEF\na....f\n0....5");
+        term.advance_bytes(b"\x1b[2;5$z");
+        assert_eq!(text(&term), "ABCDEF\na...\n0...");
+    }
+
+    #[test]
+    fn dec_rectangle_fill_translates_graphic_characters_and_keeps_line_rendition() {
+        let (mut term, _) = engine();
+        term.advance_bytes("\x1b#6A界Z\x1b(0\x1b[113;1;3;1;3$x\x1b(B\x1b[163;1;5;1;5$x");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "A ─Z£");
+        assert!(frame.rows[0].is_double_width());
+        for col in [2, 4] {
+            assert_eq!(frame.rows[0].get_cell(col).unwrap().width(), 1);
+        }
+    }
+
+    #[test]
+    fn dec_rectangle_copy_reads_overlapping_rows_and_columns_before_overwriting() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes(b"ABCDEFGHIJ\r\n0123456789\r\nxxxxxxxxxx\x1b[4;8H");
+        term.advance_bytes(b"\x1b[1;2;2;5;1;2;4;1$v");
+        assert!(text(&term).starts_with("ABCDEFGHIJ\n012BCDE789\nxxx1234xxx\n"));
+        term.advance_bytes(b"\x1b[2;4;3;7;1;1;1;1$v\x1b[1;1;1;4;1;1;3;1$v\x1b[6n");
+        assert!(text(&term).starts_with("BCBCDEGHIJ\n1234CDE789\nxxx1234xxx\n"));
+        assert_eq!(receive(&mut replies), b"\x1b[4;8R");
+    }
+
+    #[test]
+    fn dec_rectangle_copy_keeps_cell_style_and_clips_wide_graphemes_at_either_edge() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 5,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes("A\x1b[1\"q\x1b[44m界\x1b[0m\x1b[0\"qB\x1b[2;1H\x1b#6zzzz");
+        term.advance_bytes(b"\x1b[1;2;1;3;1;2;3;1$v\x1b[1;2;1;3;1;3;8;1$v\x1b[1;3;1;4;1;4;1;1$v");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(frame.rows[1].is_double_width());
+        assert_eq!(frame.rows[1].as_str().trim_end(), "zz界");
+        assert_eq!(frame.rows[2].as_str().trim_end(), "");
+        assert_eq!(frame.rows[3].as_str().trim_end(), " B");
+        for (row, col) in [(1, 2), (2, 7), (3, 0)] {
+            let cell = frame.rows[row].get_cell(col).unwrap();
+            assert!(cell.attrs().protected());
+            assert_eq!(
+                cell.attrs().background(),
+                wezterm_term::color::ColorAttribute::PaletteIndex(4)
+            );
+        }
+    }
+
+    #[test]
+    fn dec_rectangle_copy_uses_origin_defaults_and_the_active_page() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 6,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"primary\x1b[?1049hABCDEF\r\nabcdef\r\n012345\r\nuvwxyz");
+        term.advance_bytes(b"\x1b[?69h\x1b[2;5s\x1b[2;3r\x1b[?6h");
+        // Pages above the single active page clamp to page 1. Zero and omitted
+        // parameters take their usual defaults.
+        term.advance_bytes(b"\x1b[0;0;1;;7;2;2;5$v");
+        assert_eq!(text(&term), "ABCDEF\nabcdef\n01bcd5\nuvwxyz");
+        term.advance_bytes(b"\x1b[1;1;2;4;1;9;9;1$v\x1b[2;3;1;1;1;1;1;1$v");
+        assert_eq!(text(&term), "ABCDEF\nabcdef\n01bcd5\nuvwxyz");
+        term.advance_bytes(b"\x1b[?1049l");
+        assert!(text(&term).starts_with("primar\ny\n"));
+    }
+
+    #[test]
+    fn dec_range_attributes_follow_stream_then_rectangle_without_changing_the_pen() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"ABCDEF\r\nabcdef\r\n012345\x1b[4;8H\x1b[3;31m");
+        term.advance_bytes(b"\x1b[1;4;3;2;1;4$r");
+        let first = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        for (row, styled) in [(0, 3..6), (1, 0..6), (2, 0..2)] {
+            for col in 0..6 {
+                let cell = first.rows[row].get_cell(col).unwrap();
+                assert_eq!(
+                    cell.attrs().intensity() == wezterm_term::Intensity::Bold,
+                    styled.contains(&col)
+                );
+                assert_eq!(
+                    cell.attrs().underline() == wezterm_term::Underline::Single,
+                    styled.contains(&col)
+                );
+            }
+        }
+        term.advance_bytes(b"\x1b[2*x\x1b[2;2;3;4;1;7$t");
+        let toggled = Snapshot::capture(&term, Some(&first), 2, 0, String::new(), 0);
+        for row in [1, 2] {
+            for col in 0..6 {
+                let before = first.rows[row].get_cell(col).unwrap();
+                let after = toggled.rows[row].get_cell(col).unwrap();
+                let selected = (1..4).contains(&col);
+                assert_eq!(after.attrs().reverse(), selected);
+                assert_eq!(
+                    after.attrs().intensity() == wezterm_term::Intensity::Bold,
+                    (before.attrs().intensity() == wezterm_term::Intensity::Bold) ^ selected
+                );
+                assert_eq!(after.attrs().underline(), before.attrs().underline());
+            }
+        }
+        assert!(text(&term).starts_with("ABCDEF\nabcdef\n012345\n"));
+        assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (7, 3));
+        assert!(term.pen().italic());
+        assert_eq!(
+            term.pen().foreground(),
+            wezterm_term::color::ColorAttribute::PaletteIndex(1)
+        );
+    }
+
+    #[test]
+    fn dec_rectangle_attributes_restyle_complete_glyphs_and_extend_into_blanks() {
+        let (mut term, _) = engine();
+        term.advance_bytes("\x1b[1\"q\x1b[44;4:3m界\x1b[0m\x1b[0\"q!");
+        term.advance_bytes(b"\x1b[1;4;1;5;4$r");
+        let stream = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(stream.rows[0].get_cell(4).is_none());
+        term.advance_bytes(b"\x1b[2*x\x1b[1;2;1;5;0;4;7$r\x1b[1;2;1;5;7;7$t");
+        let rect = Snapshot::capture(&term, Some(&stream), 2, 0, String::new(), 0);
+        let wide = rect.rows[0].get_cell(0).unwrap();
+        assert_eq!(wide.str(), "界");
+        assert_eq!(wide.width(), 2);
+        assert!(wide.attrs().protected());
+        assert_eq!(
+            wide.attrs().background(),
+            wezterm_term::color::ColorAttribute::PaletteIndex(4)
+        );
+        for col in [0, 2, 3, 4] {
+            let cell = rect.rows[0].get_cell(col).unwrap();
+            assert_eq!(cell.attrs().underline(), wezterm_term::Underline::Single);
+            assert!(cell.attrs().reverse());
+        }
+    }
+
+    #[test]
+    fn dec_attribute_extent_is_queryable_and_resettable() {
+        let (mut term, mut replies) = engine();
+        for (command, extent) in [
+            ("", 0),
+            ("\x1b[2*x\x1b[9*x", 2),
+            ("\x1b[1*x", 1),
+            ("\x1b[2*x\x1b[!p", 0),
+            ("\x1b[2*x\x1bc", 0),
+        ] {
+            term.advance_bytes(format!("{command}\x1bP$q*x\x1b\\"));
+            assert_eq!(
+                receive(&mut replies),
+                format!("\x1bP1$r{extent}*x\x1b\\").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn dec_column_edits_shift_the_scrolling_region_and_keep_the_cursor() {
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 5,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"ABCDEFGH\r\nabcdefgh\r\n12345678\r\nijklmnop\r\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[?69h\x1b[2;7s\x1b[2;4r\x1b[3;3H\x1b[44m\x1b[2'}");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nab  cdeh\n12  3458\nij  klmp\nIJKLMNOP"
+        );
+        term.advance_bytes(b"\x1b[3'~\x1b[6n");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nabde   h\n1245   8\nijlm   p\nIJKLMNOP"
+        );
+        assert_eq!(receive(&mut replies), b"\x1b[3;3R");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(
+            frame.rows[1].get_cell(4).unwrap().attrs().background(),
+            wezterm_term::color::ColorAttribute::Default
+        );
+        // A cursor above the top margin or to the left of the region has no effect.
+        term.advance_bytes(b"\x1b[1;3H\x1b['}\x1b[3;1H\x1b['~");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nabde   h\n1245   8\nijlm   p\nIJKLMNOP"
+        );
+        term.advance_bytes(b"\x1b[3;3H\x1b[4294967295'~");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nab     h\n12     8\nij     p\nIJKLMNOP"
+        );
+    }
+
+    #[test]
+    fn dec_column_edits_clip_wide_glyphs_and_respect_each_rows_rendition() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 3,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes("A界B語Z\x1b[2;1H\x1b#6m界n");
+        term.advance_bytes(b"\x1b[1;3H\x1b[0'}");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "A   B語Z");
+        assert_eq!(frame.rows[1].as_str().trim_end(), "m");
+        assert!(frame.rows[1].is_double_width());
+        assert_eq!(frame.rows[0].get_cell(5).unwrap().width(), 2);
+    }
+
+    #[test]
+    fn dec_horizontal_index_moves_the_cursor_and_scrolls_at_horizontal_margins() {
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"ABCDEFGH\r\nabcdefgh\r\n12345678\r\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[2;3H\x1b6\x1b[6n");
+        assert_eq!(text(&term), "ABCDEFGH\nab cdegh\n12 34578\nIJKLMNOP");
+        assert_eq!(receive(&mut replies), b"\x1b[2;3R");
+        term.advance_bytes(b"\x1b[3;6H\x1b9\x1b[6n");
+        assert_eq!(text(&term), "ABCDEFGH\nabcde gh\n12345 78\nIJKLMNOP");
+        assert_eq!(receive(&mut replies), b"\x1b[3;6R");
+        for (bytes, position) in [
+            (b"\x1b[2;4H\x1b9\x1b[6n".as_slice(), b"\x1b[2;5R".as_slice()),
+            (b"\x1b6\x1b[6n", b"\x1b[2;4R"),
+            (b"\x1b[1;2H\x1b9\x1b6\x1b[6n", b"\x1b[1;3R"),
+            (b"\x1b[3;7H\x1b9\x1b9\x1b[6n", b"\x1b[3;8R"),
+        ] {
+            term.advance_bytes(bytes);
+            assert_eq!(receive(&mut replies), position);
+        }
+        assert_eq!(text(&term), "ABCDEFGH\nabcde gh\n12345 78\nIJKLMNOP");
+    }
+
+    #[test]
+    fn dec_forward_index_honors_double_width_and_clears_pending_wrap() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 3,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"\x1b[2;1Habcdefgh\x1b[1;1H\x1b#61234\x1b9Z");
+        assert_eq!(text(&term), "234Z\nbcdefgh\n");
+        assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (3, 0));
+        assert!(Snapshot::capture(&term, None, 1, 0, String::new(), 0).rows[0].is_double_width());
+    }
+
+    #[test]
     fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(

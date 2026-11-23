@@ -134,3 +134,28 @@ The original MIT license is preserved in `LICENSE.md`.
   The model tracks whether an application supplied the window title, including
   across title saves and restores. A full reset or reconnect clears that flag.
   Consumers can read the application window title independently of the icon.
+
+- DECSCA stores character protection in a spare attribute bit in the vendored
+  wezterm-cell. DECSEL, DECSED, and DECSERA erase unprotected text, including
+  complete wide graphemes, while preserving visual and line attributes.
+  DECRQSS reports the current protection setting. Saving the cursor saves
+  protection with the pen, and SGR changes only the visual attributes.
+
+- DECFRA and DECERA use the active screen's rectangle coordinates and keep
+  the cursor and line rendition. Fill uses the active character set and
+  pen with one cell per column. Erase replaces cells with default blanks.
+
+- DECCRA copies styled cells within the active screen. One row of scratch
+  storage and overlap-aware traversal keep the source intact during a copy.
+  Destination line rendition and independent Kitty placements stay in place.
+
+- DECSACE selects a wrapped range or rectangle for DECCARA and DECRARA
+  attribute edits. Changes are applied in place to preserve text, metadata
+  and graphics. DECRQSS reports the selected extent.
+
+- DECIC and DECDC shift the cells in each row of the scrolling region
+  once. They insert default blanks, clip split wide glyphs, and preserve
+  the row rendition and stationary Kitty placements.
+
+- DECBI and DECFI move the cursor across the current row or reuse the
+  column shift at a scrolling-region edge.

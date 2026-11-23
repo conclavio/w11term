@@ -1086,8 +1086,32 @@ fn text_erasure_keeps_direct_kitty_layers_and_full_screen_erase_clears_them() {
     assert!(start_erased.rows[2].as_str().contains("OW"));
     check_layers(&start_erased);
 
+    t.advance_bytes(b"\x1b[46;2;3;3;4$x");
+    let filled = frame(&t, Some(&start_erased), 0);
+    assert!(filled.rows[1].as_str().contains(".."));
+    check_layers(&filled);
+    t.advance_bytes(b"\x1b[2;3;3;4$z");
+    let rectangle_erased = frame(&t, Some(&filled), 0);
+    assert!(!rectangle_erased.rows[1].as_str().contains(".."));
+    check_layers(&rectangle_erased);
+
+    t.advance_bytes(b"\x1b[2;3HCOPY\x1b[2;3;2;6;1;3;3;1$v");
+    let copied = frame(&t, Some(&rectangle_erased), 0);
+    assert_eq!(copied.rows[2].as_str().trim_end(), "  COPY");
+    check_layers(&copied);
+    assert_eq!(pixel(&copied, 2, 2, 41), None);
+    assert_eq!(pixel(&copied, 3, 2, 42), None);
+
+    t.advance_bytes(b"\x1b[2*x\x1b[2;3;3;4;4;7$r");
+    let styled = frame(&t, Some(&copied), 0);
+    assert_eq!(
+        styled.rows[2].get_cell(2).unwrap().attrs().underline(),
+        wezterm_term::Underline::Single
+    );
+    check_layers(&styled);
+
     t.advance_bytes(b"\x1b[2J");
-    let cleared = frame(&t, Some(&start_erased), 0);
+    let cleared = frame(&t, Some(&styled), 0);
     assert_eq!(pixel(&cleared, 2, 1, 40), None);
     assert_eq!(pixel(&cleared, 2, 1, 41), None);
     assert_eq!(pixel(&cleared, 2, 2, 40), None);
@@ -1215,6 +1239,29 @@ fn kitty_character_insert_and_delete_keep_direct_tiles_at_the_original_columns()
     let deleted = frame(&t, Some(&inserted), 0);
     assert!(deleted.rows[0].as_str().starts_with("ABCD"));
     check(&deleted);
+
+    t.advance_bytes(b"\x1b[2;1Habcd\x1b[1;2H\x1b[2'}");
+    let columns_inserted = frame(&t, Some(&deleted), 0);
+    assert!(columns_inserted.rows[0].as_str().starts_with("A  BCD"));
+    assert!(columns_inserted.rows[1].as_str().starts_with("a  bcd"));
+    check(&columns_inserted);
+    t.advance_bytes(b"\x1b[2'~");
+    let columns_deleted = frame(&t, Some(&columns_inserted), 0);
+    assert!(columns_deleted.rows[0].as_str().starts_with("ABCD"));
+    assert!(columns_deleted.rows[1].as_str().starts_with("abcd"));
+    check(&columns_deleted);
+
+    t.advance_bytes(b"\x1b[H\x1b6");
+    let indexed_back = frame(&t, Some(&columns_deleted), 0);
+    assert!(indexed_back.rows[0].as_str().starts_with(" ABCD"));
+    assert!(indexed_back.rows[1].as_str().starts_with(" abcd"));
+    check(&indexed_back);
+    let rightmost = t.get_size().cols;
+    t.advance_bytes(format!("\x1b[1;{rightmost}H\x1b9"));
+    let indexed_forward = frame(&t, Some(&indexed_back), 0);
+    assert!(indexed_forward.rows[0].as_str().starts_with("ABCD"));
+    assert!(indexed_forward.rows[1].as_str().starts_with("abcd"));
+    check(&indexed_forward);
 }
 
 #[test]

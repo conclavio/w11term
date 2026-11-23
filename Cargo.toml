@@ -56,4 +56,5 @@ codegen-units = 1
 
 [patch."https://github.com/wezterm/wezterm"]
 vtparse = { path = "vendor/vtparse" }
+wezterm-cell = { path = "vendor/wezterm-cell" }
 wezterm-escape-parser = { path = "vendor/wezterm-escape-parser" }

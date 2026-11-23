@@ -620,6 +620,43 @@ pub enum Window {
         bottom: OneBased,
         right: OneBased,
     },
+    /// DECSERA.
+    SelectiveEraseRectangle {
+        top: OneBased,
+        left: OneBased,
+        bottom: OneBased,
+        right: OneBased,
+    },
+    /// DECERA.
+    EraseRectangle {
+        top: OneBased,
+        left: OneBased,
+        bottom: OneBased,
+        right: OneBased,
+    },
+    /// DECFRA.
+    FillRectangle {
+        character: u8,
+        top: OneBased,
+        left: OneBased,
+        bottom: OneBased,
+        right: OneBased,
+    },
+    /// DECCRA.
+    CopyRectangle {
+        source: [OneBased; 4],
+        source_page: OneBased,
+        destination: [OneBased; 2],
+        destination_page: OneBased,
+    },
+    /// DECSACE. 0 and 1 use a stream, 2 uses a rectangle.
+    AttributeExtent(u8),
+    /// DECCARA or DECRARA.
+    EditAreaAttributes {
+        area: [OneBased; 4],
+        attributes: Box<[i64]>,
+        reverse: bool,
+    },
     /// DECRQCRA; used by esctest
     ChecksumRectangularArea {
         request_id: i64,
@@ -694,8 +731,59 @@ impl Display for Window {
                 write!(f, "23;{};{slot}t", *scope as u8)
             }
             Window::ReportTitleStackPosition => write!(f, "#S"),
-            Window::ReportRectangularSgr { top, left, bottom, right } => {
+            Window::ReportRectangularSgr {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
                 write!(f, "{};{};{};{}#|", top, left, bottom, right)
+            }
+            Window::SelectiveEraseRectangle {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                write!(f, "{};{};{};{}${{", top, left, bottom, right)
+            }
+            Window::EraseRectangle {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                write!(f, "{};{};{};{}$z", top, left, bottom, right)
+            }
+            Window::FillRectangle {
+                character,
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                write!(f, "{};{};{};{};{}$x", character, top, left, bottom, right)
+            }
+            Window::CopyRectangle {
+                source: [top, left, bottom, right],
+                source_page,
+                destination: [row, column],
+                destination_page,
+            } => write!(
+                f,
+                "{top};{left};{bottom};{right};{source_page};{row};{column};{destination_page}$v"
+            ),
+            Window::AttributeExtent(extent) => write!(f, "{extent}*x"),
+            Window::EditAreaAttributes {
+                area: [top, left, bottom, right],
+                attributes,
+                reverse,
+            } => {
+                write!(f, "{top};{left};{bottom};{right}")?;
+                for attribute in attributes.iter() {
+                    write!(f, ";{attribute}")?;
+                }
+                write!(f, "${}", if *reverse { 't' } else { 'r' })
             }
             Window::ChecksumRectangularArea {
                 request_id,
@@ -1279,6 +1367,14 @@ pub enum Edit {
 
     /// ED - ERASE IN PAGE (XTerm calls this Erase in Display)
     EraseInDisplay(EraseInDisplay),
+    /// DECIC and DECDC.
+    InsertColumns(u32),
+    DeleteColumns(u32),
+    /// DECSED and DECSEL.
+    SelectiveEraseInDisplay(EraseInDisplay),
+    SelectiveEraseInLine(EraseInLine),
+    /// DECSCA. Protection applies to subsequently written cells.
+    CharacterProtection(bool),
 
     /// REP - Repeat the preceding character n times
     Repeat(u32),
@@ -1331,6 +1427,17 @@ impl Display for Edit {
             Edit::ScrollDown(n) => n.write_csi(f, "T")?,
             Edit::ScrollUp(n) => n.write_csi(f, "S")?,
             Edit::EraseInDisplay(n) => n.write_csi(f, "J")?,
+            Edit::InsertColumns(n) => n.write_csi(f, "'}")?,
+            Edit::DeleteColumns(n) => n.write_csi(f, "'~")?,
+            Edit::SelectiveEraseInDisplay(n) => {
+                write!(f, "?")?;
+                n.write_csi(f, "J")?;
+            }
+            Edit::SelectiveEraseInLine(n) => {
+                write!(f, "?")?;
+                n.write_csi(f, "K")?;
+            }
+            Edit::CharacterProtection(protected) => write!(f, "{}\"q", u8::from(*protected))?,
             Edit::Repeat(n) => n.write_csi(f, "b")?,
         }
         Ok(())
@@ -1849,6 +1956,16 @@ impl Cracked {
         self.get(idx).and_then(CsiParam::as_integer).ok_or(())
     }
 
+    fn rectangle(&self, offset: usize) -> Result<[OneBased; 4], ()> {
+        let far_edge = CsiParam::Integer(0);
+        Ok([
+            OneBased::from_optional_esc_param(self.get(offset))?,
+            OneBased::from_optional_esc_param(self.get(offset + 1))?,
+            OneBased::from_esc_param_with_big_default(self.get(offset + 2).unwrap_or(&far_edge))?,
+            OneBased::from_esc_param_with_big_default(self.get(offset + 3).unwrap_or(&far_edge))?,
+        ])
+    }
+
     pub fn len(&self) -> usize {
         self.params.len()
     }
@@ -1882,8 +1999,30 @@ macro_rules! parse {
 impl<'a> CSIParser<'a> {
     fn parse_next(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
         match (self.control, self.orig_params) {
+            ('}' | '~', [count @ .., CsiParam::P(b'\'')]) if !self.parameters_truncated => {
+                let count = u32::parse_params(count)?;
+                Ok(CSI::Edit(if self.control == '}' {
+                    Edit::InsertColumns(count)
+                } else {
+                    Edit::DeleteColumns(count)
+                }))
+            }
             ('k', [.., CsiParam::P(b' ')]) => self.select_character_path(params),
             ('q', [.., CsiParam::P(b' ')]) => self.cursor_style(params),
+            ('q', [value @ .., CsiParam::P(b'"')]) if !self.parameters_truncated => {
+                let protected = match value {
+                    [] | [CsiParam::Integer(0 | 2)] => false,
+                    [CsiParam::Integer(1)] => true,
+                    _ => return Err(()),
+                };
+                Ok(CSI::Edit(Edit::CharacterProtection(protected)))
+            }
+            ('J', [CsiParam::P(b'?'), area @ ..]) if !self.parameters_truncated => {
+                parse!(Edit, SelectiveEraseInDisplay, area)
+            }
+            ('K', [CsiParam::P(b'?'), area @ ..]) if !self.parameters_truncated => {
+                parse!(Edit, SelectiveEraseInLine, area)
+            }
             ('y', [.., CsiParam::P(b'*')]) => self.checksum_area(params),
 
             ('c', [CsiParam::P(b'='), ..]) => self
@@ -1917,18 +2056,85 @@ impl<'a> CSIParser<'a> {
                 Ok(CSI::PushSgr(parameters))
             }
             ('q' | '}', [CsiParam::P(b'#')]) if !self.parameters_truncated => Ok(CSI::PopSgr),
-            ('|', [parameters @ .., CsiParam::P(b'#')]) if !self.parameters_truncated => {
+            ('|', [parameters @ .., CsiParam::P(b'#')])
+            | ('{' | 'z' | 'x', [parameters @ .., CsiParam::P(b'$')])
+                if !self.parameters_truncated =>
+            {
                 let area = Cracked::parse(parameters)?;
-                if area.len() > 4 {
+                let offset = usize::from(self.control == 'x');
+                if area.len() > offset + 4 {
                     return Err(());
                 }
-                let far_edge = CsiParam::Integer(0);
-                Ok(CSI::Window(Box::new(Window::ReportRectangularSgr {
-                    top: OneBased::from_optional_esc_param(area.get(0))?,
-                    left: OneBased::from_optional_esc_param(area.get(1))?,
-                    bottom: OneBased::from_esc_param_with_big_default(area.get(2).unwrap_or(&far_edge))?,
-                    right: OneBased::from_esc_param_with_big_default(area.get(3).unwrap_or(&far_edge))?,
+                let [top, left, bottom, right] = area.rectangle(offset)?;
+                let operation = match self.control {
+                    '|' => Window::ReportRectangularSgr {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    },
+                    '{' => Window::SelectiveEraseRectangle {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    },
+                    'z' => Window::EraseRectangle {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    },
+                    'x' => {
+                        let character = u8::try_from(area.int(0)?).map_err(|_| ())?;
+                        if !matches!(character, 32..=126 | 160..=255) {
+                            return Err(());
+                        }
+                        Window::FillRectangle {
+                            character,
+                            top,
+                            left,
+                            bottom,
+                            right,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(CSI::Window(Box::new(operation)))
+            }
+            ('v', [parameters @ .., CsiParam::P(b'$')]) if !self.parameters_truncated => {
+                let area = Cracked::parse(parameters)?;
+                if area.len() > 8 {
+                    return Err(());
+                }
+                Ok(CSI::Window(Box::new(Window::CopyRectangle {
+                    source: area.rectangle(0)?,
+                    source_page: OneBased::from_optional_esc_param(area.get(4))?,
+                    destination: [
+                        OneBased::from_optional_esc_param(area.get(5))?,
+                        OneBased::from_optional_esc_param(area.get(6))?,
+                    ],
+                    destination_page: OneBased::from_optional_esc_param(area.get(7))?,
                 })))
+            }
+            ('r' | 't', [parameters @ .., CsiParam::P(b'$')]) if !self.parameters_truncated => {
+                let area = Cracked::parse(parameters)?;
+                let attributes = (4..area.len().max(5))
+                    .map(|index| area.opt_int(index).unwrap_or(0))
+                    .collect();
+                Ok(CSI::Window(Box::new(Window::EditAreaAttributes {
+                    area: area.rectangle(0)?,
+                    attributes,
+                    reverse: self.control == 't',
+                })))
+            }
+            ('x', [value @ .., CsiParam::P(b'*')]) if !self.parameters_truncated => {
+                let extent = match value {
+                    [] => 0,
+                    [CsiParam::Integer(n @ 0..=2)] => *n as u8,
+                    _ => return Err(()),
+                };
+                Ok(CSI::Window(Box::new(Window::AttributeExtent(extent))))
             }
             ('S', [CsiParam::P(b'#')]) if !self.parameters_truncated => {
                 Ok(CSI::Window(Box::new(Window::ReportTitleStackPosition)))

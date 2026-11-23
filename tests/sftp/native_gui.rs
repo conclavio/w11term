@@ -520,7 +520,7 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     stream.push_str("history-search-ready\r\n");
     run_palette_fixture(
         "search-command-history-ui.ps1",
-        b"history-resumed",
+        b"deploy audithistory-resumed",
         Some(&stream),
     )
     .await;
@@ -676,6 +676,17 @@ async fn native_read_only_input_is_per_pane_in_a_mixed_split() {
         "read-only-pane-ui.ps1",
         b"resumed'fanout-' + (40+7)\rraw-only",
         None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits saved commands and inserts them into SSH and PowerShell through the native palette"]
+async fn native_saved_commands_insert_into_the_focused_shell() {
+    run_palette_fixture(
+        "saved-commands-ui.ps1",
+        b"\x1b[200~'saved-' + (40+7)\x1b[201~",
+        Some("\x1b[?2004hcommand-fixture-ready\r\n"),
     )
     .await;
 }

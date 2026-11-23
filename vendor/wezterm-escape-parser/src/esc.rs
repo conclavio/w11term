@@ -65,6 +65,8 @@ pub enum EscCode {
     DecSaveCursorPosition = esc!('7'),
     /// DECRC - Restore saved cursor position
     DecRestoreCursorPosition = esc!('8'),
+    /// DECFI - Forward Index
+    DecForwardIndex = esc!('9'),
     /// DECPAM - Application Keypad
     DecApplicationKeyPad = esc!('='),
     /// DECPNM - Normal Keypad

@@ -26,6 +26,8 @@ use wezterm_escape_parser::csi::{
 use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
+mod area_attributes;
+mod column_edit;
 mod image;
 mod iterm;
 mod keyboard;
@@ -33,7 +35,9 @@ mod kitty;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod rectangle;
 mod rendition;
+mod selective_erase;
 mod sgr_stack;
 mod sixel;
 mod title;
@@ -158,7 +162,6 @@ pub(crate) struct SavedCursor {
     dec_origin_mode: bool,
     g0_charset: CharSet,
     g1_charset: CharSet,
-    // TODO: selective_erase when supported
 }
 
 struct ScreenOrAlt {
@@ -429,6 +432,7 @@ pub struct TerminalState {
     synchronized_output: bool,
     saved_private_modes: SavedPrivateModes,
     sgr_stack: sgr_stack::SgrStack,
+    attribute_extent: u8,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -697,6 +701,7 @@ impl TerminalState {
             synchronized_output: false,
             saved_private_modes: SavedPrivateModes::default(),
             sgr_stack: Default::default(),
+            attribute_extent: 0,
             seqno,
             unicode_version,
             unicode_version_stack: vec![],
@@ -1767,6 +1772,7 @@ impl TerminalState {
                 }
                 // TODO: see https://vt100.net/docs/vt510-rm/DECSTR.html
                 self.pen = CellAttributes::default();
+                self.attribute_extent = 0;
                 self.insert = false;
                 self.dec_origin_mode = false;
                 // Note that xterm deviates from the documented DECSTR
@@ -2620,6 +2626,54 @@ impl TerminalState {
             } => {
                 self.report_rectangular_sgr(top, left, bottom, right);
             }
+            Window::SelectiveEraseRectangle {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                let (rows, cols) = self.screen_rectangle(top, left, bottom, right);
+                for row in rows {
+                    self.selectively_erase_line(row as VisibleRowIndex, cols.clone());
+                }
+            }
+            Window::EraseRectangle {
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                let area = self.screen_rectangle(top, left, bottom, right);
+                self.paint_rectangle(area, &Cell::blank());
+            }
+            Window::CopyRectangle {
+                source,
+                destination,
+                ..
+            } => {
+                // Only the active buffer is addressable, so all page numbers
+                // resolve to its sole page per the DEC out-of-range rule.
+                self.copy_rectangle(source, destination);
+            }
+            Window::AttributeExtent(extent) => self.attribute_extent = extent,
+            Window::EditAreaAttributes {
+                area,
+                attributes,
+                reverse,
+            } => {
+                self.edit_area_attributes(area, &attributes, reverse);
+            }
+            Window::FillRectangle {
+                character,
+                top,
+                left,
+                bottom,
+                right,
+            } => {
+                let area = self.screen_rectangle(top, left, bottom, right);
+                let cell = self.rectangle_fill_cell(character);
+                self.paint_rectangle(area, &cell);
+            }
             Window::ChecksumRectangularArea {
                 request_id,
                 top,
@@ -2698,6 +2752,17 @@ impl TerminalState {
         }
     }
 
+    fn erase_line_columns(&self, erase: EraseInLine) -> Range<usize> {
+        let col = self.cursor.x;
+        let width = self.screen().logical_cols(self.cursor.y);
+        match erase {
+            // In pending-wrap state the cursor is effectively past the last column.
+            EraseInLine::EraseToEndOfLine => col + usize::from(self.wrap_next)..width,
+            EraseInLine::EraseToStartOfLine => 0..col + 1,
+            EraseInLine::EraseLine => 0..width,
+        }
+    }
+
     fn erase_line_text(
         &mut self,
         y: VisibleRowIndex,
@@ -2756,6 +2821,8 @@ impl TerminalState {
     fn perform_csi_edit(&mut self, edit: Edit) {
         let seqno = self.seqno;
         match edit {
+            Edit::InsertColumns(n) => self.edit_columns(n, column_edit::Shift::Right),
+            Edit::DeleteColumns(n) => self.edit_columns(n, column_edit::Shift::Left),
             Edit::DeleteCharacter(n) => {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
@@ -2815,23 +2882,15 @@ impl TerminalState {
             }
 
             Edit::EraseInLine(erase) => {
-                let cx = self.cursor.x;
-                let cy = self.cursor.y;
                 let pen = self.pen.clone_sgr_only();
-                let cols = self.screen().logical_cols(cy);
-                let range = match erase {
-                    // If wrap_next is true, then cx is effectively 1 column to the right.
-                    // It feels wrong to handle this here, but in trying to centralize
-                    // the logic for updating the cursor position, it causes regressions
-                    // in the test suite.
-                    // So this is here for now until a better solution is found.
-                    // <https://github.com/wezterm/wezterm/issues/3548>
-                    EraseInLine::EraseToEndOfLine => cx + if self.wrap_next { 1 } else { 0 }..cols,
-                    EraseInLine::EraseToStartOfLine => 0..cx + 1,
-                    EraseInLine::EraseLine => 0..cols,
-                };
-
-                self.erase_line_text(cy, range, &pen, true);
+                self.erase_line_text(self.cursor.y, self.erase_line_columns(erase), &pen, true);
+            }
+            Edit::SelectiveEraseInLine(erase) => {
+                self.selectively_erase_line(self.cursor.y, self.erase_line_columns(erase));
+            }
+            Edit::SelectiveEraseInDisplay(erase) => self.selectively_erase_display(erase),
+            Edit::CharacterProtection(protected) => {
+                self.pen.set_protected(protected);
             }
             Edit::InsertCharacter(n) => {
                 // https://vt100.net/docs/vt510-rm/ICH.html
@@ -3289,9 +3348,11 @@ impl TerminalState {
             Sgr::Reset => {
                 let link = self.pen.hyperlink().map(Arc::clone);
                 let semantic_type = self.pen.semantic_type();
+                let protected = self.pen.protected();
                 self.pen = CellAttributes::default();
                 self.pen.set_hyperlink(link);
                 self.pen.set_semantic_type(semantic_type);
+                self.pen.set_protected(protected);
             }
             Sgr::Intensity(intensity) => {
                 self.pen.set_intensity(intensity);

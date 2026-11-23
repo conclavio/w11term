@@ -17,6 +17,7 @@ pub mod pane_layout;
 pub mod profiles;
 pub mod prompts;
 pub mod recorder;
+pub mod saved_commands;
 pub mod search;
 pub mod session;
 pub mod sftp;

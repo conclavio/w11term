@@ -1,4 +1,5 @@
 use crate::terminal::{Alert, Progress};
+use crate::terminalstate::column_edit::Index;
 use crate::terminalstate::palette::Slot;
 use crate::terminalstate::rendition::Rendition;
 use crate::terminalstate::{
@@ -64,9 +65,11 @@ impl<'a> Performer<'a> {
             print: String::new(),
         }
     }
+}
 
+impl TerminalState {
     /// Apply character set related remapping to the input glyph if required
-    fn remap_grapheme<'b>(&self, g: &'b str) -> &'b str {
+    pub(super) fn remap_grapheme<'b>(&self, g: &'b str) -> &'b str {
         if (self.shift_out && self.g1_charset == CharSet::DecLineDrawing)
             || (!self.shift_out && self.g0_charset == CharSet::DecLineDrawing)
         {
@@ -115,7 +118,9 @@ impl<'a> Performer<'a> {
             g
         }
     }
+}
 
+impl Performer<'_> {
     fn flush_print(&mut self) {
         if self.print.is_empty() {
             return;
@@ -350,6 +355,16 @@ impl<'a> Performer<'a> {
                                     SteadyBar => 6,
                                 };
                                 write!(self.writer, "{DCS}1$r{style} q{ST}").ok();
+                                self.writer.flush().ok();
+                            }
+                            b"\"q" => {
+                                let protected = u8::from(self.pen.protected());
+                                write!(self.writer, "{DCS}1$r{protected}\"q{ST}").ok();
+                                self.writer.flush().ok();
+                            }
+                            b"*x" => {
+                                let extent = self.attribute_extent;
+                                write!(self.writer, "{DCS}1$r{extent}*x{ST}").ok();
                                 self.writer.flush().ok();
                             }
                             &[b'"', b'p'] => {
@@ -676,6 +691,8 @@ impl<'a> Performer<'a> {
             }
             Esc::Code(EscCode::ReverseIndex) => self.c1_reverse_index(),
             Esc::Code(EscCode::Index) => self.c1_index(),
+            Esc::Code(EscCode::DecBackIndex) => self.horizontal_index(Index::Back),
+            Esc::Code(EscCode::DecForwardIndex) => self.horizontal_index(Index::Forward),
             Esc::Code(EscCode::NextLine) => self.c1_nel(),
             Esc::Code(EscCode::HorizontalTabSet) => self.c1_hts(),
             Esc::Code(EscCode::DecLineDrawingG0) => {
@@ -813,6 +830,7 @@ impl<'a> Performer<'a> {
                 self.accumulating_title.take();
                 self.saved_titles = Default::default();
                 self.saved_private_modes = Default::default();
+                self.attribute_extent = 0;
                 self.title.from_application = false;
                 self.end_synchronized_output();
                 self.progress = Progress::default();

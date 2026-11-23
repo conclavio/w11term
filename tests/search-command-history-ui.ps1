@@ -121,8 +121,23 @@ try {
         (Find-Element "Selected, $unknown" $button) -and (Find-Element $recent $button) -and
             (Find-Element $old $button) -and (Find-Element $retry $button)
     }
+    $saveAs = 'Save as command' + [char]0x2026
+    Click $saveAs
+    $name = Wait-Until 'saved command name editor' { Find-Element 'Saved command name' $edit }
+    $name.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Audit deployment')
+    Click 'Cancel saving command'
+    $null = Wait-Until 'history save editor closes' { !(Find-Element 'Saved command name' $edit) }
+    Click $saveAs
+    $name = Wait-Until 'new command name editor' { Find-Element 'Saved command name' $edit }
+    $value = $name.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    if ($value.Current.Value) { throw 'Canceled name carried into a new save' }
+    $value.SetValue('Audit deployment')
+    Click 'Save to commands'
+    $null = Wait-Until 'history reports the saved command' { Find-Element 'Saved command' }
+
     Click 'Return to pane'
     Wait-Focus $remote
+    Run-Palette ('Insert command' + $dot + 'Audit deployment')
     foreach ($char in 'history-resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$char) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','history-resumed')
 } finally {
