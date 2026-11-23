@@ -57,6 +57,10 @@ enum TargetState {
 }
 
 impl TargetState {
+    fn is_ready(self) -> bool {
+        matches!(self, Self::Ready(_) | Self::Matched(_))
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Offline => "Disconnected",
@@ -67,6 +71,23 @@ impl TargetState {
             Self::InUse => "Waiting for a fresh prompt",
             Self::Ready(_) => "Ready",
             Self::Matched(_) => "Ready · prompt match",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ShownSelection {
+    All,
+    None,
+    Ready,
+}
+
+impl ShownSelection {
+    fn includes(self, state: TargetState) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::Ready => state.is_ready(),
         }
     }
 }
@@ -254,7 +275,7 @@ pub enum Action {
     Edit(TabId, String),
     Filter(TabId, String),
     Select(TabId, u64, bool),
-    SelectShown(TabId, Vec<u64>, bool),
+    SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
     FilterResults(TabId, u64, progress::Filter),
@@ -559,16 +580,20 @@ impl TerminalApp {
                     }
                 }
             }
-            Action::SelectShown(id, shown, selected) => {
+            Action::SelectShown(id, shown, selection) => {
                 let roster = self.host_group_targets();
-                if let Some(page) = self.host_group_mut(id) {
-                    let visible: BTreeSet<_> =
-                        page.shown(&roster).map(|target| target.pane).collect();
-                    for pane in shown.into_iter().filter(|pane| visible.contains(pane)) {
-                        if selected {
-                            page.selected.insert(pane);
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
+                {
+                    let visible: Vec<_> = page.shown(&roster).collect();
+                    for target in visible
+                        .into_iter()
+                        .filter(|target| shown.contains(&target.pane))
+                    {
+                        if selection.includes(target.state) {
+                            page.selected.insert(target.pane);
                         } else {
-                            page.selected.remove(&pane);
+                            page.selected.remove(&target.pane);
                         }
                     }
                 }
@@ -711,14 +736,8 @@ impl TerminalApp {
             .collect::<Vec<_>>();
         let text: Arc<str> = page.draft.as_str().into();
         let valid_text = w11term::saved_commands::valid_command_text(&text);
-        let enabled = valid_text
-            && !page.sending()
-            && selected.iter().any(|target| {
-                matches!(
-                    target.state,
-                    TargetState::Ready(_) | TargetState::Matched(_)
-                )
-            });
+        let enabled =
+            valid_text && !page.sending() && selected.iter().any(|target| target.state.is_ready());
         let send_label = format!(
             "Send to {} {}",
             selected.len(),
@@ -779,13 +798,15 @@ impl TerminalApp {
                 page.selected.contains(&target.pane) && !selected_shown.contains(&target.pane)
             })
             .count();
-        let shown_ids: Vec<_> = shown.iter().map(|target| target.pane).collect();
-        let bulk = |label, select, enabled| {
+        let shown_ids: BTreeSet<_> = shown.iter().map(|target| target.pane).collect();
+        let bulk = |label, selection: ShownSelection| {
             let panes = shown_ids.clone();
             Button::new()
-                .is_enabled(enabled)
+                .is_enabled(shown.iter().any(|target| {
+                    page.selected.contains(&target.pane) != selection.includes(target.state)
+                }))
                 .on_click(ctx.callback(move |_| {
-                    Message::HostGroup(Action::SelectShown(id, panes.clone(), select))
+                    Message::HostGroup(Action::SelectShown(id, panes.clone(), selection))
                 }))
                 .content(label)
         };
@@ -801,8 +822,9 @@ impl TerminalApp {
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)
                 .children((
-                    bulk("Select shown", true, selected.len() < shown.len()),
-                    bulk("Deselect shown", false, !selected.is_empty()),
+                    bulk("Select shown", ShownSelection::All),
+                    bulk("Deselect shown", ShownSelection::None),
+                    bulk("Select only ready shown", ShownSelection::Ready),
                     Button::new()
                         .is_enabled(!selected_shown.is_empty())
                         .on_click(ctx.callback(move |_| {
@@ -815,9 +837,17 @@ impl TerminalApp {
                 )),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
-            "Enter one command line of up to 4096 bytes."
+            "Enter one command line of up to 4096 bytes.".into()
+        } else if selected.is_empty() {
+            "Select panes with a fresh shell marker or a configured prompt match.".into()
         } else {
-            "Select panes with a fresh shell marker or a configured prompt match."
+            let ready = selected
+                .iter()
+                .filter(|target| target.state.is_ready())
+                .count();
+            let count = selected.len();
+            let hosts = if count == 1 { "host" } else { "hosts" };
+            format!("{ready} of {count} selected {hosts} ready")
         };
         let entry = TextBox::new()
             .element_ref(&page.command_editor)
