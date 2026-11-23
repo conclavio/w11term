@@ -1226,6 +1226,9 @@ pub enum Cursor {
     /// depends on the setting of the TABULATION STOP MODE (TSM).
     TabulationControl(CursorTabulationControl),
 
+    /// DECST8C – replace horizontal tab stops with the eight-column pattern.
+    ResetTabStops,
+
     /// CUB - Cursor Left
     /// Moves cursor to the left Ps columns. The default value of Ps is 1.
     Left(u32),
@@ -1469,6 +1472,7 @@ impl Display for Cursor {
             Cursor::Position { line, col } => write!(f, "{};{}H", line, col)?,
             Cursor::LineTabulation(n) => n.write_csi(f, "Y")?,
             Cursor::TabulationControl(n) => n.write_csi(f, "W")?,
+            Cursor::ResetTabStops => f.write_str("?5W")?,
             Cursor::TabulationClear(n) => n.write_csi(f, "g")?,
             Cursor::RequestTabStops => write!(f, "2$w")?,
             Cursor::CharacterPositionAbsolute(n) => n.write_csi(f, "`")?,
@@ -2135,6 +2139,9 @@ impl<'a> CSIParser<'a> {
                     destination_page: OneBased::from_optional_esc_param(area.get(7))?,
                 })))
             }
+            ('W', [CsiParam::P(b'?'), CsiParam::Integer(5)]) if !self.parameters_truncated => {
+                Ok(CSI::Cursor(Cursor::ResetTabStops))
+            }
             ('w', [CsiParam::Integer(2), CsiParam::P(b'$')]) if !self.parameters_truncated => {
                 Ok(CSI::Cursor(Cursor::RequestTabStops))
             }
@@ -2272,7 +2279,7 @@ impl<'a> CSIParser<'a> {
                 'R' => parse!(Cursor, ActivePositionReport, line, col, params),
                 'S' => parse!(Edit, ScrollUp, params),
                 'T' => parse!(Edit, ScrollDown, params),
-                'W' => parse!(Cursor, TabulationControl, params),
+                'W' => self.tabulation_control(params),
                 'X' => parse!(Edit, EraseCharacter, params),
                 'Y' => parse!(Cursor, LineTabulation, params),
                 'Z' => parse!(Cursor, BackwardTabulation, params),
@@ -2332,6 +2339,24 @@ impl<'a> CSIParser<'a> {
         } else {
             params
         }
+    }
+
+    fn tabulation_control(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
+        let separator = |param: &CsiParam| *param == CsiParam::P(b';');
+        if self.parameters_truncated
+            || (params == self.orig_params
+                && params
+                    .split(separator)
+                    .any(|field| CursorTabulationControl::parse_params(field).is_err()))
+        {
+            return Err(());
+        }
+
+        let first_end = params.iter().position(separator).unwrap_or(params.len());
+        let control = CursorTabulationControl::parse_params(&params[..first_end])?;
+        // An omitted parameter, including after a trailing separator, means set.
+        self.params = params.get(first_end + 1..);
+        Ok(CSI::Cursor(Cursor::TabulationControl(control)))
     }
 
     fn select_character_path(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {

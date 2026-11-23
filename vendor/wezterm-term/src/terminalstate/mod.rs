@@ -20,9 +20,10 @@ use wezterm_bidi::ParagraphDirectionHint;
 use wezterm_cell::image::ImageData;
 use wezterm_cell::UnicodeVersion;
 use wezterm_escape_parser::csi::{
-    Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
-    EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
-    XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
+    Cursor, CursorStyle, CursorTabulationControl, DecPrivateMode, DecPrivateModeCode, Device, Edit,
+    EraseInDisplay, EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode,
+    Window, XtSmGraphics, XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus,
+    XtermKeyModifierResource,
 };
 use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
@@ -132,22 +133,43 @@ impl TabStop {
         self.tabs = tabs;
     }
 
-    fn find_prev_tab_stop(&self, col: usize) -> Option<usize> {
-        for i in (0..col.min(self.tabs.len())).rev() {
-            if self.tabs[i] {
-                return Some(i);
-            }
+    fn clear_tab_stop(&mut self, col: usize) {
+        if let Some(stop) = self.tabs.get_mut(col) {
+            *stop = false;
         }
-        None
     }
 
-    fn find_next_tab_stop(&self, col: usize) -> Option<usize> {
-        for i in col + 1..self.tabs.len() {
-            if self.tabs[i] {
-                return Some(i);
-            }
+    fn clear_all_tab_stops(&mut self) {
+        self.tabs.fill(false);
+    }
+
+    fn reset_tab_stops(&mut self) {
+        for (index, stop) in self.tabs.iter_mut().enumerate() {
+            *stop = index != 0 && index % self.tab_width == 0;
         }
-        None
+    }
+
+    fn backward(&self, column: usize, left: usize, skip: usize) -> usize {
+        self.tabs
+            .iter()
+            .take(column)
+            .enumerate()
+            .skip(left)
+            .rev()
+            .filter_map(|(index, &stop)| stop.then_some(index))
+            .nth(skip)
+            .unwrap_or(left)
+    }
+
+    fn forward(&self, column: usize, right: usize, skip: usize) -> usize {
+        self.tabs
+            .iter()
+            .take(right + 1)
+            .enumerate()
+            .skip(column + 1)
+            .filter_map(|(index, &stop)| stop.then_some(index))
+            .nth(skip)
+            .unwrap_or(right)
     }
 
     /// Respond to the terminal resizing.
@@ -164,18 +186,10 @@ impl TabStop {
 
     fn clear(&mut self, to_clear: TabulationClear, col: usize, log_unknown_escape_sequences: bool) {
         match to_clear {
-            TabulationClear::ClearCharacterTabStopAtActivePosition => {
-                if let Some(t) = self.tabs.get_mut(col) {
-                    *t = false;
-                }
-            }
-            // If we want to exactly match VT100/xterm behavior, then
-            // we cannot honor ClearCharacterTabStopsAtActiveLine.
-            TabulationClear::ClearAllCharacterTabStops => {
-                // | TabulationClear::ClearCharacterTabStopsAtActiveLine
-                for t in &mut self.tabs {
-                    *t = false;
-                }
+            TabulationClear::ClearCharacterTabStopAtActivePosition => self.clear_tab_stop(col),
+            // Preserve VT100 behavior for TBC 2. Stops are shared across the screen.
+            TabulationClear::ClearAllCharacterTabStops | TabulationClear::ClearAllTabStops => {
+                self.clear_all_tab_stops();
             }
             _ => {
                 if log_unknown_escape_sequences {
@@ -1717,17 +1731,17 @@ impl TerminalState {
     /// the cursor moves to the right margin. HT does not cause text to auto
     /// wrap.
     fn c0_horizontal_tab(&mut self) {
-        let seqno = self.seqno;
-        let x = match self.tabs.find_next_tab_stop(self.cursor.x) {
-            Some(x) => x,
-            None => self.left_and_right_margins.end - 1,
-        };
+        self.horizontal_tabs_forward(0);
+    }
+
+    fn horizontal_tabs_forward(&mut self, skip: usize) {
         let right = self
             .left_and_right_margins
             .end
-            .min(self.screen().logical_cols(self.cursor.y));
-        self.cursor.x = x.min(right - 1);
-        self.cursor.seqno = seqno;
+            .min(self.screen().logical_cols(self.cursor.y))
+            - 1;
+        self.cursor.x = self.tabs.forward(self.cursor.x, right, skip);
+        self.cursor.seqno = self.seqno;
     }
 
     /// Move the cursor up 1 line.  If the position is at the top scroll margin,
@@ -3125,17 +3139,19 @@ impl TerminalState {
             }
 
             Cursor::ForwardTabulation(n) => {
-                for _ in 0..n {
-                    self.c0_horizontal_tab();
+                if let Some(skip) = n.checked_sub(1) {
+                    self.horizontal_tabs_forward(skip as usize);
                 }
             }
             Cursor::BackwardTabulation(n) => {
-                for _ in 0..n {
-                    let x = match self.tabs.find_prev_tab_stop(self.cursor.x) {
-                        Some(x) => x,
-                        None => 0,
+                if let Some(skip) = n.checked_sub(1) {
+                    let left = if self.dec_origin_mode {
+                        self.left_and_right_margins.start
+                    } else {
+                        0
                     };
-                    self.set_cursor_pos(&Position::Absolute(x as i64), &Position::Relative(0));
+                    let column = self.tabs.backward(self.cursor.x, left, skip as usize);
+                    self.set_cursor_position_absolute(column, self.cursor.y);
                 }
             }
 
@@ -3158,7 +3174,19 @@ impl TerminalState {
                 self.writer.write_all(reply.as_bytes()).ok();
                 self.writer.flush().ok();
             }
-            Cursor::TabulationControl(_) => {}
+            Cursor::ResetTabStops => self.tabs.reset_tab_stops(),
+            Cursor::TabulationControl(control) => match control {
+                CursorTabulationControl::SetCharacterTabStopAtActivePosition => self.c1_hts(),
+                CursorTabulationControl::ClearCharacterTabStopAtActivePosition => {
+                    self.tabs.clear_tab_stop(self.cursor.x);
+                }
+                CursorTabulationControl::ClearAllCharacterTabStopsAtActiveLine
+                | CursorTabulationControl::ClearAllCharacterTabStops => {
+                    // Character stops are shared across the screen.
+                    self.tabs.clear_all_tab_stops();
+                }
+                _ => {}
+            },
             Cursor::LineTabulation(_) => {}
 
             Cursor::Left(_n) => {
