@@ -1,16 +1,24 @@
 use super::*;
-use std::collections::BTreeSet;
-use tokio::sync::oneshot::{self, error::TryRecvError};
-use w11term::events::{PromptToken, ShellPrompt};
+use std::{borrow::Cow, collections::BTreeSet};
+use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
+use w11term::events::{CommandLink, GroupExecution, GroupOutput, PromptToken, ShellPrompt};
 
 pub(super) const LABEL: &str = "SSH host group";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBMISSION_LIMIT: usize = 8;
 
 #[derive(Default)]
 pub(super) struct HostGroup {
     selected: BTreeSet<u64>,
     draft: String,
-    submitted: Option<Arc<str>>,
+    submissions: VecDeque<Submission>,
+    viewing: u64,
+    next_submission: u64,
+}
+
+struct Submission {
+    id: u64,
+    text: Arc<str>,
     results: Vec<Delivery>,
 }
 
@@ -50,6 +58,7 @@ impl TargetState {
 struct Delivery {
     target: Target,
     status: DeliveryStatus,
+    execution: Option<watch::Receiver<GroupExecution>>,
 }
 
 enum DeliveryStatus {
@@ -70,6 +79,9 @@ impl Delivery {
             Err(TryRecvError::Empty) if started.elapsed() < ACK_TIMEOUT => return,
             Err(_) => DeliveryStatus::Unconfirmed,
         };
+        if !matches!(self.status, DeliveryStatus::Sent) {
+            self.execution = None;
+        }
     }
 
     fn description(&self) -> String {
@@ -85,9 +97,25 @@ impl Delivery {
 
 impl HostGroup {
     fn sending(&self) -> bool {
-        self.results
-            .iter()
-            .any(|item| matches!(item.status, DeliveryStatus::Pending(..)))
+        self.submissions.back().is_some_and(|submission| {
+            submission
+                .results
+                .iter()
+                .any(|item| matches!(item.status, DeliveryStatus::Pending(..)))
+        })
+    }
+
+    fn submit(&mut self, text: Arc<str>, results: Vec<Delivery>) {
+        self.next_submission += 1;
+        self.viewing = self.next_submission;
+        self.submissions.push_back(Submission {
+            id: self.viewing,
+            text,
+            results,
+        });
+        if self.submissions.len() > SUBMISSION_LIMIT {
+            self.submissions.pop_front();
+        }
     }
 }
 
@@ -97,6 +125,8 @@ pub enum Action {
     Edit(TabId, String),
     Select(TabId, u64, bool),
     Visit(TabId, u64),
+    ViewSubmission(TabId, u64),
+    ViewOutput(TabId, u64, CommandLink),
     Send(TabId, Arc<str>, Vec<Target>),
 }
 
@@ -190,6 +220,7 @@ impl TerminalApp {
     }
 
     fn dispatch_to_host(&self, target: Target, text: Arc<str>) -> Delivery {
+        let mut execution = None;
         let status = match target.state {
             TargetState::Ready(prompt) => {
                 match self
@@ -201,6 +232,7 @@ impl TerminalApp {
                         ..
                     }) if live.session.is_direct_ssh_shell() => {
                         let (reply, received) = oneshot::channel();
+                        let (observe, observed) = watch::channel(GroupExecution::AwaitingMarkers);
                         if live
                             .session
                             .input
@@ -208,9 +240,11 @@ impl TerminalApp {
                                 prompt,
                                 text,
                                 reply,
+                                execution: observe,
                             })
                             .is_ok()
                         {
+                            execution = Some(observed);
                             DeliveryStatus::Pending(Instant::now(), received)
                         } else {
                             DeliveryStatus::Rejected("The pane closed.".into())
@@ -221,7 +255,11 @@ impl TerminalApp {
             }
             state => DeliveryStatus::Rejected(state.label().into()),
         };
-        Delivery { target, status }
+        Delivery {
+            target,
+            status,
+            execution,
+        }
     }
 
     pub(super) fn handle_host_group(&mut self, action: Action, ctx: &ComponentContext<Self>) {
@@ -264,8 +302,10 @@ impl TerminalApp {
                     .collect();
                 if let Some(page) = self.host_group_mut(id) {
                     page.selected.retain(|pane| panes.contains(pane));
-                    for delivery in &mut page.results {
-                        delivery.poll();
+                    for submission in &mut page.submissions {
+                        for delivery in &mut submission.results {
+                            delivery.poll();
+                        }
                     }
                 }
                 self.update_host_group_timer(ctx);
@@ -293,6 +333,18 @@ impl TerminalApp {
                     self.activate(ctx);
                 }
             }
+            Action::ViewSubmission(id, submission) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && page.submissions.iter().any(|item| item.id == submission)
+                {
+                    page.viewing = submission;
+                }
+            }
+            Action::ViewOutput(id, pane, link) => {
+                if self.host_group_mut(id).is_some() {
+                    self.open_command_history(pane, Some(link), ctx);
+                }
+            }
             Action::Send(id, text, targets) => {
                 let Some(page) = self.host_group_mut(id) else {
                     return;
@@ -310,8 +362,7 @@ impl TerminalApp {
                     .map(|target| self.dispatch_to_host(target, text.clone()))
                     .collect();
                 if let Some(page) = self.host_group_mut(id) {
-                    page.submitted = Some(text);
-                    page.results = results;
+                    page.submit(text, results);
                 }
             }
         }
@@ -384,23 +435,7 @@ impl TerminalApp {
                 TextBlock::new().text("Open a direct SSH shell to add it to this roster."),
             ));
         }
-        if let Some(submitted) = &page.submitted {
-            details.push(KeyedView::new(
-                "results",
-                TextBlock::new()
-                    .font_size(18.0)
-                    .text(format!("Submitted · {submitted}"))
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-            ));
-            details.extend(page.results.iter().map(|delivery| {
-                KeyedView::new(
-                    format!("delivery-{}", delivery.target.pane),
-                    TextBlock::new()
-                        .text(delivery.description())
-                        .text_wrapping(TextWrapping::Wrap),
-                )
-            }));
-        }
+        self.host_group_results(id, page, ctx, &mut details);
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes."
         } else {
@@ -434,5 +469,166 @@ impl TerminalApp {
                     .grid_row(2)
                     .content(StackPanel::new().spacing(10.0).keyed_children(details)),
             ))
+    }
+
+    fn host_group_results(
+        &self,
+        id: TabId,
+        page: &HostGroup,
+        ctx: &ViewContext<Self>,
+        details: &mut Vec<KeyedView>,
+    ) {
+        let Some(index) = page
+            .submissions
+            .iter()
+            .position(|item| item.id == page.viewing)
+        else {
+            return;
+        };
+        let submission = &page.submissions[index];
+        let navigate = |label, destination: Option<&Submission>| {
+            let destination = destination.map(|item| item.id);
+            Button::new()
+                .is_enabled(destination.is_some())
+                .on_click(ctx.callback(move |_| {
+                    destination.map_or(Message::ControlIdle, |next| {
+                        Message::HostGroup(Action::ViewSubmission(id, next))
+                    })
+                }))
+                .content(label)
+        };
+        details.push(KeyedView::new(
+            "results",
+            StackPanel::new().spacing(4.0).children((
+                TextBlock::new()
+                    .font_size(18.0)
+                    .text(format!("Submitted · {}", submission.text))
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        navigate(
+                            "Previous submission",
+                            index.checked_sub(1).and_then(|i| page.submissions.get(i)),
+                        ),
+                        navigate("Next submission", page.submissions.get(index + 1)),
+                        TextBlock::new().text(format!(
+                            "{} of {}",
+                            index + 1,
+                            page.submissions.len()
+                        )),
+                    )),
+            )),
+        ));
+        details.extend(submission.results.iter().map(|delivery| {
+            KeyedView::new(
+                format!("delivery-{}-{}", submission.id, delivery.target.pane),
+                self.host_group_result_row(id, delivery, ctx),
+            )
+        }));
+    }
+
+    fn host_group_result_row(
+        &self,
+        id: TabId,
+        delivery: &Delivery,
+        ctx: &ViewContext<Self>,
+    ) -> View {
+        let pane = delivery.target.pane;
+        let mut rows = vec![KeyedView::new(
+            "delivery",
+            TextBlock::new()
+                .text(delivery.description())
+                .text_wrapping(TextWrapping::Wrap),
+        )];
+        if matches!(delivery.status, DeliveryStatus::Sent)
+            && let Some(execution) = &delivery.execution
+        {
+            let result = execution.borrow().clone();
+            let name = &delivery.target.name;
+            let caption = match &result {
+                GroupExecution::AwaitingMarkers => "Waiting for shell markers".into(),
+                GroupExecution::Running => "Running".into(),
+                GroupExecution::Unavailable(reason) => format!("Result unavailable · {reason}"),
+                GroupExecution::Finished(result) => result.exit_code.map_or_else(
+                    || "Completed · exit status unavailable".into(),
+                    |code| format!("Exit {code}"),
+                ),
+            };
+            rows.push(KeyedView::new(
+                "execution",
+                TextBlock::new()
+                    .automation_name(format!("{name} · {caption}"))
+                    .text(caption)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+            if let GroupExecution::Finished(result) = result {
+                let link = result.link;
+                let (preview, truncated) = match &result.output {
+                    GroupOutput::Captured { text, .. } if text.is_empty() => {
+                        ("No output captured".into(), false)
+                    }
+                    GroupOutput::Captured { text, truncated } => {
+                        (Cow::Borrowed(text.as_str()), *truncated)
+                    }
+                    GroupOutput::Unavailable(reason) => {
+                        (Cow::Owned(format!("Output unavailable · {reason}")), false)
+                    }
+                };
+                rows.push(KeyedView::new(
+                    "output",
+                    TextBlock::new()
+                        .text(preview.trim_end_matches(['\r', '\n']))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+                if truncated {
+                    rows.push(KeyedView::new(
+                        "truncated",
+                        TextBlock::new().text("Output preview truncated"),
+                    ));
+                }
+                if self
+                    .history_frame(pane)
+                    .is_some_and(|frame| frame.has_command(link))
+                {
+                    rows.push(KeyedView::new(
+                        "view-output",
+                        Button::new()
+                            .automation_name(format!("View output for pane {pane}"))
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::ViewOutput(id, pane, link))
+                            }))
+                            .content("View full output"),
+                    ));
+                }
+            }
+        }
+        if self.tab_for_pane(pane).is_some() {
+            rows.push(KeyedView::new(
+                "focus",
+                Button::new()
+                    .automation_name(format!("Focus result pane {pane}"))
+                    .on_click(ctx.callback(move |_| Message::HostGroup(Action::Visit(id, pane))))
+                    .content("Focus pane"),
+            ));
+        }
+        StackPanel::new().spacing(4.0).keyed_children(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submission_history_retains_the_latest_eight_and_selects_the_newest() {
+        let mut group = HostGroup::default();
+        for id in 1..=10 {
+            group.submit(format!("command {id}").into(), Vec::new());
+        }
+        assert_eq!(group.submissions.len(), SUBMISSION_LIMIT);
+        assert_eq!(group.submissions.front().unwrap().id, 3);
+        assert_eq!(group.submissions.back().unwrap().id, group.viewing);
     }
 }

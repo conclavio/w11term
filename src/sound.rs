@@ -20,13 +20,18 @@ impl wezterm_term::AlertHandler for Alerts {
     fn semantic_prompt(
         &mut self,
         marker: &wezterm_term::FinalTermSemanticPrompt,
-        completed: Option<u64>,
+        started: Option<(u64, Option<&str>)>,
+        completed: Option<wezterm_term::ShellCommandCompletion<'_>>,
     ) {
-        self.events.semantic_prompt(marker, completed);
+        self.events.semantic_prompt(marker, started, completed);
     }
 
     fn terminal_reset(&mut self) {
         self.events.reset_command_watch();
+    }
+
+    fn shell_command_line(&mut self, id: u64, label: Option<&str>) {
+        self.events.group_command_line(id, label);
     }
 
     fn alert(&mut self, alert: wezterm_term::Alert) {

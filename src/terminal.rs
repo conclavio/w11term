@@ -1167,6 +1167,80 @@ mod tests {
     }
 
     #[test]
+    fn group_result_follows_exact_shell_markers_and_keeps_its_exit_status() {
+        use crate::events::{GroupExecution, GroupOutput};
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(1));
+        term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+        events.observe_group_command(1, "echo east".into(), notice);
+        term.advance_bytes(b"echo east\r\n\x1b]133;C\x07");
+        assert!(matches!(*outcome.borrow(), GroupExecution::Running));
+        term.advance_bytes(b"east result\r\n\x1b]133;D;17\x07");
+        let GroupExecution::Finished(result) = outcome.borrow().clone() else {
+            panic!("the matching completion must be captured");
+        };
+        assert_eq!(result.link.generation, 1);
+        assert_eq!(result.exit_code, Some(17));
+        assert_eq!(term.last_command().unwrap().id, result.link.id);
+        assert!(
+            matches!(&result.output, GroupOutput::Captured { text, truncated: false }
+            if text == "east result\r\n")
+        );
+
+        term.advance_bytes(b"\x1b]633;A\x07$ \x1b]633;B\x07");
+        let (notice, late) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+        events.observe_group_command(1, "echo west".into(), notice);
+        term.advance_bytes(b"\r\n\x1b]633;C\x07west result\r\n");
+        assert!(matches!(*late.borrow(), GroupExecution::AwaitingMarkers));
+        term.advance_bytes(b"\x1b]633;E;echo west\x07");
+        assert!(matches!(*late.borrow(), GroupExecution::Running));
+        term.advance_bytes(b"\x1b]633;D;0\x07");
+        assert!(matches!(&*late.borrow(), GroupExecution::Finished(result)
+            if result.exit_code == Some(0) && result.link.id != term.command_history()[0].id));
+
+        term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let (notice, prompt_only) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+        events.observe_group_command(1, "next".into(), notice);
+        term.advance_bytes(b"next\r\n\x1b]133;C\x07output\r\n\x1b]133;A\x07");
+        assert!(
+            matches!(&*prompt_only.borrow(), GroupExecution::Finished(result)
+            if result.exit_code.is_none())
+        );
+    }
+
+    #[test]
+    fn group_result_rejects_another_command_overlapping_markers_and_reconnect() {
+        use crate::events::GroupExecution;
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(1));
+        for tail in [
+            b"echo other\r\n\x1b]133;C\x07unrelated\r\n\x1b]133;D;0\x07".as_slice(),
+            b"run\r\n\x1b]133;C\x07\x1b]133;C\x07nested\r\n\x1b]133;D;0\x07",
+            b"run\r\n\x1b]133;C;aid=parent\x07partial\r\n\x1b]133;D;0;aid=other\x07",
+        ] {
+            term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+            events.observe_group_command(1, "run".into(), notice);
+            term.advance_bytes(tail);
+            assert!(matches!(*outcome.borrow(), GroupExecution::Unavailable(_)));
+        }
+        term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+        events.observe_group_command(1, "run".into(), notice);
+        term.advance_bytes(b"run\r\n\x1b]133;C\x07");
+        assert!(matches!(*outcome.borrow(), GroupExecution::Running));
+        events.command_stream(None);
+        events.command_stream(Some(2));
+        term.advance_bytes(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07new\r\n\x1b]133;D;0\x07",
+        );
+        assert!(
+            matches!(*outcome.borrow(), GroupExecution::Unavailable(reason) if reason.starts_with("The connection closed"))
+        );
+    }
+
+    #[test]
     fn command_watch_fires_once_for_the_first_paired_primary_command_in_a_batch() {
         let (mut term, events) = watched_terminal();
         events.command_stream(Some(1));

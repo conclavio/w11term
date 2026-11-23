@@ -863,9 +863,8 @@ impl Performer<'_> {
 
     fn semantic_prompt(&mut self, marker: FinalTermSemanticPrompt, fresh_line: bool) {
         let primary = !self.is_alt_screen_active();
-        let pending =
-            (primary && !self.capturing_shell_input && self.screen.command_start.is_some())
-                .then_some(self.next_command_id);
+        let previous_command_id = self.next_command_id;
+        let had_output_start = !self.capturing_shell_input && self.screen.command_start.is_some();
         match &marker {
             FinalTermSemanticPrompt::FreshLine => self.fresh_line(),
             FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. } => {
@@ -901,10 +900,23 @@ impl Performer<'_> {
                 self.finish_command_output(*status)
             }
         }
-        let completed = pending.filter(|&id| id != self.next_command_id);
+        let state = &mut *self.state;
         if primary {
-            if let Some(handler) = self.alert_handler.as_mut() {
-                handler.semantic_prompt(&marker, completed);
+            let history = &state.command_history;
+            if let Some(handler) = state.alert_handler.as_mut() {
+                let completed = history
+                    .back()
+                    .filter(|command| command.id == previous_command_id)
+                    .map(|command| crate::ShellCommandCompletion {
+                        command,
+                        had_output_start,
+                    });
+                let started = matches!(
+                    marker,
+                    FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { .. }
+                )
+                .then_some((state.next_command_id, state.command_label.as_deref()));
+                handler.semantic_prompt(&marker, started, completed);
             }
         }
     }
@@ -973,6 +985,13 @@ impl Performer<'_> {
                         self.vscode_command = VscodeCommand::Idle;
                     } else {
                         self.command_label = Some(command);
+                    }
+                    let state = &mut *self.state;
+                    if let Some(handler) = state.alert_handler.as_mut() {
+                        handler.shell_command_line(
+                            state.next_command_id,
+                            state.command_label.as_deref(),
+                        );
                     }
                 } else {
                     self.vscode_command = VscodeCommand::Pending(Some(command));
