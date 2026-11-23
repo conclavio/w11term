@@ -533,6 +533,17 @@ async fn roundtrip(
         assert_eq!(restored.first_stable_row, history.first_stable_row);
         assert!(restored.rows[0].as_str().starts_with("NEW"));
         assert!(restored.rows[1].as_str().starts_with("AFTER"));
+        let vscode = echoed(
+            &session,
+            &mut output,
+            b"\r\n\x1b]633;A\x07\x1b]633;P;Cwd=/tmp/work\\x20tree\x07$ \x1b]633;B\x07shown\r\n\
+              \x1b]633;E;git\\x20status;fixture-nonce\x07\x1b]633;C\x07vscode-output\x1b]633;D;17\x07",
+        ).await;
+        assert_eq!(vscode.reported_directory.as_deref(), Some("file://127.0.0.1/tmp/work%20tree"));
+        let command = vscode.command_history.back().unwrap();
+        assert_eq!(command.command.as_deref(), Some("git status"));
+        assert_eq!(command.exit_code, Some(17));
+        assert_eq!(command.output.as_deref(), Ok("vscode-output"));
         drop(session);
         tokio::time::timeout(Duration::from_secs(2), server)
             .await

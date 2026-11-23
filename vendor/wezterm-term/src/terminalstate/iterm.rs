@@ -63,6 +63,15 @@ fn directory_report(authority: &str, path: &str) -> Option<(Url, Arc<str>)> {
 }
 
 impl TerminalState {
+    /// A literal POSIX path from a shell integration that omits the host.
+    pub(super) fn shell_posix_directory(&self, path: &str) -> Option<(Url, Arc<str>)> {
+        let authority = self
+            .iterm_directory_peer
+            .as_ref()
+            .map_or("", |peer| peer.authority.as_str());
+        directory_report(authority, path)
+    }
+
     /// Accept iTerm2 shell integration's RemoteHost and CurrentDir for this
     /// authenticated SSH user and destination. Reconnects require a new report.
     pub fn enable_iterm_directory_reports(&mut self, user: &str, host: &str) {

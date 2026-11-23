@@ -341,6 +341,14 @@ enum ConEmuDirectoryReports {
     Wsl,
 }
 
+#[derive(Default)]
+enum VscodeCommand {
+    #[default]
+    Idle,
+    Pending(Option<String>),
+    Running,
+}
+
 /// Manages the state for the terminal
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
@@ -467,6 +475,7 @@ pub struct TerminalState {
     next_command_id: u64,
     capturing_shell_input: bool,
     command_label: Option<String>,
+    vscode_command: VscodeCommand,
 
     term_program: String,
     term_version: String,
@@ -745,6 +754,7 @@ impl TerminalState {
             next_command_id: 1,
             capturing_shell_input: false,
             command_label: None,
+            vscode_command: VscodeCommand::Idle,
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
             writer: BufWriter::new(writer),

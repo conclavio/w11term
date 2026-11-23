@@ -8,6 +8,7 @@
 - Kitty ED 22 archives the primary display through the normal scrollback buffer and clips relative image placements at the archived screen edge.
 - Kitty's `CSI Ps + T` restores history into the primary display. Surviving command output anchors follow their rows, and the embedding can keep a scrolled viewport anchored as rows leave history.
 - OSC 7501 implements revision 0.4 of the Program Status Protocol, including feature detection, bounded per-pane records, hierarchical clearing, and prompt and reset lifetimes.
+- VS Code OSC 633 prompt, command and working-directory markers feed the shared shell integration. Prompt markers preserve cursor position. A nonce has no bearing on the trust of a reported command.
 
 Source: https://github.com/wezterm/wezterm/tree/e2a98e1b8af156988ad0ac778658ac27b60a55fb/term
 
