@@ -812,6 +812,7 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives a native group across two SSH endpoints and a local PowerShell tab"]
 async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
+    let state = tempfile::tempdir().unwrap();
     let mut runtimes = Vec::new();
     let mut profiles = serde_json::Map::new();
     for (name, use_633) in [("East", false), ("West", true)] {
@@ -828,6 +829,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         };
         let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
         let peer_trace = trace.clone();
+        let release_slow = state.path().join("release-west-result");
         let responder = tokio::spawn(async move {
             use in_band_resize::Wire;
             let prompt = if use_633 {
@@ -866,14 +868,49 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                 continue;
                             }
                             ordinary if ordinary.ends_with(b"\r") => {
-                                let complete = if use_633 {
-                                    b"\r\n\x1b]633;C\x07west-accepted\r\n\x1b]633;D;0\x07"
-                                        .as_slice()
+                                let line = ordinary.strip_suffix(b"\r").unwrap();
+                                let line = if use_633 {
+                                    line.strip_prefix(b"\x1b[200~")
+                                        .unwrap()
+                                        .strip_suffix(b"\x1b[201~")
+                                        .unwrap()
                                 } else {
-                                    b"\r\n\x1b]133;C\x07east-accepted\r\n\x1b]133;D;0\x07"
-                                        .as_slice()
+                                    line
                                 };
-                                [complete, prompt].concat()
+                                let line = std::str::from_utf8(line).unwrap();
+                                if use_633 && line == "both" {
+                                    handle
+                                        .data(
+                                            id,
+                                            b"\r\n\x1b]633;E;both\x07\x1b]633;C\x07".as_slice(),
+                                        )
+                                        .await
+                                        .unwrap();
+                                    let finish = [
+                                        b"west-accepted both\r\n\x1b]633;D;17\x07".as_slice(),
+                                        prompt,
+                                    ]
+                                    .concat();
+                                    let gate = release_slow.clone();
+                                    let handle = handle.clone();
+                                    tokio::spawn(async move {
+                                        while !gate.is_file() {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        }
+                                        let _ = handle.data(id, finish).await;
+                                    });
+                                    continue;
+                                }
+                                let complete = if use_633 {
+                                    format!(
+                                        "\r\n\x1b]633;C\x07west-accepted {line}\r\n\x1b]633;E;{line}\x07\x1b]633;D;17\x07"
+                                    )
+                                } else {
+                                    format!(
+                                        "{line}\r\n\x1b]133;C\x07east-accepted {line}\r\n\x1b]133;D;0\x07"
+                                    )
+                                };
+                                [complete.as_bytes(), prompt].concat()
                             }
                             _ => continue,
                         };
@@ -891,7 +928,6 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
             "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]
         }),
     );
-    let state = tempfile::tempdir().unwrap();
     fs::write(
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({"profiles":profiles})).unwrap(),
@@ -899,7 +935,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
     .unwrap();
     drive_gui("ssh-host-group-ui.ps1", state.path());
     let expected: [&[u8]; 2] = [
-        b"one\rboth\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\r",
+        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\r",
         b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {

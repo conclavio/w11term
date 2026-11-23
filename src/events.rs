@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
+mod group_command;
 mod inbox;
+use group_command::GroupRun;
+pub use group_command::{GroupCommandResult, GroupExecution, GroupOutput};
 pub use inbox::Inbox;
 pub(crate) use inbox::display_field;
 
@@ -46,6 +49,7 @@ struct State {
     replay: Option<crate::session::ReplayState>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
+    group_run: Option<GroupRun>,
     next_prompt: u64,
     notify_long_commands: bool,
     restart_token: Option<u64>,
@@ -312,6 +316,27 @@ impl Events {
         true
     }
 
+    pub(crate) fn observe_group_command(
+        &self,
+        generation: u64,
+        text: Arc<str>,
+        status: tokio::sync::watch::Sender<GroupExecution>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(previous) = state
+            .group_run
+            .replace(GroupRun::new(generation, text, status))
+        {
+            previous.abandon("The pane began a new group submission.");
+        }
+    }
+
+    pub(crate) fn group_command_line(&self, id: u64, label: Option<&str>) {
+        if let Some(run) = &self.state.lock().unwrap().group_run {
+            run.identify(id, label);
+        }
+    }
+
     pub fn set_command_watch(&self, armed: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
@@ -326,6 +351,9 @@ impl Events {
     pub(crate) fn command_stream(&self, generation: Option<u64>) {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
+        if let Some(run) = state.group_run.take() {
+            run.abandon("The connection closed before the shell reported a result.");
+        }
         state.command_watch = generation.map(CommandWatch::new);
         state.refresh_watch(previous);
     }
@@ -333,6 +361,9 @@ impl Events {
     pub(crate) fn reset_command_watch(&self) {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
+        if let Some(run) = state.group_run.take() {
+            run.abandon("The terminal reset before the shell reported a result.");
+        }
         if let Some(watch) = &mut state.command_watch {
             watch.reset();
         }
@@ -342,19 +373,47 @@ impl Events {
     pub(crate) fn semantic_prompt(
         &self,
         marker: &wezterm_term::FinalTermSemanticPrompt,
-        completed: Option<u64>,
+        started: Option<(u64, Option<&str>)>,
+        completed: Option<wezterm_term::ShellCommandCompletion<'_>>,
     ) {
-        self.semantic_prompt_at(marker, completed, Instant::now());
+        let mut state = self.state.lock().unwrap();
+        if let Some(run) = &mut state.group_run
+            && !run.marker(
+                marker,
+                started,
+                completed.as_ref().map(|ended| ended.command),
+            )
+        {
+            state.group_run = None;
+        }
+        self.process_semantic_prompt(
+            state,
+            marker,
+            completed
+                .filter(|ended| ended.had_output_start)
+                .map(|ended| ended.command.id),
+            Instant::now(),
+        );
     }
 
+    #[cfg(test)]
     fn semantic_prompt_at(
         &self,
         marker: &wezterm_term::FinalTermSemanticPrompt,
         completed: Option<u64>,
         now: Instant,
     ) {
+        self.process_semantic_prompt(self.state.lock().unwrap(), marker, completed, now);
+    }
+
+    fn process_semantic_prompt(
+        &self,
+        mut state: std::sync::MutexGuard<'_, State>,
+        marker: &wezterm_term::FinalTermSemanticPrompt,
+        completed: Option<u64>,
+        now: Instant,
+    ) {
         use wezterm_term::FinalTermSemanticPrompt::*;
-        let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
         let notify_long_commands = state.notify_long_commands;
         let input_marker = matches!(

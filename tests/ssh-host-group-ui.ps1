@@ -38,6 +38,12 @@ function Submit([string]$Text, [string]$ButtonName) {
 function Outcome([string]$Target, [string]$Status) {
     $null = Wait-Until "$Target $Status" { Find-Element "$Target$dot$Status" }
 }
+function Click([string]$Name) {
+    Invoke-Button (Wait-Until "enabled '$Name'" {
+        $entry = Find-Element $Name $button
+        if ($entry -and $entry.Current.IsEnabled) { $entry }
+    })
+}
 
 $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
@@ -70,8 +76,26 @@ try {
     Submit 'both' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName 'Sent to SSH channel'
-    $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','east-accepted')
-    $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west-accepted')
+    Outcome $eastName 'Exit 0'
+    Outcome $westName 'Running'
+    $null = Wait-Until 'East output in the group' { Find-Element 'east-accepted both' }
+    Submit 'while-slow' 'Send to 2 hosts'
+    Outcome $eastName 'Exit 0'
+    Outcome $westName "Not sent${dot}Waiting for a fresh prompt"
+    Click 'Previous submission'
+    $null = Wait-Until 'earlier submission' { Find-Element "Submitted${dot}both" }
+    Outcome $westName 'Running'
+    [IO.File]::WriteAllText((Join-Path $State 'release-west-result'), '')
+    Outcome $westName 'Exit 17'
+    $null = Wait-Until 'distinct West output in the earlier submission' { Find-Element 'west-accepted both' }
+    Click "View output for pane $west"
+    $null = Wait-Until 'full West output opens the matching command history entry' {
+        Find-Element "Selected, both${dot}exit 17" $button
+    }
+    Run-Palette 'SSH host group'
+    Outcome $westName 'Exit 17'
+    Click 'Next submission'
+    $null = Wait-Until 'later submission restored' { Find-Element "Submitted${dot}while-slow" }
     Send-Raw $west 'part'
     Pane-Status $west "Connected${dot}Waiting for a fresh prompt"
     Submit 'while-edit' 'Send to 2 hosts'
@@ -96,9 +120,9 @@ try {
     Send-Raw $west 'prompt'
     Pane-Status $west "Connected${dot}Ready"
     Submit 'after-reconnect' 'Send to 2 hosts'
-    Outcome $eastName 'Sent to SSH channel'
-    Outcome $westName 'Sent to SSH channel'
-    Invoke-Button (Find-Element "Focus pane $west" $button)
+    Outcome $eastName 'Exit 0'
+    Outcome $westName 'Exit 17'
+    Click "Focus result pane $west"
     Wait-Focus $west
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"

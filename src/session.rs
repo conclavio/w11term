@@ -94,6 +94,7 @@ pub enum Command {
         prompt: crate::events::PromptToken,
         text: Arc<str>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        execution: tokio::sync::watch::Sender<crate::events::GroupExecution>,
     },
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
     /// Capture immutable UTF-8 text on this worker. The caller owns all file I/O.
@@ -925,7 +926,7 @@ async fn run(
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
                     Some(Command::MirroredKeyboard(_)) => unreachable!("mirrored input was unwrapped above"),
-                    Some(Command::SendGroupCommand { prompt, text, reply }) => {
+                    Some(Command::SendGroupCommand { prompt, text, reply, execution }) => {
                         let kind = terminal::ScopedInput::GroupCommand;
                         let rejected = if !group_shell || player.read().unwrap().rustmush {
                             Some("Group commands require a direct SSH shell.")
@@ -948,10 +949,13 @@ async fn run(
                         }
                         match terminal::group_command_bytes(&terminal, &text) {
                             Ok(bytes) => {
-                                if let Err(error) = writer.send(TransportInput::Scoped {
+                                match writer.send(TransportInput::Scoped {
                                     connection: prompt.connection, bytes, reply, kind,
-                                }) && let TransportInput::Scoped { reply, .. } = error.0 {
-                                    let _ = reply.send(Err("The host connection closed.".into()));
+                                }) {
+                                    Ok(()) => events.observe_group_command(prompt.connection, text, execution),
+                                    Err(error) => if let TransportInput::Scoped { reply, .. } = error.0 {
+                                        let _ = reply.send(Err("The host connection closed.".into()));
+                                    },
                                 }
                             }
                             Err(error) => { let _ = reply.send(Err(error.to_string())); }

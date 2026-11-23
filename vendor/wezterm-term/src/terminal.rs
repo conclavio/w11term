@@ -86,11 +86,24 @@ pub enum Alert {
     Progress(Progress),
 }
 
+pub struct ShellCommandCompletion<'a> {
+    pub command: &'a crate::CompletedCommand,
+    pub had_output_start: bool,
+}
+
 pub trait AlertHandler: Send + Sync {
     fn alert(&mut self, alert: Alert);
 
-    /// Live primary-screen markers and the captured command ID, if the marker finished output.
-    fn semantic_prompt(&mut self, _marker: &FinalTermSemanticPrompt, _completed: Option<u64>) {}
+    /// Live primary-screen markers and the command capture they opened or completed.
+    fn semantic_prompt(
+        &mut self,
+        _marker: &FinalTermSemanticPrompt,
+        _started: Option<(u64, Option<&str>)>,
+        _completed: Option<ShellCommandCompletion<'_>>,
+    ) {
+    }
+    /// A shell may report the command line after marking the start of its output.
+    fn shell_command_line(&mut self, _id: u64, _label: Option<&str>) {}
     fn terminal_reset(&mut self) {}
 }
 
