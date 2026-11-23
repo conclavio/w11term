@@ -9,6 +9,7 @@ pub enum CommandId {
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
     SelectAll(Option<clipboard_paste::Origin>),
+    PaneFind(Option<clipboard_paste::Origin>, Shortcut),
     CopySelection(Option<clipboard_paste::Origin>),
     PaneColorScheme(u64, ColorScheme),
     SharedFolders(Option<u64>),
@@ -226,12 +227,9 @@ impl TerminalApp {
                         Shortcut::NewTab => true,
                         Shortcut::CloseTab => tab_count > 0,
                         Shortcut::ClosePane => live.is_some(),
-                        Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => live
-                            .is_some_and(|tab| {
-                                !tab.device_busy
-                                    && !tab.browsing_sessions()
-                                    && tab.session.frames.load().prompt.is_none()
-                            }),
+                        Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => {
+                            live.is_some_and(LiveTab::find_available)
+                        }
                         Shortcut::NextTab | Shortcut::PreviousTab => tab_count > 1,
                         Shortcut::Select(index) => index < tab_count,
                         _ => false,
@@ -269,6 +267,9 @@ impl TerminalApp {
                 Shortcut::SelectAll => {
                     row.id = CommandId::SelectAll(origin);
                     row.enabled = self.copy_mode_target().is_some();
+                }
+                Shortcut::Find | Shortcut::FindNext | Shortcut::FindPrevious => {
+                    row.id = CommandId::PaneFind(origin, shortcut);
                 }
                 Shortcut::DuplicateTabLayout | Shortcut::MoveTabLeft | Shortcut::MoveTabRight => {
                     // A click queued on this row must keep its original tab even
@@ -365,6 +366,7 @@ impl TerminalApp {
                 pane.map_or(Message::ControlIdle, Message::ClearScrollback)
             }
             CommandId::SelectAll(origin) => Message::SelectAll(origin),
+            CommandId::PaneFind(origin, shortcut) => Message::PaneFind(origin, shortcut),
             CommandId::CopySelection(origin) => Message::CopySelection(origin),
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),

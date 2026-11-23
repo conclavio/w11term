@@ -1435,8 +1435,14 @@ impl State {
                     if mode == LocalMode::Copy {
                         let mods = modifiers();
                         let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
-                        if self.keymap.resolve(vk, mods, true, right_alt) == Some(Action::SelectAll)
-                        {
+                        let action = self.keymap.resolve(vk, mods, true, right_alt);
+                        if action == Some(Action::Find) {
+                            self.local_held.remove(&slot);
+                            self.find_keys.insert(slot, FindPress::Held);
+                            if !repeat {
+                                (self.shortcut)(Shortcut::Find);
+                            }
+                        } else if action == Some(Action::SelectAll) {
                             if !repeat {
                                 (self.shortcut)(Shortcut::SelectAll);
                             }
@@ -2158,6 +2164,29 @@ mod tests {
             lParam: LPARAM(((scan << 16) | (u32::from(repeat) << 30)) as isize),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn find_selected_text_remap_owns_the_copy_mode_key_across_the_transition() {
+        let _scope = WindowScope::default().enter();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let seen = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::Find, Some("F2".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            local_mode: Some(LocalMode::Copy),
+            keymap: bindings.keymap().unwrap(),
+            ..State::new(move |action| seen.borrow_mut().push(action))
+        };
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, false)));
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        state.local_mode = None;
+        state.set_search(true);
+        assert!(state.handle(&find_key(WM_KEYDOWN, 0x71, 0x3c, true)));
+        assert!(state.handle(&find_key(WM_KEYUP, 0x71, 0x3c, false)));
+        assert_eq!(*actions.borrow(), [Shortcut::Find]);
     }
 
     #[test]

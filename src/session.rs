@@ -125,6 +125,10 @@ pub enum Command {
         regex: bool,
     },
     SearchNavigate(isize),
+    FindSelection(
+        std::sync::Arc<crate::interaction::FindSelection>,
+        tokio::sync::oneshot::Sender<Option<String>>,
+    ),
     SearchClose,
     SearchPreview {
         query: String,
@@ -1009,6 +1013,17 @@ async fn run(
                             let _ = reply.send(target);
                         }
                         Ok(())
+                    }
+                    Some(Command::FindSelection(target, reply)) => {
+                        if !reply.is_closed() {
+                            let seed = if playback.as_ref().is_some_and(|reader| reader.in_group) {
+                                None
+                            } else {
+                                target.read(&terminal, connection_generation)
+                            };
+                            let _ = reply.send(seed);
+                        }
+                        continue;
                     }
                     Some(Command::CopyRange { screen, selection, trim_block, reply }) => {
                         if !reply.is_closed() {
