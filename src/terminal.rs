@@ -2927,6 +2927,68 @@ mod tests {
     }
 
     #[test]
+    fn dec_rectangle_copy_reads_overlapping_rows_and_columns_before_overwriting() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes(b"ABCDEFGHIJ\r\n0123456789\r\nxxxxxxxxxx\x1b[4;8H");
+        term.advance_bytes(b"\x1b[1;2;2;5;1;2;4;1$v");
+        assert!(text(&term).starts_with("ABCDEFGHIJ\n012BCDE789\nxxx1234xxx\n"));
+        term.advance_bytes(b"\x1b[2;4;3;7;1;1;1;1$v\x1b[1;1;1;4;1;1;3;1$v\x1b[6n");
+        assert!(text(&term).starts_with("BCBCDEGHIJ\n1234CDE789\nxxx1234xxx\n"));
+        assert_eq!(receive(&mut replies), b"\x1b[4;8R");
+    }
+
+    #[test]
+    fn dec_rectangle_copy_keeps_cell_style_and_clips_wide_graphemes_at_either_edge() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 5,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes("A\x1b[1\"q\x1b[44m界\x1b[0m\x1b[0\"qB\x1b[2;1H\x1b#6zzzz");
+        term.advance_bytes(b"\x1b[1;2;1;3;1;2;3;1$v\x1b[1;2;1;3;1;3;8;1$v\x1b[1;3;1;4;1;4;1;1$v");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(frame.rows[1].is_double_width());
+        assert_eq!(frame.rows[1].as_str().trim_end(), "zz界");
+        assert_eq!(frame.rows[2].as_str().trim_end(), "");
+        assert_eq!(frame.rows[3].as_str().trim_end(), " B");
+        for (row, col) in [(1, 2), (2, 7), (3, 0)] {
+            let cell = frame.rows[row].get_cell(col).unwrap();
+            assert!(cell.attrs().protected());
+            assert_eq!(
+                cell.attrs().background(),
+                wezterm_term::color::ColorAttribute::PaletteIndex(4)
+            );
+        }
+    }
+
+    #[test]
+    fn dec_rectangle_copy_uses_origin_defaults_and_the_active_page() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 6,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"primary\x1b[?1049hABCDEF\r\nabcdef\r\n012345\r\nuvwxyz");
+        term.advance_bytes(b"\x1b[?69h\x1b[2;5s\x1b[2;3r\x1b[?6h");
+        // Pages above the single active page clamp to page 1. Zero and omitted
+        // parameters take their usual defaults.
+        term.advance_bytes(b"\x1b[0;0;1;;7;2;2;5$v");
+        assert_eq!(text(&term), "ABCDEF\nabcdef\n01bcd5\nuvwxyz");
+        term.advance_bytes(b"\x1b[1;1;2;4;1;9;9;1$v\x1b[2;3;1;1;1;1;1;1$v");
+        assert_eq!(text(&term), "ABCDEF\nabcdef\n01bcd5\nuvwxyz");
+        term.advance_bytes(b"\x1b[?1049l");
+        assert!(text(&term).starts_with("primar\ny\n"));
+    }
+
+    #[test]
     fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(
