@@ -123,7 +123,7 @@ impl NewShell {
         Ok(self)
     }
 
-    fn launch(self, osc52: bool) -> AppTab {
+    fn launch(self, osc52: RemoteClipboardPolicy) -> AppTab {
         let mut tab = if let (Some(startup), Source::Ssh(options)) = (self.startup, &self.source) {
             // A directory-only recipe opens an interactive shell. Its directory
             // was bound to this endpoint when the user saved it in w11term.
@@ -170,7 +170,12 @@ impl TerminalApp {
         };
         let catalog = self.store.catalog().ok();
         let shell = closed.shell.clone().prepare(catalog.as_ref())?;
-        let osc52 = self.appearance.read().unwrap().interaction.osc52;
+        let osc52 = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .remote_clipboard_policy();
         self.tabs.reopen_pane(&closed.location, shell.launch(osc52));
         self.closed_pane = None;
         self.sync_selection(context);
@@ -211,7 +216,12 @@ impl TerminalApp {
             return Ok(());
         };
         let catalog = self.store.catalog().ok();
-        let osc52 = self.appearance.read().unwrap().interaction.osc52;
+        let osc52 = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .remote_clipboard_policy();
         self.tabs.reopen_group(
             &closed.layout,
             |recipe| recipe.clone().prepare(catalog.as_ref()),
@@ -253,7 +263,12 @@ impl TerminalApp {
         // Only keep a profile association if the on-disk catalog still agrees.
         // A moved/deleted catalog cannot change a live pane's launch recipe.
         let catalog = self.store.catalog().ok();
-        let osc52 = self.appearance.read().unwrap().interaction.osc52;
+        let osc52 = self
+            .appearance
+            .read()
+            .unwrap()
+            .interaction
+            .remote_clipboard_policy();
         self.tabs.duplicate_active_group(
             |tab| NewShell::capture(tab)?.prepare(catalog.as_ref()),
             |recipe| recipe.launch(osc52),
@@ -373,7 +388,7 @@ mod tests {
             .unwrap();
         tabs.duplicate_active_group(
             |tab| NewShell::capture(tab)?.prepare(None),
-            |recipe| recipe.launch(false),
+            |recipe| recipe.launch(RemoteClipboardPolicy::Disabled),
         )
         .unwrap();
         let duplicate = tabs.active_id().unwrap();
@@ -387,7 +402,7 @@ mod tests {
         tabs.reopen_group(
             &closed_recipe,
             |recipe| recipe.clone().prepare(None),
-            |recipe| recipe.launch(false),
+            |recipe| recipe.launch(RemoteClipboardPolicy::Disabled),
         )
         .unwrap();
         let reopened = tabs.active_id().unwrap();

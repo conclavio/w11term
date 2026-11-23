@@ -106,7 +106,7 @@ pub enum Action {
 pub(super) fn discovery_tab(
     name: String,
     mut options: SshOptions,
-    osc52: bool,
+    osc52: RemoteClipboardPolicy,
     saved: Option<DurableReference>,
     herdr: bool,
 ) -> AppTab {
@@ -397,7 +397,12 @@ impl TerminalApp {
                     .get(name)
                     .filter(|o| !o.player.rustmush)
                 {
-                    let osc52 = self.appearance.read().unwrap().interaction.osc52;
+                    let osc52 = self
+                        .appearance
+                        .read()
+                        .unwrap()
+                        .interaction
+                        .remote_clipboard_policy();
                     self.insert_tab(
                         discovery_tab(name.clone(), options.clone(), osc52, None, *herdr),
                         context,

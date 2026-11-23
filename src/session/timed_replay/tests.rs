@@ -410,11 +410,7 @@ async fn timed_replay_exposes_titles_without_enabling_desktop_actions() {
     })
     .await;
     assert_eq!(done.title, "Cockpit");
-    assert!(
-        !pane
-            .clipboard_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    );
+    assert!(!pane.remote_clipboard.writes_enabled());
     let events = pane.events.since(0).events;
     assert!(events.iter().any(|event| event.kind == "title"));
     assert!(!events.iter().any(|event| matches!(

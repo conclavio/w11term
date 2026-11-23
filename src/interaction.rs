@@ -63,6 +63,7 @@ pub struct Interaction {
     pub scroll_to_zoom: bool,
     pub detect_urls: bool,
     pub osc52: bool,
+    pub osc52_foreground_only: bool,
     pub word_delimiters: String,
 }
 impl Default for Interaction {
@@ -79,6 +80,7 @@ impl Default for Interaction {
             scroll_to_zoom: true,
             detect_urls: true,
             osc52: true,
+            osc52_foreground_only: false,
             word_delimiters: " /\\()\"'-:,.;<>~!@#$%^&*|+=[]{}?│".into(),
         }
     }
@@ -88,6 +90,15 @@ pub fn paste_text(text: &str, trim: bool) -> &str {
 }
 
 impl Interaction {
+    pub fn remote_clipboard_policy(&self) -> crate::clipboard::RemoteClipboardPolicy {
+        use crate::clipboard::RemoteClipboardPolicy::*;
+        match (self.osc52, self.osc52_foreground_only) {
+            (false, _) => Disabled,
+            (true, false) => AnyPane,
+            (true, true) => ForegroundPane,
+        }
+    }
+
     /// Use the actual clipboard payload, after any trimming, for both the
     /// prompt decision and delivery. Raw paste never has bracket protection.
     pub fn clipboard_paste<'a>(
@@ -552,6 +563,21 @@ pub(crate) fn text_urls(text: &str) -> impl Iterator<Item = (Range<usize>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_osc52_settings_keep_their_scope_and_the_disable_switch_takes_precedence() {
+        use crate::clipboard::RemoteClipboardPolicy::*;
+        for (json, expected) in [
+            (r#"{}"#, AnyPane),
+            (r#"{"osc52":true}"#, AnyPane),
+            (r#"{"osc52":false}"#, Disabled),
+            (r#"{"osc52ForegroundOnly":true}"#, ForegroundPane),
+            (r#"{"osc52":false,"osc52ForegroundOnly":true}"#, Disabled),
+        ] {
+            let settings: Interaction = serde_json::from_str(json).unwrap();
+            assert_eq!(settings.remote_clipboard_policy(), expected);
+        }
+    }
     fn screen(bytes: &[u8], cols: usize) -> Snapshot {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut terminal = crate::terminal::create(

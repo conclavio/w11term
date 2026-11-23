@@ -483,7 +483,7 @@ Remote programs can set the local Windows clipboard with **OSC 52**, without a f
 printf '\033]52;c;%s\a' "$(printf '%s' 'Copied from the remote host 🌍' | base64 | tr -d '\n')"
 ```
 
-OSC 52 writes are plain text, work for background sessions, and are capped at 1 MiB and four remote writes per second across the process. Clipboard-read queries receive no response. Remote clipboard writes can be disabled in Settings. Normal UI paste remains distinct from the control CLI's `send-text --no-paste`, which always sends raw bytes. For bytes that cannot be represented as Windows clipboard text, use `--file`, `--stdin`, or `--base64` through the CLI.
+OSC 52 writes are plain text and are capped at 1 MiB and four remote writes per second across the process. Clipboard-read queries receive no response. Background sessions can write by default. Turn on **Limit OSC 52 to the foreground pane** in Settings to accept writes only from the selected pane in the foreground w11term window. The app checks again when it writes to the clipboard. Turn off **Allow remote clipboard copy (OSC 52)** to disable remote writes entirely. Normal UI paste remains distinct from the control CLI's `send-text --no-paste`, which always sends raw bytes. For bytes that cannot be represented as Windows clipboard text, use `--file`, `--stdin`, or `--base64` through the CLI.
 
 ## Architecture
 

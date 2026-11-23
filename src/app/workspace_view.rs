@@ -263,7 +263,12 @@ impl TerminalApp {
                         .load()?
                         .remove(&name)
                         .with_context(|| format!("Workspace {name} was removed"))?;
-                    let osc52 = self.appearance.read().unwrap().interaction.osc52;
+                    let osc52 = self
+                        .appearance
+                        .read()
+                        .unwrap()
+                        .interaction
+                        .remote_clipboard_policy();
                     append_workspace(&mut self.tabs, &workspace, &self.catalog.profiles, osc52)
                 });
                 match result {
@@ -528,7 +533,7 @@ pub(super) fn append_workspace(
     tabs: &mut Tabs<AppTab>,
     workspace: &Workspace,
     profiles: &BTreeMap<String, SshOptions>,
-    osc52: bool,
+    osc52: RemoteClipboardPolicy,
 ) -> anyhow::Result<()> {
     let sources = workspace.resolve_sources(profiles)?;
     append_resolved_workspace(tabs, workspace, sources, osc52);
@@ -539,7 +544,7 @@ pub(super) fn append_resolved_workspace(
     tabs: &mut Tabs<AppTab>,
     workspace: &Workspace,
     mut sources: BTreeMap<u64, Source>,
-    osc52: bool,
+    osc52: RemoteClipboardPolicy,
 ) {
     restore_tabs(tabs, workspace, |slot, saved, pane_name| {
         let source = sources.remove(&slot).expect("validated workspace slot");
@@ -927,7 +932,13 @@ mod tests {
         workspace.tabs[0].title = Some("Dashboard".to_owned().try_into().unwrap());
 
         let mut tabs = Tabs::default();
-        append_workspace(&mut tabs, &workspace, &BTreeMap::new(), false).unwrap();
+        append_workspace(
+            &mut tabs,
+            &workspace,
+            &BTreeMap::new(),
+            RemoteClipboardPolicy::Disabled,
+        )
+        .unwrap();
         let named = tabs.active_id().unwrap();
         let sibling = tabs.active_layout().unwrap().leaves()[1];
         let live = |tabs: &Tabs<AppTab>, id| {
@@ -968,7 +979,13 @@ mod tests {
             label: "Settings".into(),
             page: Page::Settings(None),
         });
-        let error = append_workspace(&mut tabs, &workspace, &BTreeMap::new(), false).unwrap_err();
+        let error = append_workspace(
+            &mut tabs,
+            &workspace,
+            &BTreeMap::new(),
+            RemoteClipboardPolicy::Disabled,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("missing"));
         assert_eq!(tabs.active_id(), Some(existing));
         assert_eq!(tabs.entries().len(), 1);

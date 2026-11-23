@@ -1,10 +1,6 @@
 //! Plain Unicode clipboard access on a dedicated message-only window. No focus changes.
 use anyhow::{Context, Result, ensure};
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use windows::{
     Win32::{
@@ -18,7 +14,8 @@ use windows::{
 pub(crate) const MAX_TEXT: usize = 1024 * 1024;
 enum Request {
     Read(mpsc::SyncSender<Result<String>>),
-    Write(String, Option<mpsc::SyncSender<Result<()>>>),
+    Write(String, mpsc::SyncSender<Result<()>>),
+    RemoteWrite(String, Permission),
 }
 fn service() -> Result<&'static mpsc::SyncSender<Request>> {
     static SERVICE: OnceLock<Result<mpsc::SyncSender<Request>, String>> = OnceLock::new();
@@ -66,10 +63,12 @@ fn service() -> Result<&'static mpsc::SyncSender<Request>> {
                                 let _ = reply.send(read_native(hwnd));
                             }
                             Ok(Request::Write(text, reply)) => {
-                                let result = write_native(hwnd, &text);
-                                if let Some(reply) = reply {
-                                    let _ = reply.send(result);
-                                } else if let Err(e) = result {
+                                let _ = reply.send(write_native(hwnd, &text, None));
+                            }
+                            Ok(Request::RemoteWrite(text, permission)) => {
+                                if permission.current()
+                                    && let Err(e) = write_remote(hwnd, &text, &permission)
+                                {
                                     log::warn!("OSC 52 clipboard write: {e:#}");
                                 }
                             }
@@ -104,7 +103,7 @@ pub fn write(text: &str) -> Result<()> {
     }
     let (tx, rx) = mpsc::sync_channel(1);
     service()?
-        .try_send(Request::Write(text.into(), Some(tx)))
+        .try_send(Request::Write(text.into(), tx))
         .context("Clipboard service is busy")?;
     rx.recv_timeout(Duration::from_secs(2))
         .context("Clipboard write timed out")?
@@ -124,16 +123,114 @@ impl RemoteRateLimit {
         Ok(())
     }
 }
-pub struct RemoteClipboard(pub Arc<AtomicBool>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteClipboardPolicy {
+    Disabled,
+    AnyPane,
+    ForegroundPane,
+}
+
+impl From<bool> for RemoteClipboardPolicy {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::AnyPane
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+struct AccessState {
+    policy: RemoteClipboardPolicy,
+    focused_window: Option<usize>,
+    revision: u64,
+}
+
+impl AccessState {
+    fn allows(&self, foreground_window: Option<usize>) -> bool {
+        match self.policy {
+            RemoteClipboardPolicy::Disabled => false,
+            RemoteClipboardPolicy::AnyPane => true,
+            RemoteClipboardPolicy::ForegroundPane => {
+                self.focused_window.is_some() && self.focused_window == foreground_window
+            }
+        }
+    }
+}
+
+pub struct RemoteClipboardAccess(Mutex<AccessState>);
+
+impl RemoteClipboardAccess {
+    pub fn new(policy: RemoteClipboardPolicy) -> Self {
+        Self(Mutex::new(AccessState {
+            policy,
+            focused_window: None,
+            revision: 0,
+        }))
+    }
+
+    pub fn set_policy(&self, policy: RemoteClipboardPolicy) {
+        let mut state = self.0.lock().unwrap();
+        if state.policy != policy {
+            state.policy = policy;
+            state.revision = state.revision.wrapping_add(1);
+        }
+    }
+
+    pub fn writes_enabled(&self) -> bool {
+        self.0.lock().unwrap().policy != RemoteClipboardPolicy::Disabled
+    }
+
+    pub fn set_focused_window(&self, window: Option<usize>) {
+        let mut state = self.0.lock().unwrap();
+        if state.focused_window != window {
+            state.focused_window = window;
+            if state.policy == RemoteClipboardPolicy::ForegroundPane {
+                state.revision = state.revision.wrapping_add(1);
+            }
+        }
+    }
+
+    fn permission(self: &Arc<Self>, foreground_window: Option<usize>) -> Option<Permission> {
+        let state = self.0.lock().unwrap();
+        state.allows(foreground_window).then(|| Permission {
+            access: self.clone(),
+            revision: state.revision,
+        })
+    }
+}
+
+struct Permission {
+    access: Arc<RemoteClipboardAccess>,
+    revision: u64,
+}
+
+impl Permission {
+    fn current(&self) -> bool {
+        self.allows(foreground_window())
+    }
+
+    fn allows(&self, foreground_window: Option<usize>) -> bool {
+        let state = self.access.0.lock().unwrap();
+        state.revision == self.revision && state.allows(foreground_window)
+    }
+}
+
+fn foreground_window() -> Option<usize> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    (!hwnd.is_invalid()).then_some(hwnd.0 as usize)
+}
+
+pub struct RemoteClipboard(pub Arc<RemoteClipboardAccess>);
 impl wezterm_term::Clipboard for RemoteClipboard {
     fn set_contents(
         &self,
         _selection: wezterm_term::ClipboardSelection,
         data: Option<String>,
     ) -> Result<()> {
-        if !self.0.load(Ordering::Relaxed) {
+        let Some(permission) = self.0.permission(foreground_window()) else {
             return Ok(());
-        }
+        };
         let text = data.unwrap_or_default();
         ensure!(
             text.len() <= MAX_TEXT,
@@ -143,7 +240,7 @@ impl wezterm_term::Clipboard for RemoteClipboard {
             std::sync::Mutex::new(RemoteRateLimit(None));
         LIMIT.lock().unwrap().admit(std::time::Instant::now())?;
         service()?
-            .try_send(Request::Write(text, None))
+            .try_send(Request::RemoteWrite(text, permission))
             .context("Clipboard service is busy")?;
         Ok(())
     }
@@ -185,7 +282,18 @@ fn read_native(hwnd: HWND) -> Result<String> {
         Ok(text)
     }
 }
-fn write_native(hwnd: HWND, text: &str) -> Result<()> {
+fn write_remote(hwnd: HWND, text: &str, permission: &Permission) -> Result<()> {
+    #[cfg(feature = "ui-smoke")]
+    if let Some(path) = std::env::var_os("W11TERM_TEST_REMOTE_COPY_FILE") {
+        if permission.current() {
+            return std::fs::write(path, text).context("Writing the remote clipboard test fixture");
+        }
+        return Ok(());
+    }
+    write_native(hwnd, text, Some(permission))
+}
+
+fn write_native(hwnd: HWND, text: &str, permission: Option<&Permission>) -> Result<()> {
     let units: Vec<u16> = text
         .split('\0')
         .next()
@@ -203,16 +311,19 @@ fn write_native(hwnd: HWND, text: &str) -> Result<()> {
         }
         std::ptr::copy_nonoverlapping(units.as_ptr(), ptr, units.len());
         let _ = GlobalUnlock(memory);
-        let result = (|| -> Result<()> {
+        let result = (|| -> Result<bool> {
             let _open = open(hwnd)?;
+            if permission.is_some_and(|permission| !permission.current()) {
+                return Ok(false);
+            }
             EmptyClipboard()?;
             SetClipboardData(13, Some(HANDLE(memory.0)))?;
-            Ok(())
+            Ok(true)
         })();
-        if result.is_err() {
+        if !matches!(result, Ok(true)) {
             let _ = GlobalFree(Some(memory));
         }
-        result
+        result.map(|_| ())
     }
 }
 
@@ -226,6 +337,42 @@ mod tests {
         assert!(limit.admit(now).is_ok());
         assert!(limit.admit(now + Duration::from_millis(249)).is_err());
         assert!(limit.admit(now + Duration::from_millis(250)).is_ok());
+    }
+
+    #[test]
+    fn foreground_grants_require_the_selected_pane_in_the_foreground_window() {
+        use RemoteClipboardPolicy::*;
+        let access = Arc::new(RemoteClipboardAccess::new(ForegroundPane));
+        assert!(access.permission(None).is_none());
+        assert!(access.permission(Some(7)).is_none());
+        access.set_focused_window(Some(7));
+        assert!(access.permission(None).is_none());
+        assert!(access.permission(Some(8)).is_none());
+        let allowed = access.permission(Some(7)).unwrap();
+        assert!(!allowed.allows(Some(8)));
+        assert!(allowed.allows(Some(7)));
+        access.set_focused_window(None);
+        access.set_focused_window(Some(7));
+        assert!(!allowed.allows(Some(7)));
+        assert!(access.permission(Some(7)).is_some());
+    }
+
+    #[test]
+    fn policy_changes_cancel_queued_writes_and_legacy_grants_ignore_focus() {
+        use RemoteClipboardPolicy::*;
+        let access = Arc::new(RemoteClipboardAccess::new(AnyPane));
+        let background = access.permission(None).unwrap();
+        access.set_focused_window(Some(5));
+        access.set_focused_window(None);
+        assert!(background.allows(Some(5)));
+        access.set_policy(ForegroundPane);
+        assert!(!background.allows(Some(5)));
+        assert!(access.permission(Some(5)).is_none());
+        access.set_focused_window(Some(5));
+        let active = access.permission(Some(5)).unwrap();
+        access.set_policy(Disabled);
+        assert!(!active.allows(Some(5)));
+        assert!(access.permission(Some(5)).is_none());
     }
     #[test]
     #[ignore = "Writes the system clipboard; run explicitly during native verification"]
@@ -259,7 +406,9 @@ mod tests {
             }
         }
         let _restore = Restore(previous);
-        let disabled = RemoteClipboard(Arc::new(AtomicBool::new(false)));
+        let disabled = RemoteClipboard(Arc::new(RemoteClipboardAccess::new(
+            RemoteClipboardPolicy::Disabled,
+        )));
         disabled
             .set_contents(
                 wezterm_term::ClipboardSelection::Clipboard,
