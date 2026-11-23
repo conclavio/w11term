@@ -61,6 +61,7 @@ mod keyboard_settings;
 mod live_profile;
 mod local_forwards;
 mod local_profile;
+mod pane_drop;
 mod pattern_settings;
 mod saved_commands;
 mod word_delimiters;
@@ -989,6 +990,7 @@ pub struct TerminalApp {
     name_edit_serial: u64,
     identity_picker: Option<identity_picker::Pending>,
     clipboard: clipboard_paste::State,
+    pane_drop: pane_drop::State,
     focused_osc52: Option<Arc<RemoteClipboardAccess>>,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
     copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
@@ -1118,6 +1120,7 @@ pub enum Message {
     PasteRaw,
     Paste,
     Clipboard(clipboard_paste::Action),
+    PaneDrop(pane_drop::Action),
     CopyResult(TabId, u64, Result<(), String>),
     SelectAll(Option<clipboard_paste::Origin>),
     PaneFind(Option<clipboard_paste::Origin>, Shortcut),
@@ -2518,6 +2521,7 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.pane_drop.cancel();
         self.refresh_remote_clipboard_focus();
         self.tabs.record_pane_focus(AppTab::visited_terminal);
         self.clipboard.input_origin.set(self.paste_origin());
@@ -4597,6 +4601,7 @@ impl Component for TerminalApp {
             name_edit_serial: 0,
             identity_picker: None,
             clipboard,
+            pane_drop: Default::default(),
             focused_osc52: None,
             hints: Default::default(),
             copy_mode: Default::default(),
@@ -6026,6 +6031,7 @@ impl Component for TerminalApp {
                 self.finish_copy_word(pane, request, point, context)
             }
             Message::Clipboard(action) => self.clipboard_action(action, context),
+            Message::PaneDrop(action) => self.pane_drop_action(action, context),
             Message::MultilinePasteWarning(mode, checked) => {
                 if checked {
                     let mut appearance = self.appearance.read().unwrap().clone();

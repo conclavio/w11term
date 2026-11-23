@@ -1614,6 +1614,13 @@ fn native_wsl_profiles_launch_from_the_menu_and_restore_a_workspace() {
     drive_gui("wsl-profiles-ui.ps1", state.path());
 }
 
+#[test]
+#[ignore = "inserts Explorer drop payloads into PowerShell and named WSL panes through ConPTY"]
+fn native_shell_path_drops_target_the_right_pane_without_submitting() {
+    let state = tempfile::tempdir().unwrap();
+    drive_gui("drop-shell-paths-ui.ps1", state.path());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits profile colors and live overrides through WinUI, including a saved workspace"]
 async fn native_profile_tab_colors_follow_focused_panes_and_new_launches() {

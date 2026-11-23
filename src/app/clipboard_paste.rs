@@ -114,7 +114,13 @@ impl TerminalApp {
     // Each native invocation is scoped to one window, group, pane and connection.
     // Re-check them before presenting the dialog and before consuming its payload.
     fn paste_target(&self, origin: Origin) -> Option<&LiveTab> {
+        self.pane_paste_target(self.tabs.active_id()?, origin)
+    }
+
+    pub(super) fn pane_paste_target(&self, id: TabId, origin: Origin) -> Option<&LiveTab> {
         if self.tabs.active_group_id() != Some(origin.group)
+            || self.tabs.group_id(id) != Some(origin.group)
+            || !self.tabs.visible(id)
             || self
                 .outgoing
                 .as_ref()
@@ -126,7 +132,7 @@ impl TerminalApp {
         {
             return None;
         }
-        let Page::Terminal(tab) = &self.tabs.active()?.page else {
+        let Page::Terminal(tab) = &self.tabs.get(id)?.page else {
             return None;
         };
         let frame = tab.session.frames.load();

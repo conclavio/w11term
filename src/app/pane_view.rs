@@ -572,9 +572,18 @@ impl TerminalApp {
                 .pane_canvas(id, tab, context)
                 .map_err(|error| error.to_string()),
         };
+        let drop_target = self.pane_drop_target(id, tab);
         let content = match canvas {
             Ok(canvas) => Border::new()
                 .background(Color::rgb(14, 16, 20))
+                .drop_policy(drop_target.map(|_| {
+                    DragDropPolicy::new().storage_items(
+                        DragDropAction::new(DragDropOperation::Copy).caption("Insert file paths"),
+                    )
+                }))
+                .on_drop(context.callback(move |data| {
+                    drop_target.map_or(Message::ControlIdle, |target| target.data(data))
+                }))
                 .capture_pointer_on_press(true)
                 .on_pointer_capture_lost(context.callback(move |_| Message::CaptureLost(id)))
                 .on_pointer_entered(context.callback(move |_| Message::HoverPane(id)))
@@ -600,6 +609,8 @@ impl TerminalApp {
                     )),
                 ),
         };
+        #[cfg(feature = "ui-smoke")]
+        let content = pane_drop::with_fixture(content, drop_target, context);
         let active = self.tabs.active_id() == Some(id);
         let content = if let Some(browser) =
             session_browser::discovery_view(id, tab, active, &self.keyboard, context)
