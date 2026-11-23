@@ -19,6 +19,7 @@ pub enum CommandId {
     Clipboard(Option<clipboard_paste::Origin>, bool),
     TabAction(Shortcut, Option<TabId>),
     ReopenClosedTab(Option<TabId>),
+    ReopenClosedPane(Option<TabId>),
     SwapPanes(PaneSwap),
     RotateSplit(PaneRotation),
     BalancePanes(PaneBalance),
@@ -264,6 +265,11 @@ impl TerminalApp {
                     row.enabled = closed.is_some();
                     row.id = CommandId::ReopenClosedTab(closed);
                 }
+                Shortcut::ReopenClosedPane => {
+                    let closed = self.closed_pane.as_ref().map(|pane| pane.id);
+                    row.enabled = closed.is_some();
+                    row.id = CommandId::ReopenClosedPane(closed);
+                }
                 Shortcut::FocusPreviousPane => {
                     row.enabled = previous.is_some();
                     row.id = CommandId::FocusPreviousPane(previous);
@@ -357,6 +363,7 @@ impl TerminalApp {
         let message = match id {
             CommandId::RenamePane(target) => tab_title::show_pane(target),
             CommandId::ReopenClosedTab(group) => Message::ReopenClosedTab(group),
+            CommandId::ReopenClosedPane(id) => Message::ReopenClosedPane(id),
             CommandId::FocusPreviousPane(target) => previous_pane::message(target),
             CommandId::PaneColorScheme(pane, scheme) => Message::PaneColorScheme(pane, scheme),
             CommandId::LocalForward(origin) => local_forwards::open(origin),

@@ -67,6 +67,12 @@ pub(in crate::app) struct ClosedTab {
     layout: w11term::tabs::TabLayoutRecipe<NewShell>,
 }
 
+pub(in crate::app) struct ClosedPane {
+    pub(in crate::app) id: TabId,
+    location: w11term::tabs::ClosedPaneLocation,
+    shell: NewShell,
+}
+
 #[derive(Clone)]
 struct NewShell {
     source: Source,
@@ -139,6 +145,37 @@ impl NewShell {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn remember_closed_pane(&mut self, id: TabId) {
+        if let Some(location) = self.tabs.closed_pane_location(id)
+            && let Some(tab) = self.tabs.get(id)
+            && let Ok(shell) = NewShell::capture(tab)
+        {
+            self.closed_pane = Some(ClosedPane {
+                id,
+                location,
+                shell,
+            });
+        }
+    }
+
+    pub(in crate::app) fn reopen_closed_pane(
+        &mut self,
+        id: TabId,
+        context: &ComponentContext<Self>,
+    ) -> Result<()> {
+        let Some(closed) = self.closed_pane.as_ref().filter(|closed| closed.id == id) else {
+            return Ok(());
+        };
+        let catalog = self.store.catalog().ok();
+        let shell = closed.shell.clone().prepare(catalog.as_ref())?;
+        let osc52 = self.appearance.read().unwrap().interaction.osc52;
+        self.tabs.reopen_pane(&closed.location, shell.launch(osc52));
+        self.closed_pane = None;
+        self.sync_selection(context);
+        self.activate(context);
+        Ok(())
+    }
+
     pub(in crate::app) fn close_user_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
         if let Some(group) = self.tabs.group_id(id)
             && let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture)
