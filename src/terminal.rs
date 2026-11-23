@@ -671,11 +671,19 @@ struct ApplicationTitle {
 
 impl Snapshot {
     pub fn has_command(&self, link: crate::events::CommandLink) -> bool {
-        self.connection_generation == link.generation
-            && self
-                .command_history
-                .iter()
-                .any(|command| command.id == link.id)
+        self.command_for_link(link).is_some()
+    }
+
+    pub fn command_for_link(
+        &self,
+        link: crate::events::CommandLink,
+    ) -> Option<&Arc<wezterm_term::CompletedCommand>> {
+        if self.connection_generation != link.generation {
+            return None;
+        }
+        self.command_history
+            .iter()
+            .find(|command| command.id == link.id)
     }
 
     /// A bounded single-line caption from the application's window title.

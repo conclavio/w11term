@@ -931,8 +931,16 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                         "\r\n\x1b]633;C\x07west-accepted {line}\r\n\x1b]633;E;{line}\x07\x1b]633;D;17\x07"
                                     )
                                 } else {
+                                    let details = if line == "while-slow" {
+                                        format!(
+                                            "{}east-report-tail\r\n",
+                                            "east-report-line\r\n".repeat(35)
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
                                     format!(
-                                        "{line}\r\n\x1b]133;C\x07east-accepted {line}\r\n\x1b]133;D;0\x07"
+                                        "{line}\r\n\x1b]133;C\x07east-accepted {line}\r\n{details}\x1b]133;D;0\x07"
                                     )
                                 };
                                 [complete.as_bytes(), prompt].concat()

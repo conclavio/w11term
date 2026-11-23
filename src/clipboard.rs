@@ -11,7 +11,8 @@ use windows::{
     core::w,
 };
 
-pub(crate) const MAX_TEXT: usize = 1024 * 1024;
+/// Largest UTF-8 text payload accepted by the clipboard service.
+pub const MAX_TEXT: usize = 1024 * 1024;
 enum Request {
     Read(mpsc::SyncSender<Result<String>>),
     Write(String, Option<u32>, mpsc::SyncSender<Result<()>>),

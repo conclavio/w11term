@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'group-result-clipboard.txt'
 $profiles = Join-Path $State 'profiles.json'
 $profileData = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
 $dot = ' ' + [char]0xb7 + ' '
@@ -113,12 +114,33 @@ try {
     Submit 'while-slow' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName "Not sent${dot}Waiting for a fresh prompt"
+    Set-HostFilter 'east'
+    $null = Wait-Until 'West has left the roster' { !(Find-Element "Focus pane $west" $button) }
+    $null = Wait-Until 'the full East output is retained' { Find-Element "View output for pane $east" $button }
+    Click 'Copy results'
+    $null = Wait-Until 'the current report contains full output and both host outcomes' {
+        $report = Read-ClipboardFixture
+        $report -and $report.StartsWith("Submitted${dot}while-slow") -and
+            $report.Contains("$eastName${dot}Sent to SSH channel") -and
+            $report.Contains("  Exit 0") -and $report.Contains("east-report-tail") -and
+            $report.Contains("$westName${dot}Not sent${dot}Waiting for a fresh prompt")
+    }
+    $null = Wait-Until 'copy confirmation' { Find-Element 'Copied results' }
+    Set-HostFilter ''
     Click 'Previous submission'
     $null = Wait-Until 'earlier submission' { Find-Element "Submitted${dot}both" }
     Outcome $westName 'Running'
     [IO.File]::WriteAllText((Join-Path $State 'release-west-result'), '')
     Outcome $westName 'Exit 17'
     $null = Wait-Until 'distinct West output in the earlier submission' { Find-Element 'west-accepted both' }
+    Click 'Copy results'
+    $null = Wait-Until 'the earlier report contains its own outputs and exit statuses' {
+        $report = Read-ClipboardFixture
+        $report -and $report.StartsWith("Submitted${dot}both") -and
+            $report.Contains("  Exit 0") -and $report.Contains('east-accepted both') -and
+            $report.Contains("  Exit 17") -and $report.Contains('west-accepted both') -and
+            !$report.Contains('east-report-tail')
+    }
     Click "View output for pane $west"
     $null = Wait-Until 'full West output opens the matching command history entry' {
         Find-Element "Selected, both${dot}exit 17" $button
