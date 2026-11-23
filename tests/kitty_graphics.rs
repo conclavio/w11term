@@ -872,6 +872,81 @@ fn place(t: &mut Terminal, id: u32, placement: u32, row: usize, col: usize, heig
 }
 
 #[test]
+fn text_erasure_keeps_direct_kitty_layers_and_full_screen_erase_clears_them() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "\x1b[2;3HTOP\x1b[3;3HLOW",
+        "\x1b[2;3H\x1b_Ga=T,i=40,p=1,f=24,s=1,v=2,c=1,r=2,C=1,q=2;/wAAAP8A\x1b\\",
+        "\x1b_Ga=T,i=41,p=2,f=24,s=1,v=1,c=1,r=1,C=1,q=2;AAD/\x1b\\",
+        "\x1b_Ga=t,i=42,f=24,s=1,v=1,q=2;/wAA\x1b\\",
+        "\x1b_Ga=p,i=42,p=3,P=40,Q=1,H=1,c=1,r=1,q=2\x1b\\",
+    ));
+    let original = frame(&t, None, 0);
+    let check_layers = |snapshot: &Snapshot| {
+        assert_eq!(pixel(snapshot, 2, 1, 40), RED);
+        assert_eq!(pixel(snapshot, 2, 1, 41), Some([0, 0, 255, 255]));
+        assert_eq!(pixel(snapshot, 2, 2, 40), Some([0, 255, 0, 255]));
+        assert_eq!(pixel(snapshot, 3, 1, 42), RED);
+    };
+    check_layers(&original);
+
+    t.advance_bytes(b"\x1b[2;3H\x1b[K");
+    let line_erased = frame(&t, Some(&original), 0);
+    assert!(!line_erased.rows[1].as_str().contains("TOP"));
+    assert!(line_erased.rows[2].as_str().contains("LOW"));
+    check_layers(&line_erased);
+
+    t.advance_bytes(b"\x1b[2;1H\x1b[0J");
+    let end_erased = frame(&t, Some(&line_erased), 0);
+    assert!(!end_erased.rows[2].as_str().contains("LOW"));
+    check_layers(&end_erased);
+
+    t.advance_bytes(b"\x1b[2;3HTOP\x1b[3;3HLOW\x1b[3;3H\x1b[1J");
+    let start_erased = frame(&t, Some(&end_erased), 0);
+    assert!(!start_erased.rows[1].as_str().contains("TOP"));
+    assert!(!start_erased.rows[2].as_str().contains("LOW"));
+    assert!(start_erased.rows[2].as_str().contains("OW"));
+    check_layers(&start_erased);
+
+    t.advance_bytes(b"\x1b[2J");
+    let cleared = frame(&t, Some(&start_erased), 0);
+    assert_eq!(pixel(&cleared, 2, 1, 40), None);
+    assert_eq!(pixel(&cleared, 2, 1, 41), None);
+    assert_eq!(pixel(&cleared, 2, 2, 40), None);
+    assert_eq!(pixel(&cleared, 3, 1, 42), None);
+    place(&mut t, 40, 1, 2, 3, 2);
+    place(&mut t, 42, 3, 2, 4, 1);
+    let replaced = frame(&t, Some(&cleared), 0);
+    assert_eq!(pixel(&replaced, 2, 1, 40), RED);
+    assert_eq!(pixel(&replaced, 3, 1, 42), RED);
+}
+
+#[test]
+fn line_erasure_preserves_tiles_on_a_wide_glyph_continuation() {
+    let (mut t, _) = engine();
+    t.advance_bytes("界");
+    transmit_red(&mut t, 80);
+    place(&mut t, 80, 1, 1, 2, 1);
+    t.advance_bytes(b"\x1b[1;2H\x1b[K");
+    let erased = frame(&t, None, 0);
+    assert!(!erased.rows[0].as_str().contains('界'));
+    assert_eq!(pixel(&erased, 1, 0, 80), RED);
+}
+
+#[test]
+fn erasing_placeholder_text_hides_the_virtual_image() {
+    let (mut t, _) = engine();
+    t.advance_bytes(b"\x1b_Ga=T,i=33554474,p=7,U=1,c=2,r=1,f=32,s=2,v=1,q=2;/wAA/wD/AP8=\x1b\\");
+    t.advance_bytes("\x1b[38;2;0;0;42;58;2;0;0;7m\u{10eeee}\u{305}\u{305}\u{30e}\u{10eeee}\x1b[0m");
+    let before = frame(&t, None, 0);
+    assert_eq!(pixel(&before, 0, 0, 33554474), RED);
+    t.advance_bytes(b"\x1b[2K");
+    let erased = frame(&t, Some(&before), 0);
+    assert!(!erased.rows[0].as_str().contains('\u{10eeee}'));
+    assert_eq!(pixel(&erased, 0, 0, 33554474), None);
+}
+
+#[test]
 fn cell_delete_uses_the_live_grid_and_preserves_image_data_referenced_in_history() {
     for selector in ["d=C", "d=P,x=3,y=1"] {
         let (mut t, _) = engine();

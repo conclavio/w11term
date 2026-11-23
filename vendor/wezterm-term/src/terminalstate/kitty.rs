@@ -118,6 +118,10 @@ pub struct KittyImageState {
 }
 
 impl KittyImageState {
+    pub(super) fn has_physical_placements(&self) -> bool {
+        !self.placements.is_empty()
+    }
+
     fn id_for_number(&self, number: u32) -> Option<u32> {
         self.numbered_images.get(&number)?.last().copied()
     }
@@ -764,14 +768,7 @@ impl TerminalState {
     fn kitty_delete(&mut self, what: KittyImageDelete) {
         let (mut keys, mut free_ids): (HashSet<Key>, HashSet<u32>) = match what {
             KittyImageDelete::All { delete } => {
-                let (retained, mut visible) = self.kitty_img.physical_keys(self.screen());
-                let screen = self.screen();
-                self.find_kitty_relatives(
-                    &mut visible,
-                    screen.phys_row(0)..screen.scrollback_rows(),
-                    0..screen.physical_cols,
-                    None,
-                );
+                let (retained, mut visible) = self.visible_kitty_keys();
                 let release = visible
                     .iter()
                     .map(|key| key.0)
@@ -1104,6 +1101,28 @@ impl TerminalState {
                 line.update_last_change_seqno(seqno);
             }
         });
+    }
+
+    fn visible_kitty_keys(&self) -> (HashSet<Key>, HashSet<Key>) {
+        let screen = self.screen();
+        let (retained, mut visible) = self.kitty_img.physical_keys(screen);
+        self.find_kitty_relatives(
+            &mut visible,
+            screen.phys_row(0)..screen.scrollback_rows(),
+            0..screen.physical_cols,
+            None,
+        );
+        (retained, visible)
+    }
+
+    pub(super) fn clear_visible_kitty_images(&mut self) {
+        if self.kitty_img.placement_count() != 0 {
+            let (_, mut visible) = self.visible_kitty_keys();
+            self.kitty_img
+                .collect_kitty_dependents(&mut visible, &mut HashSet::new());
+            self.detach_kitty_cells(&visible);
+            self.kitty_img.discard_placements(&visible);
+        }
     }
 
     pub(super) fn reset_kitty_images(&mut self) {
