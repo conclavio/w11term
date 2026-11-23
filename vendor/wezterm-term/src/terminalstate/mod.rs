@@ -26,6 +26,7 @@ use wezterm_escape_parser::csi::{
 use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
+mod area_attributes;
 mod image;
 mod iterm;
 mod keyboard;
@@ -430,6 +431,7 @@ pub struct TerminalState {
     synchronized_output: bool,
     saved_private_modes: SavedPrivateModes,
     sgr_stack: sgr_stack::SgrStack,
+    attribute_extent: u8,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -698,6 +700,7 @@ impl TerminalState {
             synchronized_output: false,
             saved_private_modes: SavedPrivateModes::default(),
             sgr_stack: Default::default(),
+            attribute_extent: 0,
             seqno,
             unicode_version,
             unicode_version_stack: vec![],
@@ -1768,6 +1771,7 @@ impl TerminalState {
                 }
                 // TODO: see https://vt100.net/docs/vt510-rm/DECSTR.html
                 self.pen = CellAttributes::default();
+                self.attribute_extent = 0;
                 self.insert = false;
                 self.dec_origin_mode = false;
                 // Note that xterm deviates from the documented DECSTR
@@ -2649,6 +2653,14 @@ impl TerminalState {
                 // Only the active buffer is addressable, so all page numbers
                 // resolve to its sole page per the DEC out-of-range rule.
                 self.copy_rectangle(source, destination);
+            }
+            Window::AttributeExtent(extent) => self.attribute_extent = extent,
+            Window::EditAreaAttributes {
+                area,
+                attributes,
+                reverse,
+            } => {
+                self.edit_area_attributes(area, &attributes, reverse);
             }
             Window::FillRectangle {
                 character,

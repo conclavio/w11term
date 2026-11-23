@@ -1102,8 +1102,16 @@ fn text_erasure_keeps_direct_kitty_layers_and_full_screen_erase_clears_them() {
     assert_eq!(pixel(&copied, 2, 2, 41), None);
     assert_eq!(pixel(&copied, 3, 2, 42), None);
 
+    t.advance_bytes(b"\x1b[2*x\x1b[2;3;3;4;4;7$r");
+    let styled = frame(&t, Some(&copied), 0);
+    assert_eq!(
+        styled.rows[2].get_cell(2).unwrap().attrs().underline(),
+        wezterm_term::Underline::Single
+    );
+    check_layers(&styled);
+
     t.advance_bytes(b"\x1b[2J");
-    let cleared = frame(&t, Some(&copied), 0);
+    let cleared = frame(&t, Some(&styled), 0);
     assert_eq!(pixel(&cleared, 2, 1, 40), None);
     assert_eq!(pixel(&cleared, 2, 1, 41), None);
     assert_eq!(pixel(&cleared, 2, 2, 40), None);

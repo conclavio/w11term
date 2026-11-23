@@ -2,7 +2,7 @@ use super::*;
 use wezterm_cell::SemanticType;
 use wezterm_surface::line::Line;
 
-fn rectangle_axis(start: OneBased, end: OneBased, limits: Range<usize>) -> Range<usize> {
+pub(super) fn rectangle_axis(start: OneBased, end: OneBased, limits: Range<usize>) -> Range<usize> {
     if limits.is_empty() || start.as_one_based() > end.as_one_based() {
         return limits.start..limits.start;
     }
@@ -12,7 +12,7 @@ fn rectangle_axis(start: OneBased, end: OneBased, limits: Range<usize>) -> Range
 }
 
 impl TerminalState {
-    fn rectangle_limits(&self) -> (Range<usize>, Range<usize>) {
+    pub(super) fn rectangle_limits(&self) -> (Range<usize>, Range<usize>) {
         let screen = self.screen();
         if self.dec_origin_mode {
             (

@@ -649,6 +649,14 @@ pub enum Window {
         destination: [OneBased; 2],
         destination_page: OneBased,
     },
+    /// DECSACE. 0 and 1 use a stream, 2 uses a rectangle.
+    AttributeExtent(u8),
+    /// DECCARA or DECRARA.
+    EditAreaAttributes {
+        area: [OneBased; 4],
+        attributes: Box<[i64]>,
+        reverse: bool,
+    },
     /// DECRQCRA; used by esctest
     ChecksumRectangularArea {
         request_id: i64,
@@ -765,6 +773,18 @@ impl Display for Window {
                 f,
                 "{top};{left};{bottom};{right};{source_page};{row};{column};{destination_page}$v"
             ),
+            Window::AttributeExtent(extent) => write!(f, "{extent}*x"),
+            Window::EditAreaAttributes {
+                area: [top, left, bottom, right],
+                attributes,
+                reverse,
+            } => {
+                write!(f, "{top};{left};{bottom};{right}")?;
+                for attribute in attributes.iter() {
+                    write!(f, ";{attribute}")?;
+                }
+                write!(f, "${}", if *reverse { 't' } else { 'r' })
+            }
             Window::ChecksumRectangularArea {
                 request_id,
                 page_number,
@@ -2083,6 +2103,25 @@ impl<'a> CSIParser<'a> {
                     ],
                     destination_page: OneBased::from_optional_esc_param(area.get(7))?,
                 })))
+            }
+            ('r' | 't', [parameters @ .., CsiParam::P(b'$')]) if !self.parameters_truncated => {
+                let area = Cracked::parse(parameters)?;
+                let attributes = (4..area.len().max(5))
+                    .map(|index| area.opt_int(index).unwrap_or(0))
+                    .collect();
+                Ok(CSI::Window(Box::new(Window::EditAreaAttributes {
+                    area: area.rectangle(0)?,
+                    attributes,
+                    reverse: self.control == 't',
+                })))
+            }
+            ('x', [value @ .., CsiParam::P(b'*')]) if !self.parameters_truncated => {
+                let extent = match value {
+                    [] => 0,
+                    [CsiParam::Integer(n @ 0..=2)] => *n as u8,
+                    _ => return Err(()),
+                };
+                Ok(CSI::Window(Box::new(Window::AttributeExtent(extent))))
             }
             ('S', [CsiParam::P(b'#')]) if !self.parameters_truncated => {
                 Ok(CSI::Window(Box::new(Window::ReportTitleStackPosition)))
