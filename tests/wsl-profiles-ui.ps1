@@ -177,6 +177,7 @@ public static class WslFixture {
         @{ Action = 'Copy Fish directory setup'; Files = @('fish-directory.fish') }
         @{ Action = 'Copy Bash shell integration'; Files = @('bash-directory.sh','bash-integration.sh') }
         @{ Action = 'Copy Zsh shell integration'; Files = @('zsh-directory.zsh','zsh-integration.zsh') }
+        @{ Action = 'Copy Fish shell integration'; Files = @('fish-directory.fish','fish-integration.fish') }
     )) {
         Run-Palette $setup.Action
         $parts = foreach ($file in $setup.Files) {
