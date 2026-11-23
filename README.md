@@ -87,6 +87,8 @@ In a named WSL shell, the same actions open another shell in the distribution us
 
 Choose **Panes → Open current folder in File Explorer**, or search for it in the command palette, to browse the folder reported by the focused PowerShell or named WSL shell. For Linux paths, Explorer opens the folder through that distribution’s Windows share. The action becomes available after the shell reports a supported directory. [WSL file access from Windows](https://learn.microsoft.com/en-us/windows/dev-environment/wsl-interop#access-linux-files-from-windows)
 
+In a direct SSH or named WSL pane running Bash 5.1 or later, choose **Panes → Copy Bash directory setup** or find it in the command palette. Paste the setup into the Bash prompt and press Enter. It adds directory reporting for that shell session alongside existing prompt hooks. To enable it in future interactive Bash sessions, add the same setup to your Bash startup file. [Bash prompt hooks](https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html#index-PROMPT_005fCOMMAND)
+
 Saving the workspace remembers the starting directory of the new tab or split. Its next launch opens a shell there.
 
 Windows PowerShell 5.1 can treat square brackets in its starting directory as a wildcard. For those paths, w11term restores the literal directory if PowerShell opens at `$PSHOME` or a matching sibling. A profile that intentionally selects that same fallback directory will also start in the requested folder.

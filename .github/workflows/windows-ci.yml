@@ -143,6 +143,8 @@ jobs:
     timeout-minutes: 6
     steps:
       - *checkout
+      - name: Exercise directory reporting in an interactive Bash shell
+        run: python3 tests/bash-directory.py
       - name: Exercise input, resize and graphics on both sides of a loopback SSH PTY
         run: bash tests/durable/run-mux-linux.sh artifacts
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
