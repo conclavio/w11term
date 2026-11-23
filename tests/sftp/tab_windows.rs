@@ -13,6 +13,12 @@ async fn native_move_live_split_to_window_then_close_destination() {
     run("Destination", b"ssh-probe/").await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "moves a live SSH and PowerShell split into an existing HWND"]
+async fn native_move_live_split_to_existing_window() {
+    run("Existing", b"ssh-probe/existing-window/").await;
+}
+
 async fn run(first_close: &str, expected_wire: &[u8]) {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, sessions, server) =

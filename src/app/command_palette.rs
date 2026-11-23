@@ -4,6 +4,7 @@ use w11term::shortcuts::BINDINGS;
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandId {
     Menu(String),
+    MoveTabToExistingWindow(Option<TabId>, u64),
     BroadcastTyping(pane_broadcast::Action),
     RenamePane(Option<(u64, TabId)>),
     FocusPreviousPane(Option<previous_pane::Target>),
@@ -174,6 +175,13 @@ impl TerminalApp {
             .and_then(AppTab::pane_id)
             .zip(self.tabs.active_group_id());
         for row in &mut rows {
+            if let CommandId::Menu(label) = &row.id
+                && let Some(window) = tab_windows::menu_window(label)
+            {
+                let title = label.strip_prefix("Window ").unwrap_or(label);
+                row.label = format!("Move tab to existing window {title}");
+                row.id = CommandId::MoveTabToExistingWindow(self.tabs.active_group_id(), window);
+            }
             if matches!(&row.id, CommandId::Menu(label) if pane_broadcast::is_label(label))
                 && let Some(action) = broadcast
                     .as_ref()
@@ -420,6 +428,9 @@ impl TerminalApp {
             CommandId::CopySelection(origin) => Message::CopySelection(origin),
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),
+            CommandId::MoveTabToExistingWindow(group, window) => {
+                Message::MoveTabToExistingWindow(group, window)
+            }
             CommandId::BroadcastTyping(action) => Message::BroadcastTyping(action),
             CommandId::Recording(choice) => recordings::invoke(choice),
             CommandId::Shortcut(shortcut) => Message::Shortcut(shortcut),

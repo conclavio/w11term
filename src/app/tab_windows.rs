@@ -1,7 +1,45 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    rc::Weak,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use w11term::control::PaneTransfer;
 use w11term::options::Options;
+use windows::Win32::{
+    Foundation::HWND,
+    UI::WindowsAndMessaging::{
+        GetWindowTextW, IsIconic, IsWindow, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
+    },
+};
+
+const WINDOW_LABEL: &str = "Window ";
+
+pub(super) fn menu_window(label: &str) -> Option<u64> {
+    let (id, _) = label.strip_prefix(WINDOW_LABEL)?.split_once(" · ")?;
+    id.parse().ok().filter(|id| *id != 0)
+}
+
+struct WindowEndpoint {
+    hwnd: HWND,
+    sender: LocalSender<Message>,
+    outgoing: Weak<Transfer>,
+}
+
+thread_local! {
+    static WINDOWS: RefCell<BTreeMap<u64, WindowEndpoint>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+fn windows_changed() {
+    let senders = WINDOWS.with_borrow(|windows| {
+        windows
+            .values()
+            .map(|endpoint| endpoint.sender.clone())
+            .collect::<Vec<_>>()
+    });
+    for sender in senders {
+        sender.send(Message::WindowTargetsChanged);
+    }
+}
 
 #[derive(Clone)]
 pub struct WindowLaunch {
@@ -31,8 +69,9 @@ impl PartialEq for WindowLaunch {
 // Both components live on the same UI thread. Only the numeric ticket passes
 // through Reactor messages; the owned sessions move once through this slot.
 pub(super) struct Transfer {
-    pub(super) registry: Registry,
-    pub(super) server: Arc<Server>,
+    ticket: u64,
+    destination: u64,
+    pub(super) new_window: Option<NewWindow>,
     pub(super) group: TabId,
     panes: Vec<u64>,
     source: LocalSender<Message>,
@@ -41,6 +80,11 @@ pub(super) struct Transfer {
     pin: RefCell<Option<PaneTransfer>>,
     phase: Cell<TransferPhase>,
     started: Instant,
+}
+
+pub(super) struct NewWindow {
+    pub(super) registry: Registry,
+    pub(super) server: Arc<Server>,
 }
 
 struct OfferedTab<T> {
@@ -92,7 +136,7 @@ impl TransferPhase {
 
 impl Transfer {
     fn id(&self) -> u64 {
-        self.registry.window_id()
+        self.ticket
     }
 
     fn send_target(&self, message: Message) -> bool {
@@ -100,6 +144,14 @@ impl Transfer {
             .borrow()
             .as_ref()
             .is_some_and(|sender| sender.send(message))
+    }
+
+    fn cancel_target(&self) {
+        if !self.send_target(Message::TransferCanceled(self.id()))
+            && let Some(window) = &self.new_window
+        {
+            let _ = window.registry.unregister();
+        }
     }
 }
 
@@ -135,6 +187,17 @@ impl TerminalApp {
             match self.registry.set_hwnd(hwnd.0 as usize) {
                 Ok(()) => {
                     self.native_bound = true;
+                    WINDOWS.with_borrow_mut(|windows| {
+                        windows.insert(
+                            self.registry.window_id(),
+                            WindowEndpoint {
+                                hwnd,
+                                sender: ctx.sender(),
+                                outgoing: Weak::new(),
+                            },
+                        );
+                    });
+                    windows_changed();
                     if let Some(opening) = self.opening.take() {
                         opening.published();
                     }
@@ -161,10 +224,46 @@ impl TerminalApp {
                 TransferPhase::Opening | TransferPhase::Offered => {}
             }
         }
-        if self.native_bound && self.outgoing.is_none() {
+        if self.native_bound && self.outgoing.is_none() && self.incoming.is_none() {
             self.window_timer = None;
         } else {
             self.arm_window_tick(ctx);
+        }
+    }
+
+    pub(super) fn existing_window_menu(&self) -> MenuItem {
+        let windows = if self.incoming.is_some() || self.outgoing.is_some() {
+            Vec::new()
+        } else {
+            WINDOWS.with_borrow(|windows| {
+                windows
+                    .iter()
+                    .filter(|(id, _)| **id != self.registry.window_id())
+                    .filter_map(|(id, endpoint)| {
+                        if !unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool() {
+                            return None;
+                        }
+                        let mut title = [0; 256];
+                        let len = unsafe { GetWindowTextW(endpoint.hwnd, &mut title) } as usize;
+                        let title = String::from_utf16_lossy(&title[..len]);
+                        let title = title
+                            .strip_prefix("w11term · ")
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("Terminal");
+                        Some(MenuItem::item(
+                            format!("move-tab-existing-{id}"),
+                            format!("{WINDOW_LABEL}{id} · {title}"),
+                        ))
+                    })
+                    .collect()
+            })
+        };
+        let key = "move-tab-existing";
+        let label = "Move tab to existing window";
+        if windows.is_empty() {
+            MenuItem::disabled(key, label)
+        } else {
+            MenuItem::submenu(key, label, windows)
         }
     }
 
@@ -187,7 +286,11 @@ impl TerminalApp {
         })
     }
 
-    pub(super) fn move_tab_window(&mut self, ctx: &ComponentContext<Self>) {
+    pub(super) fn move_tab_window(
+        &mut self,
+        destination: Option<u64>,
+        ctx: &ComponentContext<Self>,
+    ) {
         if self.outgoing.is_some() || self.incoming.is_some() {
             return;
         }
@@ -210,24 +313,45 @@ impl TerminalApp {
         else {
             return;
         };
-        static NEXT: AtomicU64 = AtomicU64::new(2);
-        let registry = match self
-            .registry
-            .register_window(NEXT.fetch_add(1, Ordering::Relaxed), None)
-        {
-            Ok(registry) => registry,
-            Err(error) => {
-                self.window_error = Some(format!("Opening another window: {error}"));
+        let (destination, new_window, target) = if let Some(destination) = destination {
+            let source = self.registry.window_id();
+            let target = WINDOWS.with_borrow(|windows| {
+                let endpoint = windows.get(&destination)?;
+                (destination != source
+                    && windows.contains_key(&source)
+                    && unsafe { IsWindow(Some(endpoint.hwnd)) }.as_bool())
+                .then(|| endpoint.sender.clone())
+            });
+            let Some(target) = target else {
+                self.window_error = Some("That window is no longer available.".into());
                 return;
-            }
+            };
+            (destination, None, Some(target))
+        } else {
+            static NEXT_WINDOW: AtomicU64 = AtomicU64::new(2);
+            let destination = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
+            let registry = match self.registry.register_window(destination, None) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    self.window_error = Some(format!("Opening another window: {error}"));
+                    return;
+                }
+            };
+            let new_window = NewWindow {
+                registry,
+                server: self._control.clone(),
+            };
+            (destination, Some(new_window), None)
         };
+        static NEXT_TRANSFER: AtomicU64 = AtomicU64::new(1);
         let transfer = Rc::new(Transfer {
-            registry,
-            server: self._control.clone(),
+            ticket: NEXT_TRANSFER.fetch_add(1, Ordering::Relaxed),
+            destination,
+            new_window,
             group,
             panes,
             source: ctx.sender(),
-            target: Default::default(),
+            target: RefCell::new(target),
             payload: Default::default(),
             pin: Default::default(),
             phase: Default::default(),
@@ -235,16 +359,58 @@ impl TerminalApp {
         });
         self.window_error = None;
         self.outgoing = Some(transfer.clone());
-        let launch = WindowLaunch {
-            options: self.window_launch.clone(),
-            opening: None,
-            transfer: Some(transfer.clone()),
+        let started = if transfer.new_window.is_some() {
+            let launch = WindowLaunch {
+                options: self.window_launch.clone(),
+                opening: None,
+                transfer: Some(transfer.clone()),
+            };
+            ctx.open_window(View::component::<Self>(launch))
+        } else {
+            let source = self.registry.window_id();
+            WINDOWS.with_borrow_mut(|windows| {
+                if let Some(endpoint) = windows.get_mut(&source) {
+                    endpoint.outgoing = Rc::downgrade(&transfer);
+                }
+            });
+            transfer.send_target(Message::TransferRequest(source, transfer.id()))
         };
-        if ctx.open_window(View::component::<Self>(launch)) {
+        if started {
             self.arm_window_tick(ctx);
         } else {
             self.cancel_transfer(transfer.id(), ctx);
         }
+    }
+
+    fn existing_destination_blocked(&self) -> bool {
+        self.tabs.entries().is_empty()
+            || self.outgoing.is_some()
+            || self.title_editor.is_some()
+            || self.clipboard.is_open()
+            || self
+                .tabs
+                .active_id()
+                .is_some_and(|id| self.tab_move_blocker(&[id]).is_some())
+    }
+
+    pub(super) fn accept_transfer(&mut self, source: u64, id: u64, ctx: &ComponentContext<Self>) {
+        let offer = WINDOWS.with_borrow(|windows| windows.get(&source)?.outgoing.upgrade());
+        let Some(offer) = offer.filter(|offer| {
+            offer.id() == id
+                && offer.destination == self.registry.window_id()
+                && offer.phase.get() == TransferPhase::Opening
+        }) else {
+            return;
+        };
+        if self.incoming.is_some() || self.existing_destination_blocked() {
+            offer.phase.set(TransferPhase::Canceled);
+            offer.source.send(Message::TransferCanceled(id));
+            return;
+        }
+        offer.phase.set(TransferPhase::Ready);
+        offer.source.send(Message::TransferReady(id));
+        self.incoming = Some(offer);
+        self.arm_window_tick(ctx);
     }
 
     pub(super) fn offer_group(&mut self, id: u64, ctx: &ComponentContext<Self>) {
@@ -316,6 +482,13 @@ impl TerminalApp {
         else {
             return;
         };
+        let existing = offer.new_window.is_none();
+        if existing && self.existing_destination_blocked() {
+            offer.phase.set(TransferPhase::Canceled);
+            offer.source.send(Message::TransferCanceled(id));
+            self.cancel_transfer(id, ctx);
+            return;
+        }
         let Some(payload) = offer.payload.take() else {
             return;
         };
@@ -346,6 +519,14 @@ impl TerminalApp {
         offer.pin.take();
         offer.source.send(Message::TransferDone(id));
         self.incoming = None;
+        if existing && let Some(hwnd) = self.keyboard.hwnd() {
+            unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
     }
 
     pub(super) fn finish_transfer(&mut self, id: u64, ctx: &ComponentContext<Self>) {
@@ -362,9 +543,8 @@ impl TerminalApp {
     }
 
     pub(super) fn cancel_transfer(&mut self, id: u64, ctx: &ComponentContext<Self>) {
-        if self.incoming.as_ref().is_some_and(|o| o.id() == id) {
-            self.incoming = None;
-            if self.tabs.entries().is_empty() {
+        if let Some(offer) = self.incoming.take_if(|o| o.id() == id) {
+            if offer.new_window.is_some() && self.tabs.entries().is_empty() {
                 let _ = ctx.window().request_close();
             }
             return;
@@ -384,9 +564,7 @@ impl TerminalApp {
             self.sync_selection(ctx);
         }
         offer.pin.take();
-        if !offer.send_target(Message::TransferCanceled(id)) {
-            let _ = offer.registry.unregister();
-        }
+        offer.cancel_target();
         self.window_error =
             Some("The tab could not move. It is still available in this window.".into());
     }
@@ -394,6 +572,12 @@ impl TerminalApp {
 
 impl Drop for TerminalApp {
     fn drop(&mut self) {
+        if WINDOWS
+            .try_with(|windows| windows.borrow_mut().remove(&self.registry.window_id()))
+            .is_ok_and(|window| window.is_some())
+        {
+            windows_changed();
+        }
         if let Some(offer) = &self.incoming {
             offer.phase.set(TransferPhase::Canceled);
             offer.source.send(Message::TransferCanceled(offer.id()));
@@ -403,9 +587,7 @@ impl Drop for TerminalApp {
             && offer.payload.borrow().is_none()
         {
             offer.phase.set(TransferPhase::Canceled);
-            if !offer.send_target(Message::TransferCanceled(offer.id())) {
-                let _ = offer.registry.unregister();
-            }
+            offer.cancel_target();
         }
         let _ = self.registry.unregister();
     }
@@ -414,6 +596,18 @@ impl Drop for TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn existing_window_menu_routes_by_id_and_binds_the_selected_tab() {
+        let label = "Window 27 · Work: pane · Window 12    F7";
+        assert_eq!(menu_window(label), Some(27));
+        assert_eq!(menu_window("Window 0 · Terminal"), None);
+        assert_eq!(menu_window("Window 27"), None);
+        assert!(matches!(
+            bind_tab_action(tab_menu_message(label.into()), Some(42)),
+            Message::MoveTabToExistingWindow(Some(42), 27)
+        ));
+    }
 
     #[test]
     fn rollback_keeps_a_newer_source_tab_and_recognizes_the_fallback_by_group() {
