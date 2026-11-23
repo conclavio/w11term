@@ -1,6 +1,7 @@
 use crate::{
     clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     demo,
+    events::ShellPrompt,
     options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
@@ -13,6 +14,7 @@ use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 mod clear_scrollback_tests;
 mod clipboard;
 mod colors;
+mod group_prompt;
 mod launch;
 #[cfg(test)]
 mod recording_tests;
@@ -645,6 +647,13 @@ async fn run(
     let live_commands = sharing.durable.is_none() && can_watch_commands(&source);
     let group_shell =
         direct_ssh_shell(&source, sharing.durable.is_some(), sharing.startup.as_ref());
+    let mut prompt_matcher = match &source {
+        Source::Ssh(options) if group_shell => {
+            options.group_prompt.clone().map(group_prompt::Matcher::new)
+        }
+        _ => None,
+    };
+    terminal.set_track_primary_prints(prompt_matcher.is_some());
     let restartable = can_restart(live_commands, sharing.startup.as_ref());
     let mut launch =
         launch::Launcher::new(source.clone(), sharing, prompts.clone(), events.clone());
@@ -856,7 +865,16 @@ async fn run(
             _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if !is_timed_replay && animation_deadline.is_some() => {
                 presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
             },
-            _=tokio::time::sleep_until(presentation.deadline.unwrap_or_else(||tokio::time::Instant::now()+std::time::Duration::from_secs(86400))),if !is_timed_replay && presentation.deadline.is_some()=>{presentation.expire(&mut terminal);},
+            _=tokio::time::sleep_until(presentation.deadline.unwrap_or_else(||tokio::time::Instant::now()+std::time::Duration::from_secs(86400))),if !is_timed_replay && presentation.deadline.is_some()=>{
+                let seq_before = terminal.current_seqno();
+                presentation.expire(&mut terminal);
+                if let Some(matcher) = &mut prompt_matcher
+                    && connection_generation != 0
+                    && prompts.current().is_none()
+                {
+                    matcher.observe_output(&terminal, seq_before, &events);
+                }
+            },
             _=prompts.changed()=>{},
             Some(notice)=notices.recv()=>match notice {
                 crate::sound::Notice::Play(name)=>{if sounds.try_send(name).is_err(){events.push("sound-error",serde_json::json!({"reason":"audio queue full"}));}},
@@ -908,9 +926,9 @@ async fn run(
                         other => other,
                     }
                 } else { command };
-                if group_shell && matches!(events.shell_prompt(), Some(
-                    crate::events::ShellPrompt::Ready(_) | crate::events::ShellPrompt::Opening
-                )) && match &command {
+                if group_shell && (prompt_matcher.is_some() || matches!(events.shell_prompt(), Some(
+                    ShellPrompt::Ready(_) | ShellPrompt::Matched(_) | ShellPrompt::Opening
+                ))) && match &command {
                     Some(Command::Key { key, modifiers, down, repeat }) =>
                         terminal::encode_key_input(&terminal, *key, *modifiers, *down, *repeat, &Default::default())
                             .is_ok_and(|wire| !wire.is_empty()),
@@ -924,6 +942,7 @@ async fn run(
                     _ => false,
                 } {
                     events.invalidate_shell_prompt();
+                    if let Some(matcher) = &mut prompt_matcher { matcher.input_sent(); }
                 }
                 let mut changes_screen = matches!(&command,Some(Command::Resize(_) | Command::Key {..} | Command::DetailedKey {..} | Command::Paste(_) | Command::Text(_) | Command::Composed(_) | Command::ReloadDemo));
                 let old_offset=scroll_offset;
@@ -932,6 +951,12 @@ async fn run(
                     Some(Command::MirroredKeyboard(_)) => unreachable!("mirrored input was unwrapped above"),
                     Some(Command::SendGroupCommand { prompt, text, reply, execution }) => {
                         let kind = terminal::ScopedInput::GroupCommand;
+                        let ready = match events.shell_prompt() {
+                            Some(ShellPrompt::Ready(current)) => current == prompt && terminal.at_shell_input_start(),
+                            Some(ShellPrompt::Matched(current)) => current == prompt && prompt_matcher
+                                .as_ref().is_some_and(|matcher| matcher.still_matches(&terminal)),
+                            _ => false,
+                        };
                         let rejected = if !group_shell || player.read().unwrap().rustmush {
                             Some("Group commands require a direct SSH shell.")
                         } else if connection_generation != prompt.connection {
@@ -942,7 +967,7 @@ async fn run(
                             Some("The host is on the alternate screen.")
                         } else if !crate::saved_commands::valid_command_text(&text) {
                             Some("Enter one command line of up to 4096 bytes.")
-                        } else if !terminal.at_shell_input_start() || !events.claim_shell_prompt(prompt) {
+                        } else if !ready || !events.claim_shell_prompt(prompt) {
                             Some("The verified prompt changed before the command was sent.")
                         } else {
                             None
@@ -1007,6 +1032,7 @@ async fn run(
                             Ok(Decision::Send { text, raw }) if interactive => {
                                 if group_shell {
                                     events.invalidate_shell_prompt();
+                                    if let Some(matcher) = &mut prompt_matcher { matcher.input_sent(); }
                                 }
                                 let bytes = if raw { text.into_bytes() } else {
                                     scroll_offset = 0;
@@ -1165,7 +1191,12 @@ async fn run(
                             size = new_size;
                             // Apply the PTY resize before its in-band notification reaches the peer.
                             let _ = writer.send(TransportInput::Resize(size));
+                            let matched_before = prompt_matcher.as_ref()
+                                .is_some_and(|matcher| matcher.still_matches(&terminal));
                             resize_model(&mut terminal, size, &mut scroll_offset);
+                            if let Some(matcher) = &mut prompt_matcher {
+                                matcher.resized(&terminal, matched_before, &events);
+                            }
                             update_recording(&mut recorder, &events, |active| active.resize(size));
                             if is_demo && !demo_loaded {
                                 let bytes = demo::bytes();
@@ -1372,6 +1403,7 @@ async fn run(
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
                         ssh::Event::Disconnected => {
+                            if let Some(matcher) = &mut prompt_matcher { matcher.reset(); }
                             terminal.clear_color_scheme_subscription();
                             terminal.clear_resize_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
@@ -1393,9 +1425,16 @@ async fn run(
                             total_bytes += bytes.len() as u64;
                             let before = terminal.get_progress();
                             let program_before = terminal.program_status().cloned();
+                            let seq_before = terminal.current_seqno();
                             scroll_offset = presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                            if let Some(matcher) = &mut prompt_matcher
+                                && connection_generation != 0
+                                && prompts.current().is_none()
+                            {
+                                matcher.observe_output(&terminal, seq_before, &events);
+                            }
                             if group_shell && !terminal.at_shell_input_start()
-                                && matches!(events.shell_prompt(), Some(crate::events::ShellPrompt::Ready(_)))
+                                && matches!(events.shell_prompt(), Some(ShellPrompt::Ready(_)))
                             {
                                 events.invalidate_shell_prompt();
                             }
@@ -1414,6 +1453,7 @@ async fn run(
                             presentation.refresh_view = true;
                         }
                         ssh::Event::Connected(generation) => {
+                            if let Some(matcher) = &mut prompt_matcher { matcher.reset(); }
                             search_origin = Arc::new(());
                             if matches!(phase, Phase::Restarting { .. }) {
                                 // Anything already waiting in this FIFO predates the ready frame.

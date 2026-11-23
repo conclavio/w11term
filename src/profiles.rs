@@ -585,6 +585,9 @@ impl ProfileStore {
             if !keep_forwards && options.local_forwards.is_empty() {
                 object.remove("local_forwards");
             }
+            if options.group_prompt.is_none() {
+                object.remove("group_prompt");
+            }
             for (key, value) in serde_json::to_value(options)?.as_object().unwrap() {
                 if (key == "identity" && keep_identity)
                     || (key == "proxy_jump" && keep_route)
@@ -743,6 +746,7 @@ mod tests {
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
             durable: false,
+            group_prompt: None,
             player: Default::default(),
         };
         store.add("new", &options).unwrap();
@@ -758,6 +762,33 @@ mod tests {
         );
         assert!(store.add("new", &options).is_err());
         assert_eq!(std::fs::read(path).unwrap(), saved);
+    }
+
+    #[test]
+    fn editing_can_add_and_clear_a_group_prompt_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"Rack":{"host":"rack.test","user":"ops","auth":"none","custom":42}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let (_, previous) = store.inspect("Rack").unwrap();
+        let mut next = previous.options.clone();
+        next.group_prompt = Some("racadm>>".to_owned().try_into().unwrap());
+        store
+            .edit("Rack", "Rack", &next, &previous.options)
+            .unwrap();
+
+        let (_, saved) = store.inspect("Rack").unwrap();
+        assert_eq!(saved.options.group_prompt, next.group_prompt);
+        next.group_prompt = None;
+        store.edit("Rack", "Rack", &next, &saved.options).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(json["profiles"]["Rack"].get("group_prompt").is_none());
+        assert_eq!(json["profiles"]["Rack"]["custom"], 42);
     }
 
     #[test]

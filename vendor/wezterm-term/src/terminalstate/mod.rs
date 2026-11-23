@@ -335,6 +335,15 @@ impl CompletedCommand {
     }
 }
 
+/// Location of the last non-blank text printed into the primary screen.
+#[derive(Clone, Copy)]
+pub struct PrimaryPrint {
+    pub seqno: SequenceNo,
+    pub row_epoch: u64,
+    pub row: StableRowIndex,
+    pub end_col: usize,
+}
+
 #[derive(Clone, Copy)]
 enum ConEmuDirectoryReports {
     Drive,
@@ -474,6 +483,8 @@ pub struct TerminalState {
     command_history: Arc<VecDeque<Arc<CompletedCommand>>>,
     next_command_id: u64,
     capturing_shell_input: bool,
+    track_primary_prints: bool,
+    last_primary_print: Option<PrimaryPrint>,
     command_label: Option<String>,
     vscode_command: VscodeCommand,
 
@@ -753,6 +764,8 @@ impl TerminalState {
             command_history: Arc::default(),
             next_command_id: 1,
             capturing_shell_input: false,
+            track_primary_prints: false,
+            last_primary_print: None,
             command_label: None,
             vscode_command: VscodeCommand::Idle,
             term_program: term_program.to_string(),
@@ -793,6 +806,15 @@ impl TerminalState {
 
     pub fn current_seqno(&self) -> SequenceNo {
         self.seqno
+    }
+
+    pub fn set_track_primary_prints(&mut self, track: bool) {
+        self.track_primary_prints = track;
+        self.last_primary_print = None;
+    }
+
+    pub fn last_primary_print(&self) -> Option<PrimaryPrint> {
+        self.last_primary_print
     }
 
     pub fn synchronized_output(&self) -> bool {

@@ -976,6 +976,71 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives the native SSH group against an appliance shell without OSC markers"]
+async fn native_ssh_group_prompt_matches_fresh_appliance_output() {
+    use in_band_resize::Wire;
+    let state = tempfile::tempdir().unwrap();
+    let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (Source::Ssh(mut ssh), _root, opens, server) =
+        fixture_with_wire(false, 2, Arc::default(), Some(wire)).await
+    else {
+        unreachable!()
+    };
+    ssh.group_prompt = Some("rack-[12]>>".to_owned().try_into().unwrap());
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":{"Appliance":ssh}})).unwrap(),
+    )
+    .unwrap();
+    let (sent, mut trace) = tokio::sync::mpsc::unbounded_channel();
+    let responder = tokio::spawn(async move {
+        let mut peer = None;
+        while let Some(message) = received.recv().await {
+            match message {
+                Wire::Shell(id, handle) => {
+                    if peer.is_none() {
+                        handle.data(id, b"rack-1>> ".as_slice()).await.unwrap();
+                    }
+                    peer = Some(handle);
+                }
+                Wire::Window(..) => {}
+                Wire::Input(id, bytes) => {
+                    sent.send(bytes.clone()).unwrap();
+                    let handle = peer.as_ref().unwrap();
+                    let response = match bytes.as_slice() {
+                        b"show\r" => b"show\r\nappliance-output".as_slice(),
+                        b"finish" => b"\r\nrack-2>> ".as_slice(),
+                        b"redraw" => b"\r\nrack-1>> ".as_slice(),
+                        b"drop" => {
+                            handle
+                                .disconnect(
+                                    russh::Disconnect::ByApplication,
+                                    "test reconnect".into(),
+                                    "en".into(),
+                                )
+                                .await
+                                .unwrap();
+                            continue;
+                        }
+                        _ => panic!("unexpected appliance input: {bytes:?}"),
+                    };
+                    handle.data(id, response).await.unwrap();
+                }
+            }
+        }
+    });
+    drive_gui("ssh-group-prompt-matcher-ui.ps1", state.path());
+    let mut observed = Vec::new();
+    while let Ok(bytes) = trace.try_recv() {
+        observed.extend(bytes);
+    }
+    assert_eq!(observed, b"show\rfinishdropredraw");
+    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    responder.abort();
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reopens persisted group profiles as selected SSH tabs and edits the group in WinUI"]
 async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
     let state = tempfile::tempdir().unwrap();

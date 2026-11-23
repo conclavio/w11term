@@ -4,9 +4,11 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+mod group_prompt;
 mod local;
 mod ssh_destination;
 mod tab_color;
+pub use group_prompt::GroupPromptPattern;
 pub use local::LocalOptions;
 pub use tab_color::TabColor;
 
@@ -256,6 +258,8 @@ pub struct SshOptions {
     pub proxy_jump: Vec<JumpHost>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_forwards: Vec<LocalForwardPreset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_prompt: Option<GroupPromptPattern>,
     #[serde(default)]
     pub durable: bool,
     #[serde(default)]
@@ -296,6 +300,7 @@ impl From<JumpHost> for SshOptions {
             host_key_alias: hop.host_key_alias,
             proxy_jump: Vec::new(),
             local_forwards: Vec::new(),
+            group_prompt: None,
             durable: false,
             player: PlayerOptions::default(),
         }
