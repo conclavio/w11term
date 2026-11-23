@@ -198,6 +198,7 @@ pub enum Shortcut {
     KeyboardHints,
     HintKey(u32),
     CopyMode,
+    SelectAll,
     CopyKey(w11term::copy_mode::CopyKey),
     MovePane,
     MovePaneToExistingTab,
@@ -1288,7 +1289,14 @@ impl State {
                     }
                     self.local_held.insert(slot, mode == LocalMode::Copy);
                     if mode == LocalMode::Copy {
-                        if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, modifiers())
+                        let mods = modifiers();
+                        let right_alt = unsafe { GetKeyState(VK_RMENU.0 as i32) < 0 };
+                        if self.keymap.resolve(vk, mods, true, right_alt) == Some(Action::SelectAll)
+                        {
+                            if !repeat {
+                                (self.shortcut)(Shortcut::SelectAll);
+                            }
+                        } else if let Some(key) = w11term::copy_mode::CopyKey::from_vk(vk, mods)
                             && (!repeat || key.repeats())
                         {
                             if key == w11term::copy_mode::CopyKey::Cancel {
@@ -1483,8 +1491,9 @@ impl State {
                     }
                     if matches!(shortcut, Shortcut::KeyboardHints) {
                         self.local_mode = Some(LocalMode::Hints);
-                    } else if matches!(shortcut, Shortcut::CopyMode) {
+                    } else if matches!(shortcut, Shortcut::CopyMode | Shortcut::SelectAll) {
                         self.local_mode = Some(LocalMode::Copy);
+                        self.local_held.insert(slot, false);
                     }
                     if let Shortcut::ResizePane(direction) = shortcut {
                         self.held_resize = Some(HeldResize {
@@ -1790,6 +1799,7 @@ impl From<Action> for Shortcut {
             Action::FindAllPanes => Self::FindAllPanes,
             Action::KeyboardHints => Self::KeyboardHints,
             Action::CopyMode => Self::CopyMode,
+            Action::SelectAll => Self::SelectAll,
             Action::ClearScrollback => Self::ClearScrollback,
             Action::NextTab => Self::NextTab,
             Action::PreviousTab => Self::PreviousTab,
@@ -2270,6 +2280,68 @@ mod tests {
             [Shortcut::MoveTabLeft, Shortcut::MoveTabRight]
         );
         assert!(input.try_recv().is_err());
+    }
+
+    #[test]
+    fn remapped_select_all_captures_rapid_copy_and_never_claims_a_text_field() {
+        let _scope = WindowScope::default().enter();
+        let lab = Session::start(Source::Demo);
+        let (sender, mut input) = mpsc::unbounded_channel();
+        let actions = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let observed = actions.clone();
+        let mut bindings = Shortcuts::default();
+        bindings
+            .set(Action::SelectAll, Some("F10".parse().unwrap()))
+            .unwrap();
+        let mut state = State {
+            keymap: bindings.keymap().unwrap(),
+            target: Some(Target {
+                sender,
+                frames: lab.frames.clone(),
+            }),
+            read_only: Some(std::rc::Rc::new(std::cell::Cell::new(true))),
+            ..State::new(move |action| observed.borrow_mut().push(action))
+        };
+        let key = |message, vk, repeat| MSG {
+            message,
+            wParam: WPARAM(vk),
+            lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+            ..Default::default()
+        };
+        state.search = true;
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x79, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x79, false)));
+        state.search = false;
+        state.drawer_focused = true;
+        assert!(!state.handle(&key(WM_KEYDOWN, 0x79, false)));
+        assert!(!state.handle(&key(WM_KEYUP, 0x79, false)));
+        state.drawer_focused = false;
+        assert!(state.handle(&key(WM_KEYDOWN, 0x79, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x79, true)));
+        assert!(state.handle(&key(WM_KEYUP, 0x79, false)));
+        // The UI may still be fetching the selection when the user presses y.
+        assert!(state.handle(&key(WM_KEYDOWN, 0x59, false)));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x1b, false)));
+        let (next, mut next_input) = mpsc::unbounded_channel();
+        state.retarget(Some(Target {
+            sender: next,
+            frames: lab.frames.clone(),
+        }));
+        assert!(state.handle(&key(WM_KEYDOWN, 0x59, true)));
+        assert!(state.handle(&key(WM_KEYUP, 0x59, false)));
+        assert!(state.handle(&key(WM_KEYUP, 0x1b, false)));
+        assert_eq!(
+            *actions.borrow(),
+            [
+                Shortcut::SelectAll,
+                Shortcut::CopyKey(w11term::copy_mode::CopyKey::Copy),
+                Shortcut::CopyKey(w11term::copy_mode::CopyKey::Cancel)
+            ]
+        );
+        assert!(matches!(input.try_recv(), Ok(Command::Focus(false))));
+        assert!(matches!(next_input.try_recv(), Ok(Command::Focus(_))));
+        assert!(input.try_recv().is_err());
+        assert!(next_input.try_recv().is_err());
     }
 
     #[test]

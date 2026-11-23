@@ -644,6 +644,8 @@ fn tab_menu_message(label: String) -> Message {
         "Find pane…" => Message::Shortcut(Shortcut::PanePicker),
         pane_picker::FIND_TEXT_LABEL => Message::Shortcut(Shortcut::FindAllPanes),
         "Keyboard copy mode" => Message::Shortcut(Shortcut::CopyMode),
+        "Select all terminal text" => Message::Shortcut(Shortcut::SelectAll),
+        "Copy selection" => Message::Shortcut(Shortcut::Copy),
         "Keyboard hints" => Message::Shortcut(Shortcut::KeyboardHints),
         _ => Message::ControlIdle,
     }
@@ -924,6 +926,13 @@ pub enum Message {
     Paste,
     Clipboard(clipboard_paste::Action),
     CopyResult(TabId, u64, Result<(), String>),
+    SelectAll(Option<clipboard_paste::Origin>),
+    CopySelection(Option<clipboard_paste::Origin>),
+    SelectAllResult(
+        TabId,
+        u64,
+        Result<w11term::copy_mode::CopyMode, &'static str>,
+    ),
     CopyWordResult(TabId, u64, Option<Point>),
     Pointer(TabId, PointerEventInfo, MouseEventKind),
     RenderError(TabId, String),
@@ -1349,10 +1358,16 @@ impl TerminalApp {
         else {
             return false;
         };
-        tab.selection
+        let frame = tab.session.frames.load();
+        self.copy_mode.borrow().as_ref().is_some_and(|mode| {
+            Some(mode.pane) == self.tabs.active_id()
+                && mode.state.valid(&frame)
+                && mode.state.selection().is_some()
+        }) || tab
+            .selection
             .borrow()
             .as_ref()
-            .is_some_and(|selection| selection.can_copy(&tab.session.frames.load()))
+            .is_some_and(|selection| selection.can_copy(&frame))
     }
     fn clear_selection(&mut self) {
         if let Some(AppTab {
@@ -2819,6 +2834,8 @@ impl TerminalApp {
                 Message::Shortcut(Shortcut::ClearScrollback) => {
                     pane.map_or(Message::ControlIdle, Message::ClearScrollback)
                 }
+                Message::Shortcut(Shortcut::SelectAll) => Message::SelectAll(paste),
+                Message::Shortcut(Shortcut::Copy) => Message::CopySelection(paste),
                 message => bind_tab_action(message, group),
             },
         });
@@ -3270,6 +3287,17 @@ impl TerminalApp {
                 MenuItem::disabled("move-tab-window", "Move tab to new window")
             },
             self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
+            self.binding_menu_enabled(
+                "select-all",
+                KeyAction::SelectAll.binding().label,
+                KeyAction::SelectAll,
+                self.copy_mode_target().is_some(),
+            ),
+            command_menu_item(
+                "copy-selection",
+                "Copy selection    Ctrl+Shift+C",
+                self.active_selection(),
+            ),
             self.binding_menu("keyboard-hints", "Keyboard hints", KeyAction::KeyboardHints),
         ];
         if matches!(self.tabs.active(), Some(AppTab { page: Page::Terminal(tab), .. }) if matches!(tab.source, Source::Ssh(_)))
@@ -3754,6 +3782,7 @@ impl Component for TerminalApp {
         let shortcut_menu = caret_menu_binding.clone();
         let keyboard = KeyboardBridge::install(move |shortcut| {
             sender.send(match shortcut {
+                Shortcut::SelectAll => Message::SelectAll(paste_origin.get()),
                 Shortcut::Paste | Shortcut::PasteRaw => {
                     Message::Clipboard(clipboard_paste::Action::Start(
                         paste_origin.get(),
@@ -4888,6 +4917,7 @@ impl Component for TerminalApp {
                         let frame = tab.session.frames.load();
                         if tab.reconcile_selection(&frame) && active {
                             self.keyboard.set_selection(false);
+                            self.header.borrow_mut().take();
                         }
                         if let Some(selection) =
                             tab.selection.borrow_mut().as_mut().filter(|s| s.dragging)
@@ -5071,7 +5101,10 @@ impl Component for TerminalApp {
                         self.place_pane(source, target, side, context);
                     }
                 }
-                Shortcut::CopyMode => self.open_copy_mode(),
+                Shortcut::CopyMode => {
+                    self.open_copy_mode();
+                }
+                Shortcut::SelectAll => self.select_all(self.paste_origin(), context),
                 // Keyboard input uses the worker receiving the keydown. Menus carry its pane ID.
                 Shortcut::ClearScrollback => {}
                 Shortcut::CopyKey(key) => self.copy_key(key, context),
@@ -5294,6 +5327,19 @@ impl Component for TerminalApp {
             Message::PasteRaw => self.paste(true, context),
             Message::CopyResult(pane, request, result) => {
                 self.finish_keyboard_copy(pane, request, result)
+            }
+            Message::SelectAll(origin) => self.select_all(origin, context),
+            Message::CopySelection(origin) => {
+                if origin.is_some() && self.paste_origin() == origin && self.active_selection() {
+                    if self.copy_mode.borrow().is_some() {
+                        self.copy_key(w11term::copy_mode::CopyKey::Copy, context);
+                    } else {
+                        self.copy();
+                    }
+                }
+            }
+            Message::SelectAllResult(pane, request, result) => {
+                self.finish_select_all(pane, request, result, context)
             }
             Message::CopyWordResult(pane, request, point) => {
                 self.finish_copy_word(pane, request, point, context)
@@ -5677,10 +5723,12 @@ impl Component for TerminalApp {
             && !self.clipboard.is_open()
             && let (Some(parent), Some(bounds)) = (crate::input::window(), self.focused_pane_rect())
         {
+            let frame = tab.session.frames.load();
             let marked = self
                 .copy_mode
                 .borrow()
                 .as_ref()
+                .filter(|mode| Some(mode.pane) == self.tabs.active_id() && mode.state.valid(&frame))
                 .and_then(|m| m.state.selection());
             let metrics = tab.surface.metrics.get();
             let sender = context.sender();
@@ -5698,9 +5746,10 @@ impl Component for TerminalApp {
                         cell_height: f64::from(metrics.cell_height * metrics.scale),
                         padding: f64::from(PADDING * metrics.scale),
                     },
-                    selection: marked.as_ref().or(tab.selection.borrow().as_ref()).filter(
-                        |selection| selection.survives_scrollback_clear(&tab.session.frames.load()),
-                    ),
+                    selection: marked
+                        .as_ref()
+                        .or(tab.selection.borrow().as_ref())
+                        .filter(|selection| selection.survives_scrollback_clear(&frame)),
                 },
                 move |request| {
                     sender.send(Message::AccessibleSelection(request));

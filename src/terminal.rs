@@ -21,7 +21,7 @@ mod scrollback_view;
 pub use scrollback_view::{ScrollbackTarget, ScrollbackView};
 #[cfg(test)]
 mod scrollback_tests;
-pub(crate) use export::export_text;
+pub(crate) use export::{export_text, retained_text_rows};
 pub use kitty::KeypadKey;
 
 pub type Rgba = [f32; 4];

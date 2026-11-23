@@ -38,6 +38,7 @@ pub enum Action {
     FindAllPanes,
     KeyboardHints,
     CopyMode,
+    SelectAll,
     ClearScrollback,
     NextTab,
     PreviousTab,
@@ -183,6 +184,13 @@ pub const BINDINGS: &[Binding] = &[
         CTRL_SHIFT,
     ),
     Binding::new(
+        SelectAll,
+        "select_all",
+        "Select all terminal text",
+        0x41,
+        CTRL_SHIFT,
+    ),
+    Binding::new(
         ClearScrollback,
         "clear_scrollback",
         "Clear scrollback",
@@ -268,6 +276,7 @@ impl Action {
                 | DuplicateTabLayout
                 | KeyboardHints
                 | CopyMode
+                | SelectAll
                 | ClearScrollback
         )
     }
@@ -503,6 +512,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn select_all_keeps_plain_ctrl_a_and_native_text_fields_available() {
+        let mut shortcuts = Shortcuts::default();
+        let map = shortcuts.keymap().unwrap();
+        assert_eq!(map.resolve(0x41, CTRL_SHIFT, true, false), Some(SelectAll));
+        assert_eq!(map.resolve(0x41, Mods::CTRL, true, false), None);
+        assert_eq!(map.resolve(0x41, CTRL_SHIFT, false, false), None);
+
+        shortcuts
+            .set(SelectAll, Some("F10".parse().unwrap()))
+            .unwrap();
+        let map = shortcuts.keymap().unwrap();
+        assert_eq!(map.resolve(0x41, CTRL_SHIFT, true, false), None);
+        assert_eq!(map.resolve(0x79, Mods::NONE, true, false), Some(SelectAll));
+        assert_eq!(map.resolve(0x79, Mods::NONE, false, false), None);
     }
 
     #[test]

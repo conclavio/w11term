@@ -107,6 +107,10 @@ pub enum Command {
         delimiters: String,
         reply: tokio::sync::oneshot::Sender<Option<crate::interaction::Point>>,
     },
+    SelectAll {
+        screen: crate::copy_mode::ScreenId,
+        reply: tokio::sync::oneshot::Sender<Result<crate::copy_mode::CopyMode, &'static str>>,
+    },
     CopyRange {
         screen: crate::copy_mode::ScreenId,
         selection: crate::interaction::Selection,
@@ -996,7 +1000,25 @@ async fn run(
                         Ok(())
                     }
                     Some(Command::CopyRange { screen, selection, trim_block, reply }) => {
-                        let _ = reply.send(crate::copy_mode::selected_text(&terminal, connection_generation, screen, selection, trim_block));
+                        if !reply.is_closed() {
+                            let result = if playback.as_ref().is_some_and(|reader| reader.in_group) {
+                                Err("Terminal output is updating; try again after the frame finishes")
+                            } else {
+                                crate::copy_mode::selected_text(&terminal, connection_generation, screen, selection, trim_block)
+                            };
+                            let _ = reply.send(result);
+                        }
+                        Ok(())
+                    }
+                    Some(Command::SelectAll { screen, reply }) => {
+                        if !reply.is_closed() {
+                            let result = if playback.as_ref().is_some_and(|reader| reader.in_group) {
+                                Err("Terminal output is updating; try again after the frame finishes")
+                            } else {
+                                crate::copy_mode::CopyMode::select_all(&terminal, connection_generation, screen, &frames.load())
+                            };
+                            let _ = reply.send(result);
+                        }
                         Ok(())
                     }
                     Some(Command::ScrollRange(request)) => {

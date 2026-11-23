@@ -41,7 +41,8 @@ impl CopyKey {
                 0x27 if !mods.contains(Mods::SHIFT) => Some(Word(WordMotion::NextStart)),
                 0x24 => Some(First),
                 0x23 => Some(Last),
-                0x43 if mods.contains(Mods::SHIFT) => Some(Copy),
+                0x43 => Some(Copy),
+                0x2d if !mods.contains(Mods::SHIFT) => Some(Copy),
                 0x56 if !mods.contains(Mods::SHIFT) => Some(Block),
                 _ => None,
             };
@@ -112,13 +113,15 @@ impl ScreenId {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Shape {
+    All { empty_last_row: bool },
     Character,
     Line,
     Block,
 }
 
+#[derive(Debug)]
 pub struct CopyMode {
     pub screen: ScreenId,
     pub cursor: Point,
@@ -153,6 +156,52 @@ impl CopyMode {
         }
     }
 
+    /// Retain only stable endpoints. A large history costs no memory until Copy,
+    /// when the same bounded plain-text formatter as any keyboard selection runs.
+    pub(crate) fn select_all(
+        terminal: &TerminalState,
+        generation: u64,
+        id: ScreenId,
+        frame: &Snapshot,
+    ) -> Result<Self, &'static str> {
+        let screen = terminal.screen();
+        if id != frame.into()
+            || !id.same_coordinates(terminal, generation)
+            || id.history_clear_count != screen.history_clear_count()
+        {
+            return Err("The terminal changed while selecting");
+        }
+        let rows = crate::terminal::retained_text_rows(terminal)?;
+        let last = rows.end - 1;
+        let line = screen
+            .physical_lines()
+            .nth(last)
+            .expect("a screen has at least one row");
+        let last_col = line
+            .visible_cells()
+            .take_while(|cell| cell.cell_index() < screen.physical_cols)
+            .filter(|cell| !cell.str().trim_end().is_empty())
+            .map(|cell| cell.cell_index() + cell.width().saturating_sub(1))
+            .last();
+        let mut mode = Self::new(frame);
+        mode.anchor = Some((
+            Point {
+                row: screen.phys_to_stable_row_index(rows.start),
+                col: 0,
+            },
+            Shape::All {
+                empty_last_row: last_col.is_none(),
+            },
+        ));
+        mode.cursor = Point {
+            row: screen.phys_to_stable_row_index(last),
+            col: last_col
+                .unwrap_or(0)
+                .min(screen.physical_cols.saturating_sub(1)),
+        };
+        Ok(mode)
+    }
+
     pub fn valid(&self, frame: &Snapshot) -> bool {
         let live_top = frame.first_stable_row + frame.scroll_offset as isize;
         let retained = frame.oldest_stable_row..live_top + frame.rows.len() as isize;
@@ -163,6 +212,12 @@ impl CopyMode {
 
     pub fn instructions(&self) -> &'static str {
         match self.anchor {
+            Some((_, Shape::All { .. })) if self.screen.alternate => {
+                "Copy mode · Alternate screen text selected · y or Enter copy · Esc cancel"
+            }
+            Some((_, Shape::All { .. })) => {
+                "Copy mode · All retained text selected · y or Enter copy · Esc cancel"
+            }
             None => {
                 "Copy mode · Arrows or hjkl move · w/b/e words · v character · Shift+V line · Ctrl+V or r block · Esc exit"
             }
@@ -229,6 +284,9 @@ impl CopyMode {
     }
 
     pub fn move_to(&mut self, point: Point, frame: &Snapshot) {
+        if let Some((_, shape @ Shape::All { .. })) = &mut self.anchor {
+            *shape = Shape::Character;
+        }
         let height = frame.rows.len().max(1) as isize;
         let last_top = frame.first_stable_row + frame.scroll_offset as isize;
         self.cursor = Point {
@@ -255,6 +313,12 @@ impl CopyMode {
         }
         let mut selection = Selection::new(anchor, shape == Shape::Block, self.screen.alternate);
         selection.end = end;
+        selection.end_exclusive = matches!(
+            shape,
+            Shape::All {
+                empty_last_row: true
+            }
+        );
         selection.active = true;
         selection.dragging = false;
         selection.cols = self.screen.cols;
@@ -271,6 +335,9 @@ pub fn selected_text(
     trim_block: bool,
 ) -> Result<String, &'static str> {
     let screen = terminal.screen();
+    if terminal.synchronized_output() {
+        return Err("Terminal output is updating; try again after the frame finishes");
+    }
     if !id.same_coordinates(terminal, generation) {
         return Err("The terminal changed while selecting");
     }
@@ -282,18 +349,16 @@ pub fn selected_text(
     ) else {
         return Err("Selected text left scrollback");
     };
-    let mut result = Ok(String::new());
-    screen.with_phys_lines(start..end + 1, |lines| {
-        result = selection.text_from_rows(
-            lines
-                .iter()
-                .enumerate()
-                .map(|(i, line)| (first + i as isize, *line)),
-            trim_block,
-            crate::clipboard::MAX_TEXT,
-        );
-    });
-    result
+    if id.history_clear_count != screen.history_clear_count() {
+        return Err("The terminal changed while selecting");
+    }
+    let lines = screen
+        .physical_lines()
+        .skip(start)
+        .take(end - start + 1)
+        .enumerate()
+        .map(|(offset, line)| (first + offset as isize, line));
+    selection.text_from_rows(lines, trim_block, crate::clipboard::MAX_TEXT)
 }
 
 #[cfg(test)]
@@ -316,6 +381,125 @@ mod tests {
     }
     fn view(t: &TerminalState, offset: usize) -> Snapshot {
         Snapshot::capture(t, None, 1, offset, String::new(), 0)
+    }
+
+    #[test]
+    fn select_all_keeps_the_viewport_and_selects_wrapped_unicode_history_through_the_last_cell() {
+        let mut t = terminal("123456789\r\n\r\n\x1b[35me\u{301}\x1b[0m\r\nlast界");
+        let frame = view(&t, 1);
+        let mode = CopyMode::select_all(&t, 0, (&frame).into(), &frame).unwrap();
+        let selection = mode.selection().unwrap();
+        assert!(mode.valid(&frame));
+        assert!(frame.first_stable_row > frame.oldest_stable_row);
+        assert_eq!(mode.top, frame.first_stable_row);
+        assert_eq!(mode.original_top, Some(mode.top));
+        assert_eq!(
+            selection.anchor,
+            Point {
+                row: frame.oldest_stable_row,
+                col: 0
+            }
+        );
+        assert_eq!(selection.end.col, 5); // Includes the trailing column of 界.
+        let expected = "123456789\r\n\r\ne\u{301}\r\nlast界";
+        assert_eq!(crate::terminal::export_text(&t).as_deref(), Ok(expected));
+        t.advance_bytes("xy\r\nlater");
+        assert!(mode.valid(&view(&t, 0)));
+        assert_eq!(
+            selected_text(&t, 0, mode.screen, selection, true).as_deref(),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn select_all_preserves_intentional_blank_lines_and_only_visits_the_active_screen() {
+        let mut t = terminal("");
+        let copy = |t: &TerminalState| {
+            let frame = view(t, 0);
+            let mode = CopyMode::select_all(t, 0, (&frame).into(), &frame).unwrap();
+            selected_text(t, 0, mode.screen, mode.selection().unwrap(), true).unwrap()
+        };
+        assert_eq!(copy(&t), "");
+        t.advance_bytes("primary\r\n\r\n");
+        assert_eq!(copy(&t), "primary\r\n\r\n");
+        let primary = view(&t, 0);
+        t.advance_bytes("\x1b[?1049h\x1b[Halt\x1b[3;2H界\x1b[H");
+        assert!(CopyMode::select_all(&t, 0, (&primary).into(), &primary).is_err());
+        let frame = view(&t, 0);
+        let mut mode = CopyMode::select_all(&t, 0, (&frame).into(), &frame).unwrap();
+        assert!(mode.instructions().contains("Alternate screen"));
+        assert_eq!(copy(&t), "alt\r\n\r\n 界");
+        mode.navigate(Left, &frame);
+        assert!(mode.instructions().contains("Character selection"));
+        t.advance_bytes("\x1b[?1049l");
+        assert!(!mode.valid(&view(&t, 0)));
+        assert_eq!(copy(&t), "primary\r\n\r\n");
+    }
+
+    #[test]
+    fn select_all_ending_at_an_empty_row_does_not_grow_when_that_row_receives_output() {
+        for initial in ["", "previous\r\n"] {
+            let mut t = terminal(initial);
+            let frame = view(&t, 0);
+            let mode = CopyMode::select_all(&t, 0, (&frame).into(), &frame).unwrap();
+            let selection = mode.selection().unwrap();
+            assert_eq!(selection.span(selection.end.row, frame.cols), Some(0..0));
+            t.advance_bytes("new");
+            assert_eq!(
+                selected_text(&t, 0, mode.screen, selection, true).as_deref(),
+                Ok(initial)
+            );
+        }
+    }
+
+    #[test]
+    fn select_all_rejects_reconnect_clear_and_natural_eviction_even_at_the_same_dimensions() {
+        let mut t = crate::terminal::create_with_profile(
+            wezterm_term::TerminalSize {
+                cols: 8,
+                rows: 2,
+                ..Default::default()
+            },
+            tokio::sync::mpsc::unbounded_channel().0,
+            1u32.try_into().unwrap(),
+            Default::default(),
+        );
+        t.advance_bytes("one\r\ntwo\r\nthree");
+        let frame = view(&t, 0);
+        let mode = CopyMode::select_all(&t, 0, (&frame).into(), &frame).unwrap();
+        assert!(CopyMode::select_all(&t, 1, mode.screen, &frame).is_err());
+        t.advance_bytes("\r\nfour");
+        assert!(!mode.valid(&view(&t, 0)));
+        assert_eq!(
+            selected_text(&t, 0, mode.screen, mode.selection().unwrap(), true),
+            Err("Selected text left scrollback")
+        );
+        let frame = view(&t, 0);
+        let mode = CopyMode::select_all(&t, 0, (&frame).into(), &frame).unwrap();
+        t.advance_bytes("\x1b[3J");
+        assert!(!mode.valid(&view(&t, 0)));
+        assert!(CopyMode::select_all(&t, 0, mode.screen, &frame).is_err());
+    }
+
+    #[test]
+    fn select_all_accepts_the_standard_copy_gestures_in_keyboard_selection() {
+        for (vk, mods) in [
+            (0x43, Mods::CTRL),
+            (0x43, Mods::CTRL | Mods::SHIFT),
+            (0x2d, Mods::CTRL),
+        ] {
+            assert_eq!(CopyKey::from_vk(vk, mods), Some(Copy));
+        }
+        assert!(!Copy.repeats());
+        for (vk, mods) in [
+            (0x43, Mods::NONE),
+            (0x2d, Mods::NONE),
+            (0x2d, Mods::CTRL | Mods::SHIFT),
+            (0x43, Mods::CTRL | Mods::ALT),
+            (0x43, Mods::CTRL | Mods::SUPER),
+        ] {
+            assert_eq!(CopyKey::from_vk(vk, mods), None);
+        }
     }
     #[test]
     fn reverse_line_selection_copies_pages_between_endpoints_and_joins_wrapped_lines() {

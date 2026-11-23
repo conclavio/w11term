@@ -7,6 +7,61 @@ pub(super) async fn capture(input: &mpsc::UnboundedSender<Command>) -> Snapshot 
     receive.await.unwrap().0
 }
 
+#[tokio::test(start_paused = true)]
+async fn select_all_waits_for_a_committed_screen_and_keeps_the_scrolled_read_only_view() {
+    let size = TerminalSize {
+        cols: 16,
+        rows: 2,
+        ..Default::default()
+    };
+    with_demo(size, async |input, frames| {
+        let select = async |screen| {
+            let (reply, receive) = oneshot::channel();
+            input.send(Command::SelectAll { screen, reply }).unwrap();
+            receive.await.unwrap()
+        };
+        let copy = async |mode: &crate::copy_mode::CopyMode| {
+            let (reply, receive) = oneshot::channel();
+            input
+                .send(Command::CopyRange {
+                    screen: mode.screen,
+                    selection: mode.selection().unwrap(),
+                    trim_block: true,
+                    reply,
+                })
+                .unwrap();
+            receive.await.unwrap()
+        };
+        let before = feed(&input, "one\ntwo\nthree").await;
+        let previous = select((&before).into()).await.unwrap();
+        feed(&input, "\x1b[?2026h\nfour").await;
+        assert!(
+            select((&before).into())
+                .await
+                .unwrap_err()
+                .contains("updating")
+        );
+        assert!(copy(&previous).await.unwrap_err().contains("updating"));
+        feed(&input, "\x1b[?2026l").await;
+        input.send(Command::ScrollEdge(true)).unwrap();
+        input.send(Command::SetReadOnly(true)).unwrap();
+        capture(&input).await;
+        let scrolled = frames.load();
+        assert!(scrolled.scroll_offset > 0);
+        let mode = select((&*scrolled).into()).await.unwrap();
+        assert!(mode.valid(&scrolled));
+        assert_eq!(mode.original_top, Some(scrolled.first_stable_row));
+        assert_eq!(
+            copy(&mode).await.as_deref(),
+            Ok("one\r\ntwo\r\nthree\r\nfour")
+        );
+        assert_eq!(frames.load().generation, scrolled.generation);
+        input.send(Command::ClearScrollback).unwrap();
+        assert!(copy(&mode).await.is_err());
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn raw_recording_viewer_uses_saved_grid_and_emits_only_title_alerts() {
     use crate::options::Source;

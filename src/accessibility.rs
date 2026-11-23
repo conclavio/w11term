@@ -378,6 +378,7 @@ impl Bridge {
         let selected = selection.filter(|s| s.active).map(|s| Selection {
             anchor: s.anchor,
             end: s.end,
+            end_exclusive: s.end_exclusive,
             block: s.block,
         });
         let mut slot = self.host.borrow_mut();
