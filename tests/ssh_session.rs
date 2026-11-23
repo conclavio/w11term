@@ -157,6 +157,7 @@ impl server::Handler for Peer {
                     "\x1b[6;1HABCDEF\x1b[7;1H123456\x1b[6;7r\x1b[6;3H\x1b[2'}\x1b['~",
                     "\x1b[6;1H\x1b6\x1b9\x1b[2 A\x1b[ @\x1b[6n\x1b[r",
                     "\x1b[1\"q\x1bP$q\"q\x1b\\\x1b8",
+                    "\x1bP2$t4/12\x1b\\\x1b[2$w",
                 )
                 .as_bytes(),
             )?;
@@ -305,6 +306,10 @@ async fn roundtrip(
         assert_eq!(
             next(&mut observed, &session).await,
             Observed::Data(b"\x1bP1$r1\"q\x1b\\".to_vec())
+        );
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(b"\x1bP2$u4/12\x1b\\".to_vec())
         );
         let generation = session.events.shell_generation().expect("running shell");
         for (text, connection) in [

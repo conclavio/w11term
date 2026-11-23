@@ -8,6 +8,7 @@ use crate::config::{BidiMode, NewlineCanon};
 use log::debug;
 use num_traits::ToPrimitive;
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{channel, Sender};
@@ -98,6 +99,37 @@ impl TabStop {
 
     fn set_tab_stop(&mut self, col: usize) {
         self.tabs[col] = true;
+    }
+
+    fn columns(&self, width: usize) -> impl Iterator<Item = usize> + '_ {
+        self.tabs
+            .iter()
+            .take(width)
+            .enumerate()
+            .filter_map(|(index, &stop)| stop.then_some(index + 1))
+    }
+
+    fn restore(&mut self, report: &[u8]) {
+        let Ok(report) = std::str::from_utf8(report) else {
+            return;
+        };
+        let mut tabs = vec![false; self.tabs.len()];
+        for field in report.split_terminator('/') {
+            if !field.bytes().all(|byte| byte.is_ascii_digit()) {
+                return;
+            }
+            let Some(index) = field
+                .parse::<usize>()
+                .ok()
+                .and_then(|column| column.checked_sub(1))
+            else {
+                return;
+            };
+            if let Some(stop) = tabs.get_mut(index) {
+                *stop = true;
+            }
+        }
+        self.tabs = tabs;
     }
 
     fn find_prev_tab_stop(&self, col: usize) -> Option<usize> {
@@ -3115,6 +3147,17 @@ impl TerminalState {
                 );
             }
 
+            Cursor::RequestTabStops => {
+                let mut reply = format!("{DCS}2$u");
+                let mut separator = "";
+                for column in self.tabs.columns(self.screen().physical_cols) {
+                    write!(reply, "{separator}{column}").ok();
+                    separator = "/";
+                }
+                reply.push_str(ST);
+                self.writer.write_all(reply.as_bytes()).ok();
+                self.writer.flush().ok();
+            }
             Cursor::TabulationControl(_) => {}
             Cursor::LineTabulation(_) => {}
 

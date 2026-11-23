@@ -3640,6 +3640,67 @@ mod tests {
     }
 
     #[test]
+    fn tab_stop_report_round_trips_custom_and_empty_tables() {
+        let (mut terminal, mut replies) = engine();
+        let query = b"\x1b[2$w";
+        let size = terminal.get_size();
+        terminal.resize(TerminalSize {
+            cols: 24,
+            rows: 4,
+            ..size
+        });
+        terminal.advance_bytes(query);
+        assert_eq!(receive(&mut replies), b"\x1bP2$u1/9/17\x1b\\");
+        terminal.advance_bytes(b"\x1b[3g\x1b[4G\x1bH\x1b[12G\x1bH");
+        terminal.advance_bytes(query);
+        let saved = receive(&mut replies);
+        assert_eq!(saved, b"\x1bP2$u4/12\x1b\\");
+        assert_eq!(terminal.cursor_pos().x, 11);
+
+        terminal.advance_bytes(b"\x1b[3g");
+        terminal.advance_bytes(query);
+        assert_eq!(receive(&mut replies), b"\x1bP2$u\x1b\\");
+        let mut restore = saved;
+        restore[4] = b't';
+        for byte in restore {
+            terminal.advance_bytes([byte]);
+        }
+        terminal.advance_bytes(b"\x1b[1G\t");
+        assert_eq!(terminal.cursor_pos().x, 3);
+        terminal.advance_bytes(b"\x1b[I");
+        assert_eq!(terminal.cursor_pos().x, 11);
+        terminal.advance_bytes(b"\x1b[Z");
+        assert_eq!(terminal.cursor_pos().x, 3);
+
+        terminal.advance_bytes(b"\x1bP2$t\x9c\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u\x1b\\");
+        terminal.advance_bytes(b"\x1bc\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u1/9/17\x1b\\");
+    }
+
+    #[test]
+    fn tab_stop_restore_ignores_cancelled_malformed_and_oversize_strings() {
+        let (mut terminal, mut replies) = engine();
+        terminal.advance_bytes(b"\x1bP2$t3/8\x1b\\");
+        for rejected in [
+            b"\x1bP2$t5/0/7\x1b\\".as_slice(),
+            b"\x1bP2$t5/oops/7\x1b\\",
+            b"\x1bP2$t5\x18",
+            b"\x1bP2$t5\x1a",
+            b"\x1bP2$t5\x1b\x1b\\",
+            b"\x1bP2$t5\x1b[1G",
+        ] {
+            terminal.advance_bytes(rejected);
+            terminal.advance_bytes(b"\x1b[2$w");
+            assert_eq!(receive(&mut replies), b"\x1bP2$u3/8\x1b\\");
+        }
+        terminal.advance_bytes(format!("\x1bP2$t{}4\x1b\\\x1b[2$w", "5/".repeat(4200)));
+        assert_eq!(receive(&mut replies), b"\x1bP2$u3/8\x1b\\");
+        terminal.advance_bytes(b"\x1bP2$t7/2/7\x9c\x1b[2$w");
+        assert_eq!(receive(&mut replies), b"\x1bP2$u2/7\x1b\\");
+    }
+
+    #[test]
     fn vim_undercurl_probe_reports_the_rendition_at_the_query() {
         let (mut terminal, mut replies) = engine();
         // Vim's term.c sends the reset after the query in the same write.

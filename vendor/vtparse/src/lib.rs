@@ -151,6 +151,17 @@ pub trait VTActor {
     /// for more information on device control strings.
     fn dcs_unhook(&mut self);
 
+    /// Wait for the full seven-bit ST before unhooking a DCS that requires it.
+    fn dcs_requires_string_terminator(&self) -> bool {
+        false
+    }
+
+    /// Identify a completed DCS, including raw C1 ST and the complete ESC form
+    /// for actors that request it. The default preserves legacy unhook behavior.
+    fn dcs_unhook_with_terminator(&mut self, _terminated: bool) {
+        self.dcs_unhook();
+    }
+
     /// The final character of an escape sequence has arrived, so determine the control function
     /// to be executed from the intermediate character(s) and final character, and execute it.
     ///
@@ -684,7 +695,7 @@ impl VTParser {
                     param,
                 );
             }
-            Action::Unhook => actor.dcs_unhook(),
+            Action::Unhook => actor.dcs_unhook_with_terminator(param == 0x9c),
             Action::OscStart => {
                 self.osc.buffer.clear();
                 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -843,6 +854,11 @@ impl VTParser {
                 self.next_utf8(actor, byte);
                 return;
             }
+            State::DcsStringEscape => {
+                self.action(Action::Unhook, if byte == b'\\' { 0x9c } else { 0x1b }, actor);
+                self.state = State::Escape;
+                self.action(lookup_entry(State::Escape), 0x1b, actor);
+            }
             State::OscLiteralEscape => {
                 // The ESC may have arrived at the end of a read. Commit the
                 // literal only for ST, then process this byte in Escape as usual.
@@ -859,6 +875,13 @@ impl VTParser {
         let (action, state) = lookup(self.state, byte);
 
         if state != self.state {
+            if self.state == State::DcsPassthrough
+                && state == State::Escape
+                && actor.dcs_requires_string_terminator()
+            {
+                self.state = State::DcsStringEscape;
+                return;
+            }
             if self.state == State::OscString
                 && state == State::Escape
                 && self.osc.literal_field.is_some()

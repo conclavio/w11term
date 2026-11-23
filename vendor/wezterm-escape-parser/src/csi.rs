@@ -1136,6 +1136,9 @@ pub enum Cursor {
     /// TBC - TABULATION CLEAR
     TabulationClear(TabulationClear),
 
+    /// DECRQPSR 2 – request the horizontal tab stop report (DECTABSR).
+    RequestTabStops,
+
     /// CHA: Moves cursor to the Ps-th column of the active line. The default
     /// value of Ps is 1.
     CharacterAbsolute(OneBased),
@@ -1467,6 +1470,7 @@ impl Display for Cursor {
             Cursor::LineTabulation(n) => n.write_csi(f, "Y")?,
             Cursor::TabulationControl(n) => n.write_csi(f, "W")?,
             Cursor::TabulationClear(n) => n.write_csi(f, "g")?,
+            Cursor::RequestTabStops => write!(f, "2$w")?,
             Cursor::CharacterPositionAbsolute(n) => n.write_csi(f, "`")?,
             Cursor::CharacterPositionBackward(n) => n.write_csi(f, "j")?,
             Cursor::CharacterPositionForward(n) => n.write_csi(f, "a")?,
@@ -2130,6 +2134,9 @@ impl<'a> CSIParser<'a> {
                     ],
                     destination_page: OneBased::from_optional_esc_param(area.get(7))?,
                 })))
+            }
+            ('w', [CsiParam::Integer(2), CsiParam::P(b'$')]) if !self.parameters_truncated => {
+                Ok(CSI::Cursor(Cursor::RequestTabStops))
             }
             ('r' | 't', [parameters @ .., CsiParam::P(b'$')]) if !self.parameters_truncated => {
                 let area = Cracked::parse(parameters)?;
