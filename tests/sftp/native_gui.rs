@@ -509,6 +509,11 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
         "\x1b]133;A\x07$ \x1b]133;B\x07visible deployment prompt\r\n\
          \x1b]133;C;cmdline_url={encoded}\x07archived deploy output\r\n\x1b]133;D;17\x07"
     );
+    stream.push_str(concat!(
+        "\x1b]133;A\x07$ \x1b]133;B\x07wrapped command\r\n",
+        "\x1b]133;C;cmdline_url=echo%20first%0A%20%20echo%20second\x07",
+        "multiline output\r\n\x1b]133;D;0\x07"
+    ));
     for (command, output, status) in [
         ("deploy audit", "no status reported", ""),
         ("deploy retry", "retry failed", ";2"),
@@ -523,7 +528,7 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     stream.push_str("history-search-ready\r\n");
     run_palette_fixture(
         "search-command-history-ui.ps1",
-        b"deploy audithistory-resumed",
+        b"deploy auditdeploy retry\x1b[?2004hhistory-paste-ready\r\n\x1b[200~echo first\n  echo second\x1b[201~history-resumed",
         Some(&stream),
     )
     .await;

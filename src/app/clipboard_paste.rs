@@ -189,6 +189,40 @@ impl TerminalApp {
         self.paste_from(Some(origin), false, Some(text), ctx);
     }
 
+    fn begin_paste(
+        &mut self,
+        origin: Origin,
+    ) -> Option<(tokio::sync::mpsc::UnboundedSender<Command>, Ticket)> {
+        if self.clipboard.is_open() {
+            return None;
+        }
+        let sender = self.paste_target(origin)?.session.input.clone();
+        Some((sender, self.clipboard.start(origin)))
+    }
+
+    pub(super) fn paste_history_text(
+        &mut self,
+        origin: Origin,
+        command: u64,
+        text: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some((sender, ticket)) = self.begin_paste(origin) else {
+            return;
+        };
+        send(
+            &sender,
+            ticket,
+            ClipboardPaste::InsertHistory {
+                text,
+                connection: origin.connection,
+                command,
+            },
+            ctx,
+        );
+        self.clear_selection();
+    }
+
     fn paste_from(
         &mut self,
         origin: Option<Origin>,
@@ -196,15 +230,10 @@ impl TerminalApp {
         saved_text: Option<String>,
         ctx: &ComponentContext<Self>,
     ) {
-        if self.clipboard.is_open() {
-            return;
-        }
         let Some(origin) = origin else { return };
-        let Some(tab) = self.paste_target(origin) else {
+        let Some((sender, ticket)) = self.begin_paste(origin) else {
             return;
         };
-        let sender = tab.session.input.clone();
-        let ticket = self.clipboard.start(origin);
         let preserve_text = saved_text.is_some();
         let text = match saved_text.map_or_else(read_clipboard, Ok) {
             Ok(text) => text,

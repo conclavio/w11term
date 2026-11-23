@@ -563,6 +563,7 @@ pub struct Snapshot {
     pub scrollback_clear_generation: u64,
     pub scrollback_clear_floor: Option<isize>,
     pub alternate: bool,
+    pub bracketed_paste: bool,
     pub mouse_grabbed: bool,
     pub search: Option<crate::search::SearchSnapshot>,
     pub prompt: Option<crate::prompts::Prompt>,
@@ -751,6 +752,7 @@ impl Snapshot {
             scrollback_clear_generation: 0,
             scrollback_clear_floor: None,
             alternate,
+            bracketed_paste: terminal.bracketed_paste_enabled(),
             mouse_grabbed: terminal.is_mouse_grabbed(),
             search: None,
             prompt: None,
@@ -814,6 +816,7 @@ impl Snapshot {
             && self.scrollback_clear_generation == old.scrollback_clear_generation
             && self.scroll_offset == old.scroll_offset
             && self.alternate == old.alternate
+            && self.bracketed_paste == old.bracketed_paste
             && self.cursor_visible == old.cursor_visible
             && self.mouse_grabbed == old.mouse_grabbed
             && (
@@ -990,6 +993,23 @@ mod tests {
             .filter(|e| e.kind == "command-finished")
             .map(|e| e.data)
             .collect()
+    }
+
+    #[test]
+    fn history_input_requires_the_current_shell_to_finish_its_command() {
+        let (mut term, events) = watched_terminal();
+        assert!(!events.idle_shell(1));
+        events.command_stream(Some(1));
+        assert!(events.idle_shell(1));
+        term.advance_bytes(b"\x1b]133;C;aid=outer\x07");
+        assert!(!events.idle_shell(1));
+        term.advance_bytes(b"\x1b]133;D;0;aid=inner\x07");
+        assert!(!events.idle_shell(1));
+        term.advance_bytes(b"\x1b]133;D;0;aid=outer\x07");
+        assert!(events.idle_shell(1));
+        events.command_stream(Some(2));
+        assert!(!events.idle_shell(1));
+        assert!(events.idle_shell(2));
     }
 
     #[test]
