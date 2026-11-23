@@ -5,6 +5,7 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, PromptToken, ShellPrompt,
 };
 mod report;
+mod save_command;
 mod saved;
 
 pub(super) const LABEL: &str = "SSH host group";
@@ -19,6 +20,7 @@ pub(super) struct HostGroup {
     draft: String,
     previous_draft: Option<String>,
     command_editor: ElementRef<TextBox>,
+    command_save: save_command::State,
     submissions: VecDeque<Submission>,
     viewing: u64,
     next_submission: u64,
@@ -254,6 +256,7 @@ pub enum Action {
     LoadCommand(TabId, u64),
     OpenSavedCommands(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
+    SaveCommand(TabId, save_command::Action),
     RestoreDraft(TabId),
     CopyResults(TabId, u64),
     ViewOutput(TabId, u64, CommandLink),
@@ -596,6 +599,16 @@ impl TerminalApp {
                     let _ = page.command_editor.request_focus();
                 }
             }
+            Action::SaveCommand(id, action) => {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
+                    && let Some(commands) =
+                        page.command_save
+                            .update(action, &page.draft, saved_commands::create)
+                {
+                    self.saved_commands = commands;
+                }
+            }
             Action::RestoreDraft(id) => {
                 if let Some(page) = self.host_group_mut(id)
                     && page.restore_draft()
@@ -793,6 +806,7 @@ impl TerminalApp {
         let saved_commands = Button::new()
             .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenSavedCommands(id))))
             .content("Saved commands…");
+        let save_command = page.command_save.button(id, &page.draft, ctx);
         let restore = if page.previous_draft.is_some() {
             Button::new()
                 .on_click(ctx.callback(move |_| Message::HostGroup(Action::RestoreDraft(id))))
@@ -833,7 +847,8 @@ impl TerminalApp {
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
-                        .children((send, saved_commands, restore)),
+                        .children((send, saved_commands, save_command, restore)),
+                    page.command_save.view(id, ctx),
                     hidden_selection,
                     TextBlock::new()
                         .text(instructions)
