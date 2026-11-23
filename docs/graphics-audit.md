@@ -170,6 +170,13 @@ placeholder text is erased. A full display erase clears visible graphics
 and keeps named image data available for later placement.
 [Kitty interaction with terminal actions](https://sw.kovidgoyal.net/kitty/graphics-protocol/#interaction-with-other-terminal-actions)
 
+In a bounded scroll region, a direct kitty placement that crosses a margin
+stays in place while the text scrolls. Placements entirely inside the region
+move with the text and keep their original scale when clipped at the edge.
+Rows may enter primary-screen scrollback during a bounded scroll. The image
+tiles clipped by the margin stay out of those rows.
+[Kitty scrolling reference](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty_tests/graphics.py#L1423-L1500)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

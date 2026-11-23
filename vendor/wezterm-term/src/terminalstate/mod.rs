@@ -1511,6 +1511,13 @@ impl TerminalState {
         let top_and_bottom_margins = self.top_and_bottom_margins.clone();
         let left_and_right_margins = self.left_and_right_margins.clone();
         let bidi_mode = self.get_bidi_mode();
+        let count =
+            num_rows.min((top_and_bottom_margins.end - top_and_bottom_margins.start) as usize);
+        let graphics = self.prepare_kitty_margin_scroll(
+            &top_and_bottom_margins,
+            &left_and_right_margins,
+            -(count as VisibleRowIndex),
+        );
         self.screen_mut().scroll_up_within_margins(
             &top_and_bottom_margins,
             &left_and_right_margins,
@@ -1518,7 +1525,8 @@ impl TerminalState {
             seqno,
             blank_attr,
             bidi_mode,
-        )
+        );
+        self.finish_kitty_margin_scroll(graphics);
     }
 
     fn scroll_down(&mut self, num_rows: usize) {
@@ -1527,6 +1535,13 @@ impl TerminalState {
         let top_and_bottom_margins = self.top_and_bottom_margins.clone();
         let left_and_right_margins = self.left_and_right_margins.clone();
         let bidi_mode = self.get_bidi_mode();
+        let count =
+            num_rows.min((top_and_bottom_margins.end - top_and_bottom_margins.start) as usize);
+        let graphics = self.prepare_kitty_margin_scroll(
+            &top_and_bottom_margins,
+            &left_and_right_margins,
+            count as VisibleRowIndex,
+        );
         self.screen_mut().scroll_down_within_margins(
             &top_and_bottom_margins,
             &left_and_right_margins,
@@ -1534,7 +1549,8 @@ impl TerminalState {
             seqno,
             blank_attr,
             bidi_mode,
-        )
+        );
+        self.finish_kitty_margin_scroll(graphics);
     }
 
     /// Defined by FinalTermSemanticPrompt; a fresh-line is a NOP if the

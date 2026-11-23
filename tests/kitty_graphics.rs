@@ -934,6 +934,86 @@ fn line_erasure_preserves_tiles_on_a_wide_glyph_continuation() {
 }
 
 #[test]
+fn kitty_index_keeps_images_crossing_vertical_margins_and_clips_inside_images() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "\x1b[2;2H\x1b_Ga=T,i=40,p=1,f=24,s=1,v=2,c=1,r=2,C=1,q=2;/wAAAP8A\x1b\\",
+        "\x1b[3;5H\x1b_Ga=T,i=41,p=1,f=24,s=1,v=2,c=1,r=2,C=1,q=2;/wAAAAD/\x1b\\",
+        "\x1b_Ga=t,i=42,f=24,s=1,v=1,q=2;/wAA\x1b\\",
+        "\x1b_Ga=p,i=42,p=1,P=40,Q=1,H=1,c=1,r=1,q=2\x1b\\",
+        "\x1b[4;7Hmove",
+        "\x1b[3;6r\x1b[6;1H\x1bD",
+    ));
+    let scrolled = frame(&t, None, 0);
+    assert_eq!(pixel(&scrolled, 1, 1, 40), RED);
+    assert_eq!(pixel(&scrolled, 1, 2, 40), Some([0, 255, 0, 255]));
+    assert_eq!(pixel(&scrolled, 2, 1, 42), RED);
+    assert_eq!(pixel(&scrolled, 4, 2, 41), Some([0, 0, 255, 255]));
+    assert_eq!(pixel(&scrolled, 4, 3, 41), None);
+    assert!(scrolled.rows[2].as_str().contains("move"));
+
+    t.advance_bytes(b"\x1bD");
+    assert_eq!(pixel(&frame(&t, Some(&scrolled), 0), 4, 2, 41), None);
+    place(&mut t, 41, 1, 4, 5, 2);
+    let placed_again = frame(&t, Some(&scrolled), 0);
+    assert_eq!(pixel(&placed_again, 4, 3, 41), RED);
+    assert_eq!(pixel(&placed_again, 4, 4, 41), Some([0, 0, 255, 255]));
+}
+
+#[test]
+fn kitty_reverse_index_honors_horizontal_margins_and_clips_at_the_bottom() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "\x1b[?1049h",
+        "\x1b[4;2H\x1b_Ga=T,i=40,p=1,f=24,s=2,v=1,c=2,r=1,C=1,q=2;/wAAAP8A\x1b\\",
+        "\x1b[5;6H\x1b_Ga=T,i=41,p=1,f=24,s=1,v=2,c=1,r=2,C=1,q=2;/wAAAAD/\x1b\\",
+        "\x1b[?69h\x1b[3;10s\x1b[2;6r\x1b[2;3H\x1bM",
+    ));
+    let scrolled = frame(&t, None, 0);
+    assert_eq!(pixel(&scrolled, 1, 3, 40), RED);
+    assert_eq!(pixel(&scrolled, 2, 3, 40), Some([0, 255, 0, 255]));
+    assert_eq!(pixel(&scrolled, 2, 4, 40), None);
+    assert_eq!(pixel(&scrolled, 5, 4, 41), None);
+    assert_eq!(pixel(&scrolled, 5, 5, 41), RED);
+}
+
+#[test]
+fn kitty_regional_scroll_clips_graphics_when_text_enters_primary_scrollback() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "\x1b[1;1Htop",
+        "\x1b[1;1H\x1b_Ga=T,i=40,p=1,f=24,s=1,v=2,c=1,r=2,C=1,q=2;/wAAAP8A\x1b\\",
+        "\x1b[1;4r\x1b[4;1H\x1bD",
+    ));
+    let live = frame(&t, None, 0);
+    assert_eq!(pixel(&live, 0, 0, 40), Some([0, 255, 0, 255]));
+    let history = frame(&t, Some(&live), 1);
+    assert_eq!(history.scroll_offset, 1);
+    assert!(history.rows[0].as_str().contains("top"));
+    assert_eq!(pixel(&history, 0, 0, 40), None);
+    assert_eq!(pixel(&history, 0, 1, 40), Some([0, 255, 0, 255]));
+}
+
+#[test]
+fn kitty_regional_scroll_keeps_a_placement_crossing_into_history_together() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=T,i=40,p=1,f=24,s=1,v=2,c=1,r=2,C=1,q=2;/wAAAP8A\x1b\\",
+        "\x1b[8;1H\x1bD",
+    ));
+    let before = frame(&t, None, 1);
+    assert_eq!(pixel(&before, 0, 0, 40), RED);
+    assert_eq!(pixel(&before, 0, 1, 40), Some([0, 255, 0, 255]));
+
+    t.advance_bytes(b"\x1b[1;4r\x1b[4;1H\x1bD");
+    let after = frame(&t, Some(&before), 2);
+    assert_eq!(after.scroll_offset, 2);
+    assert_eq!(pixel(&after, 0, 0, 40), None);
+    assert_eq!(pixel(&after, 0, 1, 40), RED);
+    assert_eq!(pixel(&after, 0, 2, 40), Some([0, 255, 0, 255]));
+}
+
+#[test]
 fn erasing_placeholder_text_hides_the_virtual_image() {
     let (mut t, _) = engine();
     t.advance_bytes(b"\x1b_Ga=T,i=33554474,p=7,U=1,c=2,r=1,f=32,s=2,v=1,q=2;/wAA/wD/AP8=\x1b\\");
