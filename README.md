@@ -255,6 +255,10 @@ From the profile editor, **Duplicate saved profile…** opens a copy of the last
 
 To connect once, open **+ → New Profile…**, enter the SSH details and choose **Connect without saving**. The profile name can stay blank. The connection uses the usual authentication and host-key checks, and relative key paths still resolve beside the current `profiles.json`.
 
+For a shorter route, choose **+ → Quick connect…** or search for it in the command palette. Paste an explicit address such as `play@conclav.io:6792`, `ssh://play@conclav.io:6792`, or `user@[2001:db8::1]:2222`, choose authentication, and select **Connect**. Quick Connect uses the existing host-key and authentication prompts. It leaves the profile catalog untouched.
+
+The same destinations work with `w11term ssh`. The optional `--port` flag takes precedence over a port in the address.
+
 In a local shell profile editor, **Duplicate saved profile…** copies the saved executable, arguments, starting directory and scrollback settings. Change the name or settings and select **Save copy**. **Delete profile…** removes a custom profile after confirmation and leaves open shells running. If you customized an automatically discovered PowerShell profile, **Restore defaults…** removes its saved overrides and keeps the installed shell in the menu.
 
 The caret menu displays **On**/**Off** for fullscreen, mute, game mode, alternate-screen wheel keys, remote named sounds, and asset synchronization, using the active terminal’s effective settings. Terminal-only actions are disabled when a settings/form tab is selected.

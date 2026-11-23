@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 mod local;
+mod ssh_destination;
 mod tab_color;
 pub use local::LocalOptions;
 pub use tab_color::TabColor;
@@ -643,7 +644,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -675,31 +676,8 @@ impl Options {
                 "--smoke-seconds" => smoke_seconds = Some(value(&mut args, &arg)?.parse()?),
                 "ssh" => {
                     let target = value(&mut args, &arg)?;
-                    let (user, host) = target
-                        .rsplit_once('@')
-                        .ok_or_else(|| anyhow::anyhow!("specify an explicit user@host"))?;
-                    let host = host.trim_matches(['[', ']']);
-                    ensure!(
-                        !user.is_empty() && !host.is_empty(),
-                        "specify a nonempty user and host"
-                    );
                     profile = None;
-                    source = Source::Ssh(SshOptions {
-                        host: host.into(),
-                        user: user.into(),
-                        port: 22,
-                        terminal_type: TerminalType::default(),
-                        scrollback_lines: ScrollbackLines::default(),
-                        color_scheme: ColorScheme::default(),
-                        tab_color: Default::default(),
-                        authentication: Authentication::Agent,
-                        host_key: None,
-                        host_key_alias: None,
-                        proxy_jump: Vec::new(),
-                        local_forwards: Vec::new(),
-                        durable: false,
-                        player: Default::default(),
-                    });
+                    source = Source::Ssh(SshOptions::from_destination(&target)?);
                 }
                 "--port" => port = Some(value(&mut args, &arg)?.parse::<u16>()?),
                 "--identity" => {
@@ -1210,9 +1188,16 @@ mod tests {
     #[test]
     fn explicit_auth_modes_and_invalid_combinations() {
         let parse = |args: &[&str]| Options::parse_from(args.iter().map(|s| s.to_string()));
-        let options = parse(&["ssh", "play@conclav.io", "--auth", "none", "--port", "6789"])
-            .unwrap()
-            .unwrap();
+        let options = parse(&[
+            "ssh",
+            "ssh://play@conclav.io:6792",
+            "--auth",
+            "none",
+            "--port",
+            "6789",
+        ])
+        .unwrap()
+        .unwrap();
         let Source::Ssh(ssh) = options.source else {
             panic!("expected SSH")
         };
