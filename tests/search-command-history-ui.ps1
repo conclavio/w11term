@@ -3,18 +3,22 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $verifyClipboard = $env:GITHUB_ACTIONS -eq 'true' -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted'
 if ($verifyClipboard) { . (Join-Path $PSScriptRoot 'support/clipboard.ps1') }
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = $State
 $profiles = Join-Path $State 'profiles.json'
 $word = '[' + [char]0xc5 + 'ngstr' + [char]0xf6 + 'm]'
 $command = 'deploy ' + ('x' * 128) + ' ' + $word
+$output = 'archived deploy output ' + $word + ' ' + ('y' * 90) + "`r`n`r`nsecond line`r`n"
 $multiline = "echo first`n  echo second"
 $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
 $dot = ' ' + [char]0xb7 + ' '
+$saveOutput = 'Save output as text' + [char]0x2026
 function Click([string]$Label) {
     Invoke-Button (Wait-Until "enabled '$Label'" {
         $b = Find-Element $Label $button
@@ -24,6 +28,22 @@ function Click([string]$Label) {
 function Search([string]$Text) {
     $field = Wait-Until 'command search field' { Find-Element 'Search command history' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
+}
+function Find-OutputDialog {
+    foreach ($handle in [FixtureDialog]::Windows($app.Id)) {
+        if ([FixtureDialog]::GetWindow($handle, 4) -ne $window) { continue }
+        $dialog = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+        if ($dialog.Current.ClassName -eq '#32770' -and $dialog.Current.Name -eq 'Save command output as text') {
+            return $handle
+        }
+    }
+}
+function Pick-Output([string]$Path, [int]$ButtonId, [string]$Suggestion) {
+    Click $saveOutput
+    $dialog = Wait-Until 'save dialog for the selected command' { Find-OutputDialog }
+    $null = Wait-Until 'set the output filename' { [FixtureDialog]::SetFilename($dialog, $Path, $Suggestion) }
+    $null = Wait-Until 'close the output save dialog' { [FixtureDialog]::ClickButton($dialog, $ButtonId) }
+    $null = Wait-Until 'the output dialog has closed' { !(Find-OutputDialog) }
 }
 function Status-Box([string]$Expected) {
     Wait-Until "command status selector showing '$Expected'" {
@@ -73,6 +93,9 @@ try {
     Check-List 'failed' @('deploy retry',$command)
     Check-List 'succeeded' @('check-status',$multiline)
     Check-List 'unknown' @('deploy audit')
+    $archivedId = ((Control @('list-commands','--pane',"$remote")).commands |
+        Where-Object command -CEQ $command).id
+    $suggestion = "pane-$remote-command-$archivedId.txt"
     Run-Palette 'Command history'
     $recent = 'check-status' + $dot + 'exit 0'
     $old = $command.Substring(0,120) + $dot + 'exit 17'
@@ -95,17 +118,40 @@ try {
     $null = Wait-Until 'older full command found beyond its row label' {
         (Find-Element "Selected, $old" $button) -and (Find-Element $command) -and !(Find-Element $retry $button)
     }
+    $canceled = Join-Path $State 'canceled-output.txt'
+    Pick-Output $canceled 2 $suggestion
+    if ([IO.File]::Exists($canceled)) { throw 'Cancel created an output file' }
+    $path = Join-Path $State 'selected-output.txt'
+    Pick-Output $path 1 $suggestion
+    $null = Wait-Until 'selected command output saved' { [IO.File]::Exists($path) }
+    $bytes = [IO.File]::ReadAllBytes($path)
+    if ([Convert]::ToBase64String($bytes) -cne [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($output))) {
+        throw "The output file contained unexpected bytes: $([Convert]::ToBase64String($bytes))"
+    }
+    $savePrefix = "Saved command output from pane $remote to "
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $buttonFilter = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
+    $null = Wait-Until 'output export success on the history page' {
+        foreach ($candidate in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonFilter)) {
+            $name = $candidate.Current.Name
+            if ($name.StartsWith($savePrefix) -and [FixtureDialog]::SameFile($path, $name.Substring($savePrefix.Length))) {
+                return $candidate
+            }
+        }
+    }
     if ($verifyClipboard) {
         $before = [FixtureClipboard]::GetClipboardSequenceNumber()
         Click 'Copy command'
         $null = Wait-Until 'full original command on the clipboard' { [FixtureClipboard]::ContainsNewText($before, $command) }
         $before = [FixtureClipboard]::GetClipboardSequenceNumber()
         Click 'Copy output'
-        $null = Wait-Until 'independent output on the clipboard' { [FixtureClipboard]::ContainsNewText($before, "archived deploy output`r`n") }
+        $null = Wait-Until 'independent output on the clipboard' { [FixtureClipboard]::ContainsNewText($before, $output) }
     }
     Change-Status 'Failed' 'Succeeded'
     $null = Wait-Until 'matching successful output alone cannot enable copy' {
-        (Find-Element 'No matching commands') -and !(Find-Element 'Copy command' $button).Current.IsEnabled -and !(Find-Element 'Copy output' $button).Current.IsEnabled
+        (Find-Element 'No matching commands') -and !(Find-Element 'Copy command' $button).Current.IsEnabled -and
+            !(Find-Element 'Copy output' $button).Current.IsEnabled -and !(Find-Element $saveOutput $button).Current.IsEnabled
     }
     Search ''
     $null = Wait-Until 'the successful command is selected' {

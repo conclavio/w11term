@@ -25,6 +25,7 @@ pub(super) enum Purpose {
     DownloadFolder,
     Save(String),
     Scrollback,
+    CommandOutput(String),
     StartRecording,
     OpenRecording,
 }
@@ -263,13 +264,20 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
                 None
             }
-            Purpose::Scrollback => {
+            Purpose::Scrollback | Purpose::CommandOutput(_) => {
                 #[cfg(feature = "ui-smoke")]
                 if fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")? {
                     options |= FOS_DONTADDTORECENT;
                 }
-                dialog.SetTitle(w!("Save scrollback as text"))?;
-                dialog.SetFileName(w!("terminal.txt"))?;
+                let (title, suggestion) = match &purpose {
+                    Purpose::CommandOutput(suggestion) => {
+                        (w!("Save command output as text"), suggestion.as_str())
+                    }
+                    _ => (w!("Save scrollback as text"), "terminal.txt"),
+                };
+                dialog.SetTitle(title)?;
+                let wide: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
+                dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
                 dialog.SetDefaultExtension(w!("txt"))?;
                 // The atomic writer creates its own sibling file and reports any write errors.
                 options |= FOS_OVERWRITEPROMPT | FOS_NOTESTFILECREATE;

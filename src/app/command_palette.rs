@@ -272,7 +272,7 @@ impl TerminalApp {
         });
         rows.push(Row {
             id: CommandId::SaveScrollback(pane),
-            label: scrollback_export::LABEL.into(),
+            label: text_export::SCROLLBACK_LABEL.into(),
             chord: String::new(),
             enabled: pane.is_some() && self.export.pending.is_none(),
         });
@@ -464,7 +464,7 @@ impl TerminalApp {
             CommandId::RestartExited(Some(exit)) => Message::RestartExited(exit),
             CommandId::RestartExited(None) => return,
             CommandId::SaveScrollback(pane) => {
-                Message::Export(scrollback_export::Action::Start(pane))
+                Message::Export(text_export::Action::StartScrollback(pane))
             }
             CommandId::ClearScrollback(pane) => {
                 pane.map_or(Message::ControlIdle, Message::ClearScrollback)
