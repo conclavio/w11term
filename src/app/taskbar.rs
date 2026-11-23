@@ -1,4 +1,4 @@
-use wezterm_term::Progress;
+use wezterm_term::{ProgramBlockKind, ProgramState, ProgramStatus, Progress};
 use windows::Win32::{
     Foundation::HWND,
     System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
@@ -34,6 +34,75 @@ pub(super) fn tab_header(label: &str, progress: Progress) -> String {
         Progress::Paused(value) => format!("Paused {value}% · {label}"),
         Progress::Indeterminate => format!("In progress · {label}"),
     }
+}
+
+pub(super) fn program_progress(status: &ProgramStatus) -> Progress {
+    match status.state {
+        ProgramState::Idle | ProgramState::Done => Progress::None,
+        ProgramState::Working => status
+            .progress
+            .map_or(Progress::Indeterminate, Progress::Percentage),
+        ProgramState::Blocked => Progress::Paused(status.progress.unwrap_or(100)),
+        ProgramState::Error => Progress::Error(100),
+    }
+}
+
+pub(super) fn prefer_program(status: &ProgramStatus, legacy: Progress) -> bool {
+    let progress = program_progress(status);
+    legacy == Progress::None || most_important(progress, legacy) == progress
+}
+
+pub(super) fn program_tab_header(label: &str, status: &ProgramStatus) -> String {
+    let state = match status.state {
+        ProgramState::Idle => return label.into(),
+        ProgramState::Working => return tab_header(label, program_progress(status)),
+        ProgramState::Done => "Done",
+        ProgramState::Error => "Error",
+        ProgramState::Blocked => match status.kind {
+            Some(ProgramBlockKind::Permission) => "Needs approval",
+            Some(ProgramBlockKind::Question) => "Needs an answer",
+            Some(ProgramBlockKind::Auth) => "Needs sign-in",
+            None => "Waiting for input",
+        },
+    };
+    if let Some(value) = status.progress {
+        format!("{state} {value}% · {label}")
+    } else {
+        format!("{state} · {label}")
+    }
+}
+
+pub(super) fn program_tooltip(label: &str, pane: u64, status: &ProgramStatus) -> String {
+    let mut lines = vec![format!("{label} (pane {pane})")];
+    for field in [
+        status.title.as_deref().or(status.app.as_deref()),
+        status.message.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut printable = field
+            .chars()
+            .map(|c| {
+                if matches!(c, '\u{2028}' | '\u{2029}') {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .filter(|&c| {
+                !matches!(c, '\u{00ad}' | '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' |
+                '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+            });
+        let mut text: String = printable.by_ref().take(300).collect();
+        if printable.next().is_some() {
+            text.push('…');
+        }
+        if !text.trim().is_empty() {
+            lines.push(text);
+        }
+    }
+    lines.join("\n")
 }
 
 fn button(progress: Progress) -> (TBPFLAG, Option<u8>) {
@@ -92,6 +161,29 @@ impl Taskbar {
 mod tests {
     use super::*;
     use Progress::*;
+
+    #[test]
+    fn program_header_and_tooltip_attribute_a_plain_text_report_to_its_pane() {
+        let status = ProgramStatus {
+            state: ProgramState::Blocked,
+            kind: Some(ProgramBlockKind::Permission),
+            progress: Some(31),
+            app: Some("cargo".into()),
+            title: Some("Build\u{202e} tests".into()),
+            message: Some("Proceed?\u{2028}Confirm in the terminal.".into()),
+        };
+        assert_eq!(
+            program_tab_header("SSH", &status),
+            "Needs approval 31% · SSH"
+        );
+        assert_eq!(program_progress(&status), Paused(31));
+        assert!(prefer_program(&status, Percentage(20)));
+        assert!(!prefer_program(&status, Error(23)));
+        assert_eq!(
+            program_tooltip("Needs approval 31% · SSH", 7, &status),
+            "Needs approval 31% · SSH (pane 7)\nBuild tests\nProceed? Confirm in the terminal.",
+        );
+    }
 
     #[test]
     fn explorer_priority_is_independent_of_pane_order() {

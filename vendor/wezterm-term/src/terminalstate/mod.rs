@@ -37,6 +37,7 @@ mod kitty;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod program_status;
 mod rectangle;
 mod rendition;
 mod selective_erase;
@@ -45,6 +46,7 @@ mod sixel;
 mod title;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
+pub use program_status::{ProgramBlockKind, ProgramState, ProgramStatus};
 
 #[derive(Default)]
 struct SavedPrivateModes {
@@ -441,6 +443,7 @@ pub struct TerminalState {
     icon_title: Option<String>,
     saved_titles: title::TitleStack,
     progress: Progress,
+    program_statuses: program_status::ProgramStatuses,
     // OSC 9;4 preserves the previous value while the bar is indeterminate.
     progress_value: u8,
 
@@ -768,6 +771,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            program_statuses: Default::default(),
             progress_value: 0,
         }
     }
@@ -923,7 +927,20 @@ impl TerminalState {
     }
 
     pub fn get_progress(&self) -> Progress {
-        self.progress
+        if self.program_statuses.seen_report {
+            Progress::None
+        } else {
+            self.progress
+        }
+    }
+
+    pub fn program_status(&self) -> Option<&Arc<ProgramStatus>> {
+        self.program_statuses.summary.as_ref()
+    }
+
+    /// The attached process has ended. Finished and failed results stay visible.
+    pub fn retire_running_program_statuses(&mut self) {
+        self.program_statuses.process_ended();
     }
 
     /// Returns the current working directory associated with the

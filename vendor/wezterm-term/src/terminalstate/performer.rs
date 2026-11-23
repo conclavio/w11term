@@ -837,6 +837,7 @@ impl Performer<'_> {
                 self.end_synchronized_output();
                 self.progress = Progress::default();
                 self.progress_value = 0;
+                self.program_statuses = Default::default();
 
                 self.screen.full_reset();
                 self.activate_screen(true);
@@ -866,6 +867,7 @@ impl Performer<'_> {
         match &marker {
             FinalTermSemanticPrompt::FreshLine => self.fresh_line(),
             FinalTermSemanticPrompt::FreshLineAndStartPrompt { .. } => {
+                self.retire_running_program_statuses();
                 self.next_shell_prompt();
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
@@ -942,6 +944,15 @@ impl Performer<'_> {
                 if unspec.first().is_some_and(|part| part == b"440") {
                     if let Some(handler) = self.alert_handler.as_mut() {
                         handler.alert(Alert::W11termOsc440(unspec));
+                    }
+                } else if unspec.first().is_some_and(|part| part == b"7501") {
+                    if let [_, body] = unspec.as_slice() {
+                        if body == b"?" {
+                            self.writer.write_all(b"\x1b]7501;?\x1b\\").ok();
+                            self.writer.flush().ok();
+                        } else {
+                            self.program_statuses.apply(body);
+                        }
                     }
                 } else if self.config.log_unknown_escape_sequences() {
                     let mut output = String::new();
@@ -1165,6 +1176,9 @@ impl Performer<'_> {
                 }
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
+                if self.program_statuses.seen_report {
+                    return;
+                }
                 use wezterm_escape_parser::osc::Progress as TProg;
                 let retained = if self.progress_value == 0 {
                     10

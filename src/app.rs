@@ -3427,12 +3427,21 @@ impl TerminalApp {
 
     fn header_view(&self, context: &ViewContext<Self>, application_titles: bool) -> View {
         let mut progress = BTreeMap::new();
+        let mut programs: BTreeMap<u64, (u64, Arc<wezterm_term::ProgramStatus>)> = BTreeMap::new();
         for entry in self.tabs.entries() {
             if let Page::Terminal(pane) = &entry.value.page {
-                let next = pane.session.events.progress();
+                let group_id = entry.group_id();
+                let (next, status) = pane.session.events.terminal_activity();
                 if next != wezterm_term::Progress::None {
-                    let group = progress.entry(entry.group_id()).or_default();
+                    let group = progress.entry(group_id).or_default();
                     *group = taskbar::most_important(*group, next);
+                }
+                if let Some(status) = status
+                    && programs
+                        .get(&group_id)
+                        .is_none_or(|(_, old)| status.state > old.state)
+                {
+                    programs.insert(group_id, (entry.id, status));
                 }
             }
         }
@@ -3440,6 +3449,7 @@ impl TerminalApp {
             let state = progress
                 .values()
                 .copied()
+                .chain(programs.values().map(|(_, s)| taskbar::program_progress(s)))
                 .fold(wezterm_term::Progress::None, taskbar::most_important);
             self.taskbar.borrow_mut().show(hwnd, state);
         }
@@ -3479,10 +3489,19 @@ impl TerminalApp {
                 self.tabs.headers().into_iter().map(|tab| {
                     let group = tab.group_id();
                     let pinned = self.tabs.group_is_pinned(group);
-                    let label = taskbar::tab_header(
-                        self.tab_label(tab.id, application_titles).as_ref(),
-                        progress.get(&group).copied().unwrap_or_default(),
-                    );
+                    let title = self.tab_label(tab.id, application_titles);
+                    let legacy = progress.get(&group).copied().unwrap_or_default();
+                    let program = programs
+                        .get(&group)
+                        .filter(|(_, s)| taskbar::prefer_program(s, legacy));
+                    let label = match program {
+                        Some((_, status)) => taskbar::program_tab_header(title.as_ref(), status),
+                        None => taskbar::tab_header(title.as_ref(), legacy),
+                    };
+                    let tooltip = match program {
+                        Some((pane, status)) => taskbar::program_tooltip(&label, *pane, status),
+                        None => label.clone(),
+                    };
                     let color =
                         self.tabs
                             .group_color(group)
@@ -3497,7 +3516,13 @@ impl TerminalApp {
                             .header(header)
                             .automation_name(name)
                             .tag(tab.id.to_string())
-                            .is_closable(!pinned),
+                            .is_closable(!pinned)
+                            .tooltip_with(Tooltip::rich(
+                                TextBlock::new()
+                                    .max_width(420.0)
+                                    .text_wrapping(TextWrapping::Wrap)
+                                    .text(tooltip),
+                            )),
                     )
                 }),
             );

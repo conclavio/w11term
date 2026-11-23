@@ -163,7 +163,7 @@ fn contain_worker_failure(
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         events.close_restart();
         events.command_stream(None);
-        events.set_progress(wezterm_term::Progress::None);
+        events.set_terminal_activity(wezterm_term::Progress::None, None);
         // Never resume a possibly inconsistent terminal engine after unwinding.
         let mut frame = (*frames.load()).clone();
         frame.generation += 1;
@@ -946,6 +946,7 @@ async fn run(
                             phase = Phase::Restarting { reset: true };
                             search_origin = Arc::new(());
                             terminal.reset_connection();
+                            events.set_terminal_activity(wezterm_term::Progress::None, None);
                             scroll_offset = 0;
                             last_mouse.button = wezterm_term::MouseButton::None;
                             let (tx, rx) = mpsc::unbounded_channel();
@@ -1251,7 +1252,13 @@ async fn run(
                     let joined = transports.join_next().await;
                     prompts.cancel();
                     events.command_stream(None);
-                    events.set_progress(wezterm_term::Progress::None);
+                    let program = if show_progress {
+                        terminal.retire_running_program_statuses();
+                        terminal.program_status().cloned()
+                    } else {
+                        None
+                    };
+                    events.set_terminal_activity(wezterm_term::Progress::None, program);
                     if let Some(task) = asset_task.take() { task.abort(); }
                     pending_pack = Default::default();
                     while let Ok(notice) = notices.try_recv() {
@@ -1277,7 +1284,7 @@ async fn run(
                     match event {
                         ssh::Event::HerdrViewer => {
                             show_progress = false;
-                            events.set_progress(wezterm_term::Progress::None);
+                            events.set_terminal_activity(wezterm_term::Progress::None, None);
                             terminal::enter_herdr_viewer(&mut terminal, &writer, &events);
                         }
                         ssh::Event::Disconnected => {
@@ -1285,7 +1292,13 @@ async fn run(
                             terminal.clear_resize_subscription();
                             if let Phase::Restarting { reset } = &mut phase { *reset = false; }
                             events.command_stream(None);
-                            events.set_progress(wezterm_term::Progress::None);
+                            let program = if show_progress {
+                                terminal.retire_running_program_statuses();
+                                terminal.program_status().cloned()
+                            } else {
+                                None
+                            };
+                            events.set_terminal_activity(wezterm_term::Progress::None, program);
                             show_progress = interactive;
                         }
                         ssh::Event::Data(bytes) => {
@@ -1295,9 +1308,12 @@ async fn run(
                             update_recording(&mut recorder, &events, |active| active.write(&bytes));
                             total_bytes += bytes.len() as u64;
                             let before = terminal.get_progress();
+                            let program_before = terminal.program_status().cloned();
                             scroll_offset = presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
-                            if show_progress && before != terminal.get_progress() {
-                                events.set_progress(terminal.get_progress());
+                            if show_progress && (before != terminal.get_progress()
+                                || program_before.as_ref() != terminal.program_status())
+                            {
+                                events.set_terminal_activity(terminal.get_progress(), terminal.program_status().cloned());
                             }
                         }
                         ssh::Event::Status(message) => {
@@ -1317,7 +1333,7 @@ async fn run(
                             }
                             if generation > 1 && !matches!(phase, Phase::Restarting { reset: true }) {
                                 terminal.reset_connection();
-                                events.set_progress(wezterm_term::Progress::None);
+                                events.set_terminal_activity(wezterm_term::Progress::None, None);
                                 scroll_offset = 0;
                             }
                             presentation.dirty = true;
