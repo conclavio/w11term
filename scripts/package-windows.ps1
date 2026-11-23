@@ -55,7 +55,7 @@ try {
         foreach ($name in 'LICENSE', 'NOTICE', 'README.md', 'CONTROL.md') {
             Add-File (Join-Path $repo $name) $name
         }
-        foreach ($name in 'wezterm-term', 'wezterm-escape-parser', 'vtparse') {
+        foreach ($name in 'wezterm-term', 'wezterm-cell', 'wezterm-escape-parser', 'vtparse') {
             $license = "vendor/$name/LICENSE.md"
             Add-File (Join-Path $repo $license) $license
         }

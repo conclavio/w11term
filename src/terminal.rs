@@ -2790,6 +2790,82 @@ mod tests {
     }
 
     #[test]
+    fn dec_selective_erase_keeps_fields_and_uses_the_requested_line_or_display_extent() {
+        let (mut term, _) = engine();
+        term.advance_bytes(b"a\x1b[1\"qA\x1b[0mB\x1b[2\"qc\r\n");
+        term.advance_bytes(b"d\x1b[1\"qCD\x1b[\"qe\r\nplain");
+        term.advance_bytes(b"\x1b[2;2H\x1b[?1J");
+        assert!(text(&term).starts_with(" AB\n CDe\nplain\n"));
+        term.advance_bytes(b"\x1b[2;4H\x1b[?K");
+        assert!(text(&term).starts_with(" AB\n CD\nplain\n"));
+        term.advance_bytes(b"\x1b[2;1H\x1b[?J");
+        assert!(text(&term).starts_with(" AB\n CD\n\n"));
+        term.advance_bytes(b"\x1b[1;1HX\x1b[1;1H\x1b[?1K");
+        assert!(text(&term).starts_with(" AB\n CD\n\n"));
+        term.advance_bytes(b"\x1b[2K\x1b[?2J");
+        assert!(text(&term).starts_with("\n CD\n\n"));
+    }
+
+    #[test]
+    fn dec_selective_rectangle_preserves_wide_protected_glyphs_and_cell_rendition() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes("\x1b#6\x1b[1\"q界\x1b[0\"q\x1b[4:3;44m語\x1b[0mZ");
+        term.advance_bytes(b"\x1b[1;2;1;2${\x1b[1;4;1;4${\x1b[6n");
+        assert_eq!(receive(&mut replies), b"\x1b[1;6R");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let row = &frame.rows[0];
+        assert!(row.is_double_width());
+        assert_eq!(row.as_str().trim_end(), "界  Z");
+        assert!(row.get_cell(0).unwrap().attrs().protected());
+        for col in 2..4 {
+            let cell = row.get_cell(col).unwrap();
+            assert_eq!(cell.attrs().underline(), wezterm_term::Underline::Curly);
+            assert_eq!(
+                cell.attrs().background(),
+                wezterm_term::color::ColorAttribute::PaletteIndex(4)
+            );
+        }
+    }
+
+    #[test]
+    fn dec_character_protection_is_saved_with_the_cursor_and_has_a_status_reply() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes(b"\x1b[1\"q\x1b7\x1b[2\"q\x1bP$q\"q\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0\"q\x1b\\");
+        term.advance_bytes(b"\x1b8\x1b[9\"q\x1bP$q\"q\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r1\"q\x1b\\");
+        // Ordinary erasure inserts unprotected blanks even while the pen is protected.
+        term.advance_bytes(b"AB\r\x1b[X");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(!frame.rows[0].get_cell(0).unwrap().attrs().protected());
+        assert!(frame.rows[0].get_cell(1).unwrap().attrs().protected());
+        term.advance_bytes(b"\x1b[!p\x1bP$q\"q\x1b\\");
+        assert_eq!(receive(&mut replies), b"\x1bP1$r0\"q\x1b\\");
+    }
+
+    #[test]
+    fn dec_selective_protection_follows_the_wrapped_cells_between_screen_edits() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 5,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"..\x1b[1\"qprotected\x1b[0\"q..");
+        let size = TerminalSize {
+            cols: 16,
+            ..term.get_size()
+        };
+        term.resize(size);
+        term.advance_bytes(b"\x1b[?1049hdiscard\x1b[?2J\x1b[?1049l");
+        term.advance_bytes(b"\x1b[1;1H\x1b[@\x1b[?2J");
+        assert!(text(&term).starts_with("   protected\n"));
+    }
+
+    #[test]
     fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(

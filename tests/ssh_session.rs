@@ -145,6 +145,11 @@ impl server::Handler for Peer {
                 channel,
                 b"\x1b[1;34mXY\x1b[0m\r\x1b[2;1;2;2#|\x1b[2K".as_slice(),
             )?;
+        } else if data == b"\x1b[0;1;34m" {
+            session.data(
+                channel,
+                b"\x1b7\x1b[3;1H\x1b[1\"qprotected header\x1b[0\"q transient\x1b[?2K\x1b[1\"q\x1bP$q\"q\x1b\\\x1b8".as_slice(),
+            )?;
         } else if let Some(bytes) = data.strip_prefix(b"\0sync:") {
             session.data(channel, bytes.to_vec())?;
         }
@@ -260,6 +265,10 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
             next(&mut observed, &session).await,
             Observed::Data(b"\x1b[0;1;34m".to_vec())
         );
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(b"\x1bP1$r1\"q\x1b\\".to_vec())
+        );
         let generation = session.events.shell_generation().expect("running shell");
         for (text, connection) in [
             ("stale input", generation + 1),
@@ -322,7 +331,8 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                 frame.cursor,
                 frame.status
             );
-            if text.contains("remote ready\nx") {
+            if text.contains("remote ready\nx\nprotected header") {
+                assert!(!text.contains("transient"));
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

@@ -134,3 +134,9 @@ The original MIT license is preserved in `LICENSE.md`.
   The model tracks whether an application supplied the window title, including
   across title saves and restores. A full reset or reconnect clears that flag.
   Consumers can read the application window title independently of the icon.
+
+- DECSCA stores character protection in a spare attribute bit in the vendored
+  wezterm-cell. DECSEL, DECSED, and DECSERA erase unprotected text, including
+  complete wide graphemes, while preserving visual and line attributes.
+  DECRQSS reports the current protection setting. Saving the cursor saves
+  protection with the pen, and SGR changes only the visual attributes.
