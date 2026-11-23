@@ -148,7 +148,12 @@ impl server::Handler for Peer {
         } else if data == b"\x1b[0;1;34m" {
             session.data(
                 channel,
-                b"\x1b7\x1b[3;1H\x1b[1\"qprotected header\x1b[0\"q transient\x1b[?2K\x1b[1\"q\x1bP$q\"q\x1b\\\x1b8".as_slice(),
+                concat!(
+                    "\x1b7\x1b[3;1H\x1b[1\"qprotected header\x1b[0\"q transient\x1b[?2K",
+                    "\x1b[4;1HLaXXXXfR\x1b[35;4;3;4;6$x\x1b[4;4;4;4$z",
+                    "\x1b[1\"q\x1bP$q\"q\x1b\\\x1b8",
+                )
+                .as_bytes(),
             )?;
         } else if let Some(bytes) = data.strip_prefix(b"\0sync:") {
             session.data(channel, bytes.to_vec())?;
@@ -331,7 +336,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                 frame.cursor,
                 frame.status
             );
-            if text.contains("remote ready\nx\nprotected header") {
+            if text.contains("remote ready\nx\nprotected header\nLa# ##fR") {
                 assert!(!text.contains("transient"));
                 break;
             }

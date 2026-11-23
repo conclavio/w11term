@@ -64,9 +64,11 @@ impl<'a> Performer<'a> {
             print: String::new(),
         }
     }
+}
 
+impl TerminalState {
     /// Apply character set related remapping to the input glyph if required
-    fn remap_grapheme<'b>(&self, g: &'b str) -> &'b str {
+    pub(super) fn remap_grapheme<'b>(&self, g: &'b str) -> &'b str {
         if (self.shift_out && self.g1_charset == CharSet::DecLineDrawing)
             || (!self.shift_out && self.g0_charset == CharSet::DecLineDrawing)
         {
@@ -115,7 +117,9 @@ impl<'a> Performer<'a> {
             g
         }
     }
+}
 
+impl Performer<'_> {
     fn flush_print(&mut self) {
         if self.print.is_empty() {
             return;

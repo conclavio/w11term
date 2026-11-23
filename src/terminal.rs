@@ -2866,6 +2866,67 @@ mod tests {
     }
 
     #[test]
+    fn dec_rectangle_fill_uses_the_pen_and_ordinary_erase_clears_protection() {
+        let (mut term, mut replies) = engine();
+        term.advance_bytes(b"ABCDEF\r\nabcdef\r\n012345\x1b[4;9H");
+        term.advance_bytes(b"\x1b[1;4:3;44m\x1b[1\"q\x1b[42;1;2;2;5$x");
+        term.advance_bytes(b"\x1b[2;3;3;4$z\x1b[6n");
+        assert_eq!(receive(&mut replies), b"\x1b[4;9R");
+        assert!(text(&term).starts_with("A****F\na*  *f\n01  45\n"));
+
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let fill = frame.rows[1].get_cell(1).unwrap();
+        assert!(fill.attrs().protected());
+        assert_eq!(fill.attrs().underline(), wezterm_term::Underline::Curly);
+        assert_eq!(
+            fill.attrs().background(),
+            wezterm_term::color::ColorAttribute::PaletteIndex(4)
+        );
+        let blank = frame.rows[1].get_cell(2).unwrap();
+        assert!(!blank.attrs().protected());
+        assert_eq!(blank.attrs().underline(), wezterm_term::Underline::None);
+        assert_eq!(
+            blank.attrs().background(),
+            wezterm_term::color::ColorAttribute::Default
+        );
+        // The active protection setting still applies to text after the edit.
+        term.advance_bytes(b"Z\x1b[?2J");
+        assert!(text(&term).starts_with(" ****\n *  *\n\n        Z\n"));
+    }
+
+    #[test]
+    fn dec_rectangle_edit_coordinates_follow_origin_and_handle_invalid_or_default_borders() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 6,
+                rows: 3,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"ABCDEF\r\nabcdef\r\n012345");
+        term.advance_bytes(b"\x1b[?69h\x1b[2;5s\x1b[2;3r\x1b[?6h\x1b[46;1;1;99;99$x");
+        assert_eq!(text(&term), "ABCDEF\na....f\n0....5");
+        term.advance_bytes(b"\x1b[?6l\x1b[100;100;99;99$z\x1b[127;1;1;3;6$x");
+        assert_eq!(text(&term), "ABCDEF\na....f\n0....5");
+        term.advance_bytes(b"\x1b[2;5$z");
+        assert_eq!(text(&term), "ABCDEF\na...\n0...");
+    }
+
+    #[test]
+    fn dec_rectangle_fill_translates_graphic_characters_and_keeps_line_rendition() {
+        let (mut term, _) = engine();
+        term.advance_bytes("\x1b#6A界Z\x1b(0\x1b[113;1;3;1;3$x\x1b(B\x1b[163;1;5;1;5$x");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "A ─Z£");
+        assert!(frame.rows[0].is_double_width());
+        for col in [2, 4] {
+            assert_eq!(frame.rows[0].get_cell(col).unwrap().width(), 1);
+        }
+    }
+
+    #[test]
     fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(

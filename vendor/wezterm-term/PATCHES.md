@@ -140,3 +140,7 @@ The original MIT license is preserved in `LICENSE.md`.
   complete wide graphemes, while preserving visual and line attributes.
   DECRQSS reports the current protection setting. Saving the cursor saves
   protection with the pen, and SGR changes only the visual attributes.
+
+- DECFRA and DECERA use the active screen's rectangle coordinates and keep
+  the cursor and line rendition. Fill uses the active character set and
+  pen with one cell per column. Erase replaces cells with default blanks.

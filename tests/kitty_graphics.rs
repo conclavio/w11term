@@ -1086,8 +1086,17 @@ fn text_erasure_keeps_direct_kitty_layers_and_full_screen_erase_clears_them() {
     assert!(start_erased.rows[2].as_str().contains("OW"));
     check_layers(&start_erased);
 
+    t.advance_bytes(b"\x1b[46;2;3;3;4$x");
+    let filled = frame(&t, Some(&start_erased), 0);
+    assert!(filled.rows[1].as_str().contains(".."));
+    check_layers(&filled);
+    t.advance_bytes(b"\x1b[2;3;3;4$z");
+    let rectangle_erased = frame(&t, Some(&filled), 0);
+    assert!(!rectangle_erased.rows[1].as_str().contains(".."));
+    check_layers(&rectangle_erased);
+
     t.advance_bytes(b"\x1b[2J");
-    let cleared = frame(&t, Some(&start_erased), 0);
+    let cleared = frame(&t, Some(&rectangle_erased), 0);
     assert_eq!(pixel(&cleared, 2, 1, 40), None);
     assert_eq!(pixel(&cleared, 2, 1, 41), None);
     assert_eq!(pixel(&cleared, 2, 2, 40), None);
