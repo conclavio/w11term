@@ -1,4 +1,5 @@
 //! Bounded per-pane event journal with monotonic cursors and loss detection.
+use crate::options::GroupPromptPattern;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -52,6 +53,7 @@ struct State {
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
     group_run: Option<GroupRun>,
+    group_prompt_pattern: Option<GroupPromptPattern>,
     group_serial: u64,
     next_prompt: u64,
     notify_long_commands: bool,
@@ -133,6 +135,49 @@ pub struct Events {
     changed: Arc<Notify>,
 }
 impl Events {
+    pub(crate) fn with_group_prompt_pattern(pattern: Option<GroupPromptPattern>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(State {
+                group_prompt_pattern: pattern,
+                ..State::default()
+            })),
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn group_prompt_pattern(&self) -> Option<GroupPromptPattern> {
+        self.state.lock().unwrap().group_prompt_pattern.clone()
+    }
+
+    pub(crate) fn change_group_prompt_pattern(
+        &self,
+        expected: Option<&GroupPromptPattern>,
+        replacement: Option<&GroupPromptPattern>,
+    ) -> Result<bool, &'static str> {
+        let mut state = self.state.lock().unwrap();
+        if state.group_prompt_pattern.as_ref() != expected {
+            return Err("The pane's prompt pattern changed. Reopen prompt setup.");
+        }
+        if expected == replacement {
+            return Ok(false);
+        }
+        state.group_prompt_pattern = replacement.cloned();
+        if let Some(watch) = &mut state.command_watch
+            && !watch.saw_markers
+        {
+            watch.prompt = ShellPrompt::Unverified;
+        }
+        if state
+            .group_run
+            .as_ref()
+            .is_some_and(GroupRun::awaiting_prompt)
+            && let Some(run) = state.group_run.take()
+        {
+            run.abandon("The prompt pattern changed before the shell reported a result.");
+        }
+        Ok(true)
+    }
+
     pub fn replay_state(&self) -> Option<crate::session::ReplayState> {
         self.state.lock().unwrap().replay
     }

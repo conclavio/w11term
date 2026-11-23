@@ -8,6 +8,7 @@ use w11term::events::{
 mod import;
 mod live_output;
 mod progress;
+mod prompt_setup;
 mod reconnect;
 mod report;
 mod retry;
@@ -36,6 +37,7 @@ pub(super) struct HostGroup {
     import: import::State,
     reconnect_feedback: String,
     retry_feedback: String,
+    prompt_setup: prompt_setup::State,
 }
 
 struct DraftBackup {
@@ -317,6 +319,7 @@ pub enum Action {
     FilterResults(TabId, u64, progress::Filter),
     LoadCommand(TabId, u64),
     PrepareRetry(TabId, u64, BTreeSet<u64>),
+    PromptSetup(TabId, prompt_setup::Action),
     OpenSavedCommands(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
     SaveCommand(TabId, save_command::Action),
@@ -351,7 +354,8 @@ impl TerminalApp {
             Page::HostGroup(page)
                 if !page.saved.is_editing()
                     && page.live_output.is_none()
-                    && !page.import.is_open() =>
+                    && !page.import.is_open()
+                    && !page.prompt_setup.is_open() =>
             {
                 Some(id)
             }
@@ -618,6 +622,7 @@ impl TerminalApp {
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Import(id, action) => self.handle_host_import(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
+            Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
             Action::Tick => {
                 let Some(id) = self.tabs.active_id() else {
                     return;
@@ -635,6 +640,7 @@ impl TerminalApp {
                     .collect();
                 if let Some(page) = self.host_group_mut(id) {
                     page.selected.retain(|pane| panes.contains(pane));
+                    page.prompt_setup.poll();
                     for submission in &mut page.submissions {
                         for delivery in &mut submission.results {
                             delivery.poll();
@@ -768,6 +774,9 @@ impl TerminalApp {
                 self.interrupt_hosts(id, submission, targets)
             }
             Action::Send(id, text, targets) => {
+                if self.host_group_command_target() != Some(id) {
+                    return;
+                }
                 let roster = self.host_group_targets();
                 let Some(page) = self.host_group_mut(id) else {
                     return;
@@ -821,6 +830,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &ViewContext<Self>,
     ) -> View {
+        if let Some(view) = page.prompt_setup.view(id, ctx) {
+            return view;
+        }
         if let Some(view) = page.import.view(id, ctx) {
             return view;
         }
@@ -882,6 +894,7 @@ impl TerminalApp {
                                     }))
                                     .content("Focus pane"),
                                 reconnect::host_button(id, target.state, ctx),
+                                prompt_setup::button(id, target, ctx),
                             )),
                     )),
                 )

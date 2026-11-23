@@ -118,6 +118,10 @@ impl GroupRun {
         self.status.send_replace(GroupExecution::PromptReturned);
     }
 
+    pub(super) fn awaiting_prompt(&self) -> bool {
+        matches!(*self.status.borrow(), GroupExecution::AwaitingPrompt)
+    }
+
     pub(super) fn identify(&self, id: u64, label: Option<&str>) {
         if self
             .started

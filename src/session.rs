@@ -99,6 +99,12 @@ pub enum Command {
         execution: tokio::sync::watch::Sender<crate::events::GroupExecution>,
         transcript: crate::events::GroupTranscriptHost,
     },
+    /// A local pane setting, ordered with input and prompt authorization.
+    SetGroupPrompt {
+        expected: Option<crate::options::GroupPromptPattern>,
+        replacement: Option<crate::options::GroupPromptPattern>,
+        reply: tokio::sync::oneshot::Sender<Result<(), &'static str>>,
+    },
     InterruptGroupCommand {
         target: crate::events::GroupInterruptTarget,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -477,7 +483,12 @@ impl Session {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
         let prompts = crate::prompts::Prompts::default();
-        let events = crate::events::Events::default();
+        let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
+        let group_prompt_pattern = match &source {
+            Source::Ssh(ssh) if direct_ssh_shell => ssh.group_prompt.clone(),
+            _ => None,
+        };
+        let events = crate::events::Events::with_group_prompt_pattern(group_prompt_pattern);
         let player = Arc::new(std::sync::RwLock::new(match &source {
             Source::Ssh(ssh) => ssh.player.clone(),
             _ => Default::default(),
@@ -502,7 +513,6 @@ impl Session {
         } else {
             clipboard_policy
         }));
-        let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         match &source {
             Source::Local(shell) if shell.wsl_distribution().is_some() => {
                 terminal.enable_wsl_directory_reports();
@@ -648,12 +658,9 @@ async fn run(
     let live_commands = sharing.durable.is_none() && can_watch_commands(&source);
     let group_shell =
         direct_ssh_shell(&source, sharing.durable.is_some(), sharing.startup.as_ref());
-    let mut prompt_matcher = match &source {
-        Source::Ssh(options) if group_shell => {
-            options.group_prompt.clone().map(group_prompt::Matcher::new)
-        }
-        _ => None,
-    };
+    let mut prompt_matcher = events
+        .group_prompt_pattern()
+        .map(group_prompt::Matcher::new);
     terminal.set_track_primary_prints(prompt_matcher.is_some());
     let restartable = can_restart(live_commands, sharing.startup.as_ref());
     let mut launch =
@@ -950,6 +957,15 @@ async fn run(
                 presentation.dirty|=matches!(&command,Some(Command::Scroll(_) | Command::ScrollEdge(_) | Command::Wheel(..) | Command::Prompt(_) | Command::Search{..} | Command::SearchNavigate(_) | Command::SearchClose | Command::ReloadDemo)) || (is_demo && changes_screen);
                 let result = match command {
                     Some(Command::MirroredKeyboard(_)) => unreachable!("mirrored input was unwrapped above"),
+                    Some(Command::SetGroupPrompt { expected, replacement, reply }) => {
+                        let updated = if group_shell {
+                            group_prompt::configure(&mut terminal, &mut prompt_matcher, &events, expected.as_ref(), replacement)
+                        } else {
+                            Err("Prompt setup requires a direct SSH pane.")
+                        };
+                        let _ = reply.send(updated);
+                        Ok(())
+                    }
                     Some(Command::SendGroupCommand { prompt, text, reply, execution, transcript }) => {
                         let kind = terminal::ScopedInput::GroupCommand;
                         let ready = match events.shell_prompt() {

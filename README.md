@@ -81,6 +81,8 @@ Choose **caret → SSH host group** or search for it in the command palette to s
 
 For an appliance SSH shell, set **SSH group prompt regex** in its profile and open a new pane from that profile. For example, `rack-[12]>>` matches the visible prompt on either rack. The regex matches the full line up to the cursor with trailing spaces removed. A fresh match reports **Ready · prompt match**, and the next match after a submission reports **Prompt returned · exit status unavailable**. Inspect the pane for command output. OSC 133 and OSC 633 take precedence when present. Choose a pattern specific to the prompt because matching output can also mark the pane ready.
 
+Choose **Prompt setup…** on a connected host’s roster row to copy the Bash, Zsh, or Fish integration and open the pane to paste and run it. For an appliance, **Apply to pane** changes its prompt regex immediately and keeps the setting for reconnects in that pane. A blank regex disables matching. The pane waits for a freshly printed matching prompt after a change. Use the profile field to set the default for new panes.
+
 Use **Host filter** to find SSH panes by profile, pane name, or address. **Select shown** and **Deselect shown** change the visible rows. The filter preserves hidden selections and scopes **Send** and **Interrupt selected** to the shown hosts. Prior submission results remain visible.
 
 The command editor shows how many selected, visible hosts are ready. **Select only ready shown** checks the visible hosts with a fresh shell marker or a configured prompt match and unchecks the other visible hosts. The selection stays in place as prompts change. Review the recipients before choosing **Send**.

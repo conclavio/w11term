@@ -11,6 +11,11 @@ pub enum Setup {
 }
 
 impl Setup {
+    pub(super) const INTEGRATIONS: [Self; 3] = [
+        Self::BashIntegration,
+        Self::ZshIntegration,
+        Self::FishIntegration,
+    ];
     const ALL: [Self; 6] = [
         Self::BashDirectory,
         Self::ZshDirectory,
@@ -20,7 +25,7 @@ impl Setup {
         Self::FishIntegration,
     ];
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::BashDirectory => "Copy Bash directory setup",
             Self::ZshDirectory => "Copy Zsh directory setup",

@@ -287,6 +287,10 @@ impl TerminalApp {
                 !page.import.is_open(),
                 "Finish reviewing the host list before opening another group."
             );
+            ensure!(
+                !page.prompt_setup.is_open(),
+                "Finish prompt setup before opening another group."
+            );
         }
         let catalog = self.store.catalog()?;
         ensure!(
