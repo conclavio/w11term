@@ -24,6 +24,10 @@ fn single_line(value: &str) -> bool {
         .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
 }
 
+pub fn valid_command_text(text: &str) -> bool {
+    text.len() <= 4096 && !text.trim().is_empty() && single_line(text)
+}
+
 impl TryFrom<Vec<Entry>> for Commands {
     type Error = anyhow::Error;
 
@@ -73,7 +77,7 @@ impl Commands {
         );
         entry.name = entry.name.trim().to_owned();
         ensure!(
-            single_line(&entry.text) && !entry.text.trim().is_empty() && entry.text.len() <= 4096,
+            valid_command_text(&entry.text),
             "Enter one command line of up to 4,096 UTF-8 bytes, without tabs or control characters."
         );
         let name = entry.name.to_lowercase();

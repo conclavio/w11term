@@ -520,7 +520,7 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     stream.push_str("history-search-ready\r\n");
     run_palette_fixture(
         "search-command-history-ui.ps1",
-        b"history-resumed",
+        b"deploy audithistory-resumed",
         Some(&stream),
     )
     .await;
