@@ -6,7 +6,7 @@ use windows::{
     Win32::Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, MOVE_FILE_FLAGS, MoveFileExW,
+        FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, MOVE_FILE_FLAGS, MoveFileExW,
     },
     core::HSTRING,
 };
@@ -48,12 +48,11 @@ impl PartialEq for WindowsName {
     }
 }
 
-// Keep each staged ancestor from being renamed or converted to a reparse point
-// while we open its children. A file or directory is always created exclusively.
-fn pin_directory(path: &Path) -> Result<std::fs::File> {
+// Open the directory itself and deny delete sharing while we use its children.
+pub(super) fn pin_directory(path: &Path, sharing: FILE_SHARE_MODE) -> Result<std::fs::File> {
     let dir = std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ.0)
+        .share_mode(sharing.0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
         .open(path)?;
     let metadata = dir.metadata()?;
@@ -165,7 +164,7 @@ impl Download<'_> {
         if self.cancelled() {
             return Ok(());
         }
-        let _pin = pin_directory(local)?;
+        let _pin = pin_directory(local, FILE_SHARE_READ)?;
         let attrs = self.engine.raw.lstat(remote).await?.attrs;
         ensure!(
             EntryKind::from_permissions(attrs.permissions) == Some(EntryKind::Directory),
