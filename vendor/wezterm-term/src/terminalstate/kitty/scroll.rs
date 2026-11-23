@@ -12,9 +12,14 @@ struct Tile {
     image: ImageCell,
 }
 
-pub(in crate::terminalstate) struct KittyMarginScroll {
+pub(in crate::terminalstate) struct KittyTileUpdate {
     stationary: Vec<Tile>,
     clipped: HashSet<Key>,
+}
+
+enum TextMotion {
+    Scroll(VisibleRowIndex),
+    Edit { pushes_history: bool },
 }
 
 impl TerminalState {
@@ -23,17 +28,43 @@ impl TerminalState {
         rows: &Range<VisibleRowIndex>,
         cols: &Range<usize>,
         delta: VisibleRowIndex,
-    ) -> Option<KittyMarginScroll> {
+    ) -> Option<KittyTileUpdate> {
+        self.prepare_kitty_tiles(rows, cols, TextMotion::Scroll(delta))
+    }
+
+    pub(in crate::terminalstate) fn prepare_kitty_text_edit(
+        &mut self,
+        rows: &Range<VisibleRowIndex>,
+        cols: &Range<usize>,
+        pushes_history: bool,
+    ) -> Option<KittyTileUpdate> {
+        self.prepare_kitty_tiles(rows, cols, TextMotion::Edit { pushes_history })
+    }
+
+    fn prepare_kitty_tiles(
+        &mut self,
+        rows: &Range<VisibleRowIndex>,
+        cols: &Range<usize>,
+        motion: TextMotion,
+    ) -> Option<KittyTileUpdate> {
         let state = &self.kitty_img;
-        if delta == 0
-            || state.placements.is_empty()
-            || (rows.start == 0
-                && rows.end == self.screen.physical_rows as VisibleRowIndex
-                && cols.start == 0
-                && cols.end == self.screen.physical_cols)
-        {
+        if state.placements.is_empty() || rows.is_empty() || cols.is_empty() {
             return None;
         }
+        let full_width = cols.start == 0 && cols.end == self.screen.physical_cols;
+        let (stationary_edit, delta, pushes_history) = match motion {
+            TextMotion::Scroll(delta) => {
+                if delta == 0
+                    || (full_width
+                        && rows.start == 0
+                        && rows.end == self.screen.physical_rows as VisibleRowIndex)
+                {
+                    return None;
+                }
+                (false, delta, delta < 0)
+            }
+            TextMotion::Edit { pushes_history } => (true, 0, pushes_history),
+        };
 
         let screen = &mut self.screen;
         let first_live = screen.phys_row(0);
@@ -72,53 +103,55 @@ impl TerminalState {
             .iter()
             .map(|key| state.placements[key].created)
             .min()?;
-        let full_width = cols.start == 0 && cols.end == screen.physical_cols;
-        let history_moves = delta < 0 && rows.start == 0 && full_width;
+        let history_moves = pushes_history && rows.start == 0 && full_width && first_live != 0;
         let mut crossing = HashSet::new();
-        screen.for_each_phys_line_mut(|physical, line| {
-            if (full_width && region.contains(&physical))
-                || !line.changed_since(earliest.saturating_sub(1))
-            {
-                return;
-            }
-            if physical < first_live {
-                // Read historical rows in their existing representation. Only
-                // stationary tiles that need to move relative to history are staged.
-                for cell in line.visible_cells() {
-                    for image in cell.attrs().images().into_iter().flatten() {
-                        if let Some(key) =
-                            state.tile_key(&image).filter(|key| involved.contains(key))
-                        {
-                            crossing.insert(key);
-                            if history_moves {
-                                tiles.push(Tile {
-                                    row: physical as VisibleRowIndex
-                                        - first_live as VisibleRowIndex,
-                                    col: cell.cell_index(),
-                                    key,
-                                    image,
-                                });
+        if !stationary_edit || history_moves {
+            screen.for_each_phys_line_mut(|physical, line| {
+                if (full_width && region.contains(&physical))
+                    || !line.changed_since(earliest.saturating_sub(1))
+                {
+                    return;
+                }
+                if physical < first_live {
+                    // Read historical rows in their existing representation. Only
+                    // stationary tiles that need to move relative to history are staged.
+                    for cell in line.visible_cells() {
+                        for image in cell.attrs().images().into_iter().flatten() {
+                            if let Some(key) =
+                                state.tile_key(&image).filter(|key| involved.contains(key))
+                            {
+                                crossing.insert(key);
+                                if history_moves {
+                                    tiles.push(Tile {
+                                        row: physical as VisibleRowIndex
+                                            - first_live as VisibleRowIndex,
+                                        col: cell.cell_index(),
+                                        key,
+                                        image,
+                                    });
+                                }
                             }
                         }
                     }
+                    return;
                 }
-                return;
-            }
-            if crossing.len() == involved.len() {
-                return;
-            }
-            visit_kitty_tiles(line, state, |col, key, _| {
-                if (!region.contains(&physical) || !cols.contains(&col)) && involved.contains(&key)
-                {
-                    crossing.insert(key);
+                if stationary_edit || crossing.len() == involved.len() {
+                    return;
                 }
+                visit_kitty_tiles(line, state, |col, key, _| {
+                    if (!region.contains(&physical) || !cols.contains(&col))
+                        && involved.contains(&key)
+                    {
+                        crossing.insert(key);
+                    }
+                });
             });
-        });
+        }
 
         let mut stationary = Vec::new();
         let mut surviving = HashSet::new();
         for tile in tiles {
-            let stays = crossing.contains(&tile.key);
+            let stays = stationary_edit || crossing.contains(&tile.key);
             if !stays && rows.contains(&(tile.row + delta)) {
                 // The normal text scroll already moves these tiles without
                 // changing their texture coordinates or pixel padding.
@@ -137,20 +170,20 @@ impl TerminalState {
             }
         }
         involved.retain(|key| !surviving.contains(key));
-        Some(KittyMarginScroll {
+        Some(KittyTileUpdate {
             stationary,
             clipped: involved,
         })
     }
 
-    pub(in crate::terminalstate) fn finish_kitty_margin_scroll(
+    pub(in crate::terminalstate) fn finish_kitty_tile_update(
         &mut self,
-        scroll: Option<KittyMarginScroll>,
+        update: Option<KittyTileUpdate>,
     ) {
-        let Some(KittyMarginScroll {
+        let Some(KittyTileUpdate {
             stationary,
             mut clipped,
-        }) = scroll
+        }) = update
         else {
             return;
         };

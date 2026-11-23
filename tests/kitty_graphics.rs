@@ -1014,6 +1014,70 @@ fn kitty_regional_scroll_keeps_a_placement_crossing_into_history_together() {
 }
 
 #[test]
+fn kitty_character_insert_and_delete_keep_direct_tiles_at_the_original_columns() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "ABCD",
+        "\x1b[1;2H\x1b_Ga=T,i=40,p=1,f=24,s=2,v=1,c=2,r=1,C=1,q=2;/wAAAP8A\x1b\\",
+        "\x1b[1;3H\x1b_Ga=T,i=41,p=1,f=24,s=1,v=1,c=1,r=1,C=1,q=2;AAD/\x1b\\",
+        "\x1b[1;2H\x1b[@",
+    ));
+    let inserted = frame(&t, None, 0);
+    let check = |snapshot: &Snapshot| {
+        assert_eq!(pixel(snapshot, 1, 0, 40), RED);
+        assert_eq!(pixel(snapshot, 2, 0, 40), Some([0, 255, 0, 255]));
+        assert_eq!(pixel(snapshot, 2, 0, 41), Some([0, 0, 255, 255]));
+        assert_eq!(pixel(snapshot, 3, 0, 40), None);
+        assert_eq!(pixel(snapshot, 3, 0, 41), None);
+    };
+    assert!(inserted.rows[0].as_str().starts_with("A BCD"));
+    check(&inserted);
+
+    t.advance_bytes(b"\x1b[P");
+    let deleted = frame(&t, Some(&inserted), 0);
+    assert!(deleted.rows[0].as_str().starts_with("ABCD"));
+    check(&deleted);
+}
+
+#[test]
+fn kitty_line_edits_keep_images_at_their_rows_when_text_moves_into_history() {
+    let (mut t, _) = engine();
+    t.advance_bytes(concat!(
+        "top\x1b[2;1Hbottom",
+        "\x1b[1;2H\x1b_Ga=T,i=40,p=1,f=24,s=1,v=2,c=1,r=2,C=1,q=2;/wAAAP8A\x1b\\",
+        "\x1b[1;1H\x1b[M",
+    ));
+    let deleted = frame(&t, None, 0);
+    assert!(deleted.rows[0].as_str().starts_with("bottom"));
+    assert_eq!(pixel(&deleted, 1, 0, 40), RED);
+    assert_eq!(pixel(&deleted, 1, 1, 40), Some([0, 255, 0, 255]));
+    let history = frame(&t, Some(&deleted), 1);
+    assert!(history.rows[0].as_str().starts_with("top"));
+    assert_eq!(pixel(&history, 1, 0, 40), None);
+
+    t.advance_bytes(b"\x1b[L");
+    let inserted = frame(&t, Some(&deleted), 0);
+    assert!(inserted.rows[1].as_str().starts_with("bottom"));
+    assert_eq!(pixel(&inserted, 1, 0, 40), RED);
+    assert_eq!(pixel(&inserted, 1, 1, 40), Some([0, 255, 0, 255]));
+    assert_eq!(pixel(&inserted, 1, 2, 40), None);
+}
+
+#[test]
+fn kitty_placeholder_images_move_with_inserted_characters_and_lines() {
+    let (mut t, _) = engine();
+    t.advance_bytes(b"\x1b_Ga=T,i=33554474,p=7,U=1,c=2,r=1,f=32,s=2,v=1,q=2;/wAA/wD/AP8=\x1b\\");
+    t.advance_bytes("\x1b[38;2;0;0;42;58;2;0;0;7m\u{10eeee}\u{305}\u{305}\u{30e}\x1b[0m");
+    let before = frame(&t, None, 0);
+    assert_eq!(pixel(&before, 0, 0, 33554474), RED);
+
+    t.advance_bytes(b"\x1b[H\x1b[@\x1b[L");
+    let shifted = frame(&t, Some(&before), 0);
+    assert_eq!(pixel(&shifted, 0, 0, 33554474), None);
+    assert_eq!(pixel(&shifted, 1, 1, 33554474), RED);
+}
+
+#[test]
 fn erasing_placeholder_text_hides_the_virtual_image() {
     let (mut t, _) = engine();
     t.advance_bytes(b"\x1b_Ga=T,i=33554474,p=7,U=1,c=2,r=1,f=32,s=2,v=1,q=2;/wAA/wD/AP8=\x1b\\");
@@ -1036,7 +1100,8 @@ fn cell_delete_uses_the_live_grid_and_preserves_image_data_referenced_in_history
         place(&mut t, 11, 2, 2, 3, 3);
         place(&mut t, 12, 1, 2, 3, 3);
         place(&mut t, 12, 2, 6, 10, 1);
-        t.advance_bytes(b"\x1b[6;1H\x1b[M"); // The removed row must not pin image 12.
+        // Clip the second placement at the top edge of a bounded scroll.
+        t.advance_bytes(b"\x1b[6;8r\x1b[8;1H\x1bD\x1b[r");
         t.advance_bytes(b"\x1b[8;1H\r\n\r\n\x1b[1;3H");
         let old = frame(&t, None, 2);
         assert_eq!(pixel(&old, 2, 1, 11), RED);
@@ -1427,7 +1492,7 @@ fn replacing_a_moved_placement_then_deleting_it_leaves_no_tiles_in_the_retained_
                 ..size
             });
         } else {
-            t.advance_bytes(b"\x1b[H\x1b[2L");
+            t.advance_bytes(b"\x1b[2T");
         }
         let moved = tile_positions(&t);
         assert_eq!(moved.len(), 1);
