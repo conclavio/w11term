@@ -81,6 +81,7 @@ mod pane_colors;
 mod pane_picker;
 mod pane_view;
 mod previous_pane;
+mod quick_connect;
 mod recordings;
 mod scrollback_bar;
 mod scrollback_export;
@@ -360,6 +361,7 @@ enum Page {
     Workspaces(workspace_view::WorkspacePage),
     Settings(Option<SettingsEditor>),
     NewProfile(ProfileDraft),
+    QuickConnect(quick_connect::Draft),
 }
 struct AppTab {
     label: String,
@@ -516,21 +518,7 @@ impl ProfileDraft {
             .parse::<std::num::NonZeroU16>()
             .map_err(|_| anyhow::anyhow!("Port must be between 1 and 65535"))?
             .get();
-        let authentication = match self.authentication {
-            1 => {
-                anyhow::ensure!(
-                    !self.identity.trim().is_empty(),
-                    "Enter the private key file path"
-                );
-                Authentication::Identity {
-                    identity: self.identity.trim().into(),
-                }
-            }
-            2 => Authentication::None,
-            3 => Authentication::Password,
-            4 => Authentication::KeyboardInteractive,
-            _ => Authentication::Agent,
-        };
+        let authentication = ssh_authentication(self.authentication, &self.identity)?;
         Ok(SshOptions {
             host: host.into(),
             terminal_type: self.terminal_type()?,
@@ -596,6 +584,30 @@ impl ProfileDraft {
             ..Default::default()
         }
     }
+}
+
+const SSH_AUTH_LABELS: [&str; 5] = [
+    "Windows SSH agent",
+    "Private key file",
+    "None (keyless server)",
+    "Password",
+    "Keyboard-interactive (password / MFA)",
+];
+
+fn ssh_authentication(index: usize, identity: &str) -> anyhow::Result<Authentication> {
+    Ok(match index {
+        1 => {
+            let identity = identity.trim();
+            anyhow::ensure!(!identity.is_empty(), "Enter the private key file path");
+            Authentication::Identity {
+                identity: identity.into(),
+            }
+        }
+        2 => Authentication::None,
+        3 => Authentication::Password,
+        4 => Authentication::KeyboardInteractive,
+        _ => Authentication::Agent,
+    })
 }
 
 fn color_scheme_editor(id: TabId, scheme: ColorScheme, context: &ViewContext<TerminalApp>) -> View {
@@ -1077,6 +1089,7 @@ pub enum Message {
     SyncSelection(u64),
     Shortcut(Shortcut),
     ProfileMenu(String),
+    QuickConnect(quick_connect::Action),
     MoveProfile(String, isize, Arc<[String]>),
     StartupProfile(String),
     WindowActivation(bool),
@@ -3479,6 +3492,7 @@ impl TerminalApp {
         }
         menu.extend([
             MenuItem::separator("profiles-end"),
+            MenuItem::item("quick-connect", quick_connect::LABEL),
             MenuItem::item("new-profile", NEW_PROFILE),
             MenuItem::item("lab", LAB),
         ]);
@@ -4058,13 +4072,7 @@ impl TerminalApp {
             StackPanel::new().spacing(5.0).children((
                 TextBlock::new().text("Authentication"),
                 ComboBox::new()
-                    .items_source([
-                        "Windows SSH agent",
-                        "Private key file",
-                        "None (keyless server)",
-                        "Password",
-                        "Keyboard-interactive (password / MFA)",
-                    ])
+                    .items_source(SSH_AUTH_LABELS)
                     .selected_index(draft.authentication)
                     .horizontal_alignment(HorizontalAlignment::Stretch)
                     .on_selection_changed(context.callback(move |v| Message::Auth(id, v))),
@@ -5850,6 +5858,8 @@ impl Component for TerminalApp {
             Message::ProfileMenu(label) => {
                 if label == NEW_PROFILE {
                     self.utility(false, context);
+                } else if label == quick_connect::LABEL {
+                    self.open_quick_connect(context);
                 } else if label == LAB {
                     self.open(LAB.into(), Source::Demo, None, context);
                 } else if let Some((name, profile)) = self
@@ -5871,6 +5881,7 @@ impl Component for TerminalApp {
                     );
                 }
             }
+            Message::QuickConnect(action) => self.edit_quick_connect(action, context),
             Message::EditProfile(name) => self.edit_profile(name, context),
             Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
             Message::DeleteProfile(id) => {
@@ -6526,6 +6537,7 @@ impl Component for TerminalApp {
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
+                Page::QuickConnect(draft) => quick_connect::view(id, draft, context),
             }
         } else if self.incoming.is_some() || self.outgoing.is_some() {
             TextBlock::new().text("Moving tab…").margin(16.0).into()

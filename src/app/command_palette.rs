@@ -97,7 +97,11 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
                     continue;
                 }
                 let (label, chord) = match &id {
-                    CommandId::Profile(_) if key != "new-profile".into() && key != "lab".into() => {
+                    CommandId::Profile(_)
+                        if key != "new-profile".into()
+                            && key != "quick-connect".into()
+                            && key != "lab".into() =>
+                    {
                         (format!("New tab with {label}"), String::new())
                     }
                     CommandId::Shortcut(Shortcut::Fullscreen) => {
