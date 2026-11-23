@@ -1657,7 +1657,6 @@ impl FileDrawer {
                                 .automation_name(spoken_size)
                                 .text(listing_size_label(bytes)),
                         ))
-                        .into()
                 } else {
                     filename.into()
                 };
