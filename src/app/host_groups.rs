@@ -2,6 +2,7 @@ use super::*;
 use std::{borrow::Cow, collections::BTreeSet};
 use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
 use w11term::events::{CommandLink, GroupExecution, GroupOutput, PromptToken, ShellPrompt};
+mod saved;
 
 pub(super) const LABEL: &str = "SSH host group";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -9,6 +10,7 @@ const SUBMISSION_LIMIT: usize = 8;
 
 #[derive(Default)]
 pub(super) struct HostGroup {
+    saved: saved::SavedUi,
     selected: BTreeSet<u64>,
     draft: String,
     submissions: VecDeque<Submission>,
@@ -121,6 +123,7 @@ impl HostGroup {
 
 pub enum Action {
     Open,
+    Saved(TabId, saved::Action),
     Tick,
     Edit(TabId, String),
     Select(TabId, u64, bool),
@@ -265,6 +268,7 @@ impl TerminalApp {
     pub(super) fn handle_host_group(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
             Action::Open => {
+                self.refresh_profiles();
                 if let Some(id) = self
                     .tabs
                     .entries()
@@ -285,6 +289,7 @@ impl TerminalApp {
                     );
                 }
             }
+            Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
             Action::Tick => {
                 let Some(id) = self.tabs.active_id() else {
                     return;
@@ -374,6 +379,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &ViewContext<Self>,
     ) -> View {
+        if let Some(editor) = self.saved_host_group_editor(id, &page.saved, ctx) {
+            return editor;
+        }
         let targets = self.host_group_targets();
         let selected = targets
             .iter()
@@ -455,10 +463,16 @@ impl TerminalApp {
             .content(send_label);
         Grid::new()
             .margin(Thickness::uniform(16.0))
-            .rows([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+            .rows([
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::STAR,
+            ])
             .children((
                 TextBlock::new().font_size(24.0).text(LABEL),
-                StackPanel::new().grid_row(1).spacing(7.0).children((
+                self.saved_host_group_toolbar(id, &page.saved, ctx),
+                StackPanel::new().grid_row(2).spacing(7.0).children((
                     entry,
                     send,
                     TextBlock::new()
@@ -466,7 +480,7 @@ impl TerminalApp {
                         .text_wrapping(TextWrapping::Wrap),
                 )),
                 ScrollViewer::new()
-                    .grid_row(2)
+                    .grid_row(3)
                     .content(StackPanel::new().spacing(10.0).keyed_children(details)),
             ))
     }

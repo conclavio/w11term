@@ -951,6 +951,35 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reopens persisted group profiles as selected SSH tabs and edits the group in WinUI"]
+async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["East", "West"] {
+        let (Source::Ssh(ssh), root, opens, server) = fixture_server(false).await else {
+            unreachable!()
+        };
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((root, opens, server));
+    }
+    profiles.insert(
+        "Local witness".into(),
+        json!({"backend":"local", "executable":"powershell.exe", "args":["-NoProfile"]}),
+    );
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":profiles, "other":17})).unwrap(),
+    )
+    .unwrap();
+    drive_gui("saved-ssh-host-group-ui.ps1", state.path());
+    for (_, opens, server) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks actual tab and window titles while native Settings, SSH and PowerShell change the active title"]
 async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manual_name() {
     let input = concat!(

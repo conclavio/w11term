@@ -23,11 +23,13 @@ pub struct ProfileStore {
 const SHARE_TOKEN: &str = "folder_share_id";
 const SHARE_EPOCH: &str = "folder_share_epoch";
 const STARTUP_PROFILE: &str = "startup_profile";
+const SSH_HOST_GROUPS: &str = "ssh_host_groups";
 
 #[derive(Default)]
 struct CatalogEdit {
     order: Option<Vec<String>>,
     startup: Option<Option<String>>, // None leaves the setting untouched.
+    ssh_host_groups: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -91,7 +93,40 @@ fn profile_identity_edit(catalog: &Profiles, old: Option<&str>, new: Option<&str
         order: order_after_edit(catalog, old, new),
         startup: (old.is_some() && old != new && catalog.startup_profile.as_deref() == old)
             .then(|| new.map(str::to_owned)),
+        ..Default::default()
     }
+}
+
+fn ssh_profile_identity_edit(
+    catalog: &Profiles,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> CatalogEdit {
+    let mut edit = profile_identity_edit(catalog, old, new);
+    if let Some(old) = old
+        && Some(old) != new
+        && catalog
+            .ssh_host_groups
+            .values()
+            .any(|members| members.iter().any(|name| name == old))
+    {
+        let mut groups = catalog.ssh_host_groups.clone();
+        for members in groups
+            .values_mut()
+            .filter(|members| members.iter().any(|name| name == old))
+        {
+            let mut seen = std::collections::HashSet::new();
+            members.retain_mut(|name| {
+                if name == old {
+                    let Some(new) = new else { return false };
+                    *name = new.to_owned();
+                }
+                seen.insert(name.clone())
+            });
+        }
+        edit.ssh_host_groups = Some(groups);
+    }
+    edit
 }
 
 impl ProfileStore {
@@ -114,6 +149,53 @@ impl ProfileStore {
 
     pub fn catalog(&self) -> Result<crate::options::Profiles> {
         load_profiles(&self.path)
+    }
+
+    pub fn save_ssh_host_group(
+        &self,
+        name: &str,
+        members: &[String],
+        original: Option<(&str, &[String])>,
+    ) -> Result<Profiles> {
+        ensure!(
+            !name.is_empty() && name == name.trim() && !name.chars().any(char::is_control),
+            "Enter a group name on one line"
+        );
+        self.modify(|_, catalog| {
+            let mut groups = catalog.ssh_host_groups.clone();
+            if let Some((old, expected)) = original {
+                ensure!(
+                    groups.get(old).map(Vec::as_slice) == Some(expected),
+                    "The SSH group changed on disk. Reopen it before saving."
+                );
+                groups.remove(old);
+            }
+            ensure!(
+                !groups.contains_key(name),
+                "An SSH group named {name} already exists"
+            );
+            catalog.resolve_ssh_host_group_members(members)?;
+            groups.insert(name.to_owned(), members.to_vec());
+            Ok(CatalogEdit {
+                ssh_host_groups: Some(groups),
+                ..Default::default()
+            })
+        })
+    }
+
+    pub fn delete_ssh_host_group(&self, name: &str, expected: &[String]) -> Result<Profiles> {
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.ssh_host_groups.get(name).map(Vec::as_slice) == Some(expected),
+                "The SSH group changed on disk. Reopen it before deleting."
+            );
+            let mut groups = catalog.ssh_host_groups.clone();
+            groups.remove(name);
+            Ok(CatalogEdit {
+                ssh_host_groups: Some(groups),
+                ..Default::default()
+            })
+        })
     }
 
     pub fn set_startup_profile(
@@ -387,7 +469,7 @@ impl ProfileStore {
                 "Profile changed on disk; reopen the editor before deleting"
             );
             profiles.remove(&base.name);
-            Ok(profile_identity_edit(catalog, Some(&base.name), None))
+            Ok(ssh_profile_identity_edit(catalog, Some(&base.name), None))
         })
         .map(|_| ())
     }
@@ -529,7 +611,7 @@ impl ProfileStore {
                 profiles.remove(original);
             }
             profiles.insert(name.into(), value);
-            Ok(profile_identity_edit(catalog, original, Some(name)))
+            Ok(ssh_profile_identity_edit(catalog, original, Some(name)))
         })
     }
 
@@ -607,6 +689,13 @@ impl ProfileStore {
             }
             None => {}
         }
+        if let Some(groups) = edit.ssh_host_groups {
+            if groups.is_empty() {
+                fields.remove(SSH_HOST_GROUPS);
+            } else {
+                fields.insert(SSH_HOST_GROUPS.into(), serde_json::to_value(groups)?);
+            }
+        }
         // Return the catalog from the exact document being committed.
         let result = crate::options::parse_profiles(&serde_json::to_vec(&document)?, &self.path)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -669,6 +758,78 @@ mod tests {
         );
         assert!(store.add("new", &options).is_err());
         assert_eq!(std::fs::read(path).unwrap(), saved);
+    }
+
+    #[test]
+    fn ssh_host_groups_save_edit_rename_and_delete_with_the_profile_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            r#"{"other":17,"profiles":{
+            "East":{"host":"east.test","user":"u","auth":"none"},
+            "West":{"host":"west.test","user":"u","auth":"none"},
+            "Local":{"backend":"local","executable":"powershell.exe"},
+            "Durable":{"host":"old.test","user":"u","auth":"none","durable":true},
+            "Game":{"host":"game.test","user":"u","auth":"none","player":{"rustmush":true}}
+        }}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        assert!(store.catalog().unwrap().ssh_host_groups.is_empty());
+        let ordered = ["West".into(), "East".into()];
+        for disallowed in ["Local", "Durable", "Game", "Missing"] {
+            assert!(
+                store
+                    .save_ssh_host_group("Fleet", &[disallowed.into()], None)
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .save_ssh_host_group("Fleet", &["East".into(), "East".into()], None)
+                .is_err()
+        );
+        store.save_ssh_host_group("Fleet", &ordered, None).unwrap();
+        assert!(store.save_ssh_host_group("Fleet", &ordered, None).is_err());
+        let second = ProfileStore::new(path.clone()).unwrap();
+        assert_eq!(second.catalog().unwrap().ssh_host_groups["Fleet"], ordered);
+
+        let (_, east) = second.inspect("East").unwrap();
+        second
+            .edit("East", "East Coast", &east.options, &east.options)
+            .unwrap();
+        let catalog = store.catalog().unwrap();
+        let after_rename = catalog.ssh_host_groups["Fleet"].clone();
+        assert_eq!(after_rename, ["West", "East Coast"]);
+        assert_eq!(
+            catalog
+                .resolve_ssh_host_group_members(&after_rename)
+                .unwrap()[1]
+                .host,
+            "east.test"
+        );
+        assert!(
+            store
+                .save_ssh_host_group("Stale", &ordered, Some(("Fleet", &ordered)))
+                .is_err()
+        );
+        assert!(store.delete_ssh_host_group("Fleet", &ordered).is_err());
+
+        store
+            .save_ssh_host_group("Edge", &after_rename, Some(("Fleet", &after_rename)))
+            .unwrap();
+        let (_, west) = second.inspect("West").unwrap();
+        second.delete(&west).unwrap();
+        let remaining = store.catalog().unwrap();
+        assert_eq!(remaining.ssh_host_groups["Edge"], ["East Coast"]);
+        store
+            .delete_ssh_host_group("Edge", &remaining.ssh_host_groups["Edge"])
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(doc["other"], 17);
+        assert!(doc.get(SSH_HOST_GROUPS).is_none());
+        assert_eq!(doc["profiles"]["East Coast"]["host"], "east.test");
     }
 }
 

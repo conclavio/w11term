@@ -2841,7 +2841,12 @@ impl TerminalApp {
         profile: Option<String>,
         context: &ComponentContext<Self>,
     ) {
-        let tab = live_tab(
+        let tab = self.make_live_tab(label, source, profile);
+        self.insert_tab(tab, context);
+    }
+
+    fn make_live_tab(&self, label: String, source: Source, profile: Option<String>) -> AppTab {
+        live_tab(
             label,
             source,
             self.appearance
@@ -2850,8 +2855,7 @@ impl TerminalApp {
                 .interaction
                 .remote_clipboard_policy(),
         )
-        .with_profile(profile);
-        self.insert_tab(tab, context);
+        .with_profile(profile)
     }
 
     fn insert_tab(&mut self, tab: AppTab, context: &ComponentContext<Self>) {
