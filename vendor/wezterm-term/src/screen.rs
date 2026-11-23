@@ -189,6 +189,14 @@ impl Screen {
         self.stable_row_to_phys(row).map(|_| row)
     }
 
+    /// Retained completed-command IDs and the stable rows where their output starts.
+    pub fn command_output_rows(&self) -> impl Iterator<Item = (u64, StableRowIndex)> + '_ {
+        self.command_outputs
+            .iter()
+            .filter(move |&&(_, row, _)| self.stable_row_to_phys(row).is_some())
+            .map(|&(id, row, _)| (id, row))
+    }
+
     fn discard_output_rows(&mut self, rows: Range<PhysRowIndex>) {
         let start = self.phys_to_stable_row_index(rows.start);
         let end = self.phys_to_stable_row_index(rows.end);

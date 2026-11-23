@@ -111,6 +111,7 @@ struct LiveTab {
     files: Box<FileDrawer>,
     discovery: Option<session_browser::Browser>,
     copy_output_unavailable: Option<&'static str>,
+    failed_command_jumps: [bool; 2],
     can_clear_scrollback: bool,
     split_directory_report: Option<Arc<str>>,
     confirm_end: bool,
@@ -339,6 +340,7 @@ struct TabSwitcher {
 #[derive(Clone, Copy)]
 pub enum InteractionField {
     ApplicationTabTitles,
+    FailedCommandMarks,
     CopyOnSelect,
     LargePasteWarning,
     TrimBlock,
@@ -1018,6 +1020,7 @@ pub enum Message {
     Export(text_export::Action),
     Recording(recordings::Action),
     ClearScrollback(u64),
+    ScrollFailedCommand(Option<clipboard_paste::Origin>, bool),
     PaneColorScheme(u64, ColorScheme),
     TabTitle(tab_title::Action),
     Attention(attention::Action),
@@ -1214,6 +1217,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             files: Box::default(),
             discovery: None,
             copy_output_unavailable: Some("waiting for shell markers"),
+            failed_command_jumps: [false; 2],
             can_clear_scrollback: false,
             split_directory_report: None,
             color_scheme: source.color_scheme(),
@@ -1793,7 +1797,15 @@ impl TerminalApp {
             && tab.surface.scrollbar.pointer(
                 pointer,
                 kind,
-                || tab.session.frames.load().scrollback_view(),
+                |marked_row| {
+                    let frame = tab.session.frames.load();
+                    if let Some(row) = marked_row
+                        && !frame.failed_command_rows.contains(&row)
+                    {
+                        return None;
+                    }
+                    frame.scrollback_view()
+                },
                 |view, row| {
                     let _ = tab.session.input.send(view.scroll_to(row));
                 },
@@ -2300,6 +2312,11 @@ impl TerminalApp {
                 InteractionField::ApplicationTabTitles,
                 "Use application titles for tabs",
                 appearance.interaction.application_tab_titles,
+            ),
+            (
+                InteractionField::FailedCommandMarks,
+                "Mark failed commands on the scrollbar",
+                appearance.interaction.failed_command_marks,
             ),
             (
                 InteractionField::ScrollZoom,
@@ -4814,6 +4831,19 @@ impl Component for TerminalApp {
                 self.recording_action(action, context);
                 self.refresh_open_commands();
             }
+            Message::ScrollFailedCommand(origin, older) => {
+                if origin.is_some()
+                    && origin == self.paste_origin()
+                    && let Some(AppTab {
+                        page: Page::Terminal(tab),
+                        ..
+                    }) = self.tabs.active()
+                    && let Some((view, row)) =
+                        tab.session.frames.load().adjacent_failed_command(older)
+                {
+                    let _ = tab.session.input.send(view.scroll_to(Some(row)));
+                }
+            }
             Message::ClearScrollback(pane) => {
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
@@ -5539,6 +5569,12 @@ impl Component for TerminalApp {
                             tab.follow_shell_directory(&frame, context);
                         }
                         let unavailable = frame.copy_output_unavailable();
+                        let jumps = [true, false]
+                            .map(|older| frame.adjacent_failed_command(older).is_some());
+                        if tab.failed_command_jumps != jumps {
+                            tab.failed_command_jumps = jumps;
+                            pane_actions_changed |= active;
+                        }
                         let can_clear = !frame.alternate
                             && (frame.scroll_offset > 0
                                 || frame.first_stable_row > frame.oldest_stable_row);
@@ -6125,6 +6161,9 @@ impl Component for TerminalApp {
                     InteractionField::TrimPaste => &mut appearance.interaction.trim_paste,
                     InteractionField::Snap => &mut appearance.interaction.snap_to_grid_on_resize,
                     InteractionField::ScrollZoom => &mut appearance.interaction.scroll_to_zoom,
+                    InteractionField::FailedCommandMarks => {
+                        &mut appearance.interaction.failed_command_marks
+                    }
                     InteractionField::DetectUrls => &mut appearance.interaction.detect_urls,
                     InteractionField::Osc52 => &mut appearance.interaction.osc52,
                     InteractionField::Osc52ForegroundOnly => {

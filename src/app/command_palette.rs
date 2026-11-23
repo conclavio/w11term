@@ -12,6 +12,7 @@ pub enum CommandId {
     SaveScrollback(Option<u64>),
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
+    ScrollFailedCommand(Option<clipboard_paste::Origin>, bool),
     SelectAll(Option<clipboard_paste::Origin>),
     PaneFind(Option<clipboard_paste::Origin>, Shortcut),
     CopySelection(Option<clipboard_paste::Origin>),
@@ -282,6 +283,20 @@ impl TerminalApp {
             chord: String::new(),
             enabled: pane.is_some() && self.export.pending.is_none(),
         });
+        let frame = live.map(|tab| tab.session.frames.load());
+        for (older, label) in [
+            (true, "Previous failed command"),
+            (false, "Next failed command"),
+        ] {
+            rows.push(Row {
+                id: CommandId::ScrollFailedCommand(origin, older),
+                label: label.into(),
+                chord: String::new(),
+                enabled: frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.adjacent_failed_command(older).is_some()),
+            });
+        }
         let selection = self.active_selection();
         let appearance = self.appearance.read().unwrap();
         for binding in BINDINGS
@@ -474,6 +489,9 @@ impl TerminalApp {
             }
             CommandId::ClearScrollback(pane) => {
                 pane.map_or(Message::ControlIdle, Message::ClearScrollback)
+            }
+            CommandId::ScrollFailedCommand(origin, older) => {
+                Message::ScrollFailedCommand(origin, older)
             }
             CommandId::SelectAll(origin) => Message::SelectAll(origin),
             CommandId::PaneFind(origin, shortcut) => Message::PaneFind(origin, shortcut),

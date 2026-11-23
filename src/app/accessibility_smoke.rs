@@ -60,17 +60,23 @@ impl TerminalApp {
             let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
                 panic!("scrollbar probe must target a fixture pane")
             };
-            let (width, height, _) = tab.surface.area.get().unwrap();
+            let (width, height, scale) = tab.surface.area.get().unwrap();
             let top = PADDING + 1.0;
             let bottom = height - STATUS_HEIGHT - PADDING - 1.0;
-            let (press, drag) = match gesture {
-                "drag-up" => (bottom, Some(top)),
-                "drag-down" => (top, Some(bottom)),
-                "page-up" => (top, None),
+            let track = width - PADDING / 2.0;
+            let (x, press, drag) = match gesture {
+                "drag-up" => (track, bottom, Some(top)),
+                "drag-down" => (track, top, Some(bottom)),
+                "page-up" => (track, top, None),
+                value if let Some(pixel) = value.strip_prefix("failure:") => (
+                    width - PADDING + 1.5,
+                    ((PADDING * scale).round() + pixel.parse::<f32>().unwrap()) / scale,
+                    None,
+                ),
                 _ => panic!("unknown scrollbar probe"),
             };
             let event = |y: f32, held| PointerEventInfo {
-                x: (width - PADDING / 2.0) as f64,
+                x: f64::from(x),
                 y: y as f64,
                 is_left_button_pressed: held,
                 capture_succeeded: true,

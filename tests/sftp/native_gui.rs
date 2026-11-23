@@ -419,11 +419,14 @@ async fn native_pane_scrollbar_tracks_async_ssh_output_without_moving_its_neighb
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reads back actual Direct2D Find marks in a live SSH and PowerShell split"]
+#[ignore = "reads back Direct2D Find and command-failure marks in a live SSH and PowerShell split"]
 async fn native_find_scrollbar_marks_show_the_current_result_and_clear_with_find() {
     let lines = (0..201)
         .map(|row| match row {
             20 | 100 | 175 => format!("line {row:03} has a rail-witness"),
+            40 | 135 => format!("\x1b]133;C\x07line {row:03} failed\x1b]133;D;17\x07"),
+            60 => format!("\x1b]133;C\x07line {row:03} succeeded\x1b]133;D;0\x07"),
+            155 => format!("\x1b]133;C\x07line {row:03} unknown\x1b]133;D\x07"),
             _ => format!("line {row:03}"),
         })
         .collect::<Vec<_>>();
