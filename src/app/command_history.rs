@@ -12,6 +12,7 @@ pub(super) struct HistoryPage {
     status: CommandStatus,
     feedback: String,
     save: Option<SaveDraft>,
+    showing: Option<Arc<()>>,
 }
 
 struct SaveDraft {
@@ -22,6 +23,13 @@ struct SaveDraft {
 pub enum Action {
     Open,
     InPane(u64, HistoryAction),
+    OutputShown {
+        page: TabId,
+        pane: u64,
+        target: (u64, u64),
+        request: Arc<()>,
+        result: Result<(), &'static str>,
+    },
 }
 
 pub enum HistoryAction {
@@ -31,6 +39,7 @@ pub enum HistoryAction {
     Select(u64, u64),
     Copy(u64, u64, CopyPart),
     ExportOutput((u64, u64)),
+    ShowOutput((u64, u64)),
     Insert((u64, u64)),
     BeginSave((u64, u64)),
     SaveName((u64, u64), String),
@@ -177,7 +186,103 @@ impl TerminalApp {
         ))
     }
 
+    fn show_history_output(
+        &mut self,
+        page_id: TabId,
+        pane: u64,
+        target: (u64, u64),
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some(Page::Terminal(live)) = self
+            .tab_for_pane(pane)
+            .and_then(|id| self.tabs.get(id))
+            .map(|tab| &tab.page)
+        else {
+            return;
+        };
+        let input = live.session.input.clone();
+        let Some(Page::CommandHistory(page)) = self.tabs.get_mut(page_id).map(|tab| &mut tab.page)
+        else {
+            return;
+        };
+        let (reply, received) = tokio::sync::oneshot::channel();
+        let request = Arc::new(());
+        let complete = {
+            let request = request.clone();
+            move |result| {
+                Message::History(Action::OutputShown {
+                    page: page_id,
+                    pane,
+                    target,
+                    request: request.clone(),
+                    result,
+                })
+            }
+        };
+        page.showing = Some(request);
+        let rejected = complete(Err("Could not locate the command output."));
+        let task = ctx.spawn_background_with_rejection(
+            move |_| {
+                complete(
+                    received
+                        .blocking_recv()
+                        .unwrap_or(Err("The source pane has closed.")),
+                )
+            },
+            rejected,
+        );
+        if task.status() != ComponentTaskStatus::Rejected {
+            let _ = input.send(Command::RevealCommand {
+                connection: target.0,
+                command: target.1,
+                reply,
+            });
+        }
+    }
+
     pub(super) fn handle_history(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if let Action::OutputShown {
+            page,
+            pane,
+            target,
+            request,
+            result,
+        } = action
+        {
+            let active = self.tabs.active_id() == Some(page);
+            let frame = self.history_frame(pane);
+            let Some(Page::CommandHistory(view)) = self.tabs.get_mut(page).map(|tab| &mut tab.page)
+            else {
+                return;
+            };
+            if view.pane != pane
+                || !view
+                    .showing
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &request))
+            {
+                return;
+            }
+            view.showing = None;
+            if view.selected == Some(target) {
+                match result {
+                    Ok(())
+                        if frame
+                            .as_ref()
+                            .is_some_and(|frame| frame.connection_generation == target.0) =>
+                    {
+                        if active && let Some(source) = self.tab_for_pane(pane) {
+                            self.tabs.select(source);
+                            self.sync_selection(ctx);
+                            self.activate(ctx);
+                        }
+                    }
+                    Ok(()) => view.feedback = "The source pane changed.".into(),
+                    Err(error) => view.feedback = error.into(),
+                }
+            }
+            return;
+        }
         if matches!(action, Action::Open) {
             let Some(source) = self.tabs.active() else {
                 return;
@@ -197,6 +302,7 @@ impl TerminalApp {
                 status: CommandStatus::All,
                 feedback: String::new(),
                 save: None,
+                showing: None,
             });
             if let Some(id) = existing {
                 self.tabs.get_mut(id).unwrap().page = page;
@@ -276,6 +382,16 @@ impl TerminalApp {
                         .and_then(|entry| CopyPart::Output.text(entry))
                 {
                     self.export_command_output(pane, target.1, output, ctx);
+                }
+                return;
+            }
+            HistoryAction::ShowOutput(target) => {
+                if page.showing.is_none()
+                    && page.selected == Some(target)
+                    && selected_command(&frame, Some(target)).is_some()
+                    && !frame.alternate
+                {
+                    self.show_history_output(id, pane, target, ctx);
                 }
                 return;
             }
@@ -467,6 +583,9 @@ impl TerminalApp {
         let export_target = page.selected.filter(|_| {
             selected.is_some_and(|entry| entry.output.is_ok()) && self.export.pending.is_none()
         });
+        let show_target = page
+            .selected
+            .filter(|_| selected.is_some() && !frame.alternate && page.showing.is_none());
         let save =
             match (&page.save, save_target) {
                 (Some(draft), Some(target)) if draft.target == target => {
@@ -593,6 +712,14 @@ impl TerminalApp {
                                     })
                                 }))
                                 .content(text_export::COMMAND_OUTPUT_LABEL),
+                            Button::new()
+                                .is_enabled(show_target.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    show_target.map_or(Message::ControlIdle, |target| {
+                                        action(HistoryAction::ShowOutput(target))
+                                    })
+                                }))
+                                .content("Show output in pane"),
                             TextBlock::new()
                                 .text(preview)
                                 .text_wrapping(TextWrapping::Wrap),

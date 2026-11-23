@@ -1220,17 +1220,78 @@ mod tests {
         assert!(term.command_history().is_empty());
         term.advance_bytes(b"\x1b]133;B\x07echo first\r\n\x1b]133;C\x07first\x1b]133;D;0\x07");
         let frozen = term.command_history().clone();
+        assert!(term.command_output_row(frozen[0].id).is_some());
         for _ in 0..64 {
             term.advance_bytes(b"\x1b]133;C\x07ok\x1b]133;D;1\x07");
         }
         assert_eq!(term.command_history().len(), 64);
         assert_eq!(term.command_history().front().unwrap().id, 2);
+        assert_eq!(term.command_output_row(frozen[0].id), None);
         assert_eq!(frozen[0].command.as_deref(), Some("echo first"));
         assert_eq!(frozen[0].output.as_deref(), Ok("first"));
         term.reset_connection();
         assert!(term.command_history().is_empty());
         term.advance_bytes(b"\x1b]133;C\x07new\x1b]133;D\x07");
         assert_eq!(term.command_history()[0].id, 66);
+    }
+
+    #[test]
+    fn command_output_anchor_follows_reflow_and_expires_when_scrollback_is_cleared() {
+        let (mut term, _) = engine();
+        let size = |cols| TerminalSize {
+            cols,
+            rows: 4,
+            ..TerminalSize::default()
+        };
+        term.resize(size(24));
+        term.advance_bytes(
+            b"prelude\r\nprefix-12345\x1b]133;C\x07target output\r\n\x1b]133;D;0\x07",
+        );
+        let id = term.last_command().unwrap().id;
+        for _ in 0..16 {
+            term.advance_bytes(b"unrelated output\r\n");
+        }
+        for cols in [24, 9, 31] {
+            term.resize(size(cols));
+            let row = term.command_output_row(id).unwrap();
+            let screen = term.screen();
+            assert!(row < screen.visible_row_to_stable_row(0));
+            let phys = screen.stable_row_to_phys(row).unwrap();
+            assert!(
+                screen.lines_in_phys_range(phys..phys + 1)[0]
+                    .as_str()
+                    .contains("target")
+            );
+        }
+        term.advance_bytes(b"\x1b[?1049h");
+        assert_eq!(term.command_output_row(id), None);
+        term.advance_bytes(b"\x1b[?1049l");
+        assert!(term.command_output_row(id).is_some());
+        term.advance_bytes(b"\x1b[3J");
+        assert_eq!(term.command_output_row(id), None);
+        assert_eq!(
+            term.last_command().unwrap().output.as_deref(),
+            Ok("target output\r\n")
+        );
+    }
+
+    #[test]
+    fn command_output_anchor_is_removed_when_its_visible_row_is_erased() {
+        let (mut term, _) = engine();
+        term.resize(TerminalSize {
+            cols: 6,
+            rows: 4,
+            ..TerminalSize::default()
+        });
+        term.advance_bytes(b"pref: \x1b]133;C\x07result\x1b]133;D;0\x07");
+        let id = term.last_command().unwrap().id;
+        assert_eq!(
+            term.command_output_row(id),
+            Some(term.screen().visible_row_to_stable_row(1))
+        );
+        term.advance_bytes(b"\x1b[2K");
+        assert_eq!(term.command_output_row(id), None);
+        assert_eq!(term.last_command().unwrap().output.as_deref(), Ok("result"));
     }
 
     #[test]

@@ -483,6 +483,8 @@ The alternate screen has no local scrollback. A TUI receives wheel reports when 
 
 Choose **Save output as text…** to write the selected command’s captured output to a UTF-8 file. It uses the same plain text as **Copy output**, including blank lines, and remains available for a read-only source pane.
 
+Choose **Show output in pane** to return to the source pane and scroll to where the selected command’s output began. The location follows the text when the pane is resized. If its start has left scrollback, history stays open and you can still copy or save the captured output.
+
 Choose **Insert command** to return to the source pane and paste the selected command for editing. Press Enter in the shell when you are ready to submit it. The action requires a live, writable shell on the same connection. Commands containing line breaks or tabs require bracketed paste.
 
 Scripts can read the same OSC 133 history with `w11term-cli list-commands` and retrieve one command’s output with `get-command`. [Command history in the control reference](CONTROL.md#completed-shell-commands)

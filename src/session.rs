@@ -98,6 +98,11 @@ pub enum Command {
     /// Discard only the offscreen rows of the primary buffer on this worker.
     ClearScrollback,
     ScrollTo(isize),
+    RevealCommand {
+        connection: u64,
+        command: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), &'static str>>,
+    },
     ScrollViewport(crate::terminal::ScrollbackTarget),
     ScrollRange(RangeScrollRequest),
     CopyWord {
@@ -1162,6 +1167,29 @@ async fn run(
                         if !terminal.is_alt_screen_active() {
                             scroll_offset = terminal.screen().visible_row_to_stable_row(0).saturating_sub(top).max(0) as usize;
                             scroll_offset = scroll_offset.min(crate::search::max_offset(&terminal));
+                        }
+                        Ok(())
+                    }
+                    Some(Command::RevealCommand { connection, command, reply }) => {
+                        let row = if connection != connection_generation {
+                            Err("The pane has reconnected.")
+                        } else if terminal.is_alt_screen_active() {
+                            Err("Leave the alternate screen to show command output.")
+                        } else if terminal.synchronized_output() {
+                            Err("Terminal output is updating. Try again after the frame finishes.")
+                        } else {
+                            terminal.command_output_row(command).ok_or("This command’s output location is no longer available.")
+                        };
+                        match row {
+                            Ok(row) => {
+                                let top = terminal.screen().visible_row_to_stable_row(0);
+                                let offset = top.saturating_sub(row).max(0) as usize;
+                                if reply.send(Ok(())).is_ok() && offset != scroll_offset {
+                                    scroll_offset = offset;
+                                    presentation.publish_scroll(presentation.scrolled_view(&terminal, offset, &search));
+                                }
+                            }
+                            Err(error) => { let _ = reply.send(Err(error)); }
                         }
                         Ok(())
                     }

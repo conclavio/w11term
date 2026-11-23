@@ -527,6 +527,9 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     ] {
         stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D{status}\x07"));
     }
+    for row in 0..64 {
+        stream.push_str(&format!("newer-output-{row:03}\r\n"));
+    }
     stream.push_str("history-search-ready\r\n");
     run_palette_fixture(
         "search-command-history-ui.ps1",
