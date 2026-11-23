@@ -482,6 +482,56 @@ impl Default for ProfileDraft {
 }
 
 impl ProfileDraft {
+    fn ssh_options(&self) -> anyhow::Result<SshOptions> {
+        let host = self.host.trim().trim_matches(['[', ']']);
+        let user = self.user.trim();
+        anyhow::ensure!(
+            !host.is_empty() && !user.is_empty(),
+            "Enter a host and user"
+        );
+        anyhow::ensure!(
+            !host.chars().any(|c| c.is_whitespace() || c.is_control())
+                && !user.chars().any(|c| c.is_whitespace() || c.is_control()),
+            "Host and user cannot contain spaces or control characters"
+        );
+        let port = self
+            .port
+            .trim()
+            .parse::<std::num::NonZeroU16>()
+            .map_err(|_| anyhow::anyhow!("Port must be between 1 and 65535"))?
+            .get();
+        let authentication = match self.authentication {
+            1 => {
+                anyhow::ensure!(
+                    !self.identity.trim().is_empty(),
+                    "Enter the private key file path"
+                );
+                Authentication::Identity {
+                    identity: self.identity.trim().into(),
+                }
+            }
+            2 => Authentication::None,
+            3 => Authentication::Password,
+            4 => Authentication::KeyboardInteractive,
+            _ => Authentication::Agent,
+        };
+        Ok(SshOptions {
+            host: host.into(),
+            terminal_type: self.terminal_type()?,
+            color_scheme: self.color_scheme,
+            scrollback_lines: self.scrollback_lines.parse()?,
+            user: user.into(),
+            port,
+            authentication,
+            host_key: (!self.fingerprint.trim().is_empty()).then(|| self.fingerprint.trim().into()),
+            host_key_alias: self.host_key_alias(),
+            player: self.player.clone(),
+            proxy_jump: self.proxy_jump.clone(),
+            local_forwards: self.local_forwards.clone(),
+            durable: self.durable,
+        })
+    }
+
     fn host_key_alias(&self) -> Option<String> {
         let alias = self.host_key_alias.trim();
         (!alias.is_empty()).then(|| alias.to_ascii_lowercase())
@@ -1011,6 +1061,7 @@ pub enum Message {
     ProfileColorScheme(TabId, ColorScheme),
     SaveProfile(TabId),
     SaveProfileOnly(TabId),
+    ConnectOnce(TabId),
     EditProfile(String),
     EditActiveProfile,
     DuplicateProfile(TabId),
@@ -2870,6 +2921,34 @@ impl TerminalApp {
     fn save_profile(&mut self, id: TabId, context: &ComponentContext<Self>) {
         self.save_profile_action(id, true, context);
     }
+    fn connect_once(&mut self, id: TabId, context: &ComponentContext<Self>) {
+        let Some(tab) = self.tabs.get_mut(id) else {
+            return;
+        };
+        let Page::NewProfile(draft) = &mut tab.page else {
+            return;
+        };
+        if !matches!(draft.origin, DraftOrigin::New) || draft.generating {
+            return;
+        }
+        let prepared = draft.ssh_options().and_then(|mut options| {
+            options.prepare_profile_connection(self.store.path())?;
+            Ok(options)
+        });
+        match prepared {
+            Ok(options) => {
+                let source = Source::Ssh(options);
+                *tab = live_tab(
+                    source_label(&source),
+                    source,
+                    self.appearance.read().unwrap().interaction.osc52,
+                );
+                self.sync_selection(context);
+                self.activate(context);
+            }
+            Err(error) => draft.error = Some(format!("{error:#}")),
+        }
+    }
     fn save_profile_action(&mut self, id: TabId, connect: bool, context: &ComponentContext<Self>) {
         let Some(AppTab {
             page: Page::NewProfile(draft),
@@ -2882,51 +2961,7 @@ impl TerminalApp {
         let result = (|| -> anyhow::Result<ProfileSnapshot> {
             let name = draft.name.trim();
             anyhow::ensure!(!name.is_empty(), "Enter a profile name");
-            let host = draft.host.trim().trim_matches(['[', ']']);
-            let user = draft.user.trim();
-            anyhow::ensure!(
-                !host.is_empty() && !user.is_empty(),
-                "Enter a host and user"
-            );
-            anyhow::ensure!(
-                !host.chars().any(char::is_whitespace) && !user.chars().any(char::is_whitespace),
-                "Host and user cannot contain spaces"
-            );
-            let authentication = match draft.authentication {
-                1 => {
-                    anyhow::ensure!(
-                        !draft.identity.trim().is_empty(),
-                        "Enter the private key file path"
-                    );
-                    Authentication::Identity {
-                        identity: draft.identity.trim().into(),
-                    }
-                }
-                2 => Authentication::None,
-                3 => Authentication::Password,
-                4 => Authentication::KeyboardInteractive,
-                _ => Authentication::Agent,
-            };
-            let options = SshOptions {
-                host: host.into(),
-                terminal_type: draft.terminal_type()?,
-                color_scheme: draft.color_scheme,
-                scrollback_lines: draft.scrollback_lines.parse()?,
-                user: user.into(),
-                port: draft
-                    .port
-                    .trim()
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("Port must be between 1 and 65535"))?,
-                authentication,
-                host_key: (!draft.fingerprint.trim().is_empty())
-                    .then(|| draft.fingerprint.trim().into()),
-                host_key_alias: draft.host_key_alias(),
-                player: draft.player.clone(),
-                proxy_jump: draft.proxy_jump.clone(),
-                local_forwards: draft.local_forwards.clone(),
-                durable: draft.durable,
-            };
+            let options = draft.ssh_options()?;
             match &draft.origin {
                 DraftOrigin::New => self.store.add(name, &options)?,
                 DraftOrigin::Edit(base) => {
@@ -3958,22 +3993,35 @@ impl TerminalApp {
                     }),
             );
         }
+        let is_new = matches!(draft.origin, DraftOrigin::New);
+        let mut actions = vec![KeyedView::new(
+            "save",
+            Button::new()
+                .style(is_new.then_some(ButtonStyle::Accent))
+                .is_enabled(!draft.generating)
+                .on_click(context.callback(move |_| Message::SaveProfile(id)))
+                .content("Save and connect"),
+        )];
+        if is_new {
+            actions.push(KeyedView::new(
+                "once",
+                Button::new()
+                    .is_enabled(!draft.generating)
+                    .on_click(context.callback(move |_| Message::ConnectOnce(id)))
+                    .content("Connect without saving"),
+            ));
+        }
+        actions.push(KeyedView::new(
+            "cancel",
+            Button::new()
+                .on_click(context.callback(move |_| Message::CloseTab(id.to_string())))
+                .content(if draft.saved { "Close" } else { "Cancel" }),
+        ));
         fields.push(
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(10.0)
-                .children((
-                    Button::new()
-                        .style(
-                            matches!(draft.origin, DraftOrigin::New).then_some(ButtonStyle::Accent),
-                        )
-                        .is_enabled(!draft.generating)
-                        .on_click(context.callback(move |_| Message::SaveProfile(id)))
-                        .content("Save and connect"),
-                    Button::new()
-                        .on_click(context.callback(move |_| Message::CloseTab(id.to_string())))
-                        .content(if draft.saved { "Close" } else { "Cancel" }),
-                )),
+                .keyed_children(actions),
         );
         if let Some(base) = draft.origin.editing() {
             if draft.confirm_delete {
@@ -6006,6 +6054,7 @@ impl Component for TerminalApp {
             }
             Message::SaveProfile(id) => self.save_profile(id, context),
             Message::SaveProfileOnly(id) => self.save_profile_action(id, false, context),
+            Message::ConnectOnce(id) => self.connect_once(id, context),
             Message::Pointer(id, pointer, kind) => self.pointer(id, pointer, kind, context),
             Message::FindSeed(id, epoch, view, target, seed) => {
                 if self.watch_epoch == view
@@ -6815,11 +6864,36 @@ impl TerminalApp {
                 assert_eq!(live.profile_name, None);
                 assert_eq!(live.session.pane_id, pane);
                 assert!(live.session.frames.load().connection_generation > 0);
-                eprintln!(
-                    "Profile UI smoke passed: rename, duplicate, cancel and confirm deletion, live pane identity and save-and-connect"
-                );
-                self.update(Message::CloseWindow, context);
-                return;
+                let before = std::fs::read(self.store.path()).unwrap();
+                self.utility(false, context);
+                let once = self.tabs.active_id().unwrap();
+                self.update(Message::ConnectOnce(once), context);
+                let Page::NewProfile(draft) = &mut self.tabs.get_mut(once).unwrap().page else {
+                    panic!("Invalid one-off connection should leave the form open");
+                };
+                assert_eq!(draft.error.as_deref(), Some("Enter a host and user"));
+                *draft = ProfileDraft::from_options(String::new(), &options);
+                self.update(Message::ConnectOnce(once), context);
+                assert!(matches!(
+                    &self.tabs.get(once).unwrap().page,
+                    Page::Terminal(_)
+                ));
+                assert_eq!(std::fs::read(self.store.path()).unwrap(), before);
+            }
+            33..=52 => {
+                let Page::Terminal(live) = &self.tabs.active().unwrap().page else {
+                    panic!("Expected a one-off SSH pane")
+                };
+                assert!(live.profile_name.is_none());
+                if live.session.frames.load().connection_generation == 0 {
+                    assert!(step < 52, "one-off SSH connection did not become ready");
+                } else {
+                    eprintln!(
+                        "Profile UI smoke passed: profile edits, live pane identity, saved and one-off connections"
+                    );
+                    self.update(Message::CloseWindow, context);
+                    return;
+                }
             }
             _ => {
                 let id = self.tabs.active_id().unwrap();

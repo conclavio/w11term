@@ -323,6 +323,34 @@ pub(crate) fn deserialize_host_key_alias<'de, D: serde::Deserializer<'de>>(
 }
 
 impl SshOptions {
+    /// Validate a profile and resolve its key paths against the catalog location.
+    pub fn prepare_profile_connection(&mut self, catalog: &Path) -> Result<()> {
+        ensure!(
+            crate::assets::name(&self.player.bell),
+            "bell must be a sound name, system, or off"
+        );
+        ensure!(
+            !self.host.is_empty() && !self.user.is_empty() && self.port != 0,
+            "host, user, and port must be nonempty"
+        );
+        self.validate_route()?;
+        let base = catalog.parent().unwrap_or(Path::new("."));
+        if let Some(key) = &mut self.player.device_key
+            && key.is_relative()
+        {
+            *key = base.join(&*key);
+        }
+        for auth in self.authentications_mut() {
+            if let Authentication::Identity { identity } = auth {
+                ensure!(!identity.as_os_str().is_empty(), "identity path is empty");
+                if identity.is_relative() {
+                    *identity = base.join(&*identity);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_route(&self) -> Result<()> {
         ensure!(
             self.proxy_jump.len() <= MAX_JUMPS,
@@ -480,33 +508,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         }
     }
     for (name, ssh) in &mut profiles.profiles {
-        ensure!(
-            crate::assets::name(&ssh.player.bell),
-            "profile {name}: bell must be a sound name, system, or off"
-        );
-        if let Some(device_key) = &mut ssh.player.device_key
-            && device_key.is_relative()
-        {
-            *device_key = path.parent().unwrap_or(Path::new(".")).join(&*device_key);
-        }
-        ensure!(
-            !ssh.host.is_empty() && !ssh.user.is_empty() && ssh.port != 0,
-            "profile {name}: host, user, and port must be nonempty"
-        );
-        ssh.validate_route()
+        ssh.prepare_profile_connection(path)
             .with_context(|| format!("profile {name}"))?;
-        for auth in ssh.authentications_mut() {
-            let Authentication::Identity { identity } = auth else {
-                continue;
-            };
-            ensure!(
-                !identity.as_os_str().is_empty(),
-                "profile {name}: identity path is empty"
-            );
-            if identity.is_relative() {
-                *identity = path.parent().unwrap_or(Path::new(".")).join(&*identity);
-            }
-        }
     }
     let mut seen = std::collections::HashSet::new();
     let known = explicit_order
