@@ -26,13 +26,21 @@ function Settings {
 function Select-StartupProfile([string]$Choice) {
     Click 'Startup profile, Terminal lab' $button
     Click $Choice $menuItem
-    $null = Wait-Until "Startup profile persisted for $localName" {
-        $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-        $file = [IO.File]::Open($profiles, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-        $reader = [IO.StreamReader]::new($file)
-        try { ($reader.ReadToEnd() | ConvertFrom-Json).startup_profile -ceq $localName } finally { $reader.Dispose() }
+    # A successful save publishes the selected name. Wait for that before
+    # opening the catalog, so the fixture cannot hold the file during replacement.
+    $owners = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $texts = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $null = Wait-Until "Startup selector shows '$Choice'" {
+        $current = Find-Element "Startup profile, $Choice" $button
+        if ($current) { return $current }
+        $saveError = $owners.FindAll([System.Windows.Automation.TreeScope]::Descendants, $texts) |
+            ForEach-Object { $_.Current.Name } | Where-Object { $_ -like 'Could not set startup profile*' }
+        if ($saveError) { throw "Startup selection failed with '$saveError'" }
     }
-    $null = Wait-Until "Startup selector shows '$Choice'" { Find-Element "Startup profile, $Choice" $button }
+    $startupName = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).startup_profile
+    if ($startupName -cne $localName) { throw "Startup catalog contains '$startupName' rather than '$localName'" }
 }
 function Wait-SettingsOrder([string]$First, [string]$Second) {
     $null = Wait-Until "Settings to show '$First', '$Second', and disabled end controls" {

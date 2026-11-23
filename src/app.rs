@@ -970,10 +970,7 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     MoveProfile(String, isize, Arc<[String]>),
-    StartupProfile {
-        selected: Option<String>,
-        expected: Option<String>,
-    },
+    StartupProfile(String),
     WindowActivation(bool),
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
@@ -1967,7 +1964,7 @@ impl TerminalApp {
         let mut profiles: Vec<View> =
             vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
         let order: Arc<[String]> = self.catalog.profile_order.as_slice().into();
-        let startup = self.catalog.startup_profile.clone();
+        let startup = self.catalog.startup_profile.as_deref();
         let startup_choices: Vec<_> = std::iter::once((None, LAB.to_owned()))
             .chain(order.iter().map(|name| {
                 let backend = if self.catalog.profiles.contains_key(name) {
@@ -1975,7 +1972,7 @@ impl TerminalApp {
                 } else {
                     "Local"
                 };
-                (Some(name.clone()), format!("{name} · {backend}"))
+                (Some(name.as_str()), format!("{name} · {backend}"))
             }))
             .collect();
         let startup_label = startup_choices
@@ -2004,17 +2001,10 @@ impl TerminalApp {
                             FontIcon::new().glyph("\u{e70d}"),
                         )),
                 )
+                // A stable callback keeps the flyout mounted across Settings redraws.
                 .menu(Menu::new(
                     startup_items,
-                    context.callback(move |label: String| {
-                        startup_choices
-                            .iter()
-                            .find(|(_, choice)| *choice == label)
-                            .map_or(Message::ControlIdle, |(name, _)| Message::StartupProfile {
-                                selected: name.clone(),
-                                expected: startup.clone(),
-                            })
-                    }),
+                    context.callback(Message::StartupProfile),
                 )),
         );
         let mut rows = Vec::with_capacity(order.len());
@@ -5669,12 +5659,15 @@ impl Component for TerminalApp {
                     }
                 }
             }
-            Message::StartupProfile { selected, expected } => {
-                if selected != self.catalog.startup_profile {
-                    match self
-                        .store
-                        .set_startup_profile(selected.as_deref(), expected.as_deref())
-                    {
+            Message::StartupProfile(label) => {
+                let selected = match label.rsplit_once(" · ") {
+                    Some((name, "SSH" | "Local")) => Some(name),
+                    None if label == LAB => None,
+                    _ => return,
+                };
+                let expected = self.catalog.startup_profile.as_deref();
+                if selected != expected {
+                    match self.store.set_startup_profile(selected, expected) {
                         Ok(catalog) => {
                             self.catalog = catalog;
                             self.profile_error = None;
