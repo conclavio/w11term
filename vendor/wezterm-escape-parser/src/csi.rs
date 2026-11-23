@@ -1367,6 +1367,9 @@ pub enum Edit {
 
     /// ED - ERASE IN PAGE (XTerm calls this Erase in Display)
     EraseInDisplay(EraseInDisplay),
+    /// DECIC and DECDC.
+    InsertColumns(u32),
+    DeleteColumns(u32),
     /// DECSED and DECSEL.
     SelectiveEraseInDisplay(EraseInDisplay),
     SelectiveEraseInLine(EraseInLine),
@@ -1424,6 +1427,8 @@ impl Display for Edit {
             Edit::ScrollDown(n) => n.write_csi(f, "T")?,
             Edit::ScrollUp(n) => n.write_csi(f, "S")?,
             Edit::EraseInDisplay(n) => n.write_csi(f, "J")?,
+            Edit::InsertColumns(n) => n.write_csi(f, "'}")?,
+            Edit::DeleteColumns(n) => n.write_csi(f, "'~")?,
             Edit::SelectiveEraseInDisplay(n) => {
                 write!(f, "?")?;
                 n.write_csi(f, "J")?;
@@ -1994,6 +1999,14 @@ macro_rules! parse {
 impl<'a> CSIParser<'a> {
     fn parse_next(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
         match (self.control, self.orig_params) {
+            ('}' | '~', [count @ .., CsiParam::P(b'\'')]) if !self.parameters_truncated => {
+                let count = u32::parse_params(count)?;
+                Ok(CSI::Edit(if self.control == '}' {
+                    Edit::InsertColumns(count)
+                } else {
+                    Edit::DeleteColumns(count)
+                }))
+            }
             ('k', [.., CsiParam::P(b' ')]) => self.select_character_path(params),
             ('q', [.., CsiParam::P(b' ')]) => self.cursor_style(params),
             ('q', [value @ .., CsiParam::P(b'"')]) if !self.parameters_truncated => {

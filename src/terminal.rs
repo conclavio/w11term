@@ -3074,6 +3074,67 @@ mod tests {
     }
 
     #[test]
+    fn dec_column_edits_shift_the_scrolling_region_and_keep_the_cursor() {
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 5,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"ABCDEFGH\r\nabcdefgh\r\n12345678\r\nijklmnop\r\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[?69h\x1b[2;7s\x1b[2;4r\x1b[3;3H\x1b[44m\x1b[2'}");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nab  cdeh\n12  3458\nij  klmp\nIJKLMNOP"
+        );
+        term.advance_bytes(b"\x1b[3'~\x1b[6n");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nabde   h\n1245   8\nijlm   p\nIJKLMNOP"
+        );
+        assert_eq!(receive(&mut replies), b"\x1b[3;3R");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(
+            frame.rows[1].get_cell(4).unwrap().attrs().background(),
+            wezterm_term::color::ColorAttribute::Default
+        );
+        // A cursor above the top margin or to the left of the region has no effect.
+        term.advance_bytes(b"\x1b[1;3H\x1b['}\x1b[3;1H\x1b['~");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nabde   h\n1245   8\nijlm   p\nIJKLMNOP"
+        );
+        term.advance_bytes(b"\x1b[3;3H\x1b[4294967295'~");
+        assert_eq!(
+            text(&term),
+            "ABCDEFGH\nab     h\n12     8\nij     p\nIJKLMNOP"
+        );
+    }
+
+    #[test]
+    fn dec_column_edits_clip_wide_glyphs_and_respect_each_rows_rendition() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 3,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes("A界B語Z\x1b[2;1H\x1b#6m界n");
+        term.advance_bytes(b"\x1b[1;3H\x1b[0'}");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert_eq!(frame.rows[0].as_str().trim_end(), "A   B語Z");
+        assert_eq!(frame.rows[1].as_str().trim_end(), "m");
+        assert!(frame.rows[1].is_double_width());
+        assert_eq!(frame.rows[0].get_cell(5).unwrap().width(), 2);
+    }
+
+    #[test]
     fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(

@@ -27,6 +27,7 @@ use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
 mod area_attributes;
+mod column_edit;
 mod image;
 mod iterm;
 mod keyboard;
@@ -2820,6 +2821,8 @@ impl TerminalState {
     fn perform_csi_edit(&mut self, edit: Edit) {
         let seqno = self.seqno;
         match edit {
+            Edit::InsertColumns(n) => self.edit_columns(n, column_edit::Shift::Right),
+            Edit::DeleteColumns(n) => self.edit_columns(n, column_edit::Shift::Left),
             Edit::DeleteCharacter(n) => {
                 let y = self.cursor.y;
                 let x = self.cursor.x;
