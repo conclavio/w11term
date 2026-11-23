@@ -1,7 +1,7 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
 use std::sync::Arc;
-pub use wezterm_escape_parser::osc::FinalTermSemanticPrompt;
+pub use wezterm_escape_parser::osc::{FinalTermPromptKind, FinalTermSemanticPrompt};
 use wezterm_escape_parser::parser::Parser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

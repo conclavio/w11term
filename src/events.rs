@@ -46,6 +46,7 @@ struct State {
     replay: Option<crate::session::ReplayState>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
+    next_prompt: u64,
     notify_long_commands: bool,
     restart_token: Option<u64>,
     restart_closed: bool,
@@ -56,6 +57,21 @@ struct CommandWatch {
     generation: u64,
     armed: bool,
     running: Option<RunningCommand>,
+    prompt: ShellPrompt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromptToken {
+    pub(crate) connection: u64,
+    serial: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellPrompt {
+    Unverified,
+    Opening,
+    Ready(PromptToken),
+    InUse,
 }
 
 impl CommandWatch {
@@ -64,6 +80,7 @@ impl CommandWatch {
             generation,
             armed: false,
             running: None,
+            prompt: ShellPrompt::Unverified,
         }
     }
 
@@ -271,6 +288,30 @@ impl Events {
             .is_some_and(|watch| watch.generation == generation && watch.running.is_none())
     }
 
+    pub fn shell_prompt(&self) -> Option<ShellPrompt> {
+        Some(self.state.lock().unwrap().command_watch.as_ref()?.prompt)
+    }
+
+    pub(crate) fn invalidate_shell_prompt(&self) {
+        if let Some(watch) = &mut self.state.lock().unwrap().command_watch
+            && matches!(watch.prompt, ShellPrompt::Opening | ShellPrompt::Ready(_))
+        {
+            watch.prompt = ShellPrompt::InUse;
+        }
+    }
+
+    pub(crate) fn claim_shell_prompt(&self, token: PromptToken) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some(watch) = &mut state.command_watch else {
+            return false;
+        };
+        if watch.prompt != ShellPrompt::Ready(token) {
+            return false;
+        }
+        watch.prompt = ShellPrompt::InUse;
+        true
+    }
+
     pub fn set_command_watch(&self, armed: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
@@ -316,9 +357,34 @@ impl Events {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
         let notify_long_commands = state.notify_long_commands;
+        let input_marker = matches!(
+            marker,
+            MarkEndOfPromptAndStartOfInputUntilNextMarker
+                | MarkEndOfPromptAndStartOfInputUntilEndOfLine
+        );
+        let serial = if input_marker
+            && state
+                .command_watch
+                .as_ref()
+                .is_some_and(|watch| watch.prompt == ShellPrompt::Opening)
+        {
+            state.next_prompt += 1;
+            Some(state.next_prompt)
+        } else {
+            None
+        };
         let Some(watch) = &mut state.command_watch else {
             return;
         };
+        use wezterm_term::FinalTermPromptKind;
+        match marker {
+            FreshLineAndStartPrompt { .. } | StartPrompt(FinalTermPromptKind::Initial) => {
+                watch.prompt = ShellPrompt::Opening;
+            }
+            FreshLine | StartPrompt(FinalTermPromptKind::RightSide) => {}
+            _ if !input_marker => watch.prompt = ShellPrompt::InUse,
+            _ => {}
+        }
         let (aid, exit_code) = match marker {
             MarkEndOfInputAndStartOfOutput { aid, .. } => {
                 if let Some(running) = &mut watch.running {
@@ -348,8 +414,17 @@ impl Events {
                     .is_some_and(|command| command.aid.is_none())
                 {
                     watch.reset();
-                    state.refresh_watch(previous);
                 }
+                if let Some(serial) = serial {
+                    watch.prompt = ShellPrompt::Ready(PromptToken {
+                        connection: watch.generation,
+                        serial,
+                    });
+                } else if matches!(watch.prompt, ShellPrompt::Ready(_)) {
+                    // Redrawing a prompt suffix can leave partially edited input in place.
+                    watch.prompt = ShellPrompt::InUse;
+                }
+                state.refresh_watch(previous);
                 return;
             }
             StartPrompt(_) | FreshLine => return,

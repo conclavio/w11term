@@ -801,6 +801,111 @@ async fn run_palette_fixture(script: &str, expected_input: &[u8], history: Optio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives a native group across two SSH endpoints and a local PowerShell tab"]
+async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
+    let mut runtimes = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for (name, use_633) in [("East", false), ("West", true)] {
+        let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (Source::Ssh(ssh), root, opens, server) = fixture_with_wire(
+            false,
+            if use_633 { 2 } else { 1 },
+            Arc::default(),
+            Some(wire),
+        )
+        .await
+        else {
+            unreachable!()
+        };
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let peer_trace = trace.clone();
+        let responder = tokio::spawn(async move {
+            use in_band_resize::Wire;
+            let prompt = if use_633 {
+                b"\x1b[?2004h\x1b]633;A\x07west$ \x1b]633;B\x07".as_slice()
+            } else {
+                b"\x1b]133;A\x07east$ \x1b]133;B\x07".as_slice()
+            };
+            let mut peer = None;
+            let mut connections = 0;
+            while let Some(message) = received.recv().await {
+                match message {
+                    Wire::Shell(id, handle) => {
+                        connections += 1;
+                        if connections == 1 {
+                            handle.data(id, prompt).await.unwrap();
+                        }
+                        peer = Some(handle);
+                    }
+                    Wire::Window(..) => {}
+                    Wire::Input(id, bytes) => {
+                        peer_trace.lock().unwrap().extend_from_slice(&bytes);
+                        let handle = peer.as_ref().unwrap();
+                        let response = match bytes.as_slice() {
+                            b"part" => b"part".to_vec(),
+                            b"alt" => b"\x1b[?1049h\x1b[Halternate-proof".to_vec(),
+                            b"prompt" => [b"\x1b[?1049l\r\n".as_slice(), prompt].concat(),
+                            b"drop" => {
+                                handle
+                                    .disconnect(
+                                        russh::Disconnect::ByApplication,
+                                        "test reconnect".into(),
+                                        "en".into(),
+                                    )
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
+                            ordinary if ordinary.ends_with(b"\r") => {
+                                let complete = if use_633 {
+                                    b"\r\n\x1b]633;C\x07west-accepted\r\n\x1b]633;D;0\x07"
+                                        .as_slice()
+                                } else {
+                                    b"\r\n\x1b]133;C\x07east-accepted\r\n\x1b]133;D;0\x07"
+                                        .as_slice()
+                                };
+                                [complete, prompt].concat()
+                            }
+                            _ => continue,
+                        };
+                        handle.data(id, response).await.unwrap();
+                    }
+                }
+            }
+        });
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        runtimes.push((root, opens, server, responder, trace));
+    }
+    profiles.insert(
+        "Local witness".into(),
+        json!({
+            "backend":"local", "executable":"powershell.exe", "args":["-NoProfile","-NoLogo"]
+        }),
+    );
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":profiles})).unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-ui.ps1", state.path());
+    let expected: [&[u8]; 2] = [
+        b"one\rboth\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\r",
+        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r",
+    ];
+    for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
+        assert_eq!(opens.load(Ordering::Relaxed), index + 1);
+        assert_eq!(
+            *trace.lock().unwrap(),
+            expected[index],
+            "host index {index}"
+        );
+        responder.abort();
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks actual tab and window titles while native Settings, SSH and PowerShell change the active title"]
 async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manual_name() {
     let input = concat!(

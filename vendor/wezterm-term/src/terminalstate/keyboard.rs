@@ -24,18 +24,7 @@ impl TerminalState {
         mods: KeyModifiers,
         is_down: bool,
     ) -> anyhow::Result<()> {
-        let encoding = self.effective_keyboard_encoding();
-
-        let to_send = key.encode(
-            mods,
-            KeyCodeEncodeModes {
-                encoding,
-                newline_mode: self.newline_mode,
-                application_cursor_keys: self.application_cursor_keys,
-                modify_other_keys: self.modify_other_keys,
-            },
-            is_down,
-        )?;
+        let to_send = self.encode_key(key, mods, is_down)?;
 
         if to_send.is_empty() {
             return Ok(());
@@ -51,6 +40,24 @@ impl TerminalState {
         self.writer.flush()?;
 
         Ok(())
+    }
+
+    pub fn encode_key(
+        &self,
+        key: KeyCode,
+        mods: KeyModifiers,
+        is_down: bool,
+    ) -> anyhow::Result<String> {
+        Ok(key.encode(
+            mods,
+            KeyCodeEncodeModes {
+                encoding: self.effective_keyboard_encoding(),
+                newline_mode: self.newline_mode,
+                application_cursor_keys: self.application_cursor_keys,
+                modify_other_keys: self.modify_other_keys,
+            },
+            is_down,
+        )?)
     }
 
     pub fn key_up(&mut self, key: KeyCode, mods: KeyModifiers) -> anyhow::Result<()> {

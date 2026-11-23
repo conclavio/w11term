@@ -122,18 +122,32 @@ pub enum TransportInput {
     /// Parser-generated reply on a viewer transport that distinguishes it from user input.
     Automatic(Vec<u8>),
     Raw(Vec<u8>, tokio::sync::oneshot::Sender<Result<(), String>>),
-    /// A GUI clipboard write is valid only for the shell that was
-    /// active when the paste was requested.
-    Clipboard {
+    /// The receiving transport must still be the one that approved this write.
+    Scoped {
         connection: u64,
         bytes: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        kind: ScopedInput,
     },
     Resize(TerminalSize),
 }
 
-pub(crate) const STALE_PASTE: &str =
-    "The pane connection changed. Paste again to use the new connection.";
+#[derive(Clone, Copy, Debug)]
+pub enum ScopedInput {
+    Clipboard,
+    GroupCommand,
+}
+
+impl ScopedInput {
+    pub(crate) fn stale_error(self) -> &'static str {
+        match self {
+            Self::Clipboard => {
+                "The pane connection changed. Paste again to use the new connection."
+            }
+            Self::GroupCommand => "The host reconnected before the command was sent.",
+        }
+    }
+}
 
 struct ReplyWriter {
     sender: mpsc::UnboundedSender<TransportInput>,
@@ -294,120 +308,92 @@ pub fn send_key_event_detailed(
     repeat: bool,
     details: &KeyDetails,
 ) -> anyhow::Result<()> {
-    if let termwiz::input::KeyboardEncoding::Kitty(flags) = terminal.get_keyboard_encoding() {
-        use wezterm_input_types::{KeyCode as K, KeyEvent, KeyboardLedStatus, Modifiers};
-        use wezterm_term::KeyCode as L;
-        let all = flags
-            .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
-        let reports = flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
-        if let Some(native) = kitty::NativeKey::from_event(flags, key, details) {
-            let wire = native.encode(flags, key, modifiers, details, down, repeat);
-            if !wire.is_empty() {
-                writer.send(TransportInput::Data(wire.into_bytes()))?;
-            }
-            return Ok(());
+    if let Some(encoded) = key_override(terminal, key, modifiers, down, repeat, details) {
+        if !encoded.is_empty() {
+            writer.send(TransportInput::Data(encoded.into_bytes()))?;
         }
-        let safety_key = matches!(
-            key,
-            L::Enter | L::Tab | L::Backspace | L::Char('\r' | '\t' | '\x08')
-        );
-        if safety_key && !all && !down {
-            return Ok(());
+        return Ok(());
+    }
+    if down {
+        terminal.key_down(key, modifiers)
+    } else {
+        terminal.key_up(key, modifiers)
+    }
+}
+
+fn key_override(
+    terminal: &Terminal,
+    key: wezterm_term::KeyCode,
+    modifiers: wezterm_term::KeyModifiers,
+    down: bool,
+    repeat: bool,
+    details: &KeyDetails,
+) -> Option<String> {
+    match terminal.get_keyboard_encoding() {
+        termwiz::input::KeyboardEncoding::Kitty(flags) => {
+            encode_kitty_key_event(flags, key, modifiers, down, repeat, details)
         }
-        if let Some(code) = match key {
-            L::Shift | L::LeftShift => Some(57441),
-            L::RightShift => Some(57447),
-            L::Control | L::LeftControl => Some(57442),
-            L::RightControl => Some(57448),
-            L::Alt | L::LeftAlt | L::LeftMenu => Some(57443),
-            L::RightAlt | L::RightMenu => Some(57449),
-            L::Super | L::LeftWindows => Some(57444),
-            L::RightWindows => Some(57450),
-            L::CapsLock => Some(57358),
-            L::NumLock => Some(57360),
-            _ => None,
-        } {
-            if all && (down || reports) {
-                let modifier = 1
-                    + u8::from(modifiers.contains(wezterm_term::KeyModifiers::SHIFT))
-                    + 2 * u8::from(modifiers.contains(wezterm_term::KeyModifiers::ALT))
-                    + 4 * u8::from(modifiers.contains(wezterm_term::KeyModifiers::CTRL))
-                    + 8 * u8::from(modifiers.contains(wezterm_term::KeyModifiers::SUPER));
-                let event = if !reports {
-                    ""
-                } else if !down {
-                    ":3"
-                } else if repeat {
-                    ":2"
-                } else {
-                    ""
-                };
-                writer.send(TransportInput::Data(
-                    format!("\x1b[{code};{modifier}{event}u").into_bytes(),
-                ))?;
-            }
-            return Ok(());
-        }
-        if let Some(text) = &details.text
-            && !all
-        {
-            if down {
-                writer.send(TransportInput::Data(text.as_bytes().to_vec()))?;
-            }
-            return Ok(());
-        }
-        let rich = match key {
-            L::Char(c) => K::Char(c),
-            L::Enter => K::Char('\r'),
-            L::Escape => K::Char('\x1b'),
-            L::Tab => K::Char('\t'),
-            L::Backspace => K::Char('\x08'),
-            L::Delete => K::Char('\x7f'),
-            L::LeftArrow => K::LeftArrow,
-            L::RightArrow => K::RightArrow,
-            L::UpArrow => K::UpArrow,
-            L::DownArrow => K::DownArrow,
-            L::Home => K::Home,
-            L::End => K::End,
-            L::PageUp => K::PageUp,
-            L::PageDown => K::PageDown,
-            L::Insert => K::Insert,
-            L::Function(n) => K::Function(n),
-            _ => {
-                return if down {
-                    terminal.key_down(key, modifiers)
-                } else {
-                    terminal.key_up(key, modifiers)
-                };
-            }
-        };
-        let mut mods = Modifiers::NONE;
-        if modifiers.contains(wezterm_term::KeyModifiers::SHIFT) {
-            mods |= Modifiers::SHIFT;
-        }
-        if modifiers.contains(wezterm_term::KeyModifiers::CTRL) {
-            mods |= Modifiers::CTRL;
-        }
-        if modifiers.contains(wezterm_term::KeyModifiers::ALT) {
-            mods |= Modifiers::ALT;
-        }
-        if modifiers.contains(wezterm_term::KeyModifiers::SUPER) {
-            mods |= Modifiers::SUPER;
-        }
-        // The pinned encoder treats an unmodified DEL character as Backspace
-        // before reaching its functional-key branch. Preserve physical Delete
-        // for every negotiated flag set and every event type.
-        if matches!(key, L::Delete | L::Char('\x7f')) {
-            let reports =
-                flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
-            if !down && !reports {
-                return Ok(());
-            }
+        _ if down => details.text.clone(),
+        _ => None,
+    }
+}
+
+pub(crate) fn encode_key_input(
+    terminal: &Terminal,
+    key: wezterm_term::KeyCode,
+    modifiers: wezterm_term::KeyModifiers,
+    down: bool,
+    repeat: bool,
+    details: &KeyDetails,
+) -> anyhow::Result<String> {
+    match key_override(terminal, key, modifiers, down, repeat, details) {
+        Some(encoded) => Ok(encoded),
+        None => terminal.encode_key(key, modifiers, down),
+    }
+}
+
+fn encode_kitty_key_event(
+    flags: wezterm_input_types::KittyKeyboardFlags,
+    key: wezterm_term::KeyCode,
+    modifiers: wezterm_term::KeyModifiers,
+    down: bool,
+    repeat: bool,
+    details: &KeyDetails,
+) -> Option<String> {
+    use wezterm_input_types::{KeyCode as K, KeyEvent, KeyboardLedStatus, Modifiers};
+    use wezterm_term::KeyCode as L;
+    let all =
+        flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+    let reports = flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
+    if let Some(native) = kitty::NativeKey::from_event(flags, key, details) {
+        return Some(native.encode(flags, key, modifiers, details, down, repeat));
+    }
+    let safety_key = matches!(
+        key,
+        L::Enter | L::Tab | L::Backspace | L::Char('\r' | '\t' | '\x08')
+    );
+    if safety_key && !all && !down {
+        return Some(String::new());
+    }
+    if let Some(code) = match key {
+        L::Shift | L::LeftShift => Some(57441),
+        L::RightShift => Some(57447),
+        L::Control | L::LeftControl => Some(57442),
+        L::RightControl => Some(57448),
+        L::Alt | L::LeftAlt | L::LeftMenu => Some(57443),
+        L::RightAlt | L::RightMenu => Some(57449),
+        L::Super | L::LeftWindows => Some(57444),
+        L::RightWindows => Some(57450),
+        L::CapsLock => Some(57358),
+        L::NumLock => Some(57360),
+        _ => None,
+    } {
+        if all && (down || reports) {
             let modifier = 1
-                + u8::from(mods.contains(Modifiers::SHIFT))
-                + 2 * u8::from(mods.contains(Modifiers::ALT))
-                + 4 * u8::from(mods.contains(Modifiers::CTRL))
-                + 8 * u8::from(mods.contains(Modifiers::SUPER));
+                + u8::from(modifiers.contains(wezterm_term::KeyModifiers::SHIFT))
+                + 2 * u8::from(modifiers.contains(wezterm_term::KeyModifiers::ALT))
+                + 4 * u8::from(modifiers.contains(wezterm_term::KeyModifiers::CTRL))
+                + 8 * u8::from(modifiers.contains(wezterm_term::KeyModifiers::SUPER));
             let event = if !reports {
                 ""
             } else if !down {
@@ -417,127 +403,193 @@ pub fn send_key_event_detailed(
             } else {
                 ""
             };
-            writer.send(TransportInput::Data(
-                format!("\x1b[3;{modifier}{event}~").into_bytes(),
-            ))?;
-            return Ok(());
+            return Some(format!("\x1b[{code};{modifier}{event}u"));
         }
-        let report_repeat = repeat
-            && down
-            && (!safety_key || all)
-            && flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
-        let encode_flags = if report_repeat {
-            flags | wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        return Some(String::new());
+    }
+    if let Some(text) = &details.text
+        && !all
+    {
+        return Some(if down { text.clone() } else { String::new() });
+    }
+    let rich = match key {
+        L::Char(c) => K::Char(c),
+        L::Enter => K::Char('\r'),
+        L::Escape => K::Char('\x1b'),
+        L::Tab => K::Char('\t'),
+        L::Backspace => K::Char('\x08'),
+        L::Delete => K::Char('\x7f'),
+        L::LeftArrow => K::LeftArrow,
+        L::RightArrow => K::RightArrow,
+        L::UpArrow => K::UpArrow,
+        L::DownArrow => K::DownArrow,
+        L::Home => K::Home,
+        L::End => K::End,
+        L::PageUp => K::PageUp,
+        L::PageDown => K::PageDown,
+        L::Insert => K::Insert,
+        L::Function(n) => K::Function(n),
+        _ => return None,
+    };
+    let mut mods = Modifiers::NONE;
+    if modifiers.contains(wezterm_term::KeyModifiers::SHIFT) {
+        mods |= Modifiers::SHIFT;
+    }
+    if modifiers.contains(wezterm_term::KeyModifiers::CTRL) {
+        mods |= Modifiers::CTRL;
+    }
+    if modifiers.contains(wezterm_term::KeyModifiers::ALT) {
+        mods |= Modifiers::ALT;
+    }
+    if modifiers.contains(wezterm_term::KeyModifiers::SUPER) {
+        mods |= Modifiers::SUPER;
+    }
+    // The pinned encoder treats an unmodified DEL character as Backspace
+    // before reaching its functional-key branch. Preserve physical Delete
+    // for every negotiated flag set and every event type.
+    if matches!(key, L::Delete | L::Char('\x7f')) {
+        let reports = flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
+        if !down && !reports {
+            return Some(String::new());
+        }
+        let modifier = 1
+            + u8::from(mods.contains(Modifiers::SHIFT))
+            + 2 * u8::from(mods.contains(Modifiers::ALT))
+            + 4 * u8::from(mods.contains(Modifiers::CTRL))
+            + 8 * u8::from(mods.contains(Modifiers::SUPER));
+        let event = if !reports {
+            ""
+        } else if !down {
+            ":3"
+        } else if repeat {
+            ":2"
         } else {
-            flags
+            ""
         };
-        let mut encoded = KeyEvent {
-            key: rich.clone(),
-            modifiers: mods,
-            leds: KeyboardLedStatus::empty(),
-            repeat_count: 1,
-            key_is_down: down,
-            raw: None,
-            #[cfg(windows)]
-            win32_uni_char: None,
-        }
-        .encode_kitty(encode_flags);
-        // Upstream's legacy-character branch also bypasses REPORT_ALL_KEYS.
-        // Repair that branch before adding the repeat event type.
-        if encode_flags
-            .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
-            && down
-            && !encoded.starts_with("\x1b[")
-            && let K::Char(character) = rich
+        return Some(format!("\x1b[3;{modifier}{event}~"));
+    }
+    let report_repeat = repeat
+        && down
+        && (!safety_key || all)
+        && flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_EVENT_TYPES);
+    let encode_flags = if report_repeat {
+        flags | wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+    } else {
+        flags
+    };
+    let mut encoded = KeyEvent {
+        key: rich.clone(),
+        modifiers: mods,
+        leds: KeyboardLedStatus::empty(),
+        repeat_count: 1,
+        key_is_down: down,
+        raw: None,
+        #[cfg(windows)]
+        win32_uni_char: None,
+    }
+    .encode_kitty(encode_flags);
+    // Upstream's legacy-character branch also bypasses REPORT_ALL_KEYS.
+    // Repair that branch before adding the repeat event type.
+    if encode_flags
+        .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+        && down
+        && !encoded.starts_with("\x1b[")
+        && let K::Char(character) = rich
+    {
+        let base = if character == '\x08' {
+            '\x7f'
+        } else {
+            character.to_ascii_lowercase()
+        };
+        let modifier = 1
+            + u8::from(mods.contains(Modifiers::SHIFT))
+            + 2 * u8::from(mods.contains(Modifiers::ALT))
+            + 4 * u8::from(mods.contains(Modifiers::CTRL))
+            + 8 * u8::from(mods.contains(Modifiers::SUPER));
+        let alternate = if encode_flags
+            .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)
+            && base != character
         {
-            let base = if character == '\x08' {
-                '\x7f'
-            } else {
-                character.to_ascii_lowercase()
-            };
-            let modifier = 1
-                + u8::from(mods.contains(Modifiers::SHIFT))
-                + 2 * u8::from(mods.contains(Modifiers::ALT))
-                + 4 * u8::from(mods.contains(Modifiers::CTRL))
-                + 8 * u8::from(mods.contains(Modifiers::SUPER));
-            let alternate = if encode_flags
+            format!(":{}", character as u32)
+        } else {
+            String::new()
+        };
+        let text = if encode_flags
+            .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT)
+            && !character.is_control()
+            && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+        {
+            format!(";{}", character as u32)
+        } else {
+            String::new()
+        };
+        encoded = format!("\x1b[{}{alternate};{modifier}{text}u", base as u32);
+    }
+    // The pinned upstream encoder only distinguishes press/release. Supply
+    // the negotiated repeat event type without changing its key encoding.
+    if report_repeat
+        && encoded.starts_with("\x1b[")
+        && let Some(separator) = encoded.find(';')
+    {
+        let start = separator + 1;
+        let digits = encoded[start..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        encoded.insert_str(start + digits, ":2");
+    }
+    if encoded.starts_with("\x1b[") && encoded.ends_with('u') {
+        if let Some(base) = details.base
+            && let Some(separator) = encoded.find(';')
+        {
+            let alternate = if flags
                 .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)
-                && base != character
+                && modifiers.contains(wezterm_term::KeyModifiers::SHIFT)
+                && let L::Char(character) = key
+                && character != base
             {
                 format!(":{}", character as u32)
             } else {
                 String::new()
             };
-            let text = if encode_flags
-                .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT)
-                && !character.is_control()
-                && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
-            {
-                format!(";{}", character as u32)
-            } else {
-                String::new()
-            };
-            encoded = format!("\x1b[{}{alternate};{modifier}{text}u", base as u32);
+            encoded.replace_range(2..separator, &format!("{}{alternate}", base as u32));
         }
-        // The pinned upstream encoder only distinguishes press/release. Supply
-        // the negotiated repeat event type without changing its key encoding.
-        if report_repeat
-            && encoded.starts_with("\x1b[")
-            && let Some(separator) = encoded.find(';')
+        if let Some(text) = &details.text
+            && down
+            && flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT)
         {
-            let start = separator + 1;
-            let digits = encoded[start..]
-                .bytes()
-                .take_while(u8::is_ascii_digit)
-                .count();
-            encoded.insert_str(start + digits, ":2");
+            let codepoints = text
+                .chars()
+                .map(|c| (c as u32).to_string())
+                .collect::<Vec<_>>()
+                .join(":");
+            let separator = encoded.find(';').unwrap();
+            let text_start = encoded[separator + 1..]
+                .find(';')
+                .map(|i| separator + 1 + i)
+                .unwrap_or(encoded.len() - 1);
+            encoded.replace_range(text_start..encoded.len() - 1, &format!(";{codepoints}"));
         }
-        if encoded.starts_with("\x1b[") && encoded.ends_with('u') {
-            if let Some(base) = details.base
-                && let Some(separator) = encoded.find(';')
-            {
-                let alternate = if flags
-                    .contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)
-                    && modifiers.contains(wezterm_term::KeyModifiers::SHIFT)
-                    && let L::Char(character) = key
-                    && character != base
-                {
-                    format!(":{}", character as u32)
-                } else {
-                    String::new()
-                };
-                encoded.replace_range(2..separator, &format!("{}{alternate}", base as u32));
-            }
-            if let Some(text) = &details.text
-                && down
-                && flags.contains(wezterm_input_types::KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT)
-            {
-                let codepoints = text
-                    .chars()
-                    .map(|c| (c as u32).to_string())
-                    .collect::<Vec<_>>()
-                    .join(":");
-                let separator = encoded.find(';').unwrap();
-                let text_start = encoded[separator + 1..]
-                    .find(';')
-                    .map(|i| separator + 1 + i)
-                    .unwrap_or(encoded.len() - 1);
-                encoded.replace_range(text_start..encoded.len() - 1, &format!(";{codepoints}"));
-            }
-        }
-        if !encoded.is_empty() {
-            writer.send(TransportInput::Data(encoded.into_bytes()))?;
-        }
-        Ok(())
-    } else if down {
-        if let Some(text) = &details.text {
-            writer.send(TransportInput::Data(text.as_bytes().to_vec()))?;
-            return Ok(());
-        }
-        terminal.key_down(key, modifiers)
-    } else {
-        terminal.key_up(key, modifiers)
     }
+    Some(encoded)
+}
+
+/// Encode the text and Enter together so they cannot reach different connections.
+pub(crate) fn group_command_bytes(terminal: &Terminal, text: &str) -> anyhow::Result<Vec<u8>> {
+    use wezterm_term::{KeyCode, KeyModifiers};
+    let mut encoded = terminal.encode_paste(text);
+    for down in [true, false] {
+        let edge = encode_key_input(
+            terminal,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            down,
+            false,
+            &KeyDetails::default(),
+        )?;
+        encoded.push_str(&edge);
+    }
+    Ok(encoded.into_bytes())
 }
 
 #[derive(Clone, Debug)]
@@ -1045,6 +1097,73 @@ mod tests {
         events.command_stream(Some(2));
         assert!(!events.idle_shell(1));
         assert!(events.idle_shell(2));
+    }
+
+    #[test]
+    fn group_command_prompt_is_one_use_and_bound_to_the_stream() {
+        use crate::events::ShellPrompt;
+        let (mut term, events) = watched_terminal();
+        let ready = || match events.shell_prompt() {
+            Some(ShellPrompt::Ready(token)) => token,
+            status => panic!("expected a fresh prompt, got {status:?}"),
+        };
+        events.command_stream(Some(1));
+        assert_eq!(events.shell_prompt(), Some(ShellPrompt::Unverified));
+        term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(term.at_shell_input_start());
+        let first = ready();
+        assert!(events.claim_shell_prompt(first));
+        assert!(!events.claim_shell_prompt(first));
+        term.advance_bytes(b"x");
+        assert!(!term.at_shell_input_start());
+        term.advance_bytes(b"\r\n\x1b]633;A\x07$ \x1b]633;B\x07");
+        let edited = ready();
+        events.invalidate_shell_prompt();
+        assert!(!events.claim_shell_prompt(edited));
+        term.advance_bytes(b"\r\n\x1b]133;B\x07");
+        assert_eq!(events.shell_prompt(), Some(ShellPrompt::InUse));
+        term.advance_bytes(b"\x1b]133;A\x07");
+        assert_eq!(events.shell_prompt(), Some(ShellPrompt::Opening));
+        term.advance_bytes(b"$ \x1b]133;B\x07");
+        let old_stream = ready();
+        events.command_stream(None);
+        events.command_stream(Some(2));
+        term.advance_bytes(b"\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        let replacement = ready();
+        assert!(!events.claim_shell_prompt(old_stream));
+        assert!(events.claim_shell_prompt(replacement));
+    }
+
+    #[test]
+    fn group_command_encodes_one_paste_and_the_negotiated_enter() {
+        let (mut term, mut outgoing) = engine();
+        assert!(
+            encode_key_input(
+                &term,
+                KeyCode::LeftShift,
+                KeyModifiers::SHIFT,
+                true,
+                false,
+                &KeyDetails::default()
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            group_command_bytes(&term, "echo snow").unwrap(),
+            b"echo snow\r"
+        );
+        term.advance_bytes(b"\x1b[?2004h\x1b[>11u");
+        let mut expected = b"\x1b[200~echo snow\x1b[201~".to_vec();
+        for down in [true, false] {
+            let (writer, mut key) = mpsc::unbounded_channel();
+            send_key(&mut term, &writer, KeyCode::Enter, KeyModifiers::NONE, down).unwrap();
+            match key.try_recv().or_else(|_| outgoing.try_recv()) {
+                Ok(TransportInput::Data(bytes)) => expected.extend(bytes),
+                item => panic!("expected Kitty Enter: {item:?}"),
+            }
+        }
+        assert_eq!(group_command_bytes(&term, "echo snow").unwrap(), expected);
     }
 
     #[test]

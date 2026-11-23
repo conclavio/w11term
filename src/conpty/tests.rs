@@ -178,10 +178,11 @@ async fn local_process_receives_input_interrupt_and_resize_and_drains_before_exi
     fixture.until("READY-80x24").await?;
     fixture.input.send(TransportInput::Resize(size(104, 33)))?;
     let (reply, stale) = tokio::sync::oneshot::channel();
-    fixture.input.send(TransportInput::Clipboard {
+    fixture.input.send(TransportInput::Scoped {
         connection: 0,
         bytes: b"old paste ".to_vec(),
         reply,
+        kind: crate::terminal::ScopedInput::Clipboard,
     })?;
     assert!(stale.await?.is_err());
     let (ack, rx) = tokio::sync::oneshot::channel();
@@ -190,10 +191,11 @@ async fn local_process_receives_input_interrupt_and_resize_and_drains_before_exi
         .send(TransportInput::Raw(b"typed ".to_vec(), ack))?;
     rx.await?.map_err(anyhow::Error::msg)?;
     let (reply, delivered) = tokio::sync::oneshot::channel();
-    fixture.input.send(TransportInput::Clipboard {
+    fixture.input.send(TransportInput::Scoped {
         connection: 1,
         bytes: b"input\r".to_vec(),
         reply,
+        kind: crate::terminal::ScopedInput::Clipboard,
     })?;
     delivered.await?.map_err(anyhow::Error::msg)?;
     fixture.until("INPUT-typed input-104x33").await?;

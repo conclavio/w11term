@@ -1,5 +1,5 @@
 use crate::interaction::{Interaction, PasteWarning};
-use crate::terminal::TransportInput;
+use crate::terminal::{ScopedInput, TransportInput};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
@@ -131,10 +131,11 @@ pub(super) fn write(
 ) {
     let (ack, received) = oneshot::channel();
     if writer
-        .send(TransportInput::Clipboard {
+        .send(TransportInput::Scoped {
             connection,
             bytes,
             reply: ack,
+            kind: ScopedInput::Clipboard,
         })
         .is_err()
     {
