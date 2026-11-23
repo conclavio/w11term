@@ -6,6 +6,7 @@ $keymap.shortcuts.keyboard_hints = 'F12'
 
 $hostKey = 'Software\w11term-wsl-fixture-' + (Split-Path -Leaf $State)
 $env:W11TERM_TEST_WSL_FIXTURE = $State
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'clipboard.txt'
 $launcher = Join-Path $State 'wsl.exe'
 $leftName = 'QA Linux ' + [char]0x96ea
 $rightName = 'Build Linux'
@@ -160,6 +161,12 @@ public static class WslFixture {
         Sessions | Where-Object { $_.active -and $_.label -ceq $leftLabel }
     }
     Wait-Launch $left.id $leftName
+    Run-Palette 'Copy Bash directory setup'
+    $bashSetup = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '../src/app/bash-directory.sh')).TrimEnd()
+    $null = Wait-Until 'the bundled Bash directory setup copied from a WSL pane' {
+        (Test-Path -LiteralPath $env:W11TERM_TEST_COPY_FILE) -and
+            [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $bashSetup
+    }
     Publish-Report $left.id 'linux'
     $explorerAction = 'Open current folder in File Explorer'
     $search = Open-Palette $explorerAction

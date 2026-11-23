@@ -364,6 +364,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bash_directory_reports_preserve_encoded_paths_and_clear_an_invalid_location() {
+        let (writer, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = w11term::terminal::create(Default::default(), writer);
+        term.advance_bytes(
+            b"\x1b]7;file:///home/tree%20%23100%25%20%5Bpilot%5D%20%27%20%E9%9B%AA\x07",
+        );
+        let report = term.reported_current_dir().map(AsRef::as_ref);
+        assert_eq!(
+            file_drawer::shell_directory(report, "node.example").as_deref(),
+            Some("/home/tree #100% [pilot] ' 雪")
+        );
+        term.advance_bytes(b"\x1b]7;file://\x07");
+        let report = term.reported_current_dir().map(AsRef::as_ref);
+        assert!(file_drawer::shell_directory(report, "node.example").is_none());
+    }
+
+    #[test]
     fn local_file_reports_decode_drive_paths_without_filesystem_probes() {
         for (uri, expected) in [
             ("file:///C:/", r"C:\"),
