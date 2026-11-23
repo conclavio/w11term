@@ -4,15 +4,17 @@ use windows_reactor::MenuItem;
 pub enum Shell {
     Bash,
     Zsh,
+    Fish,
 }
 
 impl Shell {
-    const ALL: [Self; 2] = [Self::Bash, Self::Zsh];
+    const ALL: [Self; 3] = [Self::Bash, Self::Zsh, Self::Fish];
 
     fn label(self) -> &'static str {
         match self {
             Self::Bash => "Copy Bash directory setup",
             Self::Zsh => "Copy Zsh directory setup",
+            Self::Fish => "Copy Fish directory setup",
         }
     }
 
@@ -25,6 +27,7 @@ impl Shell {
             let key = match shell {
                 Self::Bash => "copy-bash-directory",
                 Self::Zsh => "copy-zsh-directory",
+                Self::Fish => "copy-fish-directory",
             };
             MenuItem::item(key, shell.label())
         })
@@ -34,6 +37,7 @@ impl Shell {
         let setup = match self {
             Self::Bash => include_str!("bash-directory.sh"),
             Self::Zsh => include_str!("zsh-directory.zsh"),
+            Self::Fish => include_str!("fish-directory.fish"),
         };
         w11term::clipboard::write(setup.trim_end())
     }
