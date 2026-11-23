@@ -5,14 +5,16 @@ pub enum Setup {
     BashDirectory,
     ZshDirectory,
     FishDirectory,
+    BashIntegration,
     ZshIntegration,
 }
 
 impl Setup {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::BashDirectory,
         Self::ZshDirectory,
         Self::FishDirectory,
+        Self::BashIntegration,
         Self::ZshIntegration,
     ];
 
@@ -21,6 +23,7 @@ impl Setup {
             Self::BashDirectory => "Copy Bash directory setup",
             Self::ZshDirectory => "Copy Zsh directory setup",
             Self::FishDirectory => "Copy Fish directory setup",
+            Self::BashIntegration => "Copy Bash shell integration",
             Self::ZshIntegration => "Copy Zsh shell integration",
         }
     }
@@ -35,6 +38,7 @@ impl Setup {
                 Self::BashDirectory => "copy-bash-directory",
                 Self::ZshDirectory => "copy-zsh-directory",
                 Self::FishDirectory => "copy-fish-directory",
+                Self::BashIntegration => "copy-bash-integration",
                 Self::ZshIntegration => "copy-zsh-integration",
             };
             MenuItem::item(key, shell.label())
@@ -46,6 +50,11 @@ impl Setup {
             Self::BashDirectory => include_str!("bash-directory.sh"),
             Self::ZshDirectory => include_str!("zsh-directory.zsh"),
             Self::FishDirectory => include_str!("fish-directory.fish"),
+            Self::BashIntegration => concat!(
+                include_str!("bash-directory.sh"),
+                "\n",
+                include_str!("bash-integration.sh")
+            ),
             Self::ZshIntegration => concat!(
                 include_str!("zsh-directory.zsh"),
                 "\n",

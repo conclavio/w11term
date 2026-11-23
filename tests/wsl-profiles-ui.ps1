@@ -172,22 +172,21 @@ public static class WslFixture {
     }
     Wait-Launch $left.id $leftName
     foreach ($setup in @(
-        @{ Shell = 'Bash'; File = 'bash-directory.sh' }
-        @{ Shell = 'Zsh'; File = 'zsh-directory.zsh' }
-        @{ Shell = 'Fish'; File = 'fish-directory.fish' }
+        @{ Action = 'Copy Bash directory setup'; Files = @('bash-directory.sh') }
+        @{ Action = 'Copy Zsh directory setup'; Files = @('zsh-directory.zsh') }
+        @{ Action = 'Copy Fish directory setup'; Files = @('fish-directory.fish') }
+        @{ Action = 'Copy Bash shell integration'; Files = @('bash-directory.sh','bash-integration.sh') }
+        @{ Action = 'Copy Zsh shell integration'; Files = @('zsh-directory.zsh','zsh-integration.zsh') }
     )) {
-        Run-Palette "Copy $($setup.Shell) directory setup"
-        $setupText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "../src/app/$($setup.File)")).TrimEnd()
-        $null = Wait-Until "the bundled $($setup.Shell) directory setup copied from a WSL pane" {
+        Run-Palette $setup.Action
+        $parts = foreach ($file in $setup.Files) {
+            [IO.File]::ReadAllText((Join-Path $PSScriptRoot "../src/app/$file"))
+        }
+        $setupText = ($parts -join [char]10).TrimEnd()
+        $null = Wait-Until "$($setup.Action) copied the complete script from a WSL pane" {
             (Test-Path -LiteralPath $env:W11TERM_TEST_COPY_FILE) -and
                 [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $setupText
         }
-    }
-    Run-Palette 'Copy Zsh shell integration'
-    $zshSetup = ([IO.File]::ReadAllText((Join-Path $PSScriptRoot '../src/app/zsh-directory.zsh')) +
-        [char]10 + [IO.File]::ReadAllText((Join-Path $PSScriptRoot '../src/app/zsh-integration.zsh'))).TrimEnd()
-    $null = Wait-Until 'both parts of the Zsh shell integration were copied' {
-        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $zshSetup
     }
     Publish-Report $left.id 'linux'
     Press-Key 0x70 # F1 copies the reported directory.
