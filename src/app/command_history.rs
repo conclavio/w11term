@@ -30,6 +30,7 @@ pub enum HistoryAction {
     Refresh,
     Select(u64, u64),
     Copy(u64, u64, CopyPart),
+    ExportOutput((u64, u64)),
     Insert((u64, u64)),
     BeginSave((u64, u64)),
     SaveName((u64, u64), String),
@@ -269,6 +270,15 @@ impl TerminalApp {
                     };
                 }
             }
+            HistoryAction::ExportOutput(target) => {
+                if page.selected == Some(target)
+                    && let Some(output) = selected_command(&frame, Some(target))
+                        .and_then(|entry| CopyPart::Output.text(entry))
+                {
+                    self.export_command_output(pane, target.1, output, ctx);
+                }
+                return;
+            }
             HistoryAction::Insert(target) => {
                 if page.selected != Some(target) {
                     return;
@@ -454,6 +464,9 @@ impl TerminalApp {
                 .is_some_and(|text| history_text_allowed(text, frame.bracketed_paste))
                 && self.history_insert_target(pane, &frame).is_some()
         });
+        let export_target = page.selected.filter(|_| {
+            selected.is_some_and(|entry| entry.output.is_ok()) && self.export.pending.is_none()
+        });
         let save =
             match (&page.save, save_target) {
                 (Some(draft), Some(target)) if draft.target == target => {
@@ -572,6 +585,14 @@ impl TerminalApp {
                                 }))
                                 .content("Insert command"),
                             save,
+                            Button::new()
+                                .is_enabled(export_target.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    export_target.map_or(Message::ControlIdle, |target| {
+                                        action(HistoryAction::ExportOutput(target))
+                                    })
+                                }))
+                                .content(text_export::COMMAND_OUTPUT_LABEL),
                             TextBlock::new()
                                 .text(preview)
                                 .text_wrapping(TextWrapping::Wrap),

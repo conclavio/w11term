@@ -89,7 +89,6 @@ mod previous_pane;
 mod quick_connect;
 mod recordings;
 mod scrollback_bar;
-mod scrollback_export;
 mod session_browser;
 #[cfg(feature = "ui-smoke")]
 mod split_smoke;
@@ -97,6 +96,7 @@ mod tab_colors;
 mod tab_title;
 mod tab_windows;
 mod taskbar;
+mod text_export;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
 use pane_view::PaneSurface;
@@ -954,7 +954,7 @@ pub struct TerminalApp {
     native_bound: bool,
     window_error: Option<String>,
     pending_directory_copy: Option<directory_split::PendingCopy>,
-    export: scrollback_export::Export,
+    export: text_export::Export,
     recordings: recordings::Recordings,
     registry: Registry,
     control_rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<UiWork>>>,
@@ -1015,7 +1015,7 @@ pub enum Message {
     FolderShare(folder_shares::Action),
     FolderRevoke(TabId, u64, folder_revoke::Action),
     RestartExited(ExitedPane),
-    Export(scrollback_export::Action),
+    Export(text_export::Action),
     Recording(recordings::Action),
     ClearScrollback(u64),
     PaneColorScheme(u64, ColorScheme),
@@ -3299,7 +3299,9 @@ impl TerminalApp {
             folder_shares::LABEL => pane.map_or(Message::ControlIdle, |id| {
                 Message::FolderShare(folder_shares::Action::Open(id))
             }),
-            scrollback_export::LABEL => Message::Export(scrollback_export::Action::Start(pane)),
+            text_export::SCROLLBACK_LABEL => {
+                Message::Export(text_export::Action::StartScrollback(pane))
+            }
             value if recordings::is_command(value) => recordings::invoke(recordings.target(value)),
             RESTART_EXITED_PANE => exited.map_or(Message::ControlIdle, Message::RestartExited),
             "Paste" => Message::Clipboard(clipboard_paste::Action::Start(paste, false)),
@@ -3904,7 +3906,7 @@ impl TerminalApp {
             items.push(MenuItem::item("command-history", "Command history"));
             items.push(command_menu_item(
                 "save-scrollback",
-                scrollback_export::LABEL,
+                text_export::SCROLLBACK_LABEL,
                 self.export.pending.is_none(),
             ));
             let clear = KeyAction::ClearScrollback.binding();
@@ -4792,7 +4794,7 @@ impl Component for TerminalApp {
                 self.refresh_open_commands();
             }
             Message::Export(action) => {
-                self.export_scrollback(action, context);
+                self.handle_text_export(action, context);
                 self.refresh_open_commands();
             }
             Message::Recording(action) => {
@@ -6645,15 +6647,13 @@ impl Component for TerminalApp {
         }
         if let Some(message) = &self.export.status {
             views.push(KeyedView::new(
-                "scrollback-export-status",
+                "text-export-status",
                 Button::new()
                     .grid_row(1)
                     .automation_name(message)
                     .horizontal_alignment(HorizontalAlignment::Right)
                     .vertical_alignment(VerticalAlignment::Bottom)
-                    .on_click(
-                        context.callback(|_| Message::Export(scrollback_export::Action::Dismiss)),
-                    )
+                    .on_click(context.callback(|_| Message::Export(text_export::Action::Dismiss)))
                     .content(format!("{message}  ·  Dismiss")),
             ));
         }

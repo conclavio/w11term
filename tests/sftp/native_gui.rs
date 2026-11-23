@@ -505,9 +505,11 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
 async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     let long = format!("deploy {} [Ångström]", "x".repeat(128));
     let encoded = percent_encoding::utf8_percent_encode(&long, percent_encoding::NON_ALPHANUMERIC);
+    let line = "y".repeat(90);
     let mut stream = format!(
         "\x1b]133;A\x07$ \x1b]133;B\x07visible deployment prompt\r\n\
-         \x1b]133;C;cmdline_url={encoded}\x07archived deploy output\r\n\x1b]133;D;17\x07"
+         \x1b]133;C;cmdline_url={encoded}\x07archived deploy output \x1b[32m[Ångström]\x1b[0m {line}\r\n\
+         \r\nsecond line\r\n\x1b]133;D;17\x07"
     );
     stream.push_str(concat!(
         "\x1b]133;A\x07$ \x1b]133;B\x07wrapped command\r\n",
