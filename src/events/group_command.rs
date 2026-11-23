@@ -9,9 +9,17 @@ const PREVIEW_LINES: usize = 32;
 #[derive(Clone, Debug)]
 pub enum GroupExecution {
     AwaitingMarkers,
-    Running,
+    Running(GroupInterruptTarget),
     Finished(Arc<GroupCommandResult>),
     Unavailable(&'static str),
+}
+
+/// One verified group submission on a single shell stream. Capture IDs can
+/// be reused after an incomplete command, so they cannot guard a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupInterruptTarget {
+    pub generation: u64,
+    pub serial: u64,
 }
 
 #[derive(Debug)]
@@ -48,7 +56,7 @@ impl From<&CompletedCommand> for GroupOutput {
 
 #[derive(Debug)]
 pub(super) struct GroupRun {
-    generation: u64,
+    target: GroupInterruptTarget,
     expected: Arc<str>,
     status: watch::Sender<GroupExecution>,
     started: Option<Started>,
@@ -62,12 +70,12 @@ struct Started {
 
 impl GroupRun {
     pub(super) fn new(
-        generation: u64,
+        target: GroupInterruptTarget,
         expected: Arc<str>,
         status: watch::Sender<GroupExecution>,
     ) -> Self {
         Self {
-            generation,
+            target,
             expected,
             status,
             started: None,
@@ -87,11 +95,16 @@ impl GroupRun {
         {
             self.status
                 .send_replace(if label == Some(self.expected.as_ref()) {
-                    GroupExecution::Running
+                    GroupExecution::Running(self.target)
                 } else {
                     GroupExecution::AwaitingMarkers
                 });
         }
+    }
+
+    pub(super) fn is_running(&self, target: GroupInterruptTarget) -> bool {
+        !self.status.is_closed()
+            && matches!(*self.status.borrow(), GroupExecution::Running(current) if current == target)
     }
 
     /// Keep observing only while this capture can still be attributed to the submitted line.
@@ -142,7 +155,7 @@ impl GroupRun {
                 self.status
                     .send_replace(GroupExecution::Finished(Arc::new(GroupCommandResult {
                         link: CommandLink {
-                            generation: self.generation,
+                            generation: self.target.generation,
                             id: command.id,
                         },
                         exit_code: command.exit_code,

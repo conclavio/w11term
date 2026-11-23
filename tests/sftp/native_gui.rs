@@ -830,6 +830,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
             };
             let mut peer = None;
             let mut connections = 0;
+            let mut waiting_interrupt = false;
             while let Some(message) = received.recv().await {
                 match message {
                     Wire::Shell(id, handle) => {
@@ -845,6 +846,19 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                         let handle = peer.as_ref().unwrap();
                         let response = match bytes.as_slice() {
                             b"part" => b"part".to_vec(),
+                            b"\x03" => {
+                                assert!(
+                                    waiting_interrupt,
+                                    "Ctrl+C arrived outside an interrupt test command"
+                                );
+                                waiting_interrupt = false;
+                                let finish = if use_633 {
+                                    b"west interrupted\r\n\x1b]633;D;130\x07".as_slice()
+                                } else {
+                                    b"east interrupted\r\n\x1b]133;D;130\x07".as_slice()
+                                };
+                                [finish, prompt].concat()
+                            }
                             b"alt" => b"\x1b[?1049h\x1b[Halternate-proof".to_vec(),
                             b"prompt" => [b"\x1b[?1049l\r\n".as_slice(), prompt].concat(),
                             b"drop" => {
@@ -869,6 +883,17 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                     line
                                 };
                                 let line = std::str::from_utf8(line).unwrap();
+                                if matches!(line, "interrupt-pair" | "interrupt-both") {
+                                    assert!(!waiting_interrupt);
+                                    waiting_interrupt = true;
+                                    let start = if use_633 {
+                                        format!("\r\n\x1b]633;E;{line}\x07\x1b]633;C\x07")
+                                    } else {
+                                        format!("{line}\r\n\x1b]133;C\x07")
+                                    };
+                                    handle.data(id, start.into_bytes()).await.unwrap();
+                                    continue;
+                                }
                                 if use_633 && line == "both" {
                                     handle
                                         .data(
@@ -926,8 +951,8 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
     .unwrap();
     drive_gui("ssh-host-group-ui.ps1", state.path());
     let expected: [&[u8]; 2] = [
-        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\r",
-        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r",
+        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03",
+        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
         assert_eq!(opens.load(Ordering::Relaxed), index + 1);

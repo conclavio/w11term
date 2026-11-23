@@ -927,6 +927,22 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
         })
         .unwrap();
     assert!(response.await.unwrap().unwrap_err().contains("reconnected"));
+    for (generation, error) in [(1, "reconnected"), (2, "no longer running")] {
+        let (reply, response) = oneshot::channel();
+        client
+            .input
+            .send(TransportInput::Scoped {
+                connection: generation,
+                bytes: vec![3],
+                reply,
+                kind: ScopedInput::GroupInterrupt(w11term::events::GroupInterruptTarget {
+                    generation,
+                    serial: 1,
+                }),
+            })
+            .unwrap();
+        assert!(response.await.unwrap().unwrap_err().contains(error));
+    }
     client
         .input
         .send(TransportInput::Data(b"quit".to_vec()))
@@ -963,6 +979,7 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
     assert!(!observations.contains(&Seen::Data(b"OFFLINE_PASTE".to_vec())));
     assert!(!observations.contains(&Seen::Data(b"STALE_PASTE".to_vec())));
     assert!(!observations.contains(&Seen::Data(b"STALE_GROUP_COMMAND\r".to_vec())));
+    assert!(!observations.contains(&Seen::Data(vec![3])));
     let paste = Seen::Data(b"CURRENT_PASTE".to_vec());
     assert_eq!(observations.iter().filter(|e| **e == paste).count(), 1);
     assert!(

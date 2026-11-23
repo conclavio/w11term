@@ -96,6 +96,10 @@ pub enum Command {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
         execution: tokio::sync::watch::Sender<crate::events::GroupExecution>,
     },
+    InterruptGroupCommand {
+        target: crate::events::GroupInterruptTarget,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
     /// Capture immutable UTF-8 text on this worker. The caller owns all file I/O.
     ExportText(tokio::sync::oneshot::Sender<Result<String, &'static str>>),
@@ -881,7 +885,7 @@ async fn run(
                 let command = if phase != Phase::Running || queued_offline {
                     match command {
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("No active terminal connection; clipboard text was not sent".into())); continue; }
-                        Some(Command::SendGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
+                        Some(Command::SendGroupCommand { reply, .. } | Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
@@ -893,7 +897,7 @@ async fn run(
                 let command = if read_only {
                     match command {
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("Pane input is read-only".into())); continue; }
-                        Some(Command::SendGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
+                        Some(Command::SendGroupCommand { reply, .. } | Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
                         Some(Command::Raw(_, reply)) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
@@ -949,16 +953,30 @@ async fn run(
                         }
                         match terminal::group_command_bytes(&terminal, &text) {
                             Ok(bytes) => {
-                                match writer.send(TransportInput::Scoped {
-                                    connection: prompt.connection, bytes, reply, kind,
-                                }) {
-                                    Ok(()) => events.observe_group_command(prompt.connection, text, execution),
-                                    Err(error) => if let TransportInput::Scoped { reply, .. } = error.0 {
-                                        let _ = reply.send(Err("The host connection closed.".into()));
-                                    },
+                                if write_group_input(&writer, prompt.connection, bytes, reply, kind) {
+                                    events.observe_group_command(prompt.connection, text, execution);
                                 }
                             }
                             Err(error) => { let _ = reply.send(Err(error.to_string())); }
+                        }
+                        Ok(())
+                    }
+                    Some(Command::InterruptGroupCommand { target, reply }) => {
+                        let kind = terminal::ScopedInput::GroupInterrupt(target);
+                        let bytes = if !group_shell || player.read().unwrap().rustmush {
+                            Err("Group interrupts require a direct SSH shell.".into())
+                        } else if connection_generation != target.generation {
+                            Err(kind.stale_error().into())
+                        } else if prompts.current().is_some() {
+                            Err("The host requires authentication.".into())
+                        } else if !events.group_command_running(target) {
+                            Err(terminal::GROUP_COMMAND_ENDED.into())
+                        } else {
+                            terminal::group_interrupt_bytes(&terminal).map_err(|error| error.to_string())
+                        };
+                        match bytes {
+                            Ok(bytes) => { write_group_input(&writer, target.generation, bytes, reply, kind); }
+                            Err(error) => { let _ = reply.send(Err(error)); }
                         }
                         Ok(())
                     }
@@ -1427,6 +1445,29 @@ async fn run(
     }
     if let Some(recorder) = recorder {
         let _ = finish_recording(recorder, &events);
+    }
+}
+
+fn write_group_input(
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    connection: u64,
+    bytes: Vec<u8>,
+    reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    kind: terminal::ScopedInput,
+) -> bool {
+    match writer.send(TransportInput::Scoped {
+        connection,
+        bytes,
+        reply,
+        kind,
+    }) {
+        Ok(()) => true,
+        Err(error) => {
+            if let TransportInput::Scoped { reply, .. } = error.0 {
+                let _ = reply.send(Err("The host connection closed.".into()));
+            }
+            false
+        }
     }
 }
 

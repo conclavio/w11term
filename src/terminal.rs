@@ -136,6 +136,7 @@ pub enum TransportInput {
 pub enum ScopedInput {
     Clipboard,
     GroupCommand,
+    GroupInterrupt(crate::events::GroupInterruptTarget),
 }
 
 impl ScopedInput {
@@ -145,9 +146,12 @@ impl ScopedInput {
                 "The pane connection changed. Paste again to use the new connection."
             }
             Self::GroupCommand => "The host reconnected before the command was sent.",
+            Self::GroupInterrupt(_) => "The host reconnected before Ctrl+C was sent.",
         }
     }
 }
+
+pub(crate) const GROUP_COMMAND_ENDED: &str = "The selected group command is no longer running.";
 
 struct ReplyWriter {
     sender: mpsc::UnboundedSender<TransportInput>,
@@ -578,18 +582,37 @@ fn encode_kitty_key_event(
 pub(crate) fn group_command_bytes(terminal: &Terminal, text: &str) -> anyhow::Result<Vec<u8>> {
     use wezterm_term::{KeyCode, KeyModifiers};
     let mut encoded = terminal.encode_paste(text);
+    encoded.push_str(&group_key_press(
+        terminal,
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )?);
+    Ok(encoded.into_bytes())
+}
+
+pub(crate) fn group_interrupt_bytes(terminal: &Terminal) -> anyhow::Result<Vec<u8>> {
+    use wezterm_term::{KeyCode, KeyModifiers};
+    Ok(group_key_press(terminal, KeyCode::Char('c'), KeyModifiers::CTRL)?.into_bytes())
+}
+
+fn group_key_press(
+    terminal: &Terminal,
+    key: wezterm_term::KeyCode,
+    modifiers: wezterm_term::KeyModifiers,
+) -> anyhow::Result<String> {
+    let mut encoded = String::new();
     for down in [true, false] {
         let edge = encode_key_input(
             terminal,
-            KeyCode::Enter,
-            KeyModifiers::NONE,
+            key,
+            modifiers,
             down,
             false,
             &KeyDetails::default(),
         )?;
         encoded.push_str(&edge);
     }
-    Ok(encoded.into_bytes())
+    Ok(encoded)
 }
 
 #[derive(Clone, Debug)]
@@ -1175,8 +1198,24 @@ mod tests {
         let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
         events.observe_group_command(1, "echo east".into(), notice);
         term.advance_bytes(b"echo east\r\n\x1b]133;C\x07");
-        assert!(matches!(*outcome.borrow(), GroupExecution::Running));
+        let GroupExecution::Running(target) = *outcome.borrow() else {
+            panic!("expected running command")
+        };
+        assert!(events.group_command_running(target));
+        assert!(
+            !events.group_command_running(crate::events::GroupInterruptTarget {
+                serial: target.serial + 1,
+                ..target
+            })
+        );
+        assert!(
+            !events.group_command_running(crate::events::GroupInterruptTarget {
+                generation: 2,
+                ..target
+            })
+        );
         term.advance_bytes(b"east result\r\n\x1b]133;D;17\x07");
+        assert!(!events.group_command_running(target));
         let GroupExecution::Finished(result) = outcome.borrow().clone() else {
             panic!("the matching completion must be captured");
         };
@@ -1194,7 +1233,7 @@ mod tests {
         term.advance_bytes(b"\r\n\x1b]633;C\x07west result\r\n");
         assert!(matches!(*late.borrow(), GroupExecution::AwaitingMarkers));
         term.advance_bytes(b"\x1b]633;E;echo west\x07");
-        assert!(matches!(*late.borrow(), GroupExecution::Running));
+        assert!(matches!(*late.borrow(), GroupExecution::Running(_)));
         term.advance_bytes(b"\x1b]633;D;0\x07");
         assert!(matches!(&*late.borrow(), GroupExecution::Finished(result)
             if result.exit_code == Some(0) && result.link.id != term.command_history()[0].id));
@@ -1207,6 +1246,36 @@ mod tests {
             matches!(&*prompt_only.borrow(), GroupExecution::Finished(result)
             if result.exit_code.is_none())
         );
+    }
+
+    #[test]
+    fn group_interrupt_target_cannot_be_reused_after_terminal_reset() {
+        use crate::events::GroupExecution;
+        let (mut term, events) = watched_terminal();
+        events.command_stream(Some(1));
+        let mut previous = None;
+        for _ in 0..2 {
+            term.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
+            events.observe_group_command(1, "run".into(), notice);
+            term.advance_bytes(b"run\r\n\x1b]133;C\x07");
+            let GroupExecution::Running(target) = *outcome.borrow() else {
+                panic!("expected running command")
+            };
+            assert_eq!(target.generation, 1);
+            assert!(events.group_command_running(target));
+            if let Some(old) = previous {
+                assert_ne!(old, target);
+                assert!(!events.group_command_running(old));
+            }
+            previous = Some(target);
+            term.advance_bytes(b"\x1bc");
+            assert!(!events.group_command_running(target));
+            assert!(matches!(
+                outcome.borrow().clone(),
+                GroupExecution::Unavailable(_)
+            ));
+        }
     }
 
     #[test]
@@ -1229,15 +1298,42 @@ mod tests {
         let (notice, outcome) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
         events.observe_group_command(1, "run".into(), notice);
         term.advance_bytes(b"run\r\n\x1b]133;C\x07");
-        assert!(matches!(*outcome.borrow(), GroupExecution::Running));
+        let GroupExecution::Running(link) = *outcome.borrow() else {
+            panic!("expected running command")
+        };
         events.command_stream(None);
         events.command_stream(Some(2));
+        assert!(!events.group_command_running(link));
         term.advance_bytes(
             b"\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07new\r\n\x1b]133;D;0\x07",
         );
         assert!(
             matches!(*outcome.borrow(), GroupExecution::Unavailable(reason) if reason.starts_with("The connection closed"))
         );
+    }
+
+    #[test]
+    fn group_interrupt_uses_the_panes_ctrl_c_encoding() {
+        let (mut term, mut outgoing) = engine();
+        assert_eq!(group_interrupt_bytes(&term).unwrap(), b"\x03");
+        term.advance_bytes(b"\x1b[>11u");
+        let mut expected = Vec::new();
+        for down in [true, false] {
+            let (writer, mut key) = mpsc::unbounded_channel();
+            send_key(
+                &mut term,
+                &writer,
+                KeyCode::Char('c'),
+                KeyModifiers::CTRL,
+                down,
+            )
+            .unwrap();
+            match key.try_recv().or_else(|_| outgoing.try_recv()) {
+                Ok(TransportInput::Data(bytes)) => expected.extend(bytes),
+                item => panic!("expected Kitty Ctrl+C: {item:?}"),
+            }
+        }
+        assert_eq!(group_interrupt_bytes(&term).unwrap(), expected);
     }
 
     #[test]
