@@ -1,4 +1,6 @@
 use super::*;
+use regex::{Regex, RegexBuilder};
+use std::{collections::HashMap, ops::Range, sync::Weak};
 use w11term::control::CommandStatus;
 use w11term::saved_commands::{Commands, Entry, valid_command_text};
 use w11term::session::history_text_allowed;
@@ -8,7 +10,7 @@ use wezterm_term::CompletedCommand;
 pub(super) struct HistoryPage {
     pane: u64,
     selected: Option<(u64, u64)>, // Connection generation and command id.
-    query: String,
+    search: HistorySearch,
     status: CommandStatus,
     feedback: String,
     save: Option<SaveDraft>,
@@ -34,6 +36,7 @@ pub enum Action {
 
 pub enum HistoryAction {
     Search(String),
+    IncludeOutput(bool),
     Status(CommandStatus),
     Refresh,
     Select(u64, u64),
@@ -70,13 +73,84 @@ const STATUS_OPTIONS: [(CommandStatus, &str); 4] = [
     (CommandStatus::Unknown, "Status unknown"),
 ];
 
-fn matches_command(entry: &CompletedCommand, needle: &str, status: CommandStatus) -> bool {
-    status.matches(entry.exit_code)
-        && (needle.is_empty()
-            || entry
-                .command
-                .as_ref()
-                .is_some_and(|text| text.to_lowercase().contains(needle)))
+#[derive(Default)]
+struct HistorySearch {
+    query: String,
+    needle: String,
+    include_output: bool,
+    matcher: Option<Regex>,
+    cache: RefCell<OutputMatches>,
+}
+
+#[derive(Default)]
+struct OutputMatches {
+    // Previewing command history should not keep evicted output in memory.
+    history: Weak<VecDeque<Arc<CompletedCommand>>>,
+    ranges: HashMap<u64, Range<usize>>,
+}
+
+impl HistorySearch {
+    fn update_matcher(&mut self) {
+        self.matcher = if self.include_output && !self.query.is_empty() {
+            RegexBuilder::new(&regex::escape(&self.query))
+                .case_insensitive(true)
+                .build()
+                .ok()
+        } else {
+            None
+        };
+        *self.cache.get_mut() = OutputMatches::default();
+    }
+
+    fn output_match(&self, frame: &Snapshot, id: u64) -> Option<Range<usize>> {
+        let matcher = self.matcher.as_ref()?;
+        let mut cache = self.cache.borrow_mut();
+        if cache.history.as_ptr() != Arc::as_ptr(&frame.command_history) {
+            cache.ranges = frame
+                .command_history
+                .iter()
+                .filter_map(|entry| {
+                    let text = entry.output.as_ref().ok()?;
+                    let hit = matcher.find(text)?;
+                    Some((entry.id, hit.range()))
+                })
+                .collect();
+            cache.history = Arc::downgrade(&frame.command_history);
+        }
+        cache.ranges.get(&id).cloned()
+    }
+
+    fn includes(&self, frame: &Snapshot, entry: &CompletedCommand, status: CommandStatus) -> bool {
+        status.matches(entry.exit_code)
+            && (command_text_matches(entry, &self.needle)
+                || self.output_match(frame, entry.id).is_some())
+    }
+}
+
+fn command_text_matches(entry: &CompletedCommand, needle: &str) -> bool {
+    needle.is_empty()
+        || entry
+            .command
+            .as_ref()
+            .is_some_and(|text| text.to_lowercase().contains(needle))
+}
+
+fn output_preview(text: &str, hit: Option<Range<usize>>) -> String {
+    const PREVIEW_BYTES: usize = 8192;
+    const CONTEXT_BYTES: usize = 384;
+    let start = hit.map_or(0, |hit| {
+        text.ceil_char_boundary(hit.start.saturating_sub(CONTEXT_BYTES))
+    });
+    let end = text.floor_char_boundary(text.len().min(start + PREVIEW_BYTES));
+    let mut preview = String::new();
+    if start > 0 {
+        preview.push_str("…\r\n");
+    }
+    preview.push_str(&text[start..end]);
+    if start > 0 || end < text.len() {
+        preview.push_str("\r\n… Copy output for the full text.");
+    }
+    preview
 }
 
 fn selected_command(frame: &Snapshot, selected: Option<(u64, u64)>) -> Option<&CompletedCommand> {
@@ -96,22 +170,21 @@ fn saveable_command(frame: &Snapshot, target: (u64, u64)) -> Option<&str> {
         .filter(|text| valid_command_text(text))
 }
 
-fn newest(frame: &Snapshot, needle: &str, status: CommandStatus) -> Option<(u64, u64)> {
+fn newest(frame: &Snapshot, search: &HistorySearch, status: CommandStatus) -> Option<(u64, u64)> {
     frame
         .command_history
         .iter()
         .rev()
-        .find(|entry| matches_command(entry, needle, status))
+        .find(|entry| search.includes(frame, entry, status))
         .map(|c| (frame.connection_generation, c.id))
 }
 
 impl HistoryPage {
     fn keep_matching_selection(&mut self, frame: &Snapshot) {
-        let needle = self.query.to_lowercase();
         if !selected_command(frame, self.selected)
-            .is_some_and(|entry| matches_command(entry, &needle, self.status))
+            .is_some_and(|entry| self.search.includes(frame, entry, self.status))
         {
-            self.selected = newest(frame, &needle, self.status);
+            self.selected = newest(frame, &self.search, self.status);
         }
     }
 }
@@ -253,10 +326,11 @@ impl TerminalApp {
             return false;
         };
         let label = format!("History · {}", source.label);
+        let search = HistorySearch::default();
         let selected = match target {
             Some(link) if frame.has_command(link) => Some((link.generation, link.id)),
             Some(_) => return false,
-            None => newest(&frame, "", CommandStatus::All),
+            None => newest(&frame, &search, CommandStatus::All),
         };
         let existing = self
             .tabs
@@ -267,7 +341,7 @@ impl TerminalApp {
         let page = Page::CommandHistory(HistoryPage {
             pane,
             selected,
-            query: String::new(),
+            search,
             status: CommandStatus::All,
             feedback: String::new(),
             save: None,
@@ -358,27 +432,35 @@ impl TerminalApp {
         let Page::CommandHistory(page) = &mut self.tabs.get_mut(id).unwrap().page else {
             return;
         };
-        if matches!(&action, HistoryAction::Status(status) if *status == page.status) {
+        if matches!(&action, HistoryAction::Status(status) if *status == page.status)
+            || matches!(&action, HistoryAction::IncludeOutput(include) if *include == page.search.include_output)
+            || matches!(&action, HistoryAction::Search(query) if *query == page.search.query)
+        {
             return;
         }
         page.feedback.clear();
         match action {
             HistoryAction::Search(query) => {
-                page.query = query;
+                page.search.needle = query.to_lowercase();
+                page.search.query = query;
+                page.search.update_matcher();
+                page.keep_matching_selection(&frame);
+            }
+            HistoryAction::IncludeOutput(include) => {
+                page.search.include_output = include;
+                page.search.update_matcher();
                 page.keep_matching_selection(&frame);
             }
             HistoryAction::Status(status) => {
                 page.status = status;
                 page.keep_matching_selection(&frame);
             }
-            HistoryAction::Refresh => {
-                page.selected = newest(&frame, &page.query.to_lowercase(), page.status)
-            }
+            HistoryAction::Refresh => page.selected = newest(&frame, &page.search, page.status),
             HistoryAction::Select(generation, command) => {
                 let key = Some((generation, command));
-                if selected_command(&frame, key).is_some_and(|entry| {
-                    matches_command(entry, &page.query.to_lowercase(), page.status)
-                }) {
+                if selected_command(&frame, key)
+                    .is_some_and(|entry| page.search.includes(&frame, entry, page.status))
+                {
                     page.selected = key;
                 }
             }
@@ -507,13 +589,13 @@ impl TerminalApp {
         let generation = frame.connection_generation;
         let pane = page.pane;
         let action = move |request| Message::History(Action::InPane(pane, request));
-        let needle = page.query.to_lowercase();
-        let selected = selected_command(&frame, page.selected);
+        let selected = selected_command(&frame, page.selected)
+            .filter(|entry| page.search.includes(&frame, entry, page.status));
         let mut matches = frame
             .command_history
             .iter()
             .rev()
-            .filter(|c| matches_command(c, &needle, page.status))
+            .filter(|c| page.search.includes(&frame, c, page.status))
             .peekable();
         let has_matches = matches.peek().is_some();
         let rows = matches.map(|entry| {
@@ -550,6 +632,12 @@ impl TerminalApp {
                     .content(label),
             )
         });
+        let preview_hit = selected.and_then(|entry| page.search.output_match(&frame, entry.id));
+        // Mount a fresh native scroll surface when the matching context moves.
+        let preview_key = selected.zip(preview_hit.as_ref()).map_or_else(
+            || "output".to_owned(),
+            |(entry, hit)| format!("{generation}/{}/{}", entry.id, hit.start),
+        );
         let (heading, preview) = match selected {
             Some(entry) => {
                 let heading = entry
@@ -559,14 +647,7 @@ impl TerminalApp {
                 let preview = match &entry.output {
                     Err(why) => (*why).to_owned(),
                     Ok(text) if text.is_empty() => "No output".to_owned(),
-                    Ok(text) => {
-                        let end = text.floor_char_boundary(text.len().min(8192));
-                        let mut view = text[..end].to_owned();
-                        if end < text.len() {
-                            view.push_str("\r\n… Copy output for the full text.");
-                        }
-                        view
-                    }
+                    Ok(text) => output_preview(text, preview_hit),
                 };
                 (heading, preview)
             }
@@ -682,10 +763,19 @@ impl TerminalApp {
                     TextBox::new()
                         .automation_name("Search command history")
                         .placeholder_text("Search command history")
-                        .text(&page.query)
+                        .text(&page.search.query)
                         .on_text_changed(
                             ctx.callback(move |text| action(HistoryAction::Search(text))),
                         ),
+                    CheckBox::new()
+                        .automation_name("Include command output")
+                        .is_checked(page.search.include_output)
+                        .on_is_checked_changed(
+                            ctx.callback(move |checked| {
+                                action(HistoryAction::IncludeOutput(checked))
+                            }),
+                        )
+                        .content("Include command output"),
                     ComboBox::new()
                         .automation_name("Command status")
                         .items_source(STATUS_OPTIONS.map(|(_, label)| label))
@@ -706,46 +796,49 @@ impl TerminalApp {
                 ScrollViewer::new()
                     .grid_row(3)
                     .content(StackPanel::new().spacing(4.0).keyed_children(rows)),
-                ScrollViewer::new()
+                Grid::new()
                     .grid_row(2)
                     .grid_row_span(2)
                     .grid_column(1)
-                    .content(
-                        StackPanel::new().spacing(8.0).children((
-                            TextBlock::new()
-                                .font_size(18.0)
-                                .text(heading)
-                                .text_wrapping(TextWrapping::Wrap),
-                            Button::new()
-                                .is_enabled(insert_target.is_some())
-                                .on_click(ctx.callback(move |_| {
-                                    insert_target.map_or(Message::ControlIdle, |target| {
-                                        action(HistoryAction::Insert(target))
-                                    })
-                                }))
-                                .content("Insert command"),
-                            save,
-                            Button::new()
-                                .is_enabled(export_target.is_some())
-                                .on_click(ctx.callback(move |_| {
-                                    export_target.map_or(Message::ControlIdle, |target| {
-                                        action(HistoryAction::ExportOutput(target))
-                                    })
-                                }))
-                                .content(text_export::COMMAND_OUTPUT_LABEL),
-                            Button::new()
-                                .is_enabled(show_target.is_some())
-                                .on_click(ctx.callback(move |_| {
-                                    show_target.map_or(Message::ControlIdle, |target| {
-                                        action(HistoryAction::ShowOutput(target))
-                                    })
-                                }))
-                                .content("Show output in pane"),
-                            TextBlock::new()
-                                .text(preview)
-                                .text_wrapping(TextWrapping::Wrap),
-                        )),
-                    ),
+                    .keyed_children([KeyedView::new(
+                        preview_key,
+                        ScrollViewer::new().content(
+                            StackPanel::new().spacing(8.0).children((
+                                TextBlock::new()
+                                    .font_size(18.0)
+                                    .text(heading)
+                                    .text_wrapping(TextWrapping::Wrap),
+                                Button::new()
+                                    .is_enabled(insert_target.is_some())
+                                    .on_click(ctx.callback(move |_| {
+                                        insert_target.map_or(Message::ControlIdle, |target| {
+                                            action(HistoryAction::Insert(target))
+                                        })
+                                    }))
+                                    .content("Insert command"),
+                                save,
+                                Button::new()
+                                    .is_enabled(export_target.is_some())
+                                    .on_click(ctx.callback(move |_| {
+                                        export_target.map_or(Message::ControlIdle, |target| {
+                                            action(HistoryAction::ExportOutput(target))
+                                        })
+                                    }))
+                                    .content(text_export::COMMAND_OUTPUT_LABEL),
+                                Button::new()
+                                    .is_enabled(show_target.is_some())
+                                    .on_click(ctx.callback(move |_| {
+                                        show_target.map_or(Message::ControlIdle, |target| {
+                                            action(HistoryAction::ShowOutput(target))
+                                        })
+                                    }))
+                                    .content("Show output in pane"),
+                                TextBlock::new()
+                                    .text(preview)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )),
+                        ),
+                    )]),
             ))
     }
 }
@@ -753,6 +846,50 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_search_uses_literal_unicode_text_and_keeps_the_status_filter() {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let terminal = w11term::terminal::create(TerminalSize::default(), tx);
+        let mut frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let message = "Error [Ångström.*]";
+        let long = format!("{}\r\n{message}\r\nafter", "界".repeat(4097));
+        let entry = |id, output, exit_code| {
+            Arc::new(CompletedCommand {
+                id,
+                command: Some(format!("run {id}")),
+                output,
+                exit_code,
+            })
+        };
+        frame.command_history = Arc::new(VecDeque::from([
+            entry(1, Ok(long.clone()), Some(4)),
+            entry(2, Ok("error ÅngströmZZ".into()), Some(0)),
+            entry(3, Err("Error [Ångström.*]"), Some(8)),
+        ]));
+        let mut search = HistorySearch {
+            query: "[ångstrÖm.*]".into(),
+            needle: "[ångström.*]".into(),
+            ..Default::default()
+        };
+        assert_eq!(newest(&frame, &search, CommandStatus::All), None);
+
+        search.include_output = true;
+        search.update_matcher();
+        assert_eq!(newest(&frame, &search, CommandStatus::Failed), Some((0, 1)));
+        assert_eq!(newest(&frame, &search, CommandStatus::Succeeded), None);
+        assert!(search.output_match(&frame, 3).is_none());
+        let hit = search.output_match(&frame, 1).unwrap();
+        assert_eq!(&long[hit.clone()], "[Ångström.*]");
+        assert!(!output_preview(&long, None).contains(message));
+        assert!(output_preview(&long, Some(hit)).contains(message));
+
+        // A new snapshot may reuse numeric IDs after a connection change.
+        let old_history = Arc::downgrade(&frame.command_history);
+        frame.command_history = Arc::new(VecDeque::from([entry(1, Ok("new".into()), Some(4))]));
+        assert!(old_history.upgrade().is_none());
+        assert!(search.output_match(&frame, 1).is_none());
+    }
 
     #[test]
     fn command_search_uses_full_captured_input_and_keeps_output_separate() {
@@ -763,19 +900,14 @@ mod tests {
             output: Ok("archived result\r\n".into()),
             exit_code: Some(17),
         };
-        assert!(matches_command(&entry, "[ångström]", CommandStatus::Failed));
-        assert!(!matches_command(
-            &entry,
-            "[ångström]",
-            CommandStatus::Succeeded
-        ));
-        assert!(!matches_command(&entry, "archived", CommandStatus::All));
-        assert!(!matches_command(&entry, ".*", CommandStatus::All));
+        assert!(command_text_matches(&entry, "[ångström]"));
+        assert!(!command_text_matches(&entry, "archived"));
+        assert!(!command_text_matches(&entry, ".*"));
         assert_eq!(CopyPart::Command.text(&entry), Some(command.as_str()));
         assert_eq!(CopyPart::Output.text(&entry), Some("archived result\r\n"));
         entry.command = None;
-        assert!(matches_command(&entry, "", CommandStatus::Failed));
-        assert!(!matches_command(&entry, "9", CommandStatus::All));
+        assert!(command_text_matches(&entry, ""));
+        assert!(!command_text_matches(&entry, "9"));
         assert_eq!(CopyPart::Command.text(&entry), None);
         entry.output = Err("Unavailable");
         assert_eq!(CopyPart::Output.text(&entry), None);
