@@ -36,7 +36,8 @@ fn supports(action: char, key: &str, value: &str, delete: Option<&str>) -> bool 
     match (action, key) {
         ('t' | 'T' | 'q' | 'f', "t") => value == "d",
         ('t' | 'T' | 'q' | 'f', "o") => value == "z",
-        ('t' | 'T' | 'q' | 'f', "f") => matches!(value, "24" | "32" | "100"),
+        ('t' | 'T' | 'q', "f") => matches!(value, "8" | "16" | "24" | "32" | "100"),
+        ('f', "f") => matches!(value, "24" | "32" | "100"),
         ('t' | 'T' | 'q' | 'f', "s" | "v") => value
             .parse::<u32>()
             .is_ok_and(|n| (1..=32 * 1024 * 1024 / 4).contains(&n)),
@@ -75,8 +76,7 @@ fn supports(action: char, key: &str, value: &str, delete: Option<&str>) -> bool 
         ('a' | 'f', "z") => signed(),
         ('f', "X") | ('c', "C") => value == "1",
         ('a', "s") => matches!(value, "1" | "2" | "3"),
-        // Local file and shared-memory transports, indexed pixels, and usage
-        // hints are unavailable. Do not echo their parameters.
+        // Local file and shared-memory transports and usage hints are unavailable.
         _ => false,
     }
 }

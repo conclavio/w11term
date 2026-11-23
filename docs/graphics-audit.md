@@ -138,6 +138,17 @@ The response omits unavailable options such as file and shared-memory
 transports. Queries do not load their payload or disturb an upload in progress.
 [Kitty feature queries](https://sw.kovidgoyal.net/kitty/graphics-protocol/#querying-support-for-protocol-features)
 
+Indexed uploads use either one palette index per pixel or an index followed
+by alpha. Each indexed image counts both its source indices and expanded
+RGBA pixels toward the 32 MiB per-image and 64 MiB image-table budgets.
+Palette changes recolor committed images and produce new GPU texture keys.
+Older snapshots keep their captured colors. Palette index 254 uses the
+default foreground, which is the fallback for the renderer's URL-hover
+color. The indexed formats support static images, and frame uploads,
+animation controls and frame composition return an error for indexed
+images. The Windows tests check the protocol replies, RGBA values and
+rendered Direct2D pixels. [Kitty indexed color](https://sw.kovidgoyal.net/kitty/graphics-protocol/#indexed-color-data)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

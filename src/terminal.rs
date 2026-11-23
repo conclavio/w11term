@@ -612,6 +612,13 @@ impl Snapshot {
         status: String,
         bytes_received: u64,
     ) -> Self {
+        // DECSCNM exchanges the display defaults. Leave the underlying OSC colors
+        // and indexed palette intact so queries and later resets see the originals.
+        let mut palette = terminal.palette();
+        if terminal.get_reverse_video() {
+            std::mem::swap(&mut palette.foreground, &mut palette.background);
+        }
+        terminal.recolor_indexed_kitty_images(&palette);
         let screen = terminal.screen();
         let offset = if terminal.is_alt_screen_active() {
             0
@@ -709,12 +716,6 @@ impl Snapshot {
             });
         }
         let cursor = terminal.cursor_pos();
-        // DECSCNM exchanges the display defaults. Leave the underlying OSC colors
-        // and indexed palette intact so queries and later resets see the originals.
-        let mut palette = terminal.palette();
-        if terminal.get_reverse_video() {
-            std::mem::swap(&mut palette.foreground, &mut palette.background);
-        }
         Self {
             generation,
             rows,
