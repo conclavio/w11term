@@ -769,6 +769,7 @@ fn tab_menu_message(label: String) -> Message {
             Message::Shortcut(Shortcut::SplitBelowInCurrentDirectory)
         }
         "New tab in current directory" => Message::Shortcut(Shortcut::NewTabInCurrentDirectory),
+        "Copy current directory" => Message::Shortcut(Shortcut::CopyCurrentDirectory),
         "Focus left" => Message::PaneNeighbor(Direction::Left),
         "Focus right" => Message::PaneNeighbor(Direction::Right),
         "Focus above" => Message::PaneNeighbor(Direction::Up),
@@ -952,6 +953,7 @@ pub struct TerminalApp {
     window_timer: Option<crate::ui_timer::RetryTimer>,
     native_bound: bool,
     window_error: Option<String>,
+    pending_directory_copy: Option<directory_split::PendingCopy>,
     export: scrollback_export::Export,
     recordings: recordings::Recordings,
     registry: Registry,
@@ -1036,6 +1038,8 @@ pub enum Message {
     SplitPane(Axis, Option<String>),
     OpenInDirectory(directory_split::Destination, directory_split::Origin),
     OpenExplorer(directory_split::Origin),
+    CopyCurrentDirectory(directory_split::Origin),
+    DirectoryCopyReady(Arc<()>, Result<String, String>),
     ExplorerOpened(Result<(), String>),
     PaneNeighbor(Direction),
     FocusPreviousPane(previous_pane::Target),
@@ -2530,6 +2534,7 @@ impl TerminalApp {
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
         self.pane_drop.cancel();
+        self.cancel_directory_copy();
         self.refresh_remote_clipboard_focus();
         self.tabs.record_pane_focus(AppTab::visited_terminal);
         self.clipboard.input_origin.set(self.paste_origin());
@@ -3317,6 +3322,9 @@ impl TerminalApp {
                 {
                     directory_split::message(destination, split_target.as_ref())
                 }
+                Message::Shortcut(Shortcut::CopyCurrentDirectory) => {
+                    directory_split::copy_message(split_target.as_ref())
+                }
                 Message::Shortcut(Shortcut::ClearScrollback) => {
                     pane.map_or(Message::ControlIdle, Message::ClearScrollback)
                 }
@@ -3815,6 +3823,12 @@ impl TerminalApp {
                 "new-tab-here",
                 "New tab in current directory",
                 KeyAction::NewTabInCurrentDirectory,
+                can_split_directory,
+            ),
+            self.binding_menu_enabled(
+                "copy-current-directory",
+                "Copy current directory",
+                KeyAction::CopyCurrentDirectory,
                 can_split_directory,
             ),
             command_menu_item("restart-exited", RESTART_EXITED_PANE, can_restart),
@@ -4380,6 +4394,12 @@ impl Component for TerminalApp {
                         menu.as_ref().and_then(|m| m.directory_split.as_ref()),
                     )
                 }
+                Shortcut::CopyCurrentDirectory => {
+                    let menu = shortcut_menu.borrow();
+                    directory_split::copy_message(
+                        menu.as_ref().and_then(|m| m.directory_split.as_ref()),
+                    )
+                }
                 _ => bind_tab_action(Message::Shortcut(shortcut), shortcut_group.get()),
             });
         })
@@ -4575,6 +4595,7 @@ impl Component for TerminalApp {
             window_timer: None,
             native_bound: false,
             window_error: None,
+            pending_directory_copy: None,
             export: Default::default(),
             recordings: Default::default(),
             registry,
@@ -5709,6 +5730,10 @@ impl Component for TerminalApp {
                 self.open_in_directory(destination, origin, context)
             }
             Message::OpenExplorer(origin) => self.open_explorer(origin, context),
+            Message::CopyCurrentDirectory(origin) => self.copy_current_directory(origin, context),
+            Message::DirectoryCopyReady(request, result) => {
+                self.finish_directory_copy(request, result)
+            }
             Message::ExplorerOpened(Err(error)) => {
                 self.window_error = Some(format!("Couldn’t open the current folder. {error}"));
             }
@@ -5799,7 +5824,8 @@ impl Component for TerminalApp {
                 | Shortcut::BalancePanes
                 | Shortcut::SplitRightInCurrentDirectory
                 | Shortcut::SplitBelowInCurrentDirectory
-                | Shortcut::NewTabInCurrentDirectory => {}
+                | Shortcut::NewTabInCurrentDirectory
+                | Shortcut::CopyCurrentDirectory => {}
                 Shortcut::SplitBelow => self.split_pane(Axis::Rows, None, context),
                 Shortcut::FocusPane(direction) => {
                     self.update(Message::PaneNeighbor(direction), context)

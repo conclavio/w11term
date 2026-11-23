@@ -14,7 +14,7 @@ use windows::{
 pub(crate) const MAX_TEXT: usize = 1024 * 1024;
 enum Request {
     Read(mpsc::SyncSender<Result<String>>),
-    Write(String, mpsc::SyncSender<Result<()>>),
+    Write(String, Option<u32>, mpsc::SyncSender<Result<()>>),
     RemoteWrite(String, Permission),
 }
 fn service() -> Result<&'static mpsc::SyncSender<Request>> {
@@ -62,8 +62,12 @@ fn service() -> Result<&'static mpsc::SyncSender<Request>> {
                             Ok(Request::Read(reply)) => {
                                 let _ = reply.send(read_native(hwnd));
                             }
-                            Ok(Request::Write(text, reply)) => {
-                                let _ = reply.send(write_native(hwnd, &text, None));
+                            Ok(Request::Write(text, expected, reply)) => {
+                                let _ = reply.send(write_native(
+                                    hwnd,
+                                    &text,
+                                    WriteGuard::Local(expected),
+                                ));
                             }
                             Ok(Request::RemoteWrite(text, permission)) => {
                                 if permission.current()
@@ -96,14 +100,30 @@ pub fn read() -> Result<String> {
         .context("Clipboard read timed out")?
 }
 pub fn write(text: &str) -> Result<()> {
+    write_local(text, None)
+}
+
+pub fn sequence() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+/// Complete a deferred local copy only if the clipboard is still current.
+pub fn write_if_sequence(text: &str, expected: u32) -> Result<()> {
+    write_local(text, Some(expected))
+}
+
+fn write_local(text: &str, expected: Option<u32>) -> Result<()> {
     ensure!(text.len() <= MAX_TEXT, "Clipboard text exceeds 1 MiB");
     #[cfg(feature = "ui-smoke")]
     if let Some(path) = std::env::var_os("W11TERM_TEST_COPY_FILE") {
+        if expected.is_some_and(|expected| sequence() != expected) {
+            return Ok(());
+        }
         return std::fs::write(path, text).context("Writing the clipboard test fixture");
     }
     let (tx, rx) = mpsc::sync_channel(1);
     service()?
-        .try_send(Request::Write(text.into(), tx))
+        .try_send(Request::Write(text.into(), expected, tx))
         .context("Clipboard service is busy")?;
     rx.recv_timeout(Duration::from_secs(2))
         .context("Clipboard write timed out")?
@@ -294,10 +314,15 @@ fn write_remote(hwnd: HWND, text: &str, permission: &Permission) -> Result<()> {
         }
         return Ok(());
     }
-    write_native(hwnd, text, Some(permission))
+    write_native(hwnd, text, WriteGuard::Remote(permission))
 }
 
-fn write_native(hwnd: HWND, text: &str, permission: Option<&Permission>) -> Result<()> {
+enum WriteGuard<'a> {
+    Local(Option<u32>),
+    Remote(&'a Permission),
+}
+
+fn write_native(hwnd: HWND, text: &str, guard: WriteGuard<'_>) -> Result<()> {
     let units: Vec<u16> = text
         .split('\0')
         .next()
@@ -317,7 +342,12 @@ fn write_native(hwnd: HWND, text: &str, permission: Option<&Permission>) -> Resu
         let _ = GlobalUnlock(memory);
         let result = (|| -> Result<bool> {
             let _open = open(hwnd)?;
-            if permission.is_some_and(|permission| !permission.current()) {
+            let current = match guard {
+                WriteGuard::Local(Some(expected)) => sequence() == expected,
+                WriteGuard::Local(None) => true,
+                WriteGuard::Remote(permission) => permission.current(),
+            };
+            if !current {
                 return Ok(false);
             }
             EmptyClipboard()?;

@@ -38,6 +38,7 @@ pub enum CommandId {
         Option<directory_split::Origin>,
     ),
     OpenExplorer(Option<directory_split::Origin>),
+    CopyCurrentDirectory(Option<directory_split::Origin>),
     Profile(String),
     Shortcut(Shortcut),
 }
@@ -330,6 +331,9 @@ impl TerminalApp {
                 shortcut if let Some(destination) = directory_split::destination(shortcut) => {
                     row.id = CommandId::OpenInDirectory(destination, directory_split.clone());
                 }
+                Shortcut::CopyCurrentDirectory => {
+                    row.id = CommandId::CopyCurrentDirectory(directory_split.clone());
+                }
                 Shortcut::ClearScrollback => {
                     row.id = CommandId::ClearScrollback(pane);
                 }
@@ -432,6 +436,9 @@ impl TerminalApp {
                 directory_split::message(destination, target.as_ref())
             }
             CommandId::OpenExplorer(target) => directory_split::explorer_message(target.as_ref()),
+            CommandId::CopyCurrentDirectory(target) => {
+                directory_split::copy_message(target.as_ref())
+            }
             CommandId::Clipboard(origin, raw) => {
                 Message::Clipboard(clipboard_paste::Action::Start(origin, raw))
             }

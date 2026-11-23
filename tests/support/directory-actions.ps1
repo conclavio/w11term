@@ -2,7 +2,7 @@ function Check-DirectoryActions([bool]$Enabled) {
     $field = Open-Palette 'current directory'
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('current directory')
     $null = Wait-Until "current-directory commands enabled=$Enabled" {
-        foreach ($name in 'Split right in current directory','Split below in current directory','New tab in current directory') {
+        foreach ($name in 'Split right in current directory','Split below in current directory','New tab in current directory','Copy current directory') {
             $row = Find-Element $name ([System.Windows.Automation.ControlType]::Button)
             if (!$row -or $row.Current.IsEnabled -ne $Enabled) { return $false }
         }

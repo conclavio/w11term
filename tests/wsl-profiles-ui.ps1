@@ -2,6 +2,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
 $keymap.shortcuts.keyboard_hints = 'F12'
+$keymap.shortcuts.copy_current_directory = 'F1'
 [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, ($keymap | ConvertTo-Json))
 
 $hostKey = 'Software\w11term-wsl-fixture-' + (Split-Path -Leaf $State)
@@ -98,6 +99,12 @@ public static class WslFixture {
             Console.WriteLine(@"\\wsl.localhost\Other distro\home\dev\foreign.rs");
             return 0;
         }
+        if (args.Length == 6 && args[0] == "--distribution" && args[1] == "QA Linux \u96ea" &&
+            args[2] == "--exec" && args[3] == "/usr/bin/wslpath" && args[4] == "-u" &&
+            args[5] == @"C:\custom mount\100% #") {
+            Console.WriteLine("/different-root/c/custom mount/100% #");
+            return 0;
+        }
         if (args.Length != 4 || args[0] != "--distribution" || args[2] != "--cd") {
             Console.WriteLine("wsl-fixture got unexpected arguments");
             return 2;
@@ -115,6 +122,9 @@ public static class WslFixture {
             switch (line) {
                 case "report-linux":
                     Console.Write("\u001b]7;file:///mnt/c/work%20tree\u0007");
+                    break;
+                case "report-drive":
+                    Console.Write("\u001b]9;9;\"C:\\custom mount\\100% #\"\u0007");
                     break;
                 case "report-foreign":
                     Console.Write("\u001b]9;9;\\\\wsl.localhost\\Other distro\\home\u0007");
@@ -174,6 +184,16 @@ public static class WslFixture {
         }
     }
     Publish-Report $left.id 'linux'
+    Press-Key 0x70 # F1 copies the reported directory.
+    $null = Wait-Until 'the reported Linux directory was copied' {
+        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq '/mnt/c/work tree'
+    }
+    Publish-Report $left.id 'drive'
+    Press-Key 0x70
+    $null = Wait-Until 'the WSL distribution translated the reported drive path' {
+        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq '/different-root/c/custom mount/100% #'
+    }
+    Publish-Report $left.id 'linux'
     $explorerAction = 'Open current folder in File Explorer'
     $search = Open-Palette $explorerAction
     $search.GetCurrentPattern($value).SetValue($explorerAction)
@@ -218,8 +238,12 @@ public static class WslFixture {
     Press-Key 27
     $null = Wait-Until 'command palette dismissed' { !(Find-Element 'Search commands') }
     Publish-Report $right.id 'share'
-    Run-Palette $action
     $directory = '/home/100% # notes'
+    Press-Key 0x70
+    $null = Wait-Until 'the WSL share was copied as a Linux directory' {
+        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $directory
+    }
+    Run-Palette $action
     $child = Wait-Until 'WSL split uses a report for its own distribution' {
         Sessions | Where-Object { $_.active -and $_.label -ceq $rightLabel -and $_.id -ne $right.id -and $_.tab_id -eq $right.tab_id }
     }
