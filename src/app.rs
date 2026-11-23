@@ -848,7 +848,7 @@ pub struct TerminalApp {
     catalog: Profiles,
     store: ProfileStore,
     profile_error: Option<String>,
-    profile_move_error: Option<String>,
+    profile_action_error: Option<String>,
     width: f64,
     selection_pending: bool,
     selection_epoch: u64,
@@ -970,6 +970,7 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     MoveProfile(String, isize, Arc<[String]>),
+    StartupProfile(String),
     WindowActivation(bool),
     SettingsMenu,
     Keyboard(keyboard_settings::Edit),
@@ -1963,6 +1964,49 @@ impl TerminalApp {
         let mut profiles: Vec<View> =
             vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
         let order: Arc<[String]> = self.catalog.profile_order.as_slice().into();
+        let startup = self.catalog.startup_profile.as_deref();
+        let startup_choices: Vec<_> = std::iter::once((None, LAB.to_owned()))
+            .chain(order.iter().map(|name| {
+                let backend = if self.catalog.profiles.contains_key(name) {
+                    "SSH"
+                } else {
+                    "Local"
+                };
+                (Some(name.as_str()), format!("{name} · {backend}"))
+            }))
+            .collect();
+        let startup_label = startup_choices
+            .iter()
+            .find(|(name, _)| *name == startup)
+            .map_or(LAB, |(_, label)| label.as_str());
+        let startup_items = startup_choices
+            .iter()
+            .enumerate()
+            .map(|(index, (_, label))| {
+                MenuItem::item(format!("startup-profile-{index}"), label.clone())
+            })
+            .collect::<Vec<_>>();
+        profiles.push(TextBlock::new().text("Startup profile").into());
+        profiles.push(
+            Button::new()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .automation_name(format!("Startup profile, {startup_label}"))
+                .is_enabled(self.profile_error.is_none())
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            TextBlock::new().text(startup_label),
+                            FontIcon::new().glyph("\u{e70d}"),
+                        )),
+                )
+                // A stable callback keeps the flyout mounted across Settings redraws.
+                .menu(Menu::new(
+                    startup_items,
+                    context.callback(Message::StartupProfile),
+                )),
+        );
         let mut rows = Vec::with_capacity(order.len());
         for (index, name) in order.iter().enumerate() {
             let edit_name = name.clone();
@@ -2025,7 +2069,7 @@ impl TerminalApp {
                 )
                 .content("New local shell profile…"),
         );
-        for error in self.profile_error.iter().chain(&self.profile_move_error) {
+        for error in self.profile_error.iter().chain(&self.profile_action_error) {
             profiles.push(
                 TextBlock::new()
                     .text(error)
@@ -4254,7 +4298,7 @@ impl Component for TerminalApp {
             catalog,
             store,
             profile_error,
-            profile_move_error: None,
+            profile_action_error: None,
             width: client_size.0,
             window_height: client_size.1,
             client_size,
@@ -5605,13 +5649,35 @@ impl Component for TerminalApp {
                     Ok(catalog) => {
                         self.catalog = catalog;
                         self.profile_error = None;
-                        self.profile_move_error = None;
+                        self.profile_action_error = None;
                     }
                     Err(error) => {
                         self.refresh_profiles();
-                        self.profile_move_error = Some(format!(
+                        self.profile_action_error = Some(format!(
                             "Could not move {name}: {error:#}. Review the current order and try again."
                         ));
+                    }
+                }
+            }
+            Message::StartupProfile(label) => {
+                let selected = match label.rsplit_once(" · ") {
+                    Some((name, "SSH" | "Local")) => Some(name),
+                    None if label == LAB => None,
+                    _ => return,
+                };
+                let expected = self.catalog.startup_profile.as_deref();
+                if selected != expected {
+                    match self.store.set_startup_profile(selected, expected) {
+                        Ok(catalog) => {
+                            self.catalog = catalog;
+                            self.profile_error = None;
+                            self.profile_action_error = None;
+                        }
+                        Err(error) => {
+                            self.refresh_profiles();
+                            self.profile_action_error =
+                                Some(format!("Could not set startup profile. {error:#}"));
+                        }
                     }
                 }
             }

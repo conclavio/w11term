@@ -322,7 +322,7 @@ impl ProfileStore {
             entry.remove(SHARE_TOKEN);
             entry.insert(SHARE_EPOCH.into(), new.into());
             updated.raw = serde_json::Value::Object(entry.clone());
-            Ok(None)
+            Ok(super::CatalogEdit::default())
         })?;
         Ok(updated)
     }
@@ -399,7 +399,7 @@ impl ProfileStore {
             }
             entry.insert(SHARE_TOKEN.into(), token.clone().into());
             entry.insert(SHARE_EPOCH.into(), current.consent.into());
-            Ok(None)
+            Ok(super::CatalogEdit::default())
         })?;
         Ok(token)
     }

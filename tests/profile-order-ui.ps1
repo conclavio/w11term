@@ -23,6 +23,25 @@ function Settings {
     Click 'Tab menu' $button
     Click 'Settings' $menuItem
 }
+function Select-StartupProfile([string]$Choice) {
+    Click 'Startup profile, Terminal lab' $button
+    Click $Choice $menuItem
+    # A successful save publishes the selected name. Wait for that before
+    # opening the catalog, so the fixture cannot hold the file during replacement.
+    $owners = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $texts = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $null = Wait-Until "Startup selector shows '$Choice'" {
+        $current = Find-Element "Startup profile, $Choice" $button
+        if ($current) { return $current }
+        $saveError = $owners.FindAll([System.Windows.Automation.TreeScope]::Descendants, $texts) |
+            ForEach-Object { $_.Current.Name } | Where-Object { $_ -like 'Could not set startup profile*' }
+        if ($saveError) { throw "Startup selection failed with '$saveError'" }
+    }
+    $startupName = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).startup_profile
+    if ($startupName -cne $localName) { throw "Startup catalog contains '$startupName' rather than '$localName'" }
+}
 function Wait-SettingsOrder([string]$First, [string]$Second) {
     $null = Wait-Until "Settings to show '$First', '$Second', and disabled end controls" {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -63,7 +82,9 @@ for ($launch = 1; $launch -le 2; $launch++) {
     # Only the saved catalog is shared between launches.
     $env:W11TERM_DATA_DIR = Join-Path $State "data-$launch"
     $env:W11TERM_SETTINGS_PATH = Join-Path $State "appearance-$launch.json"
-    $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+    $arguments = @('--profiles',('"' + $profiles + '"'))
+    if ($launch -eq 1) { $arguments += '--demo' }
+    $app = Start-Process -FilePath $Gui -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
     try {
         $window = Wait-InputWindow
         $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
@@ -92,7 +113,12 @@ for ($launch = 1; $launch -le 2; $launch++) {
             Wait-SettingsOrder $sshName $localName
             if ([IO.File]::ReadAllText($profiles) -cne $external) { throw 'The stale move rewrote the catalog' }
             Click "Move $sshName down" $button
+            Wait-SettingsOrder $localName $sshName
+            Select-StartupProfile $localLabel
         } else {
+            $startup = Active-Pane $localName
+            $null = Control @('wait-for-text','--pane',"$startup",'--timeout','15','PS ')
+            if (@((Control @('list')).sessions).Count -ne 1) { throw 'Expected only the startup profile on implicit launch' }
             Settings
         }
         Wait-SettingsOrder $localName $sshName
