@@ -28,6 +28,10 @@ use w11term::{
 mod gui;
 
 #[cfg(feature = "ui-smoke")]
+#[path = "durable_ssh/search_ui.rs"]
+mod search_ui;
+
+#[cfg(feature = "ui-smoke")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens an isolated native WinUI window"]
 async fn native_durable_workspace() {
@@ -75,6 +79,8 @@ struct Backend {
     hold_once: bool,
     replace_on_resume: bool,
     tmux_name: Option<String>,
+    tmux_extra_listings: std::collections::VecDeque<String>,
+    zmx_extra_rows: String,
     tmux_available: bool,
     herdr: herdr::Records,
 }
@@ -187,7 +193,13 @@ impl server::Handler for Peer {
                     "list-sessions",
                     ..,
                 ] => match (&b.tmux_name, b.tmux_available) {
-                    (Some(name), _) => (0, format!("$7\t11\t2345\t2\t1\t{name}\n"), false),
+                    (Some(name), _) => {
+                        let mut rows = format!("$7\t11\t2345\t2\t1\t{name}\n");
+                        if let Some(extra) = b.tmux_extra_listings.pop_front() {
+                            rows.push_str(&extra);
+                        }
+                        (0, rows, false)
+                    }
                     (None, true) => (0, String::new(), false),
                     (None, false) => (127, String::new(), false),
                 },
@@ -221,6 +233,7 @@ impl server::Handler for Peer {
                 ["zmx", "version"] => (0, "zmx\t\t1.0.1\nghostty_vt\tfixture\n".into(), false),
                 ["zmx", "list"] => {
                     let mut rows = "name=unmanaged\tpid=40\tclients=0\n".to_owned();
+                    rows.push_str(&b.zmx_extra_rows);
                     if let Some((name, generation)) = &b.shell {
                         rows.push_str(&format!("name={name}\tpid=41\tclients=2\tcreated=123\tcwd=/home/pilot\tcmd=vim\tw11term_generation={generation}\n"));
                     }

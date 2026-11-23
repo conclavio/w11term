@@ -166,7 +166,7 @@ impl TerminalApp {
                 if let Err(error) = live.session.durable_action(command) {
                     live.device_message = Some(format!("Remote session: {error:#}"));
                 } else if browsing {
-                    live.discovery_page = Some(0);
+                    live.discovery.get_or_insert_with(Default::default);
                 }
             }
             Action::ConfirmEnd(value) => live.confirm_end = value,

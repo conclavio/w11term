@@ -56,7 +56,7 @@ fn eligible_pane(tab: &AppTab) -> Result<&LiveTab> {
     };
     eligible(
         &live.source,
-        live.discovery_page.is_some(),
+        live.discovery.is_some(),
         live.startup.as_deref(),
     )?;
     Ok(live)

@@ -87,7 +87,7 @@ struct LiveTab {
     startup: Option<Box<w11term::workspace::SshStartup>>,
     observed_frame: u64,
     files: Box<FileDrawer>,
-    discovery_page: Option<usize>,
+    discovery: Option<session_browser::Browser>,
     copy_output_unavailable: Option<&'static str>,
     can_clear_scrollback: bool,
     split_directory_report: Option<Arc<str>>,
@@ -166,7 +166,7 @@ impl LiveTab {
     }
 
     fn browsing_sessions(&self) -> bool {
-        self.discovery_page.is_some()
+        self.discovery.is_some()
             && self
                 .session
                 .durable_state()
@@ -993,7 +993,7 @@ fn live_tab_for_session(label: String, source: Source, session: Session) -> AppT
             startup: None,
             observed_frame: 0,
             files: Box::default(),
-            discovery_page: None,
+            discovery: None,
             copy_output_unavailable: Some("waiting for shell markers"),
             can_clear_scrollback: false,
             split_directory_report: None,
@@ -1143,21 +1143,41 @@ impl TerminalApp {
                 || editing_files
                 || self.clipboard.is_open(),
         );
-        let choosing = tab.browsing_sessions();
-        if changed {
-            self.keyboard
-                .set_target(if prompt_id.is_none() && !tab.device_busy && !choosing {
-                    Some((
-                        tab.session.input.clone(),
-                        tab.session.frames.clone(),
-                        tab.read_only.clone(),
-                    ))
-                } else {
-                    None
-                });
+        let discovery = tab
+            .discovery
+            .as_ref()
+            .and_then(|_| tab.session.durable_state());
+        self.keyboard.watch_session_search(
+            tab.discovery
+                .as_ref()
+                .zip(discovery.as_ref())
+                .filter(|(_, state)| state.phase.is_browser() && prompt_id.is_none())
+                .map(|(browser, state)| (id, state.listing_revision, browser.query_revision)),
+        );
+        // A browser can pass through Connecting or Failed after Choose. Keep
+        // keyboard input local until the verified remote PTY is attached.
+        let can_send_keys = prompt_id.is_none()
+            && !tab.device_busy
+            && (tab.discovery.is_none()
+                || discovery.is_some_and(|state| {
+                    matches!(
+                        state.phase,
+                        w11term::ssh::DurablePhase::Attached | w11term::ssh::DurablePhase::Direct
+                    )
+                }));
+        if changed || (tab.discovery.is_some() && self.keyboard.has_target() != can_send_keys) {
+            self.keyboard.set_target(if can_send_keys {
+                Some((
+                    tab.session.input.clone(),
+                    tab.session.frames.clone(),
+                    tab.read_only.clone(),
+                ))
+            } else {
+                None
+            });
             self.keyboard
                 .set_search(prompt_id.is_none() && tab.find.open);
-        } else if prompt_id.is_some() || tab.device_busy || choosing {
+        } else if tab.discovery.is_none() && !can_send_keys {
             self.keyboard.set_target(None);
         }
     }
@@ -2202,6 +2222,7 @@ impl TerminalApp {
         if target.is_none() {
             self.keyboard.set_modal(false);
             self.keyboard.watch_file_drawer(None);
+            self.keyboard.watch_session_search(None);
         }
         self.keyboard.set_target(target);
         self.sync_ime_surface();
@@ -2220,6 +2241,7 @@ impl TerminalApp {
             }));
         if let Some(id) = self.tabs.active_id() {
             self.connection_ui(id);
+            self.discovery_action(session_browser::Action::Focus(id, 0), context);
             if let Some(AppTab {
                 page: Page::Terminal(tab),
                 ..
@@ -4111,6 +4133,9 @@ impl Component for TerminalApp {
                     pattern_settings::Edit::Name(_) | pattern_settings::Edit::Expression(_)
                 )
                 | Message::PickerQuery(..)
+                | Message::Discovery(
+                    session_browser::Action::Query(..) | session_browser::Action::Focus(..)
+                )
                 | Message::PaneText(..)
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
@@ -4836,6 +4861,7 @@ impl Component for TerminalApp {
                     let active = self.tabs.active_id() == Some(id);
                     let mut pane_actions_changed = false;
                     let mut discovery_changed = false;
+                    let mut focus_session_search = false;
                     if let Some(AppTab {
                         page: Page::Terminal(tab),
                         ..
@@ -4890,8 +4916,12 @@ impl Component for TerminalApp {
                             self.header.borrow_mut().take();
                         }
                         let phase = tab.session.durable_state().map(|s| s.phase);
+                        focus_session_search = tab.discovery.is_some()
+                            && phase.is_some_and(|p| p.is_browser())
+                            && (tab.prompt_id.is_some() && frame.prompt.is_none()
+                                || tab.durable_phase.is_some_and(|p| !p.is_browser()));
                         if tab.durable_phase != phase {
-                            discovery_changed = tab.discovery_page.is_some();
+                            discovery_changed = tab.discovery.is_some();
                             tab.durable_phase = phase;
                             tab.confirm_end = false;
                             self.header.borrow_mut().take();
@@ -4905,6 +4935,9 @@ impl Component for TerminalApp {
                         }
                         self.refresh_copy_mode(id, context);
                         self.connection_ui(id);
+                        if focus_session_search {
+                            self.discovery_action(session_browser::Action::Focus(id, 0), context);
+                        }
                     }
                     if pane_actions_changed || discovery_changed {
                         self.refresh_open_commands();
@@ -5090,6 +5123,9 @@ impl Component for TerminalApp {
                 }
             }
             Message::Shortcut(shortcut) => match shortcut {
+                Shortcut::SubmitSessionSearch(id, listing, query) => {
+                    self.submit_session_search(id, listing, query)
+                }
                 Shortcut::CommandPalette => self.open_command_palette(context),
                 Shortcut::PanePicker => self.open_picker(context),
                 Shortcut::FindAllPanes => self.open_text_picker(context),

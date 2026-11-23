@@ -570,15 +570,33 @@ impl TerminalApp {
                     )),
                 ),
         };
-        let content = if let Some(browser) = session_browser::discovery_view(id, tab, context) {
+        let active = self.tabs.active_id() == Some(id);
+        let content = if let Some(browser) =
+            session_browser::discovery_view(id, tab, active, &self.keyboard, context)
+        {
             // Keep the terminal surface mounted to measure this leaf. Every
             // neighbor in a split uses its dimensions for accessibility and IME.
-            Grid::new().children((
-                content,
-                Border::new()
-                    .background(Color::rgb(14, 16, 20))
-                    .content(browser),
-            ))
+            let browser = Border::new()
+                .background(Color::rgb(14, 16, 20))
+                .content(browser);
+            let mut layers = vec![
+                KeyedView::new("canvas", content),
+                KeyedView::new("browser", browser),
+            ];
+            if !active {
+                // A click anywhere in an inactive browser, including over the
+                // search field, focuses its pane before text can reach a sibling.
+                layers.push(KeyedView::new(
+                    "activate",
+                    Button::new()
+                        .automation_name("Activate remote session browser")
+                        .horizontal_alignment(HorizontalAlignment::Stretch)
+                        .vertical_alignment(VerticalAlignment::Stretch)
+                        .opacity(0.0)
+                        .on_click(context.callback(move |_| Message::PaneFocus(id))),
+                ));
+            }
+            Grid::new().keyed_children(layers)
         } else {
             content
         };

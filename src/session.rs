@@ -371,7 +371,18 @@ impl Session {
         self.durable
             .as_ref()
             .context("This pane does not manage a durable SSH shell")?
-            .action(action)
+            .action(action, None)
+    }
+
+    pub fn durable_action_for_listing(
+        &self,
+        revision: u64,
+        action: ssh::DurableAction,
+    ) -> anyhow::Result<()> {
+        self.durable
+            .as_ref()
+            .context("This pane does not manage a durable SSH shell")?
+            .action(action, Some(revision))
     }
 
     fn start_worker(
