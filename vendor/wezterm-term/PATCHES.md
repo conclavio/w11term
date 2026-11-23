@@ -156,3 +156,6 @@ The original MIT license is preserved in `LICENSE.md`.
 - DECIC and DECDC shift the cells in each row of the scrolling region
   once. They insert default blanks, clip split wide glyphs, and preserve
   the row rendition and stationary Kitty placements.
+
+- DECBI and DECFI move the cursor across the current row or reuse the
+  column shift at a scrolling-region edge.

@@ -1250,6 +1250,18 @@ fn kitty_character_insert_and_delete_keep_direct_tiles_at_the_original_columns()
     assert!(columns_deleted.rows[0].as_str().starts_with("ABCD"));
     assert!(columns_deleted.rows[1].as_str().starts_with("abcd"));
     check(&columns_deleted);
+
+    t.advance_bytes(b"\x1b[H\x1b6");
+    let indexed_back = frame(&t, Some(&columns_deleted), 0);
+    assert!(indexed_back.rows[0].as_str().starts_with(" ABCD"));
+    assert!(indexed_back.rows[1].as_str().starts_with(" abcd"));
+    check(&indexed_back);
+    let rightmost = t.get_size().cols;
+    t.advance_bytes(format!("\x1b[1;{rightmost}H\x1b9"));
+    let indexed_forward = frame(&t, Some(&indexed_back), 0);
+    assert!(indexed_forward.rows[0].as_str().starts_with("ABCD"));
+    assert!(indexed_forward.rows[1].as_str().starts_with("abcd"));
+    check(&indexed_forward);
 }
 
 #[test]

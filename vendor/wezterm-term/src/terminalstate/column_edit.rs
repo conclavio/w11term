@@ -7,13 +7,49 @@ pub(super) enum Shift {
     Right,
 }
 
+pub(super) enum Index {
+    Back,
+    Forward,
+}
+
 impl TerminalState {
     pub(super) fn edit_columns(&mut self, count: u32, shift: Shift) {
-        let rows = self.top_and_bottom_margins.clone();
         let x = self.cursor.x;
-        if !rows.contains(&self.cursor.y) || !self.left_and_right_margins.contains(&x) {
+        if !self.top_and_bottom_margins.contains(&self.cursor.y)
+            || !self.left_and_right_margins.contains(&x)
+        {
             return;
         }
+        self.shift_columns_at(x, count, shift);
+    }
+
+    pub(super) fn horizontal_index(&mut self, index: Index) {
+        let x = self.cursor.x;
+        let y = self.cursor.y;
+        let width = self.screen().logical_cols(y);
+        let left = self.left_and_right_margins.start;
+        let right = self.left_and_right_margins.end.min(width);
+        let at_margin = match index {
+            Index::Back if x == left && x < right => Some(Shift::Right),
+            Index::Forward if x >= left && x == right.saturating_sub(1) => Some(Shift::Left),
+            _ => None,
+        };
+        if let Some(shift) = at_margin {
+            if self.top_and_bottom_margins.contains(&y) {
+                self.shift_columns_at(left, 1, shift);
+                self.wrap_next = false;
+            }
+            return;
+        }
+        let column = match index {
+            Index::Back => x.saturating_sub(1),
+            Index::Forward => (x + 1).min(width - 1),
+        };
+        self.set_cursor_position_absolute(column, y);
+    }
+
+    fn shift_columns_at(&mut self, x: usize, count: u32, shift: Shift) {
+        let rows = self.top_and_bottom_margins.clone();
         let right = self.left_and_right_margins.end;
         // A cut through a wide glyph can change the adjacent boundary cell.
         let graphics_cols = x.saturating_sub(1)..(right + 1).min(self.screen().physical_cols);

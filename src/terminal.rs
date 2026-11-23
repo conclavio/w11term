@@ -3135,6 +3135,53 @@ mod tests {
     }
 
     #[test]
+    fn dec_horizontal_index_moves_the_cursor_and_scrolls_at_horizontal_margins() {
+        let (tx, mut replies) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"ABCDEFGH\r\nabcdefgh\r\n12345678\r\nIJKLMNOP");
+        term.advance_bytes(b"\x1b[?69h\x1b[3;6s\x1b[2;3r\x1b[2;3H\x1b6\x1b[6n");
+        assert_eq!(text(&term), "ABCDEFGH\nab cdegh\n12 34578\nIJKLMNOP");
+        assert_eq!(receive(&mut replies), b"\x1b[2;3R");
+        term.advance_bytes(b"\x1b[3;6H\x1b9\x1b[6n");
+        assert_eq!(text(&term), "ABCDEFGH\nabcde gh\n12345 78\nIJKLMNOP");
+        assert_eq!(receive(&mut replies), b"\x1b[3;6R");
+        for (bytes, position) in [
+            (b"\x1b[2;4H\x1b9\x1b[6n".as_slice(), b"\x1b[2;5R".as_slice()),
+            (b"\x1b6\x1b[6n", b"\x1b[2;4R"),
+            (b"\x1b[1;2H\x1b9\x1b6\x1b[6n", b"\x1b[1;3R"),
+            (b"\x1b[3;7H\x1b9\x1b9\x1b[6n", b"\x1b[3;8R"),
+        ] {
+            term.advance_bytes(bytes);
+            assert_eq!(receive(&mut replies), position);
+        }
+        assert_eq!(text(&term), "ABCDEFGH\nabcde gh\n12345 78\nIJKLMNOP");
+    }
+
+    #[test]
+    fn dec_forward_index_honors_double_width_and_clears_pending_wrap() {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 8,
+                rows: 3,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"\x1b[2;1Habcdefgh\x1b[1;1H\x1b#61234\x1b9Z");
+        assert_eq!(text(&term), "234Z\nbcdefgh\n");
+        assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (3, 0));
+        assert!(Snapshot::capture(&term, None, 1, 0, String::new(), 0).rows[0].is_double_width());
+    }
+
+    #[test]
     fn dec_line_width_controls_cursor_addressing_and_auto_wrap() {
         let (tx, mut replies) = mpsc::unbounded_channel();
         let mut term = create(

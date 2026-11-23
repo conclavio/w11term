@@ -1,4 +1,5 @@
 use crate::terminal::{Alert, Progress};
+use crate::terminalstate::column_edit::Index;
 use crate::terminalstate::palette::Slot;
 use crate::terminalstate::rendition::Rendition;
 use crate::terminalstate::{
@@ -690,6 +691,8 @@ impl Performer<'_> {
             }
             Esc::Code(EscCode::ReverseIndex) => self.c1_reverse_index(),
             Esc::Code(EscCode::Index) => self.c1_index(),
+            Esc::Code(EscCode::DecBackIndex) => self.horizontal_index(Index::Back),
+            Esc::Code(EscCode::DecForwardIndex) => self.horizontal_index(Index::Forward),
             Esc::Code(EscCode::NextLine) => self.c1_nel(),
             Esc::Code(EscCode::HorizontalTabSet) => self.c1_hts(),
             Esc::Code(EscCode::DecLineDrawingG0) => {
