@@ -1556,6 +1556,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
             Request::Record {
                 pane: 1,
                 path: Some(path.clone()),
+                timed: false,
             },
             capture.clone(),
         )
@@ -1614,6 +1615,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
             Request::Record {
                 pane: 1,
                 path: None,
+                timed: false,
             },
             capture.clone(),
         )
@@ -1627,7 +1629,8 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
             .execute(
                 Request::Record {
                     pane: 1,
-                    path: Some(path)
+                    path: Some(path),
+                    timed: false,
                 },
                 capture
             )

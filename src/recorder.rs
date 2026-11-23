@@ -5,52 +5,108 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
 };
+use wezterm_term::TerminalSize;
+
+mod timed;
+use timed::TimelineWriter;
+pub(crate) use timed::{ReplayEvent, TimedReplay};
+
+const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 pub struct Recorder {
     file: BufWriter<File>,
     pub path: PathBuf,
     pub bytes: u64,
+    timing: Option<TimelineWriter>,
+    failed: bool,
 }
 impl Recorder {
-    pub fn start(path: &Path, size: wezterm_term::TerminalSize) -> Result<Self> {
-        let file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .context("creating new VT capture (existing files are never overwritten)")?;
-        let metadata = path.with_extension("vt.json");
-        if let Err(error) = (|| -> Result<()> {
-            let mut sidecar = File::options()
+    pub fn start(path: &Path, size: TerminalSize) -> Result<Self> {
+        Self::create(path, size, false)
+    }
+
+    pub fn start_timed(path: &Path, size: TerminalSize) -> Result<Self> {
+        Self::create(path, size, true)
+    }
+
+    fn create(path: &Path, size: TerminalSize, timed: bool) -> Result<Self> {
+        let mut created = Vec::new();
+        let mut create_file = |path: &Path| -> Result<File> {
+            let file = File::options()
                 .write(true)
                 .create_new(true)
-                .open(metadata)?;
+                .open(path)
+                .with_context(|| format!("creating new recording file {}", path.display()))?;
+            created.push(path.to_owned());
+            Ok(file)
+        };
+        let result = (|| -> Result<Self> {
+            let file = create_file(path)?;
+            let mut sidecar = create_file(&path.with_extension("vt.json"))?;
             serde_json::to_writer_pretty(
                 &mut sidecar,
                 &serde_json::json!({"version":1,"cols":size.cols,"rows":size.rows,"output_only":true}),
             )?;
-            Ok(())
-        })() {
-            drop(file);
-            let _ = std::fs::remove_file(path);
-            return Err(error);
+            let timing = if timed {
+                Some(TimelineWriter::new(
+                    create_file(&path.with_extension("vt.jsonl"))?,
+                    size,
+                )?)
+            } else {
+                None
+            };
+            Ok(Self {
+                file: BufWriter::new(file),
+                path: path.into(),
+                bytes: 0,
+                timing,
+                failed: false,
+            })
+        })();
+        if result.is_err() {
+            for path in created.into_iter().rev() {
+                let _ = std::fs::remove_file(path);
+            }
         }
-        Ok(Self {
-            file: BufWriter::new(file),
-            path: path.into(),
-            bytes: 0,
-        })
+        result
     }
     pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        ensure!(
-            self.bytes + bytes.len() as u64 <= 256 * 1024 * 1024,
-            "VT recording reached 256 MiB limit"
-        );
-        self.file.write_all(bytes)?;
-        self.bytes += bytes.len() as u64;
+        ensure!(!self.failed, "VT recording has failed");
+        let result = (|| -> Result<()> {
+            ensure!(
+                self.bytes
+                    .checked_add(bytes.len() as u64)
+                    .is_some_and(|len| len <= MAX_BYTES),
+                "VT recording reached 256 MiB limit"
+            );
+            if let Some(timing) = &mut self.timing {
+                timing.output(bytes)?;
+            }
+            self.file.write_all(bytes)?;
+            self.bytes += bytes.len() as u64;
+            Ok(())
+        })();
+        self.failed = result.is_err();
+        result
+    }
+
+    pub fn resize(&mut self, size: TerminalSize) -> Result<()> {
+        ensure!(!self.failed, "VT recording has failed");
+        if let Some(timing) = &mut self.timing {
+            let result = timing.resize(size);
+            self.failed = result.is_err();
+            return result;
+        }
         Ok(())
     }
     pub fn finish(mut self) -> Result<()> {
+        let stopped = tokio::time::Instant::now();
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
+        if let Some(timing) = self.timing {
+            ensure!(!self.failed, "timed recording is incomplete");
+            timing.finish(self.bytes, stopped)?;
+        }
         Ok(())
     }
 }

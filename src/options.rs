@@ -521,6 +521,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
 pub enum Source {
     Demo,
     Replay(PathBuf),
+    TimedReplay(PathBuf),
     Local(LocalOptions),
     Ssh(SshOptions),
 }
@@ -530,7 +531,7 @@ impl Source {
         match self {
             Self::Local(shell) => shell.color_scheme,
             Self::Ssh(ssh) => ssh.color_scheme,
-            Self::Demo | Self::Replay(_) => ColorScheme::default(),
+            Self::Demo | Self::Replay(_) | Self::TimedReplay(_) => ColorScheme::default(),
         }
     }
 
@@ -538,7 +539,7 @@ impl Source {
         match self {
             Self::Local(shell) => shell.scrollback_lines,
             Self::Ssh(ssh) => ssh.scrollback_lines,
-            Self::Demo | Self::Replay(_) => ScrollbackLines::default(),
+            Self::Demo | Self::Replay(_) | Self::TimedReplay(_) => ScrollbackLines::default(),
         }
     }
 }
@@ -583,12 +584,12 @@ impl Options {
         while let Some(arg) = args.next() {
             explicit_source |= matches!(
                 arg.as_str(),
-                "--demo" | "--replay" | "--profile" | "ssh" | "--tab"
+                "--demo" | "--replay" | "--replay-timed" | "--profile" | "ssh" | "--tab"
             );
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt\n  w11term ssh user@host [--port 22] [--identity KEY | --auth none|agent|password|keyboard-interactive]\n      [--host-key SHA256:...] [--host-key-alias NAME]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from profiles.json in the working directory, or --profiles PATH.\nRelative identity paths resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -598,6 +599,10 @@ impl Options {
                 }
                 "--replay" => {
                     source = Source::Replay(value(&mut args, &arg)?.into());
+                    profile = None;
+                }
+                "--replay-timed" => {
+                    source = Source::TimedReplay(value(&mut args, &arg)?.into());
                     profile = None;
                 }
                 "--profile" => profile = Some(value(&mut args, &arg)?),
@@ -737,7 +742,12 @@ impl Options {
                 "SSH options require ssh user@host or --profile NAME"
             );
         }
-        if let Source::Replay(path) = &source {
+        if let Source::TimedReplay(path) = &source {
+            let size = crate::recorder::TimedReplay::read_initial_size(path)?;
+            // The initial window may be smaller than the recorded terminal grid.
+            cols.get_or_insert(size.cols.min(1000));
+            rows.get_or_insert(size.rows.min(500));
+        } else if let Source::Replay(path) = &source {
             let metadata = path.with_extension("vt.json");
             if metadata.is_file() {
                 let metadata: serde_json::Value =
@@ -1079,6 +1089,37 @@ mod tests {
         assert!(parse(&["ssh", "a@b", "--auth", "none", "--identity", "key"]).is_err());
         assert!(parse(&["--demo", "--auth", "none"]).is_err());
         assert!(parse(&["ssh", "a@[]"]).is_err());
+    }
+
+    #[test]
+    fn timed_launch_uses_recorded_geometry_and_keeps_the_viewport_override() {
+        let parse = |args: &[&str]| Options::parse_from(args.iter().map(|s| s.to_string()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bug.vt");
+        let file = path.to_str().unwrap();
+        assert!(parse(&["--replay-timed", file]).is_err());
+        let size = wezterm_term::TerminalSize {
+            cols: 91,
+            rows: 37,
+            ..Default::default()
+        };
+        crate::recorder::Recorder::start_timed(&path, size)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let launch = parse(&["--replay-timed", file]).unwrap().unwrap();
+        assert_eq!(launch.source, Source::TimedReplay(path.clone()));
+        assert_eq!((launch.cols, launch.rows), (Some(91), Some(37)));
+        let launch = parse(&["--cols", "73", "--replay-timed", file])
+            .unwrap()
+            .unwrap();
+        assert_eq!((launch.cols, launch.rows), (Some(73), Some(37)));
+        assert!(parse(&["--replay-timed", file, "--workspace", "ops"]).is_err());
+        let raw = parse(&["--replay", file]).unwrap().unwrap();
+        assert_eq!(
+            (raw.source, raw.cols, raw.rows),
+            (Source::Replay(path), Some(91), Some(37))
+        );
     }
 
     #[test]

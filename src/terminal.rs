@@ -203,13 +203,8 @@ pub(crate) fn replace_transport(
     }));
 }
 
-/// Herdr can send a screen reconstruction on attach or while a viewer falls behind.
-/// Screen paint and subsequent live bytes share the same stream.
-pub(crate) fn enter_herdr_viewer(
-    terminal: &mut Terminal,
-    writer: &mpsc::UnboundedSender<TransportInput>,
-    events: &crate::events::Events,
-) {
+/// View archived or reconstructed output without applying historical desktop effects.
+pub(crate) fn configure_output_viewer(terminal: &mut Terminal, events: &crate::events::Events) {
     struct ViewerAlerts(crate::events::Events);
     impl wezterm_term::AlertHandler for ViewerAlerts {
         fn alert(&mut self, alert: wezterm_term::Alert) {
@@ -221,6 +216,16 @@ pub(crate) fn enter_herdr_viewer(
     events.command_stream(None);
     terminal.clear_clipboard();
     terminal.set_notification_handler(Box::new(ViewerAlerts(events.clone())));
+}
+
+/// Herdr can send a screen reconstruction on attach or while a viewer falls behind.
+/// Screen paint and subsequent live bytes share the same stream.
+pub(crate) fn enter_herdr_viewer(
+    terminal: &mut Terminal,
+    writer: &mpsc::UnboundedSender<TransportInput>,
+    events: &crate::events::Events,
+) {
+    configure_output_viewer(terminal, events);
     terminal.set_nonblocking_viewer_writers(
         Box::new(ReplyWriter {
             sender: writer.clone(),

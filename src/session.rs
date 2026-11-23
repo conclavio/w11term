@@ -26,6 +26,7 @@ pub use range_scroll::{RangeScroll, RangeScrollRequest};
 mod synchronized_capture;
 #[cfg(test)]
 mod test_worker;
+mod timed_replay;
 use launch::Phase;
 use presentation::Presentation;
 
@@ -45,6 +46,7 @@ pub enum Command {
     Observe(tokio::sync::oneshot::Sender<tokio::sync::broadcast::Receiver<Vec<u8>>>),
     Record {
         path: Option<std::path::PathBuf>,
+        timed: bool,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
     },
     Authenticate(crate::options::Authentication),
@@ -366,7 +368,8 @@ impl Session {
             source.scrollback_lines(),
             colors.effective(),
         );
-        let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard));
+        let timed_replay = matches!(source, Source::TimedReplay(_));
+        let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard && !timed_replay));
         let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         match &source {
             Source::Local(_) => terminal.enable_conemu_directory_reports(),
@@ -375,14 +378,18 @@ impl Session {
             }
             _ => {}
         }
-        let clipboard: Arc<dyn wezterm_term::Clipboard> =
-            Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
-        terminal.set_clipboard(&clipboard);
-        terminal.set_notification_handler(Box::new(crate::sound::Alerts {
-            events: events.clone(),
-            notices: notice_tx,
-            player: player.clone(),
-        }));
+        if timed_replay {
+            terminal::configure_output_viewer(&mut terminal, &events);
+        } else {
+            let clipboard: Arc<dyn wezterm_term::Clipboard> =
+                Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
+            terminal.set_clipboard(&clipboard);
+            terminal.set_notification_handler(Box::new(crate::sound::Alerts {
+                events: events.clone(),
+                notices: notice_tx,
+                player: player.clone(),
+            }));
+        }
         let frames = FrameStore::new(Snapshot::capture(
             &terminal,
             None,
@@ -492,6 +499,7 @@ async fn run(
     let (output_tx, mut output) = mpsc::channel(32);
     let is_demo = matches!(source, Source::Demo);
     let is_ssh = matches!(source, Source::Ssh(_));
+    let is_timed_replay = matches!(source, Source::TimedReplay(_));
     let interactive = is_ssh || matches!(source, Source::Local(_));
     // A durable backend may reconstruct an old screen at any time. Its OSC
     // 133 bytes cannot be used to announce a newly completed command.
@@ -526,6 +534,7 @@ async fn run(
     };
     let mut demo_loaded = false;
     let mut replay = None;
+    let mut playback = None;
     let mut transports = tokio::task::JoinSet::new();
     match source {
         Source::Local(_) | Source::Ssh(_) => {
@@ -540,6 +549,14 @@ async fn run(
                 Err(error) => status = format!("Replay: {error}"),
             }
             // Keep consuming engine replies; replay has no peer to answer them.
+            transports.spawn(async move { while transport_input.recv().await.is_some() {} });
+        }
+        Source::TimedReplay(path) => {
+            status = format!("Timed replay · {}", path.display());
+            match timed_replay::Playback::open(path) {
+                Ok(reader) => playback = Some(reader),
+                Err(error) => status = format!("Timed replay: {error:#}"),
+            }
             transports.spawn(async move { while transport_input.recv().await.is_some() {} });
         }
         Source::Demo => {
@@ -621,6 +638,39 @@ async fn run(
         }
         let animation_deadline = presentation.animation_deadline(&terminal);
         tokio::select! {
+            step = async { playback.as_mut().unwrap().next().await }, if playback.is_some() => {
+                use crate::recorder::ReplayEvent;
+                match step {
+                    Some(Ok(ReplayEvent::Output(bytes))) => {
+                        let anchor = (scroll_offset > 0 && !terminal.is_alt_screen_active()).then(||
+                            terminal.screen().visible_row_to_stable_row(0) - scroll_offset as isize);
+                        total_bytes += bytes.len() as u64;
+                        presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+                        if let Some(anchor) = anchor && !terminal.is_alt_screen_active() {
+                            scroll_offset = (terminal.screen().visible_row_to_stable_row(0) - anchor)
+                                .clamp(0, crate::search::max_offset(&terminal) as isize) as usize;
+                        }
+                    }
+                    Some(Ok(ReplayEvent::Resize(new_size))) => {
+                        size = new_size;
+                        resize_model(&mut terminal, size, &mut scroll_offset);
+                        presentation.dirty = true;
+                    }
+                    Some(Err(error)) => {
+                        status = format!("Timed replay: {error:#}");
+                        playback = None;
+                    }
+                    None => {
+                        if let Some(reader) = playback.take() {
+                            status = format!("Timed replay complete · {}", reader.path.display());
+                        }
+                    }
+                }
+                if search.open && !search_dirty {
+                    search_dirty = true;
+                    search_refresh = tokio::time::Instant::now() + std::time::Duration::from_millis(150);
+                }
+            }
             _ = colors.changed() => {},
             _ = async { if let Some(deadline)=animation_deadline {tokio::time::sleep_until(deadline).await;} }, if animation_deadline.is_some() => {
                 presentation.dirty |= terminal.advance_kitty_animations(std::time::Instant::now());
@@ -730,12 +780,11 @@ async fn run(
                         } else { Ok(()) }
                     }
                     Some(Command::Observe(reply))=>{let _=reply.send(observed.subscribe());Ok(())},
-                    Some(Command::Record{path,reply})=>{
-                        let result=(||->anyhow::Result<serde_json::Value>{
-                            if let Some(path)=path {anyhow::ensure!(recorder.is_none(),"pane is already recording");let started=crate::recorder::Recorder::start(&path,size)?;recorder=Some(started);events.push("recording-started",serde_json::json!({"path":path}));Ok(serde_json::json!({"recording":true,"path":path}))}
-                            else {let stopped=recorder.take().context("pane is not recording")?;let bytes=stopped.bytes;let path=stopped.path.clone();stopped.finish()?;events.push("recording-stopped",serde_json::json!({"bytes":bytes}));Ok(serde_json::json!({"recording":false,"path":path,"bytes":bytes}))}
-                        })();let _=reply.send(result.map_err(|e|format!("{e:#}")));Ok(())
-                    },
+                    Some(Command::Record { path, timed, reply }) => {
+                        let result = change_recording(&mut recorder, &events, path, size, interactive, timed);
+                        let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                        Ok(())
+                    }
                     Some(Command::Authenticate(auth))=>{launch.set_authentication(auth.clone());let _=writer.send(TransportInput::Authenticate(auth));Ok(())},
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
@@ -806,6 +855,7 @@ async fn run(
                             writer.send(TransportInput::Data(text.into_bytes())).map_err(|_|anyhow::anyhow!("terminal transport closed"))
                         }
                     }
+                    Some(Command::Resize(_)) if is_timed_replay => continue,
                     Some(Command::Resize(new_size)) => {
                         replay_ready |= has_cell_pixels(new_size);
                         if size != new_size || (is_demo && !demo_loaded) {
@@ -813,8 +863,8 @@ async fn run(
                             size = new_size;
                             // Apply the PTY resize before its in-band notification reaches the peer.
                             let _ = writer.send(TransportInput::Resize(size));
-                            terminal.resize(size);
-                            if !terminal.is_alt_screen_active() {scroll_offset=scroll_offset.min(crate::search::max_offset(&terminal));}
+                            resize_model(&mut terminal, size, &mut scroll_offset);
+                            update_recording(&mut recorder, &events, |active| active.resize(size));
                             if is_demo && !demo_loaded {
                                 let bytes = demo::bytes();
                                 total_bytes += bytes.len() as u64;
@@ -970,7 +1020,7 @@ async fn run(
                             if observed.receiver_count() > 0 {
                                 let _ = observed.send(bytes.clone());
                             }
-                            record_output(&mut recorder, &bytes, &events);
+                            update_recording(&mut recorder, &events, |active| active.write(&bytes));
                             total_bytes += bytes.len() as u64;
                             let before = terminal.get_progress();
                             presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
@@ -1017,7 +1067,7 @@ async fn run(
         task.abort();
     }
     if let Some(recorder) = recorder {
-        let _ = recorder.finish();
+        let _ = finish_recording(recorder, &events);
     }
 }
 
@@ -1025,7 +1075,7 @@ fn can_watch_commands(source: &Source) -> bool {
     match source {
         Source::Ssh(options) => !options.durable,
         Source::Local(_) => true,
-        Source::Replay(_) | Source::Demo => false,
+        Source::Replay(_) | Source::TimedReplay(_) | Source::Demo => false,
     }
 }
 
@@ -1043,13 +1093,66 @@ fn direct_ssh_shell(
         && startup.is_none_or(|launch| launch.command.is_empty())
 }
 
-fn record_output(
+fn resize_model(
+    terminal: &mut wezterm_term::Terminal,
+    size: TerminalSize,
+    scroll_offset: &mut usize,
+) {
+    terminal.resize(size);
+    if !terminal.is_alt_screen_active() {
+        *scroll_offset = (*scroll_offset).min(crate::search::max_offset(terminal));
+    }
+}
+
+fn change_recording(
     recorder: &mut Option<crate::recorder::Recorder>,
-    bytes: &[u8],
     events: &crate::events::Events,
+    path: Option<std::path::PathBuf>,
+    size: TerminalSize,
+    interactive: bool,
+    timed: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let Some(path) = path else {
+        return finish_recording(recorder.take().context("pane is not recording")?, events);
+    };
+    anyhow::ensure!(recorder.is_none(), "pane is already recording");
+    let started = if timed {
+        anyhow::ensure!(
+            interactive,
+            "timed recording requires an SSH or local shell"
+        );
+        crate::recorder::Recorder::start_timed(&path, size)?
+    } else {
+        crate::recorder::Recorder::start(&path, size)?
+    };
+    *recorder = Some(started);
+    events.push("recording-started", serde_json::json!({"path":path}));
+    Ok(serde_json::json!({"recording":true,"path":path}))
+}
+
+fn finish_recording(
+    recorder: crate::recorder::Recorder,
+    events: &crate::events::Events,
+) -> anyhow::Result<serde_json::Value> {
+    let bytes = recorder.bytes;
+    let path = recorder.path.clone();
+    recorder.finish().inspect_err(|error| {
+        events.push(
+            "recording-error",
+            serde_json::json!({"error":format!("{error:#}")}),
+        );
+    })?;
+    events.push("recording-stopped", serde_json::json!({"bytes":bytes}));
+    Ok(serde_json::json!({"recording":false,"path":path,"bytes":bytes}))
+}
+
+fn update_recording(
+    recorder: &mut Option<crate::recorder::Recorder>,
+    events: &crate::events::Events,
+    action: impl FnOnce(&mut crate::recorder::Recorder) -> anyhow::Result<()>,
 ) {
     if let Some(active) = recorder
-        && let Err(error) = active.write(bytes)
+        && let Err(error) = action(active)
     {
         events.push(
             "recording-error",

@@ -761,6 +761,45 @@ async fn native_clipboard_paste_confirms_original_bytes_for_the_original_pane() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "records real SSH output and resizes, then compares timed replay pixels and frame timing"]
+async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
+    let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let gate = remote.path().join("hold-shell-output");
+    fs::write(&gate, []).unwrap();
+    fs::write(
+        remote.path().join("deferred-output.vt"),
+        b"\x1b[?25l\x1b[2J\x1b[H\x1b]2;timed-first\x07FIRST-SSH-FRAME",
+    )
+    .unwrap();
+    fs::write(state.path().join("output-gate"), gate.to_str().unwrap()).unwrap();
+    drive_mixed_gui("timed-replay-ui.ps1", &ssh, state.path());
+    let live = image::open(state.path().join("live.png"))
+        .unwrap()
+        .to_rgba8();
+    let replay = image::open(state.path().join("replayed.png"))
+        .unwrap()
+        .to_rgba8();
+    assert!(
+        live.pixels().any(|p| p.0 == [255, 0, 0, 255]),
+        "missing red Kitty image"
+    );
+    assert_eq!(live.dimensions(), replay.dimensions());
+    assert!(
+        live.as_raw() == replay.as_raw(),
+        "timed replay changed rendered pixels"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        1,
+        "replay opened an SSH channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "inspects live SSH modes and geometry from the CLI while PowerShell keeps input focus"]
 async fn native_inspect_reads_background_ssh_without_disturbing_powershell() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {

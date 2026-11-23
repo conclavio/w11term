@@ -318,6 +318,7 @@ Example optional profile settings (all fields may be omitted):
 
 ```powershell
 cargo run -- --replay C:\path\to\capture.vt
+cargo run -- --replay-timed C:\path\to\cockpit.vt
 cargo run -- --benchmark
 cargo run -- --demo --smoke-seconds 5
 ```
@@ -327,6 +328,11 @@ The GUI uses the pane's measured cell grid for captures without recording metada
 Use `--cols` and `--rows` to choose an initial grid for a particular capture.
 For a restored background replay pane with unknown dimensions, showing the pane
 or sizing it with `w11term-cli resize` starts playback.
+
+For animations and resize bugs, use `w11term-cli record --pane ID --timed cockpit.vt`.
+Stop the recording with `record --pane ID --stop`, then open it with
+`--replay-timed cockpit.vt` to see output arrive at its recorded pace and
+geometry. [Recording files and control commands](CONTROL.md#vt-recording)
 
 The benchmark measures **only VT parsing and scrollback**. It excludes snapshot creation, rendering, SSH, and input-to-screen latency. Debug-build results are not performance claims. Build with `cargo build --release` for performance work. The release GUI executable does not attach a console.
 
