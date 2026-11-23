@@ -90,6 +90,27 @@ try {
     Wait-Focus $local
     if ((Read-ActiveShellPid 'shell-after') -ne $shellPid) { throw 'The second alert interrupted PowerShell' }
     Visit-Notification 'exit status unavailable'
+
+    Run-Palette 'Notify for long commands: Off'
+    Send-PeerOutput 'short-automatic-command'
+    Assert-CompletionCodes @(17, $null)
+    Send-PeerOutput 'long-command-started'
+    $running = [Diagnostics.Stopwatch]::StartNew()
+    Picker-Query 'Palette PowerShell'
+    Press-Key 13
+    Wait-Focus $local
+    # Wait for the measured threshold after the peer's start marker was committed.
+    $remaining = 10000 - $running.ElapsedMilliseconds
+    if ($remaining -gt 0) { Start-Sleep -Milliseconds $remaining }
+    Send-PeerOutput 'long-command-finished'
+    Assert-CompletionCodes @(17, $null, 23)
+    $completion = (Control @('events','--pane',"$remote",'--since',"$since",'--timeout','0')).journal.events |
+        Where-Object kind -CEQ 'command-finished' | Select-Object -Last 1
+    if ($completion.data.duration_ms -lt 10000) { throw 'The automatic alert must report the elapsed time' }
+    Wait-Focus $local
+    Visit-Notification 'exit code 23'
+    Run-Palette 'Notify for long commands: On'
+
     foreach ($c in 'ssh-resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$c) }
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','10','ssh-resumed')
 } finally {

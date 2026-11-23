@@ -20,6 +20,7 @@ pub enum CommandId {
     LocalForward(Option<local_forwards::Origin>),
     RestartExited(Option<ExitedPane>),
     Clipboard(Option<clipboard_paste::Origin>, bool),
+    LongCommands(Option<clipboard_paste::Origin>, bool),
     SavedCommand(
         Option<clipboard_paste::Origin>,
         w11term::saved_commands::Entry,
@@ -185,6 +186,11 @@ impl TerminalApp {
             .and_then(AppTab::pane_id)
             .zip(self.tabs.active_group_id());
         for row in &mut rows {
+            if let CommandId::Menu(label) = &row.id
+                && let Some(enabled) = attention::long_command_toggle(label)
+            {
+                row.id = CommandId::LongCommands(origin, enabled);
+            }
             if let CommandId::Menu(label) = &row.id
                 && let Some(window) = tab_windows::menu_window(label)
             {
@@ -472,6 +478,9 @@ impl TerminalApp {
             CommandId::SelectAll(origin) => Message::SelectAll(origin),
             CommandId::PaneFind(origin, shortcut) => Message::PaneFind(origin, shortcut),
             CommandId::CopySelection(origin) => Message::CopySelection(origin),
+            CommandId::LongCommands(origin, enabled) => {
+                attention::set_long_commands(origin, enabled)
+            }
             CommandId::Profile(label) => Message::ProfileMenu(label),
             CommandId::Menu(label) => tab_menu_message(label),
             CommandId::MoveTabToExistingWindow(group, window) => {

@@ -1,8 +1,25 @@
 use super::*;
 
+pub(super) const LONG_COMMANDS: &str = "Notify for long commands";
+
+pub(super) fn long_command_toggle(label: &str) -> Option<bool> {
+    match label.strip_prefix(LONG_COMMANDS)? {
+        ": Off" => Some(true),
+        ": On" => Some(false),
+        _ => None,
+    }
+}
+
+pub(super) fn set_long_commands(origin: Option<clipboard_paste::Origin>, enabled: bool) -> Message {
+    origin.map_or(Message::ControlIdle, |origin| {
+        Message::Attention(Action::LongCommands(origin, enabled))
+    })
+}
+
 pub enum Action {
     Open,
     WatchCommand(bool),
+    LongCommands(clipboard_paste::Origin, bool),
     Visit { pane: u64, sequence: u64 },
     MarkAllRead,
     Clear,
@@ -11,6 +28,19 @@ pub enum Action {
 impl TerminalApp {
     pub(super) fn handle_attention(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
+            Action::LongCommands(origin, enabled) => {
+                if self.paste_origin() == Some(origin)
+                    && let Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) = self.tabs.active()
+                {
+                    live.session
+                        .events
+                        .set_long_command_notifications(origin.connection, enabled);
+                }
+                return;
+            }
             Action::WatchCommand(arm) => {
                 if let Some(AppTab {
                     page: Page::Terminal(live),

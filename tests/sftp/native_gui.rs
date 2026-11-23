@@ -590,6 +590,9 @@ async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
         ("not-rearmed", start, "\x1b]133;D;0\x07"),
         ("cancel-complete", start, "\x1b]133;D;9\x07"),
         ("next-complete", start, "\x1b]133;D\x07"),
+        ("short-automatic-command", start, "\x1b]133;D;3\x07"),
+        ("long-command-started", start, ""),
+        ("long-command-finished", "", "\x1b]133;D;23\x07"),
     ] {
         let bytes = format!("{prefix}{completion}{witness}\r\n");
         expected.extend_from_slice(bytes.as_bytes());
