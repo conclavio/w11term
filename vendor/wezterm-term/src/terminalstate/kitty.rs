@@ -17,6 +17,7 @@ mod feature_query;
 mod indexed;
 mod placement;
 mod playback;
+mod scroll;
 use indexed::{IndexedImages, IndexedPixels};
 use placement::{Key, ProjectedPlacement};
 use playback::Playback;
