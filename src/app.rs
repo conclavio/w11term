@@ -3308,6 +3308,9 @@ impl TerminalApp {
             "Paste raw (no bracketed paste)" => {
                 Message::Clipboard(clipboard_paste::Action::Start(paste, true))
             }
+            label if let Some(enabled) = attention::long_command_toggle(label) => {
+                attention::set_long_commands(paste, enabled)
+            }
             _ => match tab_menu_message(label) {
                 Message::Shortcut(Shortcut::ReopenClosedTab) => {
                     Message::ReopenClosedTab(closed_group)
@@ -3920,6 +3923,14 @@ impl TerminalApp {
                 Some(true) => MenuItem::item("command-watch", "Cancel command notification"),
                 Some(false) => MenuItem::item("command-watch", "Notify when command finishes"),
                 None => MenuItem::disabled("command-watch", "Notify when command finishes"),
+            });
+            items.push(match live.session.events.long_command_notifications() {
+                Some(enabled) => state_menu_item(
+                    "long-command-notifications",
+                    attention::LONG_COMMANDS,
+                    Some(enabled),
+                ),
+                None => MenuItem::disabled("long-command-notifications", attention::LONG_COMMANDS),
             });
             if let Some(menu) = durable_view::pane_menu(live) {
                 items.push(menu);

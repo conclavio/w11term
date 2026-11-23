@@ -5,7 +5,7 @@ use std::{
     collections::VecDeque,
     path::Path,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
 mod inbox;
@@ -13,6 +13,7 @@ pub use inbox::Inbox;
 pub(crate) use inbox::display_field;
 
 const CAPACITY: usize = 4096;
+const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
     pub sequence: u64,
@@ -36,6 +37,7 @@ struct State {
     replay: Option<crate::session::ReplayState>,
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
+    notify_long_commands: bool,
     restart_token: Option<u64>,
     restart_closed: bool,
 }
@@ -65,6 +67,7 @@ impl CommandWatch {
 struct RunningCommand {
     /// Keep a fixed-size identity even if the shell supplies a large OSC 133 aid.
     aid: Option<[u8; 32]>,
+    started: Instant,
 }
 
 fn application_id(aid: Option<&str>) -> Option<[u8; 32]> {
@@ -214,6 +217,30 @@ impl Events {
         self.state.lock().unwrap().watch_state()
     }
 
+    pub fn long_command_notifications(&self) -> Option<bool> {
+        let state = self.state.lock().unwrap();
+        state
+            .command_watch
+            .as_ref()
+            .map(|_| state.notify_long_commands)
+    }
+
+    pub fn set_long_command_notifications(&self, connection: u64, enabled: bool) {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .command_watch
+            .as_ref()
+            .is_none_or(|watch| watch.generation != connection)
+            || state.notify_long_commands == enabled
+        {
+            return;
+        }
+        state.notify_long_commands = enabled;
+        if let Some((_, _, inbox)) = &state.inbox {
+            inbox.refresh();
+        }
+    }
+
     /// Current live shell stream, including the interval before its first frame.
     pub fn shell_generation(&self) -> Option<u64> {
         self.state
@@ -261,9 +288,14 @@ impl Events {
     }
 
     pub(crate) fn semantic_prompt(&self, marker: &wezterm_term::FinalTermSemanticPrompt) {
+        self.semantic_prompt_at(marker, Instant::now());
+    }
+
+    fn semantic_prompt_at(&self, marker: &wezterm_term::FinalTermSemanticPrompt, now: Instant) {
         use wezterm_term::FinalTermSemanticPrompt::*;
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
+        let notify_long_commands = state.notify_long_commands;
         let Some(watch) = &mut state.command_watch else {
             return;
         };
@@ -272,6 +304,7 @@ impl Events {
                 // A repeated start or a nested shell cannot steal the original watch.
                 watch.running.get_or_insert_with(|| RunningCommand {
                     aid: application_id(aid.as_deref()),
+                    started: now,
                 });
                 return;
             }
@@ -295,20 +328,24 @@ impl Events {
             }
             StartPrompt(_) | FreshLine => return,
         };
-        if !watch
+        let Some(running) = watch
             .running
             .as_ref()
-            .is_some_and(|command| command.aid == application_id(aid.as_deref()))
-        {
+            .filter(|command| command.aid == application_id(aid.as_deref()))
+        else {
             return;
-        }
+        };
+        let elapsed = now.saturating_duration_since(running.started);
+        let automatic = notify_long_commands && elapsed >= LONG_COMMAND_THRESHOLD;
         watch.running = None;
-        if std::mem::take(&mut watch.armed) {
-            self.append(
-                state,
-                "command-finished",
-                serde_json::json!({"exit_code":exit_code}),
-            );
+        let manual = std::mem::take(&mut watch.armed);
+        if manual || automatic {
+            let data = if automatic {
+                serde_json::json!({"exit_code":exit_code,"duration_ms":elapsed.as_millis() as u64})
+            } else {
+                serde_json::json!({"exit_code":exit_code})
+            };
+            self.append(state, "command-finished", data);
         }
     }
 
@@ -537,5 +574,106 @@ mod tests {
         assert_eq!(b.events.len(), CAPACITY);
         assert_eq!(b.oldest, 2);
         assert!(e.since(b.next).events.is_empty());
+    }
+
+    #[test]
+    fn automatic_command_notifications_use_the_first_matching_start_and_deduplicate() {
+        use wezterm_term::FinalTermSemanticPrompt::{
+            CommandStatus, MarkEndOfInputAndStartOfOutput,
+        };
+        let events = Events::default();
+        let start = MarkEndOfInputAndStartOfOutput {
+            aid: Some("shell".into()),
+            command: None,
+        };
+        let end = CommandStatus {
+            aid: Some("shell".into()),
+            status: Some(17),
+        };
+        let unrelated = CommandStatus {
+            aid: Some("nested".into()),
+            status: Some(5),
+        };
+        let now = Instant::now();
+        let long = now + LONG_COMMAND_THRESHOLD;
+        events.command_stream(Some(1));
+        events.semantic_prompt_at(&start, now);
+        events.semantic_prompt_at(&end, long);
+        assert!(events.since(0).events.is_empty());
+
+        events.set_long_command_notifications(1, true);
+        events.semantic_prompt_at(&start, long);
+        events.semantic_prompt_at(
+            &end,
+            long + LONG_COMMAND_THRESHOLD - Duration::from_millis(1),
+        );
+        assert!(events.since(0).events.is_empty());
+
+        let next = long + LONG_COMMAND_THRESHOLD;
+        events.semantic_prompt_at(&start, next);
+        events.set_command_watch(true);
+        events.semantic_prompt_at(&start, next + Duration::from_secs(8));
+        events.semantic_prompt_at(&unrelated, next + LONG_COMMAND_THRESHOLD);
+        assert!(events.since(0).events.is_empty());
+        events.semantic_prompt_at(&end, next + LONG_COMMAND_THRESHOLD);
+        events.semantic_prompt_at(&end, next + LONG_COMMAND_THRESHOLD);
+        let batch = events.since(0);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].kind, "command-finished");
+        assert_eq!(
+            batch.events[0].data,
+            serde_json::json!({"exit_code":17,"duration_ms":10000})
+        );
+        assert_eq!(events.command_watch(), Some(false));
+
+        let short = next + LONG_COMMAND_THRESHOLD;
+        events.semantic_prompt_at(&start, short);
+        events.set_command_watch(true);
+        events.semantic_prompt_at(&end, short + Duration::from_secs(1));
+        let batch = events.since(batch.next);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].data, serde_json::json!({"exit_code":17}));
+    }
+
+    #[test]
+    fn automatic_preference_survives_reset_and_reconnect_but_an_old_command_does_not() {
+        use wezterm_term::FinalTermSemanticPrompt::{
+            CommandStatus, MarkEndOfInputAndStartOfOutput,
+        };
+        let events = Events::default();
+        let start = MarkEndOfInputAndStartOfOutput {
+            aid: None,
+            command: None,
+        };
+        let end = CommandStatus {
+            aid: None,
+            status: None,
+        };
+        let now = Instant::now();
+        let long = now + LONG_COMMAND_THRESHOLD;
+        events.command_stream(Some(1));
+        events.set_long_command_notifications(1, true);
+        events.semantic_prompt_at(&start, now);
+        events.reset_command_watch();
+        events.semantic_prompt_at(&end, long);
+        assert!(events.since(0).events.is_empty());
+        assert_eq!(events.long_command_notifications(), Some(true));
+
+        events.semantic_prompt_at(&start, long);
+        events.command_stream(None);
+        assert_eq!(events.long_command_notifications(), None);
+        events.command_stream(Some(2));
+        events.set_long_command_notifications(1, false);
+        assert_eq!(events.long_command_notifications(), Some(true));
+        let next = long + LONG_COMMAND_THRESHOLD;
+        events.semantic_prompt_at(&end, next);
+        assert!(events.since(0).events.is_empty());
+        events.semantic_prompt_at(&start, next);
+        events.semantic_prompt_at(&end, next + LONG_COMMAND_THRESHOLD);
+        assert_eq!(events.since(0).events.len(), 1);
+        events.set_long_command_notifications(2, false);
+        events.semantic_prompt_at(&start, next + LONG_COMMAND_THRESHOLD);
+        events.semantic_prompt_at(&end, next + 2 * LONG_COMMAND_THRESHOLD);
+        assert_eq!(events.since(0).events.len(), 1);
     }
 }
