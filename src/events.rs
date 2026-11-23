@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 mod group_command;
 mod inbox;
 use group_command::GroupRun;
-pub use group_command::{GroupCommandResult, GroupExecution, GroupOutput};
+pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use inbox::Inbox;
 pub(crate) use inbox::display_field;
 
@@ -50,6 +50,7 @@ struct State {
     inbox: Option<(u64, Arc<str>, Inbox)>,
     command_watch: Option<CommandWatch>,
     group_run: Option<GroupRun>,
+    group_serial: u64,
     next_prompt: u64,
     notify_long_commands: bool,
     restart_token: Option<u64>,
@@ -323,10 +324,12 @@ impl Events {
         status: tokio::sync::watch::Sender<GroupExecution>,
     ) {
         let mut state = self.state.lock().unwrap();
-        if let Some(previous) = state
-            .group_run
-            .replace(GroupRun::new(generation, text, status))
-        {
+        state.group_serial += 1;
+        let target = GroupInterruptTarget {
+            generation,
+            serial: state.group_serial,
+        };
+        if let Some(previous) = state.group_run.replace(GroupRun::new(target, text, status)) {
             previous.abandon("The pane began a new group submission.");
         }
     }
@@ -335,6 +338,15 @@ impl Events {
         if let Some(run) = &self.state.lock().unwrap().group_run {
             run.identify(id, label);
         }
+    }
+
+    pub(crate) fn group_command_running(&self, target: GroupInterruptTarget) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .group_run
+            .as_ref()
+            .is_some_and(|run| run.is_running(target))
     }
 
     pub fn set_command_watch(&self, armed: bool) -> bool {

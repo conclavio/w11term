@@ -1,7 +1,9 @@
 use super::*;
 use std::{borrow::Cow, collections::BTreeSet};
 use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
-use w11term::events::{CommandLink, GroupExecution, GroupOutput, PromptToken, ShellPrompt};
+use w11term::events::{
+    CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, PromptToken, ShellPrompt,
+};
 mod saved;
 
 pub(super) const LABEL: &str = "SSH host group";
@@ -61,6 +63,7 @@ struct Delivery {
     target: Target,
     status: DeliveryStatus,
     execution: Option<watch::Receiver<GroupExecution>>,
+    interrupt: Option<DeliveryStatus>,
 }
 
 enum DeliveryStatus {
@@ -70,19 +73,43 @@ enum DeliveryStatus {
     Unconfirmed,
 }
 
-impl Delivery {
+impl DeliveryStatus {
     fn poll(&mut self) {
-        let DeliveryStatus::Pending(started, reply) = &mut self.status else {
+        let Self::Pending(started, reply) = self else {
             return;
         };
-        self.status = match reply.try_recv() {
-            Ok(Ok(())) => DeliveryStatus::Sent,
-            Ok(Err(error)) => DeliveryStatus::Rejected(error),
+        *self = match reply.try_recv() {
+            Ok(Ok(())) => Self::Sent,
+            Ok(Err(error)) => Self::Rejected(error),
             Err(TryRecvError::Empty) if started.elapsed() < ACK_TIMEOUT => return,
-            Err(_) => DeliveryStatus::Unconfirmed,
+            Err(_) => Self::Unconfirmed,
         };
-        if !matches!(self.status, DeliveryStatus::Sent) {
+    }
+}
+
+impl Delivery {
+    fn poll(&mut self) {
+        self.status.poll();
+        if matches!(
+            self.status,
+            DeliveryStatus::Rejected(_) | DeliveryStatus::Unconfirmed
+        ) {
             self.execution = None;
+        }
+        if let Some(interrupt) = &mut self.interrupt {
+            interrupt.poll();
+        }
+    }
+
+    fn interrupt_target(&self) -> Option<GroupInterruptTarget> {
+        if !matches!(self.status, DeliveryStatus::Sent)
+            || matches!(self.interrupt, Some(DeliveryStatus::Pending(..)))
+        {
+            return None;
+        }
+        match *self.execution.as_ref()?.borrow() {
+            GroupExecution::Running(link) => Some(link),
+            _ => None,
         }
     }
 
@@ -130,6 +157,7 @@ pub enum Action {
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
     ViewOutput(TabId, u64, CommandLink),
+    Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, Arc<str>, Vec<Target>),
 }
 
@@ -262,6 +290,71 @@ impl TerminalApp {
             target,
             status,
             execution,
+            interrupt: None,
+        }
+    }
+
+    fn interrupt_hosts(
+        &mut self,
+        id: TabId,
+        submission: u64,
+        targets: Vec<(u64, GroupInterruptTarget)>,
+    ) {
+        let Some(page) = self
+            .host_group_mut(id)
+            .filter(|page| page.viewing == submission)
+        else {
+            return;
+        };
+        let Some(run) = page.submissions.iter().find(|run| run.id == submission) else {
+            return;
+        };
+        let selected: Vec<_> = targets
+            .into_iter()
+            .filter(|&(pane, link)| {
+                page.selected.contains(&pane)
+                    && run.results.iter().any(|delivery| {
+                        delivery.target.pane == pane && delivery.interrupt_target() == Some(link)
+                    })
+            })
+            .collect();
+        let mut outcomes: BTreeMap<_, _> = selected
+            .into_iter()
+            .map(|(pane, link)| {
+                let status = match self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) {
+                    Some(AppTab {
+                        page: Page::Terminal(live),
+                        ..
+                    }) if live.session.is_direct_ssh_shell() => {
+                        let (reply, received) = oneshot::channel();
+                        if live
+                            .session
+                            .input
+                            .send(Command::InterruptGroupCommand {
+                                target: link,
+                                reply,
+                            })
+                            .is_ok()
+                        {
+                            DeliveryStatus::Pending(Instant::now(), received)
+                        } else {
+                            DeliveryStatus::Rejected("The pane closed.".into())
+                        }
+                    }
+                    _ => DeliveryStatus::Rejected("The SSH shell is no longer available.".into()),
+                };
+                (pane, status)
+            })
+            .collect();
+        if let Some(run) = self
+            .host_group_mut(id)
+            .and_then(|page| page.submissions.iter_mut().find(|run| run.id == submission))
+        {
+            for delivery in &mut run.results {
+                if let Some(status) = outcomes.remove(&delivery.target.pane) {
+                    delivery.interrupt = Some(status);
+                }
+            }
         }
     }
 
@@ -349,6 +442,9 @@ impl TerminalApp {
                 if self.host_group_mut(id).is_some() {
                     self.open_command_history(pane, Some(link), ctx);
                 }
+            }
+            Action::Interrupt(id, submission, targets) => {
+                self.interrupt_hosts(id, submission, targets)
             }
             Action::Send(id, text, targets) => {
                 let Some(page) = self.host_group_mut(id) else {
@@ -500,6 +596,29 @@ impl TerminalApp {
             return;
         };
         let submission = &page.submissions[index];
+        let submission_id = submission.id;
+        let interrupt_targets: Vec<_> = submission
+            .results
+            .iter()
+            .filter(|delivery| page.selected.contains(&delivery.target.pane))
+            .filter_map(|delivery| {
+                delivery
+                    .interrupt_target()
+                    .map(|link| (delivery.target.pane, link))
+            })
+            .collect();
+        let interrupt_label = format!("Interrupt selected ({})", interrupt_targets.len());
+        let interrupt = Button::new()
+            .automation_name("Interrupt selected")
+            .is_enabled(!interrupt_targets.is_empty())
+            .on_click(ctx.callback(move |_| {
+                Message::HostGroup(Action::Interrupt(
+                    id,
+                    submission_id,
+                    interrupt_targets.clone(),
+                ))
+            }))
+            .content(interrupt_label);
         let navigate = |label, destination: Option<&Submission>| {
             let destination = destination.map(|item| item.id);
             Button::new()
@@ -533,6 +652,7 @@ impl TerminalApp {
                             page.submissions.len()
                         )),
                     )),
+                interrupt,
             )),
         ));
         details.extend(submission.results.iter().map(|delivery| {
@@ -563,7 +683,7 @@ impl TerminalApp {
             let name = &delivery.target.name;
             let caption = match &result {
                 GroupExecution::AwaitingMarkers => "Waiting for shell markers".into(),
-                GroupExecution::Running => "Running".into(),
+                GroupExecution::Running(_) => "Running".into(),
                 GroupExecution::Unavailable(reason) => format!("Result unavailable · {reason}"),
                 GroupExecution::Finished(result) => result.exit_code.map_or_else(
                     || "Completed · exit status unavailable".into(),
@@ -617,6 +737,21 @@ impl TerminalApp {
                     ));
                 }
             }
+        }
+        if let Some(interrupt) = &delivery.interrupt {
+            let caption = match interrupt {
+                DeliveryStatus::Pending(..) => "Sending Ctrl+C".into(),
+                DeliveryStatus::Sent => "Ctrl+C sent".into(),
+                DeliveryStatus::Rejected(reason) => format!("Ctrl+C withheld · {reason}"),
+                DeliveryStatus::Unconfirmed => "Ctrl+C delivery unconfirmed".into(),
+            };
+            rows.push(KeyedView::new(
+                "interrupt",
+                TextBlock::new()
+                    .automation_name(format!("{} · {caption}", delivery.target.name))
+                    .text(caption)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
         }
         if self.tab_for_pane(pane).is_some() {
             rows.push(KeyedView::new(

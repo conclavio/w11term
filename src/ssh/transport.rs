@@ -5,7 +5,7 @@ use crate::{
     events::Events,
     options::{Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
-    terminal::TransportInput,
+    terminal::{ScopedInput, TransportInput},
 };
 use anyhow::{Context, Result, ensure};
 use russh::{
@@ -929,6 +929,10 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                     Some(TransportInput::Scoped { connection, reply, kind, .. }) if connection != generation || pending != 0 => {
                         let _ = reply.send(Err(kind.stale_error().into()));
                     }
+                    Some(TransportInput::Scoped { kind: ScopedInput::GroupInterrupt(link), reply, .. })
+                        if !events.group_command_running(link) => {
+                        let _ = reply.send(Err(crate::terminal::GROUP_COMMAND_ENDED.into()));
+                    }
                     Some(TransportInput::Raw(bytes, reply) | TransportInput::Scoped { bytes, reply, .. }) => {
                         let result = channel.data(bytes.as_slice()).await;
                         let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
@@ -1018,6 +1022,9 @@ async fn run_herdr_channel(
                 Some(TransportInput::Automatic(data))=>viewer.automatic_input(&data).await?,
                 Some(TransportInput::Scoped {connection,reply,kind,..}) if connection != generation => {
                     let _=reply.send(Err(kind.stale_error().into()));
+                }
+                Some(TransportInput::Scoped {kind:ScopedInput::GroupInterrupt(_),reply,..}) => {
+                    let _=reply.send(Err("Group interrupts require a direct SSH shell.".into()));
                 }
                 Some(TransportInput::Raw(data,reply) | TransportInput::Scoped {bytes:data,reply,..})=>{
                     let result=viewer.input(&data).await;

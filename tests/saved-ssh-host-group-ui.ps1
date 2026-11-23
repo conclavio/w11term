@@ -3,6 +3,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+. (Join-Path $PSScriptRoot 'support/cursor-cell.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -39,6 +40,7 @@ function Launch-GroupWindow {
     $launchArgs = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
     $script:app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
     $script:window = Wait-InputWindow
+    Show-CursorWindow
     Click 'Tab menu'
     Invoke-Button (Wait-Until 'SSH host group menu item' {
         Find-Element 'SSH host group' ([System.Windows.Automation.ControlType]::MenuItem)

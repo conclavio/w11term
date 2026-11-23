@@ -122,6 +122,34 @@ try {
     Submit 'after-reconnect' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Exit 17'
+    $null = Wait-Until 'finished results cannot be interrupted' {
+        $entry = Find-Element 'Interrupt selected' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    Submit 'interrupt-pair' 'Send to 2 hosts'
+    Outcome $eastName 'Running'
+    Outcome $westName 'Running'
+    (Wait-CheckBox $eastName On).Toggle()
+    $null = Wait-CheckBox $eastName Off
+    Click 'Interrupt selected'
+    Outcome $westName 'Ctrl+C sent'
+    Outcome $westName 'Exit 130'
+    Outcome $eastName 'Running'
+    $null = Wait-Until 'only unselected East remains running' {
+        $entry = Find-Element 'Interrupt selected' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    (Wait-CheckBox $eastName Off).Toggle()
+    $null = Wait-CheckBox $eastName On
+    Click 'Interrupt selected'
+    Outcome $eastName 'Ctrl+C sent'
+    Outcome $eastName 'Exit 130'
+    Submit 'interrupt-both' 'Send to 2 hosts'
+    Outcome $eastName 'Running'
+    Outcome $westName 'Running'
+    Click 'Interrupt selected'
+    Outcome $eastName 'Exit 130'
+    Outcome $westName 'Exit 130'
     Click "Focus result pane $west"
     Wait-Focus $west
 } catch {

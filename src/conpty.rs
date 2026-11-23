@@ -3,7 +3,11 @@ mod process;
 #[cfg(test)]
 mod tests;
 
-use crate::{options::LocalOptions, ssh::Event, terminal::TransportInput};
+use crate::{
+    options::LocalOptions,
+    ssh::Event,
+    terminal::{ScopedInput, TransportInput},
+};
 use anyhow::{Context, Result};
 use process::{Console, Launch, handle};
 use std::{
@@ -65,6 +69,13 @@ fn write_input(
                 ..
             } if connection != generation => {
                 let _ = reply.send(Err(kind.stale_error().into()));
+            }
+            TransportInput::Scoped {
+                kind: ScopedInput::GroupInterrupt(_),
+                reply,
+                ..
+            } => {
+                let _ = reply.send(Err("Group interrupts require a direct SSH shell.".into()));
             }
             TransportInput::Raw(bytes, reply) | TransportInput::Scoped { bytes, reply, .. } => {
                 let result = pipe.write_all(&bytes);
