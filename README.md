@@ -169,6 +169,8 @@ Choose **Filter filenames…** and type part of a name to search the entire dire
 
 Under **Sort by**, choose **Newest first** to find a recent log or capture, or **Largest first** to find the largest regular files. Folders stay first. **Newest first** uses the reported modification time within each group. **Largest first** keeps folders alphabetical and puts files with a reported byte count ahead of other entries. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
 
+The list shows reported regular-file sizes beside their names in bytes or binary units such as KiB and MiB. An empty file shows **0 B**. Rows without a regular-file size have a blank size column. Use **Refresh** to update the listing after a transfer or a change on the server.
+
 Choose **New folder** and enter a name to create a directory under the displayed remote path. After the server confirms creation, the drawer refreshes and selects the new folder. If the name already exists, the drawer shows the server’s error. **Replace existing files** applies to file transfers.
 
 Select a file or directory and choose **Rename…** to change its name in the current remote folder. The drawer checks for an existing destination, sends a standard SFTP rename, and selects the new name after the server confirms it. Renaming a link changes the directory entry itself. If the connection drops before confirmation, refresh the parent directory to see which name the server retained.

@@ -2,7 +2,7 @@ use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "sorts a real remote directory from cached mtimes and previews the original selection after it moves between pages"]
+#[ignore = "shows cached SFTP sizes, sorts the listing and previews the same file across pages"]
 async fn native_sftp_sort_preserves_the_selected_file_across_pages_and_filters() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_server(false).await else {
         unreachable!()
@@ -16,10 +16,16 @@ async fn native_sftp_sort_preserves_the_selected_file_across_pages_and_filters()
     };
     let old = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
     create("aa-review.log", b"alphabetical decoy", old);
+    let kilobytes = [b'k'; 1536];
     for index in 0..35 {
+        let contents: &[u8] = match index {
+            0 => &kilobytes,
+            1 => b"",
+            _ => b"batch",
+        };
         create(
             &format!("batch-{index:02}.log"),
-            b"batch",
+            contents,
             old + Duration::from_secs(10 + index),
         );
     }

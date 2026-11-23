@@ -29,6 +29,23 @@ function Set-Sort([string]$Label) {
     (Sort-Radio $Label).Select()
     $null = Wait-Until "$Label selected" { (Sort-Radio $Label).Current.IsSelected }
 }
+function Size-Cell($Row) {
+    $condition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'sftp-entry-size')
+    return $Row.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+}
+function Expect-Size([string]$Name, [int]$Bytes) {
+    $null = Wait-Until "size cell for $Name has $Bytes bytes" {
+        $row = Find-Element $Name $button
+        if (!$row) { return }
+        $size = Size-Cell $row
+        if (!$size -or $size.Current.Name -cne "Size $Bytes bytes") { return }
+        $bounds = $row.Current.BoundingRectangle
+        $cell = $size.Current.BoundingRectangle
+        !$cell.IsEmpty -and $cell.Width -ge 10 -and
+            $cell.Left -gt $bounds.Left -and $cell.Right -le $bounds.Right + 1
+    }
+}
 function Wait-Order([string[]]$Expected) {
     $observed = @{ entries = @() }
     $buttons = [System.Windows.Automation.PropertyCondition]::new(
@@ -78,6 +95,10 @@ try {
         throw 'The default sort is not visibly set to Name'
     }
     Wait-Order @($folder,'aa-review.log','batch-00.log','batch-01.log')
+    Expect-Size 'aa-review.log' 18
+    Expect-Size 'batch-00.log' 1536
+    Expect-Size 'batch-01.log' 0
+    if (Size-Cell (Find-Element $folder $button)) { throw 'A directory displayed a file size' }
     if (Find-Element $target $button) { throw 'Expected the Unicode target on the second page of the name sort' }
     Click 'Next'
     Click $target
@@ -107,6 +128,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $fixtureDirectory 'aa-review.log'), ('z' * 8192))
     Set-Sort 'Sort largest first'
     Wait-Order @($folder,$target,'aa-review.log','yy-review.log')
+    Expect-Size 'aa-review.log' 18
     if ((Sort-Radio 'Sort by name').Current.IsSelected -or (Sort-Radio 'Sort newest first').Current.IsSelected) {
         throw 'Largest first left another sort order selected'
     }
