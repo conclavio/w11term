@@ -57,50 +57,69 @@ impl TerminalApp {
             let gesture = std::fs::read_to_string(&request).unwrap();
             let (id, gesture) = gesture.split_once(' ').unwrap();
             let id = id.parse().unwrap();
-            let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
-                panic!("scrollbar probe must target a fixture pane")
-            };
-            let (width, height, scale) = tab.surface.area.get().unwrap();
-            let top = PADDING + 1.0;
-            let bottom = height - STATUS_HEIGHT - PADDING - 1.0;
-            let track = width - PADDING / 2.0;
-            let (x, press, drag) = match gesture {
-                "drag-up" => (track, bottom, Some(top)),
-                "drag-down" => (track, top, Some(bottom)),
-                "page-up" => (track, top, None),
-                value if let Some(pixel) = value.strip_prefix("failure:") => (
-                    width - PADDING + 1.5,
-                    ((PADDING * scale).round() + pixel.parse::<f32>().unwrap()) / scale,
-                    None,
-                ),
-                _ => panic!("unknown scrollbar probe"),
-            };
-            let event = |y: f32, held| PointerEventInfo {
-                x: f64::from(x),
-                y: y as f64,
-                is_left_button_pressed: held,
+            let pointer = PointerEventInfo {
+                x: f64::from(PADDING) + 1.0,
+                y: f64::from(PADDING) + 1.0,
+                is_left_button_pressed: gesture == "press",
                 capture_succeeded: true,
                 ..Default::default()
             };
-            // Only the specified pane receives Reactor's normal pointer messages.
-            self.update(
-                Message::Pointer(id, event(press, true), MouseEventKind::Press),
-                context,
-            );
-            if let Some(y) = drag {
+            let boundary = match gesture {
+                "enter" => Some(Message::HoverPane(id)),
+                "leave" => Some(Message::PointerExit(id)),
+                "move" => Some(Message::Pointer(id, pointer, MouseEventKind::Move)),
+                "press" => Some(Message::Pointer(id, pointer, MouseEventKind::Press)),
+                "release" => Some(Message::Pointer(id, pointer, MouseEventKind::Release)),
+                _ => None,
+            };
+            if let Some(message) = boundary {
+                self.update(message, context);
+            } else {
+                let Page::Terminal(tab) = &self.tabs.get(id).unwrap().page else {
+                    panic!("scrollbar probe must target a fixture pane")
+                };
+                let (width, height, scale) = tab.surface.area.get().unwrap();
+                let top = PADDING + 1.0;
+                let bottom = height - STATUS_HEIGHT - PADDING - 1.0;
+                let track = width - PADDING / 2.0;
+                let (x, press, drag) = match gesture {
+                    "drag-up" => (track, bottom, Some(top)),
+                    "drag-down" => (track, top, Some(bottom)),
+                    "page-up" => (track, top, None),
+                    value if let Some(pixel) = value.strip_prefix("failure:") => (
+                        width - PADDING + 1.5,
+                        ((PADDING * scale).round() + pixel.parse::<f32>().unwrap()) / scale,
+                        None,
+                    ),
+                    _ => panic!("unknown scrollbar probe"),
+                };
+                let event = |y: f32, held| PointerEventInfo {
+                    x: f64::from(x),
+                    y: y as f64,
+                    is_left_button_pressed: held,
+                    capture_succeeded: true,
+                    ..Default::default()
+                };
+                // Only the specified pane receives Reactor's normal pointer messages.
                 self.update(
-                    Message::Pointer(id, event(y, true), MouseEventKind::Move),
+                    Message::Pointer(id, event(press, true), MouseEventKind::Press),
+                    context,
+                );
+                if let Some(y) = drag {
+                    self.update(
+                        Message::Pointer(id, event(y, true), MouseEventKind::Move),
+                        context,
+                    );
+                }
+                self.update(
+                    Message::Pointer(
+                        id,
+                        event(drag.unwrap_or(press), false),
+                        MouseEventKind::Release,
+                    ),
                     context,
                 );
             }
-            self.update(
-                Message::Pointer(
-                    id,
-                    event(drag.unwrap_or(press), false),
-                    MouseEventKind::Release,
-                ),
-                context,
-            );
             std::fs::remove_file(request).unwrap();
         }
         context.spawn_background(move |_| {

@@ -4,6 +4,12 @@ use crate::TerminalState;
 use anyhow::bail;
 use std::io::Write;
 
+fn modifier_bits(modifiers: KeyModifiers) -> i8 {
+    i8::from(modifiers.contains(KeyModifiers::SHIFT)) * 4
+        + i8::from(modifiers.contains(KeyModifiers::ALT)) * 8
+        + i8::from(modifiers.contains(KeyModifiers::CTRL)) * 16
+}
+
 impl TerminalState {
     /// Encode a coordinate value using X10 encoding or Utf8 encoding.
     /// Out of bounds coords are reported as the 0 byte value.
@@ -49,7 +55,7 @@ impl TerminalState {
                 .unwrap_or(MouseButton::None),
             b => b,
         };
-        let mut code = match button {
+        let code = match button {
             MouseButton::None => 3,
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -60,17 +66,7 @@ impl TerminalState {
             MouseButton::WheelRight(_) => 67,
         };
 
-        if event.modifiers.contains(KeyModifiers::SHIFT) {
-            code += 4;
-        }
-        if event.modifiers.contains(KeyModifiers::ALT) {
-            code += 8;
-        }
-        if event.modifiers.contains(KeyModifiers::CTRL) {
-            code += 16;
-        }
-
-        (code, button)
+        (code + modifier_bits(event.modifiers), button)
     }
 
     fn mouse_wheel(&mut self, event: MouseEvent) -> anyhow::Result<()> {
@@ -312,6 +308,19 @@ impl TerminalState {
             } else {
                 self.encode_x10_or_utf8(event, button)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Report a pointer departure using the Kitty SGR pixel extension.
+    pub fn mouse_left(&mut self, modifiers: KeyModifiers) -> anyhow::Result<()> {
+        if self.mouse_encoding == MouseEncoding::SgrPixels {
+            // A re-entry at the same pixel must report fresh motion.
+            self.last_mouse_move = None;
+            let flags = (1 << 8) | (1 << 5) | u16::from(modifier_bits(modifiers) as u8);
+            // The departure marker makes coordinates immaterial.
+            write!(self.writer, "\x1b[<{flags};1;1M")?;
+            self.writer.flush()?;
         }
         Ok(())
     }

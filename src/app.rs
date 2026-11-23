@@ -187,6 +187,7 @@ impl LiveTab {
         if let Some(release) = self.remote_mouse.release() {
             let _ = self.session.input.send(Command::Mouse(release));
         }
+        self.finish_mouse_leave();
         if let Some(selection) = self.selection.borrow_mut().as_mut() {
             selection.dragging = false;
         }
@@ -194,6 +195,23 @@ impl LiveTab {
         self.scroll_direction = 0;
         self.scroll_tick = false;
         self.gesture += 1;
+    }
+
+    fn mouse_left(&mut self, modifiers: KeyModifiers) {
+        let connection = self.session.frames.load().connection_generation;
+        self.remote_mouse.pending_leave = Some((connection, modifiers));
+        self.finish_mouse_leave();
+    }
+
+    fn finish_mouse_leave(&mut self) {
+        if self.remote_mouse.held.is_none()
+            && let Some((connection, modifiers)) = self.remote_mouse.pending_leave.take()
+        {
+            let _ = self.session.input.send(Command::MouseLeave {
+                connection,
+                modifiers,
+            });
+        }
     }
 
     fn browsing_sessions(&self) -> bool {
@@ -210,6 +228,7 @@ impl LiveTab {
 #[derive(Default)]
 struct RemoteMouse {
     held: Option<MouseEvent>,
+    pending_leave: Option<(u64, KeyModifiers)>,
 }
 
 impl RemoteMouse {
@@ -991,6 +1010,7 @@ pub struct TerminalApp {
     dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     rotation_hover: Option<pane_view::RotationHover>,
+    pointer_over: Option<TabId>,
     overlay_visible: Cell<bool>,
     mru_groups: Vec<TabId>,
     switcher: Option<TabSwitcher>,
@@ -1914,6 +1934,9 @@ impl TerminalApp {
                 modifiers,
             }) {
                 let _ = tab.session.input.send(Command::Mouse(event));
+                if kind == MouseEventKind::Release {
+                    tab.finish_mouse_leave();
+                }
             }
             return;
         }
@@ -2467,6 +2490,28 @@ impl TerminalApp {
         });
     }
 
+    fn change_pointer_pane(&mut self, next: Option<TabId>) {
+        if self.pointer_over == next {
+            return;
+        }
+        if let Some(old) = std::mem::replace(&mut self.pointer_over, next)
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(old)
+        {
+            tab.mouse_left(crate::input::modifiers());
+        }
+        if let Some(next) = next
+            && let Some(AppTab {
+                page: Page::Terminal(tab),
+                ..
+            }) = self.tabs.get_mut(next)
+        {
+            tab.remote_mouse.pending_leave = None;
+        }
+    }
+
     fn active_terminal_group(&self) -> Option<TabId> {
         match &self.tabs.active()?.page {
             Page::Terminal(_) => self.tabs.active_group_id(),
@@ -2552,6 +2597,9 @@ impl TerminalApp {
     }
 
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        if self.pointer_over.is_some_and(|id| !self.tabs.visible(id)) {
+            self.change_pointer_pane(None);
+        }
         self.pane_drop.cancel();
         self.cancel_directory_copy();
         self.refresh_remote_clipboard_focus();
@@ -4665,6 +4713,7 @@ impl Component for TerminalApp {
             dividers: Rc::default(),
             measured_layout: None,
             rotation_hover: None,
+            pointer_over: None,
             overlay_visible: Cell::new(false),
             mru_groups: Vec::new(),
             switcher: None,
@@ -6229,6 +6278,9 @@ impl Component for TerminalApp {
                 self.dividers.borrow_mut().end(epoch, &path);
             }
             Message::HoverPane(id) => {
+                if self.tabs.visible(id) {
+                    self.change_pointer_pane(Some(id));
+                }
                 self.keyboard.hover_pane(id);
                 if self.tabs.active_id() != Some(id)
                     && let Some(inspector) = &mut self.inspection
@@ -6237,6 +6289,9 @@ impl Component for TerminalApp {
                 }
             }
             Message::PointerExit(id) => {
+                if self.pointer_over == Some(id) {
+                    self.change_pointer_pane(None);
+                }
                 self.keyboard.leave_pane(id);
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
