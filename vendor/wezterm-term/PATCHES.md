@@ -109,3 +109,8 @@ The original MIT license is preserved in `LICENSE.md`.
   each enable and after a size change. DECRQM reports the subscription state.
   RIS and transport reset clear it. Both immediate and asynchronous reports
   follow the parser reply route on framed viewers.
+
+- Xterm title operations retain up to ten sets of window and icon labels per
+  terminal. An application can push or pop selected labels, access a slot
+  by index, and query stack depth. Restoring a changed window title emits
+  the same window title alert as OSC 2. A full reset clears saved labels.

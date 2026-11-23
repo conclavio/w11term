@@ -45,9 +45,30 @@ try {
     foreach ($pane in $left,$right) { $null = Control @('wait-for-text','--pane',"$pane",'--timeout','10','ready') }
 
     # Give dev1 a remote title unrelated to its saved profile or address.
-    $osc = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$([char]27)]2;build-output$([char]7)"))
-    $null = Control @('send-text','--pane',"$left",'--no-paste','--base64',$osc)
+    function Send-RemoteOutput([string]$Text) {
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))
+        $null = Control @('send-text','--pane',"$left",'--no-paste','--base64',$encoded)
+    }
+    $esc = [char]27
+    Send-RemoteOutput "$esc]2;build-output$([char]7)"
     $null = Wait-Until 'remote window title' { (Control @('get-text','--pane',"$left")).title -eq 'build-output' }
+    $cursor = (Control @('events','--pane',"$left",'--since','0','--timeout','0')).journal.next
+    # ncurses xterm+alt+title enters/leaves the alternate screen before pushing/popping.
+    Send-RemoteOutput "$esc[?1049h$esc[22;0;0t$esc]2;editor buffer$([char]7)"
+    $null = Wait-Until 'editor title on the alternate screen' {
+        $frame = Control @('get-text','--pane',"$left")
+        $frame.alternate_screen -and $frame.title -ceq 'editor buffer'
+    }
+    Send-RemoteOutput "$esc[?1049l$esc[23;0;0t"
+    $null = Wait-Until 'shell title restored on returning to the primary screen' {
+        $frame = Control @('get-text','--pane',"$left")
+        !$frame.alternate_screen -and $frame.title -ceq 'build-output'
+    }
+    $journal = (Control @('events','--pane',"$left",'--since',"$cursor",'--timeout','0')).journal
+    $titles = @($journal.events | Where-Object kind -ceq 'title' | ForEach-Object { $_.data.title })
+    if ($journal.lost -or $titles.Count -ne 2 -or $titles[0] -cne 'editor buffer' -or $titles[1] -cne 'build-output') {
+        throw "Unexpected title events during editor entry/exit: $($titles -join ', ')"
+    }
 
     # Ring and notify from the SSH split in the other tab. Verify the window-wide
     # badge updates while input stays on dev1, then select the exact sending split.
