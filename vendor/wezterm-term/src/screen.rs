@@ -1112,6 +1112,39 @@ impl Screen {
         }
     }
 
+    /// Draw the newest history rows into a full-width region starting at row 0.
+    pub(crate) fn restore_scrollback_rows(&mut self, bottom: VisibleRowIndex, count: usize) {
+        // History and the live display share one buffer. Removing rows at the
+        // region's bottom shifts the live boundary back by the same amount.
+        let end = self.phys_row(bottom);
+        let removed = end - count..end;
+        let start_row = self.phys_to_stable_row_index(removed.start);
+        let end_row = self.phys_to_stable_row_index(removed.end);
+        let surviving_row = |row: StableRowIndex| {
+            if row < start_row {
+                Some(row)
+            } else if row >= end_row {
+                Some(row - count as StableRowIndex)
+            } else {
+                None
+            }
+        };
+        self.command_outputs.retain_mut(|(_, row, _)| {
+            if let Some(survivor) = surviving_row(*row) {
+                *row = survivor;
+                true
+            } else {
+                false
+            }
+        });
+        self.command_start = self
+            .command_start
+            .and_then(|(row, col)| Some((surviving_row(row)?, col)));
+        self.lines.drain(removed);
+        // Previously discarded coordinates can be reused by later output.
+        self.invalidate_row_coordinates();
+    }
+
     /// ```text
     /// ---------
     /// |

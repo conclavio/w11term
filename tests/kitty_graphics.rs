@@ -1071,6 +1071,14 @@ fn archive_display_retains_image_only_rows_and_clips_relative_images_at_the_old_
     assert_eq!(pixel(&history, 3, 6, 41), RED);
     assert_eq!(pixel(&history, 3, 7, 41), Some([0, 255, 0, 255]));
     assert_eq!(pixel(&frame(&t, None, 4), 3, 4, 41), None);
+
+    t.advance_bytes(b"\x1b[8+T");
+    let restored = frame(&t, Some(&history), 0);
+    assert_eq!(restored.first_stable_row, original.first_stable_row);
+    assert_eq!(frame(&t, None, usize::MAX).scroll_offset, 0);
+    assert_eq!(pixel(&restored, 2, 4, 40), RED);
+    assert_eq!(pixel(&restored, 3, 6, 41), RED);
+    assert_eq!(pixel(&restored, 3, 7, 41), Some([0, 255, 0, 255]));
 }
 
 #[test]

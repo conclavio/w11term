@@ -66,6 +66,81 @@ fn archive_display_obeys_the_history_limit_and_clears_regional_and_alternate_scr
 }
 
 #[test]
+fn unscroll_consumes_newest_history_rows_in_order_without_moving_the_cursor() {
+    let mut t = terminal(5, 5, 10);
+    t.advance_bytes("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n\x1b[3;2H");
+    let before = Snapshot::capture(&t, None, 1, 0, String::new(), 0);
+    let old_rows = before.retained_rows(2, 6).unwrap();
+    assert_eq!(before.scroll_offset, 0);
+    assert_eq!(t.screen().phys_row(0), 2);
+
+    t.advance_bytes("\x1b[0+T\x1b[1;2+T");
+    assert_eq!(t.screen().row_epoch(), before.row_epoch);
+    assert_eq!(t.screen().phys_row(0), 2);
+    t.advance_bytes("\x1b[+T");
+    assert_eq!(rows(&t), ["0", "1", "2", "3", "4", "5"]);
+    assert_eq!(t.screen().visible_row_to_stable_row(0), 1);
+    t.advance_bytes("\x1b[1+T");
+    assert_eq!(rows(&t), ["0", "1", "2", "3", "4"]);
+    assert_eq!((t.cursor_pos().x, t.cursor_pos().y), (1, 2));
+    assert_eq!(t.unscrolled_rows(), 2);
+    let restored = Snapshot::capture(&t, Some(&before), 2, 0, String::new(), 0);
+    assert!(!old_rows.matches_visible(&restored));
+}
+
+#[test]
+fn unscroll_honors_scroll_regions_and_fills_missing_history_with_blanks() {
+    let mut t = terminal(8, 4, 10);
+    t.advance_bytes("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\x1b[1;2r\x1b[3+T");
+    assert_eq!(rows(&t), ["0", "1", "5", "6"]);
+    assert_eq!(t.unscrolled_rows(), 3);
+
+    t.advance_bytes("\x1b[r\x1b[4;1H\r\n\x1b[2;3r\x1b[1000000+T");
+    assert_eq!(rows(&t), ["0", "1", "", "", ""]);
+    t.advance_bytes("\x1b[?1049h\x1b[r\x1b[HALT\x1b[+T");
+    assert_eq!(rows(&t), ["", "ALT", "", ""]);
+    t.advance_bytes("\x1b[?1049l\x1b[r\x1b[3+T");
+    assert_eq!(rows(&t), ["", "", "0", "1"]);
+    assert_eq!(t.unscrolled_rows(), 4);
+}
+
+#[test]
+fn oversized_unscroll_uses_all_available_history_when_it_exceeds_the_screen_height() {
+    let mut t = terminal(5, 3, 10);
+    t.advance_bytes("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\x1b[1000000+T");
+    assert_eq!(rows(&t), ["0", "1", "2"]);
+    assert_eq!(t.unscrolled_rows(), 5);
+}
+
+#[test]
+fn unscroll_keeps_command_output_attached_to_surviving_rows() {
+    let mut t = terminal(12, 4, 10);
+    t.advance_bytes(concat!(
+        "old\r\n",
+        "\x1b]133;C\x07one\x1b]133;D;0\x07\r\n",
+        "\x1b]133;C\x07drop\x1b]133;D;0\x07\r\n",
+        "\x1b]133;C\x07keep\x1b]133;D;0\x07\r\n",
+        "next",
+    ));
+    let markers: Vec<_> = t.screen().command_output_rows().collect();
+    assert_eq!(markers.len(), 3);
+    t.advance_bytes("\x1b[1;2r\x1b[+T");
+    assert_eq!(rows(&t), ["old", "one", "keep", "next"]);
+    assert_eq!(
+        t.screen().command_output_rows().collect::<Vec<_>>(),
+        [markers[0], (markers[2].0, markers[2].1 - 1)],
+    );
+}
+
+#[test]
+fn unscroll_with_horizontal_margins_keeps_full_history_rows_intact() {
+    let mut t = terminal(8, 3, 10);
+    t.advance_bytes("HISTORY\r\nabcdef\r\nghijkl\r\nmnopqr\x1b[?69h\x1b[2;5s\x1b[+T");
+    assert_eq!(rows(&t), ["HISTORY", "a    f", "gbcdel", "mhijkr"]);
+    assert_eq!(t.unscrolled_rows(), 0);
+}
+
+#[test]
 fn retained_rows_validate_every_row_and_clamp_alignment_after_eviction() {
     let mut t = terminal(20, 4, 4);
     t.advance_bytes("a\r\nb\r\nc\r\nd");
