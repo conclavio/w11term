@@ -31,14 +31,25 @@ function Set-HostFilter([string]$Query) {
     }
     $field.SetValue($Query)
 }
-function Submit([string]$Text, [string]$ButtonName) {
-    $field = Wait-Until 'group command editor' {
+function Command-Editor {
+    Wait-Until 'group command editor' {
         $element = Find-Element 'Group command' $edit
         $provider = $null
         if ($element -and $element.TryGetCurrentPattern(
                 [System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider)) { $provider }
     }
-    $field.SetValue($Text)
+}
+function Wait-CommandDraft([string]$Text) {
+    $null = Wait-Until "focused command draft '$Text'" {
+        $field = Find-Element 'Group command' $edit
+        $provider = $null
+        $field -and $field.Current.HasKeyboardFocus -and $field.TryGetCurrentPattern(
+            [System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider
+        ) -and $provider.Current.Value -ceq $Text
+    }
+}
+function Submit([string]$Text, [string]$ButtonName) {
+    (Command-Editor).SetValue($Text)
     Invoke-Button (Wait-Until "enabled $ButtonName" {
         $entry = Find-Element $ButtonName $button
         if ($entry -and $entry.Current.IsEnabled) { $entry }
@@ -212,6 +223,27 @@ try {
     Click 'Interrupt selected'
     Outcome $eastName 'Exit 130'
     Outcome $westName 'Exit 130'
+    Click 'Previous submission'
+    $null = Wait-Until 'show the previous interrupt' { Find-Element "Submitted${dot}interrupt-pair" }
+    Click 'Previous submission'
+    $null = Wait-Until 'show the command to load' { Find-Element "Submitted${dot}after-reconnect" }
+    Set-HostFilter 'west'
+    $null = Wait-Until 'East is selected but hidden during reuse' {
+        Find-Element '1 selected host is hidden by the filter.'
+    }
+    (Command-Editor).SetValue('unsent notes')
+    Click 'Load command'
+    Wait-CommandDraft 'after-reconnect'
+    Click 'Restore draft'
+    Wait-CommandDraft 'unsent notes'
+    Click 'Load command'
+    Wait-CommandDraft 'after-reconnect'
+    Submit 'after-reconnect-review' 'Send to 1 host'
+    Outcome $westName 'Exit 17'
+    $null = Wait-Until 'submission clears the restore action' { !(Find-Element 'Restore draft' $button) }
+    Set-HostFilter ''
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     Click "Focus result pane $west"
     Wait-Focus $west
 } catch {
