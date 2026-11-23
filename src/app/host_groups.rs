@@ -4,6 +4,7 @@ use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
 use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, PromptToken, ShellPrompt,
 };
+mod report;
 mod saved;
 
 pub(super) const LABEL: &str = "SSH host group";
@@ -19,6 +20,7 @@ pub(super) struct HostGroup {
     submissions: VecDeque<Submission>,
     viewing: u64,
     next_submission: u64,
+    copy_feedback: String,
 }
 
 struct Submission {
@@ -126,6 +128,36 @@ impl Delivery {
         };
         format!("{} · {state}", self.target.name)
     }
+
+    fn execution(&self) -> Option<GroupExecution> {
+        if !matches!(self.status, DeliveryStatus::Sent) {
+            return None;
+        }
+        Some(self.execution.as_ref()?.borrow().clone())
+    }
+
+    fn interrupt_caption(&self) -> Option<Cow<'_, str>> {
+        Some(match self.interrupt.as_ref()? {
+            DeliveryStatus::Pending(..) => "Sending Ctrl+C".into(),
+            DeliveryStatus::Sent => "Ctrl+C sent".into(),
+            DeliveryStatus::Rejected(reason) => format!("Ctrl+C withheld · {reason}").into(),
+            DeliveryStatus::Unconfirmed => "Ctrl+C delivery unconfirmed".into(),
+        })
+    }
+}
+
+fn execution_caption(result: &GroupExecution) -> Cow<'_, str> {
+    match result {
+        GroupExecution::AwaitingMarkers => "Waiting for shell markers".into(),
+        GroupExecution::AwaitingPrompt => "Waiting for a matching prompt".into(),
+        GroupExecution::Running(_) => "Running".into(),
+        GroupExecution::PromptReturned => "Prompt returned · exit status unavailable".into(),
+        GroupExecution::Unavailable(reason) => format!("Result unavailable · {reason}").into(),
+        GroupExecution::Finished(result) => result.exit_code.map_or_else(
+            || "Completed · exit status unavailable".into(),
+            |code| format!("Exit {code}").into(),
+        ),
+    }
 }
 
 impl HostGroup {
@@ -162,6 +194,7 @@ impl HostGroup {
     fn submit(&mut self, text: Arc<str>, results: Vec<Delivery>) {
         self.next_submission += 1;
         self.viewing = self.next_submission;
+        self.copy_feedback.clear();
         self.submissions.push_back(Submission {
             id: self.viewing,
             text,
@@ -183,6 +216,7 @@ pub enum Action {
     SelectShown(TabId, Vec<u64>, bool),
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
+    CopyResults(TabId, u64),
     ViewOutput(TabId, u64, CommandLink),
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, Arc<str>, Vec<Target>),
@@ -491,8 +525,10 @@ impl TerminalApp {
                     && page.submissions.iter().any(|item| item.id == submission)
                 {
                     page.viewing = submission;
+                    page.copy_feedback.clear();
                 }
             }
+            Action::CopyResults(id, submission) => self.copy_host_group_results(id, submission),
             Action::ViewOutput(id, pane, link) => {
                 if self.host_group_mut(id).is_some() {
                     self.open_command_history(pane, Some(link), ctx);
@@ -523,6 +559,31 @@ impl TerminalApp {
                     page.submit(text, results);
                 }
             }
+        }
+    }
+
+    fn copy_host_group_results(&mut self, id: TabId, submission_id: u64) {
+        if self.tabs.active_id() != Some(id) {
+            return;
+        }
+        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
+            return;
+        };
+        if page.viewing != submission_id {
+            return;
+        }
+        let Some(submission) = page.submissions.iter().find(|run| run.id == submission_id) else {
+            return;
+        };
+        let copied = report::build(submission, w11term::clipboard::MAX_TEXT, |pane, link| {
+            self.history_frame(pane)?.command_for_link(link).cloned()
+        })
+        .and_then(|text| w11term::clipboard::write(&text));
+        if let Some(page) = self.host_group_mut(id) {
+            page.copy_feedback = match copied {
+                Ok(()) => "Copied results".into(),
+                Err(error) => format!("Could not copy results · {error}"),
+            };
         }
     }
 
@@ -770,7 +831,25 @@ impl TerminalApp {
                             page.submissions.len()
                         )),
                     )),
-                interrupt,
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::CopyResults(id, submission_id))
+                            }))
+                            .content("Copy results"),
+                        interrupt,
+                    )),
+                if page.copy_feedback.is_empty() {
+                    View::empty()
+                } else {
+                    TextBlock::new()
+                        .text(&page.copy_feedback)
+                        .text_wrapping(TextWrapping::Wrap)
+                        .into()
+                },
             )),
         ));
         details.extend(submission.results.iter().map(|delivery| {
@@ -794,29 +873,14 @@ impl TerminalApp {
                 .text(delivery.description())
                 .text_wrapping(TextWrapping::Wrap),
         )];
-        if matches!(delivery.status, DeliveryStatus::Sent)
-            && let Some(execution) = &delivery.execution
-        {
-            let result = execution.borrow().clone();
+        if let Some(result) = delivery.execution() {
             let name = &delivery.target.name;
-            let caption = match &result {
-                GroupExecution::AwaitingMarkers => "Waiting for shell markers".into(),
-                GroupExecution::AwaitingPrompt => "Waiting for a matching prompt".into(),
-                GroupExecution::Running(_) => "Running".into(),
-                GroupExecution::PromptReturned => {
-                    "Prompt returned · exit status unavailable".into()
-                }
-                GroupExecution::Unavailable(reason) => format!("Result unavailable · {reason}"),
-                GroupExecution::Finished(result) => result.exit_code.map_or_else(
-                    || "Completed · exit status unavailable".into(),
-                    |code| format!("Exit {code}"),
-                ),
-            };
+            let caption = execution_caption(&result);
             rows.push(KeyedView::new(
                 "execution",
                 TextBlock::new()
                     .automation_name(format!("{name} · {caption}"))
-                    .text(caption)
+                    .text(caption.as_ref())
                     .text_wrapping(TextWrapping::Wrap),
             ));
             if let GroupExecution::Finished(result) = result {
@@ -860,18 +924,12 @@ impl TerminalApp {
                 }
             }
         }
-        if let Some(interrupt) = &delivery.interrupt {
-            let caption = match interrupt {
-                DeliveryStatus::Pending(..) => "Sending Ctrl+C".into(),
-                DeliveryStatus::Sent => "Ctrl+C sent".into(),
-                DeliveryStatus::Rejected(reason) => format!("Ctrl+C withheld · {reason}"),
-                DeliveryStatus::Unconfirmed => "Ctrl+C delivery unconfirmed".into(),
-            };
+        if let Some(caption) = delivery.interrupt_caption() {
             rows.push(KeyedView::new(
                 "interrupt",
                 TextBlock::new()
                     .automation_name(format!("{} · {caption}", delivery.target.name))
-                    .text(caption)
+                    .text(caption.as_ref())
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }

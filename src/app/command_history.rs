@@ -155,11 +155,8 @@ fn output_preview(text: &str, hit: Option<Range<usize>>) -> String {
 
 fn selected_command(frame: &Snapshot, selected: Option<(u64, u64)>) -> Option<&CompletedCommand> {
     let (generation, id) = selected?;
-    (frame.connection_generation == generation).then_some(())?;
     frame
-        .command_history
-        .iter()
-        .find(|c| c.id == id)
+        .command_for_link(w11term::events::CommandLink { generation, id })
         .map(AsRef::as_ref)
 }
 
