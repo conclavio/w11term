@@ -714,8 +714,14 @@ pub enum KittyImageDelete {
     AtCursorPosition { delete: bool },
 
     /// d='f' or d='F'
-    /// Delete animation frames
-    AnimationFrames { delete: bool },
+    /// Delete one animation frame, releasing the image if its last frame is
+    /// selected with uppercase F.
+    AnimationFrames {
+        image_id: Option<u32>,
+        image_number: Option<u32>,
+        frame_number: Option<u32>,
+        delete: bool,
+    },
 
     /// d='p' or d='P'
     /// Delete all placements that intersect the specified
@@ -782,7 +788,17 @@ impl KittyImageDelete {
                 delete,
             }),
             'c' | 'C' => Some(Self::AtCursorPosition { delete }),
-            'f' | 'F' => Some(Self::AnimationFrames { delete }),
+            'f' | 'F' => {
+                let optional_number = |key| {
+                    get(keys, key).map_or(Some(None), |value| value.parse::<u32>().ok().map(Some))
+                };
+                Some(Self::AnimationFrames {
+                    image_id: optional_number("i")?,
+                    image_number: optional_number("I")?,
+                    frame_number: optional_number("r")?,
+                    delete,
+                })
+            }
             'p' | 'P' => Some(Self::DeleteAt {
                 x: geti(keys, "x")?,
                 y: geti(keys, "y")?,
@@ -857,8 +873,16 @@ impl KittyImageDelete {
             Self::AtCursorPosition { delete } => {
                 keys.insert("d", d('c', delete));
             }
-            Self::AnimationFrames { delete } => {
+            Self::AnimationFrames {
+                image_id,
+                image_number,
+                frame_number,
+                delete,
+            } => {
                 keys.insert("d", d('f', delete));
+                set(keys, "i", image_id);
+                set(keys, "I", image_number);
+                set(keys, "r", frame_number);
             }
             Self::DeleteAt { x, y, delete } => {
                 keys.insert("d", d('p', delete));

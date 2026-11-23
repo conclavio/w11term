@@ -148,6 +148,29 @@ impl Playback {
         before != self.frame
     }
 
+    pub(super) fn frame_removed(
+        &mut self,
+        data: &ImageDataType,
+        removed: usize,
+        remaining: usize,
+        root_gap: Duration,
+        now: Instant,
+    ) {
+        let selected_frame_survived = self.frame != removed;
+        let previous_deadline = self.deadline;
+        if self.frame > removed {
+            self.frame -= 1;
+        }
+        self.frame = self.frame.min(remaining - 1);
+        self.root_gap = root_gap;
+        self.schedule(data, now);
+        // The frame is still on screen after its number changes. Preserve the
+        // time already spent displaying it if playback still has a next frame.
+        if selected_frame_survived && self.deadline.is_some() && previous_deadline.is_some() {
+            self.deadline = previous_deadline;
+        }
+    }
+
     fn advance_replay(&mut self, durations: &[Duration], mut deadline: Instant, now: Instant) {
         // Finish the current lap from its original deadline, including any gapless frames.
         self.deadline = None;

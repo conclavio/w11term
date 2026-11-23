@@ -32,7 +32,7 @@ jobs:
           path: artifacts
 
   number-reference:
-    name: Kitty 0.45 image number reference
+    name: Kitty 0.45 image number and frame reference
     runs-on: ubuntu-26.04
     timeout-minutes: 8
     steps:
@@ -46,6 +46,7 @@ jobs:
           mkdir -p artifacts
           dpkg-query -W kitty xvfb libgl1-mesa-dri > artifacts/versions.txt
           xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts --scene clear-number
+          xvfb-run -a -s '-screen 0 1024x768x24 +extension GLX' /usr/bin/python3 tests/kitty-reference.py artifacts/clear-frame --scene clear-frame
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
