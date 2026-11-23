@@ -151,6 +151,7 @@ impl server::Handler for Peer {
                 concat!(
                     "\x1b7\x1b[3;1H\x1b[1\"qprotected header\x1b[0\"q transient\x1b[?2K",
                     "\x1b[4;1HLaXXXXfR\x1b[35;4;3;4;6$x\x1b[4;4;4;4$z",
+                    "\x1b[4;1;4;8;1;5;2;1$v",
                     "\x1b[1\"q\x1bP$q\"q\x1b\\\x1b8",
                 )
                 .as_bytes(),
@@ -336,7 +337,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                 frame.cursor,
                 frame.status
             );
-            if text.contains("remote ready\nx\nprotected header\nLa# ##fR") {
+            if text.contains("remote ready\nx\nprotected header\nLa# ##fR\n La# ##fR") {
                 assert!(!text.contains("transient"));
                 break;
             }

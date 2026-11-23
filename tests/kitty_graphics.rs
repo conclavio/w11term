@@ -1095,8 +1095,15 @@ fn text_erasure_keeps_direct_kitty_layers_and_full_screen_erase_clears_them() {
     assert!(!rectangle_erased.rows[1].as_str().contains(".."));
     check_layers(&rectangle_erased);
 
+    t.advance_bytes(b"\x1b[2;3HCOPY\x1b[2;3;2;6;1;3;3;1$v");
+    let copied = frame(&t, Some(&rectangle_erased), 0);
+    assert_eq!(copied.rows[2].as_str().trim_end(), "  COPY");
+    check_layers(&copied);
+    assert_eq!(pixel(&copied, 2, 2, 41), None);
+    assert_eq!(pixel(&copied, 3, 2, 42), None);
+
     t.advance_bytes(b"\x1b[2J");
-    let cleared = frame(&t, Some(&rectangle_erased), 0);
+    let cleared = frame(&t, Some(&copied), 0);
     assert_eq!(pixel(&cleared, 2, 1, 40), None);
     assert_eq!(pixel(&cleared, 2, 1, 41), None);
     assert_eq!(pixel(&cleared, 2, 2, 40), None);

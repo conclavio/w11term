@@ -2641,6 +2641,15 @@ impl TerminalState {
                 let area = self.screen_rectangle(top, left, bottom, right);
                 self.paint_rectangle(area, &Cell::blank());
             }
+            Window::CopyRectangle {
+                source,
+                destination,
+                ..
+            } => {
+                // Only the active buffer is addressable, so all page numbers
+                // resolve to its sole page per the DEC out-of-range rule.
+                self.copy_rectangle(source, destination);
+            }
             Window::FillRectangle {
                 character,
                 top,

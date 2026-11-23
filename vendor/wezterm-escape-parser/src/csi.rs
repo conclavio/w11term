@@ -642,6 +642,13 @@ pub enum Window {
         bottom: OneBased,
         right: OneBased,
     },
+    /// DECCRA.
+    CopyRectangle {
+        source: [OneBased; 4],
+        source_page: OneBased,
+        destination: [OneBased; 2],
+        destination_page: OneBased,
+    },
     /// DECRQCRA; used by esctest
     ChecksumRectangularArea {
         request_id: i64,
@@ -749,6 +756,15 @@ impl Display for Window {
             } => {
                 write!(f, "{};{};{};{};{}$x", character, top, left, bottom, right)
             }
+            Window::CopyRectangle {
+                source: [top, left, bottom, right],
+                source_page,
+                destination: [row, column],
+                destination_page,
+            } => write!(
+                f,
+                "{top};{left};{bottom};{right};{source_page};{row};{column};{destination_page}$v"
+            ),
             Window::ChecksumRectangularArea {
                 request_id,
                 page_number,
@@ -1915,6 +1931,16 @@ impl Cracked {
         self.get(idx).and_then(CsiParam::as_integer).ok_or(())
     }
 
+    fn rectangle(&self, offset: usize) -> Result<[OneBased; 4], ()> {
+        let far_edge = CsiParam::Integer(0);
+        Ok([
+            OneBased::from_optional_esc_param(self.get(offset))?,
+            OneBased::from_optional_esc_param(self.get(offset + 1))?,
+            OneBased::from_esc_param_with_big_default(self.get(offset + 2).unwrap_or(&far_edge))?,
+            OneBased::from_esc_param_with_big_default(self.get(offset + 3).unwrap_or(&far_edge))?,
+        ])
+    }
+
     pub fn len(&self) -> usize {
         self.params.len()
     }
@@ -2006,15 +2032,7 @@ impl<'a> CSIParser<'a> {
                 if area.len() > offset + 4 {
                     return Err(());
                 }
-                let far_edge = CsiParam::Integer(0);
-                let top = OneBased::from_optional_esc_param(area.get(offset))?;
-                let left = OneBased::from_optional_esc_param(area.get(offset + 1))?;
-                let bottom = OneBased::from_esc_param_with_big_default(
-                    area.get(offset + 2).unwrap_or(&far_edge),
-                )?;
-                let right = OneBased::from_esc_param_with_big_default(
-                    area.get(offset + 3).unwrap_or(&far_edge),
-                )?;
+                let [top, left, bottom, right] = area.rectangle(offset)?;
                 let operation = match self.control {
                     '|' => Window::ReportRectangularSgr {
                         top,
@@ -2050,6 +2068,21 @@ impl<'a> CSIParser<'a> {
                     _ => unreachable!(),
                 };
                 Ok(CSI::Window(Box::new(operation)))
+            }
+            ('v', [parameters @ .., CsiParam::P(b'$')]) if !self.parameters_truncated => {
+                let area = Cracked::parse(parameters)?;
+                if area.len() > 8 {
+                    return Err(());
+                }
+                Ok(CSI::Window(Box::new(Window::CopyRectangle {
+                    source: area.rectangle(0)?,
+                    source_page: OneBased::from_optional_esc_param(area.get(4))?,
+                    destination: [
+                        OneBased::from_optional_esc_param(area.get(5))?,
+                        OneBased::from_optional_esc_param(area.get(6))?,
+                    ],
+                    destination_page: OneBased::from_optional_esc_param(area.get(7))?,
+                })))
             }
             ('S', [CsiParam::P(b'#')]) if !self.parameters_truncated => {
                 Ok(CSI::Window(Box::new(Window::ReportTitleStackPosition)))

@@ -144,3 +144,7 @@ The original MIT license is preserved in `LICENSE.md`.
 - DECFRA and DECERA use the active screen's rectangle coordinates and keep
   the cursor and line rendition. Fill uses the active character set and
   pen with one cell per column. Erase replaces cells with default blanks.
+
+- DECCRA copies styled cells within the active screen. One row of scratch
+  storage and overlap-aware traversal keep the source intact during a copy.
+  Destination line rendition and independent Kitty placements stay in place.
