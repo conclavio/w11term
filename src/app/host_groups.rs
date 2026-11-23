@@ -218,14 +218,18 @@ impl HostGroup {
     }
 
     fn load_command(&mut self, id: u64) -> bool {
-        let Some(command) = self.viewed_submission(id).map(|item| item.text.clone()) else {
+        let Some(command) = self.viewed_submission(id).map(|item| item.text.to_string()) else {
             return false;
         };
-        if self.draft != command.as_ref() {
-            let previous = std::mem::replace(&mut self.draft, command.to_string());
+        self.load_draft(command);
+        true
+    }
+
+    fn load_draft(&mut self, command: String) {
+        if self.draft != command {
+            let previous = std::mem::replace(&mut self.draft, command);
             self.previous_draft.get_or_insert(previous);
         }
-        true
     }
 
     fn restore_draft(&mut self) -> bool {
@@ -248,6 +252,8 @@ pub enum Action {
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
     LoadCommand(TabId, u64),
+    OpenSavedCommands(TabId),
+    LoadSavedCommand(TabId, w11term::saved_commands::Entry),
     RestoreDraft(TabId),
     CopyResults(TabId, u64),
     ViewOutput(TabId, u64, CommandLink),
@@ -256,6 +262,14 @@ pub enum Action {
 }
 
 impl TerminalApp {
+    pub(super) fn host_group_command_target(&self) -> Option<TabId> {
+        let id = self.tabs.active_id()?;
+        match &self.tabs.get(id)?.page {
+            Page::HostGroup(page) if !page.saved.is_editing() => Some(id),
+            _ => None,
+        }
+    }
+
     pub(super) fn update_host_group_timer(&mut self, ctx: &ComponentContext<Self>) {
         if matches!(
             self.tabs.active().map(|tab| &tab.page),
@@ -568,6 +582,20 @@ impl TerminalApp {
                     let _ = page.command_editor.request_focus();
                 }
             }
+            Action::OpenSavedCommands(id) => {
+                if self.host_group_command_target() == Some(id) {
+                    self.open_group_command_library(id, ctx);
+                }
+            }
+            Action::LoadSavedCommand(id, entry) => {
+                if self.host_group_command_target() == Some(id)
+                    && self.confirm_saved_command(&entry)
+                    && let Some(page) = self.host_group_mut(id)
+                {
+                    page.load_draft(entry.text);
+                    let _ = page.command_editor.request_focus();
+                }
+            }
             Action::RestoreDraft(id) => {
                 if let Some(page) = self.host_group_mut(id)
                     && page.restore_draft()
@@ -762,6 +790,9 @@ impl TerminalApp {
                 Message::HostGroup(Action::Send(id, text.clone(), selected.clone()))
             }))
             .content(send_label);
+        let saved_commands = Button::new()
+            .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenSavedCommands(id))))
+            .content("Saved commands…");
         let restore = if page.previous_draft.is_some() {
             Button::new()
                 .on_click(ctx.callback(move |_| Message::HostGroup(Action::RestoreDraft(id))))
@@ -802,7 +833,7 @@ impl TerminalApp {
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
-                        .children((send, restore)),
+                        .children((send, saved_commands, restore)),
                     hidden_selection,
                     TextBlock::new()
                         .text(instructions)

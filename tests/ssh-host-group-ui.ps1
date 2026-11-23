@@ -6,11 +6,19 @@ $ErrorActionPreference = 'Stop'
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'group-result-clipboard.txt'
+$null = [IO.Directory]::CreateDirectory($env:W11TERM_DATA_DIR)
+$library = Join-Path $env:W11TERM_DATA_DIR 'saved-commands.json'
 $profiles = Join-Path $State 'profiles.json'
 $profileData = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
 $dot = ' ' + [char]0xb7 + ' '
 $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
+
+function Save-FixtureCommand([string]$Text) {
+    $entries = @(@{ name = 'Fleet health'; text = $Text }, @{ name = 'Fleet uptime'; text = 'uptime' })
+    [IO.File]::WriteAllText($library, (ConvertTo-Json -InputObject $entries))
+}
+Save-FixtureCommand 'show old health'
 
 function Pane-Status([uint64]$Pane, [string]$Status) {
     $null = Wait-Until "pane $Pane status '$Status'" { Find-Element "Pane $Pane$dot$Status" }
@@ -60,10 +68,13 @@ function Outcome([string]$Target, [string]$Status) {
     $null = Wait-Until "$Target $Status" { Find-Element "$Target$dot$Status" }
 }
 function Click([string]$Name) {
-    Invoke-Button (Wait-Until "enabled '$Name'" {
+    $invoke = Wait-Until "enabled '$Name'" {
         $entry = Find-Element $Name $button
-        if ($entry -and $entry.Current.IsEnabled) { $entry }
-    })
+        $provider = $null
+        if ($entry -and $entry.Current.IsEnabled -and $entry.TryGetCurrentPattern(
+                [System.Windows.Automation.InvokePattern]::Pattern, [ref]$provider)) { $provider }
+    }
+    $invoke.Invoke()
 }
 
 $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
@@ -241,6 +252,37 @@ try {
     Submit 'after-reconnect-review' 'Send to 1 host'
     Outcome $westName 'Exit 17'
     $null = Wait-Until 'submission clears the restore action' { !(Find-Element 'Restore draft' $button) }
+    (Command-Editor).SetValue('draft before library')
+    $libraryButton = 'Saved commands' + [char]0x2026
+    $saved = "Load group command${dot}Fleet health"
+    Click $libraryButton
+    $librarySearch = Wait-Until 'the group library opens with its saved command results' {
+        $entry = Find-Element 'Search saved commands' $edit
+        $provider = $null
+        if ($entry -and $entry.TryGetCurrentPattern(
+                [System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider
+            ) -and $provider.Current.Value -ceq '' -and
+            (Find-Element "Load group command${dot}Fleet uptime" $button) -and
+            !(Find-Element 'SSH host group' $button)) { $provider }
+    }
+    $librarySearch.SetValue('FLEET HEALTH')
+    $null = Wait-Until 'the library shows only the matching saved command' {
+        (Find-Element $saved $button) -and !(Find-Element "Load group command${dot}Fleet uptime" $button)
+    }
+    Save-FixtureCommand 'show  fleet-health'
+    Click $saved
+    Click ("This saved command changed. Open the palette again.  " + [char]0xb7 + '  Dismiss')
+    if ((Command-Editor).Current.Value -cne 'draft before library') { throw 'A stale saved command replaced the draft' }
+    Click $libraryButton
+    Click $saved
+    Wait-CommandDraft 'show  fleet-health'
+    Click 'Restore draft'
+    Wait-CommandDraft 'draft before library'
+    Run-Palette $saved
+    Wait-CommandDraft 'show  fleet-health'
+    Click 'Send to 1 host'
+    $null = Wait-Until 'the saved command was explicitly submitted' { Find-Element "Submitted${dot}show  fleet-health" }
+    Outcome $westName 'Exit 17'
     Set-HostFilter ''
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On

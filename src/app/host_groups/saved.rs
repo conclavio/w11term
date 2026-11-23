@@ -18,6 +18,10 @@ struct Editor {
 }
 
 impl SavedUi {
+    pub(super) fn is_editing(&self) -> bool {
+        self.editor.is_some()
+    }
+
     fn name<'a>(&'a self, catalog: &'a Profiles) -> Option<&'a str> {
         self.selected
             .as_deref()

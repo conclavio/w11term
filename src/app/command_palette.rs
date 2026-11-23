@@ -26,6 +26,7 @@ pub enum CommandId {
         Option<clipboard_paste::Origin>,
         w11term::saved_commands::Entry,
     ),
+    GroupSavedCommand(TabId, w11term::saved_commands::Entry),
     TabAction(Shortcut, Option<TabId>),
     SetTabPinned(Option<TabId>, bool),
     SetTabColor(TabId, Option<TabColor>),
@@ -434,14 +435,34 @@ impl TerminalApp {
                 enabled,
             });
         }
-        let origin = self.saved_command_origin();
-        rows.extend(self.saved_commands.entries().iter().map(|entry| Row {
-            id: CommandId::SavedCommand(origin, entry.clone()),
-            label: format!("Insert command · {}", entry.name),
-            chord: String::new(),
-            enabled: origin.is_some(),
-        }));
+        if let Some(group) = self.host_group_command_target() {
+            rows.extend(self.group_saved_rows(group));
+        } else {
+            let origin = self.saved_command_origin();
+            rows.extend(self.saved_commands.entries().iter().map(|entry| Row {
+                id: CommandId::SavedCommand(origin, entry.clone()),
+                label: format!("Insert command · {}", entry.name),
+                chord: String::new(),
+                enabled: origin.is_some(),
+            }));
+        }
         filter(rows, query)
+    }
+
+    fn group_saved_rows(&self, group: TabId) -> impl Iterator<Item = Row> + '_ {
+        self.saved_commands.entries().iter().map(move |entry| Row {
+            id: CommandId::GroupSavedCommand(group, entry.clone()),
+            label: format!("Load group command · {}", entry.name),
+            chord: String::new(),
+            enabled: true,
+        })
+    }
+
+    pub(super) fn group_saved_command_rows(&self, group: TabId, query: &str) -> Vec<Row> {
+        if self.host_group_command_target() != Some(group) {
+            return Vec::new();
+        }
+        filter(self.group_saved_rows(group).collect(), query)
     }
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
@@ -467,6 +488,9 @@ impl TerminalApp {
                 return self.insert_saved_command(origin, entry, ctx);
             }
             CommandId::SavedCommand(None, _) => return,
+            CommandId::GroupSavedCommand(group, entry) => {
+                Message::HostGroup(host_groups::Action::LoadSavedCommand(group, entry))
+            }
             CommandId::TabAction(shortcut, group) => {
                 bind_tab_action(Message::Shortcut(shortcut), group)
             }
@@ -525,19 +549,25 @@ pub(super) fn view(
     selected: usize,
     query: &str,
     input: &ElementRef<TextBox>,
+    saved_only: bool,
     app: &TerminalApp,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let page = ((app.window_height - 156.0) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
+    let search_label = if saved_only {
+        "Search saved commands"
+    } else {
+        "Search commands"
+    };
     let search = Grid::new()
         .columns([GridLength::STAR, GridLength::Auto])
         .children((
             TextBox::new()
                 .element_ref(input)
                 .text(query)
-                .placeholder_text("Search commands")
-                .automation_name("Search commands")
+                .placeholder_text(search_label)
+                .automation_name(search_label)
                 .on_text_changed(ctx.callback(Message::PickerQuery)),
             Button::new()
                 .grid_column(1)
@@ -580,7 +610,11 @@ pub(super) fn view(
     if rows.is_empty() {
         results.push(KeyedView::new(
             "empty",
-            TextBlock::new().text("No matching commands"),
+            TextBlock::new().text(if saved_only && query.is_empty() {
+                "Add saved commands in Settings."
+            } else {
+                "No matching commands"
+            }),
         ));
     } else if rows.len() > page {
         let last = (first + page).min(rows.len());

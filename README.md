@@ -87,6 +87,8 @@ After delivery, the group follows each host separately. Matching shell markers s
 
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.
 
+Choose **Saved commands…** in the group editor to browse the same command library managed in **Settings → Saved commands**. You can also search by name in the command palette while the group is active. Choosing a command fills the draft for review. **Restore draft** is available here too.
+
 Choose **Copy results** to copy the viewed submission as plain text, including every recipient’s delivery, execution and interrupt status. The report uses full output retained in each pane and labels any preview that stands in for expired output. Large reports shorten output to fit the clipboard while retaining every host’s status.
 
 While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its selected hosts that still report the matching command as running. The result shows Ctrl+C delivery and the command’s eventual exit status separately. w11term uses each pane’s current keyboard mode.
