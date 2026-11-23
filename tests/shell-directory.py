@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from urllib.parse import quote_from_bytes
+from urllib.parse import quote_from_bytes, unquote_to_bytes
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "src/app"
@@ -154,8 +154,12 @@ builtin printf 'previous=%s\n' "$?"
 
 PS1='changed:%? > '
 builtin printf 'raw-prompt=<%s>\n' "$PS1"
-exit 0
+builtin printf '%s\n' '雪+;%'
+(
+    builtin :
+)
 """
+    tail += "builtin : " + "x" * 4096 + "\nexit 0\n"
     output, _ = run(
         command,
         "\n".join((startup, setup, setup, tail)),
@@ -171,10 +175,10 @@ exit 0
     assert b"\x1b]133;A\x07changed:0 > \x1b]133;B\x07" in cycle, cycle
     assert b"raw-prompt=<changed:%? > >\n" in cycle, cycle
     assert b"previous=23\n" in cycle and b"existing-prompt=23\n" in cycle, cycle
-    assert b"existing-preexec\n\x1b]133;C\x07" in cycle, cycle
+    assert b"existing-preexec\n\x1b]133;C;cmdline_url=" in cycle, cycle
     assert b"\x1b]133;D;23\x07existing-prompt=23\n" in cycle, cycle
-    commands = [mark for mark in MARK.findall(cycle) if mark.startswith((b"C", b"D"))]
-    assert commands == [
+    marks = [mark for mark in MARK.findall(cycle) if mark.startswith((b"C", b"D"))]
+    assert [b"C" if mark.startswith(b"C") else mark for mark in marks] == [
         b"D;0",
         b"C", b"D;0",  # cd
         b"C", b"D;0",  # print the new directory
@@ -182,8 +186,18 @@ exit 0
         b"C", b"D;0",  # print the previous status
         b"C", b"D;0",  # replace PS1
         b"C", b"D;0",  # inspect PS1
+        b"C", b"D;0",  # print Unicode and punctuation
+        b"C", b"D;0",  # multiline input
+        b"C", b"D;0",  # oversized input uses a plain start mark
         b"C",          # exit doesn't return to a prompt
-    ], commands
+    ], marks
+    original_lines = [
+        unquote_to_bytes(mark.removeprefix(b"C;cmdline_url="))
+        for mark in marks if mark.startswith(b"C;cmdline_url=")
+    ]
+    assert br"builtin printf '%s\n' '" + "雪+;%".encode() + b"'" in original_lines, original_lines
+    assert b"(\n    builtin :\n)" in original_lines, original_lines
+    assert marks.count(b"C") == 1, marks
 
     for startup, diagnostic in [
         ("unsetopt PROMPT_PERCENT", b"requires the PROMPT_PERCENT option"),

@@ -755,6 +755,7 @@ pub enum FinalTermSemanticPrompt {
 
     MarkEndOfInputAndStartOfOutput {
         aid: Option<String>,
+        command: Option<String>,
     },
 
     /// Indicates the result of the command
@@ -782,13 +783,18 @@ impl FinalTermSemanticPrompt {
         single!(MarkEndOfPromptAndStartOfInputUntilEndOfLine, "I");
 
         let mut params = HashMap::new();
+        let mut command = None;
         use core::convert::TryInto;
 
         for s in osc.iter().skip(if param == "D" { 3 } else { 2 }) {
             if let Some(equal) = s.iter().position(|c| *c == b'=') {
                 let key = &s[..equal];
                 let value = &s[equal + 1..];
-                params.insert(str::from_utf8(key)?, str::from_utf8(value)?);
+                if param == "C" && key == b"cmdline_url" {
+                    command = decode_reported_command(value);
+                } else {
+                    params.insert(str::from_utf8(key)?, str::from_utf8(value)?);
+                }
             } else if !s.is_empty() {
                 bail!("malformed FinalTermSemanticPrompt");
             }
@@ -807,6 +813,7 @@ impl FinalTermSemanticPrompt {
         if param == "C" {
             return Ok(Self::MarkEndOfInputAndStartOfOutput {
                 aid: params.get("aid").map(|&s| s.to_owned()),
+                command,
             });
         }
 
@@ -844,6 +851,33 @@ impl FinalTermSemanticPrompt {
     }
 }
 
+fn decode_reported_command(encoded: &[u8]) -> Option<String> {
+    use vtparse::MAX_REPORTED_COMMAND_BYTES as MAX_BYTES;
+    if encoded.len() > MAX_BYTES * 3 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(encoded.len().min(MAX_BYTES));
+    let mut input = encoded.iter().copied();
+    while let Some(byte) = input.next() {
+        if bytes.len() == MAX_BYTES || !byte.is_ascii_graphic() {
+            return None;
+        }
+        if byte == b'%' {
+            let mut decoded = [0];
+            hex::decode_to_slice([input.next()?, input.next()?], &mut decoded).ok()?;
+            bytes.push(decoded[0]);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    let command = String::from_utf8(bytes).ok()?;
+    (!command.trim().is_empty()
+        && command
+            .chars()
+            .all(|c| !c.is_control() || matches!(c, '\t' | '\n')))
+    .then_some(command)
+}
+
 impl Display for FinalTermSemanticPrompt {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         write!(f, "133;")?;
@@ -872,10 +906,20 @@ impl Display for FinalTermSemanticPrompt {
             }
             Self::MarkEndOfPromptAndStartOfInputUntilNextMarker => write!(f, "B")?,
             Self::MarkEndOfPromptAndStartOfInputUntilEndOfLine => write!(f, "I")?,
-            Self::MarkEndOfInputAndStartOfOutput { aid } => {
+            Self::MarkEndOfInputAndStartOfOutput { aid, command } => {
                 write!(f, "C")?;
                 if let Some(aid) = aid {
                     write!(f, ";aid={}", aid)?;
+                }
+                if let Some(command) = command {
+                    write!(f, ";cmdline_url=")?;
+                    for byte in command.bytes() {
+                        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                            write!(f, "{}", char::from(byte))?;
+                        } else {
+                            write!(f, "%{byte:02X}")?;
+                        }
+                    }
                 }
             }
             Self::CommandStatus { status, aid } => {
@@ -1544,7 +1588,10 @@ mod test {
         assert_eq!(
             parse(&["133", "C"], "\x1b]133;C\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { aid: None }
+                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput {
+                    aid: None,
+                    command: None,
+                }
             )
         );
 
@@ -1552,7 +1599,8 @@ mod test {
             parse(&["133", "C", "aid=123"], "\x1b]133;C;aid=123\x1b\\"),
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput {
-                    aid: Some("123".to_string())
+                    aid: Some("123".to_string()),
+                    command: None,
                 }
             )
         );

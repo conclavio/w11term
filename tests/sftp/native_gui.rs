@@ -504,9 +504,12 @@ async fn native_control_history_keeps_command_ids_bound_to_the_ssh_connection() 
 #[ignore = "filters OSC 133 history by command and status through native controls and the CLI"]
 async fn native_ssh_command_history_searches_and_copies_the_full_command() {
     let long = format!("deploy {} [Ångström]", "x".repeat(128));
-    let mut stream = String::new();
+    let encoded = percent_encoding::utf8_percent_encode(&long, percent_encoding::NON_ALPHANUMERIC);
+    let mut stream = format!(
+        "\x1b]133;A\x07$ \x1b]133;B\x07visible deployment prompt\r\n\
+         \x1b]133;C;cmdline_url={encoded}\x07archived deploy output\r\n\x1b]133;D;17\x07"
+    );
     for (command, output, status) in [
-        (&long[..], "archived deploy output", ";17"),
         ("deploy audit", "no status reported", ""),
         ("deploy retry", "retry failed", ";2"),
         (

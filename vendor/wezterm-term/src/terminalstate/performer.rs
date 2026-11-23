@@ -1032,9 +1032,9 @@ impl Performer<'_> {
                 self.clear_semantic_attribute_on_newline = true;
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
-                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { .. },
+                FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { command, .. },
             ) => {
-                self.begin_command_output();
+                self.begin_command_output(command);
                 self.pen.set_semantic_type(SemanticType::Output);
             }
 

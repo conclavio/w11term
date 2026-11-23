@@ -259,7 +259,7 @@ impl Events {
             return;
         };
         let (aid, exit_code) = match marker {
-            MarkEndOfInputAndStartOfOutput { aid } => {
+            MarkEndOfInputAndStartOfOutput { aid, .. } => {
                 // A repeated start or a nested shell cannot steal the original watch.
                 watch.running.get_or_insert_with(|| RunningCommand {
                     aid: application_id(aid.as_deref()),
