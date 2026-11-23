@@ -33,6 +33,7 @@ mod kitty;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
+mod sgr_stack;
 mod sixel;
 mod title;
 use crate::terminalstate::image::*;
@@ -426,6 +427,7 @@ pub struct TerminalState {
 
     synchronized_output: bool,
     saved_private_modes: SavedPrivateModes,
+    sgr_stack: sgr_stack::SgrStack,
 
     /// The unicode version that is in effect
     unicode_version: UnicodeVersion,
@@ -579,6 +581,7 @@ impl TerminalState {
         self.kitty_img = Default::default();
         self.inactive_kitty_img = Default::default();
         self.image_cache.clear();
+        self.sgr_stack = Default::default();
         self.screen.screen = primary;
         self.activate_screen(false);
     }
@@ -692,6 +695,7 @@ impl TerminalState {
             kitty_animation_time: None,
             synchronized_output: false,
             saved_private_modes: SavedPrivateModes::default(),
+            sgr_stack: Default::default(),
             seqno,
             unicode_version,
             unicode_version_stack: vec![],

@@ -1368,6 +1368,99 @@ mod tests {
     }
 
     #[test]
+    fn xterm_sgr_stack_restores_text_style_while_leaving_the_current_link() {
+        use wezterm_term::{Intensity, Underline};
+
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b]8;;https://example.test/old\x1b\\");
+        term.advance_bytes(b"\x1b[1;3;4:3;5;7;8;9;53;73m\x1b[38;2;11;22;33;48;5;200;58;5;220mA");
+        for byte in b"\x1b[#{\x1b[0m\x1b]8;;https://example.test/new\x1b\\\x1b[#}B" {
+            term.advance_bytes([*byte]);
+        }
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let mut cells = frame.rows[0].visible_cells();
+        let a = cells.next().unwrap();
+        let b = cells.next().unwrap();
+        assert_eq!((a.str(), b.str()), ("A", "B"));
+        let (original, restored) = (a.attrs(), b.attrs());
+        assert_eq!(
+            restored.hyperlink().unwrap().uri(),
+            "https://example.test/new"
+        );
+        assert_eq!(restored.intensity(), Intensity::Bold);
+        assert_eq!(restored.underline(), Underline::Curly);
+        assert!(restored.italic() && restored.reverse() && restored.invisible());
+        assert!(restored.strikethrough() && restored.overline());
+        assert_eq!(restored.blink(), original.blink());
+        assert_eq!(restored.vertical_align(), original.vertical_align());
+        assert_eq!(restored.foreground(), original.foreground());
+        assert_eq!(restored.background(), original.background());
+        assert_eq!(restored.underline_color(), original.underline_color());
+    }
+
+    #[test]
+    fn xterm_sgr_stack_restores_only_the_selected_attributes() {
+        use wezterm_term::{Intensity, Underline, color::ColorAttribute};
+
+        let (mut term, _) = engine();
+        term.advance_bytes(b"\x1b[1;31m\x1b[1;10#p\x1b[22;32;44;21m\x1b[#qA");
+        term.advance_bytes(b"\x1b[2;4#{\x1b[2;4m\x1b[#}B");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let mut cells = frame.rows[0].visible_cells();
+        let first = cells.next().unwrap();
+        let second = cells.next().unwrap();
+        assert_eq!(first.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        assert_eq!(first.attrs().background(), ColorAttribute::PaletteIndex(4));
+        assert_eq!(first.attrs().intensity(), Intensity::Bold);
+        assert_eq!(first.attrs().underline(), Underline::Double);
+        assert_eq!(second.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        assert_eq!(second.attrs().background(), ColorAttribute::PaletteIndex(4));
+        assert_eq!(second.attrs().intensity(), Intensity::Normal);
+        assert_eq!(second.attrs().underline(), Underline::None);
+    }
+
+    #[test]
+    fn xterm_sgr_stack_caps_saved_levels_and_pairs_extra_pushes_with_pops() {
+        use wezterm_term::color::ColorAttribute;
+
+        let (mut term, _) = engine();
+        for index in 20..=30 {
+            term.advance_bytes(format!("\x1b[38;5;{index}m\x1b[#{{"));
+        }
+        term.advance_bytes(b"\x1b[38;5;42m\x1b[#}A");
+        for _ in 0..10 {
+            term.advance_bytes(b"\x1b[#}X");
+        }
+        term.advance_bytes(b"\x1b[#}B\x1b[0#{\x1b[35m\x1b[#}C");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let expected = std::iter::once(42).chain((20..30).rev()).chain([20, 5]);
+        let colors = frame.rows[0]
+            .visible_cells()
+            .map(|cell| cell.attrs().foreground());
+        assert!(colors.eq(expected.map(ColorAttribute::PaletteIndex)));
+    }
+
+    #[test]
+    fn xterm_sgr_stack_survives_terminal_resets_and_clears_on_reconnect() {
+        use wezterm_term::color::ColorAttribute;
+
+        let (mut term, _) = engine();
+        for reset in ["\x1bc", "\x1b[!p"] {
+            term.advance_bytes(format!("\x1b[31m\x1b[#p{reset}\x1b[#q\x1b[H"));
+            term.advance_bytes(b"A");
+            let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+            let cell = frame.rows[0].visible_cells().next().unwrap();
+            assert_eq!(cell.attrs().foreground(), ColorAttribute::PaletteIndex(1));
+        }
+        term.advance_bytes(b"\x1b[31m\x1b[#p");
+        term.reset_connection();
+        term.advance_bytes(b"\x1b[32m\x1b[#qB");
+        let frame = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        let cell = frame.rows[0].visible_cells().next().unwrap();
+        assert_eq!(cell.attrs().foreground(), ColorAttribute::PaletteIndex(2));
+    }
+
+    #[test]
     fn xterm_private_modes_restore_named_values_without_consuming_them() {
         let (mut term, mut out) = engine();
         term.advance_bytes(b"\x1b[?1;2004h\x1b[?25l");
