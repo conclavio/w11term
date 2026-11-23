@@ -78,7 +78,9 @@ impl PlacementSelection {
 pub struct KittyImageState {
     accumulator: Vec<KittyImage>,
     max_image_id: u32,
-    number_to_id: HashMap<u32, u32>,
+    // Multiple live image IDs may have the same client-supplied number.
+    // A numbered upload always allocates a fresh, increasing image ID.
+    numbered_images: HashMap<u32, Vec<u32>>,
     id_to_data: HashMap<u32, Arc<ImageData>>,
     // An upload without a wire image ID belongs to its sole placement.
     anonymous_data: HashMap<Key, Arc<ImageData>>,
@@ -93,6 +95,20 @@ pub struct KittyImageState {
 }
 
 impl KittyImageState {
+    fn id_for_number(&self, number: u32) -> Option<u32> {
+        self.numbered_images.get(&number)?.last().copied()
+    }
+
+    fn retain_numbered_images(
+        numbered_images: &mut HashMap<u32, Vec<u32>>,
+        mut keep: impl FnMut(u32) -> bool,
+    ) {
+        numbered_images.retain(|_, ids| {
+            ids.retain(|&id| keep(id));
+            !ids.is_empty()
+        });
+    }
+
     fn remove_data_for_id(&mut self, image_id: u32) {
         self.playback.remove(&image_id);
         if let Some(data) = self.id_to_data.remove(&image_id) {
@@ -231,7 +247,7 @@ impl KittyImageState {
         if ids.is_empty() {
             return false;
         }
-        self.number_to_id.retain(|_, id| !ids.contains(id));
+        Self::retain_numbered_images(&mut self.numbered_images, |id| !ids.contains(&id));
         for id in ids {
             self.remove_data_for_id(id);
         }
@@ -265,7 +281,7 @@ impl KittyImageState {
             );
             self.used_memory = self.used_memory.saturating_sub(freed);
             let table = &self.id_to_data;
-            self.number_to_id.retain(|_, id| table.contains_key(id));
+            Self::retain_numbered_images(&mut self.numbered_images, |id| table.contains_key(&id));
             self.playback.retain(|id, _| table.contains_key(id));
         }
     }
@@ -292,18 +308,14 @@ impl TerminalState {
         let image_number = image_number.filter(|&n| n != 0);
         let image_id = match image_id.filter(|&id| id != 0) {
             Some(id) => id,
-            None => *self
+            None => self
                 .kitty_img
-                .number_to_id
-                .get(
-                    &image_number
+                .id_for_number(
+                    image_number
                         .ok_or_else(|| anyhow::anyhow!("no image_id or image_number specified!"))?,
                 )
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "image_number has no matching image id {:?} in number_to_id",
-                        image_number
-                    )
+                    anyhow::anyhow!("image_number has no matching image id {:?}", image_number)
                 })?,
         };
 
@@ -554,7 +566,7 @@ impl TerminalState {
                 let image_number = image_number.filter(|&n| n != 0);
                 let id = image_id
                     .filter(|&id| id != 0)
-                    .or_else(|| self.kitty_img.number_to_id.get(&image_number?).copied());
+                    .or_else(|| self.kitty_img.id_for_number(image_number?));
                 let control = playback::Control {
                     state,
                     edit_frame,
@@ -688,6 +700,20 @@ impl TerminalState {
                 let release = delete.then_some(image_id).into_iter().collect();
                 (keys, release)
             }
+            KittyImageDelete::ByImageNumber {
+                image_number,
+                placement_id,
+                delete,
+            } => {
+                if let Some(image_id) = self.kitty_img.id_for_number(image_number) {
+                    self.kitty_delete(KittyImageDelete::ByImageId {
+                        image_id,
+                        placement_id,
+                        delete,
+                    });
+                }
+                return;
+            }
             KittyImageDelete::AtCursorPosition { delete } => {
                 let selection = usize::try_from(self.cursor.y)
                     .ok()
@@ -726,6 +752,14 @@ impl TerminalState {
         };
         self.kitty_img
             .collect_kitty_dependents(&mut keys, &mut free_ids);
+        if let KittyImageDelete::ByImageId {
+            image_id,
+            delete: false,
+            ..
+        } = what
+        {
+            free_ids.remove(&image_id);
+        }
         self.detach_kitty_cells(&keys);
         self.kitty_img.discard_placements(&keys);
         if self.kitty_img.release_unplaced_images(free_ids) {
@@ -925,8 +959,8 @@ impl TerminalState {
     ) -> anyhow::Result<()> {
         self.image_cache.clear();
         let image_id = match frame.image_number.filter(|&n| n != 0) {
-            Some(no) => match self.kitty_img.number_to_id.get(&no) {
-                Some(id) => *id,
+            Some(no) => match self.kitty_img.id_for_number(no) {
+                Some(id) => id,
                 None => {
                     self.kitty_send_response(
                         verbosity,
@@ -1076,9 +1110,9 @@ impl TerminalState {
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<()> {
         if let Some(no) = transmit.image_number.take().filter(|&n| n != 0) {
-            match self.kitty_img.number_to_id.get(&no) {
+            match self.kitty_img.id_for_number(no) {
                 Some(id) => {
-                    transmit.image_id.replace(*id);
+                    transmit.image_id.replace(id);
                 }
                 None => {
                     transmit.image_number.replace(no);
@@ -1477,7 +1511,11 @@ impl TerminalState {
             self.kitty_img.id_to_data.insert(image_id, Arc::clone(&img));
         }
         if let Some(number) = image_number {
-            self.kitty_img.number_to_id.insert(number, image_id);
+            self.kitty_img
+                .numbered_images
+                .entry(number)
+                .or_default()
+                .push(image_id);
         }
 
         if image_number.is_some() {

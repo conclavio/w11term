@@ -117,6 +117,13 @@ scrollback on the active screen. The stock kitty and Direct2D
 `clear-groups.vt` tests check row and column selection, layer removal, and
 redisplay after a different placement keeps an image's data alive.
 
+Use `d=n/N,I=<number>` to target the newest image uploaded under that number.
+An optional `p` selects one placement on that image. When `N` frees the
+newest image, the same number addresses the next newest surviving image.
+Kitty 0.45 and Direct2D share the `clear-number.vt` comparison. Kitty 0.32.2
+applies number deletion to every image with that number.
+[Kitty 0.45](https://github.com/kovidgoyal/kitty/blob/v0.45.0/kitty/graphics.c#L2011-L2020) · [Kitty 0.32.2](https://github.com/kovidgoyal/kitty/blob/v0.32.2/kitty/graphics.c#L1885-L1888)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.
