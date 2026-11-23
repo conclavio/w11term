@@ -119,6 +119,10 @@ pub enum CSI {
     /// These values affect how the character is rendered.
     Sgr(Sgr),
 
+    /// Xterm's SGR stack. An empty list saves all supported attributes.
+    PushSgr(Vec<i64>),
+    PopSgr,
+
     /// CSI codes that relate to the cursor
     Cursor(Cursor),
 
@@ -220,6 +224,16 @@ impl Display for CSI {
         write!(f, "\x1b[")?;
         match self {
             CSI::Sgr(sgr) => sgr.fmt(f)?,
+            CSI::PushSgr(parameters) => {
+                for (index, value) in parameters.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ";")?;
+                    }
+                    write!(f, "{}", value)?;
+                }
+                write!(f, "#{{")?;
+            }
+            CSI::PopSgr => write!(f, "#}}")?,
             CSI::Cursor(c) => c.fmt(f)?,
             CSI::Edit(e) => e.fmt(f)?,
             CSI::Mode(mode) => mode.fmt(f)?,
@@ -1877,6 +1891,22 @@ impl<'a> CSIParser<'a> {
                 .secondary_device_attributes(params)
                 .map(|dev| CSI::Device(Box::new(dev))),
 
+            ('p' | '{', [parameters @ .., CsiParam::P(b'#')]) if !self.parameters_truncated => {
+                let parameters = if parameters.is_empty() {
+                    Vec::new()
+                } else {
+                    parameters
+                        .split(|param| *param == CsiParam::P(b';'))
+                        .map(|param| match param {
+                            [CsiParam::Integer(value)] => Ok(*value),
+                            [] => Ok(0),
+                            _ => Err(()),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(CSI::PushSgr(parameters))
+            }
+            ('q' | '}', [CsiParam::P(b'#')]) if !self.parameters_truncated => Ok(CSI::PopSgr),
             ('S', [CsiParam::P(b'#')]) if !self.parameters_truncated => {
                 Ok(CSI::Window(Box::new(Window::ReportTitleStackPosition)))
             }

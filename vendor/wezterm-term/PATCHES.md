@@ -86,6 +86,9 @@ The original MIT license is preserved in `LICENSE.md`.
   from eviction as new output arrives. This lets the UI discard an old
   scrollbar gesture after either a local clear or a remote CSI 3 J.
 
+- XTPUSHSGR and XTPOPSGR use a bounded text-style stack with selective
+  restoration. A new transport starts with an empty stack.
+
 - XTSAVE and XTRESTORE preserve supported DEC private modes, including the
   alternate-buffer selector and the mouse reporting and encoding modes. Saved
   values are scoped to the connection and cleared by full reset.

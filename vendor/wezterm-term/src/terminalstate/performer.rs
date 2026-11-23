@@ -597,6 +597,8 @@ impl<'a> Performer<'a> {
         self.flush_print();
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
+            CSI::PushSgr(parameters) => self.state.sgr_stack.push(&parameters, &self.state.pen),
+            CSI::PopSgr => self.state.sgr_stack.pop(&mut self.state.pen),
             CSI::Cursor(wezterm_escape_parser::csi::Cursor::Left(n)) => {
                 // We treat CUB (Cursor::Left) the same as Backspace as
                 // that is what xterm does.
