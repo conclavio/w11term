@@ -8,6 +8,7 @@ use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::io::Write;
+use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 mod placement;
@@ -27,23 +28,48 @@ struct PhysicalPlacement {
     bounds: PlacementInfo,
     row_revision: u64,
     created: wezterm_surface::SequenceNo,
+    z: i32,
     // A reconnected SSH session can reuse an ID still visible in frozen history.
     data: Weak<ImageData>,
 }
 
 #[derive(Clone, Copy)]
-struct PlacementCell {
-    x: usize,
-    y: usize,
+struct PlacementSelection {
+    column: Option<usize>,
+    row: Option<usize>,
     z: Option<i32>,
 }
 
-impl PlacementCell {
-    fn from_wire(x: u32, y: u32, z: Option<i32>) -> Option<Self> {
-        Some(Self {
-            x: x.checked_sub(1)? as usize,
-            y: y.checked_sub(1)? as usize,
+impl PlacementSelection {
+    fn cell(x: usize, y: usize, z: Option<i32>) -> Self {
+        Self {
+            column: Some(x),
+            row: Some(y),
             z,
+        }
+    }
+
+    fn wire_cell(x: u32, y: u32, z: Option<i32>) -> Option<Self> {
+        Some(Self::cell(
+            x.checked_sub(1)? as usize,
+            y.checked_sub(1)? as usize,
+            z,
+        ))
+    }
+
+    fn column(x: u32) -> Option<Self> {
+        Some(Self {
+            column: Some(x.checked_sub(1)? as usize),
+            row: None,
+            z: None,
+        })
+    }
+
+    fn row(y: u32) -> Option<Self> {
+        Some(Self {
+            column: None,
+            row: Some(y.checked_sub(1)? as usize),
+            z: None,
         })
     }
 }
@@ -388,6 +414,7 @@ impl TerminalState {
                     bounds,
                     row_revision,
                     created: self.seqno,
+                    z: placement.z_index.unwrap_or(0),
                     data,
                 },
             );
@@ -595,7 +622,13 @@ impl TerminalState {
         let (mut keys, mut free_ids): (HashSet<Key>, HashSet<u32>) = match what {
             KittyImageDelete::All { delete } => {
                 let (retained, mut visible) = self.kitty_img.physical_keys(self.screen());
-                self.find_visible_kitty_relatives(&mut visible, None);
+                let screen = self.screen();
+                self.find_kitty_relatives(
+                    &mut visible,
+                    screen.phys_row(0)..screen.scrollback_rows(),
+                    0..screen.physical_cols,
+                    None,
+                );
                 let release = visible
                     .iter()
                     .map(|key| key.0)
@@ -656,18 +689,35 @@ impl TerminalState {
                 (keys, release)
             }
             KittyImageDelete::AtCursorPosition { delete } => {
-                let cell = usize::try_from(self.cursor.y).ok().map(|y| PlacementCell {
-                    x: self.cursor.x,
-                    y,
-                    z: None,
-                });
-                self.kitty_delete_at(cell, delete)
+                let selection = usize::try_from(self.cursor.y)
+                    .ok()
+                    .map(|y| PlacementSelection::cell(self.cursor.x, y, None));
+                self.kitty_delete_selection(selection, delete)
             }
             KittyImageDelete::DeleteAt { x, y, delete } => {
-                self.kitty_delete_at(PlacementCell::from_wire(x, y, None), delete)
+                self.kitty_delete_selection(PlacementSelection::wire_cell(x, y, None), delete)
             }
             KittyImageDelete::DeleteAtZ { x, y, z, delete } => {
-                self.kitty_delete_at(PlacementCell::from_wire(x, y, Some(z)), delete)
+                self.kitty_delete_selection(PlacementSelection::wire_cell(x, y, Some(z)), delete)
+            }
+            KittyImageDelete::DeleteColumn { x, delete } => {
+                self.kitty_delete_selection(PlacementSelection::column(x), delete)
+            }
+            KittyImageDelete::DeleteRow { y, delete } => {
+                self.kitty_delete_selection(PlacementSelection::row(y), delete)
+            }
+            KittyImageDelete::DeleteZ { z, delete } => {
+                let keys = self
+                    .kitty_img
+                    .placements
+                    .iter()
+                    .filter_map(|(&key, p)| (p.z == z).then_some(key))
+                    .chain(self.kitty_img.projected.iter().filter_map(|(&key, node)| {
+                        (node.parent.is_some() && node.placement.z_index.unwrap_or(0) == z)
+                            .then_some(key)
+                    }))
+                    .collect();
+                self.kitty_selected_for_deletion(keys, delete)
             }
             _ => {
                 log::warn!("unhandled KittyImage::Delete {:?}", what);
@@ -683,35 +733,75 @@ impl TerminalState {
         }
     }
 
-    fn kitty_delete_at(
+    fn kitty_delete_selection(
         &self,
-        cell: Option<PlacementCell>,
+        selection: Option<PlacementSelection>,
         delete: bool,
     ) -> (HashSet<Key>, HashSet<u32>) {
         let mut keys = HashSet::new();
-        let mut release = HashSet::new();
         let screen = self.screen();
-        let Some(cell) = cell.filter(|p| p.x < screen.physical_cols && p.y < screen.physical_rows)
-        else {
-            return (keys, release);
+        let Some(selection) = selection.filter(|p| {
+            p.column.is_none_or(|x| x < screen.physical_cols)
+                && p.row.is_none_or(|y| y < screen.physical_rows)
+        }) else {
+            return (keys, HashSet::new());
         };
-        let row = screen.phys_row(cell.y as crate::VisibleRowIndex);
-        if let Some(images) = screen
-            .physical_lines()
-            .nth(row)
-            .and_then(|line| line.get_cell(cell.x))
-            .and_then(|cell| cell.attrs().images())
-        {
+        let rows = selection.row.map_or(0..screen.scrollback_rows(), |y| {
+            let row = screen.phys_row(y as crate::VisibleRowIndex);
+            row..row + 1
+        });
+        let columns = selection
+            .column
+            .map_or(0..screen.physical_cols, |x| x..x + 1);
+        let mut collect = |attrs: &wezterm_cell::CellAttributes| {
             keys.extend(
-                images
-                    .iter()
-                    .filter(|tile| cell.z.is_none_or(|z| z == tile.z_index()))
-                    .filter_map(|tile| self.kitty_img.tile_key(tile)),
+                attrs
+                    .images()
+                    .into_iter()
+                    .flatten()
+                    .filter(|tile| selection.z.is_none_or(|z| z == tile.z_index()))
+                    .filter_map(|tile| self.kitty_img.tile_key(&tile)),
             );
+        };
+        let oldest = if rows.len() > 1 {
+            self.kitty_img.placements.values().map(|p| p.created).min()
+        } else {
+            Some(0)
+        };
+        for line in screen
+            .physical_lines()
+            .skip(rows.start)
+            .take(rows.len())
+            .filter(|line| oldest.is_some_and(|seq| line.changed_since(seq.saturating_sub(1))))
+        {
+            if let Some(x) = selection.column {
+                if let Some(cell) = line.get_cell(x) {
+                    collect(cell.attrs());
+                }
+            } else {
+                for cell in line
+                    .visible_cells()
+                    .take_while(|cell| cell.cell_index() < screen.physical_cols)
+                {
+                    collect(cell.attrs());
+                }
+            }
         }
-        self.find_visible_kitty_relatives(&mut keys, Some(cell));
-        if delete {
-            release.extend(keys.iter().map(|key| key.0).filter(|&id| id != 0));
+        self.find_kitty_relatives(&mut keys, rows, columns, selection.z);
+        self.kitty_selected_for_deletion(keys, delete)
+    }
+
+    fn kitty_selected_for_deletion(
+        &self,
+        mut keys: HashSet<Key>,
+        delete: bool,
+    ) -> (HashSet<Key>, HashSet<u32>) {
+        let release: HashSet<_> = keys
+            .iter()
+            .map(|key| key.0)
+            .filter(|&id| delete && id != 0)
+            .collect();
+        if !release.is_empty() {
             // Erased cells can leave stale placement entries. Drop such entries
             // for the selected images so only live or historical tiles pin data.
             let siblings: Vec<_> = self
@@ -722,7 +812,7 @@ impl TerminalState {
                 .copied()
                 .collect();
             if !siblings.is_empty() {
-                let (retained, _) = self.kitty_img.physical_keys(screen);
+                let (retained, _) = self.kitty_img.physical_keys(self.screen());
                 keys.extend(siblings.into_iter().filter(|key| !retained.contains(key)));
             }
         }

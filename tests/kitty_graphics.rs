@@ -480,6 +480,65 @@ fn cell_and_z_deletion_preserve_other_layers_and_placeholder_text() {
 }
 
 #[test]
+fn row_and_column_deletion_select_whole_placements_at_the_correct_history_offsets() {
+    let (mut t, _) = engine();
+    for id in 11..=14 {
+        transmit_red(&mut t, id);
+    }
+    place(&mut t, 11, 1, 1, 3, 1);
+    place(&mut t, 12, 1, 2, 3, 3);
+    place(&mut t, 13, 1, 3, 6, 2);
+    place(&mut t, 14, 1, 6, 6, 1);
+    t.advance_bytes(b"\x1b[8;1H\r\n\r\n");
+    let start = frame(&t, None, 2);
+    for (x, y, id) in [(2, 0, 11), (2, 1, 12), (5, 2, 13), (5, 5, 14)] {
+        assert_eq!(pixel(&start, x, y, id), RED);
+    }
+    t.advance_bytes(b"\x1b_Ga=d,d=Y,y=0\x1b\\\x1b_Ga=d,d=X,x=4294967295\x1b\\");
+    assert_eq!(pixel(&frame(&t, None, 0), 2, 0, 12), RED);
+    t.advance_bytes(b"\x1b_Ga=d,d=y,y=1\x1b\\");
+    let after_row = frame(&t, Some(&start), 2);
+    assert_eq!(pixel(&after_row, 2, 0, 11), RED);
+    assert_eq!(pixel(&after_row, 2, 1, 12), None);
+    assert_eq!(pixel(&after_row, 5, 3, 13), None);
+    place(&mut t, 12, 2, 5, 3, 1);
+    place(&mut t, 13, 2, 5, 7, 1);
+    t.advance_bytes(b"\x1b_Ga=d,d=X,x=3\x1b\\");
+    let after_column = frame(&t, Some(&after_row), 2);
+    assert_eq!(pixel(&after_column, 2, 0, 11), None);
+    assert_eq!(pixel(&after_column, 5, 5, 14), RED);
+    place(&mut t, 11, 3, 2, 1, 1);
+    place(&mut t, 12, 3, 2, 2, 1);
+    let live = frame(&t, None, 0);
+    assert_eq!(pixel(&live, 0, 1, 11), None);
+    assert_eq!(pixel(&live, 1, 1, 12), None);
+    assert_eq!(pixel(&live, 6, 4, 13), RED);
+}
+
+#[test]
+fn z_deletion_also_reaches_history_and_skips_virtual_placements() {
+    let (mut t, _) = engine();
+    t.advance_bytes(PLACEMENTS);
+    transmit_red(&mut t, 51);
+    t.advance_bytes(concat!(
+        "\x1b[1;10H\x1b_Ga=p,i=51,p=1,z=-7,c=1,r=1,C=1,q=2\x1b\\",
+        "\x1b[6;10H\x1b_Ga=p,i=51,p=2,z=-7,c=1,r=1,C=1,q=2\x1b\\",
+        "\x1b[6;11H\x1b_Ga=p,i=51,p=3,z=6,c=1,r=1,C=1,q=2\x1b\\",
+        "\x1b[8;1H\r\n\r\n",
+    ));
+    let start = frame(&t, None, 2);
+    assert!(pixel(&start, 2, 2, 42).is_some());
+    assert!(pixel(&start, 5, 3, 43).is_some());
+    t.advance_bytes(b"\x1b_Ga=d,d=z,z=0\x1b\\\x1b_Ga=d,d=Z,z=-7\x1b\\");
+    let deleted = frame(&t, Some(&start), 2);
+    assert!(pixel(&deleted, 2, 2, 42).is_some());
+    assert_eq!(pixel(&deleted, 5, 3, 43), None);
+    assert_eq!(pixel(&deleted, 9, 0, 51), None);
+    assert_eq!(pixel(&deleted, 9, 5, 51), None);
+    assert_eq!(pixel(&deleted, 10, 5, 51), RED);
+}
+
+#[test]
 fn targeted_delete_preserves_unnamed_placements_until_named_image_retransmission() {
     let (mut t, _) = engine();
     transmit_red(&mut t, 41);
