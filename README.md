@@ -135,6 +135,8 @@ Choose **Cancel transfer** to stop the current upload or download and skip the r
 
 Choose **Filter filenames…** and type part of a name to search the entire directory listing, including later pages. Matching ignores case and treats punctuation literally. Filtering uses the listing already in memory. **Done** returns keyboard input to the terminal and keeps the results visible. **Clear filter** brings back all entries. Refresh keeps your filter in the current directory, and opening another directory starts with its full listing.
 
+Under **Sort by**, choose **Newest first** to find a recent log or capture. Folders stay first. Within each group, entries with a reported modification time appear newest to oldest, followed by entries without a timestamp. **Name** restores alphabetical order. Changing the sort uses the cached listing and keeps the selected filename in view, including when it moves to another page. Each pane starts with name sorting and keeps its own choice.
+
 Choose **New folder** and enter a name to create a directory under the displayed remote path. After the server confirms creation, the drawer refreshes and selects the new folder. If the name already exists, the drawer shows the server’s error. **Replace existing files** applies to file transfers.
 
 Select a file or directory and choose **Rename…** to change its name in the current remote folder. The drawer checks for an existing destination, sends a standard SFTP rename, and selects the new name after the server confirms it. Renaming a link changes the directory entry itself. If the connection drops before confirmation, refresh the parent directory to see which name the server retained.

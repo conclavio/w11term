@@ -7,6 +7,8 @@ mod replay_controls;
 mod select_all;
 #[path = "../support/native_gui.rs"]
 mod shared;
+#[path = "sort_ui.rs"]
+mod sort_ui;
 use shared::run_gui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
