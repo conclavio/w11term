@@ -133,6 +133,7 @@ impl<T> Tab<T> {
 struct Group {
     id: TabId,
     title: Option<TabTitle>,
+    pinned: bool,
     focused: TabId,
     layout: Layout,
     zoomed: bool,
@@ -252,6 +253,37 @@ impl<T> Tabs<T> {
             g.title = title;
         }
     }
+
+    pub fn group_is_pinned(&self, group: TabId) -> bool {
+        self.groups.iter().any(|g| g.id == group && g.pinned)
+    }
+
+    pub fn set_group_pinned(&mut self, group: TabId, pinned: bool) -> bool {
+        let Some(index) = self.groups.iter().position(|g| g.id == group) else {
+            return false;
+        };
+        if self.groups[index].pinned == pinned {
+            return false;
+        }
+        let mut group = self.groups.remove(index);
+        group.pinned = pinned;
+        self.groups.insert(self.pinned_group_count(), group);
+        true
+    }
+
+    fn pinned_group_count(&self) -> usize {
+        self.groups.partition_point(|group| group.pinned)
+    }
+
+    fn group_insert_index(&self, index: usize, pinned: bool) -> usize {
+        let boundary = self.pinned_group_count();
+        if pinned {
+            index.min(boundary)
+        } else {
+            index.clamp(boundary, self.groups.len())
+        }
+    }
+
     pub fn active_index(&self) -> Option<usize> {
         let id = self.active_group?;
         self.groups.iter().position(|g| g.id == id)
@@ -489,11 +521,13 @@ impl<T> Tabs<T> {
             id
         });
         let id = group.expect("every tab group has a leaf");
+        // Duplicate and reopen create fresh tabs. Pinning protects a specific live tab.
         self.groups.insert(
-            index.min(self.groups.len()),
+            self.group_insert_index(index, false),
             Group {
                 id,
                 title: source_group.title,
+                pinned: false,
                 focused: focused.expect("the focused entry belongs to this layout"),
                 layout,
                 zoomed: source_group.zoomed,
@@ -513,6 +547,7 @@ impl<T> Tabs<T> {
         self.groups.push(Group {
             id,
             title: None,
+            pinned: false,
             focused: entry_id,
             layout: Layout::Leaf(entry_id),
             zoomed: false,
@@ -735,8 +770,8 @@ impl<T> Tabs<T> {
             if select || self.active_group.is_none() {
                 self.active_group = Some(group.id);
             }
-            self.groups
-                .insert((index + offset).min(self.groups.len()), group);
+            let index = self.group_insert_index(index + offset, group.pinned);
+            self.groups.insert(index, group);
         }
         self.entries.append(&mut moved.entries);
     }
@@ -769,7 +804,8 @@ impl<T> Tabs<T> {
                 return false;
             }
         }
-        self.groups.sort_by_key(|group| positions[&group.id]);
+        self.groups
+            .sort_by_key(|group| (!group.pinned, positions[&group.id]));
         true
     }
 
@@ -780,7 +816,7 @@ impl<T> Tabs<T> {
             Direction::Right if index + 1 < self.groups.len() => index + 1,
             _ => return None,
         };
-        Some((index, neighbor))
+        (self.groups[index].pinned == self.groups[neighbor].pinned).then_some((index, neighbor))
     }
 
     pub fn can_move_active_tab(&self, direction: Direction) -> bool {
@@ -799,6 +835,46 @@ impl<T> Tabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_groups_stay_in_front_during_moves_reorder_transfer_and_duplicate() {
+        fn order(tabs: &Tabs<&str>) -> Vec<TabId> {
+            tabs.headers().iter().map(|tab| tab.id).collect()
+        }
+
+        let mut tabs = Tabs::default();
+        let alpha = tabs.insert("alpha");
+        let beta = tabs.insert("beta");
+        let gamma = tabs.insert("gamma");
+        assert!(tabs.set_group_pinned(gamma, true));
+        assert!(tabs.set_group_pinned(beta, true));
+        assert!(!tabs.set_group_pinned(beta, true));
+        assert_eq!(tabs.active_id(), Some(gamma));
+        assert_eq!(order(&tabs), [gamma, beta, alpha]);
+        assert!(tabs.move_active_tab(Direction::Right));
+        assert!(!tabs.move_active_tab(Direction::Right));
+        assert_eq!(order(&tabs), [beta, gamma, alpha]);
+        assert!(tabs.reorder(&[alpha, gamma, beta]));
+        assert_eq!(order(&tabs), [gamma, beta, alpha]);
+
+        let duplicate = tabs
+            .duplicate_active_group(|value| Ok::<_, ()>(*value), |value| value)
+            .unwrap()
+            .unwrap();
+        assert!(!tabs.group_is_pinned(duplicate));
+        assert_eq!(order(&tabs), [gamma, beta, duplicate, alpha]);
+        assert!(tabs.set_group_pinned(beta, false));
+        assert_eq!(order(&tabs), [gamma, beta, duplicate, alpha]);
+
+        let mut other = Tabs::default();
+        let pinned = other.insert("builds");
+        other.set_group_pinned(pinned, true);
+        let regular = other.insert("logs");
+        other.restore_group(tabs.take_group(gamma).unwrap(), 2, true);
+        assert_eq!(order(&other), [pinned, gamma, regular]);
+        assert_eq!(other.active_id(), Some(gamma));
+        assert!(other.group_is_pinned(gamma));
+    }
 
     #[test]
     fn previous_pane_toggles_committed_terminal_visits_across_tabs_and_splits() {

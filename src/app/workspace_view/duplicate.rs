@@ -179,9 +179,13 @@ impl TerminalApp {
     }
 
     pub(in crate::app) fn close_user_tab(&mut self, id: TabId, context: &ComponentContext<Self>) {
-        if let Some(group) = self.tabs.group_id(id)
-            && let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture)
-        {
+        let Some(group) = self.tabs.group_id(id) else {
+            return;
+        };
+        if self.tabs.group_is_pinned(group) {
+            return;
+        }
+        if let Ok(Some(layout)) = self.tabs.capture_group(group, NewShell::capture) {
             if self.closed_tabs.len() == CLOSED_TAB_LIMIT {
                 self.closed_tabs.pop_front();
             }

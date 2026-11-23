@@ -351,6 +351,7 @@ impl TerminalApp {
         })?;
         for (tab, header) in workspace.tabs.iter_mut().zip(headers) {
             tab.title = self.tabs.title_for(header.id).cloned();
+            tab.pinned = self.tabs.group_is_pinned(header.group_id());
         }
         Ok(workspace)
     }
@@ -641,6 +642,7 @@ fn restore_tabs<T>(
         let (slot, source, pane_name) = first_leaf(&tab.layout);
         let entry = tabs.insert(create(slot, source, pane_name));
         tabs.set_group_title(entry, tab.title.clone());
+        tabs.set_group_pinned(entry, tab.pinned);
         let mut ids = BTreeMap::new();
         restore_split(tabs, &tab.layout, entry, &mut vec![], &mut ids, &mut create);
         let focused = ids[&tab.focused];
@@ -787,6 +789,7 @@ mod tests {
             tabs: vec![
                 WorkspaceTab {
                     title: Some("Servers".to_owned().try_into().unwrap()),
+                    pinned: false,
                     focused: 12,
                     layout: SavedLayout::Split {
                         axis: Axis::Columns,
@@ -802,11 +805,33 @@ mod tests {
                 },
                 WorkspaceTab {
                     title: None,
+                    pinned: false,
                     focused: 14,
                     layout: demo(14),
                 },
             ],
         }
+    }
+
+    #[test]
+    fn workspace_restores_saved_pins_before_unpinned_tabs_and_keeps_saved_focus() {
+        let mut workspace = nested();
+        workspace.tabs[1].pinned = true;
+        let encoded = serde_json::to_value(&workspace).unwrap();
+        assert!(encoded["tabs"][0].get("pinned").is_none());
+        assert_eq!(encoded["tabs"][1]["pinned"], true);
+        let workspace: Workspace = serde_json::from_value(encoded).unwrap();
+        let mut tabs = Tabs::default();
+        tabs.insert(0);
+        restore_tabs(&mut tabs, &workspace, |slot, _, _| slot);
+        let headers = tabs.headers();
+        assert_eq!(
+            headers.iter().map(|tab| tab.value).collect::<Vec<_>>(),
+            [14, 0, 12]
+        );
+        assert!(tabs.group_is_pinned(headers[0].group_id()));
+        assert!(!tabs.group_is_pinned(headers[2].group_id()));
+        assert_eq!(tabs.active(), Some(&12));
     }
 
     #[test]
