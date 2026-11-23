@@ -750,6 +750,9 @@ impl<'a> Performer<'a> {
                 | EscCode::DecDoubleWidthLine
                 | EscCode::DecSingleWidthLine),
             ) => {
+                if self.left_and_right_margin_mode && code != EscCode::DecSingleWidthLine {
+                    return;
+                }
                 let cols = self.screen.physical_cols;
                 let idx = self.screen.phys_row(self.cursor.y);
                 let line = self.screen.line_mut(idx);

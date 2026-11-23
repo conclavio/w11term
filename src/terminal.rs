@@ -2554,6 +2554,34 @@ mod tests {
     }
 
     #[test]
+    fn dec_line_renditions_reset_while_horizontal_margin_mode_is_enabled() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut term = create(
+            TerminalSize {
+                cols: 10,
+                rows: 4,
+                ..Default::default()
+            },
+            tx,
+        );
+        term.advance_bytes(b"\x1b#312345\r\n\x1b#412345");
+        let pair = Snapshot::capture(&term, None, 1, 0, String::new(), 0);
+        assert!(pair.rows[0].is_double_height_top());
+        assert!(pair.rows[1].is_double_height_bottom());
+
+        term.advance_bytes(b"\x1b[?69hZ\x1b#6\x1b[3;1H\x1b#3\x1b[4;1H\x1b#4");
+        let margins = Snapshot::capture(&term, Some(&pair), 2, 0, String::new(), 0);
+        assert!(margins.cell_maps().iter().all(|map| map.width_scale() == 1));
+        assert_eq!(margins.rows[0].as_str().trim_end(), "12345");
+        assert_eq!(margins.rows[1].as_str().trim_end(), "1234Z");
+        assert!(margins.rows[2].as_str().trim_end().is_empty());
+
+        term.advance_bytes(b"\x1b[?69l\x1b#6");
+        let normal = Snapshot::capture(&term, Some(&margins), 3, 0, String::new(), 0);
+        assert!(normal.rows[3].is_double_width());
+    }
+
+    #[test]
     fn dec_line_halves_survive_resize_and_keep_their_own_text() {
         for alternate in [false, true] {
             let size = TerminalSize {

@@ -2006,6 +2006,16 @@ impl TerminalState {
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::LeftRightMarginMode,
             )) => {
+                if !self.left_and_right_margin_mode {
+                    if self.screen().line_width_scale(self.cursor.y) > 1 {
+                        self.wrap_next = false;
+                    }
+                    // DECLRMM restores the live pages to single-width, single-height.
+                    self.screen.screen.reset_visible_line_renditions(self.seqno);
+                    self.screen
+                        .alt_screen
+                        .reset_visible_line_renditions(self.seqno);
+                }
                 self.left_and_right_margin_mode = true;
             }
 

@@ -88,6 +88,7 @@ The original MIT license is preserved in `LICENSE.md`.
 
 - DEC line renditions limit addressable columns, discard truncated text, and
   retain their width and height flags when rows scroll or the grid resizes.
+  Enabling left and right margins resets live rows to single width and height.
 
 - Screen storage grows as output arrives. Resizing and rewrapping enforce
   the physical row limit supplied by the profile, including a limit of zero.

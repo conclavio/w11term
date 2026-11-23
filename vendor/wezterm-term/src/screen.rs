@@ -536,6 +536,16 @@ impl Screen {
         (self.physical_cols / self.line_width_scale(row)).max(1)
     }
 
+    pub(crate) fn reset_visible_line_renditions(&mut self, seqno: SequenceNo) {
+        let start = self.phys_row(0);
+        for line in self.lines.iter_mut().skip(start) {
+            if line_width_scale(line) > 1 {
+                clip_sized_line(line, self.physical_cols, seqno);
+                line.set_single_width(seqno);
+            }
+        }
+    }
+
     /// Returns the number of occupied rows of scrollback
     pub fn scrollback_rows(&self) -> usize {
         self.lines.len()
