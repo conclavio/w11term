@@ -239,6 +239,7 @@ mod tests {
                 name: name.into(),
                 kind,
                 mtime: None,
+                size: None,
             }],
         );
         files.set_filter("résumé".into());

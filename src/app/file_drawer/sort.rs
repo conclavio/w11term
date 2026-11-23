@@ -6,6 +6,7 @@ pub enum SortOrder {
     #[default]
     Name,
     NewestFirst,
+    LargestFirst,
 }
 
 impl SortOrder {
@@ -17,6 +18,7 @@ impl SortOrder {
                 .then_with(|| match self {
                     Self::Name => Ordering::Equal,
                     Self::NewestFirst => b.mtime.cmp(&a.mtime),
+                    Self::LargestFirst => b.size.cmp(&a.size),
                 })
                 .then_with(|| a.name.cmp(&b.name))
         });
@@ -90,6 +92,40 @@ mod tests {
             names(SortOrder::NewestFirst),
             [
                 "a dir", "z dir", "a newest", ".dot", "A", "雪", "z epoch", "b stale"
+            ]
+        );
+    }
+
+    #[test]
+    fn sorts_reported_file_sizes_with_directories_first_and_unreported_sizes_last() {
+        let wire = json!({"entries": [
+            {"filename":"empty","attrs":{"permissions":0o100644,"size":0}},
+            {"filename":"z-link","attrs":{"permissions":0o120777,"size":u64::MAX}},
+            {"filename":"z-tie","attrs":{"permissions":0o100644,"size":10}},
+            {"filename":"z-folder","attrs":{"permissions":0o040755,"size":500}},
+            {"filename":"a-unknown","attrs":{"size":900}},
+            {"filename":"big","attrs":{"permissions":0o100644,"size":u64::MAX}},
+            {"filename":"a-directory","attrs":{"permissions":0o040755}},
+            {"filename":"a-tie","attrs":{"permissions":0o100644,"size":10}},
+            {"filename":"file-without-size","attrs":{"permissions":0o100644}},
+        ]});
+        let names: Vec<_> = directory_entries(&wire, SortOrder::LargestFirst)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "a-directory",
+                "z-folder",
+                "big",
+                "a-tie",
+                "z-tie",
+                "empty",
+                "a-unknown",
+                "file-without-size",
+                "z-link",
             ]
         );
     }
