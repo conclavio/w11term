@@ -24,18 +24,30 @@ mkdir -p "$kernel" "$work/debs"
 apt-get -qq update
 apt-get -qq install -y --no-install-recommends mmdebstrap ubuntu-keyring kmod cpio zstd xz-utils
 
+# Use the hosted runner's regional mirrors and fallbacks for the guest too.
+# APT can switch mirrors when a metadata or package download stalls.
+archive=https://archive.ubuntu.com/ubuntu
+security=https://security.ubuntu.com/ubuntu
+if [[ -s /etc/apt/apt-mirrors.txt ]]; then
+    archive=mirror+file:/etc/apt/apt-mirrors.txt
+    security=$archive
+fi
+
 # Install SSH and FUSE only in the guest. mmdebstrap runs maintainer scripts
 # inside its private root and suppresses service startup during the bootstrap.
 # Each guest runs its distribution's packaged SSHFS and setuid FUSE helper.
 mmdebstrap --mode=root --variant=minbase --architectures=amd64 \
     --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
+    --aptopt='Acquire::http::Timeout "25"' \
+    --aptopt='Acquire::https::Timeout "25"' \
+    --aptopt='Acquire::Retries "1"' \
     --include=openssh-server,sshfs,fuse3,busybox-static,iproute2,util-linux,mount \
     --dpkgopt='path-exclude=/usr/share/doc/*' \
     --dpkgopt='path-exclude=/usr/share/man/*' \
     "$suite" "$root" \
-    "deb http://archive.ubuntu.com/ubuntu $suite main universe" \
-    "deb http://archive.ubuntu.com/ubuntu $suite-updates main universe" \
-    "deb http://security.ubuntu.com/ubuntu $suite-security main universe"
+    "deb $archive $suite main universe" \
+    "deb $archive $suite-updates main universe" \
+    "deb $security $suite-security main universe"
 
 # Pick one signed, general-purpose Ubuntu kernel and its own modules. The
 # runner's booted kernel may be an Azure flavour, with a different ABI/config.

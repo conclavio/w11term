@@ -1601,7 +1601,7 @@ fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
     let state = tempfile::tempdir().unwrap();
     fs::write(
         state.path().join("profiles.json"),
-        br#"{"profiles":{"fixture":{"host":"example.test","user":"test","auth":"identity","identity":"original-key"}}}"#,
+        br#"{"profiles":{"fixture":{"host":"example.test","user":"test","auth":"identity","identity":"missing-key-folder/original-key"}}}"#,
     )
     .unwrap();
     drive_gui("ssh-identity-picker-ui.ps1", state.path());
