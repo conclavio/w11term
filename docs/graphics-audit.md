@@ -164,6 +164,12 @@ the destination. Successful playback controls run silently. Image and
 frame errors follow the requested quiet mode.
 [Kitty animation reference](https://github.com/kovidgoyal/kitty/blob/v0.50.0/kitty_tests/graphics.py#L1694-L1873)
 
+Erase-in-line and partial erase-in-display clear text without removing
+direct kitty graphics. Unicode placeholder images disappear when their
+placeholder text is erased. A full display erase clears visible graphics
+and keeps named image data available for later placement.
+[Kitty interaction with terminal actions](https://sw.kovidgoyal.net/kitty/graphics-protocol/#interaction-with-other-terminal-actions)
+
 Current kitty and w11term preserve an image transmitted without a placement
 when clearing the visible screen. Kitty 0.32.2 also released stored-only
 images on `d=A`. The shared screenshot fixture uses three placed images.

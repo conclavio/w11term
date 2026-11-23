@@ -2616,7 +2616,10 @@ impl TerminalState {
                 self.perform_csi_edit(Edit::EraseInLine(EraseInLine::EraseToStartOfLine));
                 0..cy
             }
-            EraseInDisplay::EraseDisplay => 0..rows,
+            EraseInDisplay::EraseDisplay => {
+                self.clear_visible_kitty_images();
+                0..rows
+            }
             EraseInDisplay::EraseScrollback => {
                 self.screen_mut().erase_scrollback();
                 return;
@@ -2624,12 +2627,56 @@ impl TerminalState {
         };
 
         {
-            let bidi_mode = self.get_bidi_mode();
-            let screen = self.screen_mut();
+            let preserve_kitty = erase != EraseInDisplay::EraseDisplay;
             for y in row_range {
-                screen.clear_line(y, col_range.clone(), &pen, seqno, bidi_mode);
+                self.erase_line_text(y, col_range.clone(), &pen, preserve_kitty);
+                let screen = self.screen_mut();
                 let line_idx = screen.phys_row(y);
                 screen.line_mut(line_idx).set_single_width(seqno);
+            }
+        }
+    }
+
+    fn erase_line_text(
+        &mut self,
+        y: VisibleRowIndex,
+        cols: Range<usize>,
+        pen: &CellAttributes,
+        preserve_kitty: bool,
+    ) {
+        let seqno = self.seqno;
+        let bidi_mode = self.get_bidi_mode();
+        let keep_placements = preserve_kitty && self.kitty_img.has_physical_placements();
+        let screen = self.screen_mut();
+        let row = screen.phys_row(y);
+        let mut saved = Vec::new();
+        if keep_placements {
+            let line = screen.line_mut(row);
+            // Wide glyph continuations can hold their own image tiles. Take
+            // the raw cells when the line has graphics or a wide character.
+            if line
+                .visible_cells()
+                .any(|cell| cell.width() > 1 || cell.attrs().images().is_some())
+            {
+                let cells = line.cells_mut_for_attr_changes_only();
+                for (x, cell) in cells.iter().enumerate().take(cols.end).skip(cols.start) {
+                    for tile in cell.attrs().images().into_iter().flatten() {
+                        if tile.has_placement_id() {
+                            saved.push((x, tile));
+                        }
+                    }
+                }
+            }
+        }
+        screen.clear_line(y, cols, pen, seqno, bidi_mode);
+        if let Some((last, _)) = saved.last() {
+            let line = screen.line_mut(row);
+            if *last >= line.len() {
+                line.resize(*last + 1, seqno);
+            }
+            let cells = line.cells_mut_for_attr_changes_only();
+            for (x, tile) in saved {
+                cells[x].attrs_mut().attach_image(Box::new(tile));
             }
         }
     }
@@ -2699,7 +2746,6 @@ impl TerminalState {
                 let cy = self.cursor.y;
                 let pen = self.pen.clone_sgr_only();
                 let cols = self.screen().physical_cols;
-                let bidi_mode = self.get_bidi_mode();
                 let range = match erase {
                     // If wrap_next is true, then cx is effectively 1 column to the right.
                     // It feels wrong to handle this here, but in trying to centralize
@@ -2712,8 +2758,7 @@ impl TerminalState {
                     EraseInLine::EraseLine => 0..cols,
                 };
 
-                self.screen_mut()
-                    .clear_line(cy, range, &pen, seqno, bidi_mode);
+                self.erase_line_text(cy, range, &pen, true);
             }
             Edit::InsertCharacter(n) => {
                 // https://vt100.net/docs/vt510-rm/ICH.html
