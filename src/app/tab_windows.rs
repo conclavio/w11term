@@ -187,6 +187,7 @@ impl TerminalApp {
             match self.registry.set_hwnd(hwnd.0 as usize) {
                 Ok(()) => {
                     self.native_bound = true;
+                    self.refresh_remote_clipboard_focus();
                     WINDOWS.with_borrow_mut(|windows| {
                         windows.insert(
                             self.registry.window_id(),

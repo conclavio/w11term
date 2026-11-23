@@ -1,14 +1,12 @@
 use crate::{
+    clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     demo,
     options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
 };
 use anyhow::Context as _;
-use std::{
-    sync::{Arc, atomic::AtomicBool},
-    thread,
-};
+use std::{sync::Arc, thread};
 use tokio::sync::mpsc;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, TerminalSize};
 #[cfg(test)]
@@ -222,7 +220,7 @@ pub struct Session {
     pub player: Arc<std::sync::RwLock<crate::options::PlayerOptions>>,
     pub input: mpsc::UnboundedSender<Command>,
     pub frames: FrameStore,
-    pub clipboard_enabled: Arc<AtomicBool>,
+    pub remote_clipboard: Arc<RemoteClipboardAccess>,
     ssh_connection: ssh::ShareSlot,
     direct_ssh_shell: bool,
     durable: Option<Arc<ssh::DurableControl>>,
@@ -260,8 +258,12 @@ impl Session {
     pub fn start_sized(source: Source, size: TerminalSize) -> Self {
         Self::start_configured(source, size, true)
     }
-    pub fn start_configured(source: Source, size: TerminalSize, allow_clipboard: bool) -> Self {
-        Self::start_configured_with_connection(source, size, allow_clipboard, None)
+    pub fn start_configured(
+        source: Source,
+        size: TerminalSize,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+    ) -> Self {
+        Self::start_configured_with_connection(source, size, clipboard_policy, None)
     }
 
     /// Snapshot the authenticated connection of a ready SSH pane, for an
@@ -303,10 +305,17 @@ impl Session {
     pub fn start_configured_with_connection(
         source: Source,
         size: TerminalSize,
-        allow_clipboard: bool,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
-        Self::start_worker(source, Some(size), allow_clipboard, connection, None, None)
+        Self::start_worker(
+            source,
+            Some(size),
+            clipboard_policy.into(),
+            connection,
+            None,
+            None,
+        )
     }
 
     /// A GUI pane can be created before layout assigns it a grid and pixel size.
@@ -314,7 +323,7 @@ impl Session {
         Self::start_worker(
             Source::ViewRecording(path),
             has_cell_pixels(size).then_some(size),
-            false,
+            RemoteClipboardPolicy::Disabled,
             None,
             None,
             None,
@@ -324,12 +333,12 @@ impl Session {
     pub fn start_replay_pane(
         path: std::path::PathBuf,
         size: TerminalSize,
-        allow_clipboard: bool,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
     ) -> Self {
         Self::start_worker(
             Source::Replay(path),
             has_cell_pixels(size).then_some(size),
-            allow_clipboard,
+            clipboard_policy.into(),
             None,
             None,
             None,
@@ -339,23 +348,23 @@ impl Session {
     pub fn start_workspace_ssh(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        allow_clipboard: bool,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
         startup: crate::workspace::SshStartup,
     ) -> Self {
-        Self::start_ssh_with_startup(options, size, allow_clipboard, startup, None)
+        Self::start_ssh_with_startup(options, size, clipboard_policy, startup, None)
     }
 
     pub fn start_ssh_with_startup(
         options: crate::options::SshOptions,
         size: TerminalSize,
-        allow_clipboard: bool,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
         startup: crate::workspace::SshStartup,
         connection: Option<ssh::ConnectionShare>,
     ) -> Self {
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            allow_clipboard,
+            clipboard_policy.into(),
             connection,
             None,
             Some(startup),
@@ -365,14 +374,14 @@ impl Session {
     pub fn start_durable(
         source: Source,
         size: TerminalSize,
-        allow_clipboard: bool,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<crate::durable::DurableReference>,
     ) -> Self {
         Self::start_worker(
             source,
             Some(size),
-            allow_clipboard,
+            clipboard_policy.into(),
             connection,
             Some(ssh::DurableStart::Attach(saved)),
             None,
@@ -383,13 +392,13 @@ impl Session {
     pub fn discover_durable(
         mut options: crate::options::SshOptions,
         size: TerminalSize,
-        allow_clipboard: bool,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
     ) -> Self {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            allow_clipboard,
+            clipboard_policy.into(),
             None,
             Some(ssh::DurableStart::Discover),
             None,
@@ -400,13 +409,13 @@ impl Session {
     pub fn discover_herdr(
         mut options: crate::options::SshOptions,
         size: TerminalSize,
-        allow_clipboard: bool,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
     ) -> Self {
         options.durable = true;
         Self::start_worker(
             Source::Ssh(options),
             Some(size),
-            allow_clipboard,
+            clipboard_policy.into(),
             None,
             Some(ssh::DurableStart::DiscoverHerdr),
             None,
@@ -438,7 +447,7 @@ impl Session {
     fn start_worker(
         source: Source,
         initial_grid: Option<TerminalSize>,
-        allow_clipboard: bool,
+        clipboard_policy: RemoteClipboardPolicy,
         connection: Option<ssh::ConnectionShare>,
         saved: Option<ssh::DurableStart>,
         startup: Option<crate::workspace::SshStartup>,
@@ -466,7 +475,11 @@ impl Session {
             source,
             Source::TimedReplay(_) | Source::PausedReplay(_) | Source::ViewRecording(_)
         );
-        let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard && !output_viewer));
+        let remote_clipboard = Arc::new(RemoteClipboardAccess::new(if output_viewer {
+            RemoteClipboardPolicy::Disabled
+        } else {
+            clipboard_policy
+        }));
         let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         match &source {
             Source::Local(_) => terminal.enable_conemu_directory_reports(),
@@ -479,7 +492,7 @@ impl Session {
             terminal::configure_output_viewer(&mut terminal, &events);
         } else {
             let clipboard: Arc<dyn wezterm_term::Clipboard> =
-                Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
+                Arc::new(crate::clipboard::RemoteClipboard(remote_clipboard.clone()));
             terminal.set_clipboard(&clipboard);
             terminal.set_notification_handler(Box::new(crate::sound::Alerts {
                 events: events.clone(),
@@ -551,7 +564,7 @@ impl Session {
             player,
             input: commands,
             frames,
-            clipboard_enabled,
+            remote_clipboard,
             ssh_connection,
             direct_ssh_shell,
             durable,
@@ -562,6 +575,8 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.remote_clipboard
+            .set_policy(RemoteClipboardPolicy::Disabled);
         self.events.close_restart();
         self.events.command_stream(None);
         let _ = self.input.send(Command::Shutdown);

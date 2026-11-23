@@ -12,6 +12,7 @@ use std::{
 };
 use w11term::{
     appearance::{Appearance, installed_fonts},
+    clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     control::{Pane, Registry, Server},
     interaction::{
         Link, MultiLinePasteWarning, Point, Selection, TabSwitcherMode, link_at, safe_url,
@@ -340,6 +341,7 @@ pub enum InteractionField {
     ScrollZoom,
     DetectUrls,
     Osc52,
+    Osc52ForegroundOnly,
 }
 enum SettingsEditor {
     Keyboard(keyboard_settings::KeyboardPage),
@@ -971,6 +973,7 @@ pub struct TerminalApp {
     title_editor: Option<tab_title::Editor>,
     name_edit_serial: u64,
     clipboard: clipboard_paste::State,
+    focused_osc52: Option<Arc<RemoteClipboardAccess>>,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
     copy_mode: Rc<RefCell<Option<keyboard_copy::ActiveCopy>>>,
 }
@@ -1143,14 +1146,14 @@ pub enum Message {
     Smoke(u8),
 }
 
-fn live_tab(label: String, source: Source, osc52: bool) -> AppTab {
+fn live_tab(label: String, source: Source, osc52: impl Into<RemoteClipboardPolicy>) -> AppTab {
     live_tab_sized(label, source, TerminalSize::default(), osc52, None, None)
 }
 fn live_tab_sized(
     label: String,
     source: Source,
     size: TerminalSize,
-    osc52: bool,
+    osc52: impl Into<RemoteClipboardPolicy>,
     connection: Option<w11term::ssh::ConnectionShare>,
     saved: Option<w11term::durable::DurableReference>,
 ) -> AppTab {
@@ -2012,13 +2015,13 @@ impl TerminalApp {
             .set_preferences(appearance.interaction.clone());
         for entry in self.tabs.entries() {
             if let Page::Terminal(tab) = &entry.value.page {
-                tab.session.clipboard_enabled.store(
-                    appearance.interaction.osc52,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                tab.session
+                    .remote_clipboard
+                    .set_policy(appearance.interaction.remote_clipboard_policy());
             }
         }
         *self.appearance.write().unwrap() = appearance.clone();
+        self.refresh_remote_clipboard_focus();
         self.appearance_error = Appearance::path()
             .and_then(|path| appearance.save(&path))
             .err()
@@ -2277,6 +2280,11 @@ impl TerminalApp {
                 "Allow remote clipboard copy (OSC 52)",
                 appearance.interaction.osc52,
             ),
+            (
+                InteractionField::Osc52ForegroundOnly,
+                "Limit OSC 52 to the foreground pane",
+                appearance.interaction.osc52_foreground_only,
+            ),
         ] {
             children.push(
                 StackPanel::new().spacing(4.0).children((
@@ -2465,7 +2473,31 @@ impl TerminalApp {
         }
     }
 
+    fn refresh_remote_clipboard_focus(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+        let active = self.keyboard.hwnd().and_then(|hwnd| {
+            let Page::Terminal(tab) = &self.tabs.active()?.page else {
+                return None;
+            };
+            (unsafe { GetForegroundWindow() } == hwnd)
+                .then(|| (tab.session.remote_clipboard.clone(), hwnd.0 as usize))
+        });
+        if let Some(previous) = self.focused_osc52.take()
+            && active
+                .as_ref()
+                .is_none_or(|(access, _)| !Arc::ptr_eq(&previous, access))
+        {
+            previous.set_focused_window(None);
+        }
+        if let Some((access, window)) = active {
+            access.set_focused_window(Some(window));
+            self.focused_osc52 = Some(access);
+        }
+    }
+
     fn activate(&mut self, context: &ComponentContext<Self>) {
+        self.refresh_remote_clipboard_focus();
         self.tabs.record_pane_focus(AppTab::visited_terminal);
         self.clipboard.input_origin.set(self.paste_origin());
         self.discard_inactive_paste();
@@ -2694,7 +2726,11 @@ impl TerminalApp {
         let tab = live_tab(
             label,
             source,
-            self.appearance.read().unwrap().interaction.osc52,
+            self.appearance
+                .read()
+                .unwrap()
+                .interaction
+                .remote_clipboard_policy(),
         )
         .with_profile(profile);
         self.insert_tab(tab, context);
@@ -2750,7 +2786,11 @@ impl TerminalApp {
             label,
             source,
             TerminalSize::default(),
-            self.appearance.read().unwrap().interaction.osc52,
+            self.appearance
+                .read()
+                .unwrap()
+                .interaction
+                .remote_clipboard_policy(),
             connection,
             None,
         )
@@ -3036,7 +3076,11 @@ impl TerminalApp {
                 *tab = live_tab(
                     source_label(&source),
                     source,
-                    self.appearance.read().unwrap().interaction.osc52,
+                    self.appearance
+                        .read()
+                        .unwrap()
+                        .interaction
+                        .remote_clipboard_policy(),
                 );
                 self.sync_selection(context);
                 self.activate(context);
@@ -3110,7 +3154,11 @@ impl TerminalApp {
                         *tab = live_tab(
                             name.clone(),
                             Source::Ssh(options.clone()),
-                            self.appearance.read().unwrap().interaction.osc52,
+                            self.appearance
+                                .read()
+                                .unwrap()
+                                .interaction
+                                .remote_clipboard_policy(),
                         )
                         .with_profile(Some(name));
                     } else if let Page::NewProfile(editor) = &mut tab.page {
@@ -4373,7 +4421,11 @@ impl Component for TerminalApp {
                 )
             })
             .unwrap_or((1120.0, 760.0));
-        let osc52 = appearance.read().unwrap().interaction.osc52;
+        let osc52 = appearance
+            .read()
+            .unwrap()
+            .interaction
+            .remote_clipboard_policy();
         if let Some(workspace) = opening.as_ref().map(|window| &window.layout) {
             workspace_view::append_resolved_workspace(
                 &mut tabs,
@@ -4526,6 +4578,7 @@ impl Component for TerminalApp {
             title_editor: None,
             name_edit_serial: 0,
             clipboard,
+            focused_osc52: None,
             hints: Default::default(),
             copy_mode: Default::default(),
             selection_pending: true,
@@ -5091,7 +5144,11 @@ impl Component for TerminalApp {
                         profile.clone(),
                         source,
                         size,
-                        self.appearance.read().unwrap().interaction.osc52,
+                        self.appearance
+                            .read()
+                            .unwrap()
+                            .interaction
+                            .remote_clipboard_policy(),
                         None,
                         None,
                     )
@@ -5848,6 +5905,9 @@ impl Component for TerminalApp {
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
+                if let Some(access) = self.focused_osc52.take() {
+                    access.set_focused_window(None);
+                }
                 if let Some(AppTab {
                     page: Page::Terminal(tab),
                     ..
@@ -5857,6 +5917,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::WindowActivation(true) => {
+                self.refresh_remote_clipboard_focus();
                 self.header.borrow_mut().take();
                 self.refresh_open_commands();
                 self.caret_interval = crate::cursor_blink::system_interval();
@@ -5967,6 +6028,9 @@ impl Component for TerminalApp {
                     InteractionField::ScrollZoom => &mut appearance.interaction.scroll_to_zoom,
                     InteractionField::DetectUrls => &mut appearance.interaction.detect_urls,
                     InteractionField::Osc52 => &mut appearance.interaction.osc52,
+                    InteractionField::Osc52ForegroundOnly => {
+                        &mut appearance.interaction.osc52_foreground_only
+                    }
                 };
                 if *setting != value {
                     *setting = value;

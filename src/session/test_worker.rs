@@ -100,11 +100,7 @@ async fn raw_recording_viewer_uses_saved_grid_and_emits_only_title_alerts() {
     );
     assert!(frame.rows[8].as_str().starts_with("last row"));
     assert_eq!(frame.title, "Viewer title");
-    assert!(
-        !pane
-            .clipboard_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-    );
+    assert!(!pane.remote_clipboard.writes_enabled());
     let events = pane.events.since(0).events;
     assert!(events.iter().any(|e| e.kind == "title"));
     assert!(
