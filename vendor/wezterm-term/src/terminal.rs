@@ -12,6 +12,11 @@ pub enum ClipboardSelection {
 }
 
 pub trait Clipboard: Send + Sync {
+    /// Whether clipboard writes are a configured capability of this terminal.
+    fn writes_enabled(&self) -> bool {
+        true
+    }
+
     fn set_contents(
         &self,
         selection: ClipboardSelection,
@@ -20,6 +25,10 @@ pub trait Clipboard: Send + Sync {
 }
 
 impl Clipboard for Box<dyn Clipboard> {
+    fn writes_enabled(&self) -> bool {
+        self.as_ref().writes_enabled()
+    }
+
     fn set_contents(
         &self,
         selection: ClipboardSelection,

@@ -7,6 +7,7 @@ use russh::{
 use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::mpsc};
 use w11term::{
+    clipboard::RemoteClipboardPolicy,
     control::{self, Pane, Registry, Request},
     options::{Authentication, Source, SshOptions},
     session::{Command, Session},
@@ -99,7 +100,7 @@ impl server::Handler for Peer {
         session.channel_success(channel)?;
         session.data(
             channel,
-            b"\x1b[?2004h\x1b[2J\x1b[Hremote ready\r\n\x1b[6n".as_slice(),
+            b"\x1b[?2004h\x1b[2J\x1b[Hremote ready\r\n\x1b[c\x1b[6n".as_slice(),
         )?;
         Ok(())
     }
@@ -168,15 +169,19 @@ impl server::Handler for Peer {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_pty_roundtrip_queries_input_and_resize() {
-    roundtrip(false, None).await;
+    roundtrip(false, None, RemoteClipboardPolicy::AnyPane).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyless_ssh_roundtrip_without_an_agent() {
-    roundtrip(true, Some("xterm-sixel")).await;
+    roundtrip(true, Some("xterm-sixel"), RemoteClipboardPolicy::Disabled).await;
 }
 
-async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
+async fn roundtrip(
+    allow_none: bool,
+    terminal_type: Option<&str>,
+    clipboard_policy: RemoteClipboardPolicy,
+) {
     tokio::time::timeout(Duration::from_secs(10), async {
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let identity = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -220,7 +225,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
         } else {
             TerminalSize::default()
         };
-        let session = Session::start_sized(
+        let session = Session::start_configured(
             Source::Ssh(SshOptions {
                 scrollback_lines: Default::default(),
                 color_scheme: Default::default(),
@@ -246,6 +251,7 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
                 player: Default::default(),
             }),
             initial_size,
+            clipboard_policy,
         );
         assert_eq!(
             next(&mut observed, &session).await,
@@ -258,6 +264,15 @@ async fn roundtrip(allow_none: bool, terminal_type: Option<&str>) {
         assert_eq!(
             next(&mut observed, &session).await,
             Observed::Env("COLORTERM".into(), "truecolor".into())
+        );
+        let expected_da1 = if clipboard_policy == RemoteClipboardPolicy::Disabled {
+            b"\x1b[?65;4;6;18;22c".as_slice()
+        } else {
+            b"\x1b[?65;4;6;18;22;52c".as_slice()
+        };
+        assert_eq!(
+            next(&mut observed, &session).await,
+            Observed::Data(expected_da1.to_vec())
         );
         assert_eq!(
             next(&mut observed, &session).await,

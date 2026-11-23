@@ -3535,10 +3535,34 @@ mod tests {
     }
 
     #[test]
+    fn da1_reports_osc52_write_support_after_policy_changes() {
+        use crate::clipboard::{RemoteClipboard, RemoteClipboardAccess, RemoteClipboardPolicy::*};
+
+        let (mut terminal, mut replies) = engine();
+        let access = Arc::new(RemoteClipboardAccess::new(Disabled));
+        let clipboard: Arc<dyn wezterm_term::Clipboard> = Arc::new(RemoteClipboard(access.clone()));
+        terminal.set_clipboard(&clipboard);
+        for (policy, report) in [
+            (Disabled, b"\x1b[?65;4;6;18;22c".as_slice()),
+            (AnyPane, b"\x1b[?65;4;6;18;22;52c".as_slice()),
+            (ForegroundPane, b"\x1b[?65;4;6;18;22;52c".as_slice()),
+            (Disabled, b"\x1b[?65;4;6;18;22c".as_slice()),
+        ] {
+            access.set_policy(policy);
+            terminal.advance_bytes(b"\x1b[c");
+            assert_eq!(receive(&mut replies), report);
+        }
+        access.set_policy(AnyPane);
+        terminal.clear_clipboard();
+        terminal.advance_bytes(b"\x1b[0c");
+        assert_eq!(receive(&mut replies), b"\x1b[?65;4;6;18;22c");
+    }
+
+    #[test]
     fn identifies_sixel_and_version_and_encodes_repeat_release_and_reconnect_reset() {
         let (mut t, mut rx) = engine();
         t.advance_bytes(b"\x1b[c");
-        assert_eq!(receive(&mut rx), b"\x1b[?65;4;6;18;22;52c");
+        assert_eq!(receive(&mut rx), b"\x1b[?65;4;6;18;22c");
         t.advance_bytes(b"\x1b[>0q");
         assert_eq!(
             receive(&mut rx),

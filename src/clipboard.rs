@@ -223,6 +223,10 @@ fn foreground_window() -> Option<usize> {
 
 pub struct RemoteClipboard(pub Arc<RemoteClipboardAccess>);
 impl wezterm_term::Clipboard for RemoteClipboard {
+    fn writes_enabled(&self) -> bool {
+        self.0.writes_enabled()
+    }
+
     fn set_contents(
         &self,
         _selection: wezterm_term::ClipboardSelection,
