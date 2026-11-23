@@ -155,6 +155,7 @@ pub struct Entry {
     name: String,
     kind: ListedKind,
     mtime: Option<u32>,
+    size: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -608,12 +609,18 @@ fn directory_entries(reply: &Value, order: SortOrder) -> Result<Vec<Entry>> {
         }
         remote_child("/", name)?;
         ensure!(names.insert(name), "SFTP returned a duplicate filename");
+        let attrs = &item["attrs"];
+        let kind = ListedKind::from_attrs(attrs);
         entries.push(Entry {
             name: name.to_owned(),
-            kind: ListedKind::from_attrs(&item["attrs"]),
-            mtime: item["attrs"]["mtime"]
+            kind,
+            mtime: attrs["mtime"]
                 .as_u64()
                 .and_then(|time| time.try_into().ok()),
+            size: match kind {
+                ListedKind::Known(EntryKind::File) => attrs["size"].as_u64(),
+                _ => None,
+            },
         });
     }
     order.sort(&mut entries);
@@ -1447,7 +1454,11 @@ impl FileDrawer {
         };
         controls.push(
             StackPanel::new()
-                .orientation(Orientation::Horizontal)
+                .orientation(if layout.content_width() >= 320.0 {
+                    Orientation::Horizontal
+                } else {
+                    Orientation::Vertical
+                })
                 .spacing(6.0)
                 .children((
                     TextBlock::new()
@@ -1455,6 +1466,11 @@ impl FileDrawer {
                         .text("Sort by"),
                     sort_button(SortOrder::Name, "Name", "Sort by name"),
                     sort_button(SortOrder::NewestFirst, "Newest first", "Sort newest first"),
+                    sort_button(
+                        SortOrder::LargestFirst,
+                        "Largest first",
+                        "Sort largest first",
+                    ),
                 )),
         );
         let filter: View = if let Some(input) = &self.filter_input {
@@ -2950,6 +2966,7 @@ mod tests {
         (0..78)
             .map(|index| Entry {
                 mtime: None,
+                size: None,
                 name: if index % 2 == 0 {
                     format!("{index:02} [Ångström] 雪")
                 } else {
@@ -3109,6 +3126,7 @@ mod tests {
                 name: name.into(),
                 kind,
                 mtime: None,
+                size: None,
             }],
         );
         let revision = drawer.listing_revision;
@@ -3556,6 +3574,7 @@ mod tests {
                 name: source.name.clone(),
                 kind: source.kind,
                 mtime: None,
+                size: None,
             }],
             selected: Some(source.name.clone()),
             ..Default::default()
@@ -3715,6 +3734,7 @@ mod tests {
                 name: entry.name.clone(),
                 kind: entry.kind,
                 mtime: None,
+                size: None,
             }],
             ..Default::default()
         };
@@ -3797,6 +3817,7 @@ mod tests {
                 name: "alias".into(),
                 kind: ListedKind::Known(EntryKind::File),
                 mtime: None,
+                size: None,
             }],
         );
         assert_eq!(drawer.status, "Deleted alias");
@@ -4029,6 +4050,7 @@ mod tests {
                     name: name.into(),
                     kind,
                     mtime: None,
+                    size: None,
                 }],
             );
             drawer.selected = Some(name.into());

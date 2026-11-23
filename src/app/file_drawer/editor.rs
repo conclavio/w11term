@@ -390,6 +390,7 @@ mod tests {
                 name: name.into(),
                 kind,
                 mtime: None,
+                size: None,
             }],
         );
         files.selected = Some(name.into());

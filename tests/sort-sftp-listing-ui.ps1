@@ -73,7 +73,8 @@ try {
     Wait-Focus $remote
     Run-Palette 'Open files here'
     $null = Wait-Until 'initial listing' { (Find-Element '/shell directory') -and (Find-Element '1 / 2') }
-    if (!(Sort-Radio 'Sort by name').Current.IsSelected -or (Sort-Radio 'Sort newest first').Current.IsSelected) {
+    if (!(Sort-Radio 'Sort by name').Current.IsSelected -or (Sort-Radio 'Sort newest first').Current.IsSelected -or
+        (Sort-Radio 'Sort largest first').Current.IsSelected) {
         throw 'The default sort is not visibly set to Name'
     }
     Wait-Order @($folder,'aa-review.log','batch-00.log','batch-01.log')
@@ -102,6 +103,16 @@ try {
     $null = Wait-Until 'four cached matches' { Find-Element '4 matches' }
     Click 'Done'
     Wait-Order @($folder,$target,'yy-review.log','aa-review.log')
+    # Grow a different file after listing. Largest first must still use cached sizes.
+    [IO.File]::WriteAllText((Join-Path $fixtureDirectory 'aa-review.log'), ('z' * 8192))
+    Set-Sort 'Sort largest first'
+    Wait-Order @($folder,$target,'aa-review.log','yy-review.log')
+    if ((Sort-Radio 'Sort by name').Current.IsSelected -or (Sort-Radio 'Sort newest first').Current.IsSelected) {
+        throw 'Largest first left another sort order selected'
+    }
+    if (!(Find-Element '4 matches') -or !(Find-Element $preview $button).Current.IsEnabled) {
+        throw 'Largest first discarded the filter or selected file'
+    }
     Set-Sort 'Sort by name'
     Wait-Order @($folder,'aa-review.log','yy-review.log',$target)
     if (!(Find-Element '4 matches') -or !(Find-Element $preview $button).Current.IsEnabled) {
