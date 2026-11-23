@@ -33,13 +33,18 @@ function Set-Field([string]$Name, [string]$Text) {
     }
     $value.SetValue($Text)
 }
-function View-ContainsPrefix([string]$Prefix) {
+function View-Text {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $type = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Text)
     foreach ($element in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $type)) {
-        if ($element.Current.Name.StartsWith($Prefix, [StringComparison]::Ordinal)) { return $true }
+        $element.Current.Name
+    }
+}
+function View-ContainsPrefix([string]$Prefix) {
+    foreach ($name in (View-Text)) {
+        if ($name.StartsWith($Prefix, [StringComparison]::Ordinal)) { return $true }
     }
     return $false
 }
@@ -75,7 +80,17 @@ try {
     $picker = Wait-Until 'owned single-file picker' { Find-OwnedDialog 'Choose a file to upload' }
     Select-DialogItem $picker 'fleet-source'
     $null = Wait-Until 'confirm the selected file' { [FixtureDialog]::ClickButton($picker, 1) }
-    $null = Wait-Until 'selected file size is shown' { Find-Element "$file${dot}97000 bytes" }
+    $null = Wait-Until 'close the single-file picker' { !(Find-OwnedDialog 'Choose a file to upload') }
+    $size = "${dot}97000 bytes"
+    $null = Wait-Until 'selected file and size are shown' {
+        foreach ($name in (View-Text)) {
+            # The Shell may expand the runner's short TEMP path before returning it.
+            if ($name.EndsWith($size, [StringComparison]::Ordinal) -and
+                [FixtureDialog]::SameFile($file, $name.Substring(0, $name.Length - $size.Length))) {
+                return $true
+            }
+        }
+    }
     Set-Field 'Remote file path' '../report.bin'
     $null = Wait-Until 'relative path is ineligible' {
         $submit = Find-Element 'Upload to 3 hosts' $button
