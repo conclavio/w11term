@@ -2,6 +2,8 @@ use super::*;
 #[path = "../support/drive_gui.rs"]
 mod drive;
 use drive::{drive_gui, drive_mixed_gui};
+#[path = "mixed_drop_ui.rs"]
+mod mixed_drop_ui;
 #[path = "recording_ui.rs"]
 mod recording_ui;
 #[path = "replay_controls.rs"]

@@ -16,10 +16,14 @@ mod preview;
 mod properties;
 mod sort;
 mod text_draft;
+mod uploads;
 
 use history::{FolderHistory, HistoryDirection};
 pub use preview::PreviewKind;
 pub use sort::SortOrder;
+pub use uploads::DropTarget;
+use uploads::{DropPreparation, UploadQueue};
+use w11term::sftp::DropSource;
 
 const PAGE_SIZE: usize = 32;
 const PANEL_PADDING: f64 = 10.0;
@@ -89,7 +93,10 @@ pub enum FileAction {
     Replace(u64, u64, bool),
     Pick(u64, u64, u64, TransferPicker),
     Picked(u64, u64, u64, TransferPicker, Result<Vec<PathBuf>, String>),
-    Drop(u64, u64, String, Vec<PathBuf>),
+    Drop(DropTarget, Vec<PathBuf>),
+    PreparedDrop(DropTarget, TransferId, Result<Vec<DropSource>, String>),
+    #[cfg(feature = "ui-smoke")]
+    SmokeDrop(DropTarget, PathBuf),
     Listed(
         u64,
         u64,
@@ -129,7 +136,8 @@ pub(super) struct FileDrawer {
     picking: Option<u64>,
     parsing: bool,
     pending: Option<Pending>,
-    uploads: VecDeque<PathBuf>,
+    uploads: UploadQueue,
+    preparing_drop: Option<DropPreparation>,
     transfer_serial: u64,
     status: String,
     cached: RefCell<Option<CachedPanel>>,
@@ -413,12 +421,18 @@ impl TransferFile {
         &self,
         reply: &mut oneshot::Receiver<Result<Value, String>>,
         bytes: u64,
+        queue: &mut UploadQueue,
     ) -> String {
-        match reply.try_recv() {
-            Ok(Ok(result)) => format!(
-                "{} SSH reconnected. Refresh to browse.",
-                self.outcome(&result)
-            ),
+        let mut status = match reply.try_recv() {
+            Ok(Ok(result)) => {
+                if result["cancelled"] != true {
+                    queue.completed_one();
+                }
+                format!(
+                    "{} SSH reconnected. Refresh to browse.",
+                    self.outcome(&result)
+                )
+            }
             Ok(Err(error)) if let Self::UploadFolder { remote } = self => {
                 format!("Could not upload folder {remote}: {error}")
             }
@@ -427,7 +441,9 @@ impl TransferFile {
                 "SSH reconnected. {} Refresh to browse.",
                 self.interrupted(bytes)
             ),
-        }
+        };
+        queue.finish(&mut status);
+        status
     }
 }
 
@@ -445,11 +461,11 @@ struct ActiveTransfer {
 }
 
 impl ActiveTransfer {
-    fn cancel(&self, id: TransferId, queue: &mut VecDeque<PathBuf>) -> bool {
+    fn cancel(&self, id: TransferId, queue: &mut UploadQueue) -> bool {
         if self.id != id || self.cancel.is_cancelled() {
             return false;
         }
-        queue.clear();
+        queue.remaining.clear();
         self.cancel.cancel();
         true
     }
@@ -1059,6 +1075,9 @@ impl FileDrawer {
 
     fn close(&mut self) {
         self.open = false;
+        if self.preparing_drop.take().is_some() {
+            self.status.clear();
+        }
         self.bookmarks = None;
         self.cancel_entry_dialog();
         self.end_filter_edit();
@@ -1067,7 +1086,10 @@ impl FileDrawer {
     }
 
     pub(super) fn awaiting_native_result(&self) -> bool {
-        self.picking.is_some() || self.parsing || self.entry_dialog_open()
+        self.picking.is_some()
+            || self.parsing
+            || self.preparing_drop.is_some()
+            || self.entry_dialog_open()
     }
 
     pub(super) fn bind_window(&mut self, sender: LocalSender<Message>) {
@@ -1098,7 +1120,7 @@ impl FileDrawer {
                 reply,
                 transfer: Some(transfer),
                 ..
-            }) => file.reconnect_status(reply, transfer.progress.borrow().bytes),
+            }) => file.reconnect_status(reply, transfer.progress.borrow().bytes, &mut self.uploads),
             _ => match &self.reveal {
                 Some(RevealTarget::Changed(change)) => format!(
                     "{} before SSH reconnected. Refresh to browse.",
@@ -1190,6 +1212,7 @@ impl FileDrawer {
         let download_folder =
             selected.is_some_and(|e| e.kind == ListedKind::Known(EntryKind::Directory));
         let revision = self.listing_revision;
+        let drop_target = DropTarget::new(pane, self, folder);
         let shell = if shell_ready {
             self.shell_origin(pane)
         } else {
@@ -1510,6 +1533,21 @@ impl FileDrawer {
                 CancelTransfer(transfer.id),
             ));
         }
+        if let Some(preparation) = &self.preparing_drop {
+            controls.push(button(
+                "Cancel transfer",
+                true,
+                CancelTransfer(preparation.id),
+            ));
+        }
+        #[cfg(feature = "ui-smoke")]
+        if let Some(file) = std::env::var_os("W11TERM_SFTP_DROP_SMOKE_ITEMS") {
+            controls.push(button(
+                "Drop fixture items",
+                writable,
+                SmokeDrop(drop_target.clone(), file.into()),
+            ));
+        }
         if !self.status.is_empty() {
             controls.push(
                 TextBlock::new()
@@ -1593,25 +1631,16 @@ impl FileDrawer {
                         .map(|(index, view)| KeyedView::new(index.to_string(), view)),
                 ),
             );
-        let drop_folder = folder.to_owned();
         let panel = Border::new()
             .padding(PANEL_PADDING)
             .background(Color::rgb(31, 32, 35))
             .drop_policy(writable.then(|| {
                 DragDropPolicy::new().storage_items(
-                    DragDropAction::new(DragDropOperation::Copy).caption("Upload files"),
+                    DragDropAction::new(DragDropOperation::Copy)
+                        .caption("Upload files and folders"),
                 )
             }))
-            .on_drop(context.callback(move |d| {
-                let paths = match d {
-                    DroppedData::StorageItems(items) => items
-                        .into_iter()
-                        .map(|item| PathBuf::from(item.path))
-                        .collect(),
-                    _ => vec![],
-                };
-                Message::Files(Drop(pane, generation, drop_folder.clone(), paths))
-            }))
+            .on_drop(context.callback(move |data| Message::Files(drop_target.data(data))))
             .content(
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -1638,15 +1667,11 @@ impl FileDrawer {
         let (tx, reply) = oneshot::channel();
         let (tx_progress, transfer) = if matches!(step, Step::Transfer(_)) {
             let (tx, progress) = watch::channel(TransferProgress::default());
-            self.transfer_serial = self.transfer_serial.wrapping_add(1);
+            let id = self.transfer_id(id);
             (
                 Some(tx),
                 Some(ActiveTransfer {
-                    id: TransferId {
-                        pane: id,
-                        generation: self.generation,
-                        serial: self.transfer_serial,
-                    },
+                    id,
                     cancel: TransferCancel::default(),
                     progress,
                 }),
@@ -1728,34 +1753,17 @@ impl FileDrawer {
         session: &Session,
         context: &ComponentContext<TerminalApp>,
     ) -> Result<()> {
-        let local = self.uploads.pop_front().context("No file selected")?;
-        ensure!(
-            local.is_absolute(),
-            "Select a local file with an absolute path"
-        );
-        let name = local
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("SFTP requires a UTF-8 filename")?
-            .to_owned();
-        let remote = remote_child(
-            self.directory
-                .as_deref()
-                .context("Open a remote directory first")?,
-            &name,
-        )?;
-        self.status = format!("Uploading {name}…");
-        self.job(
-            id,
-            session,
-            Operation::Put {
-                local,
-                remote: remote.clone(),
-                overwrite: self.replace,
-            },
-            Step::Transfer(TransferFile::Upload { name, remote }),
-            context,
-        )
+        let (op, transfer) = self
+            .uploads
+            .remaining
+            .pop_front()
+            .context("No upload selected")?;
+        self.status = match &transfer {
+            TransferFile::Upload { name, .. } => format!("Uploading {name}…"),
+            TransferFile::UploadFolder { remote } => format!("Uploading folder {remote}…"),
+            _ => unreachable!("upload queue only contains uploads"),
+        };
+        self.job(id, session, op, Step::Transfer(transfer), context)
     }
 
     fn tick(
@@ -1826,7 +1834,9 @@ impl FileDrawer {
                     bail!("{}", change.error(&error));
                 }
                 if let Step::Transfer(TransferFile::Upload { name, .. }) = &step {
-                    if !self.replace && self.entries.iter().any(|entry| &entry.name == name) {
+                    if !self.uploads.overwrite_files
+                        && self.entries.iter().any(|entry| &entry.name == name)
+                    {
                         bail!("Upload of {name} failed (replacing files is off): {error}");
                     }
                     bail!("Upload of {name} failed: {error}");
@@ -1895,11 +1905,16 @@ impl FileDrawer {
                 if !matches!(
                     file,
                     TransferFile::Upload { .. } | TransferFile::UploadFolder { .. }
-                ) || reply["cancelled"] == true
-                {
+                ) {
                     return Ok(());
                 }
-                if self.uploads.is_empty() {
+                if reply["cancelled"] == true {
+                    self.uploads.finish(&mut self.status);
+                    return Ok(());
+                }
+                self.uploads.completed_one();
+                if self.uploads.remaining.is_empty() {
+                    self.uploads.finish(&mut self.status);
                     let path = self.directory.clone().context("Missing upload directory")?;
                     self.job(
                         id,
@@ -2126,6 +2141,9 @@ impl TerminalApp {
         use FileAction::*;
         let pane = match &action {
             CancelTransfer(target) => target.pane,
+            Drop(target, ..) | PreparedDrop(target, ..) => target.pane,
+            #[cfg(feature = "ui-smoke")]
+            SmokeDrop(target, ..) => target.pane,
             Toggle | OpenHere => match self.tabs.active().and_then(AppTab::pane_id) {
                 Some(id) => id,
                 None => return,
@@ -2159,7 +2177,6 @@ impl TerminalApp {
             | Replace(id, ..)
             | Pick(id, ..)
             | Picked(id, ..)
-            | Drop(id, ..)
             | Listed(id, ..)
             | Tick(id) => *id,
         };
@@ -2194,14 +2211,23 @@ impl TerminalApp {
             && !self.clipboard.is_open();
         let dialog_was_open = files.entry_dialog_open();
         let drawer_was_open = files.open;
+        let drop_allowed = may_open_dialog
+            || (!visible
+                && !transferring
+                && frame.prompt.is_none()
+                && session.prompts.current().is_none());
         let was_editing = files.filter_editing();
         let finish_filter =
             may_open_dialog && was_editing && matches!(action, EditFilter(_, _, _, false));
         files.observe_connection(frame.connection_generation);
-        if !matches!(action, Tick(_) | Picked(..) | Listed(..) | Drop(..)) && !visible {
+        if !matches!(
+            action,
+            Tick(_) | Picked(..) | Listed(..) | Drop(..) | PreparedDrop(..)
+        ) && !visible
+        {
             return;
         }
-        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Drop(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
+        if matches!(&action, Preview(_, g, ..) | ClosePreview(_, g, ..) | NewFolder(_, g, ..) | Choose(_, g, ..) | Rename(_, g, ..) | Delete(_, g, ..) | EditName(_, g, ..) | FinishEdit(_, g, ..) | Follow(_, g, ..) | Reveal(_, g, ..) | Browse(_, g, ..) | GoToFolder(_, g, ..) | OpenEntry(_, g, ..) | Replace(_, g, ..) | Pick(_, g, ..) | Picked(_, g, ..) | Listed(_, g, ..) | Filter(_, g, ..) | ClearFilter(_, g, ..) | FocusFilter(_, g, ..) | EditFilter(_, g, ..) | Page(_, g, ..) | Sort(_, g, ..) if *g != files.generation)
         {
             if visible
                 && (dialog_was_open != files.entry_dialog_open()
@@ -2316,7 +2342,14 @@ impl TerminalApp {
                 }
                 Tick(_) => files.tick(pane, session, may_open_dialog, context)?,
                 CancelTransfer(target) => {
-                    if let Some(transfer) =
+                    if files
+                        .preparing_drop
+                        .as_ref()
+                        .is_some_and(|active| active.id == target)
+                    {
+                        files.preparing_drop = None;
+                        files.status = "Cancelled before uploading any dropped items.".into();
+                    } else if let Some(transfer) =
                         files.pending.as_ref().and_then(|job| job.transfer.as_ref())
                         && transfer.cancel(target, &mut files.uploads)
                     {
@@ -2326,6 +2359,16 @@ impl TerminalApp {
                 Listed(_, _, path, direction, result) if files.parsing => {
                     files.parsing = false;
                     files.accept_listing(direction, path, result.map_err(|e| anyhow!("{e}"))?);
+                }
+                PreparedDrop(target, token, result) => {
+                    if files.finish_drop(&target, token) && drop_allowed {
+                        files.uploads = UploadQueue::dropped(
+                            &target,
+                            token,
+                            result.map_err(anyhow::Error::msg)?,
+                        )?;
+                        files.upload_next(pane, session, context)?;
+                    }
                 }
                 Picked(_, _, serial, picker, result) => {
                     if !files.finish_picker(serial) || !may_open_dialog {
@@ -2341,7 +2384,7 @@ impl TerminalApp {
                                 files.directory.as_ref() == Some(&parent),
                                 "The upload destination changed. Choose the files again."
                             );
-                            files.uploads.extend(paths);
+                            files.uploads = UploadQueue::files(paths, &parent, files.replace)?;
                             files.upload_next(pane, session, context)?;
                         }
                         TransferPicker::UploadFolder(parent) => {
@@ -2591,19 +2634,19 @@ impl TerminalApp {
                     files.set_page(page);
                 }
                 Replace(_, _, replace) => files.replace = replace,
-                Drop(_, _, directory, paths) => {
-                    ensure!(
-                        files.directory.as_ref() == Some(&directory),
-                        "The destination directory changed. Drop the files again."
-                    );
-                    ensure!(!paths.is_empty(), "Drop local files onto this drawer");
-                    ensure!(
-                        paths.iter().all(|p| p.is_absolute()),
-                        "Drop files with local paths"
-                    );
-                    files.uploads.extend(paths);
-                    files.end_filter_edit();
-                    files.upload_next(pane, session, context)?;
+                Drop(target, paths) => {
+                    if drop_allowed {
+                        files.classify_drop(target, paths, context);
+                    }
+                }
+                #[cfg(feature = "ui-smoke")]
+                SmokeDrop(target, fixture) => {
+                    context.spawn_background(move |_| {
+                        Message::Files(target.fixture(&fixture).unwrap_or_else(|error| {
+                            eprintln!("Could not read smoke drop items: {error:#}");
+                            target.data(DroppedData::Unsupported)
+                        }))
+                    });
                 }
                 Pick(_, _, revision, picker) => {
                     if !may_open_dialog
@@ -2638,7 +2681,6 @@ impl TerminalApp {
             Ok(())
         })();
         if let Err(error) = result {
-            files.uploads.clear();
             files.status = match (files.opening_target.take(), files.reveal.take()) {
                 (Some(target), _) => format!("Could not open {target}: {error:#}"),
                 (_, Some(RevealTarget::Changed(change))) => {
@@ -2649,6 +2691,7 @@ impl TerminalApp {
                 }
                 _ => format!("{error:#}"),
             };
+            files.uploads.finish(&mut files.status);
             files.cached.borrow_mut().take();
         }
         if visible {
@@ -2694,11 +2737,11 @@ impl TerminalApp {
         let pane = tab.session.pane_id;
         let files = &tab.files;
         let status = files.status.clone();
-        let upload = FileAction::Drop(
-            pane,
-            files.generation,
-            files.directory.clone().unwrap_or_default(),
-            vec![local.join("upload.bin")],
+        let upload = DropTarget::new(pane, files, files.directory.as_deref().unwrap_or("")).data(
+            DroppedData::StorageItems(vec![windows_reactor::DroppedStorageItem {
+                name: "upload.bin".into(),
+                path: local.join("upload.bin").to_str().unwrap().into(),
+            }]),
         );
         let next = match step {
             0 if tab.session.frames.load().reported_directory.is_none() => 0,
@@ -3776,7 +3819,12 @@ mod tests {
             progress: watch::channel(TransferProgress::default()).1,
         };
         let worker = active.cancel.clone();
-        let mut queue = VecDeque::from([PathBuf::from("second.txt"), PathBuf::from("third.txt")]);
+        let mut queue = UploadQueue::files(
+            vec![r"C:\second.txt".into(), r"C:\third.txt".into()],
+            "/",
+            false,
+        )
+        .unwrap();
         for stale in [
             TransferId { pane: 5, ..id },
             TransferId {
@@ -3786,11 +3834,11 @@ mod tests {
             TransferId { serial: 6, ..id },
         ] {
             assert!(!active.cancel(stale, &mut queue));
-            assert_eq!(queue.len(), 2);
+            assert_eq!(queue.remaining.len(), 2);
             assert!(!worker.is_cancelled());
         }
         assert!(active.cancel(id, &mut queue));
-        assert!(queue.is_empty());
+        assert!(queue.remaining.is_empty());
         assert!(worker.is_cancelled());
         assert!(!active.cancel(id, &mut queue));
     }
@@ -3825,14 +3873,14 @@ mod tests {
         assert!(message.contains("64 bytes written to the temporary file"));
 
         let (worker, mut reply) = oneshot::channel();
-        let interrupted = upload.reconnect_status(&mut reply, 32);
+        let interrupted = upload.reconnect_status(&mut reply, 32, &mut UploadQueue::default());
         assert!(interrupted.contains("/srv/uploads/large.bin"));
         assert!(interrupted.contains("at least 32 bytes acknowledged"));
         assert!(interrupted.contains("remote file may be incomplete"));
         worker.send(Ok(cancelled)).unwrap();
         assert!(
             upload
-                .reconnect_status(&mut reply, 32)
+                .reconnect_status(&mut reply, 32, &mut UploadQueue::default())
                 .starts_with("Cancelled upload of /srv/uploads/large.bin (64 bytes acknowledged)")
         );
         let (worker, mut reply) = oneshot::channel();
@@ -3840,14 +3888,14 @@ mod tests {
             .send(Err("WRITE timed out; outcome is unknown".into()))
             .unwrap();
         assert_eq!(
-            upload.reconnect_status(&mut reply, 32),
+            upload.reconnect_status(&mut reply, 32, &mut UploadQueue::default()),
             "WRITE timed out; outcome is unknown"
         );
         let (worker, mut reply) = oneshot::channel();
         worker.send(Ok(complete)).unwrap();
         assert!(
             download
-                .reconnect_status(&mut reply, 64)
+                .reconnect_status(&mut reply, 64, &mut UploadQueue::default())
                 .starts_with("Downloaded /large.bin (128 bytes)")
         );
     }
@@ -3953,13 +4001,13 @@ mod tests {
                 .contains("remote folder was not created")
         );
         let (worker, mut reply) = oneshot::channel();
-        let interrupted = folder.reconnect_status(&mut reply, 42);
+        let interrupted = folder.reconnect_status(&mut reply, 42, &mut UploadQueue::default());
         assert!(interrupted.contains("/reports/run"));
         assert!(interrupted.contains("at least 42 bytes acknowledged"));
         assert!(interrupted.contains("remote folder may be incomplete"));
         worker.send(Err("Permission denied".into())).unwrap();
         assert_eq!(
-            folder.reconnect_status(&mut reply, 0),
+            folder.reconnect_status(&mut reply, 0, &mut UploadQueue::default()),
             "Could not upload folder /reports/run: Permission denied"
         );
     }
@@ -4070,12 +4118,12 @@ mod tests {
             directory: Some("/old".into()),
             picking: Some(1),
             replace: true,
-            uploads: VecDeque::from([PathBuf::from("queued")]),
+            uploads: UploadQueue::files(vec![r"C:\queued".into()], "/old", true).unwrap(),
             ..Default::default()
         };
         drawer.observe_connection(2);
         assert!(drawer.open);
-        assert!(drawer.directory.is_none() && drawer.uploads.is_empty());
+        assert!(drawer.directory.is_none() && drawer.uploads.remaining.is_empty());
         assert!(!drawer.replace && !drawer.busy());
         assert_eq!(drawer.generation, 2);
     }

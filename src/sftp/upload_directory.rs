@@ -84,7 +84,8 @@ fn validate_component(name: &str) -> Result<()> {
     Ok(())
 }
 
-enum Source {
+#[derive(Debug)]
+pub(super) enum Source {
     Directory(Arc<File>),
     File(File, u64),
     Skipped,
@@ -106,7 +107,7 @@ fn classify(file: File) -> Result<Source> {
     }
 }
 
-fn open_child(parent: &File, name: &str) -> Result<Source> {
+pub(super) fn open_child(parent: &File, name: &str) -> Result<Source> {
     validate_component(name)?;
     // Each lookup uses the directory object we enumerated. The final file handle
     // denies writes and renames until all its bytes have been read from that handle.
@@ -134,17 +135,21 @@ fn open_child(parent: &File, name: &str) -> Result<Source> {
     classify(file)
 }
 
-fn source_root(local: &Path) -> Result<Arc<File>> {
+pub(super) fn open_source(
+    local: &Path,
+    access: FILE_ACCESS_RIGHTS,
+    share: FILE_SHARE_MODE,
+) -> Result<Source> {
     ensure!(local.is_absolute(), "local path must be absolute");
     let mut components = local.components();
     ensure!(
         matches!(components.next(), Some(Component::Prefix(p)) if matches!(p.kind(),
         Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _))),
-        "expected a drive or UNC source folder"
+        "expected a drive or UNC source path"
     );
     ensure!(
         components.next() == Some(Component::RootDir),
-        "expected a rooted source folder"
+        "expected a rooted source path"
     );
     for entry in components {
         let Component::Normal(name) = entry else {
@@ -165,12 +170,16 @@ fn source_root(local: &Path) -> Result<Arc<File>> {
         .zip(local.file_name())
         .map(|(parent, name)| parent.join(name));
     let root = std::fs::OpenOptions::new()
-        .access_mode((FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0)
-        .share_mode(FILE_SHARE_READ.0)
+        .access_mode((access | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0)
+        .share_mode(share.0)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(selected.as_deref().unwrap_or(local))
-        .context("opening local source folder")?;
-    match classify(root)? {
+        .context("opening local source")?;
+    classify(root)
+}
+
+pub(super) fn source_root(local: &Path) -> Result<Arc<File>> {
+    match open_source(local, FILE_LIST_DIRECTORY | FILE_TRAVERSE, FILE_SHARE_READ)? {
         Source::Directory(dir) => Ok(dir),
         _ => bail!("local source must be a real directory, not a reparse point"),
     }
@@ -407,13 +416,11 @@ impl Upload<'_> {
 impl Engine {
     pub(super) async fn put_directory(
         &self,
-        local: PathBuf,
+        (local, dir): (PathBuf, Arc<File>),
         progress: Option<&watch::Sender<TransferProgress>>,
         cancel: Option<&TransferCancel>,
         state: &mut UploadState,
     ) -> Result<Value> {
-        let source = local.clone();
-        let dir = tokio::task::spawn_blocking(move || source_root(&source)).await??;
         let remote = state.remote.clone();
         let (parent, leaf) = destination_parts(&remote)?;
         let mut upload = Upload {

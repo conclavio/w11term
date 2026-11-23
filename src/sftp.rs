@@ -25,11 +25,13 @@ use tokio::{
 };
 
 mod directory;
+mod drop_source;
 mod editor;
 mod text_preview;
 mod upload_directory;
 pub(crate) use directory::valid_component;
 pub use directory::validate_download_name;
+pub use drop_source::{DropSource, classify_drop};
 
 pub const CHUNK: usize = 32 * 1024;
 pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
@@ -81,6 +83,13 @@ pub enum Operation {
     PutDir {
         local: PathBuf,
         remote: String,
+    },
+    /// The source was chosen by a native Explorer drop on this connection.
+    #[serde(skip)]
+    PutDrop {
+        source: DropSource,
+        remote: String,
+        overwrite: bool,
     },
     Put {
         local: PathBuf,
@@ -448,6 +457,7 @@ pub(crate) async fn run(
                     Some("Missing SSH connection for this mounted folder")
                 }
                 Operation::PreviewText { .. } => Some("Missing SSH connection for text preview"),
+                Operation::PutDrop { .. } => Some("Missing SSH connection for this dropped upload"),
                 Operation::EntryProperties { .. } => {
                     Some("Missing SSH connection for file properties")
                 }
@@ -477,6 +487,18 @@ pub(crate) async fn run(
                 _ => "Text preview cancelled",
             };
             let _ = reply.send(Err(message.into()));
+            continue;
+        }
+        if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
+            && let Operation::PutDrop { source, remote, .. } = &operation
+        {
+            let result = if source.is_directory() {
+                upload_directory::UploadState::new(remote.clone(), deadline)
+                    .cancelled(source.path())
+            } else {
+                cancelled_transfer(source.path(), remote, 0, false)
+            };
+            let _ = reply.send(Ok(result));
             continue;
         }
         if cancel.as_ref().is_some_and(TransferCancel::is_cancelled)
@@ -513,6 +535,17 @@ pub(crate) async fn run(
         let mut reply = PendingReply {
             sender: Some(reply),
             stage: match &operation {
+                Operation::PutDrop { source, remote, .. } if source.is_directory() => {
+                    JobStage::DirectoryUpload(upload_directory::UploadState::new(
+                        remote.clone(),
+                        deadline,
+                    ))
+                }
+                Operation::PutDrop { remote, .. } => JobStage::NativeUpload {
+                    remote: remote.clone(),
+                    open_dispatched: false,
+                    confirmed: 0,
+                },
                 Operation::PutDir { remote, .. } => JobStage::DirectoryUpload(
                     upload_directory::UploadState::new(remote.clone(), deadline),
                 ),
@@ -783,7 +816,44 @@ impl Engine {
                 let JobStage::DirectoryUpload(state) = stage else {
                     unreachable!("directory upload job stage");
                 };
-                self.put_directory(local, progress, cancel, state).await?
+                let source = tokio::task::spawn_blocking(move || {
+                    let dir = upload_directory::source_root(&local)?;
+                    Ok::<_, anyhow::Error>((local, dir))
+                })
+                .await??;
+                self.put_directory(source, progress, cancel, state).await?
+            }
+            PutDrop {
+                source,
+                remote,
+                overwrite,
+            } => {
+                let (local, checked) =
+                    tokio::task::spawn_blocking(move || source.open_confirmed(overwrite)).await??;
+                match (checked, stage) {
+                    (
+                        upload_directory::Source::Directory(dir),
+                        JobStage::DirectoryUpload(state),
+                    ) => {
+                        self.put_directory((local, dir), progress, cancel, state)
+                            .await?
+                    }
+                    (
+                        upload_directory::Source::File(file, _),
+                        stage @ JobStage::NativeUpload { .. },
+                    ) => {
+                        self.put(
+                            (local, tokio::fs::File::from_std(file)),
+                            remote,
+                            overwrite,
+                            progress,
+                            cancel,
+                            stage,
+                        )
+                        .await?
+                    }
+                    _ => bail!("dropped item has an unexpected type"),
+                }
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
             EntryProperties { path } => {
@@ -815,7 +885,14 @@ impl Engine {
                 remote,
                 overwrite,
             } => {
-                self.put(local, remote, overwrite, progress, cancel, stage)
+                if cancel.is_some_and(TransferCancel::is_cancelled) {
+                    return Ok(cancelled_transfer(&local, &remote, 0, false));
+                }
+                ensure!(local.is_absolute(), "local path must be absolute");
+                let source = tokio::fs::File::open(&local)
+                    .await
+                    .context("opening local source")?;
+                self.put((local, source), remote, overwrite, progress, cancel, stage)
                     .await?
             }
             Opendir { path } => {
@@ -1203,7 +1280,7 @@ impl Engine {
     }
     async fn put(
         &self,
-        local: PathBuf,
+        (local, mut file): (PathBuf, tokio::fs::File),
         remote: String,
         overwrite: bool,
         progress: Option<&watch::Sender<TransferProgress>>,
@@ -1214,10 +1291,6 @@ impl Engine {
         if cancelled() {
             return Ok(cancelled_transfer(&local, &remote, 0, false));
         }
-        ensure!(local.is_absolute(), "local path must be absolute");
-        let mut file = tokio::fs::File::open(&local)
-            .await
-            .context("opening local source")?;
         let metadata = file.metadata().await?;
         ensure!(metadata.is_file(), "local source must be a regular file");
         let total = Some(metadata.len());
