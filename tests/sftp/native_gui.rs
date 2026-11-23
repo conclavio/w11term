@@ -1595,6 +1595,18 @@ async fn native_saving_an_ssh_profile_keeps_the_original_live_pane() {
     server.abort();
 }
 
+#[test]
+#[ignore = "selects SSH key paths through the native file dialog in Quick Connect and a profile"]
+fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        br#"{"profiles":{"fixture":{"host":"example.test","user":"test","auth":"identity","identity":"original-key"}}}"#,
+    )
+    .unwrap();
+    drive_gui("ssh-identity-picker-ui.ps1", state.path());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "edits profile colors and live overrides through WinUI, including a saved workspace"]
 async fn native_profile_tab_colors_follow_focused_panes_and_new_launches() {

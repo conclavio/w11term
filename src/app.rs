@@ -56,6 +56,7 @@ mod file_picker;
 mod folder_revoke;
 mod folder_shares;
 mod folder_sharing_state;
+mod identity_picker;
 mod keyboard_settings;
 mod live_profile;
 mod local_forwards;
@@ -587,6 +588,7 @@ impl ProfileDraft {
     }
 }
 
+const PRIVATE_KEY_AUTH: usize = 1;
 const SSH_AUTH_LABELS: [&str; 5] = [
     "Windows SSH agent",
     "Private key file",
@@ -597,7 +599,7 @@ const SSH_AUTH_LABELS: [&str; 5] = [
 
 fn ssh_authentication(index: usize, identity: &str) -> anyhow::Result<Authentication> {
     Ok(match index {
-        1 => {
+        PRIVATE_KEY_AUTH => {
             let identity = identity.trim();
             anyhow::ensure!(!identity.is_empty(), "Enter the private key file path");
             Authentication::Identity {
@@ -985,6 +987,7 @@ pub struct TerminalApp {
     picker: Option<pane_picker::Picker>,
     title_editor: Option<tab_title::Editor>,
     name_edit_serial: u64,
+    identity_picker: Option<identity_picker::Pending>,
     clipboard: clipboard_paste::State,
     focused_osc52: Option<Arc<RemoteClipboardAccess>>,
     hints: Rc<RefCell<Option<keyboard_hints::Hints>>>,
@@ -1091,6 +1094,7 @@ pub enum Message {
     Shortcut(Shortcut),
     ProfileMenu(String),
     QuickConnect(quick_connect::Action),
+    SshIdentity(identity_picker::Action),
     MoveProfile(String, isize, Arc<[String]>),
     StartupProfile(String),
     WindowActivation(bool),
@@ -4079,25 +4083,21 @@ impl TerminalApp {
             StackPanel::new().spacing(5.0).children((
                 TextBlock::new().text("Authentication"),
                 ComboBox::new()
+                    .automation_name("Authentication")
                     .items_source(SSH_AUTH_LABELS)
                     .selected_index(draft.authentication)
                     .horizontal_alignment(HorizontalAlignment::Stretch)
                     .on_selection_changed(context.callback(move |v| Message::Auth(id, v))),
             )),
         );
-        if draft.authentication == 1 {
-            fields.push(
-                StackPanel::new().spacing(5.0).children((
-                    TextBlock::new().text("Private key file"),
-                    TextBox::new()
-                        .text(&draft.identity)
-                        .placeholder_text("C:\\path\\to\\key or a path beside profiles.json")
-                        .automation_name("Private key file")
-                        .on_text_changed(
-                            context.callback(move |v| Message::Edit(id, Field::Identity, v)),
-                        ),
-                )),
-            );
+        if draft.authentication == PRIVATE_KEY_AUTH {
+            fields.push(identity_picker::field(
+                id,
+                &draft.identity,
+                self.identity_picker.is_none() && !draft.generating,
+                context.callback(move |value| Message::Edit(id, Field::Identity, value)),
+                context,
+            ));
         }
         fields.push(
             StackPanel::new().spacing(5.0).children((
@@ -4592,6 +4592,7 @@ impl Component for TerminalApp {
             picker: None,
             title_editor: None,
             name_edit_serial: 0,
+            identity_picker: None,
             clipboard,
             focused_osc52: None,
             hints: Default::default(),
@@ -5889,6 +5890,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::QuickConnect(action) => self.edit_quick_connect(action, context),
+            Message::SshIdentity(action) => self.ssh_identity_action(action, context),
             Message::EditProfile(name) => self.edit_profile(name, context),
             Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
             Message::DeleteProfile(id) => {
@@ -6544,7 +6546,9 @@ impl Component for TerminalApp {
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
-                Page::QuickConnect(draft) => quick_connect::view(id, draft, context),
+                Page::QuickConnect(draft) => {
+                    quick_connect::view(id, draft, self.identity_picker.is_none(), context)
+                }
             }
         } else if self.incoming.is_some() || self.outgoing.is_some() {
             TextBlock::new().text("Moving tab…").margin(16.0).into()

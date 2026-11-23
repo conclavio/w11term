@@ -5,9 +5,9 @@ pub(super) const LABEL: &str = "Quick connect…";
 #[derive(Default)]
 pub(super) struct Draft {
     destination: String,
-    authentication: usize,
-    identity: String,
-    error: Option<String>,
+    pub(super) authentication: usize,
+    pub(super) identity: String,
+    pub(super) error: Option<String>,
     input: ElementRef<TextBox>,
 }
 
@@ -127,7 +127,12 @@ impl TerminalApp {
     }
 }
 
-pub(super) fn view(id: TabId, draft: &Draft, context: &ViewContext<TerminalApp>) -> View {
+pub(super) fn view(
+    id: TabId,
+    draft: &Draft,
+    can_browse: bool,
+    context: &ViewContext<TerminalApp>,
+) -> View {
     let mut fields =
         vec![
             KeyedView::new(
@@ -163,21 +168,16 @@ pub(super) fn view(id: TabId, draft: &Draft, context: &ViewContext<TerminalApp>)
                 )),
             ),
         ];
-    if draft.authentication == 1 {
+    if draft.authentication == PRIVATE_KEY_AUTH {
         fields.push(KeyedView::new(
             "identity",
-            StackPanel::new().spacing(5.0).children((
-                TextBlock::new().text("Private key file"),
-                TextBox::new()
-                    .automation_name("Private key file")
-                    .placeholder_text("C:\\path\\to\\key or a path beside profiles.json")
-                    .text(&draft.identity)
-                    .on_text_changed(
-                        context.callback(move |value| {
-                            Message::QuickConnect(Action::Identity(id, value))
-                        }),
-                    ),
-            )),
+            identity_picker::field(
+                id,
+                &draft.identity,
+                can_browse,
+                context.callback(move |value| Message::QuickConnect(Action::Identity(id, value))),
+                context,
+            ),
         ));
     }
     if let Some(error) = &draft.error {
