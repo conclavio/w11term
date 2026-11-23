@@ -239,7 +239,24 @@ try {
             $report.Contains("$westName${dot}Not sent${dot}Waiting for a fresh prompt")
     }
     $null = Wait-Until 'copy confirmation' { Find-Element 'Copied results' }
+    $null = Wait-Until 'the hidden West result is outside the retry scope' {
+        $entry = Find-Element 'Prepare retry' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
     Set-HostFilter ''
+    (Command-Editor).SetValue('draft before withheld retry')
+    Click 'Prepare retry'
+    Wait-CommandDraft 'while-slow'
+    $null = Wait-CheckBox $eastName Off
+    $null = Wait-CheckBox $westName On
+    $null = Wait-Until 'the withheld host still needs a fresh prompt before sending' {
+        $entry = Find-Element 'Send to 1 host' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    Click 'Restore draft'
+    Wait-CommandDraft 'draft before withheld retry'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     Click 'Previous submission'
     $null = Wait-Until 'earlier submission' { Find-Element "Submitted${dot}both" }
     Outcome $westName 'Running'
@@ -480,6 +497,13 @@ try {
         $null = Control @('save-text','--pane',"$($pair[0])",$path)
         if (![IO.File]::ReadAllText($path).Contains($pair[1])) { throw 'Reconnect discarded previous SSH output' }
     }
+    Click 'Prepare retry'
+    Wait-CommandDraft 'snapshot  status'
+    $null = Wait-CheckBox $eastName Off
+    $null = Wait-CheckBox $westName On
+    Click 'Send to 1 host'
+    $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west-accepted snapshot  status')
+    Outcome $westName 'Exit 17'
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {

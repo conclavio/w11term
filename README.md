@@ -95,6 +95,8 @@ The submission progress bar and counts cover every recipient in the viewed run. 
 
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.
 
+Choose **Prepare retry** to load the exact command and select original recipients with a confirmed nonzero exit or withheld delivery. The roster and result filters scope the selection to the hosts you can see. Review the command and checked hosts, then choose **Send** when the targets have fresh prompts. **Restore draft** also restores the previous host selection and roster filter. Unconfirmed delivery and exit outcomes remain available in **Needs attention** for inspection.
+
 Choose **Saved commands…** in the group editor to browse the same command library managed in **Settings → Saved commands**. You can also search by name in the command palette while the group is active. Choosing a command fills the draft for review. **Restore draft** is available here too.
 
 Choose **Save as command…** to add the draft to the shared library. Enter a name and choose **Save to commands**. The form shows the exact text it will save, and sending remains a separate action.

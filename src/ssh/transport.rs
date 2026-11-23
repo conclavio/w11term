@@ -933,6 +933,12 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                         if !events.group_command_running(link) => {
                         let _ = reply.send(Err(crate::terminal::GROUP_COMMAND_ENDED.into()));
                     }
+                    Some(TransportInput::Scoped { kind: ScopedInput::GroupCommand, bytes, reply, .. }) => {
+                        // A failed write can follow a partial send. Dropping the
+                        // reply leaves group delivery unconfirmed.
+                        channel.data(bytes.as_slice()).await?;
+                        let _ = reply.send(Ok(()));
+                    }
                     Some(TransportInput::Raw(bytes, reply) | TransportInput::Scoped { bytes, reply, .. }) => {
                         let result = channel.data(bytes.as_slice()).await;
                         let _ = reply.send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));

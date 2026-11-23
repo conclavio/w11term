@@ -10,6 +10,7 @@ mod live_output;
 mod progress;
 mod reconnect;
 mod report;
+mod retry;
 mod save_command;
 mod saved;
 
@@ -23,7 +24,7 @@ pub(super) struct HostGroup {
     selected: BTreeSet<u64>,
     filter: String,
     draft: String,
-    previous_draft: Option<String>,
+    previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     command_save: save_command::State,
     submissions: VecDeque<Submission>,
@@ -34,6 +35,12 @@ pub(super) struct HostGroup {
     live_output: Option<live_output::State>,
     import: import::State,
     reconnect_feedback: String,
+    retry_feedback: String,
+}
+
+struct DraftBackup {
+    text: String,
+    scope: Option<retry::Scope>,
 }
 
 struct Submission {
@@ -240,6 +247,7 @@ impl HostGroup {
         self.result_filter = progress::Filter::All;
         self.previous_draft = None;
         self.copy_feedback.clear();
+        self.retry_feedback.clear();
         self.submissions.push_back(Submission {
             id: self.viewing,
             text,
@@ -271,7 +279,10 @@ impl HostGroup {
     fn load_draft(&mut self, command: String) {
         if self.draft != command {
             let previous = std::mem::replace(&mut self.draft, command);
-            self.previous_draft.get_or_insert(previous);
+            self.previous_draft.get_or_insert(DraftBackup {
+                text: previous,
+                scope: None,
+            });
         }
     }
 
@@ -279,7 +290,12 @@ impl HostGroup {
         let Some(previous) = self.previous_draft.take() else {
             return false;
         };
-        self.draft = previous;
+        self.draft = previous.text;
+        if let Some(scope) = previous.scope {
+            self.selected = scope.selected;
+            self.filter = scope.filter;
+        }
+        self.retry_feedback.clear();
         true
     }
 }
@@ -300,6 +316,7 @@ pub enum Action {
     Reconnect(TabId, reconnect::Request),
     FilterResults(TabId, u64, progress::Filter),
     LoadCommand(TabId, u64),
+    PrepareRetry(TabId, u64, BTreeSet<u64>),
     OpenSavedCommands(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
     SaveCommand(TabId, save_command::Action),
@@ -700,6 +717,16 @@ impl TerminalApp {
                     let _ = page.command_editor.request_focus();
                 }
             }
+            Action::PrepareRetry(id, submission, offered) => {
+                if self.host_group_command_target() == Some(id) {
+                    let roster = self.host_group_targets();
+                    if let Some(page) = self.host_group_mut(id)
+                        && page.prepare_retry(submission, &roster, offered)
+                    {
+                        let _ = page.command_editor.request_focus();
+                    }
+                }
+            }
             Action::OpenSavedCommands(id) => {
                 if self.host_group_command_target() == Some(id) {
                     self.open_group_command_library(id, ctx);
@@ -871,7 +898,7 @@ impl TerminalApp {
             ));
         }
         let selected_shown: BTreeSet<_> = selected.iter().map(|target| target.pane).collect();
-        self.host_group_results(id, page, ctx, &selected_shown, &mut details);
+        self.host_group_results(id, page, ctx, &shown, &selected_shown, &mut details);
         let hidden_count = targets
             .iter()
             .filter(|target| {
@@ -989,6 +1016,7 @@ impl TerminalApp {
                         .spacing(8.0)
                         .children((send, saved_commands, save_command, restore)),
                     page.command_save.view(id, ctx),
+                    retry::feedback(page),
                     hidden_selection,
                     TextBlock::new()
                         .text(instructions)
@@ -1005,6 +1033,7 @@ impl TerminalApp {
         id: TabId,
         page: &HostGroup,
         ctx: &ViewContext<Self>,
+        roster_shown: &[&Target],
         selected_shown: &BTreeSet<u64>,
         details: &mut Vec<KeyedView>,
     ) {
@@ -1129,6 +1158,13 @@ impl TerminalApp {
                             },
                         )
                     })),
+                retry::button(
+                    id,
+                    page,
+                    submission,
+                    roster_shown.iter().map(|target| target.pane),
+                    ctx,
+                ),
                 if page.copy_feedback.is_empty() {
                     View::empty()
                 } else {
