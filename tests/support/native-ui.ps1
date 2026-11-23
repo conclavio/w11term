@@ -53,6 +53,21 @@ function Read-PeerTrace([IO.BinaryReader]$Reader) {
     return ,$Reader.ReadBytes([int]$Reader.BaseStream.Length)
 }
 
+# Give the app permission to finish its write while the fixture polls.
+function Read-ClipboardFixture {
+    try {
+        $stream = [IO.File]::Open($env:W11TERM_TEST_COPY_FILE, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    } catch [IO.FileNotFoundException] {
+        return $null
+    } catch [IO.IOException] {
+        if (($_.Exception.HResult -band 0xffff) -in 32,33) { return $null }
+        throw
+    }
+    $reader = [IO.StreamReader]::new($stream)
+    try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
 function Wait-Until([string]$Description, [scriptblock]$Probe) {
     $until = [DateTime]::UtcNow.AddSeconds(15)
     do {

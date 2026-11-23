@@ -184,19 +184,18 @@ public static class WslFixture {
         }
         $setupText = ($parts -join [char]10).TrimEnd()
         $null = Wait-Until "$($setup.Action) copied the complete script from a WSL pane" {
-            (Test-Path -LiteralPath $env:W11TERM_TEST_COPY_FILE) -and
-                [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $setupText
+            (Read-ClipboardFixture) -ceq $setupText
         }
     }
     Publish-Report $left.id 'linux'
     Press-Key 0x70 # F1 copies the reported directory.
     $null = Wait-Until 'the reported Linux directory was copied' {
-        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq '/mnt/c/work tree'
+        (Read-ClipboardFixture) -ceq '/mnt/c/work tree'
     }
     Publish-Report $left.id 'drive'
     Press-Key 0x70
     $null = Wait-Until 'the WSL distribution translated the reported drive path' {
-        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq '/different-root/c/custom mount/100% #'
+        (Read-ClipboardFixture) -ceq '/different-root/c/custom mount/100% #'
     }
     Publish-Report $left.id 'linux'
     $explorerAction = 'Open current folder in File Explorer'
@@ -246,7 +245,7 @@ public static class WslFixture {
     $directory = '/home/100% # notes'
     Press-Key 0x70
     $null = Wait-Until 'the WSL share was copied as a Linux directory' {
-        [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $directory
+        (Read-ClipboardFixture) -ceq $directory
     }
     Run-Palette $action
     $child = Wait-Until 'WSL split uses a report for its own distribution' {

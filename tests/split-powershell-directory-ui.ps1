@@ -65,15 +65,11 @@ try {
     $parentPid = Confirm-Directory $parent.id 'first'
     Check-DirectoryActions $true
     Run-Palette 'Copy current directory'
-    $copied = Wait-Until 'the PowerShell folder was copied' {
-        if ([IO.File]::Exists($env:W11TERM_TEST_COPY_FILE)) {
-            [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE)
-        }
-    }
-    if (![IO.Path]::IsPathRooted($copied) -or
-        [IO.Path]::GetFileName($copied) -cne [IO.Path]::GetFileName($env:W11TERM_SPLIT_CWD) -or
-        ![IO.File]::Exists([IO.Path]::Combine($copied, $env:W11TERM_CWD_PROOF))) {
-        throw "Unexpected copied PowerShell folder: $copied"
+    $null = Wait-Until 'the PowerShell folder containing the proof file was copied' {
+        $copied = Read-ClipboardFixture
+        $copied -and [IO.Path]::IsPathRooted($copied) -and
+            [IO.Path]::GetFileName($copied) -ceq [IO.Path]::GetFileName($env:W11TERM_SPLIT_CWD) -and
+            [IO.File]::Exists([IO.Path]::Combine($copied, $env:W11TERM_CWD_PROOF))
     }
     Send-Line $parent.id 'Set-Location -LiteralPath Env:'
     $null = Control @('wait-for-text','--pane',"$($parent.id)",'--timeout','15','PS Env:')

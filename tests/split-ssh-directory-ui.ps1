@@ -62,8 +62,7 @@ try {
         Run-Palette 'Copy current directory'
     }
     $null = Wait-Until 'the exact remote folder was copied' {
-        [IO.File]::Exists($env:W11TERM_TEST_COPY_FILE) -and
-            [IO.File]::ReadAllText($env:W11TERM_TEST_COPY_FILE) -ceq $expected
+        (Read-ClipboardFixture) -ceq $expected
     }
     $original = (Control @('list')).sessions | Where-Object id -eq $source
     if ($destination -eq 'right') {
