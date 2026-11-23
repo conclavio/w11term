@@ -519,14 +519,14 @@ async fn native_ssh_command_history_searches_and_copies_the_full_command() {
         "\x1b]133;C;cmdline_url=echo%20first%0A%20%20echo%20second\x07",
         "multiline output\r\n\x1b]133;D;0\x07"
     ));
+    let successful_output = format!(
+        "{}[Ångström] appears only in this output",
+        "progress details for finding the final line beyond the preview\r\n".repeat(150),
+    );
     for (command, output, status) in [
         ("deploy audit", "no status reported", ""),
         ("deploy retry", "retry failed", ";2"),
-        (
-            "check-status",
-            "[Ångström] appears only in this output",
-            ";0",
-        ),
+        ("check-status", successful_output.as_str(), ";0"),
     ] {
         stream.push_str(&format!("\x1b]133;A\x07$ \x1b]133;B\x07{command}\r\n\x1b]133;C\x07{output}\r\n\x1b]133;D{status}\x07"));
     }

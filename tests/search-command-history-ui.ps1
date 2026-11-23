@@ -26,8 +26,12 @@ function Click([string]$Label) {
     })
 }
 function Search([string]$Text) {
-    $field = Wait-Until 'command search field' { Find-Element 'Search command history' $edit }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Text)
+    $value = Wait-Until 'command search field value provider' {
+        $field = Find-Element 'Search command history' $edit
+        $provider = $null
+        if ($field -and $field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider)) { $provider }
+    }
+    $value.SetValue($Text)
 }
 function Visible-TerminalText {
     $doc = Find-Element ("Terminal" + $dot + "palette-ssh") ([System.Windows.Automation.ControlType]::Document)
@@ -56,8 +60,9 @@ function Pick-Output([string]$Path, [int]$ButtonId, [string]$Suggestion) {
 function Status-Box([string]$Expected) {
     Wait-Until "command status selector showing '$Expected'" {
         $box = Find-Element 'Command status' ([System.Windows.Automation.ControlType]::ComboBox)
-        if ($box) {
-            $items = $box.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+        $provider = $null
+        if ($box -and $box.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$provider)) {
+            $items = $provider.Current.GetSelection()
             if ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Expected) { $box }
         }
     }
@@ -161,6 +166,21 @@ try {
         (Find-Element 'No matching commands') -and !(Find-Element 'Copy command' $button).Current.IsEnabled -and
             !(Find-Element 'Copy output' $button).Current.IsEnabled -and !(Find-Element $saveOutput $button).Current.IsEnabled
     }
+    $includeOutput = 'Include command output'
+    (Wait-CheckBox $includeOutput Off).Toggle()
+    $null = Wait-Until 'output-only match in the selected status' {
+        (Find-Element "Selected, $recent" $button) -and !(Find-Element $old $button)
+    }
+    $textFilter = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $null = Wait-Until 'output preview jumps beyond its initial limit to the matching line' {
+        foreach ($candidate in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textFilter)) {
+            if ($candidate.Current.Name.Contains("$word appears only in this output")) { return $candidate }
+        }
+    }
+    (Wait-CheckBox $includeOutput On).Toggle()
+    $null = Wait-Until 'turning off output search restores the command-only filter' { Find-Element 'No matching commands' }
     Search ''
     $null = Wait-Until 'the successful command is selected' {
         (Find-Element "Selected, $recent" $button) -and !(Find-Element $unknown $button) -and
