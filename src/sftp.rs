@@ -25,6 +25,7 @@ use tokio::{
 };
 
 mod directory;
+mod editor;
 mod text_preview;
 pub(crate) use directory::valid_component;
 pub use directory::validate_download_name;
@@ -57,6 +58,13 @@ impl EntryKind {
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
     Info,
+    /// Explicit Save from the editor. An absent original requests a new file.
+    #[serde(skip)]
+    SaveText {
+        path: String,
+        original: Option<String>,
+        text: String,
+    },
     Get {
         remote: String,
         local: PathBuf,
@@ -319,6 +327,10 @@ enum JobStage {
         confirmed: u64,
     },
     Checking(&'static str),
+    EditorSave {
+        temporary: String,
+        publishing: bool,
+    },
     AwaitingStatus(&'static str),
 }
 
@@ -341,6 +353,14 @@ impl JobStage {
                 format!("Upload interrupted after {confirmed} confirmed bytes; remote destination {remote} may contain a partial file").into(),
             Self::NativeUpload { open_dispatched: false, .. } =>
                 "Upload interrupted before opening the remote destination; 0 confirmed bytes".into(),
+            Self::EditorSave { temporary, publishing } => {
+                let state = if *publishing {
+                    "publication outcome unknown; refresh and check the destination"
+                } else {
+                    "destination was not replaced"
+                };
+                format!("Save interrupted; {state}. Temporary file may remain at {temporary}").into()
+            }
             Self::Checking(message) | Self::AwaitingStatus(message) => (*message).into(),
         }
     }
@@ -391,6 +411,7 @@ pub(crate) async fn run(
         } = job;
         if expected_generation.is_none() {
             let missing = match operation {
+                Operation::SaveText { .. } => Some("The editor needs its original SSH connection"),
                 Operation::RenameEntry { .. } => {
                     Some("Missing SSH connection approval; rename was not started")
                 }
@@ -462,6 +483,7 @@ pub(crate) async fn run(
                     deadline,
                 },
                 Operation::RenameEntry { .. } => JobStage::Checking("Rename was not started"),
+                Operation::SaveText { .. } => JobStage::Checking("Save was not started"),
                 Operation::RemoveEntry { .. } => JobStage::Checking("Delete was not started"),
                 _ => JobStage::Ordinary,
             },
@@ -505,7 +527,9 @@ pub(crate) async fn run(
                     || (lost
                         && matches!(
                             reply.stage,
-                            JobStage::AwaitingStatus(_) | JobStage::NativeUpload { .. }
+                            JobStage::AwaitingStatus(_)
+                                | JobStage::NativeUpload { .. }
+                                | JobStage::EditorSave { .. }
                         ))
                 {
                     result.with_context(|| reply.stage.interrupted())
@@ -522,6 +546,7 @@ pub(crate) async fn run(
                 if matches!(
                     reply.stage,
                     JobStage::DirectoryDownload { .. }
+                        | JobStage::EditorSave { .. }
                         | JobStage::Checking(_)
                         | JobStage::AwaitingStatus(_)
                         | JobStage::NativeUpload { .. }
@@ -679,6 +704,15 @@ impl Engine {
         let ok = json!({});
         let mounted = matches!(op, ListMountedFolder { .. });
         Ok(match op {
+            SaveText {
+                path,
+                original,
+                text,
+            } => {
+                self.save_text(&path, original.as_deref(), &text, stage)
+                    .await?;
+                ok
+            }
             Info => {
                 json!({"version":self.version.version,"extensions":self.version.extensions,"open_handles":self.handles.len(),"read_chunk":self.read_size,"write_chunk":self.write_size})
             }

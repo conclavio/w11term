@@ -304,6 +304,7 @@ impl server::Handler for Peer {
             root: self.root.clone(),
             ssh: s.handle(),
             handles: HashMap::new(),
+            posix: None,
             next: 0,
         };
         tokio::spawn(async move {
@@ -320,6 +321,7 @@ struct Files {
     root: PathBuf,
     ssh: server::Handle,
     handles: HashMap<String, Opened>,
+    posix: Option<text_save::PosixMetadata>,
     next: u64,
 }
 fn status(id: u32) -> Status {
@@ -438,6 +440,12 @@ impl russh_sftp::server::Handler for Files {
     type Error = StatusCode;
     async fn init(&mut self, _: u32, _: HashMap<String, String>) -> Result<Version, StatusCode> {
         let mut version = Version::new();
+        if let Ok(value) = fs::read_to_string(self.root.join("posix-rename-version")) {
+            version
+                .extensions
+                .insert("posix-rename@openssh.com".into(), value);
+            self.posix = Some(Default::default());
+        }
         if self.root.join("small-reads").exists() {
             version
                 .extensions
@@ -449,8 +457,11 @@ impl russh_sftp::server::Handler for Files {
         &mut self,
         id: u32,
         request: String,
-        _: Vec<u8>,
+        data: Vec<u8>,
     ) -> Result<Packet, StatusCode> {
+        if request == "posix-rename@openssh.com" && self.posix.is_some() {
+            return self.posix_rename(id, data);
+        }
         if request != "limits@openssh.com" || !self.root.join("small-reads").exists() {
             return Err(StatusCode::OpUnsupported);
         }
@@ -468,13 +479,17 @@ impl russh_sftp::server::Handler for Files {
         id: u32,
         path: String,
         flags: OpenFlags,
-        _: FileAttributes,
+        attrs: FileAttributes,
     ) -> Result<Handle, StatusCode> {
         self.trace_transfer(format_args!("OPEN {path}"))?;
         let file = fs::OpenOptions::from(flags)
             .open(self.path(&path))
             .map_err(io)?;
-        Ok(self.add(id, Opened::File(file)))
+        let handle = self.add(id, Opened::File(file));
+        if let Some(posix) = &mut self.posix {
+            posix.opened(&handle.handle, path, flags, attrs);
+        }
+        Ok(handle)
     }
     async fn close(&mut self, id: u32, h: String) -> Result<Status, StatusCode> {
         if matches!(self.handles.get(&h), Some(Opened::File(_))) {
@@ -482,6 +497,9 @@ impl russh_sftp::server::Handler for Files {
             self.hold_response("hold-transfer-close").await;
         }
         self.handles.remove(&h).ok_or(StatusCode::Failure)?;
+        if let Some(posix) = &mut self.posix {
+            posix.closed(&h);
+        }
         Ok(status(id))
     }
     async fn read(
@@ -584,6 +602,9 @@ impl russh_sftp::server::Handler for Files {
             return Err(StatusCode::ConnectionLost);
         }
         let mut attrs = entry_attrs(&self.path(&path))?;
+        if let Some(posix) = &self.posix {
+            posix.stat(&path, &mut attrs);
+        }
         if self.root.join("tree-unknown-size").is_file() {
             attrs.size = None;
         }
@@ -600,6 +621,9 @@ impl russh_sftp::server::Handler for Files {
             return Err(StatusCode::OpUnsupported);
         }
         let mut attrs = FileAttributes::from(&self.file(&h)?.metadata().map_err(io)?);
+        if let Some(posix) = &self.posix {
+            posix.fstat(&h, &mut attrs)?;
+        }
         if self.root.join("tree-unknown-size").is_file() {
             attrs.size = None;
             attrs.permissions = Some(0o600);
@@ -631,6 +655,12 @@ impl russh_sftp::server::Handler for Files {
         h: String,
         attrs: FileAttributes,
     ) -> Result<Status, StatusCode> {
+        if let Some(posix) = &mut self.posix {
+            if self.root.join("deny-editor-fsetstat").is_file() {
+                return Err(StatusCode::PermissionDenied);
+            }
+            posix.fsetstat(&h, &attrs)?;
+        }
         if let Some(size) = attrs.size {
             self.file(&h)?.set_len(size).map_err(io)?;
         }
@@ -948,6 +978,8 @@ mod rename;
 mod tab_windows;
 #[path = "sftp/text_preview.rs"]
 mod text_preview;
+#[path = "sftp/text_save.rs"]
+mod text_save;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn folder_creation_checks_the_ssh_generation_before_opening_sftp() {

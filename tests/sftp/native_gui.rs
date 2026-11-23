@@ -2046,6 +2046,49 @@ async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "edits UTF-8 text in the SFTP drawer and saves a conflicting draft under a new name"]
+async fn native_sftp_editor_saves_explicitly_and_recovers_a_conflicting_draft() {
+    let (Source::Ssh(ssh), remote, channels, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    let folder = remote.path().join("shell directory");
+    fs::create_dir(&folder).unwrap();
+    let source = folder.join("pilot 雪.ini");
+    let original = "\u{feff}pilot=one\r\nspeed=slow\nlabel=雪";
+    fs::write(&source, original.as_bytes()).unwrap();
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    let keys = remote.path().join("keyboard-input.bin");
+    fs::write(&keys, []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("fixture-folder"),
+        folder.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("sftp-edit-text-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        fs::read(&source).unwrap(),
+        "\u{feff}pilot=one\r\nspeed=peer\nlabel=雪".as_bytes()
+    );
+    assert_eq!(
+        fs::read(folder.join("draft 雪.ini")).unwrap(),
+        "\u{feff}pilot=two\r\nspeed=fast\nlabel=雪".as_bytes()
+    );
+    assert_eq!(
+        fs::read_dir(&folder).unwrap().count(),
+        2,
+        "editor left staging files behind"
+    );
+    assert_eq!(fs::read(keys).unwrap(), b"after-editor");
+    assert_eq!(
+        channels.load(Ordering::Relaxed),
+        2,
+        "one SSH shell and one SFTP channel"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens an isolated native WinUI window"]
 async fn native_ssh_split() {
     let (source, _root, opens, server) = fixture_server(false).await;
