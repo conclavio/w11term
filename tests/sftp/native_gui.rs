@@ -1949,47 +1949,68 @@ async fn native_powershell_directory_actions_inherit_cwd_and_preserve_the_mixed_
 #[ignore = "opens tabs and splits from verified OSC 7 paths on real SSH channels"]
 async fn native_ssh_directory_actions_open_on_the_original_transport() {
     for destination in ["right", "below", "tab"] {
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let (Source::Ssh(ssh), remote, opens, server) =
-            fixture_counting_accepts(false, 2, accepted.clone()).await
-        else {
-            unreachable!()
-        };
-        let state = tempfile::tempdir().unwrap();
-        fs::write(state.path().join("destination"), destination).unwrap();
-        let inputs = remote.path().join("split-inputs");
-        fs::create_dir(&inputs).unwrap();
-        let exec = remote.path().join("workspace-exec.bin");
-        fs::write(&exec, []).unwrap();
-        drive_mixed_gui("split-ssh-directory-ui.ps1", &ssh, state.path());
-        assert_eq!(
-            accepted.load(Ordering::Relaxed),
-            1,
-            "must retain original SSH connection"
-        );
-        assert_eq!(
-            opens.load(Ordering::Relaxed),
-            2,
-            "exactly one new session channel"
-        );
-        assert_eq!(
-            fs::read_to_string(exec).unwrap(),
-            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s Work'"#,
-        );
-        let mut streams: Vec<_> = fs::read_dir(inputs)
-            .unwrap()
-            .map(|f| fs::read_to_string(f.unwrap().path()).unwrap())
-            .collect();
-        streams.sort();
-        assert_eq!(
-            streams,
-            [
-                "child-live",
-                "report-currentreport-foreignreport-current-againparent-live"
-            ]
-        );
-        server.abort();
+        check_ssh_directory_action(destination, false).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a real SSH tab using paired iTerm2 host and literal directory reports"]
+async fn native_iterm2_directory_opens_a_tab_on_the_original_transport() {
+    check_ssh_directory_action("tab", true).await;
+}
+
+async fn check_ssh_directory_action(destination: &str, iterm2: bool) {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, opens, server) =
+        fixture_counting_accepts(false, 2, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    fs::write(state.path().join("destination"), destination).unwrap();
+    if iterm2 {
+        fs::write(state.path().join("iterm2"), []).unwrap();
+    }
+    let inputs = remote.path().join("split-inputs");
+    fs::create_dir(&inputs).unwrap();
+    let exec = remote.path().join("workspace-exec.bin");
+    fs::write(&exec, []).unwrap();
+    drive_mixed_gui("split-ssh-directory-ui.ps1", &ssh, state.path());
+    assert_eq!(
+        accepted.load(Ordering::Relaxed),
+        1,
+        "must retain original SSH connection"
+    );
+    assert_eq!(
+        opens.load(Ordering::Relaxed),
+        2,
+        "exactly one new session channel"
+    );
+    assert_eq!(
+        fs::read_to_string(exec).unwrap(),
+        if iterm2 {
+            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s 100%2F;#雪'"#
+        } else {
+            r#"sh -c 'cd "$1" && exec "${SHELL:-/bin/sh}" -i' w11term '/srv/Pilot'\''s Work'"#
+        },
+    );
+    let mut streams: Vec<_> = fs::read_dir(inputs)
+        .unwrap()
+        .map(|f| fs::read_to_string(f.unwrap().path()).unwrap())
+        .collect();
+    streams.sort();
+    assert_eq!(
+        streams,
+        [
+            "child-live",
+            if iterm2 {
+                "report-currentnested-hostnested-dirother-loginlogin-hostliteral-dirparent-live"
+            } else {
+                "report-currentreport-foreignreport-current-againparent-live"
+            }
+        ]
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

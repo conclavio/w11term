@@ -3727,6 +3727,7 @@ dependencies = [
  "miniz_oxide 0.7.4",
  "num-traits",
  "ordered-float",
+ "percent-encoding",
  "serde",
  "terminfo",
  "termwiz",

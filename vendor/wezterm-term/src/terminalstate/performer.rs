@@ -761,6 +761,7 @@ impl<'a> Performer<'a> {
                 self.capturing_shell_input = false;
                 self.command_label = None;
                 self.current_dir = None;
+                self.forget_iterm_reported_host();
                 self.pen = Default::default();
                 self.cursor = Default::default();
                 self.wrap_next = false;
@@ -930,6 +931,8 @@ impl<'a> Performer<'a> {
                     self.writer.flush().ok();
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
+                ITermProprietary::RemoteHost(report) => self.iterm_remote_host(&report),
+                ITermProprietary::CurrentDir(path) => self.iterm_current_dir(&path),
                 ITermProprietary::SetUserVar { name, value } => {
                     self.user_vars.insert(name.clone(), value.clone());
                     if let Some(handler) = self.alert_handler.as_mut() {
@@ -1043,6 +1046,7 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
+                self.forget_iterm_reported_host();
                 self.set_reported_current_dir(
                     Url::parse(&url).ok().map(|parsed| (parsed, url.into())),
                 );

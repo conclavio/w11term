@@ -914,6 +914,8 @@ pub enum ITermProprietary {
     ClearScrollback,
     /// To inform iTerm2 of the current directory to help semantic history
     CurrentDir(String),
+    /// The user@host associated with subsequent CurrentDir reports.
+    RemoteHost(String),
     /// To change the session's profile on the fly
     SetProfile(String),
     /// Currently defined values for the string parameter are "rule", "find", "font"
@@ -1236,7 +1238,15 @@ impl ITermProprietary {
         single!(RequestCellSize, "ReportCellSize");
         const_arg!(HighlightCursorLine, "HighlightCursorLine", "yes", true);
         const_arg!(HighlightCursorLine, "HighlightCursorLine", "no", false);
-        one_str!(CurrentDir, "CurrentDir");
+        if matches!(keyword, "CurrentDir" | "RemoteHost") {
+            // A malformed report clears the prior value, just like an empty field.
+            let value = if osc.len() == 2 { p1.unwrap_or("") } else { "" }.into();
+            return Ok(if keyword == "RemoteHost" {
+                Self::RemoteHost(value)
+            } else {
+                Self::CurrentDir(value)
+            });
+        }
         one_str!(SetProfile, "SetProfile");
         one_str!(CopyToClipboard, "CopyToClipboard");
 
@@ -1354,6 +1364,7 @@ impl Display for ITermProprietary {
             StealFocus => write!(f, "StealFocus")?,
             ClearScrollback => write!(f, "ClearScrollback")?,
             CurrentDir(s) => write!(f, "CurrentDir={}", s)?,
+            RemoteHost(s) => write!(f, "RemoteHost={}", s)?,
             SetProfile(s) => write!(f, "SetProfile={}", s)?,
             CopyToClipboard(s) => write!(f, "CopyToClipboard={}", s)?,
             EndCopy => write!(f, "EndCopy")?,
@@ -1773,6 +1784,15 @@ mod test {
                 "\x1b]1337;CurrentDir=woot\x1b\\"
             ),
             OperatingSystemCommand::ITermProprietary(ITermProprietary::CurrentDir("woot".into()))
+        );
+        assert_eq!(
+            parse(
+                &["1337", "RemoteHost=alice@host"],
+                "\x1b]1337;RemoteHost=alice@host\x1b\\"
+            ),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::RemoteHost(
+                "alice@host".into()
+            ))
         );
 
         assert_eq!(

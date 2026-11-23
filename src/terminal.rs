@@ -1165,6 +1165,67 @@ mod tests {
     }
 
     #[test]
+    fn ssh_iterm_directory_snapshot_is_bound_to_the_current_login() {
+        let (mut ssh, _) = engine();
+        let (mut local, _) = engine();
+        ssh.enable_iterm_directory_reports("alice", "host.example");
+        local.enable_conemu_directory_reports();
+        local.advance_bytes(b"\x1b]7;file:///C:/work\x07");
+        let report =
+            b"\x1b]1337;RemoteHost=alice@host.example\x07\x1b]1337;CurrentDir=/srv/demo\x1b\\";
+        for bytes in report.chunks(3) {
+            ssh.advance_bytes(bytes);
+            local.advance_bytes(bytes);
+        }
+        let frame = Snapshot::capture(&ssh, None, 1, 0, String::new(), 0);
+        assert_eq!(
+            frame.reported_directory.as_deref(),
+            Some("file://host.example/srv/demo")
+        );
+        assert_eq!(
+            local.reported_current_dir().map(AsRef::as_ref),
+            Some("file:///C:/work")
+        );
+
+        ssh.reset_connection();
+        ssh.advance_bytes(b"\x1b]1337;CurrentDir=/from-old-login\x07");
+        assert!(ssh.reported_current_dir().is_none());
+        ssh.advance_bytes(report);
+        assert_eq!(
+            ssh.reported_current_dir().map(AsRef::as_ref),
+            frame.reported_directory.as_deref()
+        );
+        ssh.advance_bytes(b"\x1b]1337;RemoteHost=other@host.example\x07");
+        assert!(ssh.reported_current_dir().is_none());
+        // Captures used by a visible picker or hint overlay keep their original directory.
+        assert_eq!(
+            frame.reported_directory.as_deref(),
+            Some("file://host.example/srv/demo")
+        );
+    }
+
+    #[test]
+    fn incomplete_and_oversized_iterm_reports_do_not_publish_partial_directories() {
+        let (mut ssh, _) = engine();
+        ssh.enable_iterm_directory_reports("alice", "host.example");
+        ssh.advance_bytes(b"\x1b]1337;RemoteHost=alice@host.example\x07");
+        let prompt = b"\x1b]1337;CurrentDir=/shell\x07";
+        for bad in [
+            b"\x1b]1337;CurrentDir=/interrupted\x1b[0m".to_vec(),
+            format!("\x1b]1337;CurrentDir=/{}\x07", "a".repeat(140 * 1024)).into_bytes(),
+        ] {
+            ssh.advance_bytes(prompt);
+            ssh.advance_bytes(&bad);
+            assert!(ssh.reported_current_dir().is_none());
+            ssh.advance_bytes(prompt);
+            assert_eq!(
+                ssh.reported_current_dir().map(AsRef::as_ref),
+                Some("file://host.example/shell")
+            );
+        }
+    }
+
+    #[test]
     fn shell_metadata_follows_primary_pane_and_connection() {
         let (mut term, _) = engine();
         term.advance_bytes(b"\x1b]7;file://localhost/old%20dir\x07\x1b]133;C\x07left");

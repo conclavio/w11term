@@ -2961,6 +2961,22 @@ mod tests {
     }
 
     #[test]
+    fn iterm_report_preserves_posix_paths_when_opening_sftp() {
+        let (writer, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = w11term::terminal::create(Default::default(), writer);
+        term.enable_iterm_directory_reports("pilot", "host.example");
+        term.advance_bytes(b"\x1b]1337;RemoteHost=pilot@host.example\x07");
+        for path in ["/", "/C|/project", "/srv/100%2F;#雪", "/C:/a file?"] {
+            term.advance_bytes(format!("\x1b]1337;CurrentDir={path}\x07"));
+            let report = term.reported_current_dir().map(AsRef::as_ref);
+            assert_eq!(
+                shell_directory(report, "host.example").as_deref(),
+                Some(path)
+            );
+        }
+    }
+
+    #[test]
     fn remote_paths_and_directory_types_use_sftp_semantics() {
         let listing = json!({"entries":[
             {"filename":"link", "attrs":{"permissions": 0o120777}}, {"filename":".", "attrs":{}},

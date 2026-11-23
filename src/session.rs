@@ -365,8 +365,13 @@ impl Session {
             colors.effective(),
         );
         let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard));
-        if matches!(source, Source::Local(_)) {
-            terminal.enable_conemu_directory_reports();
+        let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
+        match &source {
+            Source::Local(_) => terminal.enable_conemu_directory_reports(),
+            Source::Ssh(ssh) if direct_ssh_shell => {
+                terminal.enable_iterm_directory_reports(&ssh.user, &ssh.host);
+            }
+            _ => {}
         }
         let clipboard: Arc<dyn wezterm_term::Clipboard> =
             Arc::new(crate::clipboard::RemoteClipboard(clipboard_enabled.clone()));
@@ -389,7 +394,6 @@ impl Session {
         let worker_prompts = prompts.clone();
         let worker_events = events.clone();
         let ssh_connection = ssh::ShareSlot::default();
-        let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         let (durable, lifecycle) = saved
             .filter(|_| matches!(source, Source::Ssh(_)))
             .map(ssh::DurableControl::new)
