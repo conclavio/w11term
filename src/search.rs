@@ -6,7 +6,7 @@ use wezterm_term::{SemanticType, Terminal};
 
 mod literal;
 mod panes;
-pub use panes::{PaneSearchAnchor, PaneSearchPreview};
+pub use panes::{PaneSearchAnchor, PaneSearchPreview, PaneSearchQuery};
 
 const LIMIT: usize = 10_000;
 pub const MAX_QUERY_BYTES: usize = 4096;
@@ -131,11 +131,7 @@ impl Search {
             self.selected = None;
             return;
         }
-        if let Some(pattern) = &self.compiled {
-            (self.truncated, self.incomplete) = search_regex(terminal, pattern, &mut self.matches);
-        } else {
-            self.search_literal(terminal);
-        }
+        self.collect_matches(terminal, || false);
         let screen = terminal.screen();
         self.update_match_rows(screen.row_epoch());
         let anchor = previous.unwrap_or(Point {
@@ -148,8 +144,20 @@ impl Search {
             .position(|m| m.start() >= anchor)
             .or_else(|| self.matches.len().checked_sub(1));
     }
-    fn search_literal(&mut self, terminal: &Terminal) {
-        self.collect_literal(terminal, || false);
+    fn collect_matches(&mut self, terminal: &Terminal, cancelled: impl Fn() -> bool) {
+        if let Some(pattern) = &self.compiled {
+            (self.truncated, self.incomplete) = scan_regex(terminal, pattern, cancelled, |cells| {
+                if self.matches.len() == LIMIT {
+                    return false;
+                }
+                if let Some(hit) = Match::from_cells(cells.iter()) {
+                    self.matches.push(hit);
+                }
+                true
+            });
+        } else {
+            self.collect_literal(terminal, cancelled);
+        }
     }
 
     fn update_match_rows(&mut self, row_epoch: u64) {
@@ -273,16 +281,20 @@ fn compile_regex(query: &str, sensitive: bool) -> Result<Regex, String> {
 
 /// Search complete hard lines. Running a regex on a clipped prefix can
 /// fabricate an end anchor, a word boundary, or a shorter greedy match.
-fn search_regex(terminal: &Terminal, pattern: &Regex, matches: &mut Vec<Match>) -> (bool, bool) {
+fn scan_regex(
+    terminal: &Terminal,
+    pattern: &Regex,
+    cancelled: impl Fn() -> bool,
+    mut emit: impl FnMut(&[Cell]) -> bool,
+) -> (bool, bool) {
     let screen = terminal.screen();
     let mut text = String::new();
     let mut cells = Vec::new();
     let mut skip_line = false;
     let mut incomplete = false;
-    let mut truncated = false;
-    screen.for_each_phys_line(|row, line| {
-        if truncated {
-            return;
+    for (row, line) in screen.physical_lines().enumerate() {
+        if cancelled() {
+            break;
         }
         if !skip_line {
             let stable = screen.phys_to_stable_row_index(row);
@@ -310,28 +322,30 @@ fn search_regex(terminal: &Terminal, pattern: &Regex, matches: &mut Vec<Match>) 
             }
         }
         if line.last_cell_was_wrapped() && row + 1 < screen.scrollback_rows() {
-            return;
+            continue;
         }
         if !skip_line {
-            for found in pattern.find_iter(&text).filter(|m| !m.is_empty()) {
-                if matches.len() == LIMIT {
-                    truncated = true;
-                    break;
+            for found in pattern.find_iter(&text) {
+                if cancelled() {
+                    return (false, incomplete);
+                }
+                if found.is_empty() {
+                    continue;
                 }
                 // The regexp can start or end inside a grapheme. Include the
                 // full terminal cell on either side, including its wide columns.
                 let first = cells.partition_point(|c| c.end <= found.start());
                 let end = cells.partition_point(|c| c.start < found.end());
-                if let Some(hit) = Match::from_cells(cells[first..end].iter()) {
-                    matches.push(hit);
+                if !emit(&cells[first..end]) {
+                    return (true, incomplete);
                 }
             }
         }
         skip_line = false;
         text.clear();
         cells.clear();
-    });
-    (truncated, incomplete)
+    }
+    (false, incomplete)
 }
 
 pub fn max_offset(terminal: &Terminal) -> usize {
