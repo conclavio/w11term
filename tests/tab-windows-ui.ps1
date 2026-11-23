@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 Add-Type @"
@@ -77,7 +77,7 @@ function Use-Window([IntPtr]$Hwnd) {
     }
 }
 
-function Move-Tab([IntPtr]$Hwnd) {
+function Move-Tab([IntPtr]$Hwnd, [string]$Action = 'Move tab to new window') {
     Use-Window $Hwnd
     $window = $Hwnd
     Press-Key 0x76 # F7, fixture command palette
@@ -85,10 +85,10 @@ function Move-Tab([IntPtr]$Hwnd) {
         $element = Find-Here $Hwnd 'Search commands'
         if ($element -and $element.Current.HasKeyboardFocus) { $element }
     }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('move tab to new window')
-    $null = Wait-Until 'enabled Move tab to new window action' {
-        $action = Find-Here $Hwnd 'Move tab to new window'
-        if ($action -and $action.Current.IsEnabled) { $action }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Action)
+    $null = Wait-Until "enabled $Action action" {
+        $item = Find-Here $Hwnd $Action
+        if ($item -and $item.Current.IsEnabled) { $item }
     }
     Press-Key 13
 }
@@ -217,8 +217,33 @@ try {
     Press-Key 0x78 # F9 focuses the left SSH pane
     Expect-Focus $destination $ssh.id 'F9 selects the destination SSH pane'
 
-    Write-Output "Verified per-window input; closing $FirstClose first"
-    if ($FirstClose -eq 'Origin') {
+    if ($FirstClose -eq 'Existing') {
+        # The two-pane tab is the detached window's only tab. Move it into
+        # the original window, which still has its own PowerShell tab.
+        Write-Output "Moving the live split back into existing window $origin"
+        Move-Tab $destination "Move tab to existing window $($anchor.window_id) $([char]0x00b7) Source PowerShell"
+        $returned = Expect-Group 3 $newOwner
+        if ($returned -ne $anchor.window_id) { throw 'Split moved to a different window ID' }
+        $last = $origin
+        $null = Wait-Until 'the original HWND to remain after the empty source closes' {
+            $handles = [TabFixtureWindows]::OwnedBy($app.Id)
+            $handles.Count -eq 1 -and $handles[0] -eq $origin
+        }
+        Expect-Focus $origin $ssh.id 'Existing destination receives the moved tab and keyboard focus'
+        Expect-Text $ssh.id 'ssh-probe/'
+        Type-In $origin 'existing-window/'
+        Expect-Text $ssh.id 'existing-window/'
+        $kept = (Control @('list')).sessions | Where-Object id -eq $anchor.id
+        if ($kept.tab_id -ne $anchor.tab_id -or $kept.window_id -ne $anchor.window_id -or $kept.visible) {
+            throw 'The destination changed or lost its former tab'
+        }
+        if ((Shell-State $anchor.id 'existingAnchor') -ne $anchorIdentity) { throw 'Destination PowerShell restarted' }
+        $window = $origin
+        Press-Key 0x77 # F8 follows the moved split to its new window
+        Expect-Focus $origin $moved.id 'Existing destination can focus the moved PowerShell'
+        if ((Shell-State $moved.id 'existingMoved' $origin) -ne $localIdentity) { throw 'Moved PowerShell restarted' }
+    } elseif ($FirstClose -eq 'Origin') {
+        Write-Output "Closing original window $origin first"
         Close-FixtureWindow $origin
         $null = Wait-Until 'only the destination and its two panes to remain' {
             $handles = [TabFixtureWindows]::OwnedBy($app.Id)

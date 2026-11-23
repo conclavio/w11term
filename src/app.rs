@@ -588,6 +588,9 @@ fn state_menu_item(key: &str, label: &str, state: Option<bool>) -> MenuItem {
     }
 }
 fn tab_menu_message(label: String) -> Message {
+    if let Some(window) = tab_windows::menu_window(&label) {
+        return Message::MoveTabToExistingWindow(None, window);
+    }
     if let Some(name) = label.strip_prefix("Browse Herdr terminals on ") {
         return Message::Discovery(session_browser::Action::Discover {
             name: name.into(),
@@ -691,6 +694,10 @@ fn tab_menu_message(label: String) -> Message {
 
 fn bind_tab_action(message: Message, group: Option<TabId>) -> Message {
     match message {
+        Message::MoveTabToExistingWindow(None, window) => group
+            .map_or(Message::ControlIdle, |id| {
+                Message::MoveTabToExistingWindow(Some(id), window)
+            }),
         Message::Shortcut(Shortcut::DuplicateTabLayout) => {
             group.map_or(Message::ControlIdle, Message::DuplicateTabLayout)
         }
@@ -909,12 +916,15 @@ pub enum Message {
     ClosePane,
     MovePaneToTab,
     MoveTabToWindow,
+    MoveTabToExistingWindow(Option<TabId>, u64),
     DuplicateTabLayout(TabId),
     ReopenClosedTab(Option<TabId>),
     ReopenClosedPane(Option<TabId>),
     MoveTab(TabId, Direction),
     WindowTick,
+    WindowTargetsChanged,
     DismissWindowError,
+    TransferRequest(u64, u64),
     TransferReady(u64),
     TransferClaim(u64),
     TransferDone(u64),
@@ -3493,6 +3503,7 @@ impl TerminalApp {
             } else {
                 MenuItem::disabled("move-tab-window", "Move tab to new window")
             },
+            self.existing_window_menu(),
             self.binding_menu("copy-mode", "Keyboard copy mode", KeyAction::CopyMode),
             self.binding_menu_enabled(
                 "select-all",
@@ -4146,9 +4157,13 @@ impl Component for TerminalApp {
                 Some(w11term::pane_layout::Layout::Leaf(_))
             )
         });
-        let registry = input.transfer.as_ref().map_or_else(
+        let new_window = input
+            .transfer
+            .as_ref()
+            .and_then(|transfer| transfer.new_window.as_ref());
+        let registry = new_window.map_or_else(
             || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
-            |transfer| transfer.registry.clone(),
+            |window| window.registry.clone(),
         );
         let (control_sender, control_rx) = std::sync::mpsc::sync_channel::<UiWork>(8);
         let wake = control_sender.clone();
@@ -4175,7 +4190,7 @@ impl Component for TerminalApp {
             crate::renderer::screenshot_with_font(frame, size, path, &appearance)
         });
         registry.set_capture(capture.clone());
-        let control = input.transfer.as_ref().map_or_else(
+        let control = new_window.map_or_else(
             || {
                 Arc::new(
                     Server::start(registry.clone(), move |frame, size, path| {
@@ -4184,7 +4199,7 @@ impl Component for TerminalApp {
                     .expect("starting local control pipe"),
                 )
             },
-            |transfer| transfer.server.clone(),
+            |window| window.server.clone(),
         );
         let active = registry.clone();
         let sender = context.sender();
@@ -4430,7 +4445,12 @@ impl Component for TerminalApp {
                 }
             }
             Message::DismissWindowError => self.window_error = None,
-            Message::MoveTabToWindow => self.move_tab_window(context),
+            Message::MoveTabToWindow => self.move_tab_window(None, context),
+            Message::MoveTabToExistingWindow(group, window) => {
+                if group.is_some() && self.tabs.active_group_id() == group {
+                    self.move_tab_window(Some(window), context);
+                }
+            }
             Message::DuplicateTabLayout(group) => {
                 self.window_error = self
                     .duplicate_tab_layout(group, context)
@@ -4460,6 +4480,8 @@ impl Component for TerminalApp {
                 }
             }
             Message::WindowTick => self.window_tick(context),
+            Message::WindowTargetsChanged => self.refresh_open_commands(),
+            Message::TransferRequest(source, id) => self.accept_transfer(source, id, context),
             Message::TransferReady(id) => self.offer_group(id, context),
             Message::TransferClaim(id) => self.claim_group(id, context),
             Message::TransferDone(id) => self.finish_transfer(id, context),
@@ -5566,6 +5588,8 @@ impl Component for TerminalApp {
                 }
             }
             Message::WindowActivation(true) => {
+                self.header.borrow_mut().take();
+                self.refresh_open_commands();
                 self.caret_interval = crate::cursor_blink::system_interval();
                 self.refresh_profiles();
                 for entry in self.tabs.entries() {
