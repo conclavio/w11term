@@ -238,6 +238,72 @@ fn pixel(f: &Snapshot, x: usize, y: usize, id: u32) -> Option<[u8; 4]> {
     )
 }
 
+#[tokio::test]
+async fn kitty_replies_once_after_committing_each_addressed_upload_or_placement() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(b"\x1b_Ga=t,i=7,f=32,s=1,v=1,m=1;/wAA\x1b\\\x1b[5n");
+    assert_eq!(read_through(&mut replies, b"\x1b[0n").await, "\x1b[0n");
+    t.advance_bytes(concat!(
+        "\x1b_Gm=0;/w==\x1b\\",
+        "\x1b_Ga=p,i=7,p=3,c=1,r=1,C=1\x1b\\",
+        "\x1b[1;2H\x1b_Ga=T,I=81,p=4,f=24,s=1,v=1,c=1,r=1,C=1;AP8A\x1b\\",
+        "\x1b[1;3H\x1b_Ga=p,I=81,p=5,c=1,r=1,C=1\x1b\\",
+        "\x1b_Ga=t,i=9,f=24,s=1,v=1,q=1;AP8A\x1b\\",
+        "\x1b_Ga=p,i=9,p=0,q=1\x1b\\",
+        "\x1b_Ga=p,i=99,p=6,q=2\x1b\\",
+        "\x1b_Ga=t,f=24,s=1,v=1;AP8A\x1b\\",
+        "\x1b_Ga=p,p=333\x1b\\",
+        "\x1b[5n",
+    ));
+    assert_eq!(
+        read_through(&mut replies, b"\x1b[0n").await,
+        concat!(
+            "\x1b_Gi=7;OK\x1b\\",
+            "\x1b_Gi=7,p=3;OK\x1b\\",
+            "\x1b_GI=81,i=8,p=4;OK\x1b\\",
+            "\x1b_GI=81,i=8,p=5;OK\x1b\\",
+            "\x1b[0n",
+        )
+    );
+    let committed = frame(&t, None, 0);
+    assert_eq!(pixel(&committed, 0, 0, 7), RED);
+    assert_eq!(pixel(&committed, 1, 0, 8), Some([0, 255, 0, 255]));
+    assert_eq!(pixel(&committed, 2, 0, 8), Some([0, 255, 0, 255]));
+}
+
+#[tokio::test]
+async fn kitty_upload_and_placement_errors_report_the_request_identifiers() {
+    let (mut t, mut replies) = engine();
+    t.advance_bytes(concat!(
+        "\x1b_Ga=T,i=7,p=3,f=32,s=1,v=1,c=1,r=1,C=1,q=2;/wAA/w==\x1b\\",
+        "\x1b_Ga=T,i=7,p=3,f=32,s=1,v=1,c=1,r=1,q=1;AP8A\x1b\\",
+        "\x1b_Ga=p,i=7,p=4,x=9,q=1\x1b\\",
+        "\x1b_Ga=p,i=99,p=5,q=1\x1b\\",
+        "\x1b_Ga=p,I=99,p=6,q=1\x1b\\",
+        "\x1b_Ga=T,I=99,p=7,t=s,f=24,s=1,v=1;ZmFrZS1vYmplY3Q=\x1b\\",
+        "\x1b_Ga=p,i=7,I=99,p=8,q=1\x1b\\",
+        "\x1b[5n",
+    ));
+    let response = read_through(&mut replies, b"\x1b[0n").await;
+    let received: Vec<_> = response
+        .strip_suffix("\x1b[0n")
+        .unwrap()
+        .split_terminator("\x1b\\")
+        .collect();
+    for (actual, expected) in received.iter().zip([
+        "\x1b_Gi=7,p=3;EINVAL:",
+        "\x1b_Gi=7,p=4;EINVAL:",
+        "\x1b_Gi=99,p=5;ENOENT:",
+        "\x1b_GI=99,p=6;ENOENT:",
+        "\x1b_GI=99,p=7;ENOTSUP:",
+        "\x1b_GI=99,i=7,p=8;EINVAL:",
+    ]) {
+        assert!(actual.starts_with(expected), "{actual:?} vs {expected:?}");
+    }
+    assert_eq!(received.len(), 6, "{response:?}");
+    assert_eq!(pixel(&frame(&t, None, 0), 0, 0, 7), RED);
+}
+
 #[test]
 fn indexed_images_follow_palette_changes_and_keep_old_snapshots_intact() {
     let (mut t, _) = engine();
