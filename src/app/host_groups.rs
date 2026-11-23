@@ -5,6 +5,7 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt,
 };
+mod import;
 mod live_output;
 mod progress;
 mod report;
@@ -30,6 +31,7 @@ pub(super) struct HostGroup {
     copy_feedback: String,
     result_filter: progress::Filter,
     live_output: Option<live_output::State>,
+    import: import::State,
 }
 
 struct Submission {
@@ -37,6 +39,12 @@ struct Submission {
     text: Arc<str>,
     results: Vec<Delivery>,
     transcript: GroupTranscript,
+}
+
+impl HostGroup {
+    pub(super) fn deactivated(&mut self) {
+        self.import.editor_unmounted();
+    }
 }
 
 #[derive(Clone)]
@@ -284,6 +292,7 @@ pub enum Action {
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
     LiveOutput(TabId, u64, live_output::Action),
+    Import(TabId, import::Action),
     FilterResults(TabId, u64, progress::Filter),
     LoadCommand(TabId, u64),
     OpenSavedCommands(TabId),
@@ -317,11 +326,42 @@ impl TerminalApp {
     pub(super) fn host_group_command_target(&self) -> Option<TabId> {
         let id = self.tabs.active_id()?;
         match &self.tabs.get(id)?.page {
-            Page::HostGroup(page) if !page.saved.is_editing() && page.live_output.is_none() => {
+            Page::HostGroup(page)
+                if !page.saved.is_editing()
+                    && page.live_output.is_none()
+                    && !page.import.is_open() =>
+            {
                 Some(id)
             }
             _ => None,
         }
+    }
+
+    fn start_host_group_panes(
+        &mut self,
+        id: TabId,
+        targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let mut selected = BTreeSet::new();
+        for (profile, ssh) in targets {
+            let source = Source::Ssh(ssh);
+            let label = profile.clone().unwrap_or_else(|| source_label(&source));
+            let tab = self.make_live_tab(label, source, profile);
+            if let Some(pane) = tab.pane_id() {
+                selected.insert(pane);
+            }
+            self.tabs.insert(tab);
+        }
+        self.tabs.select(id);
+        if let Some(page) = self.host_group_mut(id) {
+            page.selected = selected;
+            page.filter.clear();
+            page.saved.feedback.clear();
+            page.import.feedback.clear();
+        }
+        self.sync_selection(ctx);
+        self.activate(ctx);
     }
 
     pub(super) fn update_host_group_timer(&mut self, ctx: &ComponentContext<Self>) {
@@ -550,6 +590,7 @@ impl TerminalApp {
                 self.open_host_group_from_palette(&name, &members, ctx);
             }
             Action::Saved(id, action) => self.handle_saved_host_group(id, action, ctx),
+            Action::Import(id, action) => self.handle_host_import(id, action, ctx),
             Action::Tick => {
                 let Some(id) = self.tabs.active_id() else {
                     return;
@@ -743,6 +784,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &ViewContext<Self>,
     ) -> View {
+        if let Some(view) = page.import.view(id, ctx) {
+            return view;
+        }
         if let Some(editor) = self.saved_host_group_editor(id, &page.saved, ctx) {
             return editor;
         }
@@ -924,7 +968,7 @@ impl TerminalApp {
             ])
             .children((
                 TextBlock::new().font_size(24.0).text(LABEL),
-                self.saved_host_group_toolbar(id, &page.saved, ctx),
+                self.saved_host_group_toolbar(id, page, ctx),
                 filter,
                 StackPanel::new().grid_row(3).spacing(7.0).children((
                     entry,

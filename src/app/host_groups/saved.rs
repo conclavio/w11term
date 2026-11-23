@@ -6,7 +6,7 @@ pub(super) struct SavedUi {
     selected: Option<String>,
     editor: Option<Editor>,
     next_editor: u64,
-    feedback: String,
+    pub(super) feedback: String,
 }
 
 struct Editor {
@@ -262,7 +262,7 @@ impl TerminalApp {
         }
     }
 
-    fn use_group_catalog(&mut self, catalog: Profiles) {
+    pub(super) fn use_group_catalog(&mut self, catalog: Profiles) {
         self.catalog = catalog;
         self.profile_error = None;
         self.header.borrow_mut().take();
@@ -283,6 +283,10 @@ impl TerminalApp {
                 !page.saved.is_editing(),
                 "Finish editing the SSH group before opening another group."
             );
+            ensure!(
+                !page.import.is_open(),
+                "Finish reviewing the host list before opening another group."
+            );
         }
         let catalog = self.store.catalog()?;
         ensure!(
@@ -296,23 +300,11 @@ impl TerminalApp {
             .collect::<Vec<_>>();
         self.use_group_catalog(catalog);
         let id = id.unwrap_or_else(|| self.ensure_host_group_tab());
-        let mut selected = BTreeSet::new();
-        for (profile, ssh) in expected.iter().zip(members) {
-            let tab = self.make_live_tab(profile.clone(), Source::Ssh(ssh), Some(profile.clone()));
-            if let Some(pane) = tab.pane_id() {
-                selected.insert(pane);
-            }
-            self.tabs.insert(tab);
-        }
-        self.tabs.select(id);
+        self.start_host_group_panes(id, expected.iter().cloned().map(Some).zip(members), ctx);
         if let Some(page) = self.host_group_mut(id) {
-            page.selected = selected;
-            page.filter.clear();
             page.saved.selected = Some(name.into());
             page.saved.feedback = format!("Opened {} SSH panes for {name}", expected.len());
         }
-        self.sync_selection(ctx);
-        self.activate(ctx);
         Ok(())
     }
 
@@ -332,9 +324,10 @@ impl TerminalApp {
     pub(super) fn saved_host_group_toolbar(
         &self,
         id: TabId,
-        saved: &SavedUi,
+        page: &HostGroup,
         ctx: &ViewContext<Self>,
     ) -> View {
+        let saved = &page.saved;
         let names: Vec<_> = self.catalog.ssh_host_groups.keys().cloned().collect();
         let selected = saved.name(&self.catalog);
         let selection = selected.and_then(|name| names.iter().position(|item| item == name));
@@ -385,6 +378,7 @@ impl TerminalApp {
                 .on_click(ctx.callback(move |_| action(Action::New)))
                 .content("New group"),
         ));
+        items.push(KeyedView::new("import", import::State::button(id, ctx)));
         let members = members
             .map(|members| {
                 if members.is_empty() {
@@ -414,6 +408,14 @@ impl TerminalApp {
                 "feedback",
                 TextBlock::new()
                     .text(&saved.feedback)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        if !page.import.feedback.is_empty() {
+            details.push(KeyedView::new(
+                "import-feedback",
+                TextBlock::new()
+                    .text(&page.import.feedback)
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
