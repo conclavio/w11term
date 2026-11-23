@@ -1008,7 +1008,7 @@ async fn native_ssh_group_prompt_matches_fresh_appliance_output() {
     let state = tempfile::tempdir().unwrap();
     let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
     let (Source::Ssh(mut ssh), _root, opens, server) =
-        fixture_with_wire(false, 2, Arc::default(), Some(wire)).await
+        fixture_with_wire(false, 3, Arc::default(), Some(wire)).await
     else {
         unreachable!()
     };
@@ -1060,8 +1060,11 @@ async fn native_ssh_group_prompt_matches_fresh_appliance_output() {
     while let Ok(bytes) = trace.try_recv() {
         observed.extend(bytes);
     }
-    assert_eq!(observed, b"show\rfinishdropredraw");
-    assert_eq!(opens.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        observed,
+        b"show\rfinishdropredrawfinishredrawdropfinishredrawredraw"
+    );
+    assert_eq!(opens.load(Ordering::Relaxed), 3);
     responder.abort();
     server.abort();
 }

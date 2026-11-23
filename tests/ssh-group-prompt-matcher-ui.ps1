@@ -5,8 +5,10 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'prompt-setup-copy.txt'
 $profiles = Join-Path $State 'profiles.json'
-$port = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles.Appliance.port
+$original = [IO.File]::ReadAllText($profiles)
+$port = ($original | ConvertFrom-Json).profiles.Appliance.port
 $dot = ' ' + [char]0xb7 + ' '
 $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
@@ -19,6 +21,31 @@ function Outcome([string]$Status) {
 }
 function Send-Raw([string]$Text) {
     $null = Control @('send-text','--pane',"$pane",'--no-paste',$Text)
+}
+function Click([string]$Name) {
+    $invoke = Wait-Until "enabled '$Name'" {
+        $element = Find-Element $Name $button
+        $provider = $null
+        if ($element -and $element.Current.IsEnabled -and $element.TryGetCurrentPattern(
+                [System.Windows.Automation.InvokePattern]::Pattern, [ref]$provider)) { $provider }
+    }
+    $invoke.Invoke()
+}
+function Pattern-Field {
+    Wait-Until 'pane prompt regex field' {
+        $element = Find-Element 'Pane prompt regex' $edit
+        $provider = $null
+        if ($element -and $element.Current.IsEnabled -and $element.TryGetCurrentPattern(
+                [System.Windows.Automation.ValuePattern]::Pattern, [ref]$provider)) { $provider }
+    }
+}
+function Reconnect {
+    $previous = (Control @('inspect','--pane',"$pane")).connection_generation
+    Send-Raw 'drop'
+    $null = Wait-Until 'replacement appliance transport' {
+        (Control @('inspect','--pane',"$pane")).connection_generation -gt $previous
+    }
+    Pane-Status 'Prompt unverified'
 }
 
 $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','Appliance','--cols','95','--rows','32')
@@ -50,14 +77,58 @@ try {
     Outcome "Prompt returned${dot}exit status unavailable"
     Pane-Status "Ready${dot}prompt match"
 
-    $previous = (Control @('inspect','--pane',"$pane")).connection_generation
-    Send-Raw 'drop'
-    $null = Wait-Until 'replacement appliance transport' {
-        (Control @('inspect','--pane',"$pane")).connection_generation -gt $previous
+    Reconnect
+    Send-Raw 'redraw'
+    Pane-Status "Ready${dot}prompt match"
+
+    Click "Prompt setup for pane $pane"
+    if ((Pattern-Field).Current.Value -cne 'rack-[12]>>') { throw 'Setup did not display the current profile pattern' }
+    $null = Wait-Until 'integrations can be copied from the roster' {
+        (Find-Element 'Copy Zsh shell integration' $button) -and (Find-Element 'Copy Fish shell integration' $button)
     }
+    Click 'Copy Bash shell integration'
+    $null = Wait-Until 'Bash integration copied' {
+        $content = Read-ClipboardFixture
+        $content -and $content.Contains('133;B')
+    }
+    (Pattern-Field).SetValue('[')
+    Click 'Apply to pane'
+    $null = Wait-Until 'invalid regex is reported' { Find-Element 'Invalid group prompt regex' }
+    (Pattern-Field).SetValue('rack-1>>')
+    Click 'Apply to pane'
+    $null = Wait-Until 'worker acknowledges prompt configuration' {
+        Find-Element 'Prompt pattern applied. Wait for a freshly printed matching prompt.'
+    }
+    Click 'Back to host group'
+    Pane-Status 'Prompt unverified'
+    $null = Wait-CheckBox $target On
+    $null = Wait-Until 'a previously printed prompt does not unlock Send' {
+        $element = Find-Element 'Send to 1 host' $button
+        $element -and !$element.Current.IsEnabled
+    }
+    Send-Raw 'finish'
+    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','rack-2>>')
     Pane-Status 'Prompt unverified'
     Send-Raw 'redraw'
     Pane-Status "Ready${dot}prompt match"
+    Reconnect
+    Send-Raw 'finish'
+    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','rack-2>>')
+    Pane-Status 'Prompt unverified'
+    Send-Raw 'redraw'
+    Pane-Status "Ready${dot}prompt match"
+
+    Click "Prompt setup for pane $pane"
+    if ((Pattern-Field).Current.Value -cne 'rack-1>>') { throw 'The live pattern did not survive reconnecting' }
+    (Pattern-Field).SetValue('')
+    Click 'Apply to pane'
+    $null = Wait-Until 'matching disabled' { Find-Element 'Prompt matching disabled for this pane.' }
+    Click 'Back to host group'
+    Pane-Status 'Prompt unverified'
+    Send-Raw 'redraw'
+    $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','rack-1>>')
+    Pane-Status 'Prompt unverified'
+    if ([IO.File]::ReadAllText($profiles) -cne $original) { throw 'Live setup changed the saved profile' }
 } catch {
     $failure = $_
     $visible = if ($window) {

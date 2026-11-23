@@ -16,6 +16,20 @@ struct MatchedLine {
     text: String,
 }
 
+pub(super) fn configure(
+    terminal: &mut Terminal,
+    matcher: &mut Option<Matcher>,
+    events: &Events,
+    expected: Option<&GroupPromptPattern>,
+    replacement: Option<GroupPromptPattern>,
+) -> Result<(), &'static str> {
+    if events.change_group_prompt_pattern(expected, replacement.as_ref())? {
+        *matcher = replacement.map(Matcher::new);
+        terminal.set_track_primary_prints(matcher.is_some());
+    }
+    Ok(())
+}
+
 impl Matcher {
     pub(super) fn new(pattern: GroupPromptPattern) -> Self {
         Self {
@@ -168,6 +182,86 @@ mod tests {
             );
         };
         token
+    }
+
+    #[test]
+    fn changing_the_live_pattern_retires_only_fallback_evidence() {
+        let (mut terminal, matcher, _) = fixture();
+        let original = matcher.pattern.clone();
+        let events = Events::with_group_prompt_pattern(Some(original.clone()));
+        let (notices, _) = mpsc::channel(1);
+        terminal.set_notification_handler(Box::new(crate::sound::Alerts {
+            events: events.clone(),
+            notices,
+            player: Default::default(),
+        }));
+        events.command_stream(Some(1));
+        let mut matcher = Some(matcher);
+        feed(
+            &mut terminal,
+            matcher.as_mut().unwrap(),
+            &events,
+            b"rack-1>> ",
+        );
+        let old = matched(&events);
+        assert!(events.claim_shell_prompt(old));
+        let (status, completed) = watch::channel(GroupExecution::AwaitingPrompt);
+        events.observe_group_command(
+            1,
+            "show".into(),
+            status,
+            crate::events::GroupTranscript::default().host(1),
+        );
+
+        let replacement = GroupPromptPattern::try_from("rack-1>>".to_owned()).unwrap();
+        assert!(configure(&mut terminal, &mut matcher, &events, None, None).is_err());
+        configure(
+            &mut terminal,
+            &mut matcher,
+            &events,
+            Some(&original),
+            Some(replacement.clone()),
+        )
+        .unwrap();
+        assert_eq!(events.shell_prompt(), Some(ShellPrompt::Unverified));
+        assert!(matches!(
+            *completed.borrow(),
+            GroupExecution::Unavailable(_)
+        ));
+        feed(
+            &mut terminal,
+            matcher.as_mut().unwrap(),
+            &events,
+            b"\x1b[1C\x1b[1D",
+        );
+        assert_eq!(events.shell_prompt(), Some(ShellPrompt::Unverified));
+        feed(
+            &mut terminal,
+            matcher.as_mut().unwrap(),
+            &events,
+            b"\r\nrack-1>> ",
+        );
+        assert_ne!(matched(&events), old);
+
+        feed(
+            &mut terminal,
+            matcher.as_mut().unwrap(),
+            &events,
+            b"\r\n\x1b]133;A\x07rack-1>> \x1b]133;B\x07",
+        );
+        let semantic = events.shell_prompt();
+        assert!(matches!(semantic, Some(ShellPrompt::Ready(_))));
+        configure(
+            &mut terminal,
+            &mut matcher,
+            &events,
+            Some(&replacement),
+            None,
+        )
+        .unwrap();
+        assert!(matcher.is_none());
+        assert_eq!(events.group_prompt_pattern(), None);
+        assert_eq!(events.shell_prompt(), semantic);
     }
 
     #[test]
