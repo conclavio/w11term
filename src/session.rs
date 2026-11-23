@@ -16,6 +16,8 @@ mod clear_scrollback_tests;
 mod clipboard;
 mod colors;
 mod launch;
+#[cfg(test)]
+mod recording_tests;
 pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
 #[cfg(test)]
 mod pane_search_tests;
@@ -47,6 +49,16 @@ pub enum Command {
     Record {
         path: Option<std::path::PathBuf>,
         timed: bool,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    /// Recheck the pane after the native save picker returns.
+    StartTimedRecordingIfLive {
+        path: std::path::PathBuf,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    /// The menu captures the recording ID when it offers Stop.
+    StopRecordingIfCurrent {
+        id: u64,
         reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
     },
     Authenticate(crate::options::Authentication),
@@ -154,7 +166,7 @@ pub struct Session {
     pub clipboard_enabled: Arc<AtomicBool>,
     ssh_connection: ssh::ShareSlot,
     direct_ssh_shell: bool,
-    durable: Option<ssh::DurableControl>,
+    durable: Option<Arc<ssh::DurableControl>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -166,6 +178,7 @@ struct Services {
     notices: mpsc::Receiver<crate::sound::Notice>,
     live_frames: FrameStore,
     sharing: ssh::Sharing,
+    durable: Option<Arc<ssh::DurableControl>>,
     replay_ready: bool,
 }
 
@@ -238,6 +251,17 @@ impl Session {
     }
 
     /// A GUI pane can be created before layout assigns it a grid and pixel size.
+    pub fn start_view_recording_pane(path: std::path::PathBuf, size: TerminalSize) -> Self {
+        Self::start_worker(
+            Source::ViewRecording(path),
+            has_cell_pixels(size).then_some(size),
+            false,
+            None,
+            None,
+            None,
+        )
+    }
+
     pub fn start_replay_pane(
         path: std::path::PathBuf,
         size: TerminalSize,
@@ -368,8 +392,8 @@ impl Session {
             source.scrollback_lines(),
             colors.effective(),
         );
-        let timed_replay = matches!(source, Source::TimedReplay(_));
-        let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard && !timed_replay));
+        let output_viewer = matches!(source, Source::TimedReplay(_) | Source::ViewRecording(_));
+        let clipboard_enabled = Arc::new(AtomicBool::new(allow_clipboard && !output_viewer));
         let direct_ssh_shell = direct_ssh_shell(&source, saved.is_some(), startup.as_ref());
         match &source {
             Source::Local(_) => terminal.enable_conemu_directory_reports(),
@@ -378,7 +402,7 @@ impl Session {
             }
             _ => {}
         }
-        if timed_replay {
+        if output_viewer {
             terminal::configure_output_viewer(&mut terminal, &events);
         } else {
             let clipboard: Arc<dyn wezterm_term::Clipboard> =
@@ -407,6 +431,8 @@ impl Session {
             .filter(|_| matches!(source, Source::Ssh(_)))
             .map(ssh::DurableControl::new)
             .unzip();
+        let durable = durable.map(Arc::new);
+        let worker_durable = durable.clone();
         let sharing = ssh::Sharing::new(
             ssh_connection.clone(),
             connection.filter(|_| matches!(source, Source::Ssh(_))),
@@ -431,6 +457,7 @@ impl Session {
                         transport_input,
                         worker_frames,
                         Services {
+                            durable: worker_durable,
                             colors,
                             prompts: worker_prompts,
                             events: worker_events,
@@ -481,6 +508,7 @@ async fn run(
     services: Services,
 ) {
     let Services {
+        durable,
         mut colors,
         prompts,
         events,
@@ -540,10 +568,17 @@ async fn run(
         Source::Local(_) | Source::Ssh(_) => {
             status = launch.start(&mut transports, size, transport_input, output_tx);
         }
-        Source::Replay(path) => {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    replay = Some(bytes);
+        Source::Replay(ref path) | Source::ViewRecording(ref path) => {
+            let capture = if matches!(source, Source::ViewRecording(_)) {
+                crate::recorder::RawView::open(path)
+            } else {
+                std::fs::read(path)
+                    .map(|bytes| crate::recorder::RawView { bytes, grid: None })
+                    .map_err(Into::into)
+            };
+            match capture {
+                Ok(capture) => {
+                    replay = Some(capture);
                     status = format!("Replay · {}", path.display());
                 }
                 Err(error) => status = format!("Replay: {error}"),
@@ -576,9 +611,27 @@ async fn run(
     let clipboard_origin = Arc::new(());
     let (observed, _) = tokio::sync::broadcast::channel::<Vec<u8>>(32);
     loop {
-        if replay_ready && let Some(bytes) = replay.take() {
-            total_bytes = bytes.len() as u64;
-            presentation.advance(&mut terminal, bytes, scroll_offset, &status, total_bytes);
+        if replay_ready && let Some(capture) = replay.take() {
+            if let Some((cols, rows)) = capture.grid {
+                // v1 stores only the cell grid. Use the actual pane's cell
+                // dimensions to lay out inline graphics on the first parse.
+                size = TerminalSize {
+                    cols,
+                    rows,
+                    pixel_width: size.pixel_width.saturating_mul(cols) / size.cols.max(1),
+                    pixel_height: size.pixel_height.saturating_mul(rows) / size.rows.max(1),
+                    ..size
+                };
+                resize_model(&mut terminal, size, &mut scroll_offset);
+            }
+            total_bytes = capture.bytes.len() as u64;
+            presentation.advance(
+                &mut terminal,
+                capture.bytes,
+                scroll_offset,
+                &status,
+                total_bytes,
+            );
         }
         if colors.effective() != applied_scheme {
             applied_scheme = colors.effective();
@@ -782,6 +835,21 @@ async fn run(
                     Some(Command::Observe(reply))=>{let _=reply.send(observed.subscribe());Ok(())},
                     Some(Command::Record { path, timed, reply }) => {
                         let result = change_recording(&mut recorder, &events, path, size, interactive, timed);
+                        let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                        Ok(())
+                    }
+                    Some(Command::StartTimedRecordingIfLive { path, reply }) => {
+                        let durable_phase = durable.as_ref().map(|d| d.state().phase);
+                        let result = if can_start_native_recording(interactive, phase, durable_phase) {
+                            change_recording(&mut recorder, &events, Some(path), size, interactive, true)
+                        } else {
+                            Err(anyhow::anyhow!("Pane has no live shell to record"))
+                        };
+                        let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                        Ok(())
+                    }
+                    Some(Command::StopRecordingIfCurrent { id, reply }) => {
+                        let result = stop_recording(&mut recorder, &events, Some(id));
                         let _ = reply.send(result.map_err(|e| format!("{e:#}")));
                         Ok(())
                     }
@@ -1075,7 +1143,9 @@ fn can_watch_commands(source: &Source) -> bool {
     match source {
         Source::Ssh(options) => !options.durable,
         Source::Local(_) => true,
-        Source::Replay(_) | Source::TimedReplay(_) | Source::Demo => false,
+        Source::Replay(_) | Source::ViewRecording(_) | Source::TimedReplay(_) | Source::Demo => {
+            false
+        }
     }
 }
 
@@ -1104,6 +1174,19 @@ fn resize_model(
     }
 }
 
+fn can_start_native_recording(
+    interactive: bool,
+    phase: Phase,
+    durable: Option<ssh::DurablePhase>,
+) -> bool {
+    interactive
+        && !matches!(phase, Phase::PublishingExit | Phase::Exited)
+        && matches!(
+            durable,
+            None | Some(ssh::DurablePhase::Attached | ssh::DurablePhase::Direct)
+        )
+}
+
 fn change_recording(
     recorder: &mut Option<crate::recorder::Recorder>,
     events: &crate::events::Events,
@@ -1113,7 +1196,7 @@ fn change_recording(
     timed: bool,
 ) -> anyhow::Result<serde_json::Value> {
     let Some(path) = path else {
-        return finish_recording(recorder.take().context("pane is not recording")?, events);
+        return stop_recording(recorder, events, None);
     };
     anyhow::ensure!(recorder.is_none(), "pane is already recording");
     let started = if timed {
@@ -1126,8 +1209,19 @@ fn change_recording(
         crate::recorder::Recorder::start(&path, size)?
     };
     *recorder = Some(started);
-    events.push("recording-started", serde_json::json!({"path":path}));
-    Ok(serde_json::json!({"recording":true,"path":path}))
+    let id = events.recording_started(&path);
+    Ok(serde_json::json!({"recording":true,"path":path,"id":id}))
+}
+
+fn stop_recording(
+    recorder: &mut Option<crate::recorder::Recorder>,
+    events: &crate::events::Events,
+    expected: Option<u64>,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(id) = expected {
+        anyhow::ensure!(events.recording() == Some(id), "recording has changed");
+    }
+    finish_recording(recorder.take().context("pane is not recording")?, events)
 }
 
 fn finish_recording(
@@ -1136,13 +1230,10 @@ fn finish_recording(
 ) -> anyhow::Result<serde_json::Value> {
     let bytes = recorder.bytes;
     let path = recorder.path.clone();
-    recorder.finish().inspect_err(|error| {
-        events.push(
-            "recording-error",
-            serde_json::json!({"error":format!("{error:#}")}),
-        );
-    })?;
-    events.push("recording-stopped", serde_json::json!({"bytes":bytes}));
+    recorder
+        .finish()
+        .inspect_err(|error| events.recording_error(format!("{error:#}")))?;
+    events.recording_stopped(bytes);
     Ok(serde_json::json!({"recording":false,"path":path,"bytes":bytes}))
 }
 
@@ -1154,10 +1245,7 @@ fn update_recording(
     if let Some(active) = recorder
         && let Err(error) = action(active)
     {
-        events.push(
-            "recording-error",
-            serde_json::json!({"error":error.to_string()}),
-        );
+        events.recording_error(error.to_string());
         if let Some(stopped) = recorder.take() {
             let _ = stopped.finish();
         }
@@ -1208,6 +1296,7 @@ pub fn benchmark() {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+
     #[test]
     fn directory_splits_require_an_interactive_direct_ssh_launch() {
         let mut ssh: crate::options::SshOptions = serde_json::from_value(

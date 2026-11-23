@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::File,
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
 };
 use wezterm_term::TerminalSize;
@@ -12,6 +12,76 @@ use timed::TimelineWriter;
 pub(crate) use timed::{ReplayEvent, TimedReplay};
 
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+fn valid_grid(cols: usize, rows: usize) -> bool {
+    (1..=4096).contains(&cols) && (1..=2048).contains(&rows) && cols * rows <= 500_000
+}
+
+pub(crate) fn check_raw_file(path: &Path) -> Result<()> {
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("opening {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= MAX_BYTES,
+        "Choose a terminal recording of at most 256 MiB"
+    );
+    Ok(())
+}
+
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= limit,
+        "Invalid or oversized recording file {}",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "Recording file exceeds its size limit"
+    );
+    Ok(bytes)
+}
+
+pub(crate) struct RawView {
+    pub bytes: Vec<u8>,
+    pub grid: Option<(usize, usize)>,
+}
+
+impl RawView {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        Ok(Self {
+            grid: raw_grid(path)?,
+            bytes: read_bounded(path, MAX_BYTES)?,
+        })
+    }
+}
+
+pub(crate) fn raw_grid(path: &Path) -> Result<Option<(usize, usize)>> {
+    let sidecar = path.with_extension("vt.json");
+    if !sidecar.try_exists()? {
+        return Ok(None);
+    }
+    #[derive(serde::Deserialize)]
+    struct Grid {
+        version: u32,
+        cols: usize,
+        rows: usize,
+    }
+    let grid: Grid = serde_json::from_slice(&read_bounded(&sidecar, 64 * 1024)?)
+        .context("reading VT recording geometry")?;
+    ensure!(
+        grid.version == 1,
+        "Unsupported VT recording geometry version"
+    );
+    ensure!(
+        valid_grid(grid.cols, grid.rows),
+        "Invalid VT recording geometry"
+    );
+    Ok(Some((grid.cols, grid.rows)))
+}
 
 pub struct Recorder {
     file: BufWriter<File>,

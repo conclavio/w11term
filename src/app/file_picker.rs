@@ -23,6 +23,8 @@ pub(super) enum Purpose {
     DownloadFolder,
     Save(String),
     Scrollback,
+    StartRecording,
+    OpenRecording,
 }
 
 fn local_config_folder(dialog: &IFileDialog, config: &Path) {
@@ -157,6 +159,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let clsid = if matches!(
             purpose,
             Purpose::UploadFiles
+                | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
                 | Purpose::Folder
                 | Purpose::DownloadFolder
@@ -170,6 +173,36 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let confirmed = Rc::new(RefCell::new(None));
         let multiple = matches!(purpose, Purpose::UploadFiles);
         let cookie = match purpose {
+            Purpose::StartRecording | Purpose::OpenRecording => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetFileTypes(&[
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("Terminal recordings"),
+                        pszSpec: w!("*.vt"),
+                    },
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("All files"),
+                        pszSpec: w!("*.*"),
+                    },
+                ])?;
+                dialog.SetDefaultExtension(w!("vt"))?;
+                options |= FOS_PATHMUSTEXIST;
+                if matches!(purpose, Purpose::StartRecording) {
+                    dialog.SetTitle(w!("Start timed recording"))?;
+                    dialog.SetFileName(w!("session.vt"))?;
+                    // The recorder creates the capture and its sidecars exclusively.
+                    options &= !FOS_OVERWRITEPROMPT;
+                    options |= FOS_NOTESTFILECREATE;
+                } else {
+                    dialog.SetTitle(w!("Open recording"))?;
+                    options |= FOS_FILEMUSTEXIST;
+                }
+                #[cfg(feature = "ui-smoke")]
+                if fixture_picker_folder(&dialog, "W11TERM_RECORDING_SMOKE_DIR")? {
+                    options |= FOS_DONTADDTORECENT;
+                }
+                None
+            }
             Purpose::UploadFiles => {
                 dialog.SetTitle(w!("Choose files to upload"))?;
                 options |= FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST;

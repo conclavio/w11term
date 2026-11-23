@@ -35,6 +35,7 @@ pub enum SavedSource {
     },
     Demo,
     Replay(PathBuf),
+    ViewRecording(PathBuf),
     TimedReplay(PathBuf),
     /// Connection options contain authentication methods and key paths; live
     /// passwords, private key material and authentication answers live elsewhere.
@@ -112,6 +113,10 @@ impl SavedSource {
                 }
             }
             (Source::Demo, _) => Self::Demo,
+            (Source::ViewRecording(path), _) => {
+                ensure!(!path.as_os_str().is_empty(), "Empty recording path");
+                Self::ViewRecording(std::path::absolute(path)?)
+            }
             (Source::Replay(path) | Source::TimedReplay(path), _) => {
                 ensure!(!path.as_os_str().is_empty(), "Empty replay path");
                 let path = std::path::absolute(path)?;
@@ -181,7 +186,7 @@ impl SavedSource {
                 shell.validate()?;
                 shell.validate_resolved_paths()?;
             }
-            Self::Replay(path) | Self::TimedReplay(path) => {
+            Self::Replay(path) | Self::TimedReplay(path) | Self::ViewRecording(path) => {
                 ensure!(path.is_absolute(), "Expected an absolute replay path")
             }
             Self::Ssh(options) => {
@@ -249,6 +254,11 @@ impl SavedSource {
                 Source::Ssh(options)
             }
             Self::Demo => Source::Demo,
+            Self::ViewRecording(path) => {
+                crate::recorder::check_raw_file(path)?;
+                crate::recorder::raw_grid(path)?;
+                Source::ViewRecording(path.clone())
+            }
             Self::Local { shell, .. } => {
                 shell.check_launch_paths()?;
                 Source::Local(shell.clone())

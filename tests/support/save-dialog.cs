@@ -80,18 +80,22 @@ public static class FixtureDialog {
     }
 
     public static bool SetFilename(IntPtr dialog, string path) {
+        return SetFilename(dialog, path, "terminal.txt");
+    }
+
+    public static bool SetFilename(IntPtr dialog, string path, string suggestedFilename) {
         bool changed = false;
         EnumChildWindows(dialog, (hwnd, _) => {
             if (!IsControl(hwnd, "Edit") || !IsControl(GetParent(hwnd), "ComboBox")) return true;
             // Only the File name combo contains the suggestion we supplied to
             // IFileSaveDialog. Never type into the path bar or folder search.
             string suggested = EditText(hwnd);
-            if (suggested != "terminal.txt" && suggested != "terminal") return true;
+            if (suggested != suggestedFilename && suggested != Path.GetFileNameWithoutExtension(suggestedFilename)) return true;
             IntPtr result;
             SendMessageTimeout(dialog, 0x0028, hwnd, (IntPtr)1, 2, 1000, out result); // WM_NEXTDLGCTL
             SendMessageTimeout(hwnd, 0x00B1, IntPtr.Zero, (IntPtr)(-1), 2, 1000, out result); // EM_SETSEL
-            // WM_SETTEXT can change the edit's display while leaving the Shell's
-            // selected file at terminal.txt. Typing also notifies the containing combo.
+            // WM_SETTEXT can change the displayed text while the Shell keeps the
+            // suggested file selected. Typing also notifies the containing combo.
             foreach (char ch in path) {
                 if (SendMessageTimeout(hwnd, 0x0102, (IntPtr)(int)ch, (IntPtr)1, 2, 1000, out result) == IntPtr.Zero)
                     return false;

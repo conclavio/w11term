@@ -329,10 +329,12 @@ Use `--cols` and `--rows` to choose an initial grid for a particular capture.
 For a restored background replay pane with unknown dimensions, showing the pane
 or sizing it with `w11term-cli resize` starts playback.
 
-For animations and resize bugs, use `w11term-cli record --pane ID --timed cockpit.vt`.
-Stop the recording with `record --pane ID --stop`, then open it with
-`--replay-timed cockpit.vt` to see output arrive at its recorded pace and
-geometry. [Recording files and control commands](CONTROL.md#vt-recording)
+To capture an animation or a resize bug, choose **Start timed recording…** in
+the command palette or the tab menu’s **Recordings** submenu. Choose **Stop
+recording** on that pane to finish. **Open recording…** opens the selected
+`.vt` in a new tab and uses its timing index when available. You can keep
+working in your original SSH or PowerShell session during playback.
+[Recording files and CLI commands](CONTROL.md#vt-recording)
 
 The benchmark measures **only VT parsing and scrollback**. It excludes snapshot creation, rendering, SSH, and input-to-screen latency. Debug-build results are not performance claims. Build with `cargo build --release` for performance work. The release GUI executable does not attach a console.
 

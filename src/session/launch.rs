@@ -105,7 +105,10 @@ impl Launcher {
                 );
                 status
             }
-            Source::Replay(_) | Source::TimedReplay(_) | Source::Demo => {
+            Source::Replay(_)
+            | Source::ViewRecording(_)
+            | Source::TimedReplay(_)
+            | Source::Demo => {
                 unreachable!("only live transports are launched")
             }
         }

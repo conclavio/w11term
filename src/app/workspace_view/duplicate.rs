@@ -25,7 +25,7 @@ fn eligible(source: &Source, discovery: bool, startup: Option<&SshStartup>) -> R
         Source::Ssh(_) => Ok(()),
         Source::Local(shell) if interactive_local(shell) => Ok(()),
         Source::Local(_) => bail!("This tab contains a local command or unsupported shell launch"),
-        Source::Demo | Source::Replay(_) | Source::TimedReplay(_) => {
+        Source::Demo | Source::Replay(_) | Source::ViewRecording(_) | Source::TimedReplay(_) => {
             bail!("Only tabs containing interactive SSH and local shells can be duplicated")
         }
     }
