@@ -1,5 +1,6 @@
 use super::*;
 use w11term::control::CommandStatus;
+use w11term::saved_commands::{Commands, Entry, valid_command_text};
 use w11term::terminal::Snapshot;
 use wezterm_term::CompletedCommand;
 
@@ -9,6 +10,12 @@ pub(super) struct HistoryPage {
     query: String,
     status: CommandStatus,
     feedback: String,
+    save: Option<SaveDraft>,
+}
+
+struct SaveDraft {
+    target: (u64, u64),
+    name: String,
 }
 
 pub enum Action {
@@ -22,6 +29,10 @@ pub enum HistoryAction {
     Refresh,
     Select(u64, u64),
     Copy(u64, u64, CopyPart),
+    BeginSave((u64, u64)),
+    SaveName((u64, u64), String),
+    Save((u64, u64)),
+    CancelSave((u64, u64)),
     Return,
 }
 
@@ -64,6 +75,13 @@ fn selected_command(frame: &Snapshot, selected: Option<(u64, u64)>) -> Option<&C
         .iter()
         .find(|c| c.id == id)
         .map(AsRef::as_ref)
+}
+
+fn saveable_command(frame: &Snapshot, target: (u64, u64)) -> Option<&str> {
+    selected_command(frame, Some(target))?
+        .command
+        .as_deref()
+        .filter(|text| valid_command_text(text))
 }
 
 fn newest(frame: &Snapshot, needle: &str, status: CommandStatus) -> Option<(u64, u64)> {
@@ -149,6 +167,7 @@ impl TerminalApp {
                 query: String::new(),
                 status: CommandStatus::All,
                 feedback: String::new(),
+                save: None,
             });
             if let Some(id) = existing {
                 self.tabs.get_mut(id).unwrap().page = page;
@@ -222,13 +241,66 @@ impl TerminalApp {
                     };
                 }
             }
+            HistoryAction::BeginSave(target) => {
+                if page.selected == Some(target) && saveable_command(&frame, target).is_some() {
+                    page.save = Some(SaveDraft {
+                        target,
+                        name: String::new(),
+                    });
+                }
+            }
+            HistoryAction::SaveName(target, name) => {
+                if let Some(draft) = &mut page.save
+                    && draft.target == target
+                {
+                    draft.name = name;
+                }
+            }
+            HistoryAction::Save(target) => {
+                if let Some(draft) = &page.save
+                    && draft.target == target
+                    && page.selected == Some(target)
+                    && let Some(text) = saveable_command(&frame, target)
+                {
+                    let entry = Entry {
+                        name: draft.name.clone(),
+                        text: text.into(),
+                    };
+                    match Commands::path()
+                        .and_then(|path| Commands::update(&path, None, Some(entry)))
+                    {
+                        Ok(_) => {
+                            page.save = None;
+                            page.feedback = "Saved command".into();
+                        }
+                        Err(error) => page.feedback = format!("{error:#}"),
+                    }
+                }
+            }
+            HistoryAction::CancelSave(target) => {
+                if page
+                    .save
+                    .as_ref()
+                    .is_some_and(|draft| draft.target == target)
+                {
+                    page.save = None;
+                }
+            }
             HistoryAction::Return => {
                 if let Some(source) = self.tab_for_pane(pane) {
                     self.tabs.select(source);
                     self.sync_selection(ctx);
                     self.activate(ctx);
                 }
+                return;
             }
+        }
+        if page
+            .save
+            .as_ref()
+            .is_some_and(|draft| Some(draft.target) != page.selected)
+        {
+            page.save = None;
         }
     }
 
@@ -327,6 +399,48 @@ impl TerminalApp {
                 }))
                 .content(label)
         };
+        let save_target = page
+            .selected
+            .filter(|&target| saveable_command(&frame, target).is_some());
+        let save =
+            match (&page.save, save_target) {
+                (Some(draft), Some(target)) if draft.target == target => {
+                    StackPanel::new().spacing(6.0).children((
+                        TextBox::new()
+                            .automation_name("Saved command name")
+                            .placeholder_text("Saved command name")
+                            .text(&draft.name)
+                            .on_text_changed(ctx.callback(move |name| {
+                                action(HistoryAction::SaveName(target, name))
+                            })),
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(8.0)
+                            .children((
+                                Button::new()
+                                    .is_enabled(!draft.name.trim().is_empty())
+                                    .on_click(
+                                        ctx.callback(move |_| action(HistoryAction::Save(target))),
+                                    )
+                                    .content("Save to commands"),
+                                Button::new()
+                                    .automation_name("Cancel saving command")
+                                    .on_click(ctx.callback(move |_| {
+                                        action(HistoryAction::CancelSave(target))
+                                    }))
+                                    .content("Cancel"),
+                            )),
+                    ))
+                }
+                (_, target) => Button::new()
+                    .is_enabled(target.is_some())
+                    .on_click(ctx.callback(move |_| {
+                        target.map_or(Message::ControlIdle, |target| {
+                            action(HistoryAction::BeginSave(target))
+                        })
+                    }))
+                    .content("Save as command…"),
+            };
         Grid::new()
             .margin(16.0)
             .row_spacing(8.0)
@@ -397,6 +511,7 @@ impl TerminalApp {
                                 .font_size(18.0)
                                 .text(heading)
                                 .text_wrapping(TextWrapping::Wrap),
+                            save,
                             TextBlock::new()
                                 .text(preview)
                                 .text_wrapping(TextWrapping::Wrap),
