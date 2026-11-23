@@ -13,7 +13,24 @@ pub enum ClipboardPaste {
         connection: u64,
         preferences: Interaction,
     },
+    InsertHistory {
+        text: String,
+        connection: u64,
+        command: u64,
+    },
     Confirm(PendingPaste),
+}
+
+pub fn history_text_allowed(text: &str, bracketed: bool) -> bool {
+    if !bracketed {
+        return crate::saved_commands::valid_command_text(text);
+    }
+    text.len() <= 4096
+        && !text.trim().is_empty()
+        && text.chars().all(|c| {
+            matches!(c, '\r' | '\n' | '\t')
+                || (!c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
+        })
 }
 
 // No Clone: the confirmation consumes the exact payload that was offered.
@@ -53,13 +70,19 @@ impl ClipboardPaste {
         bracketed: bool,
     ) -> Result<Decision, String> {
         let expected = match &self {
-            Self::New { connection, .. } => *connection,
+            Self::New { connection, .. } | Self::InsertHistory { connection, .. } => *connection,
             Self::Confirm(pending) => pending.connection,
         };
         if expected != connection {
             return Err("The pane reconnected. Paste again to use the new connection.".into());
         }
         match self {
+            Self::InsertHistory { text, .. } => {
+                if !history_text_allowed(&text, bracketed) {
+                    return Err("The current paste mode cannot insert this command.".into());
+                }
+                Ok(Decision::Send { text, raw: false })
+            }
             Self::New {
                 mut text,
                 raw,
@@ -184,5 +207,33 @@ mod tests {
             preferences: Interaction::default(),
         };
         assert!(stale.evaluate(&pane, 5, false).is_err());
+    }
+
+    #[test]
+    fn history_insertion_checks_the_current_mode_and_preserves_accepted_text() {
+        let pane = Arc::new(());
+        let request = |text: &str| ClipboardPaste::InsertHistory {
+            text: text.into(),
+            connection: 4,
+            command: 9,
+        };
+        for (text, bracketed) in [("echo snow ", false), ("echo 雪\r\n  echo two\t", true)] {
+            let result = request(text).evaluate(&pane, 4, bracketed).unwrap();
+            assert!(matches!(result, Decision::Send { text: sent, raw: false } if sent == text));
+        }
+        for text in ["a\nb", "a\rb", "a\tb"] {
+            assert!(request(text).evaluate(&pane, 4, false).is_err());
+        }
+        for text in [
+            "",
+            " \r\n",
+            "a\x1b[201~",
+            "a\x00",
+            "a\u{2028}b",
+            &"x".repeat(4097),
+        ] {
+            assert!(request(text).evaluate(&pane, 4, true).is_err());
+        }
+        assert!(request("echo x").evaluate(&pane, 5, true).is_err());
     }
 }

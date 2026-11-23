@@ -16,7 +16,7 @@ mod colors;
 mod launch;
 #[cfg(test)]
 mod recording_tests;
-pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste};
+pub use clipboard::{ClipboardPaste, ClipboardReply, PendingPaste, history_text_allowed};
 #[cfg(test)]
 mod pane_search_tests;
 mod presentation;
@@ -892,6 +892,19 @@ async fn run(
                     Some(Command::MirroredKeyboard(_)) => unreachable!("mirrored input was unwrapped above"),
                     Some(Command::ClipboardPaste(request, reply)) => {
                         use clipboard::Decision;
+                        if let ClipboardPaste::InsertHistory { connection, command, text } = &request {
+                            if !events.idle_shell(*connection)
+                                || prompts.current().is_some()
+                                || terminal.is_alt_screen_active()
+                            {
+                                let _ = reply.send(Err("The source pane needs an idle shell before it can insert a command.".into()));
+                                continue;
+                            }
+                            if !terminal.command_history().iter().any(|entry| entry.id == *command && entry.command.as_ref() == Some(text)) {
+                                let _ = reply.send(Err("This command has left the source pane’s history.".into()));
+                                continue;
+                            }
+                        }
                         if interactive && connection_generation == 0 {
                             let _ = reply.send(Err("The terminal is still connecting. Paste again when it is ready.".into()));
                             continue;

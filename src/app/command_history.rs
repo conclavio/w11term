@@ -1,6 +1,7 @@
 use super::*;
 use w11term::control::CommandStatus;
 use w11term::saved_commands::{Commands, Entry, valid_command_text};
+use w11term::session::history_text_allowed;
 use w11term::terminal::Snapshot;
 use wezterm_term::CompletedCommand;
 
@@ -29,6 +30,7 @@ pub enum HistoryAction {
     Refresh,
     Select(u64, u64),
     Copy(u64, u64, CopyPart),
+    Insert((u64, u64)),
     BeginSave((u64, u64)),
     SaveName((u64, u64), String),
     Save((u64, u64)),
@@ -148,6 +150,32 @@ impl TerminalApp {
         }
     }
 
+    fn history_insert_target(
+        &self,
+        pane: u64,
+        frame: &Snapshot,
+    ) -> Option<(TabId, clipboard_paste::Origin)> {
+        let id = self.tab_for_pane(pane)?;
+        let Page::Terminal(live) = &self.tabs.get(id)?.page else {
+            return None;
+        };
+        if frame.alternate
+            || frame.prompt.is_some()
+            || live.read_only.get()
+            || !live.session.events.idle_shell(frame.connection_generation)
+        {
+            return None;
+        }
+        Some((
+            id,
+            clipboard_paste::Origin {
+                pane,
+                group: self.tabs.group_id(id)?,
+                connection: frame.connection_generation,
+            },
+        ))
+    }
+
     pub(super) fn handle_history(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         if matches!(action, Action::Open) {
             let Some(source) = self.tabs.active() else {
@@ -240,6 +268,24 @@ impl TerminalApp {
                         Err(error) => format!("Could not copy to clipboard · {error}"),
                     };
                 }
+            }
+            HistoryAction::Insert(target) => {
+                if page.selected != Some(target) {
+                    return;
+                }
+                let Some(text) = selected_command(&frame, Some(target))
+                    .and_then(|entry| entry.command.as_ref())
+                    .filter(|text| history_text_allowed(text, frame.bracketed_paste))
+                else {
+                    return;
+                };
+                if let Some((source, origin)) = self.history_insert_target(pane, &frame) {
+                    self.tabs.select(source);
+                    self.sync_selection(ctx);
+                    self.activate(ctx);
+                    self.paste_history_text(origin, target.1, text.clone(), ctx);
+                }
+                return;
             }
             HistoryAction::BeginSave(target) => {
                 if page.selected == Some(target) && saveable_command(&frame, target).is_some() {
@@ -402,6 +448,12 @@ impl TerminalApp {
         let save_target = page
             .selected
             .filter(|&target| saveable_command(&frame, target).is_some());
+        let insert_target = page.selected.filter(|_| {
+            selected
+                .and_then(|entry| entry.command.as_deref())
+                .is_some_and(|text| history_text_allowed(text, frame.bracketed_paste))
+                && self.history_insert_target(pane, &frame).is_some()
+        });
         let save =
             match (&page.save, save_target) {
                 (Some(draft), Some(target)) if draft.target == target => {
@@ -511,6 +563,14 @@ impl TerminalApp {
                                 .font_size(18.0)
                                 .text(heading)
                                 .text_wrapping(TextWrapping::Wrap),
+                            Button::new()
+                                .is_enabled(insert_target.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    insert_target.map_or(Message::ControlIdle, |target| {
+                                        action(HistoryAction::Insert(target))
+                                    })
+                                }))
+                                .content("Insert command"),
                             save,
                             TextBlock::new()
                                 .text(preview)

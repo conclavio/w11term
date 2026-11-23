@@ -11,6 +11,7 @@ $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 $word = '[' + [char]0xc5 + 'ngstr' + [char]0xf6 + 'm]'
 $command = 'deploy ' + ('x' * 128) + ' ' + $word
+$multiline = "echo first`n  echo second"
 $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
 $dot = ' ' + [char]0xb7 + ' '
@@ -66,11 +67,11 @@ try {
     $remote = ((Control @('list')).sessions | Where-Object label -eq 'palette-ssh').id
     $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','history-search-ready')
     $generation = (Control @('inspect','--pane',"$remote")).connection_generation
-    $all = @('check-status','deploy retry','deploy audit',$command)
+    $all = @('check-status','deploy retry','deploy audit',$multiline,$command)
     Check-List '' $all
     Check-List 'all' $all
     Check-List 'failed' @('deploy retry',$command)
-    Check-List 'succeeded' @('check-status')
+    Check-List 'succeeded' @('check-status',$multiline)
     Check-List 'unknown' @('deploy audit')
     Run-Palette 'Command history'
     $recent = 'check-status' + $dot + 'exit 0'
@@ -107,7 +108,7 @@ try {
         (Find-Element 'No matching commands') -and !(Find-Element 'Copy command' $button).Current.IsEnabled -and !(Find-Element 'Copy output' $button).Current.IsEnabled
     }
     Search ''
-    $null = Wait-Until 'only the successful command is offered' {
+    $null = Wait-Until 'the successful command is selected' {
         (Find-Element "Selected, $recent" $button) -and !(Find-Element $unknown $button) -and
             !(Find-Element $old $button) -and !(Find-Element $retry $button)
     }
@@ -138,8 +139,28 @@ try {
     Click 'Return to pane'
     Wait-Focus $remote
     Run-Palette ('Insert command' + $dot + 'Audit deployment')
+    Run-Palette 'Command history'
+    Search 'deploy retry'
+    Click 'Insert command'
+    Wait-Focus $remote
+    Run-Palette 'Command history'
+    Search 'echo first'
+    $null = Wait-Until 'unbracketed multiline insertion is disabled' {
+        $candidate = Find-Element 'Insert command' $button
+        $candidate -and !$candidate.Current.IsEnabled
+    }
+    $mode = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(([char]27 + "[?2004hhistory-paste-ready`r`n")))
+    $null = Control @('send-text','--pane',"$remote",'--no-paste','--base64',$mode)
+    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','history-paste-ready')
+    Click 'Refresh history'
+    Click 'Insert command'
+    Wait-Focus $remote
     foreach ($char in 'history-resumed'.ToCharArray()) { Post-Key 0x102 ([uint32]$char) }
-    $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','history-resumed')
+    try {
+        $null = Control @('wait-for-text','--pane',"$remote",'--timeout','15','history-resumed')
+    } catch {
+        throw "$_ Screen: $((Control @('get-text','--pane',"$remote")).text)"
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

@@ -224,6 +224,15 @@ impl Events {
             .map(|watch| watch.generation)
     }
 
+    pub fn idle_shell(&self, generation: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .command_watch
+            .as_ref()
+            .is_some_and(|watch| watch.generation == generation && watch.running.is_none())
+    }
+
     pub fn set_command_watch(&self, armed: bool) -> bool {
         let mut state = self.state.lock().unwrap();
         let previous = state.watch_state();
