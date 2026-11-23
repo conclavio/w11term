@@ -429,6 +429,57 @@ try {
     $null = Wait-CheckBox $westName On
     Click "Focus result pane $west"
     Wait-Focus $west
+
+    Run-Palette 'SSH host group'
+    (Command-Editor).SetValue('draft before reconnect')
+    $beforeReconnect = @((Control @('list')).sessions)
+    $exitTokens = @{}
+    foreach ($pane in $east,$west) {
+        $null = Control @('send-text','--pane',"$pane",'--no-paste','--base64','BA==')
+        $exitTokens[$pane] = Wait-Until "SSH pane $pane exits" { (Control @('events','--pane',"$pane")).restart_token }
+        Pane-Status $pane "Disconnected${dot}reconnect available"
+    }
+    Set-HostFilter 'east'
+    $null = Wait-Until 'the ended West pane is hidden' { !(Find-Element "Reconnect SSH pane $west" $button) }
+    Click 'Reconnect selected'
+    $null = Wait-Until 'one visible reconnect requested' { Find-Element 'Reconnect requested for 1 host.' }
+    Pane-Status $east "Connected${dot}Ready"
+    if ((Control @('events','--pane',"$west")).restart_token -ne $exitTokens[$west]) {
+        throw 'Reconnect selected claimed a hidden pane'
+    }
+    Set-HostFilter ''
+    (Wait-CheckBox $westName On).Toggle()
+    $null = Wait-CheckBox $westName Off
+    $null = Wait-Until 'the bulk action excludes the unchecked host and the live host' {
+        $bulk = Find-Element 'Reconnect selected' $button
+        $bulk -and !$bulk.Current.IsEnabled -and !(Find-Element "Reconnect SSH pane $east" $button)
+    }
+    Click "Reconnect SSH pane $west"
+    Pane-Status $west "Connected${dot}Ready"
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName Off
+    if ((Command-Editor).Current.Value -cne 'draft before reconnect') {
+        throw 'Reconnect changed the working command draft'
+    }
+    Outcome $westName 'Exit 17'
+    $afterReconnect = @((Control @('list')).sessions)
+    if ($afterReconnect.Count -ne $beforeReconnect.Count) { throw 'Reconnect opened or removed a pane' }
+    foreach ($previous in $beforeReconnect) {
+        $current = $afterReconnect | Where-Object id -eq $previous.id
+        if (!$current -or $current.tab_id -ne $previous.tab_id) { throw 'Reconnect replaced a pane or tab' }
+        if ($previous.id -in @($east,$west)) {
+            if ($current.connection_generation -le $previous.connection_generation) {
+                throw 'A requested SSH pane did not start a fresh connection'
+            }
+        } elseif ($current.connection_generation -ne $previous.connection_generation) {
+            throw 'Reconnect changed the local PowerShell session'
+        }
+    }
+    foreach ($pair in @(@($east,'east-accepted both'),@($west,'west-accepted snapshot  status'))) {
+        $path = Join-Path $State "reconnect-pane-$($pair[0]).txt"
+        $null = Control @('save-text','--pane',"$($pair[0])",$path)
+        if (![IO.File]::ReadAllText($path).Contains($pair[1])) { throw 'Reconnect discarded previous SSH output' }
+    }
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {

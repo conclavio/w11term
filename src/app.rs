@@ -2501,6 +2501,22 @@ impl TerminalApp {
             .find(|tab| tab.value.pane_id() == Some(pane))
             .map(|tab| tab.id)
     }
+
+    fn restart_exited_pane(&mut self, exit: ExitedPane) -> anyhow::Result<bool> {
+        let Some(id) = self.tab_for_pane(exit.pane) else {
+            return Ok(false);
+        };
+        let Some(Page::Terminal(live)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
+            return Ok(false);
+        };
+        if live.session.events.restart_token() != Some(exit.token) {
+            return Ok(false);
+        }
+        live.session.restart_exited(exit.token)?;
+        self.clipboard.connection_changed(exit.pane, 0, true);
+        live.reset_transport_input(&self.keyboard);
+        Ok(true)
+    }
     fn sync_selection(&mut self, context: &ComponentContext<Self>) {
         // Native collection resets select the first item after Reactor's property pass.
         // Reapply our selected index after mounting, and ignore intermediate reset events.
@@ -4915,23 +4931,9 @@ impl Component for TerminalApp {
             }
             Message::RestartExited(exit) => {
                 // A native menu may still be delivering a callback for a previous exit or pane.
-                if let Some(id) = self.tab_for_pane(exit.pane)
-                    && let Some(AppTab {
-                        page: Page::Terminal(live),
-                        ..
-                    }) = self.tabs.get_mut(id)
-                    && live.session.events.restart_token() == Some(exit.token)
-                {
-                    match live.session.restart_exited(exit.token) {
-                        Ok(()) => {
-                            self.clipboard.connection_changed(exit.pane, 0, true);
-                            live.reset_transport_input(&self.keyboard);
-                        }
-                        Err(error) => {
-                            self.window_error =
-                                Some(format!("Could not restart pane {}: {error:#}", exit.pane));
-                        }
-                    }
+                if let Err(error) = self.restart_exited_pane(exit) {
+                    self.window_error =
+                        Some(format!("Could not restart pane {}: {error:#}", exit.pane));
                 }
                 self.refresh_open_commands();
             }

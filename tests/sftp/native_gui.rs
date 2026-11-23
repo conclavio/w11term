@@ -819,7 +819,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
         let (Source::Ssh(ssh), root, opens, server) = fixture_with_wire(
             false,
-            if use_633 { 2 } else { 1 },
+            if use_633 { 3 } else { 2 },
             Arc::default(),
             Some(wire),
         )
@@ -846,7 +846,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                 match message {
                     Wire::Shell(id, handle) => {
                         connections += 1;
-                        if connections == 1 {
+                        if connections == 1 || !use_633 || connections == 3 {
                             handle.data(id, prompt).await.unwrap();
                         }
                         peer = Some(handle);
@@ -857,6 +857,12 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                         let handle = peer.as_ref().unwrap();
                         let response = match bytes.as_slice() {
                             b"part" => b"part".to_vec(),
+                            b"\x04" => {
+                                handle.exit_status_request(id, 23).await.unwrap();
+                                handle.eof(id).await.unwrap();
+                                handle.close(id).await.unwrap();
+                                continue;
+                            }
                             b"\x03" => {
                                 assert!(
                                     waiting_interrupt,
@@ -980,11 +986,11 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
     .unwrap();
     drive_gui("ssh-host-group-ui.ps1", state.path());
     let expected: [&[u8]; 2] = [
-        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03",
-        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r",
+        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04",
+        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
-        assert_eq!(opens.load(Ordering::Relaxed), index + 1);
+        assert_eq!(opens.load(Ordering::Relaxed), index + 2);
         assert_eq!(
             *trace.lock().unwrap(),
             expected[index],
