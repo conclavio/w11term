@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+[IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"command_palette":"F7","close_tab":"F6"}}')
 $profiles = Join-Path $State 'profiles.json'
 $config = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
 $dot = ' ' + [char]0xb7 + ' '
@@ -35,9 +36,20 @@ function Expect-Field([string]$Name, [string]$Value) {
     }
 }
 function Wait-Tab([string]$Name) {
-    $null = Wait-Until "tab '$Name' is selected" {
-        $tab = Find-Element $Name $tabItem
-        $tab -and $tab.GetCurrentPattern($selectionItem).Current.IsSelected
+    try {
+        $null = Wait-Until "tab '$Name' is selected" {
+            $tab = Find-Element $Name $tabItem
+            $tab -and $tab.GetCurrentPattern($selectionItem).Current.IsSelected
+        }
+    } catch {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $scope = [System.Windows.Automation.TreeScope]::Descendants
+        $condition = [System.Windows.Automation.AutomationElement]::ControlTypeProperty
+        $tabs = $root.FindAll($scope, [System.Windows.Automation.PropertyCondition]::new($condition, $tabItem))
+        $texts = $root.FindAll($scope, [System.Windows.Automation.PropertyCondition]::new($condition, [System.Windows.Automation.ControlType]::Text))
+        $names = @($tabs | ForEach-Object { $_.Current.Name })
+        $status = @($texts | ForEach-Object { $_.Current.Name } | Where-Object { $_ } | Select-Object -Last 15)
+        throw "$_ Tabs: $($names -join ' | '). UI text: $($status -join ' | ')"
     }
 }
 function Select-Tab([string]$Name) {
@@ -130,8 +142,9 @@ $app = Start-Process -FilePath $Gui -ArgumentList $argsForApp -WindowStyle Hidde
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
-    $origin = @((Control @('list')).sessions | Where-Object active)[0].id
-    if (!$origin) { throw 'Expected an active Demo pane before opening a review' }
+    $origin = (Wait-Until 'the active Demo pane' {
+        (Control @('list')).sessions | Where-Object active | Select-Object -First 1
+    }).id
     $groupReview = "Review SSH group${dot}Fleet Mixed"
     Open-GroupCommandSearch 'review fleet mixed group'
     Accept-GroupCommandWithEnter $groupReview
@@ -214,6 +227,8 @@ try {
     $null = Wait-CheckBox $westName Off
     Expect-Field 'Group command' ''
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'Changing group tabs started or closed an SSH pane' }
+    Press-Key 0x75
+    $null = Wait-Until 'the finished window-wide roster closes' { !(Find-Element 'SSH host group' $tabItem) }
     Select-Tab $westTab
     $null = Wait-CheckBox $westName On
     $null = Wait-Until 'West retains its own results and narrow scope' {
@@ -337,6 +352,8 @@ try {
     $null = Wait-Until 'the reviewed East session accepts the new group command' {
         Find-Element "$eastName${dot}Exit 0"
     }
+    Press-Key 0x75
+    $null = Wait-Until 'the finished mixed roster closes' { !(Find-Element "SSH group${dot}Fleet Mixed" $tabItem) }
     Select-Tab $westTab
     $null = Wait-Until 'the source group retains its earlier result' { Find-Element "Submitted${dot}west-probe" }
 
