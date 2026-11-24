@@ -184,19 +184,23 @@ function Press-FocusedKey([uint32]$Key) {
     }
     return $target
 }
-function Open-Palette([string]$Command) {
-    Press-Key 0x76 # F7 in the fixture's keymap
+function Wait-PickerEditor([string]$Label, [string]$Action) {
+    $type = [System.Windows.Automation.ControlType]::Edit
     try {
-        return Wait-Until "F7 to focus command search for '$Command'" {
-            $entry = Find-Element 'Search commands' ([System.Windows.Automation.ControlType]::Edit)
+        return Wait-Until "$Action to focus '$Label'" {
+            $entry = Find-Element $Label $type
             if ($entry -and $entry.Current.HasKeyboardFocus) { $entry }
         }
     } catch {
-        $mounted = $null -ne (Find-Element 'Search commands' ([System.Windows.Automation.ControlType]::Edit))
+        $mounted = $null -ne (Find-Element $Label $type)
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
         $focus = if ($focused -and $focused.Current.ProcessId -eq $app.Id) { $focused.Current.Name } else { '(outside fixture)' }
         throw "$_ Search edit mounted: $mounted. Foreground HWND: $([FixtureMessages]::GetForegroundWindow()), fixture HWND: $window. Focus: $focus"
     }
+}
+function Open-Palette([string]$Command) {
+    Press-Key 0x76 # F7 in the fixture's keymap
+    Wait-PickerEditor 'Search commands' "F7 for '$Command'"
 }
 function Run-Palette([string]$Command) {
     $field = Open-Palette $Command
@@ -220,7 +224,7 @@ function Run-Palette([string]$Command) {
             if (!$retired) { throw }
         }
     }
-    $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
+    $null = Wait-Until "command palette to close after '$Command'" { !(Find-Element 'Search commands') }
 }
 function Wait-Focus([int]$Pane) {
     try {
@@ -232,14 +236,14 @@ function Wait-Focus([int]$Pane) {
         throw "$_ Current panes: $((Control @('list')).sessions | Select-Object id,label,title,active,visible | ConvertTo-Json -Compress)"
     }
 }
-function Open-PickerQuery([string]$Query) {
-    Write-Output "Searching for $Query"
+function Open-PanePicker([string]$Query) {
     Invoke-Button (Wait-Until 'tab menu' { Find-Element 'Tab menu' })
     Invoke-Button (Wait-Until 'Find pane menu item' { Find-Element ('Find pane' + [char]0x2026 + '    Ctrl+Shift+P') })
-    $edit = Wait-Until 'keyboard focus in the pane search field' {
-        $field = Find-Element 'Find pane'
-        if ($field -and $field.Current.HasKeyboardFocus) { return $field }
-    }
+    Wait-PickerEditor 'Find pane' "the tab menu item for '$Query'"
+}
+function Open-PickerQuery([string]$Query) {
+    Write-Output "Searching for $Query"
+    $edit = Open-PanePicker $Query
     $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
 }
 function Get-PickerRows {

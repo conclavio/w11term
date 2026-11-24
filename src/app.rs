@@ -1072,6 +1072,8 @@ pub enum Message {
     PickerChoose(u64),
     PlacePane(TabId, TabId, Direction),
     PickerFocus(u8),
+    PickerFromMenu(Shortcut),
+    PickerFocusAfterMenu(Arc<()>),
     LocalProfile(local_profile::Action),
     Files(FileAction),
     HintRevealed(Arc<()>, Result<(), String>),
@@ -3426,6 +3428,13 @@ impl TerminalApp {
                 attention::set_long_commands(paste, enabled)
             }
             _ => match tab_menu_message(label) {
+                Message::Shortcut(
+                    shortcut @ (Shortcut::PanePicker
+                    | Shortcut::FindTab
+                    | Shortcut::FindAllPanes
+                    | Shortcut::CommandPalette
+                    | Shortcut::MovePaneToExistingTab),
+                ) => Message::PickerFromMenu(shortcut),
                 Message::Shortcut(Shortcut::ReopenClosedTab) => {
                     Message::ReopenClosedTab(closed_group)
                 }
@@ -4900,6 +4909,7 @@ impl Component for TerminalApp {
                 | Message::PickerHover(..)
                 | Message::PickerFrame(..)
                 | Message::PickerFocus(..)
+                | Message::PickerFocusAfterMenu(..)
                 | Message::PaneRatio(..)
                 | Message::PaneMeasured(_)
                 | Message::DividerPress(..)
@@ -5077,6 +5087,8 @@ impl Component for TerminalApp {
                 self.place_pane(source, target, side, context)
             }
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
+            Message::PickerFromMenu(shortcut) => self.open_picker_from_menu(shortcut, context),
+            Message::PickerFocusAfterMenu(launch) => self.focus_picker_after_menu(&launch),
             Message::Files(action) => self.file_action(action, context),
             Message::AccessibleSelection(request) => {
                 if let Some(AppTab {

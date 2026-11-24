@@ -240,6 +240,7 @@ impl Mode {
 pub(super) struct Picker {
     mode: Mode,
     query: String,
+    launch: Arc<()>,
     input: ElementRef<TextBox>,
     default_side: ElementRef<Button>,
     matches: Vec<Choice>,
@@ -635,6 +636,37 @@ impl TerminalApp {
         self.start_picker(Mode::Focus, ctx);
     }
 
+    pub(super) fn open_picker_from_menu(
+        &mut self,
+        shortcut: Shortcut,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.picker.is_some() {
+            return;
+        }
+        self.update(Message::Shortcut(shortcut), ctx);
+        if let Some(picker) = &self.picker {
+            let launch = picker.launch.clone();
+            // WinUI's MenuFlyout restores focus to its owner when it closes.
+            // Give the new editor a second chance after the close animation.
+            ctx.spawn_background(move |_| {
+                std::thread::sleep(Duration::from_millis(200));
+                Message::PickerFocusAfterMenu(launch)
+            });
+        }
+    }
+
+    pub(super) fn focus_picker_after_menu(&self, launch: &Arc<()>) {
+        if let Some(picker) = self.picker.as_ref().filter(|picker| {
+            Arc::ptr_eq(&picker.launch, launch)
+                && picker.placement().is_none()
+                && picker.query.is_empty()
+                && !picker.text.revealing
+        }) {
+            let _ = picker.input.request_focus();
+        }
+    }
+
     pub(super) fn open_text_picker(&mut self, ctx: &ComponentContext<Self>) {
         if matches!(self.tabs.active().map(|t| &t.page), Some(Page::Terminal(live)) if live.device_busy || live.session.prompts.current().is_some())
         {
@@ -703,6 +735,7 @@ impl TerminalApp {
             .unwrap_or(0);
         self.picker = Some(Picker {
             mode,
+            launch: Arc::new(()),
             input: ElementRef::new(),
             default_side: ElementRef::new(),
             query: String::new(),
