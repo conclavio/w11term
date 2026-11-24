@@ -658,6 +658,31 @@ try {
     if ($default.plan.dispatch_policy.interval_ms -ne 5000 -or $noDelay.plan.dispatch_policy.interval_ms -ne 0) {
         throw 'The pacing override changed the configured interval or failed to represent no delay'
     }
+    Select-GroupOption 'Expire unsent commands' '5 seconds'
+    $expiryLog = Join-Path $State 'cli-expiry-output.txt'
+    $expiring = Control ($serialArgs + @('--parallel','1','--interval-ms','0',
+        '--queue-expiry-ms','1800','--record-output',$expiryLog,'--','verify-expiry'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started verify-expiry')
+    $null = Wait-Until 'expiry withholds East while West stays running' {
+        $run = (Run-Snapshot $expiring.run_id).run
+        $run.dispatch_policy.queue_expiry_ms -eq 1800 -and $run.queue.state -ceq 'drained' -and
+            $run.recipients[0].execution.state -ceq 'running' -and
+            $run.recipients[1].delivery.reason -ceq 'Queue expired before sending.'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-verify-expiry') | Out-Null
+    $expired = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($expiring.run_id)",'--timeout','10')
+    if ($expired.run.recipients[0].execution.exit_code -ne 0 -or $expired.run.recording.state -cne 'saved' -or
+        !(Read-GroupRecording $expiryLog).Contains('queue expires after 1.8s')) {
+        throw 'The expiring run interrupted West or lost its policy in the recording'
+    }
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $default = Control ($serialArgs + @('--dry-run','--','verify-expiry'))
+    $noExpiry = Control ($serialArgs + @('--dry-run','--queue-expiry-ms','0','--','verify-expiry'))
+    if ($default.plan.dispatch_policy.queue_expiry_ms -ne 5000 -or $null -ne $noExpiry.plan.dispatch_policy.queue_expiry_ms) {
+        throw 'The expiry override changed the configured deadline or failed to disable expiry'
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

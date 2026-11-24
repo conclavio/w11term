@@ -1,4 +1,4 @@
-use super::{CommandOffer, Duration};
+use super::{CommandOffer, Duration, Instant};
 use serde::Serialize;
 
 #[derive(Clone, Serialize)]
@@ -18,12 +18,20 @@ struct Canary {
 }
 
 impl CommandOffer {
+    pub(super) fn queue_deadline(&self, now: Instant) -> Result<Option<Instant>, &'static str> {
+        self.queue_expiry
+            .map(|expiry| {
+                now.checked_add(expiry)
+                    .ok_or("The queue expiry exceeds the supported clock range")
+            })
+            .transpose()
+    }
+
     pub(super) fn dispatch_policy(&self) -> Policy {
         let parallel_limit = self.parallel_limit;
         let interval_ms = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
         let queue_expiry_ms = self
             .queue_expiry
-            .duration()
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
         let canary = self.canary.and_then(|pane| {
             self.targets

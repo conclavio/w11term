@@ -170,7 +170,7 @@ pub struct CommandOffer {
     targets: Vec<Target>,
     parallel_limit: Option<usize>,
     interval: Duration,
-    queue_expiry: SshGroupQueueExpiry,
+    queue_expiry: Option<Duration>,
     stop_queue_on_failure: bool,
     canary: Option<u64>,
     notify_canary: bool,
@@ -628,7 +628,7 @@ impl HostGroup {
             targets,
             parallel_limit: self.roster_preferences.command_limit.concurrency(),
             interval: self.roster_preferences.command_interval.duration(),
-            queue_expiry: self.roster_preferences.command_queue_expiry,
+            queue_expiry: self.roster_preferences.command_queue_expiry.duration(),
             stop_queue_on_failure: self.roster_preferences.stop_command_queue_on_failure,
             canary,
             notify_canary: canary.is_some() && self.notify_canary,
@@ -1193,7 +1193,7 @@ impl TerminalApp {
                 .eq(targets.iter().map(|target| target.pane))
             && page.roster_preferences.command_limit.concurrency() == *parallel_limit
             && page.roster_preferences.command_interval.duration() == *interval
-            && page.roster_preferences.command_queue_expiry == *queue_expiry
+            && page.roster_preferences.command_queue_expiry.duration() == *queue_expiry
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
             && page.canary == *canary
@@ -1217,13 +1217,14 @@ impl TerminalApp {
         transcript: GroupTranscript,
         recording: output_recording::State,
         origin: SubmissionOrigin,
-    ) -> Option<u64> {
+    ) -> Result<u64, String> {
         if !matches!(
             self.tabs.get(id).map(|tab| &tab.page),
             Some(Page::HostGroup(_))
         ) {
-            return None;
+            return Err(format!("unknown SSH group tab {id} in this window"));
         }
+        let deadline = offer.queue_deadline(Instant::now())?;
         let policy = offer.dispatch_policy();
         let CommandOffer {
             text,
@@ -1233,9 +1234,6 @@ impl TerminalApp {
             notify_canary,
             ..
         } = offer;
-        let deadline = policy
-            .queue_expiry_ms
-            .map(|ms| Instant::now() + Duration::from_millis(ms));
         let slots = policy
             .parallel_limit
             .map(|limit| limit.min(targets.len()))
@@ -1259,9 +1257,9 @@ impl TerminalApp {
                 }
             })
             .collect();
-        let Page::HostGroup(page) = &mut self.tabs.get_mut(id)?.page else {
-            unreachable!("the group remains open during dispatch");
-        };
+        let page = self
+            .host_group_by_id_mut(id)
+            .expect("the group remains open during dispatch");
         if origin == SubmissionOrigin::Interactive {
             page.manual_command_order.clear();
         }
@@ -1288,7 +1286,7 @@ impl TerminalApp {
         submission.dispatch_policy = Some(policy);
         let run = submission.id;
         self.poll_command_queues();
-        Some(run)
+        Ok(run)
     }
 
     fn interrupt_hosts(
@@ -1820,7 +1818,7 @@ impl TerminalApp {
                     page.recorded_send.clear_feedback();
                     page.alerted_send.clear_feedback();
                 }
-                self.submit_group_command(
+                let _ = self.submit_group_command(
                     id,
                     offer,
                     GroupTranscript::default(),

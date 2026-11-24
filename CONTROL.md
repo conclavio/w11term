@@ -243,7 +243,7 @@ Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
 background tab or window without changing selection or keyboard focus.
 
-`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND`
+`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--parallel N] [--interval-ms MS] [--queue-expiry-ms MS] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND`
 sends one shell line of up to 4,096 UTF-8 bytes to explicitly named panes.
 Pass the command as one quoted argument to preserve spaces. Use `--` before
 a command beginning with two hyphens. The panes must be distinct, belong
@@ -275,6 +275,12 @@ Use `--interval-ms MS` to set the minimum time between dispatches for
 this submission. The first eligible dispatch has no initial delay.
 `0` disables pacing for the run. Omit the option to use the group's
 configured interval.
+
+Use `--queue-expiry-ms MS` to expire unsent recipients after that many
+milliseconds from dispatch setup. The deadline continues while the queue
+is paused or waiting for canary approval. Already dispatched commands
+continue normally. Use `0` for no expiry or omit the option to use the
+group's configured deadline.
 
 Use `--dry-run` to validate the same request and return `window_id`,
 `tab_id`, and a `plan` containing the command, effective dispatch policy,
@@ -467,6 +473,7 @@ w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --canary 19 --dry-run -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --parallel 1 -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --interval-ms 1200 -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --queue-expiry-ms 1800 -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --expect-output '^READY$' --regex --match-case -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
@@ -497,6 +504,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"canary_pane_id":19,"command":"check-service","dry_run":true}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"parallel_limit":1,"command":"check-service"}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"interval_ms":1200,"command":"check-service"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"queue_expiry_ms":1800,"command":"check-service"}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","expect_output":{"query":"^READY$","regex":true,"match_case":true}}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}

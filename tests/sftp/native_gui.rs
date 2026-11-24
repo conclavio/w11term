@@ -1728,7 +1728,7 @@ async fn native_ssh_group_bounds_parallel_commands() {
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
             "West" => {
-                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\rverify-pacing\r"
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\rverify-pacing\rverify-expiry\r"
                     .as_slice()
             }
             "East" => {

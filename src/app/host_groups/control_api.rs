@@ -344,6 +344,10 @@ impl TerminalApp {
         if let Some(interval_ms) = dispatch.interval_ms {
             offer.interval = Duration::from_millis(interval_ms);
         }
+        if let Some(expiry_ms) = dispatch.queue_expiry_ms {
+            offer.queue_expiry = (expiry_ms != 0).then_some(Duration::from_millis(expiry_ms));
+        }
+        offer.queue_deadline(Instant::now())?;
         Ok(offer)
     }
 
@@ -367,7 +371,6 @@ impl TerminalApp {
             self.arm_group_send_alert(tab, &offer, alert, &transcript);
         }
         self.submit_group_command(tab, offer, transcript, recording, SubmissionOrigin::Control)
-            .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))
     }
 
     pub(in crate::app) fn control_ssh_group_roster(

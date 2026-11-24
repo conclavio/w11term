@@ -288,8 +288,8 @@ impl Report {
 mod tests {
     use super::*;
     use crate::app::host_groups::{
-        CommandOffer, Delivery, DeliveryStatus, GroupInterruptTarget, SshGroupQueueExpiry,
-        SubmissionContent, Target, TargetState, filter::Names,
+        CommandOffer, Delivery, DeliveryStatus, GroupInterruptTarget, SubmissionContent, Target,
+        TargetState, filter::Names,
     };
     use std::{collections::BTreeMap, time::Duration};
     use tokio::sync::{oneshot, watch};
@@ -359,7 +359,7 @@ mod tests {
                     .collect(),
                 parallel_limit: Some(2),
                 interval: Duration::from_millis(500),
-                queue_expiry: SshGroupQueueExpiry::FiveSeconds,
+                queue_expiry: Some(Duration::from_secs(5)),
                 stop_queue_on_failure: true,
                 canary: Some(7),
                 notify_canary: false,

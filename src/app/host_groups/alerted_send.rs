@@ -280,7 +280,7 @@ impl TerminalApp {
         }
         let transcript = GroupTranscript::default();
         self.arm_group_send_alert(id, &review.offer, alert, &transcript);
-        self.submit_group_command(
+        let _ = self.submit_group_command(
             id,
             review.offer,
             transcript,

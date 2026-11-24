@@ -229,14 +229,11 @@ pub(super) fn preview(
                 .text(format!("Dispatch interval · {interval:?}"))
                 .into()
         },
-        offer
-            .queue_expiry
-            .duration()
-            .map_or_else(View::empty, |expiry| {
-                TextBlock::new()
-                    .text(format!("Unsent commands expire after {expiry:?}"))
-                    .into()
-            }),
+        offer.queue_expiry.map_or_else(View::empty, |expiry| {
+            TextBlock::new()
+                .text(format!("Unsent commands expire after {expiry:?}"))
+                .into()
+        }),
         hold.map_or_else(View::empty, |text| {
             TextBlock::new()
                 .text(text)

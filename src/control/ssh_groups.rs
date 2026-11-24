@@ -41,6 +41,7 @@ pub struct SshGroupDispatchOverrides {
     pub canary_pane_id: Option<u64>,
     pub parallel_limit: Option<NonZeroUsize>,
     pub interval_ms: Option<u64>,
+    pub queue_expiry_ms: Option<u64>,
 }
 
 impl SshGroupCommandOptions {
@@ -908,6 +909,7 @@ mod tests {
                     Some(3)
                 );
                 assert_eq!(options.dispatch.interval_ms, Some(725));
+                assert_eq!(options.dispatch.queue_expiry_ms, Some(1_800));
                 assert_eq!(
                     options.record_output,
                     Some(PathBuf::from(r"C:\fixture\capture.txt"))
@@ -997,6 +999,7 @@ mod tests {
             "canary_pane_id": 7,
             "parallel_limit": 3,
             "interval_ms": 725,
+            "queue_expiry_ms": 1800,
             "expect_output": { "query": "^READY [0-9]+$", "regex": true, "match_case": true },
             "record_output": r"C:\fixture\capture.txt",
         });

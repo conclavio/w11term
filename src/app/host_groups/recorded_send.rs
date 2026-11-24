@@ -164,7 +164,7 @@ impl TerminalApp {
                 if let Some(alert) = alert {
                     self.arm_group_send_alert(id, &offer, alert, &transcript);
                 }
-                self.submit_group_command(
+                let _ = self.submit_group_command(
                     id,
                     offer,
                     transcript,
