@@ -348,7 +348,7 @@ impl TerminalApp {
                             .font_size(24.0)
                             .text("SSH group result comparison"),
                         TextBlock::new()
-                            .text(format!("Submitted · {}", submission.text))
+                            .text(format!("Submitted · {}", submission.content.label()))
                             .text_trimming(TextTrimming::CharacterEllipsis),
                         TextBlock::new()
                             .text(status)

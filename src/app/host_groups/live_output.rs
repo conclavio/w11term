@@ -139,7 +139,7 @@ impl TerminalApp {
                     TextBlock::new()
                         .font_size(24.0)
                         .text("SSH group live output"),
-                    TextBlock::new().text(format!("Submitted · {}", submission.text)),
+                    TextBlock::new().text(format!("Submitted · {}", submission.content.label())),
                     StackPanel::new()
                         .spacing(8.0)
                         .orientation(Orientation::Horizontal)

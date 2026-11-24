@@ -1012,6 +1012,83 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "checks reviewed rank, shell syntax and prompt scope on the native SSH group tab"]
+async fn native_ssh_host_group_exports_ranked_variables() {
+    use in_band_resize::Wire;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["Fleet East", "Fleet West", "Witness"] {
+        let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (Source::Ssh(ssh), root, opens, server) =
+            fixture_with_wire(false, 1, Arc::default(), Some(wire)).await
+        else {
+            unreachable!()
+        };
+        let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inputs = trace.clone();
+        let peer = tokio::spawn(async move {
+            let prompt = b"\x1b]133;A\x07fleet$ \x1b]133;B\x07";
+            let mut handle = None;
+            while let Some(message) = received.recv().await {
+                match message {
+                    Wire::Shell(id, peer) => {
+                        peer.data(id, prompt.as_slice()).await.unwrap();
+                        handle = Some(peer);
+                    }
+                    Wire::Window(..) => {}
+                    Wire::Input(id, bytes) => {
+                        let response = match bytes.as_slice() {
+                            b"alt" => b"\x1b[?1049h\x1b[Halternate-proof".to_vec(),
+                            b"prompt" => [b"\x1b[?1049l\r\n".as_slice(), prompt].concat(),
+                            line if line.ends_with(b"\r") => [
+                                line.strip_suffix(b"\r").unwrap(),
+                                b"\r\n\x1b]133;C\x07variables-set\r\n\x1b]133;D;0\x07",
+                                prompt,
+                            ]
+                            .concat(),
+                            _ => panic!("unexpected input on {name}: {bytes:?}"),
+                        };
+                        inputs.lock().unwrap().push(bytes);
+                        handle.as_ref().unwrap().data(id, response).await.unwrap();
+                    }
+                }
+            }
+        });
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, root, opens, server, peer, trace));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles":profiles})).unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-environment-ui.ps1", state.path());
+
+    for (rank, (name, _root, opens, server, peer, trace)) in peers.into_iter().enumerate() {
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        let mut expected = Vec::new();
+        if rank == 1 {
+            expected.extend([b"alt".to_vec(), b"prompt".to_vec()]);
+        }
+        if rank < 2 {
+            expected.extend([
+                format!(
+                    "export POLYSH_NR_SHELLS=2 POLYSH_RANK={rank} POLYSH_NAME='127.0.0.1' POLYSH_DISPLAY_NAME='{name}'\r"
+                ).into_bytes(),
+                format!(
+                    "set -gx POLYSH_NR_SHELLS 2 && set -gx POLYSH_RANK {rank} && set -gx POLYSH_NAME '127.0.0.1' && set -gx POLYSH_DISPLAY_NAME '{name}'\r"
+                ).into_bytes(),
+            ]);
+        }
+        assert_eq!(*trace.lock().unwrap(), expected, "{name}");
+        peer.abort();
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives two simultaneous native SSH group tabs and their independent live rosters"]
 async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
     use in_band_resize::Wire;

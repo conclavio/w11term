@@ -22,7 +22,9 @@ impl HostGroup {
         submission: &Submission,
         visible: impl Iterator<Item = u64>,
     ) -> BTreeSet<u64> {
-        if !self.result_filter.includes(progress::Outcome::Attention) {
+        if submission.content.command().is_none()
+            || !self.result_filter.includes(progress::Outcome::Attention)
+        {
             return BTreeSet::new();
         }
         let candidates: BTreeSet<_> = submission
@@ -46,6 +48,9 @@ impl HostGroup {
         let Some(submission) = self.viewed_submission(id) else {
             return false;
         };
+        let Some(command) = submission.content.command() else {
+            return false;
+        };
         let eligible =
             self.retry_candidates(submission, self.shown(roster).map(|target| target.pane));
         if eligible != offered {
@@ -53,7 +58,7 @@ impl HostGroup {
                 "The retry targets changed. Review the results and prepare the retry again.".into();
             return false;
         }
-        let command = submission.text.to_string();
+        let command = command.to_owned();
         let previous = std::mem::replace(&mut self.draft, command);
         let selected = std::mem::replace(&mut self.selected, offered);
         let backup = self.previous_draft.get_or_insert(DraftBackup {
@@ -76,6 +81,9 @@ pub(super) fn button(
     visible: impl Iterator<Item = u64>,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
+    if submission.content.command().is_none() {
+        return View::empty();
+    }
     let offered = page.retry_candidates(submission, visible);
     let submission = submission.id;
     let caption = if offered.is_empty() {
@@ -168,7 +176,7 @@ mod tests {
         group.filter.set_wildcards(true);
         group.filter.set_query("west*".into());
         group.submit(
-            "show  status".into(),
+            SubmissionContent::Command("show  status".into()),
             vec![
                 delivery(
                     targets[0].clone(),
