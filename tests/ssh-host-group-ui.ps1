@@ -409,6 +409,12 @@ try {
     if ($earlierMatch.line.pane_id -ne $east -or $earlierMatch.line.text -cne 'east-accepted both') {
         throw 'The output wait missed an existing match in retained output'
     }
+    $westPrior = Control ($outputWait + @('--regex','^west while (paused|away)$'))
+    if ($westPrior.line.text -cne 'west while paused') { throw 'The first West output marker was missing' }
+    $future = & $Cli --pid $app.Id @outputWait --after-line 999999 'west while' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $future.ok -or $future.error -notlike '*ahead of the latest line*') {
+        throw 'An output cursor ahead of the run did not return an explicit error'
+    }
     $settledMiss = & $Cli --pid $app.Id wait-ssh-group-output --window $groupWindow --tab $groupTab --run 1 unreachable-match | ConvertFrom-Json
     if ($LASTEXITCODE -eq 0 -or $settledMiss.ok -or $settledMiss.error -notlike '*settled without a matching output line*') {
         throw 'A settled run with no match did not return a distinct error'
@@ -416,7 +422,7 @@ try {
     $foregroundBeforeOutputWait = [FixtureMessages]::GetForegroundWindow()
     $waitPath = Join-Path $State 'wait-group-output.json'
     $outputJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $outputWait +
-        @('--regex','--match-case','--timeout','15','^west\x20while\x20away$')) -NoNewWindow -PassThru -RedirectStandardOutput $waitPath
+        @('--after-line',"$($westPrior.line.line_id)",'--regex','--match-case','--timeout','15','^west\x20while\x20(?:paused|away)$')) -NoNewWindow -PassThru -RedirectStandardOutput $waitPath
     if ($outputJob.WaitForExit(250)) { throw 'The output wait ended before West produced its matching line' }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-away'), '')
     if (!$outputJob.WaitForExit(10000)) { throw 'The output wait did not receive the new line' }
@@ -427,7 +433,7 @@ try {
         $match.pane_id -ne $west -or $match.label -cne 'West' -or
         $match.address -cne "test@127.0.0.1:$($profileData.West.port)" -or
         $match.text -cne 'west while away' -or $match.shortened -ne $false -or
-        $match.line_id -le $earlierMatch.line.line_id -or $match.elapsed_ms -lt $earlierMatch.line.elapsed_ms -or
+        $match.line_id -le $westPrior.line.line_id -or $match.elapsed_ms -lt $westPrior.line.elapsed_ms -or
         [FixtureMessages]::GetForegroundWindow() -ne $foregroundBeforeOutputWait) {
         throw "The output wait returned the wrong match or changed focus: $($outputReply.error)"
     }
@@ -1548,7 +1554,8 @@ try {
     if ($newLogs.Count -ne 1 -or $newLogs[0].Name -notmatch '^ssh-group-output-(\d+)\.txt$') {
         throw 'Expected one new file for the recorded run'
     }
-    $nextName = "ssh-group-output-$([int]$Matches[1] + 1).txt"
+    $burstRunId = [int]$Matches[1]
+    $nextName = "ssh-group-output-$($burstRunId + 1).txt"
     $burstPath = $newLogs[0].FullName
     $logReader = Open-PeerTraceReader $burstPath
     $null = Wait-Until 'the recorder is still open with West awaiting its result' {
@@ -1583,6 +1590,15 @@ try {
         if (($actual -join '|') -cne ($expected -join '|')) {
             throw "Unexpected burst from $side ($($actual.Count) of 80 rows): $($actual -join ', ')"
         }
+    }
+    $burstWait = @('wait-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$burstRunId",'--after-line','0')
+    $lost = & $Cli --pid $app.Id @burstWait 'east record row 79' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $lost.ok -or $lost.error -notlike '*history after cursor 0 is incomplete through line*') {
+        throw 'A cursor preceding trimmed combined history did not report a gap'
+    }
+    $kept = Control ($burstWait + @('--pane',"$east",'east record row 00'))
+    if ($kept.line.pane_id -ne $east -or $kept.line.text -cne 'east record row 00') {
+        throw 'A gap in the combined feed incorrectly affected the East cursor'
     }
     Click $liveButton
     $null = Wait-Until 'open live output for the recorded burst' { Find-Element 'SSH group live output' }

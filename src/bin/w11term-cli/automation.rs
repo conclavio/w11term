@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{CommandStatus, Request};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -18,6 +18,7 @@ pub fn parse(
     let mut match_case = false;
     let mut timeout = None;
     let mut since = None;
+    let mut after_line = None;
     let mut text = None;
     let mut stop = false;
     let mut timed = false;
@@ -71,6 +72,15 @@ pub fn parse(
                 timeout = Some(value(&mut args)?.parse()?)
             }
             "--since" if verb == "events" => since = Some(value(&mut args)?.parse()?),
+            "--after-line" if verb == "wait-ssh-group-output" => {
+                let id = value(&mut args)?
+                    .parse()
+                    .context("--after-line requires a line ID")?;
+                ensure!(
+                    after_line.replace(id).is_none(),
+                    "specify --after-line only once"
+                );
+            }
             "--stop" if verb == "record" => stop = true,
             "--timed" if verb == "record" => timed = true,
             "--pause" | "--resume" | "--step" if verb == "playback" => {
@@ -256,6 +266,7 @@ pub fn parse(
                     tab_id,
                     run_id,
                     pane,
+                    after_line,
                     pattern,
                     regex,
                     match_case,

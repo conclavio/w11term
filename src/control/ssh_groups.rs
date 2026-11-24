@@ -15,6 +15,13 @@ pub struct SshGroupOutputWatch {
     pub retained: watch::Receiver<()>,
 }
 
+pub(super) struct GroupOutputQuery {
+    pub(super) pane: Option<u64>,
+    pub(super) after_line: Option<u64>,
+    pub(super) pattern: Regex,
+    pub(super) timeout: Duration,
+}
+
 pub(super) fn output_pattern(query: &str, regex: bool, match_case: bool) -> Result<Regex> {
     ensure!(!query.is_empty(), "search text is empty");
     ensure!(
@@ -117,10 +124,14 @@ impl Registry {
         window: WindowId,
         tab: u64,
         run: u64,
-        pane: Option<u64>,
-        pattern: Regex,
-        timeout: Duration,
+        query: GroupOutputQuery,
     ) -> Result<Value> {
+        let GroupOutputQuery {
+            pane,
+            after_line,
+            pattern,
+            timeout,
+        } = query;
         let deadline = Instant::now() + timeout;
         let (reply, response) = oneshot::channel();
         self.window_ui(window)?(UiRequest::WatchSshGroupOutput {
@@ -133,9 +144,15 @@ impl Registry {
             let SshGroupOutputWatch { stream, hosts, mut retained } = response.await
                 .with_context(|| format!("window {window} closed during SSH group output lookup"))?
                 .map_err(anyhow::Error::msg)?;
+            if let Some(cursor) = after_line {
+                ensure!(cursor <= stream.latest_line, "output cursor {cursor} is ahead of the latest line {}", stream.latest_line);
+                ensure!(cursor >= stream.evicted_through, "SSH group output history after cursor {cursor} is incomplete through line {}", stream.evicted_through);
+            }
             let matched = |line: &GroupTranscriptLine| {
                 let (label, address) = hosts.get(&line.pane)?;
-                (pane.is_none_or(|pane| pane == line.pane) && pattern.is_match(&line.text)).then(|| json!({
+                (after_line.is_none_or(|cursor| line.id > cursor)
+                    && pane.is_none_or(|pane| pane == line.pane)
+                    && pattern.is_match(&line.text)).then(|| json!({
                     "window_id": window,
                     "tab_id": tab,
                     "run_id": run,
@@ -221,9 +238,12 @@ mod tests {
                 3,
                 9,
                 2,
-                Some(7),
-                output_pattern("ready", false, false).unwrap(),
-                Duration::from_secs(1),
+                GroupOutputQuery {
+                    pane: Some(7),
+                    after_line: None,
+                    pattern: output_pattern("ready", false, false).unwrap(),
+                    timeout: Duration::from_secs(1),
+                },
             )
         };
         assert!(

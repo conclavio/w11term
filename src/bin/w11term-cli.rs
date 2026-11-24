@@ -237,7 +237,7 @@ mod tests {
             )
         ));
         assert!(matches!(
-            parse_line("wait-ssh-group-output --window 11 --tab 12 --run 4 --pane 5 --regex --match-case -- --ready").unwrap(),
+            parse_line("wait-ssh-group-output --window 11 --tab 12 --run 4 --pane 5 --after-line 0 --regex --match-case -- --ready").unwrap(),
             (
                 None,
                 Request::WaitSshGroupOutput {
@@ -245,6 +245,7 @@ mod tests {
                     tab_id: 12,
                     run_id: 4,
                     pane: Some(5),
+                    after_line: Some(0),
                     pattern,
                     regex: true,
                     match_case: true,
@@ -282,6 +283,8 @@ mod tests {
             "wait-ssh-group-output --window 2 --tab 3 --run 4",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --pane 0 ready",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --timeout 3601 ready",
+            "wait-ssh-group-output --window 2 --tab 3 --run 4 --after-line -1 ready",
+            "wait-ssh-group-output --window 2 --tab 3 --run 4 --after-line 0 --after-line 3 ready",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

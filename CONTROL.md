@@ -236,7 +236,7 @@ Check the recipient statuses and exit codes to decide whether the run succeeded.
 Timeout, a closed window or tab, or an evicted run returns an error. A timeout
 leaves the original run in progress.
 
-`wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT`
+`wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT`
 returns the first matching line from the selected run. It searches the retained
 combined feed in arrival order, then listens for new output. With `--pane ID`,
 it searches that recipient's retained feed and subsequent lines from that
@@ -252,6 +252,14 @@ output, including any truncation recorded in `shortened`. The view can
 be paused or in a background tab. A timeout, settled run without a match,
 retired run, or overrun of the incoming buffer returns a distinct error.
 
+Pass the reply's `line_id` as `--after-line ID` to continue after that line
+in the same run. Use 0 to start before the first line. The cursor uses the
+run's line IDs, including when the wait is scoped to one pane. A cursor
+beyond the latest line returns an error. If any newer lines from the
+selected feed have already left retention, the wait reports the last
+missing line ID as a history gap. Omit the cursor to search the available
+retained feed from its oldest line.
+
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
@@ -259,6 +267,7 @@ w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
+w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --regex '^ready for traffic$'
 ```
 
 Direct pipe clients use these JSON requests.
@@ -270,6 +279,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}
+{"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"pattern":"^ready for traffic$","regex":true}
 ```
 
 ## Waiting, geometry, tabs, and events

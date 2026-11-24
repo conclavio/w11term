@@ -115,6 +115,8 @@ pub enum Request {
         tab_id: u64,
         run_id: u64,
         pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_line: Option<u64>,
         pattern: String,
         #[serde(default)]
         regex: bool,
@@ -535,6 +537,7 @@ impl Registry {
                 tab_id,
                 run_id,
                 pane,
+                after_line,
                 pattern,
                 regex,
                 match_case,
@@ -549,9 +552,12 @@ impl Registry {
                     window_id,
                     tab_id,
                     run_id,
-                    pane,
-                    pattern,
-                    Duration::from_secs(timeout_seconds),
+                    ssh_groups::GroupOutputQuery {
+                        pane,
+                        after_line,
+                        pattern,
+                        timeout: Duration::from_secs(timeout_seconds),
+                    },
                 )
                 .await
             }
