@@ -1,5 +1,5 @@
 use super::*;
-use crate::color::SrgbaTuple;
+use crate::color::{SelectionColors, SrgbaTuple};
 use wezterm_escape_parser::csi::PaletteStack as PaletteOperation;
 use wezterm_escape_parser::osc::DynamicColorNumber;
 
@@ -131,6 +131,21 @@ impl Slot {
 }
 
 impl TerminalState {
+    pub fn selection_color_overrides(&self) -> SelectionColors {
+        SelectionColors {
+            foreground: self
+                .palette
+                .assigned
+                .get(&Slot::SelectionForeground)
+                .copied(),
+            background: self
+                .palette
+                .assigned
+                .get(&Slot::SelectionBackground)
+                .copied(),
+        }
+    }
+
     pub(super) fn perform_palette_stack(&mut self, operation: PaletteOperation) {
         match operation {
             PaletteOperation::Push(params) => {

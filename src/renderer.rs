@@ -3,9 +3,12 @@ use crate::{
     native_drawing::{GpuImage, NativeDrawing, Typography},
 };
 use std::collections::{HashMap, HashSet};
-use std::{cell::RefCell, rc::Rc, time::Instant};
+use std::{cell::RefCell, ops::Range, rc::Rc, time::Instant};
 use termwiz::surface::CursorShape;
-use w11term::terminal::{Snapshot, colors, rgba};
+use w11term::{
+    interaction::Selection,
+    terminal::{Rgba, Snapshot, colors, rgba},
+};
 use wezterm_term::{
     Intensity, Underline,
     image::{ImageCell, ImageDataType},
@@ -16,6 +19,7 @@ use windows_canvas::{
 
 pub const PADDING: f32 = 12.0;
 pub const STATUS_HEIGHT: f32 = 26.0;
+const SELECTION_BG: Rgba = [0.25, 0.53, 0.90, 0.4];
 #[cfg(test)]
 const FONT_SIZE: f32 = 16.0;
 
@@ -110,12 +114,100 @@ struct TextStyle {
 struct TextRun<'a> {
     text: &'a str,
     style: TextStyle,
-    x: f32,
-    y: f32,
     cols: usize,
-    fg: [f32; 4],
     shape: bool,
     scale: (f32, f32),
+}
+
+struct ShapedRun<'a> {
+    layout: &'a TextLayout,
+    origin: (f32, f32),
+    scale: (f32, f32),
+    ink: Rgba,
+}
+
+#[derive(Clone, Copy)]
+struct GridRow {
+    top: f32,
+    cw: f32,
+    ch: f32,
+}
+
+impl GridRow {
+    fn rect(self, span: Range<usize>) -> Rect {
+        Rect::from_xywh(
+            PADDING + span.start as f32 * self.cw,
+            self.top,
+            span.len() as f32 * self.cw,
+            self.ch,
+        )
+    }
+}
+
+impl ShapedRun<'_> {
+    fn draw(
+        &self,
+        native: &NativeDrawing,
+        row: GridRow,
+        run: Range<usize>,
+        selection: Option<(Rgba, &[Range<usize>])>,
+    ) -> windows_canvas::Result<()> {
+        let draw_original = || {
+            native.text(
+                self.layout,
+                self.origin.0,
+                self.origin.1,
+                self.ink,
+                self.scale,
+            )
+        };
+        let Some((ink, spans)) = selection else {
+            return draw_original();
+        };
+        // Clip the complete shaped run so a selection boundary never splits a
+        // ligature or changes the shaping of neighboring glyphs.
+        let mut next = run.start;
+        for span in spans {
+            let start = span.start.max(run.start);
+            let end = span.end.min(run.end);
+            if start >= end {
+                continue;
+            }
+            if next < start {
+                native.with_clip(row.rect(next..start), draw_original)?;
+            }
+            native.with_clip(row.rect(start..end), || {
+                native.cursor_text(self.layout, self.origin, ink, self.scale)
+            })?;
+            next = end;
+        }
+        if next == run.start {
+            draw_original()?;
+        } else if next < run.end {
+            native.with_clip(row.rect(next..run.end), draw_original)?;
+        }
+        Ok(())
+    }
+}
+
+fn selection_span(
+    selection: &Selection,
+    frame: &Snapshot,
+    row: usize,
+    cols: usize,
+) -> Option<Range<usize>> {
+    let mut span = selection.span(frame.first_stable_row + row as isize, cols)?;
+    for cell in frame.rows[row].visible_cells() {
+        let start = cell.cell_index();
+        let end = start + cell.width();
+        if start < span.start && end > span.start {
+            span.start = start;
+        }
+        if start < span.end && end > span.end {
+            span.end = end;
+        }
+    }
+    Some(span)
 }
 
 #[derive(Clone, Copy)]
@@ -340,18 +432,14 @@ impl Renderer {
         })
     }
 
-    fn text(
+    fn shape_text(
         &mut self,
-        native: &NativeDrawing,
         run: TextRun<'_>,
     ) -> windows_canvas::Result<Option<(&TextLayout, (f32, f32))>> {
         let TextRun {
             text,
             style,
-            x,
-            y,
             cols,
-            fg,
             shape,
             mut scale,
         } = run;
@@ -385,7 +473,6 @@ impl Renderer {
         if shape && cached.natural_width > 0.0 {
             scale.0 *= cols as f32 * self.metrics.cell_width / cached.natural_width;
         }
-        native.text(&cached.layout, x, y, fg, scale)?;
         Ok(Some((&cached.layout, scale)))
     }
 
@@ -393,14 +480,15 @@ impl Renderer {
         &mut self,
         ctx: &DrawContext<'_>,
         frame: &Snapshot,
+        selection: Option<&Selection>,
     ) -> windows_canvas::Result<Metrics> {
         self.paint(
             ctx,
-            ctx.width,
-            ctx.height,
+            (ctx.width, ctx.height),
             ctx.device_changed(),
             frame,
             CursorDisplay::Live,
+            selection,
         )
     }
 
@@ -510,12 +598,12 @@ impl Renderer {
         &self,
         ctx: &DrawContext<'_>,
         frame: &Snapshot,
-        selection: Option<&w11term::interaction::Selection>,
+        selection: Option<&Selection>,
         link: Option<&w11term::interaction::Link>,
     ) -> windows_canvas::Result<()> {
         let cw = self.metrics.cell_width;
         let ch = self.metrics.cell_height;
-        let brush = ctx.create_solid_brush(ColorF::new(0.25, 0.53, 0.90, 0.4))?;
+        let brush = ctx.create_solid_brush(color(SELECTION_BG))?;
         let highlight = |row: usize, span, top: f32, height: f32| {
             if let Some(map) = frame.cell_map(row) {
                 for visual in map.visual_ranges(span) {
@@ -549,26 +637,14 @@ impl Renderer {
                 }
             }
         }
-        brush.set_color(ColorF::new(0.25, 0.53, 0.90, 0.4));
-        if let Some(selection) =
-            selection.filter(|s| s.alternate == frame.alternate && s.cols == frame.cols)
-        {
+        brush.set_color(color(SELECTION_BG));
+        if let Some(selection) = selection.filter(|s| {
+            frame.selection_colors == Default::default()
+                && s.alternate == frame.alternate
+                && s.cols == frame.cols
+        }) {
             for y in 0..frame.rows.len().min(self.metrics.rows) {
-                if let Some(mut span) =
-                    selection.span(frame.first_stable_row + y as isize, self.metrics.cols)
-                {
-                    for cell in frame.rows[y].visible_cells() {
-                        if cell.cell_index() < span.start
-                            && cell.cell_index() + cell.width() > span.start
-                        {
-                            span.start = cell.cell_index();
-                        }
-                        if cell.cell_index() < span.end
-                            && cell.cell_index() + cell.width() > span.end
-                        {
-                            span.end = cell.cell_index() + cell.width();
-                        }
-                    }
+                if let Some(span) = selection_span(selection, frame, y, self.metrics.cols) {
                     highlight(y, span, 0.0, ch);
                 }
             }
@@ -655,22 +731,22 @@ impl Renderer {
     ) -> windows_canvas::Result<Metrics> {
         self.paint(
             ctx,
-            width,
-            height,
+            (width, height),
             device_changed,
             frame,
             CursorDisplay::Static,
+            None,
         )
     }
 
     fn paint(
         &mut self,
         ctx: &DrawingSession<'_>,
-        width: f32,
-        height: f32,
+        (width, height): (f32, f32),
         device_changed: bool,
         frame: &Snapshot,
         display: CursorDisplay,
+        selection: Option<&Selection>,
     ) -> windows_canvas::Result<Metrics> {
         let native = NativeDrawing::new(ctx)?;
         if device_changed {
@@ -756,6 +832,13 @@ impl Renderer {
             }
         }
         self.draw_images(&native, frame, &tiles[under_background..under_text])?;
+        let selection = selection.filter(|s| {
+            frame.selection_colors != Default::default()
+                && s.alternate == frame.alternate
+                && s.cols == frame.cols
+        });
+        let selection_bg = frame.selection_colors.background.map_or(SELECTION_BG, rgba);
+        let selection_fg = frame.selection_colors.foreground.map(rgba);
         let cursor = self.visible_cursor(frame, display);
         let block = cursor.filter(|cursor| {
             self.copy_cursor.is_none()
@@ -780,6 +863,27 @@ impl Renderer {
             let width_scale = map.width_scale();
             let row_cw = cw * width_scale as f32;
             let row_top = PADDING + y as f32 * ch;
+            let row = GridRow {
+                top: row_top,
+                cw,
+                ch,
+            };
+            let selected = selection.and_then(|s| selection_span(s, frame, y, self.metrics.cols));
+            let visual_selection = selected
+                .as_ref()
+                .map_or_else(Vec::new, |span| map.visual_ranges(span.clone()));
+            if !visual_selection.is_empty() {
+                brush.set_color(color(selection_bg));
+                for span in &visual_selection {
+                    let end = span.end.min(self.metrics.cols);
+                    if span.start < end {
+                        ctx.fill_rect(&row.rect(span.start..end), &brush);
+                    }
+                }
+            }
+            let selected_ink = selection_fg
+                .filter(|_| !visual_selection.is_empty())
+                .map(|ink| (ink, visual_selection.as_slice()));
             let (glyph_top, height_scale) = glyph_row(line, row_top, ch);
             let glyph_height = ch * height_scale;
             let cells: Vec<_> = line
@@ -818,6 +922,8 @@ impl Renderer {
                     let visual = map.visual(col);
                     let x = PADDING + visual as f32 * row_cw;
                     let (fg, _) = colors(attrs, &frame.palette);
+                    let decoration_ink = selection_fg
+                        .filter(|_| selected.as_ref().is_some_and(|span| span.contains(&col)));
                     // Kitty marks the image's placement in the text grid with U+10EEEE.
                     if index >= next_run && !cell.str().starts_with('\u{10eeee}') {
                         let rtl = map.rtl(col);
@@ -844,30 +950,35 @@ impl Renderer {
                             text
                         };
                         let origin = (PADDING + left as f32 * row_cw, glyph_top);
-                        let layout = self.text(
-                            &native,
-                            TextRun {
-                                text,
-                                style: TextStyle {
-                                    bold: attrs.intensity() == Intensity::Bold,
-                                    italic: attrs.italic(),
-                                    rtl,
-                                },
-                                x: origin.0,
-                                y: origin.1,
-                                cols,
-                                fg,
-                                shape: kind.is_some(),
-                                scale: (width_scale as f32, height_scale),
+                        let layout = self.shape_text(TextRun {
+                            text,
+                            style: TextStyle {
+                                bold: attrs.intensity() == Intensity::Bold,
+                                italic: attrs.italic(),
+                                rtl,
                             },
-                        )?;
-                        if block_col
-                            .is_some_and(|col| (left..left + cols).contains(&(col / width_scale)))
-                            && let Some((layout, scale)) = layout
-                        {
-                            // Keep the complete shaped run at its original origin. Drawing the
-                            // cursor cell alone would break ligatures and joining scripts.
-                            cursor_ink = Some((layout.clone(), origin, scale));
+                            cols,
+                            shape: kind.is_some(),
+                            scale: (width_scale as f32, height_scale),
+                        })?;
+                        if let Some((layout, scale)) = layout {
+                            let run = ShapedRun {
+                                layout,
+                                origin,
+                                scale,
+                                ink: fg,
+                            };
+                            run.draw(
+                                &native,
+                                row,
+                                left * width_scale..(left + cols) * width_scale,
+                                selected_ink,
+                            )?;
+                            if block_col.is_some_and(|col| {
+                                (left..left + cols).contains(&(col / width_scale))
+                            }) {
+                                cursor_ink = Some((layout.clone(), origin, scale));
+                            }
                         }
                     }
                     if attrs.underline() != Underline::None {
@@ -878,7 +989,7 @@ impl Renderer {
                         } else {
                             rgba(frame.palette.resolve_fg(attrs.underline_color()))
                         };
-                        brush.set_color(color(underline));
+                        brush.set_color(color(decoration_ink.unwrap_or(underline)));
                         draw_underline(
                             ctx,
                             &brush,
@@ -893,7 +1004,7 @@ impl Renderer {
                         );
                     }
                     if attrs.overline() || attrs.strikethrough() {
-                        brush.set_color(color(fg));
+                        brush.set_color(color(decoration_ink.unwrap_or(fg)));
                         draw_ink_lines(
                             ctx,
                             &brush,
@@ -1295,6 +1406,77 @@ mod tests {
     }
 
     #[test]
+    fn osc_selection_recolors_only_the_selected_cells_of_shaped_runs() {
+        use w11term::interaction::Point;
+
+        let _com = Apartment::new();
+        let mut renderer = Renderer::with_size("Cascadia Code", true, 18.0).unwrap();
+        let device = windows_canvas::GpuDevice::new_or_warp().unwrap();
+        let (width, height) = (360_u32, 180_u32);
+        let target = device.create_render_target(width, height).unwrap();
+        let size = (width as f32, height as f32);
+        let metrics = renderer.measure(size.0, size.1, 1.0);
+        let (cw, ch) = (metrics.cell_width as usize, metrics.cell_height as usize);
+        let render = |renderer: &mut Renderer, frame: &Snapshot, selection: Option<&Selection>| {
+            target
+                .draw(|ctx| {
+                    NativeDrawing::new(ctx)?.set_dpi(96.0);
+                    renderer.paint(ctx, size, false, frame, CursorDisplay::Live, selection)?;
+                    Ok(())
+                })
+                .unwrap();
+            target.read_pixels().unwrap()
+        };
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut terminal = w11term::terminal::create(
+            wezterm_term::TerminalSize {
+                cols: metrics.cols,
+                rows: metrics.rows,
+                ..Default::default()
+            },
+            tx,
+        );
+        terminal.advance_bytes("\x1b[?25l\x1b]11;#000000\x07\x1b]10;#ffffff\x07\x1b]17;#602000\x07\x1b]19;#00ff00\x07A->B界X\r\nسلام");
+        let frame = Snapshot::capture(&terminal, None, 1, 0, String::new(), 0);
+        let normal = render(&mut renderer, &frame, None);
+        let mut reference = frame.clone();
+        reference.palette.background = frame.selection_colors.background.unwrap();
+        reference.palette.foreground = frame.selection_colors.foreground.unwrap();
+        let recolored = render(&mut renderer, &reference, None);
+        for (row, col, logical) in [(0, 2, 2..3), (0, 5, 4..6), (1, 1, 1..2)] {
+            let mut selection = Selection::new(
+                Point {
+                    row: frame.first_stable_row + row as isize,
+                    col,
+                },
+                false,
+                false,
+            );
+            selection.observe(&frame);
+            selection.active = true;
+            let selected = render(&mut renderer, &frame, Some(&selection));
+            let visual = frame.cell_map(row).unwrap().visual_ranges(logical);
+            let mut seen_ink = false;
+            let paper = [0, 32, 96, 255];
+            for y in 0..2 * ch {
+                for x in 0..metrics.cols * cw {
+                    let i = ((PADDING as usize + y) * width as usize + PADDING as usize + x) * 4;
+                    let inside =
+                        y / ch == row && visual.iter().any(|span| span.contains(&(x / cw)));
+                    let expected = if inside { &recolored } else { &normal };
+                    assert_eq!(
+                        &selected[i..i + 4],
+                        &expected[i..i + 4],
+                        "pixel {x},{y} with selection {row},{col}"
+                    );
+                    seen_ink |= inside && selected[i..i + 4] != paper;
+                }
+            }
+            assert!(seen_ink);
+        }
+    }
+
+    #[test]
     fn focused_block_recolors_the_original_shaped_run_only_inside_the_cursor() {
         let _com = Apartment::new();
         let mut renderer = Renderer::with_size("Cascadia Code", true, 18.0).unwrap();
@@ -1310,7 +1492,14 @@ mod tests {
             target
                 .draw(|ctx| {
                     NativeDrawing::new(ctx)?.set_dpi(96.0);
-                    renderer.paint(ctx, width as f32, height as f32, false, frame, display)?;
+                    renderer.paint(
+                        ctx,
+                        (width as f32, height as f32),
+                        false,
+                        frame,
+                        display,
+                        None,
+                    )?;
                     Ok(())
                 })
                 .unwrap();
@@ -1432,7 +1621,14 @@ mod tests {
             });
             target
                 .draw(|ctx| {
-                    renderer.paint(ctx, 260.0, 180.0, false, &frame, CursorDisplay::Live)?;
+                    renderer.paint(
+                        ctx,
+                        (260.0, 180.0),
+                        false,
+                        &frame,
+                        CursorDisplay::Live,
+                        None,
+                    )?;
                     Ok(())
                 })
                 .unwrap();
@@ -1465,11 +1661,11 @@ mod tests {
                 NativeDrawing::new(ctx)?.set_dpi(96.0);
                 renderer.paint(
                     ctx,
-                    width as f32,
-                    height as f32,
+                    (width as f32, height as f32),
                     false,
                     &frame,
                     CursorDisplay::Static,
+                    None,
                 )?;
                 Ok(())
             })

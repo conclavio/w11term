@@ -426,4 +426,32 @@ mod tests {
         term.advance_bytes(b"\x1b[2#Q");
         assert_eq!(term.palette().background, rgb(0xabcdef));
     }
+
+    #[test]
+    fn selection_color_overrides_publish_even_when_the_resolved_palette_is_unchanged() {
+        let (mut term, _) = engine(ColorScheme::OneHalfLight);
+        let snapshot = |term: &Terminal| Snapshot::capture(term, None, 1, 0, String::new(), 0);
+        let base = snapshot(&term);
+        term.advance_bytes(b"\x1b]17;#383a42\x07\x1b]19;#fafafa\x07\x1b[#P");
+        let styled = snapshot(&term);
+        assert_eq!(styled.palette, base.palette);
+        let mut without_overrides = styled.clone();
+        without_overrides.selection_colors = Default::default();
+        assert!(!styled.same_presentation(&without_overrides));
+        assert_eq!(styled.selection_colors.background, Some(rgb(0x383a42)));
+        assert_eq!(styled.selection_colors.foreground, Some(rgb(0xfafafa)));
+        term.advance_bytes(b"\x1b]117\x07");
+        let partial = snapshot(&term);
+        assert_eq!(partial.selection_colors.background, None);
+        assert_eq!(
+            partial.selection_colors.foreground,
+            styled.selection_colors.foreground
+        );
+        term.advance_bytes(b"\x1b]119\x07");
+        let reset = snapshot(&term);
+        assert_eq!(reset.selection_colors, base.selection_colors);
+        assert_eq!(reset.palette, base.palette);
+        term.advance_bytes(b"\x1b[#Q");
+        assert_eq!(snapshot(&term).selection_colors, styled.selection_colors);
+    }
 }

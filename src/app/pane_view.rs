@@ -470,16 +470,21 @@ impl TerminalApp {
             renderer.copy_cursor = mode.map(|m| m.state.cursor);
             renderer.read_only = read_only.get();
             let marked = mode.and_then(|m| m.state.selection());
-            let measured = renderer.draw(ctx, &frame)?;
-            renderer.draw_interaction(
-                ctx,
-                &frame,
-                marked
+            let measured = {
+                let mouse_selection = selection.borrow();
+                let visible_selection = marked
                     .as_ref()
-                    .or(selection.borrow().as_ref())
-                    .filter(|selection| selection.survives_scrollback_clear(&frame)),
-                hover.borrow().as_ref(),
-            )?;
+                    .or(mouse_selection.as_ref())
+                    .filter(|selection| selection.survives_scrollback_clear(&frame));
+                let measured = renderer.draw(ctx, &frame, visible_selection)?;
+                renderer.draw_interaction(
+                    ctx,
+                    &frame,
+                    visible_selection,
+                    hover.borrow().as_ref(),
+                )?;
+                measured
+            };
             if let Some(hints) = hints {
                 renderer.draw_hint_labels(ctx, &frame, hints.visible_labels())?;
             }

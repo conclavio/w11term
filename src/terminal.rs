@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use wezterm_term::color::{ColorPalette, SrgbaTuple};
+use wezterm_term::color::{ColorPalette, SelectionColors, SrgbaTuple};
 use wezterm_term::config::NewlineCanon;
 use wezterm_term::{
     CellAttributes, CursorPosition, Line, Terminal, TerminalConfiguration, TerminalSize,
@@ -649,6 +649,7 @@ pub struct Snapshot {
     /// Whether the last visible cell continues onto the following physical row.
     row_wraps: Vec<bool>,
     pub palette: ColorPalette,
+    pub selection_colors: SelectionColors,
     pub cursor: CursorPosition,
     pub cursor_visible: bool,
     pub cols: usize,
@@ -898,6 +899,7 @@ impl Snapshot {
             rows,
             row_wraps,
             palette,
+            selection_colors: terminal.selection_color_overrides(),
             cursor,
             cursor_visible: offset == 0
                 && cursor.visibility == termwiz::surface::CursorVisibility::Visible,
@@ -1014,6 +1016,7 @@ impl Snapshot {
                 old.cursor.visibility,
             )
             && self.palette == old.palette
+            && self.selection_colors == old.selection_colors
             && self.title == old.title
             && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)
