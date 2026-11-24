@@ -85,7 +85,11 @@ pub enum Action {
     New,
     NewFromSelection(BTreeSet<u64>),
     Edit(String),
-    Open { name: String, members: Vec<String> },
+    Open {
+        name: String,
+        members: Vec<String>,
+        new_tab: bool,
+    },
     Draft(u64, DraftAction),
 }
 
@@ -137,11 +141,14 @@ impl TerminalApp {
                     }
                 }
             }
-            Action::Open { name, members } => {
-                if self
-                    .host_group_mut(id)
-                    .is_some_and(|page| page.saved.editor.is_none())
-                    && let Err(error) = self.open_saved_host_group(Some(id), &name, &members, ctx)
+            Action::Open {
+                name,
+                members,
+                new_tab,
+            } => {
+                if self.host_group_command_target() == Some(id)
+                    && let Err(error) =
+                        self.open_saved_host_group((!new_tab).then_some(id), &name, &members, ctx)
                 {
                     self.refresh_profiles();
                     if let Some(page) = self.host_group_mut(id) {
@@ -276,9 +283,7 @@ impl TerminalApp {
         expected: &[String],
         ctx: &ComponentContext<Self>,
     ) -> Result<()> {
-        if let Some(id) = id
-            && let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page)
-        {
+        if let Some(Page::HostGroup(page)) = self.tabs.active().map(|tab| &tab.page) {
             ensure!(
                 !page.saved.is_editing(),
                 "Finish editing the SSH group before opening another group."
@@ -311,7 +316,20 @@ impl TerminalApp {
             .cloned()
             .collect::<Vec<_>>();
         self.use_group_catalog(catalog);
-        let id = id.unwrap_or_else(|| self.ensure_host_group_tab());
+        let id = id.unwrap_or_else(|| self.new_host_group_tab(Some(name)));
+        if self
+            .tabs
+            .get(id)
+            .is_some_and(|tab| matches!(&tab.page, Page::HostGroup(page) if page.roster.is_some()))
+        {
+            let label = self.unique_host_group_label(&format!("SSH group · {name}"), Some(id));
+            if let Some(tab) = self.tabs.get_mut(id)
+                && let Page::HostGroup(page) = &mut tab.page
+            {
+                tab.label = label;
+                page.roster = Some(Box::default());
+            }
+        }
         self.start_host_group_panes(id, expected.iter().cloned().map(Some).zip(members), ctx);
         if let Some(page) = self.host_group_mut(id) {
             page.saved.selected = Some(name.into());
@@ -326,8 +344,7 @@ impl TerminalApp {
         members: &[String],
         ctx: &ComponentContext<Self>,
     ) {
-        if let Err(error) = self.open_saved_host_group(self.host_group_tab_id(), name, members, ctx)
-        {
+        if let Err(error) = self.open_saved_host_group(None, name, members, ctx) {
             self.refresh_profiles();
             self.window_error = Some(format!("{error:#}"));
         }
@@ -348,7 +365,6 @@ impl TerminalApp {
         let mut items = Vec::new();
         if let Some((name, members)) = selected.zip(members) {
             let choices = names.clone();
-            let offered = (name.to_owned(), members.clone());
             let edit = name.to_owned();
             items.push(KeyedView::new(
                 "choose",
@@ -365,18 +381,26 @@ impl TerminalApp {
                             })
                     })),
             ));
-            items.push(KeyedView::new(
-                "open",
-                Button::new()
-                    .is_enabled(!members.is_empty())
-                    .on_click(ctx.callback(move |_| {
-                        action(Action::Open {
-                            name: offered.0.clone(),
-                            members: offered.1.clone(),
-                        })
-                    }))
-                    .content("Open group"),
-            ));
+            for (key, label, new_tab) in [
+                ("open", "Open group", false),
+                ("open-new-tab", "Open in new tab", true),
+            ] {
+                let name = name.to_owned();
+                let members = members.clone();
+                items.push(KeyedView::new(
+                    key,
+                    Button::new()
+                        .is_enabled(!members.is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            action(Action::Open {
+                                name: name.clone(),
+                                members: members.clone(),
+                                new_tab,
+                            })
+                        }))
+                        .content(label),
+                ));
+            }
             items.push(KeyedView::new(
                 "edit",
                 Button::new()

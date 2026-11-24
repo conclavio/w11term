@@ -1012,6 +1012,81 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives two simultaneous native SSH group tabs and their independent live rosters"]
+async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
+    use in_band_resize::Wire;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["East", "West"] {
+        let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (Source::Ssh(ssh), root, opens, server) =
+            fixture_with_wire(false, 1, Arc::default(), Some(wire)).await
+        else {
+            unreachable!()
+        };
+        let input = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trace = input.clone();
+        let release = state.path().join("release-east");
+        let responder = tokio::spawn(async move {
+            let prompt = b"\x1b]133;A\x07fixture$ \x1b]133;B\x07";
+            let mut peer = None;
+            while let Some(event) = received.recv().await {
+                match event {
+                    Wire::Shell(id, handle) => {
+                        handle.data(id, prompt.as_slice()).await.unwrap();
+                        peer = Some(handle);
+                    }
+                    Wire::Window(..) => {}
+                    Wire::Input(id, bytes) => {
+                        trace.lock().unwrap().extend_from_slice(&bytes);
+                        let line = std::str::from_utf8(&bytes)
+                            .unwrap()
+                            .strip_suffix('\r')
+                            .unwrap();
+                        let handle = peer.as_ref().unwrap();
+                        handle
+                            .data(id, format!("{line}\r\n\x1b]133;C\x07").into_bytes())
+                            .await
+                            .unwrap();
+                        if name == "East" {
+                            while !release.is_file() {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        }
+                        let end = format!("{name} finished {line}\r\n\x1b]133;D;0\x07");
+                        handle
+                            .data(id, [end.as_bytes(), prompt.as_slice()].concat())
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, root, opens, server, responder, input));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Fleet East": ["East"], "Fleet West": ["West"]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-tabs-ui.ps1", state.path());
+    for (name, _root, opens, server, responder, input) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), 1, "{name}");
+        let expected = format!("{}-probe\r", name.to_ascii_lowercase());
+        assert_eq!(*input.lock().unwrap(), expected.as_bytes(), "{name}");
+        responder.abort();
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "drives the native SSH group against an appliance shell without OSC markers"]
 async fn native_ssh_group_prompt_matches_fresh_appliance_output() {
     use in_band_resize::Wire;
