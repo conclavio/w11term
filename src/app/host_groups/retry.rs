@@ -1,10 +1,5 @@
 use super::*;
 
-pub(super) struct Scope {
-    pub selected: BTreeSet<u64>,
-    pub filter: filter::Filter,
-}
-
 fn retryable(delivery: &Delivery) -> bool {
     match delivery.status {
         DeliveryStatus::Rejected(_) => true,
@@ -58,18 +53,7 @@ impl HostGroup {
                 "The retry targets changed. Review the results and prepare the retry again.".into();
             return false;
         }
-        let command = command.to_owned();
-        let previous = std::mem::replace(&mut self.draft, command);
-        let selected = std::mem::replace(&mut self.selected, offered);
-        let backup = self.previous_draft.get_or_insert(DraftBackup {
-            text: previous,
-            scope: None,
-        });
-        backup.scope.get_or_insert_with(|| Scope {
-            selected,
-            filter: self.filter.clone(),
-        });
-        self.retry_feedback.clear();
+        self.load_scoped_draft(command.to_owned(), offered);
         true
     }
 }
@@ -108,7 +92,7 @@ pub(super) fn feedback(page: &HostGroup) -> View {
         .as_ref()
         .is_some_and(|backup| backup.scope.is_some())
     {
-        "Retry draft loaded. Review the command and checked hosts before sending."
+        "Draft loaded. Review the command and checked hosts before sending."
     } else {
         return View::empty();
     };

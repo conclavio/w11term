@@ -9,6 +9,7 @@ pub enum Action {
     Open,
     Refresh,
     Back,
+    PrepareFollowUp(FollowUp),
     Ready {
         revision: u64,
         comparison: Result<Comparison, &'static str>,
@@ -24,6 +25,7 @@ pub(super) struct State {
 struct Open {
     submission: u64,
     comparison: Option<Result<Comparison, &'static str>>,
+    feedback: Option<&'static str>,
 }
 
 impl State {
@@ -36,6 +38,7 @@ impl State {
 struct Member {
     pane: u64,
     name: String,
+    address: String,
     link: CommandLink,
 }
 
@@ -56,6 +59,23 @@ struct Group {
     size: usize,
     preview: String,
     note: Option<String>,
+}
+
+impl Group {
+    fn visible_members(&self, visible: &BTreeMap<u64, &str>) -> BTreeSet<u64> {
+        self.members
+            .iter()
+            .filter(|member| visible.get(&member.pane) == Some(&member.address.as_str()))
+            .map(|member| member.pane)
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct FollowUp {
+    revision: u64,
+    group: u64,
+    panes: BTreeSet<u64>,
 }
 
 pub struct Comparison {
@@ -92,6 +112,7 @@ fn sample(
         member: Member {
             pane: delivery.target.pane,
             name: host.clone(),
+            address: delivery.target.names.address().into(),
             link,
         },
         exit_code,
@@ -192,6 +213,58 @@ impl Comparison {
     }
 }
 
+impl HostGroup {
+    fn visible_comparison_addresses<'a>(&self, roster: &'a [Target]) -> BTreeMap<u64, &'a str> {
+        self.shown(roster)
+            .map(|target| (target.pane, target.names.address()))
+            .collect()
+    }
+
+    fn prepare_comparison_follow_up(
+        &mut self,
+        submission: u64,
+        offer: FollowUp,
+        roster: &[Target],
+    ) {
+        if self.comparison.revision != offer.revision || offer.panes.is_empty() {
+            return;
+        }
+        let Some(command) = self
+            .viewed_submission(submission)
+            .and_then(|item| item.content.command())
+        else {
+            return;
+        };
+        let Some(open) = self
+            .comparison
+            .open
+            .as_ref()
+            .filter(|open| open.submission == submission)
+        else {
+            return;
+        };
+        let Some(Ok(comparison)) = open.comparison.as_ref() else {
+            return;
+        };
+        let Some(group) = comparison
+            .groups
+            .iter()
+            .find(|group| group.members[0].pane == offer.group)
+        else {
+            return;
+        };
+        if group.visible_members(&self.visible_comparison_addresses(roster)) != offer.panes {
+            if let Some(open) = &mut self.comparison.open {
+                open.feedback = Some("The available hosts changed. Review the result group again.");
+            }
+            return;
+        }
+        self.load_scoped_draft(command.to_owned(), offer.panes);
+        self.comparison.open = None;
+        self.focus_loaded_command = true;
+    }
+}
+
 impl TerminalApp {
     pub(super) fn handle_host_group_comparison(
         &mut self,
@@ -222,6 +295,12 @@ impl TerminalApp {
                         .is_some_and(|open| open.submission == submission_id)
                 {
                     page.comparison.open = None;
+                }
+            }
+            Action::PrepareFollowUp(offer) => {
+                let roster = self.host_group_targets();
+                if let Some(page) = self.host_group_mut(id) {
+                    page.prepare_comparison_follow_up(submission_id, offer, &roster);
                 }
             }
             Action::Ready {
@@ -271,6 +350,7 @@ impl TerminalApp {
         state.open = Some(Box::new(Open {
             submission: submission_id,
             comparison: None,
+            feedback: None,
         }));
         let revision = state.revision;
         let ready = move |comparison| {
@@ -310,10 +390,17 @@ impl TerminalApp {
         let mut rows = Vec::new();
         let status = match &open.comparison {
             Some(Ok(comparison)) => {
+                let targets = self.host_group_targets();
+                let visible = page.visible_comparison_addresses(&targets);
                 for group in &comparison.groups {
+                    let follow_up = submission.content.command().map(|_| FollowUp {
+                        revision: page.comparison.revision,
+                        group: group.members[0].pane,
+                        panes: group.visible_members(&visible),
+                    });
                     rows.push(KeyedView::new(
                         format!("group-{}", group.members[0].pane),
-                        self.comparison_group(id, group, ctx),
+                        self.comparison_group(id, submission_id, group, follow_up, ctx),
                     ));
                 }
                 if !comparison.unavailable.is_empty() {
@@ -353,6 +440,12 @@ impl TerminalApp {
                         TextBlock::new()
                             .text(status)
                             .text_wrapping(TextWrapping::Wrap),
+                        open.feedback.map_or_else(View::empty, |feedback| {
+                            TextBlock::new()
+                                .text(feedback)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .into()
+                        }),
                         StackPanel::new()
                             .spacing(8.0)
                             .orientation(Orientation::Horizontal)
@@ -373,7 +466,14 @@ impl TerminalApp {
         )
     }
 
-    fn comparison_group(&self, id: TabId, group: &Group, ctx: &ViewContext<Self>) -> View {
+    fn comparison_group(
+        &self,
+        id: TabId,
+        submission: u64,
+        group: &Group,
+        follow_up: Option<FollowUp>,
+        ctx: &ViewContext<Self>,
+    ) -> View {
         let count = group.members.len();
         let host = if count == 1 { "host" } else { "hosts" };
         let first = group.members[0].pane;
@@ -382,6 +482,27 @@ impl TerminalApp {
                 .is_some_and(|frame| frame.has_command(member.link))
         });
         let details = history.map(|member| (member.pane, member.link));
+        let follow_up = follow_up.map_or_else(View::empty, |offer| {
+            let visible = offer.panes.len();
+            let caption = if visible == count {
+                format!("Prepare follow-up ({count} {host})")
+            } else {
+                format!("Prepare follow-up ({visible} of {count} {host} in roster)")
+            };
+            Button::new()
+                .automation_name(format!(
+                    "Prepare follow-up for result group starting at pane {first} · {caption}"
+                ))
+                .is_enabled(visible > 0)
+                .on_click(ctx.callback(move |_| {
+                    Message::HostGroup(super::Action::Compare(
+                        id,
+                        submission,
+                        Action::PrepareFollowUp(offer.clone()),
+                    ))
+                }))
+                .content(caption)
+        });
         let members = group.members.iter().map(|member| {
             let pane = member.pane;
             KeyedView::new(
@@ -417,6 +538,7 @@ impl TerminalApp {
                     }))
                     .content("View full output")
             }),
+            follow_up,
             StackPanel::new().spacing(3.0).keyed_children(members),
         ))
     }
@@ -440,7 +562,7 @@ mod tests {
             target: Target {
                 pane,
                 name: format!("Host {pane}"),
-                names: Default::default(),
+                names: filter::Names::new(&format!("Host {pane}"), "example.test", "ops", 22),
                 profile: None,
                 connected: true,
                 state: TargetState::InUse,
@@ -456,6 +578,77 @@ mod tests {
             text: text.into(),
             truncated,
         }
+    }
+
+    #[test]
+    fn follow_up_only_loads_the_reviewed_result_members_still_in_the_roster() {
+        let deliveries = vec![
+            completed(1, Some(0), capture("different\n", false)),
+            completed(2, Some(0), capture("matching\n", false)),
+            completed(3, Some(0), capture("matching\n", false)),
+        ];
+        let mut roster: Vec<_> = deliveries.iter().map(|item| item.target.clone()).collect();
+        let samples = deliveries
+            .iter()
+            .map(|item| sample(item, |_| None).unwrap())
+            .collect();
+        let mut page = HostGroup {
+            draft: "working draft".into(),
+            selected: BTreeSet::from([1, 3]),
+            roster: Some(Box::new(MemberRoster {
+                panes: BTreeSet::from([1, 2]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        page.filter.set_query("Host".into());
+        page.submit(
+            SubmissionContent::Command("original  command".into()),
+            deliveries,
+            GroupTranscript::default(),
+        );
+        page.comparison = State {
+            revision: 2,
+            open: Some(Box::new(Open {
+                submission: 1,
+                comparison: Some(Ok(Comparison::build(samples, Vec::new()))),
+                feedback: None,
+            })),
+        };
+        let offer = FollowUp {
+            revision: 2,
+            group: 2,
+            panes: BTreeSet::from([2]),
+        };
+        page.prepare_comparison_follow_up(
+            1,
+            FollowUp {
+                revision: 1,
+                ..offer.clone()
+            },
+            &roster,
+        );
+        assert!(page.comparison.is_open());
+        assert_eq!(page.draft, "working draft");
+
+        let old_names = roster[1].names.clone();
+        roster[1].names = filter::Names::new("Host 2", "example.test", "someone", 22);
+        page.prepare_comparison_follow_up(1, offer.clone(), &roster);
+        assert!(page.comparison.open.as_ref().unwrap().feedback.is_some());
+        assert_eq!(page.selected, BTreeSet::from([1, 3]));
+        assert!(page.previous_draft.is_none());
+
+        roster[1].names = old_names;
+        page.prepare_comparison_follow_up(1, offer, &roster);
+        assert!(!page.comparison.is_open());
+        assert_eq!(page.selected, BTreeSet::from([2]));
+        assert_eq!(page.draft, "original  command");
+        assert_eq!(page.submissions.len(), 1);
+        page.filter.clear();
+        assert!(page.restore_draft());
+        assert_eq!(page.filter.query(), "Host");
+        assert_eq!(page.selected, BTreeSet::from([1, 3]));
+        assert_eq!(page.draft, "working draft");
     }
 
     #[test]
