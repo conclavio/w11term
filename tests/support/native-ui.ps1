@@ -203,19 +203,23 @@ function Run-Palette([string]$Command) {
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
     # UI Automation can expose the button name while WinUI is replacing its
     # provider after filtering. Reacquire the row until it is invokable.
-    $invoke = Wait-Until "invoke provider for palette command '$Command'" {
+    $null = Wait-Until "invoke palette command '$Command'" {
         try {
             $row = Find-Element $Command ([System.Windows.Automation.ControlType]::Button)
             $provider = $null
             if ($row -and $row.Current.IsEnabled -and
                 $row.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$provider)) {
-                $provider
+                $provider.Invoke()
+                return $true
             }
-        } catch [System.Windows.Automation.ElementNotAvailableException] {
-            # A subsequent probe can read the replacement row.
+        } catch {
+            # Invoke on a retired WinUI provider can return either error.
+            $cause = $_.Exception.GetBaseException()
+            $retired = $cause -is [System.Windows.Automation.ElementNotAvailableException] -or
+                       ($cause -is [Runtime.InteropServices.COMException] -and $cause.HResult -eq -2147467259) # E_FAIL
+            if (!$retired) { throw }
         }
     }
-    $invoke.Invoke()
     $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
 }
 function Wait-Focus([int]$Pane) {
