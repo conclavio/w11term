@@ -97,6 +97,10 @@ Each entry’s `label` is its launch label and `title` is the application-report
 
 Each entry also has a `label` and `status`. Available sessions report `title`, `cols`, `rows`, `connection_generation`, and `prompt`. An unavailable session retains its IDs and flags and reports an `error`. Prompts expose public challenge metadata only. The connection generation increases after each new SSH login. `get-text.result` adds `generation`, `lines`, `text`, and `alternate_screen`. Screenshot replies contain `pane`, `generation`, absolute `path`, `width`, and `height` in pixels.
 
+Available SSH entries also report the current `ssh_connection` and
+`restart_token` using the same fields as `events`. One `list` request can
+show the lifecycle state of all SSH panes in a process.
+
 ## Live pane inspection
 
 `inspect --pane ID` reads the selected pane’s local terminal parser once. It works on background and read-only panes and preserves keyboard focus. During a synchronized update, `inspect` can already show the new modes while `get-text` still returns the last committed screen.

@@ -1,5 +1,8 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
-use crate::{session::Command, terminal::Snapshot};
+use crate::{
+    session::{Command, PaneDescription},
+    terminal::Snapshot,
+};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -228,6 +231,18 @@ impl Registry {
             .context("pane capture timed out")?
             .context("pane is closed")
     }
+
+    async fn describe_pane(pane: &Pane) -> Result<PaneDescription> {
+        let (reply, response) = oneshot::channel();
+        pane.input
+            .send(Command::DescribePane(reply))
+            .context("pane is closed")?;
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("pane description timed out")?
+            .context("pane is closed")
+    }
+
     pub async fn execute(&self, request: Request, capture_png: CapturePng) -> Result<Value> {
         match request {
             Request::Record { pane, path, timed } => {
@@ -405,15 +420,26 @@ impl Registry {
             Request::List => {
                 let mut sessions = Vec::new();
                 for (window_id, pane) in self.listing() {
-                    let mut session = match Self::capture(&pane).await {
-                        Ok((frame, size)) => json!({
-                            "title": frame.title,
-                            "status": frame.status,
-                            "cols": size.cols,
-                            "rows": size.rows,
-                            "prompt": frame.prompt,
-                            "connection_generation": frame.connection_generation,
-                        }),
+                    let mut session = match Self::describe_pane(&pane).await {
+                        Ok(PaneDescription {
+                            frame,
+                            restart_token,
+                            ssh_phase,
+                        }) => {
+                            let mut session = json!({
+                                "title": frame.title,
+                                "status": frame.status,
+                                "cols": frame.size.cols,
+                                "rows": frame.size.rows,
+                                "prompt": frame.prompt,
+                                "connection_generation": frame.connection_generation,
+                            });
+                            if let Some(phase) = ssh_phase {
+                                session["ssh_connection"] = phase.as_json();
+                                session["restart_token"] = json!(restart_token);
+                            }
+                            session
+                        }
                         Err(error) => {
                             json!({"status": "unavailable", "error": format!("{error:#}")})
                         }

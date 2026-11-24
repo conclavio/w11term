@@ -1,7 +1,7 @@
 use crate::{
     clipboard::{RemoteClipboardAccess, RemoteClipboardPolicy},
     demo,
-    events::ShellPrompt,
+    events::{ShellPrompt, SshConnectionPhase},
     options::{ColorScheme, Source},
     ssh,
     terminal::{self, FrameStore, Snapshot, TransportInput},
@@ -67,6 +67,7 @@ pub enum Command {
     Authenticate(crate::options::Authentication),
     Events(tokio::sync::oneshot::Sender<crate::events::Events>),
     Frames(tokio::sync::oneshot::Sender<FrameStore>),
+    DescribePane(tokio::sync::oneshot::Sender<PaneDescription>),
     Inspect(bool),
     /// One read of the live model and its connection generation, even between paints.
     ReadModes(tokio::sync::oneshot::Sender<(u64, terminal::TerminalModes)>),
@@ -242,6 +243,13 @@ impl Command {
             input: Box::new(input),
         }))
     }
+}
+
+#[derive(Debug)]
+pub struct PaneDescription {
+    pub(crate) frame: Arc<Snapshot>,
+    pub(crate) restart_token: Option<u64>,
+    pub(crate) ssh_phase: Option<SshConnectionPhase>,
 }
 
 pub struct Session {
@@ -1172,6 +1180,15 @@ async fn run(
                     Some(Command::Authenticate(auth))=>{launch.set_authentication(auth.clone());let _=writer.send(TransportInput::Authenticate(auth));Ok(())},
                     Some(Command::Events(reply))=>{let _=reply.send(events.clone());Ok(())},
                     Some(Command::Frames(reply))=>{let _=reply.send(live_frames.clone());Ok(())},
+                    Some(Command::DescribePane(reply)) => {
+                        let (restart_token, ssh_phase) = events.exit_snapshot();
+                        let _ = reply.send(PaneDescription {
+                            frame: live_frames.load(),
+                            restart_token,
+                            ssh_phase,
+                        });
+                        Ok(())
+                    }
                     Some(Command::Inspect(enabled))=>{
                         inspecting=enabled;
                         if !enabled { frames.set_inspection(None); }

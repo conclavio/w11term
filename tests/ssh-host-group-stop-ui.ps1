@@ -38,6 +38,10 @@ function Wait-Stopped([int]$Pane) {
         ($snapshot.journal.events | Where-Object kind -eq 'ssh-connection')) {
         throw 'Reading from the latest cursor lost the stopped phase or restart token, or repeated a transition'
     }
+    $listed = (Control @('list')).sessions | Where-Object id -eq $Pane
+    if ($listed.ssh_connection.phase -ne 'stopped' -or $listed.restart_token -ne $stopped.restart_token) {
+        throw 'The stopped pane in list disagreed with the phase or restart token reported by events'
+    }
 }
 
 $argsForApp = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
@@ -47,8 +51,10 @@ try {
     $null = Wait-Until 'the control pipe' {
         Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json")
     }
-    $demo = ((Control @('list')).sessions | Where-Object label -ceq 'Terminal lab').id
-    if ((Control @('events','--pane',"$demo")).PSObject.Properties.Name -contains 'ssh_connection') {
+    $demo = (Control @('list')).sessions | Where-Object label -ceq 'Terminal lab'
+    if (($demo.PSObject.Properties.Name -contains 'ssh_connection') -or
+        ($demo.PSObject.Properties.Name -contains 'restart_token') -or
+        ((Control @('events','--pane',"$($demo.id)")).PSObject.Properties.Name -contains 'ssh_connection')) {
         throw 'A non-SSH pane reported an SSH connection'
     }
     Run-Palette "Open SSH group${dot}Stop attempts"
@@ -90,6 +96,11 @@ try {
         (Find-Element "Pane $east${dot}Authentication required") -and !$state.restart_token -and
             $state.ssh_connection.phase -eq 'reconnecting' -and !$state.ssh_connection.attempt
     }
+    $listed = (Control @('list')).sessions | Where-Object id -eq $east
+    if ($listed.ssh_connection.phase -ne 'reconnecting' -or $listed.ssh_connection.attempt -or
+        ($listed.PSObject.Properties.Name -notcontains 'restart_token') -or $listed.restart_token) {
+        throw 'The restarted pane in list did not report a manual reconnect with an empty token'
+    }
     Run-Palette 'Stop pending SSH connections' -Enter
     Wait-Stopped $east
     Wait-Stopped $west
@@ -97,7 +108,9 @@ try {
 
     $null = Control @('send-text','--pane',"$live",'--no-paste','live-witness')
     $null = Control @('wait-for-text','--pane',"$live",'--timeout','10','live-witness')
-    if (((Control @('list')).sessions | Where-Object id -eq $live).connection_generation -ne $generation) {
+    $listed = (Control @('list')).sessions | Where-Object id -eq $live
+    if ($listed.connection_generation -ne $generation -or $listed.ssh_connection.phase -ne 'connected' -or
+        ($listed.PSObject.Properties.Name -notcontains 'restart_token') -or $listed.restart_token) {
         throw 'The stop action replaced the established shell'
     }
 } catch {
