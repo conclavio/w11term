@@ -29,21 +29,26 @@ function Field([string]$Name) {
     }
 }
 function Select-Fish {
-    $popup = Wait-Until 'shell syntax selector' {
-        $item = Find-Element 'Shell syntax' ([System.Windows.Automation.ControlType]::ComboBox)
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $listItem = [System.Windows.Automation.ControlType]::ListItem
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $choice = Wait-Until 'visible Fish option' {
+        $selector = Find-Element 'Shell syntax' $combo -Visible
+        $popup = $null
+        if (!$selector -or !$selector.TryGetCurrentPattern($expand, [ref]$popup)) { return }
+        if ($popup.Current.ExpandCollapseState -eq 'Collapsed') { $popup.Expand() }
+
+        $item = Find-Element 'Fish' $listItem -Visible
         $provider = $null
-        if ($item -and $item.TryGetCurrentPattern(
-                [System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$provider)) { $provider }
-    }
-    $popup.Expand()
-    $choice = Wait-Until 'Fish option' {
-        $item = Find-Element 'Fish' ([System.Windows.Automation.ControlType]::ListItem)
-        $provider = $null
-        if ($item -and !$item.Current.IsOffscreen -and $item.TryGetCurrentPattern(
-                [System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$provider)) { $provider }
+        if ($item -and $item.TryGetCurrentPattern($select, [ref]$provider)) { $provider }
     }
     $choice.Select()
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+
+    $selector = Find-Element 'Shell syntax' $combo -Visible
+    $popup = $null
+    if ($selector -and $selector.TryGetCurrentPattern($expand, [ref]$popup) -and
+        $popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 function Wait-SendResult {
     $null = Wait-Until 'export submission' { Find-Element "Submitted$dot$review" }
