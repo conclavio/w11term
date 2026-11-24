@@ -16,9 +16,17 @@ pub enum GroupReportFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {
     Scrollback(u64),
-    CommandOutput { pane: u64, command: u64 },
+    CommandOutput {
+        pane: u64,
+        command: u64,
+    },
     HostGroupResults(u64, GroupReportFormat),
     HostGroupShownOutput(u64),
+    HostGroupDiff {
+        submission: u64,
+        reference: u64,
+        selected: u64,
+    },
     SshHostList,
 }
 
@@ -30,6 +38,7 @@ impl Subject {
             Self::HostGroupResults(_, GroupReportFormat::Text) => "SSH group results".into(),
             Self::HostGroupResults(_, GroupReportFormat::Json) => "SSH group JSON results".into(),
             Self::HostGroupShownOutput(_) => "shown SSH group output".into(),
+            Self::HostGroupDiff { .. } => "SSH group differences".into(),
             Self::SshHostList => "SSH host list".into(),
         }
     }
@@ -51,6 +60,13 @@ impl Subject {
             Self::HostGroupShownOutput(submission) => file_picker::Purpose::GroupOutputExcerpt(
                 format!("ssh-group-output-excerpt-{submission}.txt"),
             ),
+            Self::HostGroupDiff {
+                submission,
+                reference,
+                selected,
+            } => file_picker::Purpose::GroupOutputDiff(format!(
+                "ssh-group-diff-{submission}-{reference}-to-{selected}.txt"
+            )),
             Self::SshHostList => file_picker::Purpose::SshHostList,
         }
     }

@@ -564,6 +564,19 @@ try {
             (Find-Element "Removed line 1${dot}west live first") -and
             (Find-Element "Added line 1${dot}east-accepted both")
     }
+    Click ('Save full differences' + [char]0x2026)
+    $dialog = Wait-Until 'owned output difference save dialog' { Find-OwnedDialog 'Save SSH group differences' }
+    $null = Wait-Until 'save the full output difference' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $diffPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR "ssh-group-diff-2-$west-to-$east.txt"
+    $null = Wait-Until 'the saved difference preserves the manual reference and changed lines' {
+        if ([IO.File]::Exists($diffPath)) {
+            $diff = [IO.File]::ReadAllText($diffPath, [Text.UTF8Encoding]::new($false, $true))
+            $diff.StartsWith("Submitted${dot}both`r`nReference${dot}$westName${dot}Exit 17`r`nSelected${dot}$eastName${dot}Exit 0`r`n") -and
+                $diff.Contains("Removed line 1${dot}west live first`r`n") -and
+                $diff.Contains("Removed line 4${dot}west-accepted both`r`n") -and
+                $diff.Contains("Added line 1${dot}east-accepted both`r`n")
+        }
+    }
     Click 'Back to comparison'
     Click 'Use largest group'
     $null = Wait-Until 'automatic selection restores the largest reference group' {

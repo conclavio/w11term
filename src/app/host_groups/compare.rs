@@ -17,6 +17,9 @@ pub enum Action {
         pane: u64,
     },
     CloseDiff,
+    SaveDiff {
+        revision: u64,
+    },
     SetReference {
         revision: u64,
         pane: Option<u64>,
@@ -388,6 +391,9 @@ impl TerminalApp {
                     open.diff = None;
                 }
             }
+            Action::SaveDiff { revision } => {
+                self.save_group_diff(id, submission_id, revision, ctx);
+            }
             Action::DiffReady { revision, result } => {
                 if let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
                     && page.comparison.revision == revision
@@ -558,7 +564,13 @@ impl TerminalApp {
         let action =
             move |action| Message::HostGroup(super::Action::Compare(id, submission_id, action));
         if let Some(diff) = &open.diff {
-            return Some(diff.view(submission.content.label(), action, ctx));
+            return Some(diff.view(
+                submission.content.label(),
+                page.comparison.revision,
+                self.export.pending.is_none(),
+                action,
+                ctx,
+            ));
         }
         let mut rows = Vec::new();
         let mut reset_reference = View::empty();
