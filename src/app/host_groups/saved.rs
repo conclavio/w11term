@@ -674,6 +674,7 @@ impl TerminalApp {
         self.open_group_child_window(
             WindowGroup {
                 name: name.into(),
+                profiles: expected.to_vec(),
                 members,
             },
             ctx,
@@ -686,7 +687,6 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         let id = self.new_host_group_tab(Some(&group.name));
-        let members: Vec<_> = group.members.iter().map(|(name, _)| name.clone()).collect();
         self.start_host_group_panes(
             id,
             BTreeSet::new(),
@@ -701,9 +701,13 @@ impl TerminalApp {
         self.remember_group_launch(
             id,
             &group.name,
-            &members,
-            true,
-            format!("Opened {} SSH panes for {}", members.len(), group.name),
+            &group.profiles,
+            group.members.len() == group.profiles.len(),
+            format!(
+                "Opened {} SSH panes for {}",
+                group.members.len(),
+                group.name
+            ),
         );
     }
 

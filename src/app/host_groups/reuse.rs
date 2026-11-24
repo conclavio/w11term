@@ -223,6 +223,25 @@ impl Review {
         }
         Ok(())
     }
+
+    fn window_members(&self, catalog: &Profiles) -> Result<Vec<(String, SshOptions)>> {
+        self.validate_profiles(catalog)?;
+        self.members
+            .iter()
+            .filter(|member| member.included)
+            .map(|member| {
+                ensure!(
+                    member.choice.is_none(),
+                    "Choose new panes for all included hosts to open a new window."
+                );
+                let options = member
+                    .options
+                    .clone()
+                    .context("The reviewed SSH profile is unavailable")?;
+                Ok((member.profile.clone(), options))
+            })
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -294,7 +313,7 @@ pub enum Change {
     IncludeMatches(Vec<usize>, MatchSelection),
     ChooseMatches(Vec<usize>, ConnectionSelection),
     RecipientSet(String),
-    Approve(Vec<Launch>, Option<String>),
+    Approve(Vec<Launch>, Option<String>, LaunchLocation),
     Export(Vec<Launch>, Option<String>),
     BeginSaveSet,
     BeginUpdateSet,
@@ -308,6 +327,12 @@ pub enum Change {
     BackFromSet,
     Refresh,
     Back,
+}
+
+#[derive(Clone, Copy)]
+pub enum LaunchLocation {
+    Tab,
+    Window,
 }
 
 #[derive(Clone, Copy)]
@@ -445,6 +470,8 @@ impl State {
         let selected_set = review.selected_set.clone();
         let export_offer = offered.clone();
         let export_set = selected_set.clone();
+        let window_offer = offered.clone();
+        let window_set = selected_set.clone();
         let set_names: Vec<_> = review
             .sets
             .iter()
@@ -634,6 +661,7 @@ impl State {
                                         action(Change::Approve(
                                             offered.clone(),
                                             selected_set.clone(),
+                                            LaunchLocation::Tab,
                                         ))
                                     }))
                                     .content("Open reviewed group"),
@@ -652,6 +680,30 @@ impl State {
                                 Button::new()
                                     .on_click(ctx.callback(move |_| action(Change::Back)))
                                     .content("Cancel"),
+                            )),
+                        StackPanel::new()
+                            .spacing(8.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                Button::new()
+                                    .is_enabled(reuse == 0 && new > 0)
+                                    .on_click(ctx.callback(move |_| {
+                                        action(Change::Approve(
+                                            window_offer.clone(),
+                                            window_set.clone(),
+                                            LaunchLocation::Window,
+                                        ))
+                                    }))
+                                    .content("Open reviewed group in new window"),
+                                if reuse == 0 {
+                                    View::empty()
+                                } else {
+                                    TextBlock::new()
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .text("Choose new panes for all included hosts to open a new window.")
+                                        .text_wrapping(TextWrapping::Wrap)
+                                        .into()
+                                },
                             )),
                         if filtered {
                             StackPanel::new()
@@ -1151,10 +1203,14 @@ impl TerminalApp {
                     }
                 }
             }
-            Change::Approve(offered, set)
+            Change::Approve(offered, set, location)
                 if review.choices() == offered && review.selected_set == set =>
             {
-                if let Err(error) = self.open_group_reusing_connections(id, ctx)
+                let result = match location {
+                    LaunchLocation::Tab => self.open_group_reusing_connections(id, ctx),
+                    LaunchLocation::Window => self.open_reviewed_group_window(id, ctx),
+                };
+                if let Err(error) = result
                     && let Some(page) = self.host_group_mut(id)
                     && let Some(review) = page.saved.reuse.review.as_mut()
                 {
@@ -1503,6 +1559,40 @@ impl TerminalApp {
         };
         self.start_host_group_panes(id, reused, fresh, PaneLaunch::Select, ctx);
         self.remember_group_launch(id, &name, &profiles, skipped == 0, feedback);
+        Ok(())
+    }
+
+    fn open_reviewed_group_window(
+        &mut self,
+        source_tab: TabId,
+        ctx: &ComponentContext<Self>,
+    ) -> Result<()> {
+        let Some(Page::HostGroup(page)) = self.tabs.get(source_tab).map(|tab| &tab.page) else {
+            return Ok(());
+        };
+        let Some(review) = page.saved.reuse.review.as_deref() else {
+            return Ok(());
+        };
+        let previous = page.saved.reuse.return_to;
+        let name = review.name.clone();
+        let profiles = review.profiles();
+        let catalog = self.load_expected_host_group(&name, &profiles)?;
+        let members = review.window_members(&catalog)?;
+        self.open_group_child_window(
+            WindowGroup {
+                name,
+                profiles,
+                members,
+            },
+            ctx,
+        )?;
+        self.use_group_catalog(catalog);
+        if let Some(previous) = previous {
+            self.tabs.select(previous);
+            self.close_tab(source_tab, ctx);
+        } else if let Some(page) = self.host_group_mut(source_tab) {
+            page.saved.reuse.review = None;
+        }
         Ok(())
     }
 }

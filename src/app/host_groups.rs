@@ -93,6 +93,7 @@ enum PaneLaunch {
 
 pub(super) struct WindowGroup {
     pub(super) name: String,
+    pub(super) profiles: Vec<String>,
     pub(super) members: Vec<(String, SshOptions)>,
 }
 

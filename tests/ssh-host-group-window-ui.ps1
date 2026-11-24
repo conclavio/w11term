@@ -9,6 +9,14 @@ $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
 $portByName = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
 $dot = ' ' + [char]0xb7 + ' '
+$button = [System.Windows.Automation.ControlType]::Button
+
+function Click-TestButton([string]$Name) {
+    Invoke-Button (Wait-Until "enabled '$Name'" {
+        $item = Find-Element $Name $button
+        if ($item -and $item.Current.IsEnabled) { $item }
+    })
+}
 
 function Close-TestWindow([IntPtr]$Hwnd) {
     if ([FixtureDialog]::Windows($app.Id) -notcontains $Hwnd -or
@@ -75,6 +83,54 @@ try {
     $east = ($origin | Where-Object label -ceq 'East').id
     $null = Control @('send-text','--pane',"$east",'--no-paste','origin-still-live')
     $null = Control @('wait-for-text','--pane',"$east",'--timeout','15','origin-still-live')
+
+    Run-Palette "Review SSH recipient set${dot}Fleet${dot}Canary" -Enter
+    $openSubset = 'Open reviewed group in new window'
+    $null = Wait-Until 'the review keeps the live connection choice' {
+        $item = Find-Element $openSubset $button
+        $item -and !$item.Current.IsEnabled -and (Find-Element "1 to reuse${dot}0 to open${dot}1 skipped")
+    }
+    Click-TestButton 'Use new panes for matches'
+    $null = Wait-Until 'the Canary review is ready to open one fresh pane' {
+        Find-Element "0 to reuse${dot}1 to open${dot}1 skipped"
+    }
+    $before = [IO.File]::ReadAllBytes($profiles)
+    $changed = [Text.Encoding]::UTF8.GetString($before) | ConvertFrom-Json
+    $changed.ssh_recipient_sets.Fleet.Canary = @('West')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click-TestButton $openSubset
+    $null = Wait-Until 'a stale recipient set is refused before opening a window' {
+        Find-Element 'Recipient set Canary changed. Refresh the review before continuing.'
+    }
+    if (@((Control @('list')).sessions).Count -ne 3) { throw 'The stale review opened a session' }
+    [IO.File]::WriteAllBytes($profiles, $before)
+    Click-TestButton $openSubset
+    $subset = Wait-Until 'only the included profile opens in a separate window' {
+        $all = @((Control @('list')).sessions)
+        $extra = @($all | Where-Object window_id -ne $originId)
+        if ($all.Count -eq 4 -and $extra.Count -eq 1 -and $extra[0].label -ceq 'East') { $extra[0] }
+    }
+    $null = Control @('wait-for-text','--pane',"$($subset.id)",'--timeout','15','ready')
+    $subsetHwnd = Wait-Until 'the reviewed window has its own native handle' {
+        [FixtureDialog]::Windows($app.Id) | Where-Object {
+            $_ -ne $originHwnd -and [FixtureDialog]::GetWindow($_, 4) -eq [IntPtr]::Zero
+        } | Select-Object -First 1
+    }
+    $window = $subsetHwnd
+    $null = Wait-CheckBox "East${dot}test@127.0.0.1:$($portByName.East.port)${dot}Pane $($subset.id)" On
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($subsetHwnd)
+    $update = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::NameProperty, ('Update saved group' + [char]0x2026))
+    if ($root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $update)) {
+        throw 'The partial roster offered to replace saved group membership'
+    }
+    Close-TestWindow $subsetHwnd
+    $window = $originHwnd
+    $null = Wait-Until 'closing the reviewed window restores the unchanged source roster' {
+        (Find-Element 'Open group in new window' $button) -and
+            !(Find-Element 'Find launch profiles' ([System.Windows.Automation.ControlType]::Edit)) -and
+            (@((Control @('list')).sessions).id | Sort-Object) -join ',' -ceq (($origin.id | Sort-Object) -join ',')
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

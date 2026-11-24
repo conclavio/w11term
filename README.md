@@ -193,6 +193,8 @@ Use **Choose local profile…** on an imported member to map it to a differently
 
 Choose **Open group in new window** to keep the roster and its fresh SSH panes together in a separate window. The new window uses the group’s saved roster defaults.
 
+To open just a subset or a recipient set in its own window, use **Review group launch…** and choose new panes for the included hosts. **Open reviewed group in new window** rechecks the review before connecting. A partial roster keeps the saved group’s full membership available for future launches.
+
 When creating or editing a group, filter by profile name or SSH address. **Check matches** and **Uncheck matches** apply to every matching profile across pages. **Move up** and **Move down** change a checked profile’s position in the full group. Fresh tabs open in the saved order.
 
 Group tabs keep their own drafts, filters, host selections, and results. A named tab shows the panes opened for that group and panes added with **Import host list…**. Turn on **Show all window SSH panes** to include other connections in the roster. Turning it off clears checks on those other panes. **New SSH group tab** opens an independent window-wide roster with an empty selection. **SSH host group** returns to the most recently used group tab.

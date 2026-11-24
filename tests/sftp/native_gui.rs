@@ -1455,26 +1455,28 @@ async fn native_saved_ssh_group_opens_in_an_independent_window() {
     let state = tempfile::tempdir().unwrap();
     let mut peers = Vec::new();
     let mut profiles = serde_json::Map::new();
-    for name in ["East", "West"] {
-        let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, 2).await else {
+    for (name, count) in [("East", 3), ("West", 2)] {
+        let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, count).await
+        else {
             unreachable!()
         };
         profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
-        peers.push((root, opens, server));
+        peers.push((root, opens, server, count));
     }
     fs::write(
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({
             "profiles": profiles,
             "ssh_host_groups": {"Fleet":["West","East"]},
+            "ssh_recipient_sets": {"Fleet":{"Canary":["East"]}},
             "ssh_host_group_defaults": {"Fleet":{"require_all_ready":true}}
         }))
         .unwrap(),
     )
     .unwrap();
     drive_gui("ssh-host-group-window-ui.ps1", state.path());
-    for (_, opens, server) in peers {
-        assert_eq!(opens.load(Ordering::Relaxed), 2);
+    for (_, opens, server, count) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), count);
         server.abort();
     }
 }
