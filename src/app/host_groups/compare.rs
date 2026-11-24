@@ -2,6 +2,8 @@ use super::*;
 use std::{cmp::Reverse, collections::HashMap};
 use wezterm_term::CompletedCommand;
 
+mod diff;
+
 const PREVIEW_BYTES: usize = 1024;
 const PREVIEW_LINES: usize = 6;
 
@@ -10,6 +12,15 @@ pub enum Action {
     Refresh,
     Back,
     PrepareFollowUp(FollowUp),
+    OpenDiff {
+        revision: u64,
+        pane: u64,
+    },
+    CloseDiff,
+    DiffReady {
+        revision: u64,
+        result: Result<diff::Difference, &'static str>,
+    },
     Ready {
         revision: u64,
         comparison: Result<Comparison, &'static str>,
@@ -26,6 +37,7 @@ struct Open {
     submission: u64,
     comparison: Option<Result<Comparison, &'static str>>,
     feedback: Option<&'static str>,
+    diff: Option<diff::Panel>,
 }
 
 impl State {
@@ -63,6 +75,7 @@ struct Group {
     size: usize,
     preview: String,
     note: Option<String>,
+    output: report::Output,
 }
 
 impl Group {
@@ -84,6 +97,7 @@ pub struct FollowUp {
 
 pub struct Comparison {
     compared: usize,
+    reference: Option<u64>,
     groups: Vec<Group>,
     unavailable: Vec<Unavailable>,
 }
@@ -170,6 +184,7 @@ impl Comparison {
             .enumerate()
             .max_by_key(|(index, items)| (items.len(), Reverse(*index)))
             .map(|(index, _)| index);
+        let reference = baseline.map(|index| samples[grouped[index][0]].member.pane);
         let mut groups = Vec::with_capacity(grouped.len());
         for (index, members) in grouped.iter().enumerate() {
             let sample = &samples[members[0]];
@@ -195,14 +210,22 @@ impl Comparison {
                 size: text.len(),
                 preview: preview(text),
                 note,
+                output: sample.output.clone(),
             });
         }
         groups.sort_by_key(|group| group.members.len());
         Self {
             compared,
+            reference,
             groups,
             unavailable,
         }
+    }
+
+    fn group(&self, pane: u64) -> Option<&Group> {
+        self.groups
+            .iter()
+            .find(|group| group.members[0].pane == pane)
     }
 
     fn caption(&self) -> String {
@@ -307,6 +330,27 @@ impl TerminalApp {
                     page.prepare_comparison_follow_up(submission_id, offer, &roster);
                 }
             }
+            Action::OpenDiff { revision, pane } => {
+                self.open_group_diff(id, submission_id, revision, pane, ctx);
+            }
+            Action::CloseDiff => {
+                if let Some(page) = self.host_group_mut(id)
+                    && let Some(open) = page.comparison.open.as_mut()
+                    && open.submission == submission_id
+                {
+                    open.diff = None;
+                }
+            }
+            Action::DiffReady { revision, result } => {
+                if let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
+                    && page.comparison.revision == revision
+                    && let Some(open) = &mut page.comparison.open
+                    && open.submission == submission_id
+                    && let Some(diff) = &mut open.diff
+                {
+                    diff.result = Some(result);
+                }
+            }
             Action::Ready {
                 revision,
                 comparison,
@@ -355,6 +399,7 @@ impl TerminalApp {
             submission: submission_id,
             comparison: None,
             feedback: None,
+            diff: None,
         }));
         let revision = state.revision;
         let ready = move |comparison| {
@@ -391,20 +436,38 @@ impl TerminalApp {
         let submission = page.viewed_submission(submission_id)?;
         let action =
             move |action| Message::HostGroup(super::Action::Compare(id, submission_id, action));
+        if let Some(diff) = &open.diff {
+            return Some(diff.view(submission.content.label(), action, ctx));
+        }
         let mut rows = Vec::new();
         let status = match &open.comparison {
             Some(Ok(comparison)) => {
                 let targets = self.host_group_targets();
                 let visible = page.visible_comparison_addresses(&targets);
                 for group in &comparison.groups {
+                    let pane = group.members[0].pane;
+                    let revision = page.comparison.revision;
+                    let difference = if comparison
+                        .reference
+                        .is_some_and(|reference| reference != pane)
+                    {
+                        Button::new()
+                            .automation_name(format!("View differences for pane {pane}"))
+                            .on_click(
+                                ctx.callback(move |_| action(Action::OpenDiff { revision, pane })),
+                            )
+                            .content("View differences")
+                    } else {
+                        View::empty()
+                    };
                     let follow_up = submission.content.command().map(|_| FollowUp {
-                        revision: page.comparison.revision,
-                        group: group.members[0].pane,
+                        revision,
+                        group: pane,
                         panes: group.visible_members(&visible),
                     });
                     rows.push(KeyedView::new(
-                        format!("group-{}", group.members[0].pane),
-                        self.comparison_group(id, submission_id, group, follow_up, ctx),
+                        format!("group-{pane}"),
+                        self.comparison_group(id, submission_id, group, follow_up, difference, ctx),
                     ));
                 }
                 if !comparison.unavailable.is_empty() {
@@ -476,6 +539,7 @@ impl TerminalApp {
         submission: u64,
         group: &Group,
         follow_up: Option<FollowUp>,
+        difference: View,
         ctx: &ViewContext<Self>,
     ) -> View {
         let count = group.members.len();
@@ -542,6 +606,7 @@ impl TerminalApp {
                     }))
                     .content("View full output")
             }),
+            difference,
             follow_up,
             StackPanel::new().spacing(3.0).keyed_children(members),
         ))
@@ -618,6 +683,7 @@ mod tests {
                 submission: 1,
                 comparison: Some(Ok(Comparison::build(samples, Vec::new()))),
                 feedback: None,
+                diff: None,
             })),
         };
         let offer = FollowUp {

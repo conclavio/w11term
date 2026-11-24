@@ -537,6 +537,15 @@ try {
         (Find-Element "First different line from largest group${dot}1") -and
         (Find-Element "View comparison output for pane $west" $button)
     }
+    Click "View differences for pane $west"
+    $null = Wait-Until 'the difference shows changes with the original host labels and exit codes' {
+        (Find-Element 'SSH group output differences') -and
+            (Find-Element "Reference${dot}$eastName${dot}Exit 0") -and
+            (Find-Element "Selected${dot}$westName${dot}Exit 17") -and
+            (Find-Element "Removed line 1${dot}east-accepted both") -and
+            (Find-Element "Added line 1${dot}west live first")
+    }
+    Click 'Back to comparison'
     Click "View comparison output for pane $west"
     $null = Wait-Until 'comparison links to the exact West command history entry' {
         Find-Element "Selected, both${dot}exit 17" $button
