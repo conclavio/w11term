@@ -1,4 +1,4 @@
-use super::{GroupExecution, Inbox};
+use super::{GroupExecution, GroupOutput, Inbox};
 use regex::Regex;
 use serde::Serialize;
 use std::{
@@ -30,7 +30,19 @@ struct Transcript {
     active_hosts: usize,
     dispatch_finished: bool,
     completion_notice: Option<CompletionNotice>,
-    output_alert: Option<GroupOutputAlert>,
+    output_alert: Option<ArmedOutputAlert>,
+}
+
+#[derive(Debug)]
+struct ArmedOutputAlert {
+    alert: GroupOutputAlert,
+    incomplete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupOutputAlertTrigger {
+    Match,
+    Missing,
 }
 
 #[derive(Debug)]
@@ -50,6 +62,7 @@ pub struct GroupOutputAlertRule {
     pub regex: bool,
     pub match_case: bool,
     pub host: Option<String>,
+    pub trigger: GroupOutputAlertTrigger,
 }
 
 #[derive(Debug)]
@@ -178,6 +191,12 @@ struct HostRecord {
 }
 
 impl HostRecord {
+    fn confirmed_output(&self) -> bool {
+        self.receipt.acknowledged()
+            && matches!(&self.execution, Some(GroupExecution::Finished(result))
+                if matches!(&result.output, GroupOutput::Captured { .. }))
+    }
+
     fn succeeded(&self) -> bool {
         matches!(self.outcome(), GroupRecordingOutcome::Sent(Some(GroupExecution::Finished(result)))
             if result.exit_code == Some(0))
@@ -486,13 +505,16 @@ impl GroupTranscript {
 
     pub fn output_alert_rule(&self) -> Option<Arc<GroupOutputAlertRule>> {
         let transcript = self.0.lock().unwrap();
-        Some(transcript.output_alert.as_ref()?.rule.clone())
+        Some(transcript.output_alert.as_ref()?.alert.rule.clone())
     }
 
     pub fn arm_output_alert(&self, alert: GroupOutputAlert) {
         let mut transcript = self.0.lock().unwrap();
         if !transcript.settled() && transcript.output_alert.is_none() && !alert.hosts.is_empty() {
-            transcript.output_alert = Some(alert);
+            transcript.output_alert = Some(ArmedOutputAlert {
+                alert,
+                incomplete: false,
+            });
         }
     }
 
@@ -609,7 +631,20 @@ impl GroupTranscript {
             return;
         }
         transcript.output_watch = None;
-        transcript.output_alert = None;
+        let unresolved_alert = transcript.output_alert.take().and_then(|armed| {
+            let alert = armed.alert;
+            if alert.rule.trigger != GroupOutputAlertTrigger::Missing {
+                return None;
+            }
+            let confirmed = !armed.incomplete
+                && transcript
+                    .hosts
+                    .iter()
+                    .filter(|host| alert.hosts.contains_key(&host.pane) && host.confirmed_output())
+                    .count()
+                    == alert.hosts.len();
+            Some((alert, confirmed))
+        });
         if transcript
             .recording
             .as_ref()
@@ -617,7 +652,7 @@ impl GroupTranscript {
         {
             transcript.finish_recording(GroupRecordingEnd::Settled);
         }
-        if let Some(notice) = transcript.completion_notice.take() {
+        let completion = transcript.completion_notice.take().map(|notice| {
             let succeeded = transcript
                 .hosts
                 .iter()
@@ -629,7 +664,19 @@ impl GroupTranscript {
                 .filter(|host| host.skipped())
                 .count();
             let attention = transcript.hosts.len() - succeeded - skipped;
-            drop(transcript);
+            (notice, succeeded, attention, skipped)
+        });
+        drop(transcript);
+        if let Some((alert, confirmed)) = unresolved_alert {
+            alert.inbox.group_output_unmatched(
+                alert.tab,
+                alert.submission,
+                &alert.source,
+                &alert.rule.query,
+                confirmed,
+            );
+        }
+        if let Some((notice, succeeded, attention, skipped)) = completion {
             notice.inbox.group_finished(
                 notice.tab,
                 notice.submission,
@@ -692,6 +739,11 @@ impl GroupTranscriptHost {
         let mut transcript = self.transcript.0.lock().unwrap();
         let elapsed_ms = transcript.queue_activity.elapsed_ms(Instant::now());
         if batch.gap {
+            if let Some(armed) = transcript.output_alert.as_mut()
+                && armed.alert.hosts.contains_key(&self.pane)
+            {
+                armed.incomplete = true;
+            }
             transcript.push(
                 self.pane,
                 elapsed_ms,
@@ -703,7 +755,7 @@ impl GroupTranscriptHost {
         for line in batch.lines {
             transcript.push(self.pane, elapsed_ms, line.text, line.shortened);
             if matched.is_none() {
-                matched = transcript.take_matching_alert();
+                matched = transcript.observe_alert_line();
             }
         }
         drop(transcript);
@@ -720,14 +772,22 @@ impl GroupTranscriptHost {
 }
 
 impl Transcript {
-    fn take_matching_alert(&mut self) -> Option<(GroupOutputAlert, GroupTranscriptLine)> {
-        let alert = self.output_alert.as_ref()?;
+    fn observe_alert_line(&mut self) -> Option<(GroupOutputAlert, GroupTranscriptLine)> {
+        let armed = self.output_alert.as_mut()?;
         let line = self.history.combined.snapshot.lines.back()?;
-        if alert.hosts.contains_key(&line.pane) && alert.pattern.is_match(&line.text) {
-            Some((self.output_alert.take().unwrap(), line.clone()))
-        } else {
-            None
+        if !armed.alert.hosts.contains_key(&line.pane) {
+            return None;
         }
+        let missing = armed.alert.rule.trigger == GroupOutputAlertTrigger::Missing;
+        if missing && line.shortened {
+            armed.incomplete = true;
+            return None;
+        }
+        if !armed.alert.pattern.is_match(&line.text) {
+            return None;
+        }
+        let alert = self.output_alert.take().unwrap().alert;
+        (!missing).then(|| (alert, line.clone()))
     }
 
     fn settled(&self) -> bool {
@@ -824,6 +884,7 @@ mod tests {
                 regex: true,
                 match_case: true,
                 host: None,
+                trigger: GroupOutputAlertTrigger::Match,
             }),
         });
         let (_recording, mut stream) = group
@@ -872,6 +933,108 @@ mod tests {
     }
 
     #[test]
+    fn missing_output_alert_distinguishes_no_match_from_incomplete_output() {
+        let pattern = Regex::new("^ready$").unwrap();
+        let rule = Arc::new(GroupOutputAlertRule {
+            query: "^ready$".into(),
+            regex: true,
+            match_case: true,
+            host: None,
+            trigger: GroupOutputAlertTrigger::Missing,
+        });
+        for (text, shortened, gap, finished, status) in [
+            ("ready", false, false, false, None),
+            (
+                "starting",
+                false,
+                false,
+                true,
+                Some("Expected output missing · ^ready$"),
+            ),
+            (
+                "starting",
+                false,
+                true,
+                true,
+                Some("Could not verify expected output · ^ready$"),
+            ),
+            (
+                "ready",
+                true,
+                false,
+                true,
+                Some("Could not verify expected output · ^ready$"),
+            ),
+            (
+                "starting",
+                false,
+                false,
+                false,
+                Some("Could not verify expected output · ^ready$"),
+            ),
+        ] {
+            let inbox = Inbox::new(|| {});
+            let group = GroupTranscript::default();
+            group.arm_output_alert(GroupOutputAlert {
+                inbox: inbox.clone(),
+                tab: 2,
+                submission: 9,
+                source: "Fleet".into(),
+                hosts: BTreeMap::from([(1, "East".into()), (2, "West".into())]),
+                pattern: pattern.clone(),
+                rule: rule.clone(),
+            });
+            let east = group.host(1);
+            let west = group.host(2);
+            group.finish_dispatch();
+            let complete = GroupExecution::Finished(Arc::new(GroupCommandResult {
+                link: CommandLink {
+                    generation: 1,
+                    id: 1,
+                },
+                exit_code: Some(0),
+                duration: std::time::Duration::ZERO,
+                output: GroupOutput::Captured {
+                    text: String::new(),
+                    truncated: false,
+                },
+            }));
+            east.delivery_receipt().acknowledge();
+            east.set_execution(&complete);
+            west.delivery_receipt().acknowledge();
+            west.set_execution(if finished {
+                &complete
+            } else {
+                &GroupExecution::PromptReturned
+            });
+            east.append(LiveOutputBatch {
+                lines: vec![LiveOutputLine {
+                    text: text.into(),
+                    shortened,
+                }],
+                gap,
+            });
+            drop(east);
+            assert!(inbox.rows().is_empty());
+            drop(west);
+            group.finish_dispatch();
+            let rows = inbox.rows();
+            assert_eq!(rows.len(), usize::from(status.is_some()));
+            if let Some(status) = status {
+                assert_eq!(rows[0].message, status);
+                assert_eq!(
+                    rows[0].target,
+                    NoticeTarget::GroupOutputMissing {
+                        tab: 2,
+                        submission: 9
+                    }
+                );
+            }
+            assert!(group.output_alert_rule().is_none());
+        }
+    }
+
+    #[test]
     fn output_alert_consumes_the_first_new_line_from_its_host_scope() {
         let inbox = Inbox::new(|| {});
         let group = GroupTranscript::default();
@@ -891,6 +1054,7 @@ mod tests {
                     regex: true,
                     match_case: true,
                     host: Some("West".into()),
+                    trigger: GroupOutputAlertTrigger::Match,
                 }),
             });
         };

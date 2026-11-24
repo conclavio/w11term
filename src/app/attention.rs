@@ -132,6 +132,7 @@ impl TerminalApp {
             Action::VisitGroup(target) => match target {
                 NoticeTarget::GroupRun { tab, submission }
                 | NoticeTarget::GroupCanary { tab, submission }
+                | NoticeTarget::GroupOutputMissing { tab, submission }
                 | NoticeTarget::GroupOutput {
                     tab, submission, ..
                 } if self.group_run_retained(tab, submission)
@@ -273,13 +274,16 @@ impl TerminalApp {
                         target @ (NoticeTarget::GroupRun { tab, .. }
                         | NoticeTarget::GroupCanary { tab, .. }
                         | NoticeTarget::GroupOutput { tab, .. }
+                        | NoticeTarget::GroupOutputMissing { tab, .. }
                         | NoticeTarget::GroupLogins { tab, .. }) => {
                             let (enabled, detail, key) = match target {
                                 NoticeTarget::GroupRun { submission, .. }
                                 | NoticeTarget::GroupCanary { submission, .. }
+                                | NoticeTarget::GroupOutputMissing { submission, .. }
                                 | NoticeTarget::GroupOutput { submission, .. } => {
                                     let key = match target {
                                         NoticeTarget::GroupCanary { .. } => format!("group-canary-{tab}/{submission}"),
+                                        NoticeTarget::GroupOutputMissing { .. } => format!("group-output-missing-{tab}/{submission}"),
                                         NoticeTarget::GroupOutput { line_id, .. } => {
                                             format!("group-output-{tab}/{submission}/{line_id}")
                                         }

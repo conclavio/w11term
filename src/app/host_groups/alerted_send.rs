@@ -1,7 +1,7 @@
 use super::*;
 use live_output::OutputSearch;
 use regex::Regex;
-use w11term::events::{GroupOutputAlert, GroupOutputAlertRule};
+use w11term::events::{GroupOutputAlert, GroupOutputAlertRule, GroupOutputAlertTrigger};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -13,6 +13,7 @@ struct Review {
     offer: CommandOffer,
     search: OutputSearch,
     record: bool,
+    missing: bool,
 }
 
 pub(super) struct Alert {
@@ -26,6 +27,7 @@ pub enum Action {
     Regex(bool),
     MatchCase(bool),
     Record(bool),
+    Missing(bool),
     Presets(alert_rule_presets::Action),
     Confirm,
     Cancel,
@@ -107,6 +109,12 @@ impl State {
                         }),
                         search.preset_view(move |action| send(Action::Presets(action)), ctx),
                         CheckBox::new()
+                            .is_checked(review.missing)
+                            .on_is_checked_changed(
+                                ctx.callback(move |on| send(Action::Missing(on))),
+                            )
+                            .content("Alert if expected output is missing"),
+                        CheckBox::new()
                             .is_checked(review.record)
                             .on_is_checked_changed(ctx.callback(move |on| send(Action::Record(on))))
                             .content("Record full output"),
@@ -172,6 +180,7 @@ impl TerminalApp {
                         offer,
                         search: OutputSearch::default(),
                         record: false,
+                        missing: false,
                     }));
                 }
             }
@@ -198,6 +207,7 @@ impl TerminalApp {
                         search.configure(search.query.clone(), search.regex, on)
                     }
                     Action::Record(on) => review.record = on,
+                    Action::Missing(on) => review.missing = on,
                     Action::Presets(action) => search.update_presets(action),
                     _ => {}
                 }
@@ -216,8 +226,13 @@ impl TerminalApp {
         else {
             return;
         };
+        let trigger = if review.missing {
+            GroupOutputAlertTrigger::Missing
+        } else {
+            GroupOutputAlertTrigger::Match
+        };
         let alert = Alert {
-            rule: review.search.alert_rule(None),
+            rule: review.search.alert_rule(None, trigger),
             pattern: review
                 .search
                 .matcher

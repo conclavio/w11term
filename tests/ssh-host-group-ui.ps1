@@ -1911,6 +1911,30 @@ try {
         $outcomes[-1] -cne '[Group run settled]') {
         throw "The recording footer omitted the rejected host: $($outcomes -join ' | ')"
     }
+    Set-HostFilter 'east'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-Until 'the missing-output check has only East in scope' {
+        Find-Element 'Send to 1 host' $button
+    }
+    (Command-Editor).SetValue('check-expected')
+    Click $alertedSend
+    (Command-Editor $alertSearch).SetValue('ready marker')
+    (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()
+    $null = Wait-CheckBox 'Alert if expected output is missing' On
+    Click 'Send with alert'
+    $null = Wait-Until 'the verified run reports a missing match only after settling' {
+        (Find-Element "Submitted${dot}check-expected") -and
+            (Find-Element "$eastName${dot}Exit 0") -and (Find-Element 'Attention inbox, 1 unread' $button)
+    }
+    Click 'Attention inbox, 1 unread'
+    $missingRun = $burstRunId + 2
+    Click "Unread${dot}SSH host group${dot}Run $missingRun${dot}Expected output missing${dot}ready marker"
+    $null = Wait-Until 'the missing-output notice opens the settled run and marks it read' {
+        (Find-Element "Submitted${dot}check-expected") -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Click 'Previous submission'
+    $null = Wait-Until 'return to the partially delivered recording' { Find-Element "Submitted${dot}record-one" }
+    Wait-RecordingStatus 'Saved live output to ' $withheldPath
     try {
         $explorer = New-Object -ComObject Shell.Application
         $priorExplorerWindows = @($explorer.Windows() | ForEach-Object { $_.HWND })

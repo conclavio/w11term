@@ -3,8 +3,8 @@ use regex::Regex;
 use std::{collections::BTreeMap, fmt::Write as _, io::Write as _};
 use w11term::{
     events::{
-        GroupCompletionState, GroupOutputAlert, GroupOutputAlertRule, GroupTranscriptHistory,
-        GroupTranscriptLine, GroupTranscriptSnapshot,
+        GroupCompletionState, GroupOutputAlert, GroupOutputAlertRule, GroupOutputAlertTrigger,
+        GroupTranscriptHistory, GroupTranscriptLine, GroupTranscriptSnapshot,
     },
     saved_output_rules::compile_query,
 };
@@ -114,12 +114,17 @@ impl OutputSearch {
         self.matcher.as_ref()?.as_ref().err().map(String::as_str)
     }
 
-    pub(super) fn alert_rule(&self, host: Option<String>) -> Arc<GroupOutputAlertRule> {
+    pub(super) fn alert_rule(
+        &self,
+        host: Option<String>,
+        trigger: GroupOutputAlertTrigger,
+    ) -> Arc<GroupOutputAlertRule> {
         Arc::new(GroupOutputAlertRule {
             query: self.query.clone(),
             regex: self.regex,
             match_case: self.sensitive,
             host,
+            trigger,
         })
     }
 }
@@ -298,9 +303,15 @@ pub(super) fn armed_alert_view(
         "Ignore case"
     };
     let host = rule.host.as_deref().unwrap_or("All output hosts");
+    let trigger = match rule.trigger {
+        GroupOutputAlertTrigger::Match => "",
+        GroupOutputAlertTrigger::Missing => " · Missing match at settlement",
+    };
     StackPanel::new().spacing(4.0).children((
         TextBlock::new()
-            .text(format!("Output alert armed · {mode} · {case} · {host}"))
+            .text(format!(
+                "Output alert armed · {mode} · {case} · {host}{trigger}"
+            ))
             .text_wrapping(TextWrapping::Wrap),
         Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
@@ -510,9 +521,10 @@ impl TerminalApp {
             source: label.clone(),
             hosts,
             pattern: pattern.clone(),
-            rule: filter
-                .search
-                .alert_rule(filter.host.as_ref().map(|host| host.label.clone())),
+            rule: filter.search.alert_rule(
+                filter.host.as_ref().map(|host| host.label.clone()),
+                GroupOutputAlertTrigger::Match,
+            ),
         });
     }
 

@@ -27,6 +27,10 @@ pub enum NoticeTarget {
         pane: u64,
         line_id: u64,
     },
+    GroupOutputMissing {
+        tab: u64,
+        submission: u64,
+    },
     GroupLogins {
         tab: u64,
         sequence: u64,
@@ -242,6 +246,35 @@ impl Inbox {
                 pane: line.pane,
                 line_id: line.id,
             },
+            display_field(source).into(),
+            message,
+            None,
+            None,
+            true,
+        );
+    }
+
+    pub(super) fn group_output_unmatched(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        query: &str,
+        confirmed: bool,
+    ) {
+        let status = if confirmed {
+            "Expected output missing"
+        } else {
+            "Could not verify expected output"
+        };
+        let query = display_field(query);
+        let message = if query.is_empty() {
+            status.into()
+        } else {
+            format!("{status} · {query}")
+        };
+        self.push(
+            NoticeTarget::GroupOutputMissing { tab, submission },
             display_field(source).into(),
             message,
             None,
