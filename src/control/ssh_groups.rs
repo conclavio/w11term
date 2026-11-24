@@ -22,6 +22,15 @@ pub(super) struct GroupOutputQuery {
     pub(super) timeout: Duration,
 }
 
+pub(super) struct GroupOutputFollow {
+    pub(super) window: WindowId,
+    pub(super) tab: u64,
+    pub(super) run: u64,
+    pub(super) pane: Option<u64>,
+    pub(super) after_line: Option<u64>,
+    pub(super) timeout_seconds: u64,
+}
+
 pub(super) fn output_pattern(query: &str, regex: bool, match_case: bool) -> Result<Regex> {
     ensure!(!query.is_empty(), "search text is empty");
     ensure!(
@@ -262,6 +271,123 @@ impl Registry {
             }
             bail!("SSH group run settled without a matching output line")
         }).await.context("wait-ssh-group-output timed out before a match")?
+    }
+
+    pub(super) async fn follow_ssh_group_output(
+        &self,
+        pipe: &mut NamedPipeServer,
+        follow: GroupOutputFollow,
+    ) -> Result<()> {
+        let GroupOutputFollow {
+            window,
+            tab,
+            run,
+            pane,
+            after_line,
+            timeout_seconds,
+        } = follow;
+        if !(1..=3600).contains(&timeout_seconds) {
+            return write_reply(
+                pipe,
+                Err(anyhow::anyhow!(
+                    "SSH group follow timeout must be 1..=3600 seconds"
+                )),
+            )
+            .await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+        let timeout = || anyhow::anyhow!("follow-ssh-group-output timed out before settlement");
+        let captured = tokio::time::timeout_at(
+            deadline,
+            self.read_ssh_group_output(window, tab, run, pane, true),
+        )
+        .await
+        .map_err(|_| timeout())
+        .and_then(|captured| captured);
+        let SshGroupOutput {
+            output,
+            hosts,
+            retained,
+        } = match captured {
+            Ok(captured) => captured,
+            Err(error) => return write_reply(pipe, Err(error)).await,
+        };
+        if let Err(error) = check_cursor(after_line, output.latest_line) {
+            return write_reply(pipe, Err(error)).await;
+        }
+        let cursor = after_line.unwrap_or(0);
+        if cursor < output.evicted_through {
+            if after_line.is_some() {
+                return write_reply(pipe, Err(anyhow::anyhow!(
+                    "SSH group output history after cursor {cursor} is incomplete through line {}", output.evicted_through
+                ))).await;
+            }
+            write_reply(
+                pipe,
+                Ok(json!({
+                    "kind": "gap", "window_id": window, "tab_id": tab, "run_id": run,
+                    "pane_id": pane, "evicted_through": output.evicted_through,
+                })),
+            )
+            .await?;
+        }
+        let event = |line: &GroupTranscriptLine| {
+            let (label, address) = hosts.get(&line.pane)?;
+            (line.id > cursor).then(|| {
+                json!({
+                    "kind": "line", "window_id": window, "tab_id": tab, "run_id": run,
+                    "line": describe_output_line(line, label, address),
+                })
+            })
+        };
+        for line in output.history.lines.iter().filter_map(event) {
+            if Instant::now() >= deadline {
+                return write_reply(pipe, Err(timeout())).await;
+            }
+            write_reply(pipe, Ok(line)).await?;
+        }
+        let mut next_after_line = output.latest_line;
+        if let (Some(mut incoming), Some(mut retained)) = (output.incoming, retained) {
+            let mut disconnect = [0];
+            loop {
+                let received = tokio::select! {
+                    _ = pipe.read(&mut disconnect) => return Ok(()),
+                    _ = retained.changed() => {
+                        return write_reply(pipe, Err(anyhow::anyhow!(
+                            "SSH group run {run} is no longer retained in tab {tab} of window {window}"
+                        ))).await;
+                    }
+                    received = tokio::time::timeout_at(deadline, incoming.recv()) => received,
+                };
+                match received {
+                    Ok(Ok(line)) => {
+                        next_after_line = line.id;
+                        if let Some(line) = event(&line) {
+                            write_reply(pipe, Ok(line)).await?;
+                        }
+                    }
+                    Ok(Err(RecvError::Closed)) => break,
+                    Ok(Err(RecvError::Lagged(missed))) => {
+                        return write_reply(
+                            pipe,
+                            Err(anyhow::anyhow!(
+                                "SSH group output follow fell behind and missed {missed} lines"
+                            )),
+                        )
+                        .await;
+                    }
+                    Err(_) => return write_reply(pipe, Err(timeout())).await,
+                }
+            }
+        }
+        write_reply(
+            pipe,
+            Ok(json!({
+                "kind": "settled", "window_id": window, "tab_id": tab, "run_id": run,
+                "pane_id": pane, "next_after_line": next_after_line,
+            })),
+        )
+        .await
     }
 }
 

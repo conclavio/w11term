@@ -1,7 +1,10 @@
-//! Console companion: stdout always contains exactly one JSON reply (including errors).
+//! Console companion for JSON control replies and JSON Lines output streams.
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{io::Read, path::PathBuf};
+use std::{
+    io::{Read, Write},
+    path::PathBuf,
+};
 use w11term::control::{self, Reply, Request};
 #[path = "w11term-cli/automation.rs"]
 mod automation;
@@ -42,6 +45,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "wait-ssh-group-run"
             | "wait-ssh-group-output"
             | "get-ssh-group-output"
+            | "follow-ssh-group-output"
             | "wait-ssh-group-ready"
                 if verb.is_none() =>
             {
@@ -162,6 +166,29 @@ async fn main() {
         })
     } else {
         match parse(args) {
+            Ok((pid, request @ Request::FollowSshGroupOutput { .. })) => {
+                match control::follow(pid, &request, |reply| {
+                    let mut stdout = std::io::stdout().lock();
+                    let bytes = serde_json::to_vec(reply)?;
+                    stdout.write_all(&bytes)?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                    Ok(())
+                })
+                .await
+                {
+                    Ok(true) => return,
+                    Ok(false) => std::process::exit(1),
+                    Err(error)
+                        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            error.kind() == std::io::ErrorKind::BrokenPipe
+                        }) =>
+                    {
+                        return;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             Ok((pid, request)) => control::call(pid, &request).await,
             Err(e) => Err(e),
         }
@@ -290,6 +317,8 @@ mod tests {
             "get-ssh-group-output --window 2 --tab 3 --run 4 --limit 129",
             "get-ssh-group-output --window 2 --tab 3 --run 4 --limit 1 --limit 2",
             "get-ssh-group-output --window 2 --tab 3 --run 4 unexpected",
+            "follow-ssh-group-output --window 2 --tab 3 --run 4 --timeout 0",
+            "follow-ssh-group-output --window 2 --tab 3 --run 4 --limit 1",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }
@@ -297,6 +326,12 @@ mod tests {
             parse_line("get-ssh-group-output --window 11 --tab 12 --run 4 --pane 8 --after-line 5 --limit 16").unwrap(),
             (None, Request::GetSshGroupOutput {
                 window_id: 11, tab_id: 12, run_id: 4, pane: Some(8), after_line: Some(5), limit: 16
+            })
+        ));
+        assert!(matches!(
+            parse_line("follow-ssh-group-output --window 11 --tab 12 --run 4 --pane 8 --after-line 5 --timeout 60").unwrap(),
+            (None, Request::FollowSshGroupOutput {
+                window_id: 11, tab_id: 12, run_id: 4, pane: Some(8), after_line: Some(5), timeout_seconds: 60
             })
         ));
     }

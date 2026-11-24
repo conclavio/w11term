@@ -1,6 +1,6 @@
 # External control
 
-Build both executables with `cargo build --release --bins`. `w11term.exe` is the GUI; `w11term-cli.exe` is its console companion. The CLI writes one JSON reply to stdout and exits with code 1 on errors. It never starts a GUI or a fallback server.
+Build both executables with `cargo build --release --bins`. `w11term.exe` is the GUI and `w11term-cli.exe` is its console companion. The CLI connects to an existing instance, writes JSON to stdout, and exits with code 1 on errors. Commands use one reply, while `follow-ssh-group-output` emits JSON Lines.
 
 Launch directly into a remote session with a known cell box:
 
@@ -73,7 +73,7 @@ Each GUI owns `\\.\pipe\w11term-<pid>` and publishes `%LOCALAPPDATA%\w11term\ins
 
 The pipe accepts only the process's Windows user and SYSTEM, and rejects remote clients. Treat access as permission to type into that user's SSH and local sessions and save screenshots with that user's filesystem permissions. Discovery records are removed on normal exit; stale records from a crash are ignored when the pipe cannot be opened.
 
-Open a new pipe connection for each command. Write one UTF-8 JSON object followed by LF; read one JSON reply followed by LF. Maximum request size is 2 MiB; at most eight requests run concurrently. The initial read and reply write time out after ten seconds. Input/snapshot requests have a ten-second execution timeout; the CLI allows thirty seconds for a reply to accommodate rendering.
+Open a new pipe connection for each command. Write one UTF-8 JSON object followed by LF. Replies are UTF-8 JSON objects followed by LF. `follow-ssh-group-output` sends a sequence of replies on the same connection. Maximum request size is 2 MiB. The server allows eight ordinary requests and sixteen waits or followers concurrently. The initial read and each reply write time out after ten seconds. Input and snapshot requests have a ten-second execution timeout, and the CLI allows thirty seconds for a reply to accommodate rendering.
 
 ```json
 {"verb":"list"}
@@ -279,6 +279,22 @@ command. It also includes these fields.
 Pass `next_after_line` to the same read command until `has_more` is false.
 You can then use that cursor in a wait command for the next marker.
 
+`follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]`
+emits retained and live output from one run over a single pipe connection.
+Each line of stdout is a standard JSON reply with the window, tab, and run
+IDs. A successful stream can include these records.
+
+- `kind: "line"` includes the same `line` object as the wait command.
+- `kind: "gap"` precedes available lines if the beginning of the selected feed was evicted and no cursor was supplied. It includes `pane_id` and `evicted_through`.
+- `kind: "settled"` is the last success record. It includes `pane_id` and `next_after_line`, the newest captured run line considered by the stream.
+
+Supplying a cursor requires complete retained output after that cursor.
+A missing interval, retired run, stream overrun, or timeout ends the stream
+with an error reply and exit code 1. The timeout defaults to 30 seconds
+and accepts 1 through 3600. Closing the pipe ends the subscription. A
+settled record describes the end of output tracking. Read the run result
+for recipient exit statuses.
+
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
@@ -288,6 +304,7 @@ w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --regex '^ready for traffic$'
 w11term-cli --pid 12345 get-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --limit 20
+w11term-cli --pid 12345 follow-ssh-group-output --window 1 --tab 9 --run 3 --after-line 42 --timeout 120
 ```
 
 Direct pipe clients use these JSON requests.
@@ -301,6 +318,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"pattern":"^ready for traffic$","regex":true}
 {"verb":"get-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"limit":20}
+{"verb":"follow-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"after_line":42,"timeout_seconds":120}
 ```
 
 ## Waiting, geometry, tabs, and events

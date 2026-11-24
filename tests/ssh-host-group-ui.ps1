@@ -176,6 +176,8 @@ $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $readyJob = $null
 $outputJob = $null
+$followJob = $null
+$followReader = $null
 $logReader = $null
 $explorer = $null
 $priorExplorerWindows = @()
@@ -416,6 +418,10 @@ try {
     if ($westReading.settled -or $westReading.gap -or $westReading.has_more -or
         $westReading.next_after_line -lt $westPrior.line.line_id) {
         throw 'Reading the live feed did not provide a cursor for the next line'
+    }
+    $quietFollow = & $Cli --pid $app.Id follow-ssh-group-output --window $groupWindow --tab $groupTab --run 2 --pane $west --after-line $westReading.next_after_line --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $quietFollow.ok -or $quietFollow.error -notlike '*timed out before settlement*') {
+        throw 'A quiet output stream did not return a terminal timeout record'
     }
     $future = & $Cli --pid $app.Id @outputWait --after-line 999999 'west while' | ConvertFrom-Json
     if ($LASTEXITCODE -eq 0 -or $future.ok -or $future.error -notlike '*ahead of the latest line*') {
@@ -1570,7 +1576,37 @@ try {
     }
     Click "Focus pane $west"
     Wait-Focus $west
+    $followPath = Join-Path $State 'follow-burst.jsonl'
+    $followArgs = @('--pid',"$($app.Id)",'follow-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$burstRunId",'--after-line','0','--timeout','30')
+    $followJob = Start-Process -FilePath $Cli -ArgumentList $followArgs -NoNewWindow -PassThru -RedirectStandardOutput $followPath
+    $followReader = Open-PeerTraceReader $followPath
+    $null = Wait-Until 'the follower flushes retained East lines while West is held' {
+        $text = [Text.Encoding]::UTF8.GetString((Read-PeerTrace $followReader))
+        $text.Contains('"text":"east record row 79"') -and !$followJob.HasExited
+    }
+    $followForeground = [FixtureMessages]::GetForegroundWindow()
     [IO.File]::WriteAllText((Join-Path $State 'release-record-fast'), '')
+    if (!$followJob.WaitForExit(10000)) { throw 'The output follower did not finish after settlement' }
+    $followReader.Dispose()
+    $followReader = $null
+    $stream = @([IO.File]::ReadAllLines($followPath) | ForEach-Object { $_ | ConvertFrom-Json })
+    if ($stream.Count -lt 162 -or $stream[-1].result.kind -cne 'settled' -or
+        @($stream | Where-Object { !$_.ok -or $_.result.run_id -ne $burstRunId }).Count -or
+        [FixtureMessages]::GetForegroundWindow() -ne $followForeground) {
+        throw 'The output follower lost records, changed focus, or missed settlement'
+    }
+    $streamedLines = @($stream | Where-Object { $_.result.kind -ceq 'line' } | ForEach-Object { $_.result.line })
+    $cursor = 0
+    foreach ($line in $streamedLines) {
+        if ($line.line_id -ne ($cursor + 1)) { throw 'The output follower repeated or skipped a line ID' }
+        $cursor = $line.line_id
+    }
+    if ($stream[-1].result.next_after_line -ne $cursor -or
+        $streamedLines[-1].text -cne 'west record tail' -or $streamedLines[-1].pane_id -ne $west) {
+        throw 'The output follower omitted the last live line or its cursor'
+    }
+    Wait-Focus $west
     $null = Wait-Until 'the recording ends automatically with the terminal tab focused' {
         [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains('[Group run settled]')
     }
@@ -1614,6 +1650,18 @@ try {
         $page.next_after_line -ne $page.lines[1].line_id -or
         $page.next_after_line -ge $page.latest_line) {
         throw 'Reading the combined output did not report its gap and first page'
+    }
+    $replay = @(& $Cli --pid $app.Id follow-ssh-group-output --window $groupWindow --tab $groupTab --run $burstRunId |
+        ForEach-Object { $_ | ConvertFrom-Json })
+    if ($LASTEXITCODE -ne 0 -or $replay[0].result.kind -cne 'gap' -or
+        $replay[0].result.evicted_through -ne $page.evicted_through -or
+        $replay[1].result.line.line_id -ne $page.lines[0].line_id -or
+        $replay[-1].result.kind -cne 'settled' -or $replay[-1].result.next_after_line -ne $page.latest_line) {
+        throw 'Following a settled run did not report the history gap and replay the retained lines'
+    }
+    $strictFollow = & $Cli --pid $app.Id follow-ssh-group-output --window $groupWindow --tab $groupTab --run $burstRunId --after-line 0 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $strictFollow.ok -or $strictFollow.error -notlike '*incomplete through line*') {
+        throw 'Following from a missing cursor did not fail before sending history'
     }
     $nextPage = Control ($burstRead + @('--after-line',"$($page.next_after_line)",'--limit','2'))
     if ($nextPage.gap -or !$nextPage.has_more -or $nextPage.lines.Count -ne 2 -or
@@ -1724,6 +1772,11 @@ try {
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
+    if ($followReader) { $followReader.Dispose() }
+    if ($followJob) {
+        if (!$followJob.HasExited) { $followJob.Kill(); $followJob.WaitForExit() }
+        $followJob.Dispose()
+    }
     if ($outputJob) {
         if (!$outputJob.HasExited) { $outputJob.Kill(); $outputJob.WaitForExit() }
         $outputJob.Dispose()
