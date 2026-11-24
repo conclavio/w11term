@@ -354,6 +354,37 @@ impl ProfileStore {
         })
     }
 
+    pub fn rename_ssh_recipient_set(
+        &self,
+        group: &str,
+        expected_group: &[String],
+        name: &str,
+        expected: &[String],
+        new_name: &str,
+    ) -> Result<Profiles> {
+        validate_recipient_set_name(new_name)?;
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.ssh_host_groups.get(group).map(Vec::as_slice) == Some(expected_group),
+                "The SSH group changed on disk. Reopen the group before editing recipient sets."
+            );
+            let mut groups = catalog.ssh_recipient_sets.clone();
+            let sets = groups.entry(group.to_owned()).or_default();
+            let available = !sets.contains_key(new_name);
+            let members = sets
+                .remove(name)
+                .filter(|members| available && members.as_slice() == expected)
+                .context(
+                    "This name is already in use or the recipient set changed. Reopen recipient sets.",
+                )?;
+            sets.insert(new_name.to_owned(), members);
+            Ok(CatalogEdit {
+                ssh_recipient_sets: Some(groups),
+                ..Default::default()
+            })
+        })
+    }
+
     /// Save a recipient set and recheck the launch review under the catalog write lock.
     pub fn save_reviewed_ssh_recipient_set(
         &self,
@@ -376,13 +407,7 @@ impl ProfileStore {
         replacement: Option<&[String]>,
         verify: impl FnOnce(&Profiles) -> Result<()>,
     ) -> Result<Profiles> {
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 128
-                && name == name.trim()
-                && !name.chars().any(char::is_control),
-            "Enter a recipient set name on one line and within 128 bytes"
-        );
+        validate_recipient_set_name(name)?;
         self.modify(|_, catalog| {
             ensure!(
                 catalog.ssh_host_groups.get(group).map(Vec::as_slice) == Some(expected_group),
@@ -923,6 +948,17 @@ impl ProfileStore {
     }
 }
 
+fn validate_recipient_set_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 128
+            && name == name.trim()
+            && !name.chars().any(char::is_control),
+        "Enter a recipient set name on one line and within 128 bytes"
+    );
+    Ok(())
+}
+
 fn recipient_sets_after_group_edit(
     catalog: &Profiles,
     old: &str,
@@ -1216,6 +1252,43 @@ mod tests {
         );
         store.delete_ssh_host_group("Renamed", &updated).unwrap();
         assert!(other.catalog().unwrap().ssh_recipient_sets.is_empty());
+    }
+
+    #[test]
+    fn rename_recipient_set_preserves_order_and_rejects_stale_membership_or_a_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{
+            "East":{"host":"east.test","user":"ops","auth":"none"},
+            "West":{"host":"west.test","user":"ops","auth":"none"}
+        },"ssh_host_groups":{"Fleet":["East","West"]},
+          "ssh_recipient_sets":{"Fleet":{"Canary":["West","East"],"Reserved":["East"]}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path).unwrap();
+        let group = ["East".into(), "West".into()];
+        let members = ["West".into(), "East".into()];
+        for (expected_group, expected, new_name) in [
+            (group.as_slice(), group.as_slice(), "Pilots"),
+            (members.as_slice(), members.as_slice(), "Pilots"),
+            (group.as_slice(), members.as_slice(), "Reserved"),
+        ] {
+            assert!(
+                store
+                    .rename_ssh_recipient_set("Fleet", expected_group, "Canary", expected, new_name)
+                    .is_err()
+            );
+        }
+        let catalog = store
+            .rename_ssh_recipient_set("Fleet", &group, "Canary", &members, "Pilots")
+            .unwrap();
+        let sets = &catalog.ssh_recipient_sets["Fleet"];
+        assert!(!sets.contains_key("Canary"));
+        assert_eq!(sets["Pilots"], members);
+        assert_eq!(sets["Reserved"], ["East"]);
+        assert_eq!(catalog.ssh_host_groups["Fleet"], group);
     }
 }
 

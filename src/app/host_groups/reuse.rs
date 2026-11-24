@@ -238,6 +238,25 @@ pub(super) struct State {
 enum SetEditor {
     New(String),
     Update(Option<String>),
+    Manage(ManageSet),
+}
+
+#[derive(Default)]
+struct ManageSet {
+    selected: Option<String>,
+    name: String,
+    confirm_delete: bool,
+}
+
+impl ManageSet {
+    fn rename_target(&self, review: &Review) -> Option<&str> {
+        let name = self.name.trim();
+        (self.selected.is_some()
+            && !self.confirm_delete
+            && !name.is_empty()
+            && !review.sets.contains_key(name))
+        .then_some(name)
+    }
 }
 
 impl SetEditor {
@@ -279,9 +298,13 @@ pub enum Change {
     Export(Vec<Launch>, Option<String>),
     BeginSaveSet,
     BeginUpdateSet,
+    BeginManageSets,
     SetName(String),
     SetTarget(String),
     SaveSet(String),
+    RenameSet { from: String, to: String },
+    ConfirmDeleteSet(String),
+    DeleteSet(String),
     BackFromSet,
     Refresh,
     Back,
@@ -561,6 +584,7 @@ impl State {
                                     ComboBox::new()
                                         .automation_name("Launch recipient set")
                                         .placeholder_text("Choose a recipient set")
+                                        .max_width(240.0)
                                         .items_source(set_names.clone())
                                         .selected_index(selected)
                                         .on_selection_changed(ctx.callback(
@@ -588,6 +612,15 @@ impl State {
                                             ctx.callback(move |_| action(Change::BeginUpdateSet)),
                                         )
                                         .content("Update recipient set…")
+                                },
+                                if review.sets.is_empty() {
+                                    View::empty()
+                                } else {
+                                    Button::new()
+                                        .on_click(
+                                            ctx.callback(move |_| action(Change::BeginManageSets)),
+                                        )
+                                        .content("Manage sets…")
                                 },
                             )),
                         StackPanel::new()
@@ -692,6 +725,31 @@ impl State {
     }
 }
 
+fn existing_set_picker(
+    review: &Review,
+    selected: Option<&str>,
+    action: impl Fn(Change) -> Message + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let names: Vec<_> = review.sets.keys().cloned().collect();
+    let index = names
+        .iter()
+        .position(|name| Some(name.as_str()) == selected);
+    ComboBox::new()
+        .automation_name("Existing recipient set")
+        .placeholder_text("Choose a recipient set")
+        .items_source(names.clone())
+        .selected_index(index)
+        .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+            index
+                .and_then(|index| names.get(index))
+                .map_or(Message::ControlIdle, |name| {
+                    action(Change::SetTarget(name.clone()))
+                })
+        }))
+        .into()
+}
+
 fn save_set_view(
     review: &Review,
     editor: &SetEditor,
@@ -716,25 +774,9 @@ fn save_set_view(
         ),
         SetEditor::Update(selected) => {
             let previous = selected.as_ref().and_then(|name| review.sets.get(name));
-            let names: Vec<_> = review.sets.keys().cloned().collect();
-            let index = names
-                .iter()
-                .position(|name| Some(name) == selected.as_ref());
             (
                 "Update recipient set",
-                ComboBox::new()
-                    .automation_name("Existing recipient set")
-                    .placeholder_text("Choose a recipient set")
-                    .items_source(names.clone())
-                    .selected_index(index)
-                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                        index
-                            .and_then(|index| names.get(index))
-                            .map_or(Message::ControlIdle, |name| {
-                                action(Change::SetTarget(name.clone()))
-                            })
-                    }))
-                    .into(),
+                existing_set_picker(review, selected.as_deref(), action, ctx),
                 previous,
                 if previous.is_some() && editor.target(review).is_none() {
                     "The included profiles already match this set."
@@ -743,6 +785,7 @@ fn save_set_view(
                 },
             )
         }
+        SetEditor::Manage(editor) => return manage_set_view(review, editor, action, ctx),
     };
     let feedback = if review.feedback.is_empty() {
         hint
@@ -824,6 +867,96 @@ fn save_set_view(
                         .is_text_selection_enabled(true)
                         .text_wrapping(TextWrapping::Wrap),
                 )),
+            ),
+        ))
+}
+
+fn manage_set_view(
+    review: &Review,
+    editor: &ManageSet,
+    action: impl Fn(Change) -> Message + Copy + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let selected = editor.selected.as_deref();
+    let rename = selected.zip(editor.rename_target(review));
+    let rename = rename.map(|(from, to)| (from.to_owned(), to.to_owned()));
+    let can_rename = rename.is_some();
+    let delete = editor.selected.clone();
+    let confirm_delete = editor.confirm_delete;
+    let feedback = if !review.feedback.is_empty() {
+        review.feedback.clone()
+    } else if let Some(name) = selected.filter(|_| confirm_delete) {
+        format!("Delete recipient set {name}? Your current launch choices will stay selected.")
+    } else if review.sets.contains_key(editor.name.trim()) {
+        "A recipient set with this name already exists.".to_owned()
+    } else {
+        String::new()
+    };
+    let profiles = selected
+        .and_then(|name| review.sets.get(name))
+        .map(|names| names.join("\n"))
+        .unwrap_or_default();
+    Grid::new()
+        .margin(16.0)
+        .row_spacing(8.0)
+        .rows([GridLength::Auto, GridLength::STAR])
+        .children((
+            StackPanel::new().spacing(8.0).children((
+                TextBlock::new()
+                    .font_size(24.0)
+                    .text(format!("Manage recipient sets · {}", review.name)),
+                existing_set_picker(review, selected, action, ctx),
+                TextBox::new()
+                    .automation_name("New recipient set name")
+                    .placeholder_text("New recipient set name")
+                    .is_enabled(selected.is_some())
+                    .text(&editor.name)
+                    .on_text_changed(ctx.callback(move |name| action(Change::SetName(name)))),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .is_enabled(can_rename)
+                            .on_click(ctx.callback(move |_| {
+                                rename.as_ref().map_or(Message::ControlIdle, |(from, to)| {
+                                    action(Change::RenameSet {
+                                        from: from.clone(),
+                                        to: to.clone(),
+                                    })
+                                })
+                            }))
+                            .content("Rename recipient set"),
+                        Button::new()
+                            .is_enabled(selected.is_some())
+                            .on_click(ctx.callback(move |_| {
+                                delete.as_ref().map_or(Message::ControlIdle, |name| {
+                                    action(if confirm_delete {
+                                        Change::DeleteSet(name.clone())
+                                    } else {
+                                        Change::ConfirmDeleteSet(name.clone())
+                                    })
+                                })
+                            }))
+                            .content(if confirm_delete {
+                                "Confirm delete recipient set"
+                            } else {
+                                "Delete recipient set"
+                            }),
+                        Button::new()
+                            .on_click(ctx.callback(move |_| action(Change::BackFromSet)))
+                            .content("Back to launch review"),
+                    )),
+                TextBlock::new()
+                    .text(feedback)
+                    .text_wrapping(TextWrapping::Wrap),
+            )),
+            ScrollViewer::new().grid_row(1).content(
+                TextBlock::new()
+                    .automation_name("Recipient set profiles")
+                    .text(profiles)
+                    .is_text_selection_enabled(true)
+                    .text_wrapping(TextWrapping::Wrap),
             ),
         ))
 }
@@ -1043,15 +1176,20 @@ impl TerminalApp {
                     }
                 }
             }
-            change @ (Change::BeginSaveSet | Change::BeginUpdateSet)
-                if review.included_profiles().next().is_some() =>
-            {
-                let editor = if matches!(change, Change::BeginSaveSet) {
-                    SetEditor::New(String::new())
-                } else if !review.sets.is_empty() {
-                    SetEditor::Update(review.selected_set.clone())
-                } else {
-                    return;
+            change @ (Change::BeginSaveSet | Change::BeginUpdateSet | Change::BeginManageSets) => {
+                let has_included = review.included_profiles().next().is_some();
+                let editor = match change {
+                    Change::BeginSaveSet if has_included => SetEditor::New(String::new()),
+                    Change::BeginUpdateSet if has_included && !review.sets.is_empty() => {
+                        SetEditor::Update(review.selected_set.clone())
+                    }
+                    Change::BeginManageSets if !review.sets.is_empty() => {
+                        SetEditor::Manage(ManageSet {
+                            selected: review.selected_set.clone(),
+                            ..Default::default()
+                        })
+                    }
+                    _ => return,
                 };
                 if let Some(page) = self.host_group_mut(id) {
                     let state = &mut page.saved.reuse;
@@ -1075,16 +1213,94 @@ impl TerminalApp {
             return;
         };
         match change {
-            Change::SetName(text) if let SetEditor::New(name) = editor => {
-                *name = text;
+            Change::SetName(text) => match editor {
+                SetEditor::New(name) => {
+                    *name = text;
+                    review.feedback.clear();
+                }
+                SetEditor::Manage(edit) if edit.name != text => {
+                    edit.name = text;
+                    edit.confirm_delete = false;
+                    review.feedback.clear();
+                }
+                _ => {}
+            },
+            Change::SetTarget(name) if review.sets.contains_key(&name) => match editor {
+                SetEditor::Update(selected) => {
+                    *selected = Some(name);
+                    review.feedback.clear();
+                }
+                SetEditor::Manage(edit) if edit.selected.as_ref() != Some(&name) => {
+                    *edit = ManageSet {
+                        selected: Some(name),
+                        ..Default::default()
+                    };
+                    review.feedback.clear();
+                }
+                _ => {}
+            },
+            Change::ConfirmDeleteSet(name)
+                if let SetEditor::Manage(edit) = editor
+                    && edit.selected.as_ref() == Some(&name) =>
+            {
+                edit.confirm_delete = true;
                 review.feedback.clear();
             }
-            Change::SetTarget(name)
-                if review.sets.contains_key(&name)
-                    && let SetEditor::Update(selected) = editor =>
+            change @ (Change::RenameSet { .. } | Change::DeleteSet(_))
+                if let SetEditor::Manage(edit) = editor =>
             {
-                *selected = Some(name);
-                review.feedback.clear();
+                let (name, rename) = match change {
+                    Change::RenameSet { from, to } if edit.rename_target(review) == Some(&to) => {
+                        (from, Some(to))
+                    }
+                    Change::DeleteSet(name) if edit.confirm_delete => (name, None),
+                    _ => return,
+                };
+                let Some(expected) = review.sets.get(&name) else {
+                    return;
+                };
+                if edit.selected.as_ref() != Some(&name) {
+                    return;
+                }
+                let group = &review.name;
+                let group_members = review.profiles();
+                let saved = if let Some(new_name) = &rename {
+                    self.store.rename_ssh_recipient_set(
+                        group,
+                        &group_members,
+                        &name,
+                        expected,
+                        new_name,
+                    )
+                } else {
+                    self.store.change_ssh_recipient_set(
+                        group,
+                        &group_members,
+                        &name,
+                        Some(expected),
+                        None,
+                    )
+                };
+                match saved {
+                    Ok(catalog) => {
+                        if review.selected_set.as_ref() == Some(&name) {
+                            review.selected_set = rename.clone();
+                        }
+                        // Keep the reviewed membership of every other set for stale checks.
+                        let members = review.sets.remove(&name);
+                        review.feedback = if let Some((new_name, members)) = rename.zip(members) {
+                            let feedback = format!("Renamed recipient set {name} to {new_name}");
+                            review.sets.insert(new_name, members);
+                            feedback
+                        } else {
+                            format!("Deleted recipient set {name}")
+                        };
+                        state.set_editor = None;
+                        state.revision += 1;
+                        self.use_group_catalog(catalog);
+                    }
+                    Err(error) => review.feedback = format!("{error:#}"),
+                }
             }
             Change::BackFromSet => {
                 state.set_editor = None;

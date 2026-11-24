@@ -289,6 +289,37 @@ try {
     if (($sets.'Fleet Lab'.'Before connect' -join ',') -cne 'North' -or @((Control @('list')).sessions).Count -ne 1) {
         throw 'Updating the preset saved the wrong hosts or opened an SSH session'
     }
+    $manageSets = 'Manage sets' + [char]0x2026
+    Click $manageSets
+    Expect-Choice 'Existing recipient set' 'Before connect'
+    (Field 'New recipient set name').SetValue('North pilot')
+    Click 'Rename recipient set'
+    $null = Wait-Until 'the reviewed set is renamed' { Find-Element 'Renamed recipient set Before connect to North pilot' }
+    Expect-Choice 'Launch recipient set' 'North pilot'
+    Expect-Field 'Find launch profiles' 'NORTH'
+    $null = Wait-CheckBox 'Include profile North' On
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if ($sets.'Fleet Lab'.'Before connect' -or ($sets.'Fleet Lab'.'North pilot' -join ',') -cne 'North') {
+        throw 'Renaming the recipient set altered its members or left the old name'
+    }
+    Click 'Cancel'
+    Wait-Focus $origin
+    Open-GroupCommandSearch 'review fleet lab north pilot'
+    Accept-GroupCommandWithEnter "Review SSH recipient set${dot}Fleet Lab${dot}North pilot"
+    Expect-Choice 'Launch recipient set' 'North pilot'
+    (Field 'Find launch profiles').SetValue('NORTH')
+    $null = Wait-CheckBox 'Include profile North' On
+    Click $manageSets
+    Click 'Delete recipient set'
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if (!$sets.'Fleet Lab'.'North pilot') { throw 'The set was deleted before confirmation' }
+    Click 'Confirm delete recipient set'
+    $null = Wait-Until 'the selected set is deleted' { Find-Element 'Deleted recipient set North pilot' }
+    $null = Wait-CheckBox 'Include profile North' On
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if ($sets.'Fleet Lab'.'North pilot' -or @((Control @('list')).sessions).Count -ne 1) {
+        throw 'Deleting the preset left the saved name or opened an SSH session'
+    }
     Click 'Cancel'
     Wait-Focus $origin
 
