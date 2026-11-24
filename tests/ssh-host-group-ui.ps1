@@ -245,6 +245,31 @@ try {
     Result-Progress "2 of 2 settled${dot}0 waiting${dot}0 running${dot}1 succeeded${dot}1 needs attention"
     Set-HostFilter 'east'
     $null = Wait-Until 'West has left the roster' { !(Find-Element "Focus pane $west" $button) }
+    $hostList = "test@127.0.0.1:$($profileData.East.port)`n"
+    $hostListDestination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-hosts.txt'
+    $saveHostList = 'Save host list' + [char]0x2026
+    Click ('Export host list' + [char]0x2026)
+    $null = Wait-Until 'the checked host list preview' { Find-Element 'SSH host list preview' }
+    Click 'Copy host list'
+    $null = Wait-Until 'only the shown checked East address is copied' {
+        (Read-ClipboardFixture) -ceq $hostList
+    }
+    $null = Wait-Until 'the address count is confirmed' { Find-Element 'Copied 1 SSH address' }
+    Click $saveHostList
+    $dialog = Wait-Until 'owned host list save dialog' { Find-OwnedDialog 'Save SSH host list' }
+    $null = Wait-Until 'cancel the host list export' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'host list dialog closes after cancel' { !(Find-OwnedDialog 'Save SSH host list') }
+    if ([IO.File]::Exists($hostListDestination)) { throw 'Cancelling published a host list' }
+    Click $saveHostList
+    $dialog = Wait-Until 'host list save dialog reopens' { Find-OwnedDialog 'Save SSH host list' }
+    $null = Wait-Until 'save the portable host list' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved list contains the same portable address' {
+        [IO.File]::Exists($hostListDestination) -and
+            [IO.File]::ReadAllText($hostListDestination, [Text.UTF8Encoding]::new($false, $true)) -ceq $hostList
+    }
+    Click 'Back to SSH group'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-Until 'West remains hidden after host list export' { !(Find-Element "Focus pane $west" $button) }
     $null = Wait-Until 'the full East output is retained' { Find-Element "View output for pane $east" $button }
     Click 'Copy results'
     $null = Wait-Until 'the current report contains full output and both host outcomes' {

@@ -351,6 +351,10 @@ impl TerminalApp {
                 "Finish reviewing the host list before opening another group."
             );
             ensure!(
+                !page.host_list_export.is_open(),
+                "Close the host list export before opening another group."
+            );
+            ensure!(
                 !page.edit_membership_open(),
                 "Finish editing live pane membership before opening another group."
             );

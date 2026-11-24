@@ -34,11 +34,7 @@ pub(super) struct Names {
 
 impl Names {
     pub(super) fn new(label: &str, host: &str, user: &str, port: u16) -> Self {
-        let address = if host.contains(':') && !host.starts_with('[') {
-            format!("{user}@[{host}]:{port}")
-        } else {
-            format!("{user}@{host}:{port}")
-        };
+        let address = super::address::display(user, host, port);
         let host = host
             .strip_prefix('[')
             .and_then(|host| host.strip_suffix(']'))
