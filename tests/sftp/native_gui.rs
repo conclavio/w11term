@@ -1735,7 +1735,7 @@ async fn native_ssh_group_bounds_parallel_commands() {
                     .as_slice()
             }
             "East" => {
-                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\rverify-pacing\rpolicy-continue\r"
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\rverify-pacing\rpolicy-stop\rpolicy-continue\r"
             }
             _ => b"xrestore-promptskip-middle\r",
         };

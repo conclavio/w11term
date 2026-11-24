@@ -330,7 +330,7 @@ impl TerminalApp {
         self.update_host_group_timer(ctx);
     }
 
-    fn control_command_offer(
+    pub(super) fn control_command_offer(
         &mut self,
         tab: TabId,
         pane_ids: &[u64],
@@ -392,7 +392,7 @@ impl TerminalApp {
         Ok(offer)
     }
 
-    fn dispatch_control_offer(
+    pub(super) fn dispatch_control_offer(
         &mut self,
         tab: TabId,
         offer: CommandOffer,

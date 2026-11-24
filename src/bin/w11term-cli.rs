@@ -63,6 +63,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
             | "get-ssh-group-retry-plan"
+            | "retry-ssh-group-run"
             | "interrupt-ssh-group-command"
             | "ssh-group-queue"
             | "save-ssh-group-report"
@@ -713,6 +714,11 @@ mod tests {
             )
         ));
         assert!(matches!(
+            parse_line("retry-ssh-group-run --window 11 --tab 12 --run 4 --pane 8 --pane 5").unwrap(),
+            (None, Request::RetrySshGroupRun { window_id: 11, tab_id: 12, run_id: 4, pane_ids })
+                if pane_ids == [8, 5]
+        ));
+        assert!(matches!(
             parse_line("wait-ssh-group-approval --window 11 --tab 12 --run 4 --timeout 8").unwrap(),
             (
                 None,
@@ -766,6 +772,8 @@ mod tests {
             "get-ssh-group-run --window 2 --tab 3 --run 4 --timeout 1",
             "get-ssh-group-retry-plan --window 2 --tab 3",
             "get-ssh-group-retry-plan --window 2 --tab 3 --run 4 --pane 7",
+            "retry-ssh-group-run --window 2 --tab 3 --run 4",
+            "retry-ssh-group-run --window 2 --tab 3 --run 4 --pane 7 --pane 7",
             "interrupt-ssh-group-command --window 2 --tab 3 --run 4",
             "interrupt-ssh-group-command --window 2 --tab 3 --run 4 --pane 0",
             "interrupt-ssh-group-command --window 2 --tab 3 --pane 7",

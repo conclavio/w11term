@@ -5428,6 +5428,17 @@ impl Component for TerminalApp {
                     let _ = reply.send(self.control_ssh_group_retry_plan(tab_id, run_id));
                 }
             }
+            Message::Control(w11term::control::UiRequest::RetrySshGroupRun {
+                tab_id,
+                run_id,
+                pane_ids,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_retry_ssh_group_run(tab_id, run_id, &pane_ids));
+                    self.update_host_group_timer(context);
+                }
+            }
             Message::Control(w11term::control::UiRequest::SshGroupQueue {
                 tab_id,
                 run_id,

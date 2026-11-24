@@ -141,6 +141,12 @@ pub enum Request {
         tab_id: u64,
         run_id: u64,
     },
+    RetrySshGroupRun {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane_ids: Vec<u64>,
+    },
     SshGroupQueue {
         window_id: WindowId,
         tab_id: u64,
@@ -304,6 +310,12 @@ pub enum UiRequest {
         run_id: u64,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    RetrySshGroupRun {
+        tab_id: u64,
+        run_id: u64,
+        pane_ids: Vec<u64>,
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
     SshGroupQueue {
         tab_id: u64,
         run_id: u64,
@@ -358,6 +370,10 @@ impl UiRequest {
             | Self::SshGroupQueue { reply, .. }
             | Self::InterruptSshGroupCommand { reply, .. } => reply,
             Self::ReadSshGroupOutput { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
+            Self::RetrySshGroupRun { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
                 return;
             }
@@ -674,6 +690,15 @@ impl Registry {
                 tab_id,
                 run_id,
             } => self.ssh_group_retry_plan(window_id, tab_id, run_id).await,
+            Request::RetrySshGroupRun {
+                window_id,
+                tab_id,
+                run_id,
+                pane_ids,
+            } => {
+                self.retry_ssh_group_run(window_id, tab_id, run_id, pane_ids)
+                    .await
+            }
             Request::SshGroupQueue {
                 window_id,
                 tab_id,

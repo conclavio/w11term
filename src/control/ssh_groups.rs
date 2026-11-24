@@ -36,7 +36,7 @@ pub struct SshGroupCommandOptions {
     pub record_output: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SshGroupDispatchOverrides {
     pub canary_pane_id: Option<u64>,
     pub parallel_limit: Option<NonZeroUsize>,
@@ -416,6 +416,28 @@ impl Registry {
         });
         let plan = receive(window, response, deadline).await?;
         Ok(json!({ "window_id": window, "tab_id": tab, "run_id": run, "plan": plan }))
+    }
+
+    pub(super) async fn retry_ssh_group_run(
+        &self,
+        window: WindowId,
+        tab: u64,
+        source: u64,
+        pane_ids: Vec<u64>,
+    ) -> Result<Value> {
+        validate_group_panes(&pane_ids)?;
+        let (reply, response) = oneshot::channel();
+        self.window_ui(window)?(UiRequest::RetrySshGroupRun {
+            tab_id: tab,
+            run_id: source,
+            pane_ids,
+            reply,
+        });
+        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group retry was not acknowledged. Check the retry plan before retrying");
+        };
+        let run = run.map_err(anyhow::Error::msg)?;
+        Ok(json!({ "window_id": window, "tab_id": tab, "source_run_id": source, "run_id": run }))
     }
 
     pub(super) async fn query_ssh_group_run(
@@ -923,6 +945,15 @@ mod tests {
                 assert_eq!((tab_id, run_id), (9, 2));
                 reply.send(Ok(json!({"ready_pane_ids":[7]}))).unwrap();
             }
+            UiRequest::RetrySshGroupRun {
+                tab_id,
+                run_id,
+                pane_ids,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id, pane_ids), (9, 2, vec![7, 8]));
+                reply.send(Ok(4)).unwrap();
+            }
             UiRequest::SshGroupQueue {
                 tab_id,
                 run_id,
@@ -1011,6 +1042,13 @@ mod tests {
         assert_eq!(
             second.ssh_group_retry_plan(3, 9, 2).await.unwrap(),
             json!({ "window_id": 3, "tab_id": 9, "run_id": 2, "plan": {"ready_pane_ids":[7]} })
+        );
+        assert_eq!(
+            second
+                .retry_ssh_group_run(3, 9, 2, vec![7, 8])
+                .await
+                .unwrap(),
+            json!({ "window_id": 3, "tab_id": 9, "source_run_id": 2, "run_id": 4 })
         );
         let paused = second
             .change_ssh_group_queue(3, 9, 2, SshGroupQueueAction::Pause)

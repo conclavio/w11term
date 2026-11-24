@@ -275,6 +275,12 @@ impl Drop for Waiting {
 }
 
 impl Submission {
+    pub(super) fn has_unapproved_canary(&self) -> bool {
+        self.command_queue
+            .as_ref()
+            .is_some_and(|queue| queue.canary.is_some())
+    }
+
     pub(super) fn canary_approval_available(&self) -> Result<bool, &'static str> {
         let Some(queue) = &self.command_queue else {
             return Err("This SSH group run has no canary gate");

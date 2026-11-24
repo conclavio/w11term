@@ -8,16 +8,88 @@ impl TerminalApp {
         run: u64,
     ) -> Result<Value, String> {
         let targets = self.host_group_targets();
-        let page = self
-            .host_group_by_id_mut(tab)
-            .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))?;
-        let roster = page
-            .scoped_targets(&targets)
-            .map(|target| (target.pane, target))
-            .collect();
+        let roster = self.retry_roster(tab, &targets)?;
         let submission = self.control_group_run(tab, run)?;
         submission.refresh_deliveries();
         unsent_retry_plan(submission, &roster)
+    }
+
+    pub(in crate::app) fn control_retry_ssh_group_run(
+        &mut self,
+        tab: TabId,
+        source: u64,
+        pane_ids: &[u64],
+    ) -> Result<u64, String> {
+        let targets = self.host_group_targets();
+        let roster = self.retry_roster(tab, &targets)?;
+        let submission = self.control_group_run(tab, source)?;
+        submission.refresh_deliveries();
+        let command: Arc<str> = retry_command(submission)?.into();
+        let unsent: BTreeMap<_, _> = submission
+            .results
+            .iter()
+            .filter(|delivery| matches!(delivery.status, DeliveryStatus::Rejected(_)))
+            .map(|delivery| (delivery.target.pane, &delivery.target))
+            .collect();
+        for &pane in pane_ids {
+            let original = unsent.get(&pane).ok_or_else(|| {
+                format!("Pane {pane} has no confirmed unsent command in this run")
+            })?;
+            if let Some(reason) = retry_blocker(submission, original, roster.get(&pane).copied()) {
+                return Err(format!("Pane {pane} cannot be retried. {reason}"));
+            }
+        }
+
+        let offer = self.control_command_offer(tab, pane_ids, command, Default::default())?;
+        let run = self.dispatch_control_offer(tab, offer, None, None)?;
+        if let Ok(submission) = self.control_group_run(tab, source) {
+            submission
+                .unsent_retries
+                .extend(pane_ids.iter().map(|&pane| (pane, run)));
+        }
+        Ok(run)
+    }
+
+    fn retry_roster<'a>(
+        &self,
+        tab: TabId,
+        targets: &'a [Target],
+    ) -> Result<BTreeMap<u64, &'a Target>, String> {
+        let Some(Page::HostGroup(page)) = self.tabs.get(tab).map(|entry| &entry.page) else {
+            return Err(format!("unknown SSH group tab {tab} in this window"));
+        };
+        Ok(page
+            .scoped_targets(targets)
+            .map(|target| (target.pane, target))
+            .collect())
+    }
+}
+
+fn retry_command(submission: &Submission) -> Result<&str, &'static str> {
+    submission
+        .content
+        .command()
+        .ok_or("This SSH group run did not submit a shell command")
+}
+
+fn retry_blocker(
+    submission: &Submission,
+    original: &Target,
+    current: Option<&Target>,
+) -> Option<Cow<'static, str>> {
+    if let Some(run) = submission.unsent_retries.get(&original.pane) {
+        return Some(format!("Already retried in run {run}").into());
+    }
+    if submission.has_unapproved_canary() {
+        return Some("The source run's canary was not approved".into());
+    }
+    match current {
+        None => Some("The pane is outside this group's current roster".into()),
+        Some(target) if target.names.address() != original.names.address() => {
+            Some("The pane's SSH destination changed".into())
+        }
+        Some(target) if !target.state.is_ready() => Some(target.state.label()),
+        Some(_) => None,
     }
 }
 
@@ -25,10 +97,7 @@ fn unsent_retry_plan(
     submission: &Submission,
     roster: &BTreeMap<u64, &Target>,
 ) -> Result<Value, String> {
-    let command = submission
-        .content
-        .command()
-        .ok_or("This SSH group run did not submit a shell command")?;
+    let command = retry_command(submission)?;
     let mut ready_pane_ids = Vec::new();
     let mut recipients = Vec::new();
     for delivery in &submission.results {
@@ -36,15 +105,7 @@ fn unsent_retry_plan(
             continue;
         };
         let original = &delivery.target;
-        let address = original.names.address();
-        let block_reason = match roster.get(&original.pane) {
-            None => Some("The pane is outside this group's current roster".into()),
-            Some(target) if target.names.address() != address => {
-                Some("The pane's SSH destination changed".into())
-            }
-            Some(target) if !target.state.is_ready() => Some(target.state.label()),
-            Some(_) => None,
-        };
+        let block_reason = retry_blocker(submission, original, roster.get(&original.pane).copied());
         let ready = block_reason.is_none();
         if ready {
             ready_pane_ids.push(original.pane);
@@ -52,10 +113,11 @@ fn unsent_retry_plan(
         recipients.push(json!({
             "pane_id": original.pane,
             "label": original.names.label,
-            "address": address,
+            "address": original.names.address(),
             "delivery_reason": reason,
             "ready": ready,
             "block_reason": block_reason,
+            "retry_run_id": submission.unsent_retries.get(&original.pane),
         }));
     }
     Ok(json!({

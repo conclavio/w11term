@@ -197,6 +197,11 @@ try {
         !(Find-Element 'No bells or notifications') -or [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
         throw 'The retry plan included delivered hosts, lost the reason for blocking North, or changed focus'
     }
+    $sendRetryArgs = @('retry-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $blockedSend = & $Cli --pid $app.Id @sendRetryArgs 1 --pane $panes.North | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $blockedSend.ok -or $blockedSend.error -notlike '*cannot be retried*') {
+        throw 'The retry accepted an unsent host with an unverified prompt'
+    }
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
     $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'North was tried before East despite the new roster sort' {
@@ -741,6 +746,24 @@ try {
         $retry.plan.recipients[0].delivery_reason -cne 'Queue stopped after an unsuccessful host.') {
         throw 'The retry plan did not isolate the ready, unsent host from the sent failure'
     }
+    $mixed = & $Cli --pid $app.Id @sendRetryArgs $stop.run_id --pane $panes.East --pane $panes.West | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $mixed.ok -or $mixed.error -notlike '*no confirmed unsent command*') {
+        throw 'A retry accepted a mixed list containing a known sent command'
+    }
+    $newRun = Control ($sendRetryArgs + @("$($stop.run_id)",'--pane',"$($panes.East)"))
+    $retried = (Control ($groupWait + @("$($newRun.run_id)",'--require-success'))).run
+    if ($newRun.source_run_id -ne $stop.run_id -or $newRun.run_id -ne ($stop.run_id + 1) -or
+        $retried.command -cne 'policy-stop' -or $retried.recipients.Count -ne 1 -or
+        $retried.recipients[0].pane_id -ne $panes.East -or $retried.recipients[0].execution.exit_code -ne 0) {
+        throw 'The retry did not send the original command only to East'
+    }
+    $usedRetry = Control ($retryArgs + @("$($stop.run_id)"))
+    $duplicate = & $Cli --pid $app.Id @sendRetryArgs $stop.run_id --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $duplicate.ok -or $duplicate.error -notlike '*Already retried in run*' -or
+        $usedRetry.plan.recipients[0].retry_run_id -ne $newRun.run_id -or $usedRetry.plan.ready_pane_ids.Count -ne 0) {
+        throw 'The original plan did not prevent a duplicate retry'
+    }
+    $null = Control $readyForPolicy
     $keepGoing = Control ($serialArgs + @('--parallel','1','--on-failure','continue','--','policy-continue'))
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-continue')
     New-Item -ItemType File -Path (Join-Path $State 'release-policy-continue') | Out-Null
@@ -761,6 +784,10 @@ try {
     if ($canaryResult.recipients[0].execution.exit_code -ne 17 -or
         $canaryResult.recipients[1].delivery.reason -cne 'Canary did not report a successful exit.') {
         throw 'Continue-on-failure bypassed the failed canary'
+    }
+    $gatedRetry = & $Cli --pid $app.Id @sendRetryArgs $failedCanary.run_id --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $gatedRetry.ok -or $gatedRetry.error -notlike '*canary was not approved*') {
+        throw 'An unsent retry bypassed the source run canary'
     }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)

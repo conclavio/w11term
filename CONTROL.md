@@ -337,6 +337,19 @@ draft and terminal sessions alone. Pass the reviewed command and panes
 to `submit-ssh-group-command`, which rechecks current prompt readiness
 and applies the effective queue policy.
 
+`retry-ssh-group-run --window ID --tab ID --run ID --pane ID [--pane ID ...]`
+submits the retained run's original command to explicitly chosen unsent
+recipients. It rejects the entire request if any pane is ineligible. Each
+pane must still be in the group, on the original SSH destination, and at
+a fresh prompt. A source run with an unapproved canary is ineligible.
+The new run uses the current group queue policy and returns
+`source_run_id` and `run_id`.
+
+Each source pane can be retried once with this command. Its plan row
+reports `retry_run_id` after acceptance. Check that field if a retry was
+unacknowledged. If the new run also withholds a host, inspect the new run's
+retry plan.
+
 `interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID`
 requests Ctrl+C for one verified running command on a named recipient.
 The target must still be running the command from that retained run on
@@ -509,6 +522,7 @@ w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 approve-canar
 w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 skip --pane 19
 w11term-cli --pid 12345 interrupt-ssh-group-command --window 1 --tab 9 --run 3 --pane 17
 w11term-cli --pid 12345 get-ssh-group-retry-plan --window 1 --tab 9 --run 3
+w11term-cli --pid 12345 retry-ssh-group-run --window 1 --tab 9 --run 3 --pane 19
 w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --require-success
@@ -543,6 +557,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":{"skip":{"pane_id":19}}}
 {"verb":"interrupt-ssh-group-command","window_id":1,"tab_id":9,"run_id":3,"pane_id":17}
 {"verb":"get-ssh-group-retry-plan","window_id":1,"tab_id":9,"run_id":3}
+{"verb":"retry-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"pane_ids":[19]}
 {"verb":"save-ssh-group-report","window_id":1,"tab_id":9,"run_id":3,"path":"C:\\Reports\\group report.json","format":"json","overwrite":false}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-approval","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}

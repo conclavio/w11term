@@ -155,6 +155,7 @@ struct Submission {
     dispatch_policy: Option<dispatch_policy::Policy>,
     show_queue_activity: bool,
     control_waiters: Vec<control_api::ControlRunWait>,
+    unsent_retries: BTreeMap<u64, u64>,
     output_lifetime: Option<watch::Sender<()>>,
 }
 
@@ -680,6 +681,7 @@ impl HostGroup {
             dispatch_policy: None,
             show_queue_activity: false,
             control_waiters: Vec::new(),
+            unsent_retries: BTreeMap::new(),
             output_lifetime: None,
         });
         if self.submissions.len() > SUBMISSION_LIMIT

@@ -267,6 +267,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 151. **Choose whether an SSH group run stops after failure.** Override the group's failure policy for a CLI submission while preserving the canary approval gate.
 152. **Wait for SSH canary approval from a script.** Return the pending gate and exact canary pane after a verified successful exit without approving the run.
 153. **Inspect unsent SSH retries from the CLI.** List only recipients whose commands were withheld, with the original command and the current readiness of each pane.
+154. **Retry reviewed unsent SSH commands from the CLI.** Resubmit the source command to explicitly named eligible panes and link the new run to each original recipient to prevent duplicate retries.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
