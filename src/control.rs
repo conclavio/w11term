@@ -121,6 +121,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parallel_limit: Option<NonZeroUsize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         expect_output: Option<SshGroupExpectedOutput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record_output: Option<PathBuf>,
@@ -272,7 +274,7 @@ pub enum UiRequest {
         tab_id: u64,
         pane_ids: Vec<u64>,
         command: String,
-        options: SshGroupCommandOptions,
+        options: Box<SshGroupCommandOptions>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     GetSshGroupRun {
@@ -347,8 +349,8 @@ impl UiRequest {
 }
 
 pub use ssh_groups::{
-    SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput, SshGroupQueueAction,
-    SshGroupReadiness, SshGroupReportFormat, SshGroupReportWriter,
+    SshGroupCommandOptions, SshGroupDispatchOverrides, SshGroupExpectedOutput, SshGroupOutput,
+    SshGroupQueueAction, SshGroupReadiness, SshGroupReportFormat, SshGroupReportWriter,
 };
 pub use ssh_groups::{validate_group_panes, validate_group_submission};
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
@@ -682,14 +684,18 @@ impl Registry {
                 dry_run,
                 canary_pane_id,
                 parallel_limit,
+                interval_ms,
                 expect_output,
                 record_output,
             } => {
                 validate_group_submission(&pane_ids, &command, canary_pane_id)?;
                 let options = SshGroupCommandOptions::prepare(
                     dry_run,
-                    canary_pane_id,
-                    parallel_limit,
+                    SshGroupDispatchOverrides {
+                        canary_pane_id,
+                        parallel_limit,
+                        interval_ms,
+                    },
                     expect_output,
                     record_output,
                 )?;

@@ -642,6 +642,22 @@ try {
     if ($null -ne $default.plan.dispatch_policy.parallel_limit) {
         throw 'The per-run override changed the configured parallel limit'
     }
+    Select-GroupOption 'Time between sends' '5 seconds'
+    $pacingLog = Join-Path $State 'cli-paced-output.txt'
+    $paced = Control ($serialArgs + @('--interval-ms','1200','--record-output',$pacingLog,'--','verify-pacing'))
+    $pacedResult = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($paced.run_id)",'--require-success','--timeout','15')
+    if ($pacedResult.run.dispatch_policy.interval_ms -ne 1200 -or
+        $pacedResult.run.recording.state -cne 'saved' -or !(Read-GroupRecording $pacingLog).Contains('1.2s between sends')) {
+        throw 'The recorded run lost its custom pacing interval'
+    }
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $default = Control ($serialArgs + @('--dry-run','--','verify-pacing'))
+    $noDelay = Control ($serialArgs + @('--dry-run','--interval-ms','0','--','verify-pacing'))
+    if ($default.plan.dispatch_policy.interval_ms -ne 5000 -or $noDelay.plan.dispatch_policy.interval_ms -ne 0) {
+        throw 'The pacing override changed the configured interval or failed to represent no delay'
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

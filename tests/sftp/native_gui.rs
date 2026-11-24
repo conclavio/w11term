@@ -1627,11 +1627,16 @@ async fn native_ssh_group_bounds_parallel_commands() {
                         let Some(line) = input.strip_suffix('\r') else {
                             continue;
                         };
-                        if line == "pace" {
+                        let paced = match line {
+                            "pace" => Some("pace"),
+                            "verify-pacing" => Some("verify-pacing"),
+                            _ => None,
+                        };
+                        if let Some(command) = paced {
                             arrivals
                                 .lock()
                                 .unwrap()
-                                .insert(name, std::time::Instant::now());
+                                .insert((command, name), std::time::Instant::now());
                         }
                         if name == "East" && line == "inspect" {
                             assert!(
@@ -1667,7 +1672,7 @@ async fn native_ssh_group_bounds_parallel_commands() {
                             )
                             .await
                             .unwrap();
-                        if name == "West" && line != "pace" {
+                        if name == "West" && paced.is_none() {
                             let gate = fixtures.join(format!("release-{line}"));
                             while !gate.is_file() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1709,21 +1714,25 @@ async fn native_ssh_group_bounds_parallel_commands() {
     .unwrap();
     drive_gui("ssh-host-group-command-limit-ui.ps1", state.path());
     let arrivals = paced_arrivals.lock().unwrap();
-    let elapsed = arrivals["East"].saturating_duration_since(arrivals["West"]);
-    // Allow for SSH packet delivery jitter. The queue deadline itself has an exact unit test.
-    assert!(
-        elapsed >= Duration::from_millis(4750),
-        "paced sends arrived {elapsed:?} apart"
-    );
+    for (command, minimum_ms) in [("pace", 4_750), ("verify-pacing", 950)] {
+        let east = arrivals[&(command, "East")];
+        let west = arrivals[&(command, "West")];
+        let elapsed = east.saturating_duration_since(west);
+        // Allow for SSH packet delivery jitter. The queue interval has an exact unit test.
+        assert!(
+            elapsed >= Duration::from_millis(minimum_ms),
+            "{command} reached East {elapsed:?} after West"
+        );
+    }
     drop(arrivals);
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
             "West" => {
-                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\r"
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\rverify-pacing\r"
                     .as_slice()
             }
             "East" => {
-                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\r"
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\rverify-pacing\r"
             }
             _ => b"xrestore-promptskip-middle\r",
         };

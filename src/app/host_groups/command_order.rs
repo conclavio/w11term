@@ -111,7 +111,7 @@ pub(super) fn preview(
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let limit = offer.parallel_limit;
-    let interval = offer.interval.duration();
+    let interval = offer.interval;
     let canary = offer.canary.is_some();
     let ordered = page.orders_commands();
     let summary = match (canary, limit) {

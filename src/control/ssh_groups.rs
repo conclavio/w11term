@@ -31,17 +31,22 @@ pub struct SshGroupExpectedOutput {
 #[derive(Debug)]
 pub struct SshGroupCommandOptions {
     pub dry_run: bool,
-    pub canary_pane_id: Option<u64>,
-    pub parallel_limit: Option<NonZeroUsize>,
+    pub dispatch: SshGroupDispatchOverrides,
     pub expect_output: Option<(SshGroupExpectedOutput, Regex)>,
     pub record_output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SshGroupDispatchOverrides {
+    pub canary_pane_id: Option<u64>,
+    pub parallel_limit: Option<NonZeroUsize>,
+    pub interval_ms: Option<u64>,
 }
 
 impl SshGroupCommandOptions {
     pub(super) fn prepare(
         dry_run: bool,
-        canary_pane_id: Option<u64>,
-        parallel_limit: Option<NonZeroUsize>,
+        dispatch: SshGroupDispatchOverrides,
         expect_output: Option<SshGroupExpectedOutput>,
         record_output: Option<PathBuf>,
     ) -> Result<Self> {
@@ -58,8 +63,7 @@ impl SshGroupCommandOptions {
             .context("invalid expected output")?;
         Ok(Self {
             dry_run,
-            canary_pane_id,
-            parallel_limit,
+            dispatch,
             expect_output,
             record_output,
         })
@@ -308,7 +312,7 @@ impl Registry {
             tab_id: tab,
             pane_ids,
             command,
-            options,
+            options: Box::new(options),
             reply,
         });
         let Ok(Ok(result)) = tokio::time::timeout(TIMEOUT, response).await else {
@@ -898,8 +902,12 @@ mod tests {
                 assert_eq!(tab_id, 9);
                 assert_eq!(pane_ids, [8, 7]);
                 assert_eq!(command, "show  status");
-                assert_eq!(options.canary_pane_id, Some(7));
-                assert_eq!(options.parallel_limit.map(NonZeroUsize::get), Some(3));
+                assert_eq!(options.dispatch.canary_pane_id, Some(7));
+                assert_eq!(
+                    options.dispatch.parallel_limit.map(NonZeroUsize::get),
+                    Some(3)
+                );
+                assert_eq!(options.dispatch.interval_ms, Some(725));
                 assert_eq!(
                     options.record_output,
                     Some(PathBuf::from(r"C:\fixture\capture.txt"))
@@ -988,6 +996,7 @@ mod tests {
             "command": "show  status",
             "canary_pane_id": 7,
             "parallel_limit": 3,
+            "interval_ms": 725,
             "expect_output": { "query": "^READY [0-9]+$", "regex": true, "match_case": true },
             "record_output": r"C:\fixture\capture.txt",
         });

@@ -169,7 +169,7 @@ pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
     parallel_limit: Option<usize>,
-    interval: SshGroupCommandInterval,
+    interval: Duration,
     queue_expiry: SshGroupQueueExpiry,
     stop_queue_on_failure: bool,
     canary: Option<u64>,
@@ -627,7 +627,7 @@ impl HostGroup {
             text,
             targets,
             parallel_limit: self.roster_preferences.command_limit.concurrency(),
-            interval: self.roster_preferences.command_interval,
+            interval: self.roster_preferences.command_interval.duration(),
             queue_expiry: self.roster_preferences.command_queue_expiry,
             stop_queue_on_failure: self.roster_preferences.stop_command_queue_on_failure,
             canary,
@@ -1192,7 +1192,7 @@ impl TerminalApp {
                 .map(|target| target.pane)
                 .eq(targets.iter().map(|target| target.pane))
             && page.roster_preferences.command_limit.concurrency() == *parallel_limit
-            && page.roster_preferences.command_interval == *interval
+            && page.roster_preferences.command_interval.duration() == *interval
             && page.roster_preferences.command_queue_expiry == *queue_expiry
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
@@ -1228,11 +1228,11 @@ impl TerminalApp {
         let CommandOffer {
             text,
             targets,
+            interval,
             canary,
             notify_canary,
             ..
         } = offer;
-        let interval = Duration::from_millis(policy.interval_ms);
         let deadline = policy
             .queue_expiry_ms
             .map(|ms| Instant::now() + Duration::from_millis(ms));

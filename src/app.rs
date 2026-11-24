@@ -5462,7 +5462,7 @@ impl Component for TerminalApp {
             }) => {
                 if !reply.is_closed() {
                     self.control_submit_ssh_group_command(
-                        tab_id, &pane_ids, command, options, reply, context,
+                        tab_id, &pane_ids, command, *options, reply, context,
                     );
                 }
             }
