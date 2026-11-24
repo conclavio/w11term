@@ -1,6 +1,8 @@
 use super::*;
 use std::io::Write;
-use w11term::profiles::{SavedSshGroup, encode_group_file, read_group_file};
+use w11term::profiles::{SavedSshGroup, encode_group_file, read_group_file, remap_group_profiles};
+
+mod mapping;
 
 pub enum Action {
     Export(String),
@@ -11,6 +13,8 @@ pub enum Action {
 
 pub enum Edit {
     Name(String),
+    Map(usize),
+    Pick(u64, mapping::Change),
     Refresh,
     Save,
     Cancel,
@@ -25,21 +29,38 @@ pub(super) struct Review {
     revision: u64,
     group: SavedSshGroup,
     name: String,
-    matches: Vec<Option<SshOptions>>,
+    matches: Vec<LocalProfile>,
+    picker: Option<mapping::Picker>,
+    picker_revision: u64,
+}
+
+struct LocalProfile {
+    name: String,
+    options: Option<SshOptions>,
 }
 
 impl Review {
     fn refresh(&mut self, catalog: &Profiles) {
-        self.matches = self
-            .group
-            .members
-            .iter()
-            .map(|name| catalog.ssh_host_group_member(name).cloned())
-            .collect();
+        for local in &mut self.matches {
+            local.options = catalog.ssh_host_group_member(&local.name).cloned();
+        }
+    }
+
+    fn unique_profiles(&self) -> bool {
+        let mut seen = BTreeSet::new();
+        self.matches.iter().all(|local| seen.insert(&local.name))
     }
 
     fn options(&self) -> Option<Vec<SshOptions>> {
-        self.matches.iter().cloned().collect()
+        self.matches
+            .iter()
+            .map(|local| local.options.clone())
+            .collect()
+    }
+
+    fn definition(&self) -> Result<SavedSshGroup> {
+        let local: Vec<_> = self.matches.iter().map(|item| item.name.clone()).collect();
+        remap_group_profiles(&self.group, &local)
     }
 }
 
@@ -53,23 +74,44 @@ impl State {
         };
         let revision = review.revision;
         let action = move |change| message(id, Action::Edit(revision, change));
+        if let Some(picker) = &review.picker {
+            let source = &review.group.members[picker.index];
+            return picker.view(source, &review.matches[picker.index].name, action, ctx);
+        }
         let rows = review
             .group
             .members
             .iter()
             .zip(&review.matches)
-            .map(|(name, options)| {
-                let address = options.as_ref().map_or_else(
+            .enumerate()
+            .map(|(index, (name, local))| {
+                let address = local.options.as_ref().map_or_else(
                     || "Local SSH profile unavailable".into(),
                     |ssh| address::display(&ssh.user, &ssh.host, ssh.port),
                 );
+                let label = if name == &local.name {
+                    format!("{name} · {address}")
+                } else {
+                    format!("{name} · {} · {address}", local.name)
+                };
                 KeyedView::new(
                     name.clone(),
-                    TextBlock::new()
-                        .text(format!("{name} · {address}"))
-                        .text_wrapping(TextWrapping::Wrap),
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(8.0)
+                        .children((
+                            TextBlock::new()
+                                .text(label)
+                                .text_wrapping(TextWrapping::Wrap),
+                            Button::new()
+                                .grid_column(1)
+                                .automation_name(format!("Choose local profile for {name}"))
+                                .on_click(ctx.callback(move |_| action(Edit::Map(index))))
+                                .content("Choose local profile…"),
+                        )),
                 )
             });
+        let unique = review.unique_profiles();
         Grid::new()
             .margin(16.0)
             .row_spacing(8.0)
@@ -94,7 +136,11 @@ impl State {
                             Button::new()
                                 .is_enabled(
                                     !review.name.trim().is_empty()
-                                        && review.matches.iter().all(Option::is_some),
+                                        && unique
+                                        && review
+                                            .matches
+                                            .iter()
+                                            .all(|local| local.options.is_some()),
                                 )
                                 .on_click(ctx.callback(move |_| action(Edit::Save)))
                                 .content("Save imported group"),
@@ -105,6 +151,14 @@ impl State {
                                 .on_click(ctx.callback(move |_| action(Edit::Cancel)))
                                 .content("Cancel"),
                         )),
+                    if unique {
+                        View::empty()
+                    } else {
+                        TextBlock::new()
+                            .text("Choose a different local profile for each imported member.")
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into()
+                    },
                     if feedback.is_empty() {
                         View::empty()
                     } else {
@@ -251,11 +305,21 @@ impl TerminalApp {
             group
                 .map(|group| {
                     let catalog = self.store.catalog().map_err(|error| format!("{error:#}"))?;
+                    let matches = group
+                        .members
+                        .iter()
+                        .map(|name| LocalProfile {
+                            name: name.clone(),
+                            options: None,
+                        })
+                        .collect();
                     let mut review = Review {
                         revision,
                         name: group.name.clone(),
                         group,
-                        matches: Vec::new(),
+                        matches,
+                        picker: None,
+                        picker_revision: 0,
                     };
                     review.refresh(&catalog);
                     Ok(review)
@@ -284,6 +348,26 @@ impl TerminalApp {
             return;
         }
         match edit {
+            Edit::Pick(revision, change) => {
+                let Some(picker) = review
+                    .picker
+                    .as_mut()
+                    .filter(|picker| picker.revision == revision)
+                else {
+                    return;
+                };
+                match change {
+                    mapping::Change::Cancel => review.picker = None,
+                    change => {
+                        if let Some(local) = picker.change(change) {
+                            review.matches[picker.index] = local;
+                            review.picker = None;
+                            saved.feedback.clear();
+                        }
+                    }
+                }
+            }
+            _ if review.picker.is_some() => {}
             Edit::Name(name) => {
                 review.name = name;
                 saved.feedback.clear();
@@ -299,12 +383,34 @@ impl TerminalApp {
                 }
                 Err(error) => saved.feedback = format!("{error:#}"),
             },
+            Edit::Map(index) => {
+                if index >= review.matches.len() {
+                    return;
+                }
+                match self.store.catalog() {
+                    Ok(catalog) => {
+                        review.picker_revision += 1;
+                        review.picker = Some(mapping::Picker::new(
+                            index,
+                            review.picker_revision,
+                            &catalog,
+                        ));
+                    }
+                    Err(error) => saved.feedback = format!("{error:#}"),
+                }
+            }
             Edit::Save => {
                 let Some(options) = review.options() else {
                     return;
                 };
                 let name = review.name.trim().to_owned();
-                let definition = review.group.clone();
+                let definition = match review.definition() {
+                    Ok(definition) => definition,
+                    Err(error) => {
+                        saved.feedback = format!("{error:#}");
+                        return;
+                    }
+                };
                 match self
                     .store
                     .import_ssh_group_definition(&name, &definition, &options)

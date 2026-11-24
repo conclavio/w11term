@@ -189,6 +189,8 @@ Choose **Duplicate group…** to save the selected group under a new name. The c
 
 Choose **Export group definition…** to save a portable JSON file with the saved group name, ordered profile names, recipient sets, and roster defaults. To use the file elsewhere, open **Import group definition…** and review the matching local SSH profiles and their addresses. If a profile is missing, create it locally and choose **Refresh local profiles**. Saving adds the group to the catalog for later launch.
 
+Use **Choose local profile…** on an imported member to map it to a differently named local profile. Search by name or SSH address. Each imported member needs a distinct local profile, and the saved recipient sets follow the mapping in their original order.
+
 When creating or editing a group, filter by profile name or SSH address. **Check matches** and **Uncheck matches** apply to every matching profile across pages. **Move up** and **Move down** change a checked profile’s position in the full group. Fresh tabs open in the saved order.
 
 Group tabs keep their own drafts, filters, host selections, and results. A named tab shows the panes opened for that group and panes added with **Import host list…**. Turn on **Show all window SSH panes** to include other connections in the roster. Turning it off clears checks on those other panes. **New SSH group tab** opens an independent window-wide roster with an empty selection. **SSH host group** returns to the most recently used group tab.

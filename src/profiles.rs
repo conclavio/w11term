@@ -8,7 +8,7 @@ pub use bookmarks::{BookmarkPeer, bookmark_directory};
 mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
 mod group_file;
-pub use group_file::{decode_group_file, encode_group_file, read_group_file};
+pub use group_file::{decode_group_file, encode_group_file, read_group_file, remap_group_profiles};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileSnapshot {

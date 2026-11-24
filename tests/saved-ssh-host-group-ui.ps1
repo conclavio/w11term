@@ -289,7 +289,7 @@ try {
     }
 
     $definitionCatalog = Catalog
-    $definitionCatalog | Add-Member -NotePropertyName ssh_recipient_sets -NotePropertyValue @{ Fleet = @{ Canary = @('East') } }
+    $definitionCatalog | Add-Member -NotePropertyName ssh_recipient_sets -NotePropertyValue @{ Fleet = @{ Canary = @('East','West') } }
     [IO.File]::WriteAllText($profiles, ($definitionCatalog | ConvertTo-Json -Depth 30))
     $definitionFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group.json'
     Click ('Export group definition' + [char]0x2026)
@@ -299,7 +299,7 @@ try {
     $exported = [IO.File]::ReadAllText($definitionFile) | ConvertFrom-Json
     if ($exported.format -cne 'w11term-ssh-group' -or $exported.version -ne 1 -or
         ($exported.group.members -join ',') -cne 'West,East' -or
-        ($exported.group.recipient_sets.Canary -join ',') -cne 'East' -or
+        ($exported.group.recipient_sets.Canary -join ',') -cne 'East,West' -or
         !$exported.group.roster_defaults.show_last_output -or $exported.profiles) {
         throw 'The group file did not preserve its portable definition'
     }
@@ -328,20 +328,42 @@ try {
         $save = Find-Element 'Save imported group' $button
         ($save -and !$save.Current.IsEnabled) -and (Find-Element "West${dot}Local SSH profile unavailable")
     }
-    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
-    Click 'Refresh local profiles'
-    $null = Wait-Until 'the refreshed profile address is shown' { Find-Element "West${dot}test@127.0.0.1:1" }
+    $missing.profiles | Add-Member -NotePropertyName 'West Local' -NotePropertyValue $changed.profiles.West
+    [IO.File]::WriteAllText($profiles, ($missing | ConvertTo-Json -Depth 30))
+    Click 'Choose local profile for West'
+    $null = Wait-Until 'profile search is shown' { Find-Element 'Find local SSH profiles' $edit }
+    Click 'Back to import review'
+    $null = Wait-Until 'going back kept the current mapping' { Find-Element "West${dot}Local SSH profile unavailable" }
+    Click 'Choose local profile for West'
+    Click 'Next profiles'
+    Click 'Use local profile East'
+    $null = Wait-Until 'two file entries cannot use the same local profile' {
+        $save = Find-Element 'Save imported group' $button
+        ($save -and !$save.Current.IsEnabled) -and
+            (Find-Element 'Choose a different local profile for each imported member.')
+    }
+    Click 'Choose local profile for West'
+    $search = Wait-Until 'the new picker exposes local profile search' { Find-Element 'Find local SSH profiles' $edit }
+    $search.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('wEsT local 127.0.0.1')
+    $null = Wait-Until 'local profile search matches the name and host' {
+        (Find-Element 'Use local profile West Local' $button) -and !(Find-Element 'Use local profile East' $button)
+    }
+    Click 'Use local profile West Local'
+    $null = Wait-Until 'the remapped profile and address are shown' {
+        Find-Element "West${dot}West Local${dot}test@127.0.0.1:1"
+    }
     Click 'Save imported group'
     $null = Wait-Until 'the reviewed group is saved with its settings' {
         $saved = Catalog
         (Find-Element 'SSH group imported') -and
-            ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West,East' -and
-            ($saved.ssh_recipient_sets.'Portable Fleet'.Canary -join ',') -ceq 'East' -and
+            ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West Local,East' -and
+            ($saved.ssh_recipient_sets.'Portable Fleet'.Canary -join ',') -ceq 'East,West Local' -and
             $saved.ssh_host_group_defaults.'Portable Fleet'.show_last_output
     }
     if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Importing the definition opened SSH panes' }
     $restored = Catalog
-    $restored.profiles.West.port = $definitionCatalog.profiles.West.port
+    $restored.profiles.PSObject.Properties.Remove('West Local')
+    $restored.profiles | Add-Member -NotePropertyName 'West' -NotePropertyValue $definitionCatalog.profiles.West
     [IO.File]::WriteAllText($profiles, ($restored | ConvertTo-Json -Depth 30))
     Click 'Edit group'
     Click 'Delete group'
