@@ -1,7 +1,8 @@
 use super::*;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
+use w11term::options::SshRecipientSets;
 
-pub(super) const LABEL: &str = "Review connection reuse…";
+pub(super) const LABEL: &str = "Review group launch…";
 const FRESH: &str = "Open a new SSH pane";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,19 +54,22 @@ pub(super) fn connection_picker(
 
 struct Member {
     profile: String,
-    options: SshOptions,
+    options: Option<SshOptions>,
     candidates: Vec<Candidate>,
     choice: Option<Connection>,
+    included: bool,
 }
 
 impl Member {
-    fn new(profile: String, options: SshOptions, candidates: Vec<Candidate>) -> Self {
+    fn new(profile: String, options: Option<SshOptions>, candidates: Vec<Candidate>) -> Self {
         let choice = (candidates.len() == 1).then(|| candidates[0].connection);
+        let included = options.is_some();
         Self {
             profile,
             options,
             candidates,
             choice,
+            included,
         }
     }
 
@@ -80,11 +84,21 @@ impl Member {
             self.choice = choice;
         }
     }
+
+    fn launch(&self) -> Launch {
+        if self.included {
+            self.choice.map_or(Launch::Fresh, Launch::Reuse)
+        } else {
+            Launch::Skip
+        }
+    }
 }
 
 struct Review {
     name: String,
     members: Vec<Member>,
+    sets: SshRecipientSets,
+    selected_set: Option<String>,
     feedback: String,
 }
 
@@ -96,26 +110,84 @@ impl Review {
             .collect()
     }
 
-    fn choices(&self) -> Vec<Option<Connection>> {
-        self.members.iter().map(|member| member.choice).collect()
+    fn choices(&self) -> Vec<Launch> {
+        self.members.iter().map(Member::launch).collect()
+    }
+
+    fn include(&mut self, index: usize, included: bool) {
+        if let Some(member) = self.members.get_mut(index)
+            && member.options.is_some()
+            && member.included != included
+        {
+            member.included = included;
+            self.selected_set = None;
+            self.feedback.clear();
+        }
+    }
+
+    fn select_set(&mut self, name: String) -> Result<()> {
+        let profiles = self
+            .sets
+            .get(&name)
+            .with_context(|| format!("Recipient set {name} is unavailable."))?;
+        ensure!(
+            self.set_is_available(profiles),
+            "Recipient set {name} contains an unavailable SSH profile."
+        );
+        for member in &mut self.members {
+            member.included = profiles.contains(&member.profile);
+        }
+        self.selected_set = Some(name);
+        self.feedback.clear();
+        Ok(())
+    }
+
+    fn set_is_available(&self, profiles: &[String]) -> bool {
+        let mut seen = BTreeSet::new();
+        !profiles.is_empty()
+            && profiles.iter().all(|profile| {
+                seen.insert(profile)
+                    && self
+                        .members
+                        .iter()
+                        .any(|member| &member.profile == profile && member.options.is_some())
+            })
     }
 
     fn validate(
         &self,
-        current: &[SshOptions],
+        catalog: &Profiles,
         connection: impl Fn(Connection, &str, &SshOptions) -> bool,
     ) -> Result<()> {
         ensure!(
-            self.members
-                .iter()
-                .map(|member| &member.options)
-                .eq(current),
-            "SSH profiles changed. Refresh the review before opening this group."
+            self.members.iter().any(|member| member.included),
+            "Include at least one SSH host."
         );
-        for member in &self.members {
+        if let Some(name) = &self.selected_set {
+            ensure!(
+                catalog
+                    .ssh_recipient_sets
+                    .get(&self.name)
+                    .and_then(|sets| sets.get(name))
+                    == self.sets.get(name),
+                "Recipient set {name} changed. Refresh the review before opening this group."
+            );
+        }
+        for member in self.members.iter().filter(|member| member.included) {
+            let expected = member
+                .options
+                .as_ref()
+                .filter(|expected| {
+                    catalog.ssh_host_group_member(&member.profile) == Some(*expected)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "SSH profiles changed. Refresh the review before opening this group."
+                    )
+                })?;
             if let Some(approved) = member.choice {
                 ensure!(
-                    connection(approved, &member.profile, &member.options),
+                    connection(approved, &member.profile, expected),
                     "The reviewed SSH connection for {} changed. Refresh the review or choose a new pane.",
                     member.profile
                 );
@@ -138,9 +210,19 @@ pub enum Action {
 
 pub enum Change {
     Choose(usize, Option<Connection>),
-    Approve(Vec<Option<Connection>>),
+    Include(usize, bool),
+    IncludeAll(bool),
+    RecipientSet(String),
+    Approve(Vec<Launch>, Option<String>),
     Refresh,
     Back,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+    Skip,
+    Fresh,
+    Reuse(Connection),
 }
 
 impl State {
@@ -160,18 +242,50 @@ impl State {
             Message::HostGroup(super::Action::Reuse(id, Action::Form(revision, change)))
         };
         let offered = review.choices();
-        let reuse = offered.iter().flatten().count();
-        let new = offered.len() - reuse;
+        let reuse = offered
+            .iter()
+            .filter(|choice| matches!(choice, Launch::Reuse(_)))
+            .count();
+        let new = offered
+            .iter()
+            .filter(|choice| matches!(choice, Launch::Fresh))
+            .count();
+        let skipped = offered.len() - reuse - new;
+        let selected_set = review.selected_set.clone();
+        let set_names: Vec<_> = review
+            .sets
+            .iter()
+            .filter(|(_, profiles)| review.set_is_available(profiles))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let counts = format!("{reuse} to reuse · {new} to open");
+        let counts = if skipped == 0 {
+            counts
+        } else {
+            format!("{counts} · {skipped} skipped")
+        };
         let rows = review.members.iter().enumerate().map(|(index, member)| {
             KeyedView::new(
                 member.profile.as_str(),
                 StackPanel::new().spacing(4.0).children((
-                    TextBlock::new().text(&member.profile),
+                    CheckBox::new()
+                        .automation_name(format!("Include profile {}", member.profile))
+                        .is_checked(member.included)
+                        .is_enabled(member.options.is_some())
+                        .on_is_checked_changed(
+                            ctx.callback(move |included| action(Change::Include(index, included))),
+                        )
+                        .content(member.profile.as_str()),
+                    if member.options.is_some() {
+                        View::empty()
+                    } else {
+                        TextBlock::new().text("SSH profile unavailable").into()
+                    },
                     connection_picker(
                         &member.profile,
                         &member.candidates,
                         member.choice,
-                        true,
+                        member.included,
                         move |choice| action(Change::Choose(index, choice)),
                         ctx,
                     ),
@@ -188,15 +302,39 @@ impl State {
                         TextBlock::new()
                             .font_size(24.0)
                             .text(format!("Review SSH group · {}", review.name)),
-                        TextBlock::new().text(format!("{reuse} to reuse · {new} to open")),
+                        TextBlock::new().text(counts),
+                        if set_names.is_empty() {
+                            View::empty()
+                        } else {
+                            let selected = set_names
+                                .iter()
+                                .position(|name| Some(name) == review.selected_set.as_ref());
+                            ComboBox::new()
+                                .automation_name("Launch recipient set")
+                                .placeholder_text("Choose a recipient set")
+                                .items_source(set_names.clone())
+                                .selected_index(selected)
+                                .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                                    index
+                                        .and_then(|index| set_names.get(index))
+                                        .map_or(Message::ControlIdle, |name| {
+                                            action(Change::RecipientSet(name.clone()))
+                                        })
+                                }))
+                                .into()
+                        },
                         StackPanel::new()
                             .spacing(8.0)
                             .orientation(Orientation::Horizontal)
                             .children((
                                 Button::new()
                                     .style(ButtonStyle::Accent)
+                                    .is_enabled(reuse + new > 0)
                                     .on_click(ctx.callback(move |_| {
-                                        action(Change::Approve(offered.clone()))
+                                        action(Change::Approve(
+                                            offered.clone(),
+                                            selected_set.clone(),
+                                        ))
                                     }))
                                     .content("Open reviewed group"),
                                 Button::new()
@@ -205,6 +343,21 @@ impl State {
                                 Button::new()
                                     .on_click(ctx.callback(move |_| action(Change::Back)))
                                     .content("Cancel"),
+                            )),
+                        StackPanel::new()
+                            .spacing(8.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                Button::new()
+                                    .on_click(
+                                        ctx.callback(move |_| action(Change::IncludeAll(true))),
+                                    )
+                                    .content("Include all available"),
+                                Button::new()
+                                    .on_click(
+                                        ctx.callback(move |_| action(Change::IncludeAll(false))),
+                                    )
+                                    .content("Clear included hosts"),
                             )),
                         if review.feedback.is_empty() {
                             View::empty()
@@ -297,8 +450,35 @@ impl TerminalApp {
                 if let Some(page) = self.host_group_mut(id)
                     && let Some(review) = page.saved.reuse.review.as_mut()
                     && let Some(member) = review.members.get_mut(index)
+                    && member.included
                 {
                     member.select(choice);
+                }
+            }
+            Change::Include(index, included) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && let Some(review) = page.saved.reuse.review.as_mut()
+                {
+                    review.include(index, included);
+                }
+            }
+            Change::IncludeAll(included) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && let Some(review) = page.saved.reuse.review.as_mut()
+                {
+                    for member in &mut review.members {
+                        member.included = included && member.options.is_some();
+                    }
+                    review.selected_set = None;
+                    review.feedback.clear();
+                }
+            }
+            Change::RecipientSet(name) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && let Some(review) = page.saved.reuse.review.as_mut()
+                    && let Err(error) = review.select_set(name)
+                {
+                    review.feedback = format!("{error:#}");
                 }
             }
             Change::Refresh => {
@@ -318,7 +498,9 @@ impl TerminalApp {
                     }
                 }
             }
-            Change::Approve(offered) if review.choices() == offered => {
+            Change::Approve(offered, set)
+                if review.choices() == offered && review.selected_set == set =>
+            {
                 if let Err(error) = self.open_group_reusing_connections(id, ctx)
                     && let Some(page) = self.host_group_mut(id)
                     && let Some(review) = page.saved.reuse.review.as_mut()
@@ -336,16 +518,24 @@ impl TerminalApp {
         profiles: Vec<String>,
         previous: Option<&Review>,
     ) -> Result<Review> {
-        let (_, options) = self.resolve_saved_host_group(&name, &profiles)?;
+        let catalog = self.load_expected_host_group(&name, &profiles)?;
         let targets = self.host_group_targets();
+        let sets = catalog
+            .ssh_recipient_sets
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
         let members = profiles
             .into_iter()
-            .zip(options)
             .enumerate()
-            .map(|(index, (profile, options))| {
-                let candidates = self.group_reuse_candidates(&targets, Some(&profile), &options);
+            .map(|(index, profile)| {
+                let options = catalog.ssh_host_group_member(&profile).cloned();
+                let candidates = options.as_ref().map_or_else(Vec::new, |expected| {
+                    self.group_reuse_candidates(&targets, Some(&profile), expected)
+                });
                 let mut member = Member::new(profile, options, candidates);
                 if let Some(previous) = previous {
+                    member.included &= previous.members[index].included;
                     member.choice = previous.members[index]
                         .choice
                         .filter(|&connection| member.contains(connection));
@@ -353,11 +543,20 @@ impl TerminalApp {
                 member
             })
             .collect();
-        Ok(Review {
+        let mut review = Review {
             name,
             members,
+            sets,
+            selected_set: None,
             feedback: String::new(),
-        })
+        };
+        if let Some(name) = previous.and_then(|review| review.selected_set.clone())
+            && let Err(error) = review.select_set(name)
+        {
+            review.feedback =
+                format!("{error:#} Review the checked hosts before opening the group.");
+        }
+        Ok(review)
     }
 
     pub(super) fn group_reuse_candidates(
@@ -416,17 +615,26 @@ impl TerminalApp {
         };
         let name = review.name.clone();
         let profiles = review.profiles();
-        let (catalog, current) = self.resolve_saved_host_group(&name, &profiles)?;
-        review.validate(&current, |approved, profile, expected| {
+        let catalog = self.load_expected_host_group(&name, &profiles)?;
+        review.validate(&catalog, |approved, profile, expected| {
             self.group_reuse_connection(approved.pane, Some(profile), expected) == Some(approved)
         })?;
         let mut reused = BTreeSet::new();
         let mut fresh = Vec::new();
-        for (member, options) in review.members.iter().zip(current) {
-            if let Some(connection) = member.choice {
-                reused.insert(connection.pane);
-            } else {
-                fresh.push((Some(member.profile.clone()), options));
+        let mut skipped = 0;
+        for member in &review.members {
+            match member.launch() {
+                Launch::Reuse(connection) => {
+                    reused.insert(connection.pane);
+                }
+                Launch::Fresh => {
+                    let options = member
+                        .options
+                        .clone()
+                        .context("The reviewed SSH profile is unavailable")?;
+                    fresh.push((Some(member.profile.clone()), options));
+                }
+                Launch::Skip => skipped += 1,
             }
         }
         let feedback = format!(
@@ -434,13 +642,18 @@ impl TerminalApp {
             reused.len(),
             fresh.len()
         );
+        let feedback = if skipped == 0 {
+            feedback
+        } else {
+            format!("{feedback} · Skipped {skipped}")
+        };
         self.use_group_catalog(catalog);
         if let Some(page) = self.host_group_mut(source_tab) {
             page.saved.reuse.review = None;
         }
         let id = self.new_host_group_tab(Some(&name));
         self.start_host_group_panes(id, reused, fresh, ctx);
-        self.remember_group_launch(id, &name, &profiles, feedback);
+        self.remember_group_launch(id, &name, &profiles, skipped == 0, feedback);
         Ok(())
     }
 }
@@ -469,11 +682,11 @@ mod tests {
             pane: id.pane,
             generation: id.generation + 1,
         };
-        let single = Member::new("East".into(), options("east"), vec![existing]);
+        let single = Member::new("East".into(), Some(options("east")), vec![existing]);
         assert!(single.choice == Some(id));
         let mut multiple = Member::new(
             "East".into(),
-            options("east"),
+            Some(options("east")),
             vec![candidate(2, 1), candidate(3, 1)],
         );
         assert!(multiple.choice.is_none());
@@ -490,12 +703,16 @@ mod tests {
         let review = Review {
             name: "Fleet".into(),
             members: vec![
-                Member::new("East".into(), options("east"), vec![candidate(2, 1)]),
-                Member::new("West".into(), options("west"), Vec::new()),
+                Member::new("East".into(), Some(options("east")), vec![candidate(2, 1)]),
+                Member::new("West".into(), Some(options("west")), Vec::new()),
             ],
+            sets: SshRecipientSets::new(),
+            selected_set: None,
             feedback: String::new(),
         };
-        let current = [options("east"), options("west")];
+        let mut current = Profiles::default();
+        current.profiles.insert("East".into(), options("east"));
+        current.profiles.insert("West".into(), options("west"));
         assert!(
             review
                 .validate(&current, |approved, profile, options| {
@@ -509,9 +726,6 @@ mod tests {
                 })
                 .is_ok()
         );
-        let changed = [options("east"), options("new-west")];
-        let error = review.validate(&changed, |_, _, _| true).unwrap_err();
-        assert!(error.to_string().starts_with("SSH profiles changed"));
         let error = review
             .validate(&current, |approved, _, _| approved.generation == 2)
             .unwrap_err();
@@ -520,5 +734,61 @@ mod tests {
                 .to_string()
                 .contains("reviewed SSH connection for East changed")
         );
+        current.profiles.insert("West".into(), options("new-west"));
+        let error = review.validate(&current, |_, _, _| true).unwrap_err();
+        assert!(error.to_string().starts_with("SSH profiles changed"));
+    }
+
+    #[test]
+    fn a_launch_set_only_validates_the_reviewed_members_and_its_saved_definition() {
+        let sets = SshRecipientSets::from([
+            ("Canaries".into(), vec!["East".into()]),
+            ("Unavailable".into(), vec!["Offline".into()]),
+        ]);
+        let mut review = Review {
+            name: "Fleet".into(),
+            members: vec![
+                Member::new("East".into(), Some(options("east")), Vec::new()),
+                Member::new("West".into(), Some(options("west")), vec![candidate(2, 1)]),
+                Member::new("Offline".into(), None, Vec::new()),
+            ],
+            sets: sets.clone(),
+            selected_set: None,
+            feedback: String::new(),
+        };
+        review.select_set("Canaries".into()).unwrap();
+        assert!(matches!(
+            review.choices().as_slice(),
+            [Launch::Fresh, Launch::Skip, Launch::Skip]
+        ));
+        let error = review.select_set("Unavailable".into()).unwrap_err();
+        assert!(error.to_string().contains("unavailable SSH profile"));
+
+        let mut catalog = Profiles::default();
+        catalog.profiles.insert("East".into(), options("east"));
+        catalog.ssh_recipient_sets.insert("Fleet".into(), sets);
+        assert!(
+            review
+                .validate(&catalog, |_, _, _| panic!(
+                    "skipped connection was validated"
+                ))
+                .is_ok()
+        );
+
+        catalog
+            .ssh_recipient_sets
+            .get_mut("Fleet")
+            .unwrap()
+            .insert("Canaries".into(), vec!["West".into()]);
+        let error = review.validate(&catalog, |_, _, _| true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Recipient set Canaries changed")
+        );
+        review.include(0, false);
+        review.include(2, true);
+        let error = review.validate(&catalog, |_, _, _| true).unwrap_err();
+        assert_eq!(error.to_string(), "Include at least one SSH host.");
     }
 }
