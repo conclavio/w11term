@@ -1,6 +1,5 @@
 use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Result, ensure};
-use w11term::options::SshGroupLoginLimit;
 
 mod definition;
 mod duplicate;

@@ -1,17 +1,9 @@
 use super::{filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Context, Result, ensure};
-use w11term::options::{SshGroupLoginLimit, SshRecipientSets};
+use w11term::options::SshRecipientSets;
 
 pub(super) const LABEL: &str = "Review group launch…";
 const FRESH: &str = "Open a new SSH pane";
-const LOGIN_LIMITS: [(&str, SshGroupLoginLimit); 6] = [
-    ("Unlimited", SshGroupLoginLimit::Unlimited),
-    ("1 at a time", SshGroupLoginLimit::One),
-    ("2 at a time", SshGroupLoginLimit::Two),
-    ("4 at a time", SshGroupLoginLimit::Four),
-    ("8 at a time", SshGroupLoginLimit::Eight),
-    ("16 at a time", SshGroupLoginLimit::Sixteen),
-];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Offer {
@@ -323,7 +315,7 @@ pub enum Change {
     IncludeMatches(Vec<usize>, MatchSelection),
     ChooseMatches(Vec<usize>, ConnectionSelection),
     RecipientSet(String),
-    LoginLimit(usize),
+    LoginLimit(SshGroupLoginLimit),
     SaveLoginLimit(SshGroupLoginLimit),
     Approve(
         Vec<Launch>,
@@ -602,14 +594,7 @@ impl State {
                             .spacing(8.0)
                             .orientation(Orientation::Horizontal)
                             .children((
-                                TextBlock::new().vertical_alignment(VerticalAlignment::Center).text("Parallel SSH logins"),
-                                ComboBox::new()
-                                    .automation_name("Parallel SSH logins")
-                                    .items_source(LOGIN_LIMITS.map(|(label, _)| label))
-                                    .selected_index(LOGIN_LIMITS.iter().position(|(_, limit)| *limit == login_limit))
-                                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                                        index.map_or(Message::ControlIdle, |index| action(Change::LoginLimit(index)))
-                                    })),
+                                login_limit::picker(login_limit, true, move |limit| action(Change::LoginLimit(limit)), ctx),
                                 Button::new()
                                     .automation_name("Save login limit")
                                     .is_enabled(login_limit != review.roster_defaults.login_limit)
@@ -1235,11 +1220,9 @@ impl TerminalApp {
                     review.feedback = format!("{error:#}");
                 }
             }
-            Change::LoginLimit(index) => {
-                if let Some((_, limit)) = LOGIN_LIMITS.get(index)
-                    && let Some(page) = self.host_group_mut(id)
-                {
-                    page.saved.reuse.login_limit = *limit;
+            Change::LoginLimit(limit) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.saved.reuse.login_limit = limit;
                 }
             }
             Change::SaveLoginLimit(limit)

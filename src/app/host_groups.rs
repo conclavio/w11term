@@ -5,7 +5,7 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt, SshConnectionPhase,
 };
-use w11term::options::{SshRosterDefaults, SshRosterOrder as RosterOrder};
+use w11term::options::{SshGroupLoginLimit, SshRosterDefaults, SshRosterOrder as RosterOrder};
 use w11term::prompts::Question;
 mod address;
 mod close_ended;
@@ -17,6 +17,7 @@ mod filter;
 mod host_list_export;
 mod import;
 mod live_output;
+mod login_limit;
 mod membership;
 mod output_recording;
 mod progress;

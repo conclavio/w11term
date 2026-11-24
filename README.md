@@ -201,6 +201,8 @@ Choose **Save as default** beside the login limit to use it in future reviews an
 
 In a saved group's roster, **Reconnect selected** uses the same saved limit. Overlapping batches in the same roster share the queue. Each queued retry keeps its original pane and can be stopped from the roster.
 
+**Parallel SSH logins** is also available when reviewing an imported host list or adding saved profiles to a roster. A named roster starts these reviews at its saved limit. Changing the value in the review applies to this launch.
+
 When creating or editing a group, filter by profile name or SSH address. **Check matches** and **Uncheck matches** apply to every matching profile across pages. **Move up** and **Move down** change a checked profile’s position in the full group. Fresh tabs open in the saved order.
 
 Group tabs keep their own drafts, filters, host selections, and results. A named tab shows the panes opened for that group and panes added with **Import host list…**. Turn on **Show all window SSH panes** to include other connections in the roster. Turning it off clears checks on those other panes. **New SSH group tab** opens an independent window-wide roster with an empty selection. **SSH host group** returns to the most recently used group tab.

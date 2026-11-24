@@ -2,7 +2,10 @@ use super::*;
 use std::collections::BTreeMap;
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct Approval(BTreeMap<usize, Option<reuse::Connection>>);
+pub struct Approval {
+    choices: BTreeMap<usize, Option<reuse::Connection>>,
+    login_limit: SshGroupLoginLimit,
+}
 
 pub(super) struct Review {
     pub(super) rows: Vec<list::Row>,
@@ -67,9 +70,10 @@ impl Review {
         }
     }
 
-    fn approval(&self) -> Approval {
-        Approval(
-            self.checked
+    fn approval(&self, login_limit: SshGroupLoginLimit) -> Approval {
+        Approval {
+            choices: self
+                .checked
                 .iter()
                 .map(|&index| {
                     (
@@ -78,7 +82,8 @@ impl Review {
                     )
                 })
                 .collect(),
-        )
+            login_limit,
+        }
     }
 
     pub(super) fn choose(&mut self, index: usize, selected: Option<reuse::Connection>) {
@@ -111,6 +116,7 @@ impl Review {
         cancel: View,
         error: View,
         saved: bool,
+        login_limit: SshGroupLoginLimit,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         if let Some(editor) = &self.save {
@@ -149,10 +155,10 @@ impl Review {
             };
             KeyedView::new(index, view)
         });
-        let approval = self.approval();
+        let approval = self.approval(login_limit);
         let checked = self.checked.clone();
-        let reused = approval.0.values().flatten().count();
-        let count = approval.0.len();
+        let reused = approval.choices.values().flatten().count();
+        let count = approval.choices.len();
         let fresh = count - reused;
         let verb = if reused == 0 {
             "Open"
@@ -186,6 +192,12 @@ impl Review {
                         "Review SSH hosts"
                     }),
                     TextBlock::new().text(format!("{reused} to reuse · {fresh} to open")),
+                    login_limit::picker(
+                        login_limit,
+                        fresh > 0,
+                        move |limit| action(Change::LoginLimit(limit)),
+                        ctx,
+                    ),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
@@ -229,13 +241,13 @@ impl Review {
 
 fn launch_plan(
     rows: Vec<list::Row>,
-    approval: Approval,
+    approval: &Approval,
     review_again: &str,
     matches: impl Fn(reuse::Connection, &list::Target) -> bool,
 ) -> Result<Launch> {
     let mut launch = Launch::default();
     for (index, row) in rows.into_iter().enumerate() {
-        let (Some(&connection), Ok(target)) = (approval.0.get(&index), row.target) else {
+        let (Some(&connection), Ok(target)) = (approval.choices.get(&index), row.target) else {
             continue;
         };
         if let Some(connection) = connection {
@@ -305,7 +317,9 @@ impl TerminalApp {
             return;
         };
         let Some(review) = draft.review.as_ref().filter(|review| {
-            review.save.is_none() && !approval.0.is_empty() && review.approval() == approval
+            review.save.is_none()
+                && !approval.choices.is_empty()
+                && review.approval(draft.login_limit) == approval
         }) else {
             return;
         };
@@ -341,7 +355,7 @@ impl TerminalApp {
         } else {
             "preview the host list again"
         };
-        let launch = match launch_plan(rows, approval, review_again, |connection, target| {
+        let launch = match launch_plan(rows, &approval, review_again, |connection, target| {
             self.group_reuse_connection(connection.pane, target.profile.as_deref(), &target.ssh)
                 == Some(connection)
         }) {
@@ -366,7 +380,7 @@ impl TerminalApp {
             } else {
                 PaneLaunch::Select
             },
-            None,
+            approval.login_limit.concurrency(),
             ctx,
         );
         if let Some(page) = self.host_group_mut(id) {

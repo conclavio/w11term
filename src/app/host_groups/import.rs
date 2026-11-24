@@ -29,6 +29,7 @@ struct Draft {
     default_user: String,
     authentication: usize,
     identity: String,
+    login_limit: SshGroupLoginLimit,
     profiles: Option<Box<profiles::Picker>>,
     review: Option<Review>,
     error: Option<String>,
@@ -53,6 +54,7 @@ pub enum Change {
     RefreshProfiles,
     Check(usize, bool),
     Connection(usize, Option<reuse::Connection>),
+    LoginLimit(SshGroupLoginLimit),
     ReuseUnique,
     BeginSaveGroup(BTreeSet<usize>),
     SaveGroup(save_group::Action),
@@ -142,6 +144,7 @@ impl State {
                 cancel,
                 error_text(draft),
                 draft.profiles.is_some(),
+                draft.login_limit,
                 ctx,
             ));
         }
@@ -235,7 +238,10 @@ impl TerminalApp {
                 {
                     page.import.revision += 1;
                     page.import.feedback.clear();
-                    page.import.draft = Some(Draft::default());
+                    page.import.draft = Some(Draft {
+                        login_limit: page.roster_preferences.login_limit,
+                        ..Draft::default()
+                    });
                 }
                 return;
             }
@@ -252,6 +258,7 @@ impl TerminalApp {
                                 page.import.feedback.clear();
                                 page.import.draft = Some(Draft {
                                     profiles: Some(Box::new(profiles)),
+                                    login_limit: page.roster_preferences.login_limit,
                                     ..Draft::default()
                                 });
                             }
@@ -392,6 +399,14 @@ impl TerminalApp {
                     review.choose(index, connection);
                     draft.error = None;
                 }
+            }
+            Change::LoginLimit(limit)
+                if draft
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.save.is_none()) =>
+            {
+                draft.login_limit = limit;
             }
             Change::ReuseUnique => {
                 if let Some(review) = &mut draft.review {

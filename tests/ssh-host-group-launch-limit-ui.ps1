@@ -57,9 +57,9 @@ function Stop-HostLogin($Pane, $OtherPane) {
     }
 }
 
-function Wait-QueuedLogins([string]$Phase) {
+function Wait-QueuedLogins([string]$Phase, [string]$Labels = 'Login *') {
     Wait-Until "one $Phase login awaits a password and the other remains queued" {
-        $logins = @((Control @('list')).sessions | Where-Object label -like 'Login *')
+        $logins = @((Control @('list')).sessions | Where-Object label -like $Labels)
         $queued = $logins | Where-Object { $_.ssh_connection.phase -eq 'queued' }
         $auth = $logins | Where-Object {
             $_.ssh_connection.phase -eq $Phase -and
@@ -112,6 +112,36 @@ function Check-BulkReconnect($Initial) {
     }
     Finish-QueuedLogins $overlap 'reconnecting'
 }
+function Check-HostListImport {
+    Run-Palette 'New SSH group tab' -Enter
+    Click-Button ('Import host list' + [char]0x2026)
+    $field = Wait-Until 'the host list editor' {
+        $item = Find-Element 'SSH host list' $edit
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue(
+        "Imported East`r`nImported West")
+    Click-Button 'Preview hosts'
+    Expect-LoginLimit 'Unlimited'
+    Set-LoginLimit
+    Click-Button 'Edit host list'
+    Click-Button 'Preview hosts'
+    Expect-LoginLimit '1 at a time'
+    if ((Control @('list')).sessions | Where-Object label -like 'Imported *') {
+        throw 'The preview opened an SSH session before approval'
+    }
+    Click-Button 'Open 2 checked hosts'
+    $limits = Wait-QueuedLogins 'connecting' 'Imported *'
+    Finish-QueuedLogins $limits 'connecting'
+}
+function Check-SavedProfileDefault {
+    Click-Button ('Add saved profiles' + [char]0x2026)
+    (Wait-CheckBox 'Add SSH profile Imported East' Off).Toggle()
+    $null = Wait-CheckBox 'Add SSH profile Imported East' On
+    Click-Button 'Review selected profiles'
+    Expect-LoginLimit '1 at a time'
+    Click-Button 'Cancel'
+}
 
 $launch = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -147,6 +177,8 @@ try {
     Run-Palette "Open SSH group${dot}Limited" -Enter
     $initial = Check-InitialLogins
     Check-BulkReconnect $initial
+    Check-SavedProfileDefault
+    Check-HostListImport
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {
