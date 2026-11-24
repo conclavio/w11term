@@ -272,6 +272,17 @@ try {
         $eastLine = Find-Element 'east-accepted both'
         $westLine -and $eastLine -and $westLine.Current.BoundingRectangle.Top -lt $eastLine.Current.BoundingRectangle.Top
     }
+    $outputSearch = 'Find in live output'
+    $outputHosts = 'Filter live output by host'
+    (Command-Editor $outputSearch).SetValue('EAST-ACCEPTED')
+    $null = Wait-Until 'literal live output search finds East without regard to case' {
+        (Find-Element "Newest first${dot}1 of 2 retained lines") -and
+            (Find-Element 'east-accepted both') -and !(Find-Element 'west live first')
+    }
+    Select-ComboValue $outputHosts $westName
+    $null = Wait-Until 'the text search also respects the selected output host' {
+        (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'east-accepted both')
+    }
     Click 'Pause output'
     $null = Wait-Until 'output is paused' { Find-Element 'Resume output' $button }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-paused'), '')
@@ -279,13 +290,20 @@ try {
     $null = Wait-Until 'the recorder keeps writing while the display is paused' {
         [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains("$westName$($dot)west while paused")
     }
+    (Command-Editor $outputSearch).SetValue('WHILE')
     $until = [DateTime]::UtcNow.AddMilliseconds(650)
     do {
-        if (Find-Element 'west while paused') { throw 'Output changed while paused' }
+        if ((Find-Element 'west while paused') -or
+            !(Find-Element "Paused${dot}newest first${dot}0 of 2 retained lines")) {
+            throw 'Filtered output changed while paused'
+        }
         Start-Sleep -Milliseconds 120
     } while ([DateTime]::UtcNow -lt $until)
     Click 'Resume output'
-    $null = Wait-Until 'output received while paused is available on resume' { Find-Element 'west while paused' }
+    $null = Wait-Until 'matching output received while paused is available on resume' {
+        (Find-Element "Newest first${dot}1 of 3 retained lines") -and
+            (Find-Element 'west while paused') -and !(Find-Element 'west live first')
+    }
     Click "Focus output pane $west"
     Wait-Focus $west
     [IO.File]::WriteAllText((Join-Path $State 'release-west-away'), '')
@@ -294,7 +312,13 @@ try {
     }
     Run-Palette 'SSH host group'
     $null = Wait-Until 'the same output view returns after focusing its source pane' {
-        (Find-Element 'SSH group live output') -and (Find-Element 'west while paused')
+        (Find-Element 'SSH group live output') -and (Find-Element 'west while paused') -and
+            (Find-Element 'west while away') -and !(Find-Element 'east-accepted both')
+    }
+    Click 'Clear output filters'
+    $null = Wait-Until 'clearing the filters restores all retained output' {
+        (Find-Element 'east-accepted both') -and (Find-Element 'west live first') -and
+            (Find-Element 'Newest first')
     }
     Click 'Stop recording'
     $firstRecordedPath = Wait-RecordingStatus 'Saved live output to ' $logFile -PassThru

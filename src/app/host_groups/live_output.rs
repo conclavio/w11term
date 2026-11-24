@@ -1,18 +1,64 @@
 use super::*;
+use regex::{Regex, RegexBuilder};
 use std::collections::BTreeMap;
-use w11term::events::GroupTranscriptSnapshot;
+use w11term::{
+    events::{GroupTranscriptLine, GroupTranscriptSnapshot},
+    search::MAX_QUERY_BYTES,
+};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Action {
     Open,
     Back,
     Pause,
     Resume,
+    Search(String),
+    FilterHost(Option<u64>),
+    ClearFilters,
 }
 
 pub(super) struct State {
     pub(super) submission: u64,
     paused: Option<GroupTranscriptSnapshot>,
+    filter: Filter,
+}
+
+#[derive(Default)]
+struct Filter {
+    query: String,
+    matcher: Option<Regex>,
+    pane: Option<u64>,
+}
+
+impl Filter {
+    fn set_query(&mut self, mut query: String) {
+        query.truncate(query.floor_char_boundary(query.len().min(MAX_QUERY_BYTES)));
+        if self.query == query {
+            return;
+        }
+        self.matcher = if query.is_empty() {
+            None
+        } else {
+            RegexBuilder::new(&regex::escape(&query))
+                .case_insensitive(true)
+                .build()
+                .ok()
+        };
+        self.query = query;
+    }
+
+    fn active(&self) -> bool {
+        self.pane.is_some() || !self.query.is_empty()
+    }
+
+    fn includes(&self, line: &GroupTranscriptLine) -> bool {
+        self.pane.is_none_or(|pane| pane == line.pane)
+            && (self.query.is_empty()
+                || self
+                    .matcher
+                    .as_ref()
+                    .is_some_and(|query| query.is_match(&line.text)))
+    }
 }
 
 impl Submission {
@@ -36,10 +82,19 @@ impl HostGroup {
         };
         if matches!(action, Action::Open) && self.live_output.is_none() && !self.saved.is_editing()
         {
-            self.live_output = Some(State {
+            self.live_output = Some(Box::new(State {
                 submission: id,
                 paused: None,
-            });
+                filter: Filter::default(),
+            }));
+            return;
+        }
+        if let Action::FilterHost(Some(pane)) = action
+            && !submission
+                .results
+                .iter()
+                .any(|delivery| delivery.target.pane == pane)
+        {
             return;
         }
         let pause = matches!(action, Action::Pause).then(|| submission.output_snapshot());
@@ -56,6 +111,9 @@ impl HostGroup {
                 output.paused = pause;
             }
             Action::Resume => output.paused = None,
+            Action::Search(query) => output.filter.set_query(query),
+            Action::FilterHost(pane) => output.filter.pane = pane,
+            Action::ClearFilters => output.filter = Filter::default(),
             _ => {}
         }
     }
@@ -82,6 +140,7 @@ impl TerminalApp {
             .lines
             .iter()
             .rev()
+            .filter(|line| output.filter.includes(line))
             .filter_map(|line| {
                 let pane = line.pane;
                 let name = names.get(&pane)?;
@@ -105,6 +164,8 @@ impl TerminalApp {
             })
             .collect();
         let submission_id = submission.id;
+        let send =
+            move |action| Message::HostGroup(super::Action::LiveOutput(id, submission_id, action));
         let (pause_label, pause_action) = if output.paused.is_some() {
             ("Resume output", Action::Resume)
         } else {
@@ -115,6 +176,57 @@ impl TerminalApp {
         } else {
             "Newest first"
         };
+        let panes: Vec<_> = std::iter::once(None)
+            .chain(
+                submission
+                    .results
+                    .iter()
+                    .map(|delivery| Some(delivery.target.pane)),
+            )
+            .collect();
+        let hosts = ComboBox::new()
+            .grid_column(1)
+            .automation_name("Filter live output by host")
+            .max_width(320.0)
+            .items_source(
+                std::iter::once("All output hosts").chain(
+                    submission
+                        .results
+                        .iter()
+                        .map(|delivery| delivery.target.name.as_str()),
+                ),
+            )
+            .selected_index(panes.iter().position(|&pane| pane == output.filter.pane))
+            .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                index
+                    .and_then(|index| panes.get(index))
+                    .map_or(Message::ControlIdle, |&pane| send(Action::FilterHost(pane)))
+            }));
+        let search = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+            .column_spacing(8.0)
+            .children((
+                TextBox::new()
+                    .automation_name("Find in live output")
+                    .placeholder_text("Find text in live output")
+                    .text(&output.filter.query)
+                    .on_text_changed(ctx.callback(move |query| send(Action::Search(query)))),
+                hosts,
+                Button::new()
+                    .grid_column(2)
+                    .is_enabled(output.filter.active())
+                    .on_click(ctx.callback(move |_| send(Action::ClearFilters)))
+                    .content("Clear output filters"),
+            ));
+        let status = if output.filter.active() {
+            Cow::Owned(format!(
+                "{status} · {} of {} retained lines",
+                lines.len(),
+                snapshot.lines.len()
+            ))
+        } else {
+            Cow::Borrowed(status)
+        };
         let retention = if snapshot.omitted == 0 {
             View::empty()
         } else {
@@ -123,7 +235,7 @@ impl TerminalApp {
                 .text_wrapping(TextWrapping::Wrap)
                 .into()
         };
-        let content = if lines.is_empty() {
+        let content = if snapshot.lines.is_empty() {
             TextBlock::new()
                 .text("No marked output yet. Prompt-only shells show output in their panes.")
                 .text_wrapping(TextWrapping::Wrap)
@@ -145,30 +257,49 @@ impl TerminalApp {
                         .orientation(Orientation::Horizontal)
                         .children((
                             Button::new()
-                                .on_click(ctx.callback(move |_| {
-                                    Message::HostGroup(super::Action::LiveOutput(
-                                        id,
-                                        submission_id,
-                                        Action::Back,
-                                    ))
-                                }))
+                                .on_click(ctx.callback(move |_| send(Action::Back)))
                                 .content("Back to results"),
                             Button::new()
-                                .on_click(ctx.callback(move |_| {
-                                    Message::HostGroup(super::Action::LiveOutput(
-                                        id,
-                                        submission_id,
-                                        pause_action,
-                                    ))
-                                }))
+                                .on_click(ctx.callback(move |_| send(pause_action.clone())))
                                 .content(pause_label),
                             output_recording::button(id, submission, ctx),
                         )),
-                    TextBlock::new().text(status),
+                    search,
+                    TextBlock::new().text(status.as_ref()),
                     output_recording::status_view(id, submission, ctx),
                     retention,
                 )),
                 ScrollViewer::new().grid_row(1).content(content),
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_output_filters_match_literal_unicode_text_and_source_together() {
+        let line = |pane, text: &str| GroupTranscriptLine {
+            id: pane,
+            pane,
+            text: text.into(),
+            shortened: false,
+        };
+        let east = line(1, "Result [ÉTAT]");
+        let west = line(2, "result [état]");
+        let other = line(1, "Result ÉTAT");
+        let mut filter = Filter::default();
+        assert!(filter.includes(&other));
+        filter.set_query("[état]".into());
+        assert!(filter.includes(&east) && filter.includes(&west));
+        assert!(!filter.includes(&other));
+        filter.pane = Some(2);
+        assert!(!filter.includes(&east));
+        assert!(filter.includes(&west));
+        filter.set_query(String::new());
+        assert!(!filter.includes(&east));
+        assert!(filter.includes(&west));
+        assert!(filter.active());
     }
 }
