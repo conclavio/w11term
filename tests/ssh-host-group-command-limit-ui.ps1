@@ -614,6 +614,34 @@ try {
     $null = Wait-Until 'the draft still uses the configured East canary' {
         Find-Element "Canary first${dot}$($labels.East)"
     }
+    Click 'Back to roster and results'
+    Select-GroupOption 'Canary host' 'No canary'
+    Select-GroupOption 'Parallel SSH commands' 'Unlimited'
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $parallelLog = Join-Path $State 'cli-serial-output.txt'
+    $serialArgs = @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)")
+    $serial = Control ($serialArgs + @('--parallel','1','--record-output',$parallelLog,'--','verify-parallel'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started verify-parallel')
+    $queued = (Run-Snapshot $serial.run_id).run
+    if ($queued.dispatch_policy.parallel_limit -ne 1 -or $queued.queue.unsent -ne 1 -or
+        $queued.recipients[1].delivery.state -cne 'queued') {
+        throw 'The recorded CLI command did not honor its serial dispatch limit'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-verify-parallel') | Out-Null
+    $settledSerial = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($serial.run_id)",'--require-success','--timeout','10')
+    if ($settledSerial.run.recording.state -cne 'saved' -or
+        !(Read-GroupRecording $parallelLog).Contains('parallel limit 1')) {
+        throw 'The serial run did not preserve its policy in the saved recording'
+    }
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $default = Control ($serialArgs + @('--dry-run','--','verify-parallel'))
+    if ($null -ne $default.plan.dispatch_policy.parallel_limit) {
+        throw 'The per-run override changed the configured parallel limit'
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

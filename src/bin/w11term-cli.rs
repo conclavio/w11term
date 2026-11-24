@@ -366,6 +366,8 @@ mod tests {
             "5",
             "--canary",
             "5",
+            "--parallel",
+            "3",
             "--dry-run",
             "--expect-output",
             "^READY [0-9]+$",
@@ -380,6 +382,7 @@ mod tests {
         let checked = serde_json::to_value(checked).unwrap();
         assert_eq!(checked["dry_run"], true);
         assert_eq!(checked["canary_pane_id"], 5);
+        assert_eq!(checked["parallel_limit"], 3);
         assert_eq!(
             checked["expect_output"],
             serde_json::json!({ "query":"^READY [0-9]+$", "regex":true, "match_case":true }),
@@ -399,6 +402,9 @@ mod tests {
             &["--pane", "5", "--match-case", "show"],
             &["--pane", "9", "--pane", "5", "--canary", "8", "show"],
             &["--pane", "5", "--canary", "5", "show"],
+            &["--pane", "5", "--parallel", "0", "show"],
+            &["--pane", "5", "--parallel", "-1", "show"],
+            &["--pane", "5", "--parallel", "1", "--parallel", "4", "show"],
             &[
                 "--pane", "5", "--pane", "9", "--canary", "5", "--canary", "9", "show",
             ],

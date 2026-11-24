@@ -32,6 +32,7 @@ pub struct SshGroupExpectedOutput {
 pub struct SshGroupCommandOptions {
     pub dry_run: bool,
     pub canary_pane_id: Option<u64>,
+    pub parallel_limit: Option<NonZeroUsize>,
     pub expect_output: Option<(SshGroupExpectedOutput, Regex)>,
     pub record_output: Option<PathBuf>,
 }
@@ -40,6 +41,7 @@ impl SshGroupCommandOptions {
     pub(super) fn prepare(
         dry_run: bool,
         canary_pane_id: Option<u64>,
+        parallel_limit: Option<NonZeroUsize>,
         expect_output: Option<SshGroupExpectedOutput>,
         record_output: Option<PathBuf>,
     ) -> Result<Self> {
@@ -57,6 +59,7 @@ impl SshGroupCommandOptions {
         Ok(Self {
             dry_run,
             canary_pane_id,
+            parallel_limit,
             expect_output,
             record_output,
         })
@@ -896,6 +899,7 @@ mod tests {
                 assert_eq!(pane_ids, [8, 7]);
                 assert_eq!(command, "show  status");
                 assert_eq!(options.canary_pane_id, Some(7));
+                assert_eq!(options.parallel_limit.map(NonZeroUsize::get), Some(3));
                 assert_eq!(
                     options.record_output,
                     Some(PathBuf::from(r"C:\fixture\capture.txt"))
@@ -983,6 +987,7 @@ mod tests {
             "pane_ids": [8, 7],
             "command": "show  status",
             "canary_pane_id": 7,
+            "parallel_limit": 3,
             "expect_output": { "query": "^READY [0-9]+$", "regex": true, "match_case": true },
             "record_output": r"C:\fixture\capture.txt",
         });

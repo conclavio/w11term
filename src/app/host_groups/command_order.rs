@@ -110,7 +110,7 @@ pub(super) fn preview(
     offer: &CommandOffer,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
-    let limit = offer.limit.concurrency();
+    let limit = offer.parallel_limit;
     let interval = offer.interval.duration();
     let canary = offer.canary.is_some();
     let ordered = page.orders_commands();

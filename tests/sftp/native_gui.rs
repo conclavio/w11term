@@ -1652,6 +1652,12 @@ async fn native_ssh_group_bounds_parallel_commands() {
                                 "East received the override before West was approved"
                             );
                         }
+                        if name == "East" && line == "verify-parallel" {
+                            assert!(
+                                fixtures.join("release-verify-parallel").is_file(),
+                                "East received the command while the serial West slot was occupied"
+                            );
+                        }
                         let handle = peer.as_ref().unwrap();
                         handle
                             .data(
@@ -1713,11 +1719,11 @@ async fn native_ssh_group_bounds_parallel_commands() {
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
             "West" => {
-                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\r"
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\r"
                     .as_slice()
             }
             "East" => {
-                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\r"
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\r"
             }
             _ => b"xrestore-promptskip-middle\r",
         };

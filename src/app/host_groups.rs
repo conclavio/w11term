@@ -168,7 +168,7 @@ impl Drop for Submission {
 pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
-    limit: SshGroupParallelLimit,
+    parallel_limit: Option<usize>,
     interval: SshGroupCommandInterval,
     queue_expiry: SshGroupQueueExpiry,
     stop_queue_on_failure: bool,
@@ -626,7 +626,7 @@ impl HostGroup {
         CommandOffer {
             text,
             targets,
-            limit: self.roster_preferences.command_limit,
+            parallel_limit: self.roster_preferences.command_limit.concurrency(),
             interval: self.roster_preferences.command_interval,
             queue_expiry: self.roster_preferences.command_queue_expiry,
             stop_queue_on_failure: self.roster_preferences.stop_command_queue_on_failure,
@@ -1172,7 +1172,7 @@ impl TerminalApp {
         let CommandOffer {
             text,
             targets,
-            limit,
+            parallel_limit,
             interval,
             queue_expiry,
             stop_queue_on_failure,
@@ -1191,7 +1191,7 @@ impl TerminalApp {
                 .iter()
                 .map(|target| target.pane)
                 .eq(targets.iter().map(|target| target.pane))
-            && page.roster_preferences.command_limit == *limit
+            && page.roster_preferences.command_limit.concurrency() == *parallel_limit
             && page.roster_preferences.command_interval == *interval
             && page.roster_preferences.command_queue_expiry == *queue_expiry
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
@@ -1236,9 +1236,13 @@ impl TerminalApp {
         let deadline = policy
             .queue_expiry_ms
             .map(|ms| Instant::now() + Duration::from_millis(ms));
-        let slots = policy.parallel_limit.or_else(|| {
-            (canary.is_some() || !interval.is_zero() || deadline.is_some()).then_some(targets.len())
-        });
+        let slots = policy
+            .parallel_limit
+            .map(|limit| limit.min(targets.len()))
+            .or_else(|| {
+                (canary.is_some() || !interval.is_zero() || deadline.is_some())
+                    .then_some(targets.len())
+            });
         let results = targets
             .into_iter()
             .map(|target| {

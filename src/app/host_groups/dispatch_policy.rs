@@ -19,7 +19,7 @@ struct Canary {
 
 impl CommandOffer {
     pub(super) fn dispatch_policy(&self) -> Policy {
-        let parallel_limit = self.limit.concurrency();
+        let parallel_limit = self.parallel_limit;
         let interval_ms = u64::try_from(self.interval.duration().as_millis()).unwrap_or(u64::MAX);
         let queue_expiry_ms = self
             .queue_expiry

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    num::NonZeroUsize,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -117,6 +118,8 @@ pub enum Request {
         dry_run: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         canary_pane_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parallel_limit: Option<NonZeroUsize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect_output: Option<SshGroupExpectedOutput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -678,6 +681,7 @@ impl Registry {
                 command,
                 dry_run,
                 canary_pane_id,
+                parallel_limit,
                 expect_output,
                 record_output,
             } => {
@@ -685,6 +689,7 @@ impl Registry {
                 let options = SshGroupCommandOptions::prepare(
                     dry_run,
                     canary_pane_id,
+                    parallel_limit,
                     expect_output,
                     record_output,
                 )?;

@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
+use std::num::NonZeroUsize;
 use w11term::control::{
     SshGroupCommandOptions, SshGroupOutput, SshGroupReadiness, SshGroupReportFormat,
     SshGroupReportWriter,
@@ -12,6 +13,7 @@ pub struct PreparedControlRecording {
     tab: TabId,
     offer: CommandOffer,
     canary_pane_id: Option<u64>,
+    parallel_limit: Option<NonZeroUsize>,
     alert: Option<alerted_send::Alert>,
     file: Result<output_recording::PreparedFile, String>,
     reply: ControlReply,
@@ -198,8 +200,14 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         let canary_pane_id = options.canary_pane_id;
-        let offer = match self.control_command_offer(tab, pane_ids, command.into(), canary_pane_id)
-        {
+        let parallel_limit = options.parallel_limit;
+        let offer = match self.control_command_offer(
+            tab,
+            pane_ids,
+            command.into(),
+            canary_pane_id,
+            parallel_limit,
+        ) {
             Ok(offer) => offer,
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -249,6 +257,7 @@ impl TerminalApp {
                     tab,
                     offer,
                     canary_pane_id,
+                    parallel_limit,
                     alert,
                     file,
                     reply,
@@ -266,6 +275,7 @@ impl TerminalApp {
             tab,
             offer,
             canary_pane_id,
+            parallel_limit,
             alert,
             file,
             reply,
@@ -275,8 +285,13 @@ impl TerminalApp {
         }
         let result = file.and_then(|file| {
             let panes: Vec<_> = offer.targets.iter().map(|target| target.pane).collect();
-            let latest =
-                self.control_command_offer(tab, &panes, offer.text.clone(), canary_pane_id)?;
+            let latest = self.control_command_offer(
+                tab,
+                &panes,
+                offer.text.clone(),
+                canary_pane_id,
+                parallel_limit,
+            )?;
             if latest.canary != offer.canary {
                 return Err("The SSH canary changed while preparing the recording".into());
             }
@@ -304,6 +319,7 @@ impl TerminalApp {
         pane_ids: &[u64],
         command: Arc<str>,
         canary_pane_id: Option<u64>,
+        parallel_limit: Option<NonZeroUsize>,
     ) -> Result<CommandOffer, String> {
         let targets = self.host_group_targets();
         let Some(Page::HostGroup(page)) = self.tabs.get_mut(tab).map(|tab| &mut tab.page) else {
@@ -339,7 +355,11 @@ impl TerminalApp {
             "Include the canary at a fresh shell marker and at least one other ready SSH pane"
                 .to_owned()
         })?;
-        Ok(page.command_offer(command, recipients, canary))
+        let mut offer = page.command_offer(command, recipients, canary);
+        if let Some(limit) = parallel_limit {
+            offer.parallel_limit = Some(limit.get());
+        }
+        Ok(offer)
     }
 
     fn dispatch_control_offer(
