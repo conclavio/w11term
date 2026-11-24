@@ -422,6 +422,20 @@ try {
         [IO.File]::Exists($excerptPath) -and
             [IO.File]::ReadAllText($excerptPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $excerpt
     }
+    $outputContext = 'Show surrounding lines'
+    Select-ComboValue $outputHosts 'All output hosts'
+    (Wait-CheckBox $outputContext Off).Toggle()
+    $null = Wait-Until 'context includes West neighbors while the combined feed excludes unrelated East lines' {
+        (Find-Element 'west live first') -and (Find-Element 'Context') -and
+            (Find-Element 'west while paused') -and !(Find-Element 'east-accepted both')
+    }
+    Click 'Copy shown output'
+    $null = Wait-Until 'copy includes the surrounding West lines' {
+        $text = Read-ClipboardFixture
+        $text -and $text.Contains("$westName${dot}west live first") -and
+            $text.Contains("$westName${dot}west while away") -and !$text.Contains('east-accepted both')
+    }
+    Select-ComboValue $outputHosts $westName
     $outputRun = 'Live output run'
     $outputPattern = '^WEST WHILE (PAUSED|AWAY)$'
     Click 'Pause output'
@@ -436,9 +450,10 @@ try {
     }
     Select-ComboValue $outputRun "Run 2${dot}both"
     $null = Wait-CheckBox $outputRegex On
+    $null = Wait-CheckBox $outputContext On
     $null = Wait-Until 'returning restores the same scoped lines without the prior pause' {
         (Find-Element 'Pause output' $button) -and (Find-Element 'west while paused') -and
-            (Find-Element 'west while away') -and !(Find-Element 'west live first') -and
+            (Find-Element 'west while away') -and (Find-Element 'west live first') -and
             (Command-Editor $outputSearch).Current.Value -ceq $outputPattern
     }
     Wait-RecordingStatus 'Recording live output to ' $logFile
@@ -449,6 +464,7 @@ try {
     }
     $null = Wait-CheckBox $outputRegex Off
     $null = Wait-CheckBox $outputCase Off
+    $null = Wait-CheckBox $outputContext Off
     Click 'Stop recording'
     $firstRecordedPath = Wait-RecordingStatus 'Saved live output to ' $logFile -PassThru
     $logReader.Dispose()

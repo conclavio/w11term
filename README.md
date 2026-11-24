@@ -159,6 +159,8 @@ Choose **Live output…** on a submission to follow recent output from all its h
 
 **Find in live output** starts with case-insensitive literal search. Turn on **Regular expression** to match a pattern against each retained line or **Match case** to distinguish uppercase from lowercase. Use the host dropdown to narrow the results to one SSH pane. The match count uses the retained lines in the selected feed. The view keeps the filters when you pause, resume, or visit an originating pane. An invalid pattern shows a diagnostic and disables export until corrected. **Clear output filters** restores the combined feed and the default search options.
 
+Turn on **Show surrounding lines** to include up to two retained lines before and after each match from the same host. The view labels those lines as context and shows the match count separately. Copy and save include the context in the order shown.
+
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.

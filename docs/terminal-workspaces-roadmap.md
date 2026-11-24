@@ -231,6 +231,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 115. **Search group output with a pattern.** Offer regular-expression and case-sensitive matching alongside the host filter. Report invalid patterns and export the same retained lines shown in the view.
 116. **Switch runs within live output.** Carry the query and host scope across retained submissions. Show when the selected host is absent, and keep each recording attached to its original run.
 117. **Retain output per host on busy runs.** Reserve bounded history for each emitting pane. Use it for the selected host's live, paused, and exported output while keeping the combined feed in arrival order.
+118. **Show search context from the matching host.** Include nearby retained lines, label context separately, and copy or save the resulting excerpt in the same order.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
