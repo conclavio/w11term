@@ -25,22 +25,22 @@ function Set-Command([string]$Command) {
     $field = Wait-Until 'group command' { Find-Element 'Group command' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
 }
-function Set-OneAtATime {
+function Select-GroupOption([string]$Name, [string]$Label) {
     $combo = [System.Windows.Automation.ControlType]::ComboBox
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $field = Wait-Until 'parallel command limit' { Find-Element 'Parallel SSH commands' $combo }
+    $field = Wait-Until "enabled '$Name'" { $entry = Find-Element $Name $combo; if ($entry -and $entry.Current.IsEnabled) { $entry } }
     $popup = $field.GetCurrentPattern($expand)
     $popup.Expand()
-    $option = Wait-Until 'visible one-at-a-time limit' {
-        Find-Element '1 at a time' ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    $option = Wait-Until "visible option '$Label'" {
+        Find-Element $Label ([System.Windows.Automation.ControlType]::ListItem) -Visible
     }
     $option.GetCurrentPattern($item).Select()
-    $null = Wait-Until 'one-at-a-time command limit selected' {
-        $entry = Find-Element 'Parallel SSH commands' $combo
+    $null = Wait-Until "'$Name' selected '$Label'" {
+        $entry = Find-Element $Name $combo
         $selected = $entry.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
-        $selected.Count -eq 1 -and $selected[0].Current.Name -ceq '1 at a time'
+        $selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Label
     }
-    $popup = (Find-Element 'Parallel SSH commands' $combo).GetCurrentPattern($expand)
+    $popup = (Find-Element $Name $combo).GetCurrentPattern($expand)
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 
@@ -57,7 +57,7 @@ try {
         $null = Control @('wait-for-text','--pane',"$($panes[$name])",'--timeout','10','fixture$')
         $labels[$name] = "$name${dot}test@127.0.0.1:$($config.$name.port)${dot}Pane $($panes[$name])"
     }
-    Set-OneAtATime
+    Select-GroupOption 'Parallel SSH commands' '1 at a time'
     Set-Command 'roll'
     Click 'Send to 3 hosts'
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started roll')
@@ -137,6 +137,65 @@ try {
         Find-Element "$($labels.East)${dot}Sent to SSH channel"
     }
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
+
+    Select-GroupOption 'Parallel SSH commands' 'Unlimited'
+    Select-GroupOption 'Canary host' $labels.East
+    Set-Command 'canary-ok'
+    (Wait-CheckBox $labels.East On).Toggle()
+    $null = Wait-Until 'removing the canary blocks submission' {
+        $send = Find-Element 'Run canary first' $button
+        ($send -and !$send.Current.IsEnabled) -and
+            (Find-Element 'The canary must be checked, visible, and at a fresh shell marker.')
+    }
+    (Wait-CheckBox $labels.East Off).Toggle()
+    Click ('Run canary and record' + [char]0x2026)
+    $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-ok')
+    $null = Wait-Until 'only East runs before a canary result' {
+        (Find-Element "$($labels.West)${dot}Queued") -and
+            (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
+            !(Find-Element 'Approve remaining hosts' $button)
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-canary') | Out-Null
+    $null = Wait-Until 'East succeeds and West still requires approval' {
+        (Find-Element "$($labels.East)${dot}Exit 0") -and
+            (Find-Element "$($labels.West)${dot}Queued") -and
+            (Find-Element "$($labels.East)${dot}Canary succeeded. Review its result before continuing.") -and
+            (Find-Element 'Approve remaining hosts' $button)
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-canary-ok') | Out-Null
+    New-Item -ItemType File -Path (Join-Path $State 'approve-canary-ok') | Out-Null
+    Click 'Approve remaining hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished canary-ok')
+
+    Set-Command 'canary-fails'
+    Click 'Run canary first'
+    $null = Wait-Until 'a failed canary withholds West even with an unlimited command limit' {
+        (Find-Element "$($labels.East)${dot}Exit 17") -and
+            (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
+            !(Find-Element 'Approve remaining hosts' $button)
+    }
+
+    Set-Command 'canary-unknown'
+    Click 'Run canary first'
+    $null = Wait-Until 'a canary without an exit status withholds West' {
+        (Find-Element "$($labels.East)${dot}Completed${dot}exit status unavailable") -and
+            (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
+            !(Find-Element 'Approve remaining hosts' $button)
+    }
+
+    Set-Command 'canary-stale'
+    Click 'Run canary first'
+    $null = Wait-Until 'the canary succeeds before West changes its prompt' {
+        (Find-Element "$($labels.East)${dot}Exit 0") -and
+            (Find-Element "$($labels.West)${dot}Queued") -and (Find-Element 'Approve remaining hosts' $button)
+    }
+    $null = Control @('send-text','--pane',"$($panes.West)",'--no-paste','x')
+    Click 'Approve remaining hosts'
+    $null = Wait-Until 'approval still rechecks the queued prompt' {
+        Find-Element "$($labels.West)${dot}Not sent${dot}The verified prompt changed before the command was sent."
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

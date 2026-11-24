@@ -1525,7 +1525,7 @@ async fn native_ssh_group_notifies_when_watched_logins_settle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "bounds SSH group execution and verifies pause, resume, cancellation, and stop-on-failure"]
+#[ignore = "bounds SSH group execution and verifies queue controls and canary approval"]
 async fn native_ssh_group_bounds_parallel_commands() {
     use in_band_resize::Wire;
 
@@ -1563,6 +1563,13 @@ async fn native_ssh_group_bounds_parallel_commands() {
                                 "East received the command while paused"
                             );
                         }
+                        if name == "West" && line.starts_with("canary-") {
+                            assert_eq!(line, "canary-ok", "a failed canary reached another host");
+                            assert!(
+                                fixtures.join("approve-canary-ok").is_file(),
+                                "West received the command without approval"
+                            );
+                        }
                         let handle = peer.as_ref().unwrap();
                         handle
                             .data(
@@ -1578,8 +1585,17 @@ async fn native_ssh_group_bounds_parallel_commands() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }
-                        let code = if line == "halt-on-failure" { 17 } else { 0 };
-                        let end = format!("{name} finished {line}\r\n\x1b]133;D;{code}\x07");
+                        if name == "East" && line == "canary-ok" {
+                            while !fixtures.join("release-east-canary").is_file() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        let status = match line {
+                            "halt-on-failure" | "canary-fails" => ";17",
+                            "canary-unknown" => "",
+                            _ => ";0",
+                        };
+                        let end = format!("{name} finished {line}\r\n\x1b]133;D{status}\x07");
                         handle
                             .data(id, [end.as_bytes(), prompt.as_slice()].concat())
                             .await
@@ -1604,8 +1620,8 @@ async fn native_ssh_group_bounds_parallel_commands() {
     drive_gui("ssh-host-group-command-limit-ui.ps1", state.path());
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
-            "West" => b"roll\rkeep-first\rhalt-on-failure\rinspect\r".as_slice(),
-            "East" => b"roll\rinspect\r",
+            "West" => b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rx".as_slice(),
+            "East" => b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\r",
             _ => b"x",
         };
         assert_eq!(inputs.lock().unwrap().as_slice(), expected, "{name}");

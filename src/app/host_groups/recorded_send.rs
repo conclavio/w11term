@@ -42,12 +42,17 @@ pub(super) fn button(
     enabled: bool,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
+    let label = if offer.canary.is_some() {
+        "Run canary and record…"
+    } else {
+        "Send and record…"
+    };
     Button::new()
         .is_enabled(enabled)
         .on_click(ctx.callback(move |_| {
             Message::HostGroup(super::Action::RecordedSend(id, Action::Pick(offer.clone())))
         }))
-        .content("Send and record…")
+        .content(label)
 }
 
 impl TerminalApp {

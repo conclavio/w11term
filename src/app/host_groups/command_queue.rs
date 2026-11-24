@@ -2,26 +2,110 @@ use super::*;
 use w11term::events::GroupTranscriptHost;
 
 const FAILED_RESULT: &str = "Queue stopped after an unsuccessful host.";
+const CANARY_FAILED: &str = "Canary did not report a successful exit.";
 
 pub enum Action {
     SetPaused(bool),
+    ApproveCanary,
     Cancel,
+}
+
+enum CanaryGate {
+    Pending(u64),
+    AwaitingApproval,
+    Failed,
 }
 
 pub(super) struct Queue {
     slots: Arc<Semaphore>,
     stop_on_failure: bool,
     paused: bool,
+    canary: Option<u64>,
 }
 
 impl Queue {
-    pub(super) fn new(limit: usize, stop_on_failure: bool) -> Self {
+    pub(super) fn new(limit: usize, stop_on_failure: bool, canary: Option<u64>) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(limit)),
             stop_on_failure,
             paused: false,
+            canary,
         }
     }
+
+    fn canary_gate(&self, transcript: &GroupTranscript) -> Option<CanaryGate> {
+        let pane = self.canary?;
+        Some(match transcript.settled_host_succeeded(pane) {
+            None => CanaryGate::Pending(pane),
+            Some(true) => CanaryGate::AwaitingApproval,
+            Some(false) => CanaryGate::Failed,
+        })
+    }
+}
+
+pub(super) fn canary_readiness(
+    targets: &[Target],
+    canary: Option<u64>,
+) -> Result<(), &'static str> {
+    let Some(pane) = canary else {
+        return Ok(());
+    };
+    if !targets
+        .iter()
+        .any(|target| target.pane == pane && matches!(target.state, TargetState::Ready(_)))
+    {
+        return Err("The canary must be checked, visible, and at a fresh shell marker.");
+    }
+    if !targets
+        .iter()
+        .any(|target| target.pane != pane && target.state.is_ready())
+    {
+        return Err("Check another ready host to run after the canary.");
+    }
+    Ok(())
+}
+
+pub(super) fn canary_picker(
+    id: TabId,
+    page: &HostGroup,
+    targets: &[Target],
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let mut hosts = vec![(None, "No canary".to_string())];
+    hosts.extend(
+        targets
+            .iter()
+            .map(|target| (Some(target.pane), target.name.clone())),
+    );
+    if let Some(pane) = page
+        .canary
+        .filter(|pane| !targets.iter().any(|target| target.pane == *pane))
+    {
+        hosts.push((Some(pane), format!("Canary unavailable · Pane {pane}")));
+    }
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(8.0)
+        .children((
+            TextBlock::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .text("Canary host"),
+            ComboBox::new()
+                .automation_name("Canary host")
+                .max_width(248.0)
+                .is_enabled(
+                    !page.recorded_send.pending() && (page.canary.is_some() || targets.len() > 1),
+                )
+                .items_source(hosts.iter().map(|(_, label)| label.as_str()))
+                .selected_index(hosts.iter().position(|(pane, _)| *pane == page.canary))
+                .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                    index
+                        .and_then(|index| hosts.get(index))
+                        .map_or(Message::ControlIdle, |&(pane, _)| {
+                            Message::HostGroup(super::Action::CommandCanary(id, pane))
+                        })
+                })),
+        ))
 }
 
 pub(super) struct Waiting(Option<GroupTranscriptHost>);
@@ -85,6 +169,15 @@ impl TerminalApp {
                 else {
                     continue;
                 };
+                let only_canary = match queue.canary_gate(&run.transcript) {
+                    Some(CanaryGate::Pending(pane)) => Some(pane),
+                    Some(CanaryGate::AwaitingApproval) => continue,
+                    Some(CanaryGate::Failed) => {
+                        run.reject_queued_commands(CANARY_FAILED);
+                        continue;
+                    }
+                    None => None,
+                };
                 if queue.stop_on_failure && run.transcript.has_unsuccessful_result() {
                     run.reject_queued_commands(FAILED_RESULT);
                     continue;
@@ -94,6 +187,9 @@ impl TerminalApp {
                 }
                 let stop_after_failure = queue.stop_on_failure.then(|| run.transcript.clone());
                 for (index, delivery) in run.results.iter_mut().enumerate() {
+                    if only_canary.is_some_and(|pane| delivery.target.pane != pane) {
+                        continue;
+                    }
                     let DeliveryStatus::Queued(waiting) = &mut delivery.status else {
                         continue;
                     };
@@ -156,17 +252,27 @@ impl TerminalApp {
         else {
             return;
         };
+        let Some(queue) = &mut submission.command_queue else {
+            return;
+        };
         match action {
             Action::Cancel => submission.reject_queued_commands("Cancelled before sending."),
-            Action::SetPaused(paused) => {
-                let Some(queue) = &mut submission.command_queue else {
-                    return;
-                };
+            Action::SetPaused(paused) if queue.canary.is_none() => {
                 queue.paused = paused;
                 if !paused {
                     self.poll_command_queues();
                 }
             }
+            Action::ApproveCanary
+                if matches!(
+                    queue.canary_gate(&submission.transcript),
+                    Some(CanaryGate::AwaitingApproval)
+                ) =>
+            {
+                queue.canary = None;
+                self.poll_command_queues();
+            }
+            _ => {}
         }
     }
 }
@@ -182,10 +288,29 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
     let run = submission.id;
     let paused = queue.paused;
     let event = move |action| Message::HostGroup(super::Action::CommandQueue(id, run, action));
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(8.0)
-        .children((
+    let canary_name = || {
+        submission
+            .results
+            .iter()
+            .find(|delivery| queue.canary == Some(delivery.target.pane))
+            .map_or("Canary host", |delivery| delivery.target.name.as_str())
+    };
+    let (advance, status) = match queue.canary_gate(&submission.transcript) {
+        Some(CanaryGate::Pending(_)) => (
+            View::empty(),
+            Some(format!("{} · Waiting for the canary result", canary_name())),
+        ),
+        Some(CanaryGate::AwaitingApproval) => (
+            Button::new()
+                .on_click(ctx.callback(move |_| event(Action::ApproveCanary)))
+                .content("Approve remaining hosts"),
+            Some(format!(
+                "{} · Canary succeeded. Review its result before continuing.",
+                canary_name()
+            )),
+        ),
+        Some(CanaryGate::Failed) => (View::empty(), None),
+        None => (
             Button::new()
                 .on_click(ctx.callback(move |_| event(Action::SetPaused(!paused))))
                 .content(if paused {
@@ -193,16 +318,25 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
                 } else {
                     "Pause queue"
                 }),
+            paused.then(|| "Command queue paused".to_owned()),
+        ),
+    };
+    let buttons = StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(8.0)
+        .children((
+            advance,
             Button::new()
                 .on_click(ctx.callback(move |_| event(Action::Cancel)))
                 .content("Cancel queued commands"),
-            if paused {
-                TextBlock::new()
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text("Command queue paused")
-                    .into()
-            } else {
-                View::empty()
-            },
-        ))
+        ));
+    StackPanel::new().spacing(4.0).children((
+        status.map_or_else(View::empty, |status| {
+            TextBlock::new()
+                .text_wrapping(TextWrapping::Wrap)
+                .text(status)
+                .into()
+        }),
+        buttons,
+    ))
 }

@@ -215,6 +215,17 @@ impl GroupTranscript {
         }
     }
 
+    /// Whether this host settled with a confirmed zero exit status.
+    pub fn settled_host_succeeded(&self, pane: u64) -> Option<bool> {
+        self.0
+            .lock()
+            .unwrap()
+            .hosts
+            .iter()
+            .find(|host| host.pane == pane && !host.active)
+            .map(HostRecord::succeeded)
+    }
+
     pub fn has_unsuccessful_result(&self) -> bool {
         self.0
             .lock()
@@ -416,7 +427,9 @@ mod tests {
         appliance.delivery_receipt().acknowledge();
         appliance.set_execution(&GroupExecution::PromptReturned);
         assert!(!group.has_unsuccessful_result());
+        assert_eq!(group.settled_host_succeeded(7), None);
         drop(appliance);
+        assert_eq!(group.settled_host_succeeded(7), Some(false));
         assert!(group.has_unsuccessful_result());
     }
 
@@ -444,7 +457,10 @@ mod tests {
                 truncated: false,
             },
         })));
+        assert_eq!(group.settled_host_succeeded(1), None);
         drop(east);
+        assert_eq!(group.settled_host_succeeded(1), Some(true));
+        assert_eq!(group.settled_host_succeeded(2), None);
         assert!(inbox.rows().is_empty());
         assert!(!group.has_unsuccessful_result());
         drop(west);

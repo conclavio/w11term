@@ -59,6 +59,7 @@ pub(super) struct HostGroup {
     login_queue: Option<(usize, Arc<Semaphore>)>,
     roster_copy_feedback: String,
     draft: String,
+    canary: Option<u64>,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -130,6 +131,7 @@ pub struct CommandOffer {
     targets: Vec<Target>,
     limit: SshGroupParallelLimit,
     stop_queue_on_failure: bool,
+    canary: Option<u64>,
 }
 
 enum SubmissionContent {
@@ -704,6 +706,7 @@ pub enum Action {
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, CommandOffer),
     CommandLimit(TabId, SshGroupParallelLimit),
+    CommandCanary(TabId, Option<u64>),
     StopCommandQueueOnFailure(TabId, bool),
     CommandQueue(TabId, u64, command_queue::Action),
 }
@@ -1007,6 +1010,7 @@ impl TerminalApp {
             targets,
             limit,
             stop_queue_on_failure,
+            canary,
         } = offer;
         let roster = self.host_group_targets();
         let selection = targets.iter().map(|target| target.pane).collect();
@@ -1020,8 +1024,10 @@ impl TerminalApp {
             && page.roster_preferences.command_limit == *limit
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
+            && page.canary == *canary
+            && command_queue::canary_readiness(targets, *canary).is_ok()
             && w11term::saved_commands::valid_command_text(text)
-            && ((!verify_prompts && !page.roster_preferences.require_all_ready)
+            && ((!verify_prompts && canary.is_none() && !page.roster_preferences.require_all_ready)
                 || targets.iter().all(|reviewed| {
                     roster.iter().any(|current| {
                         current.pane == reviewed.pane
@@ -1043,13 +1049,15 @@ impl TerminalApp {
             targets,
             limit,
             stop_queue_on_failure,
+            canary,
         } = offer;
         let limit = limit.concurrency();
+        let slots = limit.or_else(|| canary.map(|_| targets.len()));
         let results = targets
             .into_iter()
             .map(|target| {
                 let host = transcript.host(target.pane);
-                if limit.is_some() && target.state.is_ready() {
+                if slots.is_some() && target.state.is_ready() {
                     Delivery {
                         target,
                         status: DeliveryStatus::Queued(command_queue::Waiting::new(host)),
@@ -1064,8 +1072,9 @@ impl TerminalApp {
         if let Some(page) = self.host_group_mut(id) {
             let submission = page.submit(SubmissionContent::Command(text), results, transcript);
             submission.recording = recording;
-            submission.command_queue =
-                limit.map(|limit| command_queue::Queue::new(limit, stop_queue_on_failure));
+            submission.command_queue = slots.map(|slots| {
+                command_queue::Queue::new(slots, limit.is_some() && stop_queue_on_failure, canary)
+            });
         }
         self.poll_command_queues();
     }
@@ -1489,6 +1498,15 @@ impl TerminalApp {
                     page.roster_preferences.command_limit = limit;
                 }
             }
+            Action::CommandCanary(id, pane) => {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self
+                        .host_group_mut(id)
+                        .filter(|page| !page.recorded_send.pending())
+                {
+                    page.canary = pane;
+                }
+            }
             Action::CommandQueue(id, run, action) => self.handle_command_queue(id, run, action),
             Action::StopCommandQueueOnFailure(id, stop) => {
                 if let Some(page) = self.host_group_mut(id).filter(|page| {
@@ -1713,15 +1731,21 @@ impl TerminalApp {
             .iter()
             .filter(|target| target.state.is_ready())
             .count();
+        let canary_error = command_queue::canary_readiness(&selected, page.canary).err();
         let enabled = valid_text
+            && canary_error.is_none()
             && !page.sending()
             && !page.recorded_send.pending()
             && page.readiness_allows_send(ready, selected.len());
-        let send_label = format!(
-            "Send to {} {}",
-            selected.len(),
-            if selected.len() == 1 { "host" } else { "hosts" }
-        );
+        let send_label = if page.canary.is_some() {
+            "Run canary first".into()
+        } else {
+            format!(
+                "Send to {} {}",
+                selected.len(),
+                if selected.len() == 1 { "host" } else { "hosts" }
+            )
+        };
         let mut roster_rows = shown.clone();
         page.sort_shown(&mut roster_rows);
         let mut prompts = roster_rows
@@ -2030,6 +2054,8 @@ impl TerminalApp {
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes.".into()
+        } else if let Some(message) = canary_error {
+            message.into()
         } else if selected.is_empty() {
             "Select panes with a fresh shell marker or a configured prompt match.".into()
         } else {
@@ -2052,6 +2078,7 @@ impl TerminalApp {
             targets: selected.clone(),
             limit: page.roster_preferences.command_limit,
             stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
+            canary: page.canary,
         };
         let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
@@ -2139,6 +2166,7 @@ impl TerminalApp {
                                 }))
                                 .content("Stop queue on failure"),
                         )),
+                    command_queue::canary_picker(id, page, &selected, ctx),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
