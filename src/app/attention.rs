@@ -127,6 +127,7 @@ impl TerminalApp {
             }
             Action::VisitGroup(target) => match target {
                 NoticeTarget::GroupRun { tab, submission }
+                | NoticeTarget::GroupCanary { tab, submission }
                     if self.group_run_retained(tab, submission)
                         && self.inbox.mark_target_read(target) =>
                 {
@@ -260,9 +261,16 @@ impl TerminalApp {
                     let (pane, sequence) = match row.target {
                         NoticeTarget::Pane { pane, sequence } => (pane, sequence),
                         target @ (NoticeTarget::GroupRun { tab, .. }
+                        | NoticeTarget::GroupCanary { tab, .. }
                         | NoticeTarget::GroupLogins { tab, .. }) => {
                             let (enabled, detail, key) = match target {
-                                NoticeTarget::GroupRun { submission, .. } => {
+                                NoticeTarget::GroupRun { submission, .. }
+                                | NoticeTarget::GroupCanary { submission, .. } => {
+                                    let kind = if matches!(target, NoticeTarget::GroupCanary { .. }) {
+                                        "canary"
+                                    } else {
+                                        "run"
+                                    };
                                     let enabled = self.group_run_retained(tab, submission);
                                     let expired = if enabled {
                                         ""
@@ -272,7 +280,7 @@ impl TerminalApp {
                                     (
                                         enabled,
                                         format!(" · Run {submission}{expired}"),
-                                        format!("group-{tab}/{submission}"),
+                                        format!("group-{kind}-{tab}/{submission}"),
                                     )
                                 }
                                 NoticeTarget::GroupLogins { sequence, .. } => {

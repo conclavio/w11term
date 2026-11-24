@@ -148,6 +148,8 @@ try {
             (Find-Element 'The canary must be checked, visible, and at a fresh shell marker.')
     }
     (Wait-CheckBox $labels.East Off).Toggle()
+    (Wait-CheckBox 'Notify when canary finishes' Off).Toggle()
+    $null = Wait-CheckBox 'Notify when canary finishes' On
     Click ('Run canary and record' + [char]0x2026)
     $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -157,8 +159,16 @@ try {
             (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
             !(Find-Element 'Approve remaining hosts' $button)
     }
-    New-Item -ItemType File -Path (Join-Path $State 'release-east-canary') | Out-Null
-    $null = Wait-Until 'East succeeds and West still requires approval' {
+    Click 'Notify when run finishes'
+    $null = Wait-Until 'both notifications are armed' {
+        (Find-Element 'Cancel run notification' $button) -and (Find-Element 'Cancel canary notification' $button)
+    }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the canary group is in the background' { Find-Element 'No bells or notifications' }
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-canary-ok') | Out-Null
+    $canaryNotice = "$group${dot}Run 5${dot}Canary ready for approval${dot}$($labels.East)"
+    Click "Unread${dot}$canaryNotice"
+    $null = Wait-Until 'the canary notice opens the run requiring approval' {
         (Find-Element "$($labels.East)${dot}Exit 0") -and
             (Find-Element "$($labels.West)${dot}Queued") -and
             (Find-Element "$($labels.East)${dot}Canary succeeded. Review its result before continuing.") -and
@@ -168,10 +178,17 @@ try {
     New-Item -ItemType File -Path (Join-Path $State 'approve-canary-ok') | Out-Null
     Click 'Approve remaining hosts'
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished canary-ok')
+    Click 'Attention inbox, 1 unread'
+    $null = Wait-Until 'the canary notice stays read while the run completion is unread' {
+        Find-Element "Read${dot}$canaryNotice" $button
+    }
+    Click "Unread${dot}$group${dot}Run 5${dot}Group run finished${dot}2 succeeded${dot}0 need attention"
 
     Set-Command 'canary-fails'
     Click 'Run canary first'
-    $null = Wait-Until 'a failed canary withholds West even with an unlimited command limit' {
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}$group${dot}Run 6${dot}Canary did not report a successful exit${dot}$($labels.East)"
+    $null = Wait-Until 'a failed canary notice opens the exact run that withheld West' {
         (Find-Element "$($labels.East)${dot}Exit 17") -and
             (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
             !(Find-Element 'Approve remaining hosts' $button)
@@ -179,12 +196,19 @@ try {
 
     Set-Command 'canary-unknown'
     Click 'Run canary first'
-    $null = Wait-Until 'a canary without an exit status withholds West' {
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-unknown')
+    Click 'Cancel canary notification'
+    $null = Wait-Until 'canary notification is disarmed' { !(Find-Element 'Cancel canary notification' $button) }
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-canary-unknown') | Out-Null
+    $null = Wait-Until 'a canary without an exit status withholds West without an alert' {
         (Find-Element "$($labels.East)${dot}Completed${dot}exit status unavailable") -and
             (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
-            !(Find-Element 'Approve remaining hosts' $button)
+            !(Find-Element 'Approve remaining hosts' $button) -and
+            (Find-Element 'Attention inbox, 0 unread' $button)
     }
 
+    (Wait-CheckBox 'Notify when canary finishes' On).Toggle()
+    $null = Wait-CheckBox 'Notify when canary finishes' Off
     Set-Command 'canary-stale'
     Click 'Run canary first'
     $null = Wait-Until 'the canary succeeds before West changes its prompt' {

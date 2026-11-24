@@ -7,39 +7,38 @@ const CANARY_FAILED: &str = "Canary did not report a successful exit.";
 pub enum Action {
     SetPaused(bool),
     ApproveCanary,
+    CancelCanaryNotice,
     Cancel,
 }
 
+#[derive(Clone, Copy)]
 enum CanaryGate {
     Pending(u64),
-    AwaitingApproval,
-    Failed,
+    AwaitingApproval(u64),
 }
 
 pub(super) struct Queue {
     slots: Arc<Semaphore>,
     stop_on_failure: bool,
     paused: bool,
-    canary: Option<u64>,
+    canary: Option<CanaryGate>,
+    notify_canary: bool,
 }
 
 impl Queue {
-    pub(super) fn new(limit: usize, stop_on_failure: bool, canary: Option<u64>) -> Self {
+    pub(super) fn new(
+        limit: usize,
+        stop_on_failure: bool,
+        canary: Option<u64>,
+        notify_canary: bool,
+    ) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(limit)),
             stop_on_failure,
             paused: false,
-            canary,
+            canary: canary.map(CanaryGate::Pending),
+            notify_canary,
         }
-    }
-
-    fn canary_gate(&self, transcript: &GroupTranscript) -> Option<CanaryGate> {
-        let pane = self.canary?;
-        Some(match transcript.settled_host_succeeded(pane) {
-            None => CanaryGate::Pending(pane),
-            Some(true) => CanaryGate::AwaitingApproval,
-            Some(false) => CanaryGate::Failed,
-        })
     }
 }
 
@@ -105,6 +104,14 @@ pub(super) fn canary_picker(
                             Message::HostGroup(super::Action::CommandCanary(id, pane))
                         })
                 })),
+            CheckBox::new()
+                .automation_name("Notify when canary finishes")
+                .is_checked(page.canary.is_some() && page.notify_canary)
+                .is_enabled(page.canary.is_some() && !page.recorded_send.pending())
+                .on_is_checked_changed(ctx.callback(move |enabled| {
+                    Message::HostGroup(super::Action::NotifyCanary(id, enabled))
+                }))
+                .content("Notify when canary finishes"),
         ))
 }
 
@@ -135,6 +142,13 @@ impl Submission {
             .any(|result| matches!(result.status, DeliveryStatus::Queued(_)))
     }
 
+    fn canary_name(&self, pane: u64) -> &str {
+        self.results
+            .iter()
+            .find(|delivery| delivery.target.pane == pane)
+            .map_or("Canary host", |delivery| delivery.target.name.as_str())
+    }
+
     fn reject_queued_commands(&mut self, reason: &str) {
         for delivery in &mut self.results {
             if let DeliveryStatus::Queued(waiting) = &mut delivery.status {
@@ -159,26 +173,53 @@ impl TerminalApp {
             })
             .collect::<Vec<_>>();
         for id in groups {
-            let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
+            let Some(AppTab {
+                label,
+                page: Page::HostGroup(page),
+            }) = self.tabs.get_mut(id)
+            else {
                 continue;
             };
             let mut jobs = Vec::new();
-            for run in &mut page.submissions {
+            for run in page.submissions.iter_mut().filter(|run| run.has_queue()) {
                 let (Some(queue), SubmissionContent::Command(text)) =
-                    (&run.command_queue, &run.content)
+                    (&mut run.command_queue, &run.content)
                 else {
                     continue;
                 };
-                let only_canary = match queue.canary_gate(&run.transcript) {
-                    Some(CanaryGate::Pending(pane)) => Some(pane),
-                    Some(CanaryGate::AwaitingApproval) => continue,
-                    Some(CanaryGate::Failed) => {
-                        run.reject_queued_commands(CANARY_FAILED);
-                        continue;
+                let stopped = queue.stop_on_failure && run.transcript.has_unsuccessful_result();
+                let only_canary = match queue.canary {
+                    Some(CanaryGate::Pending(pane)) => {
+                        let result = run.transcript.settled_host_succeeded(pane);
+                        if let Some(succeeded) = result.or(stopped.then_some(false)) {
+                            let notify = std::mem::take(&mut queue.notify_canary);
+                            if succeeded {
+                                queue.canary = Some(CanaryGate::AwaitingApproval(pane));
+                            } else {
+                                let reason = if result.is_some() {
+                                    CANARY_FAILED
+                                } else {
+                                    FAILED_RESULT
+                                };
+                                run.reject_queued_commands(reason);
+                            }
+                            if notify {
+                                self.inbox.group_canary_finished(
+                                    id,
+                                    run.id,
+                                    label,
+                                    run.canary_name(pane),
+                                    succeeded,
+                                );
+                            }
+                            continue;
+                        }
+                        Some(pane)
                     }
+                    Some(CanaryGate::AwaitingApproval(_)) => continue,
                     None => None,
                 };
-                if queue.stop_on_failure && run.transcript.has_unsuccessful_result() {
+                if stopped {
                     run.reject_queued_commands(FAILED_RESULT);
                     continue;
                 }
@@ -256,7 +297,11 @@ impl TerminalApp {
             return;
         };
         match action {
-            Action::Cancel => submission.reject_queued_commands("Cancelled before sending."),
+            Action::Cancel => {
+                queue.notify_canary = false;
+                submission.reject_queued_commands("Cancelled before sending.");
+            }
+            Action::CancelCanaryNotice => queue.notify_canary = false,
             Action::SetPaused(paused) if queue.canary.is_none() => {
                 queue.paused = paused;
                 if !paused {
@@ -264,10 +309,7 @@ impl TerminalApp {
                 }
             }
             Action::ApproveCanary
-                if matches!(
-                    queue.canary_gate(&submission.transcript),
-                    Some(CanaryGate::AwaitingApproval)
-                ) =>
+                if matches!(queue.canary, Some(CanaryGate::AwaitingApproval(_))) =>
             {
                 queue.canary = None;
                 self.poll_command_queues();
@@ -288,28 +330,24 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
     let run = submission.id;
     let paused = queue.paused;
     let event = move |action| Message::HostGroup(super::Action::CommandQueue(id, run, action));
-    let canary_name = || {
-        submission
-            .results
-            .iter()
-            .find(|delivery| queue.canary == Some(delivery.target.pane))
-            .map_or("Canary host", |delivery| delivery.target.name.as_str())
-    };
-    let (advance, status) = match queue.canary_gate(&submission.transcript) {
-        Some(CanaryGate::Pending(_)) => (
+    let (advance, status) = match queue.canary {
+        Some(CanaryGate::Pending(pane)) => (
             View::empty(),
-            Some(format!("{} · Waiting for the canary result", canary_name())),
+            Some(format!(
+                "{} · Waiting for the canary result",
+                submission.canary_name(pane)
+            )),
         ),
-        Some(CanaryGate::AwaitingApproval) => (
+        Some(CanaryGate::AwaitingApproval(pane)) => (
             Button::new()
                 .on_click(ctx.callback(move |_| event(Action::ApproveCanary)))
                 .content("Approve remaining hosts"),
             Some(format!(
                 "{} · Canary succeeded. Review its result before continuing.",
-                canary_name()
+                submission.canary_name(pane)
             )),
         ),
-        Some(CanaryGate::Failed) => (View::empty(), None),
+
         None => (
             Button::new()
                 .on_click(ctx.callback(move |_| event(Action::SetPaused(!paused))))
@@ -329,6 +367,13 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
             Button::new()
                 .on_click(ctx.callback(move |_| event(Action::Cancel)))
                 .content("Cancel queued commands"),
+            if queue.notify_canary {
+                Button::new()
+                    .on_click(ctx.callback(move |_| event(Action::CancelCanaryNotice)))
+                    .content("Cancel canary notification")
+            } else {
+                View::empty()
+            },
         ));
     StackPanel::new().spacing(4.0).children((
         status.map_or_else(View::empty, |status| {

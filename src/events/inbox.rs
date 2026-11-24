@@ -11,6 +11,7 @@ const CAPACITY: usize = 128;
 pub enum NoticeTarget {
     Pane { pane: u64, sequence: u64 },
     GroupRun { tab: u64, submission: u64 },
+    GroupCanary { tab: u64, submission: u64 },
     GroupLogins { tab: u64, sequence: u64 },
 }
 
@@ -140,6 +141,29 @@ impl Inbox {
             NoticeTarget::GroupRun { tab, submission },
             display_field(source).into(),
             format!("Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"),
+            None,
+            None,
+            true,
+        );
+    }
+
+    pub fn group_canary_finished(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        host: &str,
+        succeeded: bool,
+    ) {
+        let result = if succeeded {
+            "Canary ready for approval"
+        } else {
+            "Canary did not report a successful exit"
+        };
+        self.push(
+            NoticeTarget::GroupCanary { tab, submission },
+            display_field(source).into(),
+            format!("{result} · {}", display_field(host)),
             None,
             None,
             true,
@@ -336,6 +360,33 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_canary_and_full_completion_for_the_same_run_are_read_independently() {
+        let inbox = Inbox::new(|| {});
+        let canary = NoticeTarget::GroupCanary {
+            tab: 4,
+            submission: 2,
+        };
+        let run = NoticeTarget::GroupRun {
+            tab: 4,
+            submission: 2,
+        };
+
+        inbox.group_canary_finished(4, 2, "Fleet", "East", true);
+        inbox.group_finished(4, 2, "Fleet", 2, 0);
+
+        assert_eq!(inbox.unread_count(), 2);
+        assert!(inbox.mark_target_read(canary));
+        let rows = inbox.rows();
+        assert_eq!(rows[0].target, run);
+        assert!(rows[0].unread);
+        assert_eq!(rows[1].target, canary);
+        assert_eq!(rows[1].message, "Canary ready for approval · East");
+        assert!(!rows[1].unread);
+        assert!(inbox.mark_target_read(run));
+        assert_eq!(inbox.unread_count(), 0);
+    }
     use crate::events::Events;
     use serde_json::{Value, json};
     use std::sync::atomic::{AtomicUsize, Ordering};

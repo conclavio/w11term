@@ -1525,7 +1525,7 @@ async fn native_ssh_group_notifies_when_watched_logins_settle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "bounds SSH group execution and verifies queue controls and canary approval"]
+#[ignore = "bounds SSH group execution and verifies queue controls, canary approval, and notices"]
 async fn native_ssh_group_bounds_parallel_commands() {
     use in_band_resize::Wire;
 
@@ -1585,8 +1585,9 @@ async fn native_ssh_group_bounds_parallel_commands() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }
-                        if name == "East" && line == "canary-ok" {
-                            while !fixtures.join("release-east-canary").is_file() {
+                        if name == "East" && matches!(line, "canary-ok" | "canary-unknown") {
+                            let gate = fixtures.join(format!("release-east-{line}"));
+                            while !gate.is_file() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }

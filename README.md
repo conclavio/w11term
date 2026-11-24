@@ -99,7 +99,7 @@ With a finite limit, turn on **Stop queue on failure** to withhold the remaining
 
 Use **Pause queue** to hold unsent commands while you inspect results. Active commands continue, and stop-on-failure still applies. **Resume queue** rechecks the original prompts before sending again.
 
-Choose a **Canary host** from the checked recipients to run on that shell first. It needs a fresh OSC 133 prompt and at least one other ready recipient. After a confirmed exit 0, inspect the result and select **Approve remaining hosts** to continue at the chosen concurrency. If the canary fails or its exit status is unavailable, the remaining commands are withheld.
+Choose a **Canary host** from the checked recipients to run on that shell first. It needs a fresh OSC 133 prompt and at least one other ready recipient. After a confirmed exit 0, inspect the result and select **Approve remaining hosts** to continue at the chosen concurrency. If the canary fails or its exit status is unavailable, the remaining commands are withheld. Check **Notify when canary finishes** before sending to get an Attention Inbox entry that opens the exact run when the canary succeeds or needs attention.
 
 Use the host-state dropdown to show ready shells, disconnected panes, or another current state. The state filter combines with the name or wildcard filter and keeps checks on hidden hosts. Sending and other actions on checked hosts use the visible selection.
 

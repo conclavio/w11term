@@ -60,6 +60,7 @@ pub(super) struct HostGroup {
     roster_copy_feedback: String,
     draft: String,
     canary: Option<u64>,
+    notify_canary: bool,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -132,6 +133,7 @@ pub struct CommandOffer {
     limit: SshGroupParallelLimit,
     stop_queue_on_failure: bool,
     canary: Option<u64>,
+    notify_canary: bool,
 }
 
 enum SubmissionContent {
@@ -707,6 +709,7 @@ pub enum Action {
     Send(TabId, CommandOffer),
     CommandLimit(TabId, SshGroupParallelLimit),
     CommandCanary(TabId, Option<u64>),
+    NotifyCanary(TabId, bool),
     StopCommandQueueOnFailure(TabId, bool),
     CommandQueue(TabId, u64, command_queue::Action),
 }
@@ -1011,6 +1014,7 @@ impl TerminalApp {
             limit,
             stop_queue_on_failure,
             canary,
+            notify_canary,
         } = offer;
         let roster = self.host_group_targets();
         let selection = targets.iter().map(|target| target.pane).collect();
@@ -1025,6 +1029,7 @@ impl TerminalApp {
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
             && page.canary == *canary
+            && (page.canary.is_some() && page.notify_canary) == *notify_canary
             && command_queue::canary_readiness(targets, *canary).is_ok()
             && w11term::saved_commands::valid_command_text(text)
             && ((!verify_prompts && canary.is_none() && !page.roster_preferences.require_all_ready)
@@ -1050,6 +1055,7 @@ impl TerminalApp {
             limit,
             stop_queue_on_failure,
             canary,
+            notify_canary,
         } = offer;
         let limit = limit.concurrency();
         let slots = limit.or_else(|| canary.map(|_| targets.len()));
@@ -1073,7 +1079,12 @@ impl TerminalApp {
             let submission = page.submit(SubmissionContent::Command(text), results, transcript);
             submission.recording = recording;
             submission.command_queue = slots.map(|slots| {
-                command_queue::Queue::new(slots, limit.is_some() && stop_queue_on_failure, canary)
+                command_queue::Queue::new(
+                    slots,
+                    limit.is_some() && stop_queue_on_failure,
+                    canary,
+                    notify_canary,
+                )
             });
         }
         self.poll_command_queues();
@@ -1505,6 +1516,15 @@ impl TerminalApp {
                         .filter(|page| !page.recorded_send.pending())
                 {
                     page.canary = pane;
+                }
+            }
+            Action::NotifyCanary(id, enabled) => {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self
+                        .host_group_mut(id)
+                        .filter(|page| page.canary.is_some() && !page.recorded_send.pending())
+                {
+                    page.notify_canary = enabled;
                 }
             }
             Action::CommandQueue(id, run, action) => self.handle_command_queue(id, run, action),
@@ -2079,6 +2099,7 @@ impl TerminalApp {
             limit: page.roster_preferences.command_limit,
             stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
             canary: page.canary,
+            notify_canary: page.canary.is_some() && page.notify_canary,
         };
         let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
