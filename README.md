@@ -97,6 +97,8 @@ Use the host-state dropdown to show ready shells, disconnected panes, or another
 
 Turn on **Show last command output** in a group tab to see the exit status and a short excerpt from each visible host’s latest completed shell capture. **Open history** opens that capture in the host’s command history. The preview uses the current SSH connection and hides during authentication and alternate-screen applications.
 
+Choose **Copy shown roster** to copy a plain-text status report. It includes every host shown by the current filters, its check state, SSH address, pane ID, and connection or prompt status.
+
 When an SSH shell has exited or its connection attempts have ended, use **Reconnect** on its roster row or **Reconnect selected** for checked hosts shown by the filter. Each attempt starts a fresh SSH login in the same pane with its scrollback and selection intact. Previous submissions stay available, and the replacement shell needs a fresh prompt before it can receive another group command.
 
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.

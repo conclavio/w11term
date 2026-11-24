@@ -714,6 +714,21 @@ try {
     $null = Wait-Until 'the alternate-screen host has no roster preview' {
         (Find-Element $openEastOutput $button) -and !(Find-Element $openWestOutput $button)
     }
+    $copyRoster = 'Copy shown roster'
+    Pane-Status $east "Connected${dot}Ready"
+    (Wait-CheckBox $westName On).Toggle()
+    $null = Wait-CheckBox $westName Off
+    Click $copyRoster
+    $null = Wait-Until 'the copied roster includes both the ready and unchecked alternate-screen host' {
+        $report = Read-ClipboardFixture
+        (Find-Element 'Copied roster with 2 hosts') -and $report -and
+            $report.Contains("2 shown${dot}1 checked") -and
+            $report.Contains("Checked${dot}$eastName${dot}Connected${dot}Ready") -and
+            $report.Contains("Unchecked${dot}$westName${dot}Connected${dot}Alternate screen") -and
+            !$report.Contains('east-accepted while-alt')
+    }
+    (Wait-CheckBox $westName Off).Toggle()
+    $null = Wait-CheckBox $westName On
     $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Ready'
     $null = Wait-Until 'the ready filter scopes the roster and send count to East' {
@@ -723,9 +738,18 @@ try {
             (Find-Element '1 selected host is hidden by the filter.')
     }
     Select-ComboValue $hostStateFilter 'Alternate screen'
+    Click $copyRoster
+    $null = Wait-Until 'only the host shown by the state filter is copied' {
+        $report = Read-ClipboardFixture
+        (Find-Element 'Copied roster with 1 host') -and $report -and
+            $report.Contains("1 shown${dot}1 checked") -and
+            $report.Contains("Checked${dot}$westName${dot}Connected${dot}Alternate screen") -and
+            !$report.Contains($eastName)
+    }
     Set-HostFilter 'east'
     $null = Wait-Until 'the text filter still applies inside the selected host state' {
-        Find-Element 'No SSH panes match this filter.'
+        $copy = Find-Element $copyRoster $button
+        (Find-Element 'No SSH panes match this filter.') -and $copy -and !$copy.Current.IsEnabled
     }
     Set-HostFilter ''
     $null = Wait-CheckBox $westName On

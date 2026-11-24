@@ -24,6 +24,7 @@ mod recorded_send;
 mod report;
 mod retry;
 mod reuse;
+mod roster_report;
 mod save_command;
 mod saved;
 mod transfer;
@@ -46,6 +47,7 @@ pub(super) struct HostGroup {
     filter: filter::Filter,
     show_last_output: bool,
     require_all_ready: bool,
+    roster_copy_feedback: String,
     draft: String,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
@@ -139,6 +141,17 @@ pub struct Target {
     profile: Option<String>,
     connected: bool,
     state: TargetState,
+}
+
+impl Target {
+    fn status_caption(&self) -> Cow<'static, str> {
+        let state = self.state.label();
+        if self.connected {
+            format!("Connected · {state}").into()
+        } else {
+            state.into()
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -494,6 +507,7 @@ pub enum Action {
     FilterStatus(TabId, RosterStatus),
     ShowLastOutput(TabId, bool),
     RequireAllReady(TabId, bool),
+    CopyRoster(TabId, BTreeSet<u64>),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
     RecipientSets(TabId, recipient_sets::Action),
@@ -992,6 +1006,7 @@ impl TerminalApp {
                     page.require_all_ready = require;
                 }
             }
+            Action::CopyRoster(id, offered) => self.copy_host_group_roster(id, &offered),
             Action::ShowWindowRoster(id, show) => {
                 if self.host_group_command_target() == Some(id)
                     && let Some(page) = self.host_group_mut(id)
@@ -1375,11 +1390,7 @@ impl TerminalApp {
             .iter()
             .map(|target| {
                 let pane = target.pane;
-                let state = if target.connected {
-                    format!("Connected · {}", target.state.label())
-                } else {
-                    target.state.label().to_owned()
-                };
+                let state = target.status_caption();
                 KeyedView::new(
                     format!("target-{pane}"),
                     StackPanel::new().spacing(2.0).children((
@@ -1396,7 +1407,7 @@ impl TerminalApp {
                             .children((
                                 TextBlock::new()
                                     .automation_name(format!("Pane {pane} · {state}"))
-                                    .text(state),
+                                    .text(state.as_ref()),
                                 Button::new()
                                     .automation_name(format!("Focus pane {pane}"))
                                     .on_click(ctx.callback(move |_| {
@@ -1572,7 +1583,21 @@ impl TerminalApp {
                             Message::HostGroup(Action::ShowLastOutput(id, show))
                         }))
                         .content("Show last command output"),
+                    Button::new()
+                        .is_enabled(!shown_ids.is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            Message::HostGroup(Action::CopyRoster(id, shown_ids.clone()))
+                        }))
+                        .content("Copy shown roster"),
                 )),
+            if page.roster_copy_feedback.is_empty() {
+                View::empty()
+            } else {
+                TextBlock::new()
+                    .text(&page.roster_copy_feedback)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            },
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes.".into()
