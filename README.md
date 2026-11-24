@@ -163,6 +163,8 @@ Choose **Review group launch…** for a saved group to pick which hosts to open.
 
 Filter the review by profile name or SSH address to find members in a large group. **Include matches** adds matching hosts, **Skip matches** excludes them, and **Include only matches** limits the launch to their available profiles across all pages. The launch totals include every checked host, even when the filter hides it.
 
+**Use new panes for matches** and **Reuse unique matches** apply to included profiles across every matching page. A blank filter covers all included profiles. **Reuse unique matches** picks a live pane when exactly one is available and keeps the current connection choice for other profiles.
+
 Choose **Save as recipient set…** in the launch review to name and save the included profiles before connecting. The saved set becomes the selected set in the review and is available for future launches from the command palette.
 
 From a terminal, search the command palette for **Review SSH group** and the group name, or **Review SSH recipient set** with the group and set names. Press Enter to open the review with the matching hosts checked. **Open reviewed group** turns that tab into the live roster. **Cancel** returns you to the tab you came from.

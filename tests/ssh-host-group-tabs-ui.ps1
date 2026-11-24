@@ -391,6 +391,28 @@ try {
     }
     Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
     Expect-Choice 'Connection for North' 'Open a new SSH pane'
+    (Field 'Find launch profiles').SetValue('NORTH')
+    $null = Wait-Until 'North has no reusable connection and East is hidden' {
+        $bulk = Find-Element 'Reuse unique matches' $button
+        ($bulk -and !$bulk.Current.IsEnabled) -and
+            !(Find-Element 'Connection for East' $comboBox)
+    }
+    (Field 'Find launch profiles').SetValue('EAST')
+    $null = Wait-CheckBox 'Include profile East' On
+    Click 'Use new panes for matches'
+    $null = Wait-Until 'bulk fresh choice leaves both hosts included' {
+        Find-Element "0 to reuse${dot}2 to open"
+    }
+    Expect-Choice 'Connection for East' 'Open a new SSH pane'
+    Click 'Refresh review'
+    Expect-Field 'Find launch profiles' 'EAST'
+    Expect-Choice 'Connection for East' 'Open a new SSH pane'
+    Click 'Reuse unique matches'
+    $null = Wait-Until 'the bulk reuse choice restores the unique match' {
+        Find-Element "1 to reuse${dot}1 to open"
+    }
+    Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
+    (Field 'Find launch profiles').SetValue('')
     Click 'Clear included hosts'
     $null = Wait-CheckBox 'Include profile East' Off
     (Wait-CheckBox 'Include profile North' Off).Toggle()
