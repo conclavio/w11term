@@ -142,7 +142,7 @@ try {
     Click ('Save host list' + [char]0x2026)
     $dialog = Wait-Until 'saved-group host list save dialog' { Find-OwnedDialog 'Save SSH host list' }
     $changed = Catalog
-    $changed.ssh_host_groups.Fleet = @('East')
+    $changed.profiles.West.port = 1
     [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
     $null = Wait-Until 'save the reviewed addresses' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'export keeps the reviewed saved order through a catalog edit' {
@@ -150,6 +150,7 @@ try {
     }
     [IO.File]::WriteAllBytes($profiles, $original)
     Click 'Back to SSH group'
+    $null = Wait-Until 'the saved group toolbar is visible again' { Find-Element 'West, East' }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Exporting the saved group opened SSH sessions' }
     $changed = Catalog
     $changed.profiles.PSObject.Properties.Remove('West')
