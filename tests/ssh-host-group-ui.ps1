@@ -546,6 +546,29 @@ try {
             (Find-Element "Added line 1${dot}west live first")
     }
     Click 'Back to comparison'
+    Click "Use pane $west as comparison reference"
+    $null = Wait-Until 'the manual reference reverses the comparison' {
+        (Find-Element 'Selected reference group') -and
+            (Find-Element "First different line from selected reference${dot}1") -and
+            (Find-Element "View differences for pane $east" $button) -and
+            !(Find-Element "View differences for pane $west" $button)
+    }
+    Click 'Refresh comparison'
+    $null = Wait-Until 'refresh keeps the chosen reference' {
+        (Find-Element 'Selected reference group') -and (Find-Element "View differences for pane $east" $button)
+    }
+    Click "View differences for pane $east"
+    $null = Wait-Until 'the diff uses West as the new baseline' {
+        (Find-Element "Reference${dot}$westName${dot}Exit 17") -and
+            (Find-Element "Selected${dot}$eastName${dot}Exit 0") -and
+            (Find-Element "Removed line 1${dot}west live first") -and
+            (Find-Element "Added line 1${dot}east-accepted both")
+    }
+    Click 'Back to comparison'
+    Click 'Use largest group'
+    $null = Wait-Until 'automatic selection restores the largest reference group' {
+        (Find-Element 'Largest result group') -and (Find-Element "View differences for pane $west" $button)
+    }
     Click "View comparison output for pane $west"
     $null = Wait-Until 'comparison links to the exact West command history entry' {
         Find-Element "Selected, both${dot}exit 17" $button
