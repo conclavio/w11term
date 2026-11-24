@@ -222,6 +222,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 106. **Wait for a group run from the CLI.** Return a final result snapshot when every recipient settles, including while the group is in the background. Report timeouts and runs that leave retained history.
 107. **Read a live group roster from the CLI.** Report scoped hosts, checked and shown status, and prompt readiness with the same filters and sort as the group tab. Leave the active view in place.
 108. **Wait for checked hosts to be ready from the CLI.** Wait for verified prompts on the original checked, shown panes. Return the current roster when they are ready and report a changed selection or timeout.
+109. **Find a retained group run.** Search by full command text or exact run number, including repeated commands. Jump directly to the selected results while keeping the draft and roster selection.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

@@ -52,6 +52,7 @@ pub use roster_commands::RosterCommand;
 pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
 pub(super) const RECENT_COMMANDS_LABEL: &str = "Recent group commands…";
+pub(super) const FIND_RUN_LABEL: &str = "Find group run…";
 const REQUIRE_READY: &str = "Require all recipients ready";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;
@@ -634,6 +635,19 @@ impl HostGroup {
             .find(|submission| submission.id == id)
     }
 
+    fn matching_submissions(&self, query: &str) -> impl Iterator<Item = &Submission> {
+        let needle = query.trim().to_lowercase();
+        let run_id = needle
+            .strip_prefix('#')
+            .and_then(|value| value.parse::<u64>().ok());
+        self.submissions.iter().rev().filter(move |run| {
+            run_id.map_or_else(
+                || needle.is_empty() || run.content.label().to_lowercase().contains(&needle),
+                |id| run.id == id,
+            )
+        })
+    }
+
     fn load_command(&mut self, id: u64) -> bool {
         let Some(command) = self
             .viewed_submission(id)
@@ -712,6 +726,7 @@ pub enum Action {
     VisitPrompt(TabId, u64, u64),
     FindHost(TabId),
     ViewSubmission(TabId, u64),
+    OpenRunPicker(TabId),
     NotifyCompletion(TabId, u64, bool),
     LiveOutput(TabId, u64, live_output::Action),
     RecordOutput(TabId, u64, output_recording::Action),
@@ -762,6 +777,23 @@ pub enum Action {
 }
 
 impl TerminalApp {
+    pub(super) fn group_run_choices(
+        &self,
+        group: TabId,
+        query: &str,
+    ) -> impl Iterator<Item = (u64, &str)> {
+        let page = match self.tabs.get(group).map(|tab| &tab.page) {
+            Some(Page::HostGroup(page)) if self.host_group_command_target() == Some(group) => {
+                Some(page)
+            }
+            _ => None,
+        };
+        page.into_iter().flat_map(move |page| {
+            page.matching_submissions(query)
+                .map(|run| (run.id, run.content.label()))
+        })
+    }
+
     fn recent_host_group_tab(&self) -> Option<TabId> {
         self.mru_groups
             .iter()
@@ -1424,9 +1456,17 @@ impl TerminalApp {
                     && let Some(page) = self.host_group_mut(id)
                     && page.submissions.iter().any(|item| item.id == submission)
                 {
-                    page.viewing = submission;
-                    page.result_filter = progress::Filter::All;
-                    page.copy_feedback.clear();
+                    if page.viewing != submission {
+                        page.viewing = submission;
+                        page.result_filter = progress::Filter::All;
+                        page.copy_feedback.clear();
+                    }
+                    page.preview_command_order = false;
+                }
+            }
+            Action::OpenRunPicker(id) => {
+                if self.group_run_choices(id, "").next().is_some() {
+                    self.open_group_run_picker(id, ctx);
                 }
             }
             Action::NotifyCompletion(id, submission, armed) => {
@@ -2579,6 +2619,13 @@ impl TerminalApp {
                             index.checked_sub(1).and_then(|i| page.submissions.get(i)),
                         ),
                         navigate("Next submission", page.submissions.get(index + 1)),
+                        Button::new()
+                            .on_click(
+                                ctx.callback(move |_| {
+                                    Message::HostGroup(Action::OpenRunPicker(id))
+                                }),
+                            )
+                            .content("Find run…"),
                         TextBlock::new().text(format!(
                             "{} of {}",
                             index + 1,
@@ -3028,6 +3075,31 @@ mod tests {
         assert_eq!(group.submissions.len(), SUBMISSION_LIMIT);
         assert_eq!(group.submissions.front().unwrap().id, 3);
         assert_eq!(group.submissions.back().unwrap().id, group.viewing);
+    }
+
+    #[test]
+    fn run_picker_keeps_repeated_commands_and_searches_full_text_or_exact_ids() {
+        let mut group = HostGroup::default();
+        let repeated = format!("{} ÉTAT", "long output ".repeat(90));
+        for id in 1..=10 {
+            let content = match id {
+                3 | 10 => SubmissionContent::Command(repeated.as_str().into()),
+                9 => SubmissionContent::Environment(BTreeMap::new()),
+                _ => SubmissionContent::Command(format!("command {id}").into()),
+            };
+            group.submit(content, Vec::new(), GroupTranscript::default());
+        }
+        let ids = |query: &str| {
+            group
+                .matching_submissions(query)
+                .map(|run| run.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(" état "), [10, 3]);
+        assert_eq!(ids("GROUP VARIABLES"), [9]);
+        assert_eq!(ids(" #10 "), [10]);
+        assert!(ids("#1").is_empty());
+        assert_eq!(ids(""), [10, 9, 8, 7, 6, 5, 4, 3]);
     }
 
     #[test]

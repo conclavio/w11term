@@ -614,6 +614,13 @@ impl TerminalApp {
         );
     }
 
+    pub(super) fn open_group_run_picker(&mut self, group: TabId, ctx: &ComponentContext<Self>) {
+        self.start_picker(
+            Mode::Commands(command_palette::Search::GroupRuns(group)),
+            ctx,
+        );
+    }
+
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
             Mode::Commands(command_palette::Search::Tabs) => self.tab_search_rows(query),
@@ -622,6 +629,9 @@ impl TerminalApp {
             }
             Mode::Commands(command_palette::Search::GroupRecent(group)) => {
                 self.group_recent_command_rows(group, query)
+            }
+            Mode::Commands(command_palette::Search::GroupRuns(group)) => {
+                self.group_run_rows(group, query)
             }
             _ => self.command_rows(query),
         }

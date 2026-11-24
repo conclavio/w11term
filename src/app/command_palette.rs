@@ -9,6 +9,7 @@ pub(super) enum Search {
     Tabs,
     GroupLibrary(TabId),
     GroupRecent(TabId),
+    GroupRuns(TabId),
 }
 
 impl Search {
@@ -18,6 +19,7 @@ impl Search {
             Self::Tabs => "Search tabs",
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
+            Self::GroupRuns(_) => "Search group runs",
         }
     }
 
@@ -28,6 +30,7 @@ impl Search {
                 "Commands submitted in this tab will appear here."
             }
             Self::GroupRecent(_) => "No matching recent commands",
+            Self::GroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
             _ => "No matching commands",
         }
@@ -62,6 +65,8 @@ pub enum CommandId {
     GroupSavedCommand(TabId, w11term::saved_commands::Entry),
     SearchGroupRecentCommands(TabId),
     GroupRecentCommand(TabId, u64),
+    SearchGroupRuns(TabId),
+    GroupRun(TabId, u64),
     FocusTab(TabId),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
@@ -569,6 +574,14 @@ impl TerminalApp {
                 chord: String::new(),
                 enabled: true,
             });
+            if self.group_run_choices(group, "").next().is_some() {
+                rows.push(Row {
+                    id: CommandId::SearchGroupRuns(group),
+                    label: host_groups::FIND_RUN_LABEL.into(),
+                    chord: String::new(),
+                    enabled: true,
+                });
+            }
             if let Some((name, sets)) = self.recipient_sets_for_tab(group) {
                 rows.push(Row {
                     id: CommandId::ManageRecipientSets(group, name.into()),
@@ -629,6 +642,17 @@ impl TerminalApp {
             .collect()
     }
 
+    pub(super) fn group_run_rows(&self, group: TabId, query: &str) -> Vec<Row> {
+        self.group_run_choices(group, query)
+            .map(|(run, label)| Row {
+                id: CommandId::GroupRun(group, run),
+                label: format!("Run {run} · {label}"),
+                chord: String::new(),
+                enabled: true,
+            })
+            .collect()
+    }
+
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
         let message = match id {
             CommandId::RenamePane(target) => tab_title::show_pane(target),
@@ -660,6 +684,12 @@ impl TerminalApp {
             }
             CommandId::GroupRecentCommand(group, submission) => {
                 Message::HostGroup(host_groups::Action::LoadRecentCommand(group, submission))
+            }
+            CommandId::SearchGroupRuns(group) => {
+                Message::HostGroup(host_groups::Action::OpenRunPicker(group))
+            }
+            CommandId::GroupRun(group, run) => {
+                Message::HostGroup(host_groups::Action::ViewSubmission(group, run))
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
             CommandId::OpenSavedHostGroup(name, members) => {
@@ -746,7 +776,10 @@ pub(super) fn view(
     let page = ((app.window_height - 156.0) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
     let search_label = mode.placeholder();
-    let trimming = if matches!(mode, Search::Tabs | Search::GroupRecent(_)) {
+    let trimming = if matches!(
+        mode,
+        Search::Tabs | Search::GroupRecent(_) | Search::GroupRuns(_)
+    ) {
         TextTrimming::CharacterEllipsis
     } else {
         TextTrimming::None

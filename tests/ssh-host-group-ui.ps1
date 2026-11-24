@@ -620,8 +620,28 @@ try {
     Wait-CommandDraft 'draft before withheld retry'
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
-    Click 'Previous submission'
-    $null = Wait-Until 'earlier submission' { Find-Element "Submitted${dot}both" }
+    $findRun = 'Find run' + [char]0x2026
+    $runSearch = 'Search group runs'
+    Click $findRun
+    (Wait-PickerEditor $runSearch 'the run picker button').GetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern).SetValue('not-a-submission')
+    $null = Wait-Until 'run search reports an empty result' { Find-Element 'No matching group runs' }
+    Press-Key 27
+    $null = Wait-Until 'Escape returns to the same submission' {
+        !(Find-Element $runSearch $edit) -and (Find-Element "Submitted${dot}while-slow")
+    }
+    if ((Command-Editor).Current.Value -cne 'draft before withheld retry') { throw 'Closing the run picker changed the draft' }
+    Click $findRun
+    (Wait-PickerEditor $runSearch 'the reopened run picker').GetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern).SetValue('BOTH')
+    $null = Wait-Until 'only the matching run is offered' {
+        (Find-Element "Run 2${dot}both" $button) -and !(Find-Element "Run 3${dot}while-slow" $button)
+    }
+    Press-Key 13
+    $null = Wait-Until 'run search jumps to the earlier submission' { Find-Element "Submitted${dot}both" }
+    if ((Command-Editor).Current.Value -cne 'draft before withheld retry') { throw 'Choosing a run changed the draft' }
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     Outcome $westName 'Running'
     $compareButton = 'Compare results' + [char]0x2026
     Click $compareButton
@@ -781,8 +801,14 @@ try {
     }
     Run-Palette 'SSH host group'
     Outcome $westName 'Exit 17'
-    Click 'Next submission'
-    $null = Wait-Until 'later submission restored' { Find-Element "Submitted${dot}while-slow" }
+    Run-Palette ('Find group run' + [char]0x2026)
+    (Wait-PickerEditor $runSearch 'Find group run from the palette').GetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern).SetValue('#3')
+    $null = Wait-Until 'the run number selects the exact submission' {
+        (Find-Element "Run 3${dot}while-slow" $button) -and !(Find-Element "Run 2${dot}both" $button)
+    }
+    Press-Key 13
+    $null = Wait-Until 'later submission restored by run number' { Find-Element "Submitted${dot}while-slow" }
     Click 'Attention inbox, 1 unread'
     $runNotice = "Unread${dot}SSH host group${dot}Run 2${dot}Group run finished${dot}1 succeeded${dot}1 needs attention"
     $null = Wait-Until 'the attention view is active before reading the background roster' {
