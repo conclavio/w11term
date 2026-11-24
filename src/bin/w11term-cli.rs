@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     io::{Read, Write},
     path::PathBuf,
+    process::ExitCode,
 };
 use w11term::control::{self, Reply, Request};
 #[path = "w11term-cli/automation.rs"]
@@ -13,7 +14,24 @@ mod sftp_args;
 
 const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] send-text --pane ID --no-paste [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
-fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request)> {
+#[derive(Debug)]
+struct Invocation {
+    pid: Option<u32>,
+    request: Request,
+    require_success: bool,
+}
+
+impl Invocation {
+    fn new(pid: Option<u32>, request: Request) -> Self {
+        Self {
+            pid,
+            request,
+            require_success: false,
+        }
+    }
+}
+
+fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation> {
     let mut args = args.into_iter();
     let mut pid = None;
     let mut verb = None;
@@ -66,7 +84,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
                     payload.is_none() && path.is_none() && !no_paste,
                     "sftp accepts only --pid and --pane before the command"
                 );
-                return sftp_args::parse(args, pid, pane);
+                return sftp_args::parse(args, pid, pane)
+                    .map(|(pid, request)| Invocation::new(pid, request));
             }
             "--pid" => pid = Some(value(&mut args)?.parse()?),
             "--pane" => pane = Some(value(&mut args)?.parse()?),
@@ -149,7 +168,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         }
         _ => bail!("unknown command {verb}\n{HELP}"),
     };
-    Ok((pid, request))
+    Ok(Invocation::new(pid, request))
 }
 fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -160,19 +179,24 @@ fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 #[tokio::main(flavor = "current_thread")]
-async fn main() {
+async fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] || args == ["-h"] {
         println!("{HELP}\n\n{}\n\n{}", sftp_args::HELP, automation::HELP);
-        return;
+        return ExitCode::SUCCESS;
     }
+    let mut require_success = false;
     let result = if args == ["instances"] {
         control::discover().await.map(|instances| {
             Reply::from_result(serde_json::to_value(instances).map_err(Into::into))
         })
     } else {
-        match parse(args) {
-            Ok((pid, request @ Request::FollowSshGroupOutput { .. })) => {
+        match parse_invocation(args) {
+            Ok(Invocation {
+                pid,
+                request: request @ Request::FollowSshGroupOutput { .. },
+                ..
+            }) => {
                 match control::follow(pid, &request, |reply| {
                     let mut stdout = std::io::stdout().lock();
                     let bytes = serde_json::to_vec(reply)?;
@@ -183,32 +207,129 @@ async fn main() {
                 })
                 .await
                 {
-                    Ok(true) => return,
-                    Ok(false) => std::process::exit(1),
+                    Ok(true) => return ExitCode::SUCCESS,
+                    Ok(false) => return ExitCode::FAILURE,
                     Err(error)
                         if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
                             error.kind() == std::io::ErrorKind::BrokenPipe
                         }) =>
                     {
-                        return;
+                        return ExitCode::SUCCESS;
                     }
                     Err(error) => Err(error),
                 }
             }
-            Ok((pid, request)) => control::call(pid, &request).await,
+            Ok(invocation) => {
+                require_success = invocation.require_success;
+                control::call(invocation.pid, &invocation.request).await
+            }
             Err(e) => Err(e),
         }
     };
     let reply = result.unwrap_or_else(|e| Reply::from_result(Err(e)));
     println!("{}", serde_json::to_string(&reply).unwrap());
+    cli_exit_code(&reply, require_success)
+}
+
+fn cli_exit_code(reply: &Reply, require_success: bool) -> ExitCode {
     if !reply.ok {
-        std::process::exit(1);
+        return ExitCode::FAILURE;
+    }
+    if !require_success {
+        return ExitCode::SUCCESS;
+    }
+    let Some(run) = reply.result.as_ref().and_then(|result| result.get("run")) else {
+        return ExitCode::FAILURE;
+    };
+    let Some(recipients) = run.get("recipients").and_then(serde_json::Value::as_array) else {
+        return ExitCode::FAILURE;
+    };
+    let has_expected_output = run.get("output_expectation").is_some();
+    let all_succeeded = !recipients.is_empty()
+        && recipients.iter().all(|recipient| {
+            recipient["delivery"]["state"] == "sent"
+                && recipient["execution"]["state"] == "completed"
+                && recipient["execution"]["exit_code"].as_i64() == Some(0)
+                && (!has_expected_output || recipient["output_expectation"] == "matched")
+        });
+    if all_succeeded {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request)> {
+        let invocation = parse_invocation(args)?;
+        Ok((invocation.pid, invocation.request))
+    }
+
+    #[test]
+    fn require_success_is_a_cli_option_for_the_group_wait() {
+        let invocation = parse_invocation(
+            "wait-ssh-group-run --window 2 --tab 3 --run 4 --require-success"
+                .split_ascii_whitespace()
+                .map(str::to_owned),
+        )
+        .unwrap();
+        assert!(invocation.require_success);
+        assert_eq!(
+            serde_json::to_value(invocation.request).unwrap(),
+            serde_json::json!({
+                "verb":"wait-ssh-group-run","window_id":2,"tab_id":3,"run_id":4,"timeout_seconds":30,
+            })
+        );
+        assert!(
+            parse_invocation(
+                "get-ssh-group-run --window 2 --tab 3 --run 4 --require-success"
+                    .split_ascii_whitespace()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_wait_requires_verified_zero_exits_and_checked_output() {
+        use serde_json::{Value, json};
+
+        let success = json!({
+            "delivery":{"state":"sent"},
+            "execution":{"state":"completed","exit_code":0},
+            "output_expectation":"matched",
+        });
+        let outcome = |recipient: Value| {
+            Reply::from_result(Ok(json!({
+                "run":{"recipients":[success.clone(), recipient],"output_expectation":{"query":"ready"}},
+            })))
+        };
+        assert_eq!(
+            cli_exit_code(&outcome(success.clone()), true),
+            ExitCode::SUCCESS
+        );
+        for (field, bad) in [
+            ("delivery", json!({"state":"skipped"})),
+            ("execution", json!({"state":"completed","exit_code":17})),
+            ("execution", json!({"state":"completed","exit_code":null})),
+            ("output_expectation", json!("missing")),
+            ("output_expectation", json!("unverified")),
+        ] {
+            let mut recipient = success.clone();
+            recipient[field] = bad;
+            let reply = outcome(recipient);
+            assert!(reply.ok);
+            assert_eq!(cli_exit_code(&reply, true), ExitCode::from(2));
+            assert_eq!(cli_exit_code(&reply, false), ExitCode::SUCCESS);
+        }
+        assert_eq!(
+            cli_exit_code(&Reply::from_result(Err(anyhow::anyhow!("timeout"))), true),
+            ExitCode::FAILURE
+        );
+    }
 
     #[test]
     fn parses_ssh_group_submission_without_rewriting_the_command() {

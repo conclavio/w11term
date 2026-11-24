@@ -260,6 +260,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 144. **Skip an unsent SSH host from the CLI.** Withhold a command from one pane in a retained run while the rest of the queue continues under its existing policy.
 145. **Preview SSH group commands from the CLI.** Validate a submission and show the planned recipients and dispatch policy before sending or opening a recording.
 146. **Interrupt a verified SSH group command from the CLI.** Address one running recipient by window, tab, run, and pane. Recheck the command and connection immediately before sending Ctrl+C and report the write separately from the shell's exit.
+147. **Report SSH group success through the CLI exit status.** Opt into a nonzero status for a completed run with any unsuccessful recipient while keeping its full JSON report.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

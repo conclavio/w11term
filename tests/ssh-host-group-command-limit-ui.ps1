@@ -145,9 +145,9 @@ try {
         throw 'CLI discovery changed the visible page or did not summarize the background run'
     }
     $waitArgs = @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run','1')
-    $timedOut = & $Cli --pid $app.Id @waitArgs --timeout 1 | ConvertFrom-Json
-    if ($LASTEXITCODE -eq 0 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before settlement*') {
-        throw 'A held run did not return a wait timeout'
+    $timedOut = & $Cli --pid $app.Id @waitArgs --timeout 1 --require-success | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before settlement*') {
+        throw 'A strict wait did not distinguish timeout from a settled failure'
     }
     $waitOutput = Join-Path $State 'wait-run-1.json'
     $waitJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $waitArgs + @('--timeout','15')) `
@@ -183,6 +183,10 @@ try {
     if ($again.run.summary.settled_count -ne 3 -or !(Find-Element 'No bells or notifications') -or
         [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
         throw 'Waiting again did not return the settled run or changed focus'
+    }
+    $strict = & $Cli --pid $app.Id @waitArgs --require-success | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 2 -or !$strict.ok -or $strict.result.run.recipients[1].delivery.state -cne 'rejected') {
+        throw 'A settled failure did not preserve the JSON report with exit code 2'
     }
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
     $tab.GetCurrentPattern($item).Select()
@@ -565,7 +569,7 @@ try {
     $overrideLog = Join-Path $State 'cli-canary-override.txt'
     $submissionArgs = @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",
         '--pane',"$($panes.East)",'--pane',"$($panes.West)",'--canary',"$($panes.West)",
-        '--record-output',$overrideLog)
+        '--record-output',$overrideLog,'--expect-output','finished verify-override')
     $beforePreview = (Control @('list-ssh-groups')).windows.groups.runs.run_id -join ','
     $preview = Control ($submissionArgs + @('--dry-run','--','verify-override'))
     $afterPreview = (Control @('list-ssh-groups')).windows.groups.runs.run_id -join ','
@@ -592,6 +596,12 @@ try {
     $null = Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$($submitted.run_id)",
         'approve-canary','--pane',"$($panes.West)")
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished verify-override')
+    $strictSuccess = Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($submitted.run_id)",'--require-success','--timeout','10')
+    if ($strictSuccess.run.summary.outcomes.succeeded -ne 2 -or
+        ($strictSuccess.run.recipients.output_expectation -join ',') -cne 'matched,matched') {
+        throw 'Strict wait did not return a successful checked run'
+    }
     $null = Wait-Until 'the recording contains the override and both verified outcomes' {
         $recorded = Read-GroupRecording $overrideLog
         $recorded -and $recorded.Contains("canary $($labels.West)") -and

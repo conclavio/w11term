@@ -1,16 +1,17 @@
+use super::Invocation;
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{
     CommandStatus, Request, SshGroupExpectedOutput, SshGroupQueueAction, SshGroupReportFormat,
     validate_group_panes, validate_group_submission,
 };
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
-pub fn parse(
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] interrupt-ssh-group-command --window ID --tab ID --run ID --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID pause|resume|stop\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID approve-canary --pane ID\nw11term-cli [--pid PID] ssh-group-queue --window ID --tab ID --run ID skip --pane ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub(super) fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
     mut pid: Option<u32>,
     mut pane: Option<u64>,
-) -> Result<(Option<u32>, Request)> {
+) -> Result<Invocation> {
     let mut args = args.peekable();
     let mut cols = None;
     let mut rows = None;
@@ -20,6 +21,7 @@ pub fn parse(
     let mut regex = false;
     let mut match_case = false;
     let mut timeout = None;
+    let mut require_success = false;
     let mut since = None;
     let mut after_line = None;
     let mut limit = None;
@@ -110,6 +112,7 @@ pub fn parse(
             {
                 match_case = true
             }
+            "--require-success" if verb == "wait-ssh-group-run" => require_success = true,
             "--timeout"
                 if matches!(
                     verb,
@@ -436,7 +439,10 @@ pub fn parse(
             let window_id = window_id.context("--window is required (from list-ssh-groups)")?;
             let tab_id = tab_id.context("--tab is required (from list-ssh-groups)")?;
             if verb == "get-ssh-group-roster" {
-                return Ok((pid, Request::GetSshGroupRoster { window_id, tab_id }));
+                return Ok(Invocation::new(
+                    pid,
+                    Request::GetSshGroupRoster { window_id, tab_id },
+                ));
             }
             let timeout_seconds = timeout.unwrap_or(30);
             ensure!(
@@ -450,7 +456,7 @@ pub fn parse(
                     validate_group_panes(&pane_ids)?;
                     Some(pane_ids)
                 };
-                return Ok((
+                return Ok(Invocation::new(
                     pid,
                     Request::WaitSshGroupReady {
                         window_id,
@@ -542,7 +548,11 @@ pub fn parse(
         }
         _ => bail!("unknown automation command"),
     };
-    Ok((pid, request))
+    Ok(Invocation {
+        pid,
+        request,
+        require_success,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -551,7 +561,7 @@ mod tests {
     fn timed_recording_is_opt_in_and_old_record_requests_round_trip() {
         let record =
             |args: &[&str]| parse("record", args.iter().map(|s| s.to_string()), None, Some(7));
-        let (_, timed) = record(&["--timed", "my capture.vt"]).unwrap();
+        let timed = record(&["--timed", "my capture.vt"]).unwrap().request;
         assert!(
             matches!(timed, Request::Record { pane: 7, timed: true, path: Some(path) } if path.is_absolute())
         );
@@ -562,14 +572,17 @@ mod tests {
         assert!(matches!(decoded, Request::Record { timed: false, .. }));
         assert_eq!(serde_json::to_value(decoded).unwrap(), stop);
         assert_eq!(
-            serde_json::to_value(record(&["--stop"]).unwrap().1).unwrap(),
+            serde_json::to_value(record(&["--stop"]).unwrap().request).unwrap(),
             stop
         );
     }
 
     #[test]
     fn rejects_cross_command_flags_and_missing_values() {
-        let p = |v, a: &[&str]| parse(v, a.iter().map(|s| s.to_string()), None, None);
+        let p = |v, a: &[&str]| {
+            parse(v, a.iter().map(|s| s.to_string()), None, None)
+                .map(|invocation| (invocation.pid, invocation.request))
+        };
         assert!(matches!(
             p("wait-for-text", &["--pane", "1", "--regex", "fps: [0-9]+"])
                 .unwrap()

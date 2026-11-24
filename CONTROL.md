@@ -369,15 +369,21 @@ and requires `--overwrite` to replace an existing file. The reply returns
 `window_id`, `tab_id`, `run_id`, `path`, and `format`. The export works while
 the group is in the background.
 
-`wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]`
+`wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS] [--require-success]`
 returns the same detail reply once all recipients settle, including the result
 of any active per-recipient expected-output check. For CLI-started recordings,
 it also waits for the file writer's final status. It handles running, paused,
 and canary-gated queues in the background. The timeout defaults to
 30 seconds and accepts 1 through 3600. A settled run returns immediately.
-Check the recipient statuses and exit codes to decide whether the run succeeded.
 Timeout, a closed window or tab, or an evicted run returns an error. A timeout
 leaves the original run in progress.
+
+With `--require-success`, the CLI exits **0** when every recipient reports a
+verified exit code of zero and every configured output check matches. It
+exits **2** when the run settles with any other recipient outcome, including
+a skipped host or missing exit status. In either case the JSON reply still
+has `ok: true` and the full run. Request errors and timeouts exit **1**.
+Without the flag, any successfully retrieved run exits **0**.
 
 `wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT`
 returns the first matching line from the selected run. It searches the retained
@@ -457,6 +463,7 @@ w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 skip --pane 1
 w11term-cli --pid 12345 interrupt-ssh-group-command --window 1 --tab 9 --run 3 --pane 17
 w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
+w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --require-success
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --regex '^ready for traffic$'
 w11term-cli --pid 12345 get-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --limit 20
