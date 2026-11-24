@@ -1024,8 +1024,8 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
     .unwrap();
     drive_gui("ssh-host-group-ui.ps1", state.path());
     let expected: [&[u8]; 2] = [
-        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\rrecord-fast\rrecord-one\rcheck-expected\rcheck-each-host\r",
-        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\raltprompt\x1b[200~check-each-host\x1b[201~\raltprompt\x1b[200~cli-only  west\x1b[201~\r",
+        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\rrecord-fast\rrecord-one\rcheck-expected\rcheck-each-host\rcli-expect\r",
+        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\raltprompt\x1b[200~check-each-host\x1b[201~\raltprompt\x1b[200~cli-only  west\x1b[201~\r\x1b[200~cli-expect\x1b[201~\r",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
         assert_eq!(

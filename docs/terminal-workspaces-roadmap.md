@@ -248,6 +248,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 132. **Require expected output from each recipient.** Track the hosts that match independently, and identify hosts with missing or unverified output in the run results.
 133. **Report per-recipient output checks.** Preserve matched, missing, and unverified outcomes in copied results, saved reports, and the CLI run detail.
 134. **Submit SSH group commands from the CLI.** Validate an explicit list of ready panes in an existing group, then return a run ID for settlement and output queries. Preserve the active tab and the group's draft and selection.
+135. **Arm output checks on CLI submissions.** Attach a literal or regular-expression expectation before dispatch and report whether each named host produced it.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

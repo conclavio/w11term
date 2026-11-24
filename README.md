@@ -179,7 +179,7 @@ Open **Saved alert rules…** in Live output or the send-with-alert review to sa
 
 In **Send with alert…**, turn on **Alert if expected output is missing** to look for a confirmation line across the selected hosts. A verified match clears the alert quietly. If the run settles without a match, the Attention inbox reports either **Expected output missing** when capture completed for all recipients or **Could not verify expected output** when delivery or capture was incomplete.
 
-Select **Require a match from every host** when each recipient needs to produce its own confirmation. The inbox summarizes missing and unverified hosts at settlement. Open the notice to see which hosts fall into each group. Copied results, saved text and JSON reports, and the CLI run detail include each recipient's resolved check, including successful matches.
+Select **Require a match from every host** when each recipient needs to produce its own confirmation. Scripts can arm the same check with `submit-ssh-group-command --expect-output`. The inbox summarizes missing and unverified hosts at settlement. Open the notice to see which hosts fall into each group. Copied results, saved text and JSON reports, and the CLI run detail include each recipient's resolved check, including successful matches.
 
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 

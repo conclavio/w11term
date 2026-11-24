@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
-use w11term::control::SshGroupOutput;
+use w11term::control::{SshGroupExpectedOutput, SshGroupOutput};
 use w11term::events::GroupCompletionState;
 
 pub(in crate::app) type ControlReply = oneshot::Sender<Result<Value, String>>;
@@ -86,6 +86,7 @@ impl TerminalApp {
         tab: TabId,
         pane_ids: &[u64],
         command: String,
+        expect_output: Option<(SshGroupExpectedOutput, regex::Regex)>,
     ) -> Result<u64, String> {
         let targets = self.host_group_targets();
         let Some(Page::HostGroup(page)) = self.tabs.get_mut(tab).map(|tab| &mut tab.page) else {
@@ -121,10 +122,15 @@ impl TerminalApp {
                 .to_owned()
         })?;
         let offer = page.command_offer(command.into(), recipients);
+        let transcript = GroupTranscript::default();
+        if let Some((rule, pattern)) = expect_output {
+            let alert = alerted_send::Alert::expected_output(rule, pattern);
+            self.arm_group_send_alert(tab, &offer, alert, &transcript);
+        }
         self.submit_group_command(
             tab,
             offer,
-            GroupTranscript::default(),
+            transcript,
             Default::default(),
             SubmissionOrigin::Control,
         )

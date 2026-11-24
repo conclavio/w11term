@@ -18,6 +18,16 @@ pub struct SshGroupOutput {
     pub retained: Option<watch::Receiver<()>>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshGroupExpectedOutput {
+    pub query: String,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default)]
+    pub match_case: bool,
+}
+
 pub(super) struct GroupOutputQuery {
     pub(super) pane: Option<u64>,
     pub(super) after_line: Option<u64>,
@@ -98,14 +108,23 @@ impl Registry {
         tab: u64,
         pane_ids: Vec<u64>,
         command: String,
+        expect_output: Option<SshGroupExpectedOutput>,
     ) -> Result<Value> {
         validate_group_submission(&pane_ids, &command)?;
+        let expect_output = expect_output
+            .map(|rule| {
+                let pattern = output_pattern(&rule.query, rule.regex, rule.match_case)?;
+                Ok::<_, anyhow::Error>((rule, pattern))
+            })
+            .transpose()
+            .context("invalid expected output")?;
         let ui = self.window_ui(window)?;
         let (reply, response) = oneshot::channel();
         ui(UiRequest::SubmitSshGroupCommand {
             tab_id: tab,
             pane_ids,
             command,
+            expect_output,
             reply,
         });
         let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
@@ -576,11 +595,16 @@ mod tests {
                 tab_id,
                 pane_ids,
                 command,
+                expect_output,
                 reply,
             } => {
                 assert_eq!(tab_id, 9);
                 assert_eq!(pane_ids, [8, 7]);
                 assert_eq!(command, "show  status");
+                let (rule, pattern) = expect_output.unwrap();
+                assert_eq!(rule.query, "^READY [0-9]+$");
+                assert!(pattern.is_match("READY 2"));
+                assert!(!pattern.is_match("ready 2"));
                 reply.send(Ok(json!(3))).unwrap();
             }
             UiRequest::GetSshGroupRoster {
@@ -610,7 +634,17 @@ mod tests {
         );
         let lookup = second.query_ssh_group_run(3, 9, 2, None).await.unwrap();
         let submission = second
-            .submit_ssh_group_command(3, 9, vec![8, 7], "show  status".into())
+            .submit_ssh_group_command(
+                3,
+                9,
+                vec![8, 7],
+                "show  status".into(),
+                Some(SshGroupExpectedOutput {
+                    query: "^READY [0-9]+$".into(),
+                    regex: true,
+                    match_case: true,
+                }),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -619,11 +653,29 @@ mod tests {
         );
         assert!(
             second
-                .submit_ssh_group_command(3, 9, vec![7, 7], "show".into())
+                .submit_ssh_group_command(3, 9, vec![7, 7], "show".into(), None)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("specified more than once")
+        );
+        assert!(
+            second
+                .submit_ssh_group_command(
+                    5,
+                    9,
+                    vec![7],
+                    "show".into(),
+                    Some(SshGroupExpectedOutput {
+                        query: "[".into(),
+                        regex: true,
+                        match_case: false
+                    }),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid expected output")
         );
         assert_eq!(
             lookup,

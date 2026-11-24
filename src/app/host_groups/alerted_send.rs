@@ -1,7 +1,10 @@
 use super::*;
 use live_output::OutputSearch;
 use regex::Regex;
-use w11term::events::{GroupOutputAlert, GroupOutputAlertRule, GroupOutputAlertTrigger};
+use w11term::{
+    control::SshGroupExpectedOutput,
+    events::{GroupOutputAlert, GroupOutputAlertRule, GroupOutputAlertTrigger},
+};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -20,6 +23,21 @@ struct Review {
 pub(super) struct Alert {
     pattern: Regex,
     rule: Arc<GroupOutputAlertRule>,
+}
+
+impl Alert {
+    pub(super) fn expected_output(options: SshGroupExpectedOutput, pattern: Regex) -> Self {
+        Self {
+            pattern,
+            rule: Arc::new(GroupOutputAlertRule {
+                query: options.query,
+                regex: options.regex,
+                match_case: options.match_case,
+                host: None,
+                trigger: GroupOutputAlertTrigger::MissingByHost,
+            }),
+        }
+    }
 }
 
 pub enum Action {

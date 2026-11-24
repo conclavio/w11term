@@ -2018,6 +2018,10 @@ try {
     Press-Key 0x77
     Wait-Focus $east
     $submitForeground = [FixtureMessages]::GetForegroundWindow()
+    $badPattern = & $Cli --pid $app.Id @submitArgs --pane $west --expect-output '[' --regex 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $badPattern.ok -or $badPattern.error -notlike '*invalid expected output*') {
+        throw 'The CLI accepted an invalid expected-output regex'
+    }
     $launched = Control ($submitArgs + @('--pane',"$west",'cli-only  west'))
     if ($launched.window_id -ne $groupWindow -or $launched.tab_id -ne $groupTab -or $launched.run_id -ne ($everyHostRun + 1)) {
         throw 'The CLI did not create exactly one retained run for the accepted request'
@@ -2025,10 +2029,26 @@ try {
     $verified = (Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
         '--run',"$($launched.run_id)",'--timeout','15')).run
     if ($verified.command -cne 'cli-only  west' -or $verified.recipients.Count -ne 1 -or
+        $null -ne $verified.output_expectation -or
         $verified.recipients[0].pane_id -ne $west -or $verified.recipients[0].delivery.state -cne 'sent' -or
         $verified.recipients[0].execution.exit_code -ne 17 -or
         [FixtureMessages]::GetForegroundWindow() -ne $submitForeground) {
         throw 'The CLI submission changed focus or lost its recipient, command, or outcome'
+    }
+    $null = Wait-Until 'both SSH panes are ready for the checked CLI run' {
+        ((Roster-Snapshot).hosts | Where-Object state -ceq 'ready' | Measure-Object).Count -eq 2
+    }
+    $cliPattern = '^west-accepted cli-expect$'
+    $checked = Control ($submitArgs + @('--pane',"$west",'--pane',"$east",
+        '--expect-output',$cliPattern,'--regex','--match-case','cli-expect'))
+    $cliCheck = (Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$($checked.run_id)",'--timeout','15')).run
+    $first, $second = $cliCheck.recipients
+    if ($checked.run_id -ne ($launched.run_id + 1) -or $cliCheck.recipients.Count -ne 2 -or
+        $cliCheck.output_expectation.query -cne $cliPattern -or !$cliCheck.output_expectation.regex -or
+        !$cliCheck.output_expectation.match_case -or $first.pane_id -ne $west -or $second.pane_id -ne $east -or
+        $first.output_expectation -cne 'matched' -or $second.output_expectation -cne 'missing') {
+        throw "The checked CLI submission lost its rule, recipient order, or per-pane outcomes: $($cliCheck | ConvertTo-Json -Depth 8 -Compress)"
     }
     Wait-Focus $east
     Run-Palette 'SSH host group'
@@ -2043,6 +2063,15 @@ try {
         throw 'The background send changed the roster filter or checked hosts'
     }
     Set-HostFilter ''
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}SSH host group${dot}Run $($checked.run_id)${dot}Expected output missing on 1 host${dot}$cliPattern"
+    $null = Wait-Until 'the CLI check links back to its own results in the group' {
+        (Find-Element "Submitted${dot}cli-expect") -and (Find-Element "Expected output missing${dot}$eastName")
+    }
+    Click 'Previous submission'
+    $null = Wait-Until 'return to the command submitted without a check' { Find-Element "Submitted${dot}cli-only  west" }
+    Click 'Previous submission'
+    $null = Wait-Until 'return to the previous UI output check' { Find-Element "Submitted${dot}check-each-host" }
     Click 'Previous submission'
     $null = Wait-Until 'move back to the earlier missing-output check' { Find-Element "Submitted${dot}check-expected" }
     Click 'Previous submission'

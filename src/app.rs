@@ -5410,10 +5410,16 @@ impl Component for TerminalApp {
                 tab_id,
                 pane_ids,
                 command,
+                expect_output,
                 reply,
             }) => {
                 if !reply.is_closed() {
-                    let result = self.control_submit_ssh_group_command(tab_id, &pane_ids, command);
+                    let result = self.control_submit_ssh_group_command(
+                        tab_id,
+                        &pane_ids,
+                        command,
+                        expect_output,
+                    );
                     let _ = reply.send(result.map(Into::into));
                     self.update_host_group_timer(context);
                 }

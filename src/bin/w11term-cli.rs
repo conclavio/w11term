@@ -233,6 +233,23 @@ mod tests {
                 "pane_ids":[9,5], "command":"show  status; pwd",
             }),
         );
+        let (_, checked) = submit(&[
+            "--pane",
+            "9",
+            "--pane",
+            "5",
+            "--expect-output",
+            "^READY [0-9]+$",
+            "--regex",
+            "--match-case",
+            "--",
+            "show  status",
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(checked).unwrap()["expect_output"],
+            serde_json::json!({ "query":"^READY [0-9]+$", "regex":true, "match_case":true }),
+        );
         for invalid in [
             &["show"][..],
             &["--pane", "0", "show"],
@@ -240,6 +257,18 @@ mod tests {
             &["--pane", "5", "show\rstatus"],
             &["--pane", "5", "--run", "1", "show"],
             &["--pane", "5", "show", "status"],
+            &["--pane", "5", "--regex", "show"],
+            &["--pane", "5", "--match-case", "show"],
+            &["--pane", "5", "--expect-output"],
+            &[
+                "--pane",
+                "5",
+                "--expect-output",
+                "a",
+                "--expect-output",
+                "b",
+                "show",
+            ],
         ] {
             assert!(submit(invalid).is_err(), "{invalid:?}");
         }
