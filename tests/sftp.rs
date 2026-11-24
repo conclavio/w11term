@@ -23,6 +23,8 @@ struct Peer {
     channels: HashMap<ChannelId, Channel<server::Msg>>,
     wire: Option<tokio::sync::mpsc::UnboundedSender<in_band_resize::Wire>>,
     forwarded: HashSet<ChannelId>,
+    #[cfg(feature = "ui-smoke")]
+    withheld_session_open: Option<server::ChannelOpenHandle>,
     root: PathBuf,
     opens: Arc<AtomicUsize>,
     reject: bool,
@@ -49,8 +51,10 @@ impl server::Handler for Peer {
     ) -> anyhow::Result<()> {
         self.opens.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "ui-smoke")]
-        while self.root.join("hold-session-channel").is_file() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        if self.root.join("withhold-session-open").is_file() {
+            // Keep the SSH connection responsive while leaving the request unanswered.
+            self.withheld_session_open = Some(reply);
+            return Ok(());
         }
         self.channels.insert(channel.id(), channel);
         reply.accept().await;
@@ -177,6 +181,9 @@ impl server::Handler for Peer {
     async fn shell_request(&mut self, c: ChannelId, s: &mut server::Session) -> anyhow::Result<()> {
         #[cfg(feature = "ui-smoke")]
         {
+            if self.root.join("withhold-shell-reply").is_file() {
+                return Ok(());
+            }
             let gate = self.root.join("hold-shell-request");
             while gate.is_file() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -912,6 +919,8 @@ async fn fixture_with_wire(
                 wire: wire.clone(),
                 channels: HashMap::new(),
                 forwarded: HashSet::new(),
+                #[cfg(feature = "ui-smoke")]
+                withheld_session_open: None,
                 root: root_path.clone(),
                 opens: opens_for_server.clone(),
                 reject,
@@ -1486,8 +1495,8 @@ async fn ssh_shell_setup_times_out_and_releases_the_group_login_slot() {
     };
     stalled_open.player.reconnect = false;
     stalled_setup.player.reconnect = false;
-    fs::write(open_root.path().join("hold-session-channel"), []).unwrap();
-    fs::write(setup_root.path().join("hold-shell-request"), []).unwrap();
+    fs::write(open_root.path().join("withhold-session-open"), []).unwrap();
+    fs::write(setup_root.path().join("withhold-shell-reply"), []).unwrap();
 
     let gate = Arc::new(tokio::sync::Semaphore::new(1));
     let start = |options| {
