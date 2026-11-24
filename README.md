@@ -183,13 +183,14 @@ Choose **Copy results** to copy the viewed submission as plain text, including e
 
 Choose **Save results…** to write a UTF-8 report of the viewed submission. It includes every recipient and all retained output from completed commands, even when the roster or result filters hide a host. A host still running appears with its status at the time you opened the Save dialog.
 
-Command results, reports, and output recordings show the dispatch settings captured for that run. These settings stay with the run when you change the next draft.
+Command results, reports, and output recordings show the dispatch settings captured for that run. These settings stay with the run when you change the next draft. **Show queue activity** lists pauses, resumes, canary decisions, and stops with elapsed time since submission. Reports and completed recordings include the most recent 32 queue events and count any earlier events omitted.
 
 Text and JSON reports include the known per-host times when you open the Save dialog. In JSON, `execution.elapsed_ms` is the running time for a verified running command and `execution.duration_ms` is the final time for a completed command.
 
 **Save results as JSON…** exports the same snapshot for scripts. The document has `schema_version: 1`, a `submission_id` scoped to its group tab, `kind` (`command` or `environment`), `label`, `command`, and an ordered `recipients` array. Each recipient has `pane_id`, `name`, `profile`, `address`, and `command`. A command submission puts the shared command at the top level. An environment export puts the commands on the recipients.
 
 - Command submissions include `dispatch_policy` with the numeric `parallel_limit` (null means unlimited), `interval_ms`, effective `stop_on_failure`, and a `canary` with its `pane_id` and `label` when selected. The canary field is null for a run without one.
+- When queue events exist, `queue_activity` contains an `omitted` count and an ordered `events` array with `elapsed_ms` and `kind` for each event.
 - `delivery.state` and `interrupt.state` use `pending`, `sent`, `rejected`, or `unconfirmed`. A rejection includes `reason`. The `interrupt` field is `null` until an interrupt is requested.
 - `execution.state` uses `awaiting_markers`, `awaiting_prompt`, `running`, `prompt_returned`, `completed`, or `unavailable`. A completed execution includes `connection_generation`, `command_id`, and `exit_code`. The exit code is `null` when the shell supplied none.
 - `output.state` uses `complete` or `preview` with `text`, or `unavailable` with `reason`. A run without a completed capture has `output: null`. A complete, empty capture uses an empty `text` string.

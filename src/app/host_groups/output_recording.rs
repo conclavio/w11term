@@ -227,6 +227,7 @@ fn write_outcomes(
     names: &BTreeMap<u64, String>,
     summary: GroupRecordingSummary,
 ) -> io::Result<()> {
+    file.write_all(queue_activity::text(&summary.queue_activity).as_bytes())?;
     if !summary.hosts.is_empty() {
         writeln!(file, "[Host outcomes]\r")?;
     }
@@ -293,6 +294,7 @@ fn write_output(
     let summary = stream.ended.try_recv().unwrap_or(GroupRecordingSummary {
         end: GroupRecordingEnd::Stopped,
         hosts: Vec::new(),
+        queue_activity: Default::default(),
     });
     write_outcomes(file, names, summary)?;
     file.flush()
@@ -460,6 +462,7 @@ mod tests {
         finish
             .send(GroupRecordingSummary {
                 end: GroupRecordingEnd::Stopped,
+                queue_activity: Default::default(),
                 hosts: vec![
                     (1, GroupRecordingOutcome::DeliveryUnconfirmed),
                     (

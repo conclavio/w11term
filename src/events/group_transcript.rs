@@ -1,13 +1,16 @@
 use super::{GroupExecution, Inbox};
+use serde::Serialize;
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
+    time::Instant,
 };
 use tokio::sync::{broadcast, oneshot};
 use wezterm_term::LiveOutputBatch;
 
 const TRANSCRIPT_LINES: usize = 128;
 const RECORDING_QUEUE: usize = 1024;
+const QUEUE_EVENT_LIMIT: usize = 32;
 
 #[derive(Clone, Debug, Default)]
 pub struct GroupTranscript(Arc<Mutex<Transcript>>);
@@ -15,6 +18,7 @@ pub struct GroupTranscript(Arc<Mutex<Transcript>>);
 #[derive(Debug, Default)]
 struct Transcript {
     snapshot: GroupTranscriptSnapshot,
+    queue_activity: QueueActivity,
     recording: Option<Recording>,
     next_recording: u64,
     hosts: Vec<HostRecord>,
@@ -62,6 +66,66 @@ pub enum GroupRecordingEnd {
 pub struct GroupRecordingSummary {
     pub end: GroupRecordingEnd,
     pub hosts: Vec<(u64, GroupRecordingOutcome)>,
+    pub queue_activity: GroupQueueActivity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupQueueEventKind {
+    Paused,
+    Resumed,
+    CanaryReady,
+    CanaryApproved,
+    CanaryFailed,
+    StoppedOnFailure,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupQueueEvent {
+    pub elapsed_ms: u64,
+    pub kind: GroupQueueEventKind,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct GroupQueueActivity {
+    pub omitted: u64,
+    pub events: VecDeque<GroupQueueEvent>,
+}
+
+impl GroupQueueActivity {
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct QueueActivity {
+    started_at: Instant,
+    snapshot: GroupQueueActivity,
+}
+
+impl Default for QueueActivity {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            snapshot: GroupQueueActivity::default(),
+        }
+    }
+}
+
+impl QueueActivity {
+    fn push(&mut self, kind: GroupQueueEventKind, now: Instant) {
+        if self.snapshot.events.len() == QUEUE_EVENT_LIMIT {
+            self.snapshot.events.pop_front();
+            self.snapshot.omitted = self.snapshot.omitted.saturating_add(1);
+        }
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.started_at).as_millis())
+            .unwrap_or(u64::MAX);
+        self.snapshot
+            .events
+            .push_back(GroupQueueEvent { elapsed_ms, kind });
+    }
 }
 
 #[derive(Debug)]
@@ -254,6 +318,18 @@ impl GroupTranscript {
         }
     }
 
+    pub fn note_queue_activity(&self, kind: GroupQueueEventKind) {
+        self.0
+            .lock()
+            .unwrap()
+            .queue_activity
+            .push(kind, Instant::now());
+    }
+
+    pub fn queue_activity(&self) -> GroupQueueActivity {
+        self.0.lock().unwrap().queue_activity.snapshot.clone()
+    }
+
     pub fn snapshot(&self) -> GroupTranscriptSnapshot {
         self.0.lock().unwrap().snapshot.clone()
     }
@@ -388,9 +464,11 @@ impl Transcript {
                 .iter()
                 .map(|host| (host.pane, host.outcome()))
                 .collect();
-            let _ = recording
-                .ended
-                .send(GroupRecordingSummary { end: reason, hosts });
+            let _ = recording.ended.send(GroupRecordingSummary {
+                end: reason,
+                hosts,
+                queue_activity: self.queue_activity.snapshot.clone(),
+            });
         }
     }
 
@@ -419,6 +497,38 @@ mod tests {
     use super::*;
     use crate::events::{CommandLink, GroupCommandResult, GroupOutput, NoticeTarget};
     use wezterm_term::LiveOutputLine;
+
+    #[test]
+    fn queue_activity_retains_recent_events_in_elapsed_order() {
+        let mut activity = QueueActivity::default();
+        for index in 0..QUEUE_EVENT_LIMIT + 2 {
+            let kind = if index % 2 == 0 {
+                GroupQueueEventKind::Paused
+            } else {
+                GroupQueueEventKind::Resumed
+            };
+            let at = activity.started_at + std::time::Duration::from_millis(index as u64);
+            activity.push(kind, at);
+        }
+        assert_eq!(activity.snapshot.omitted, 2);
+        assert_eq!(activity.snapshot.events.len(), QUEUE_EVENT_LIMIT);
+        assert_eq!(
+            activity.snapshot.events.front().unwrap().kind,
+            GroupQueueEventKind::Paused
+        );
+        assert_eq!(
+            activity.snapshot.events.back().unwrap().kind,
+            GroupQueueEventKind::Resumed
+        );
+        assert!(
+            activity
+                .snapshot
+                .events
+                .iter()
+                .map(|event| event.elapsed_ms)
+                .eq(2..QUEUE_EVENT_LIMIT as u64 + 2)
+        );
+    }
 
     #[test]
     fn a_settled_prompt_without_an_exit_status_is_unsuccessful() {

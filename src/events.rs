@@ -16,9 +16,10 @@ mod ssh_attempt;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
-    GroupCompletionState, GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome,
-    GroupRecordingSummary, GroupTranscript, GroupTranscriptHost, GroupTranscriptLine,
-    GroupTranscriptRecording, GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
+    GroupCompletionState, GroupQueueActivity, GroupQueueEvent, GroupQueueEventKind,
+    GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
+    GroupTranscript, GroupTranscriptHost, GroupTranscriptLine, GroupTranscriptRecording,
+    GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;
 pub use inbox::{Inbox, NoticeTarget, SshLoginResult};

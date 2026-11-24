@@ -7,6 +7,7 @@ use std::{
     io::{self, Write},
     time::{Duration, Instant},
 };
+use w11term::events::GroupQueueActivity;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -155,6 +156,8 @@ struct Document<'a> {
     command: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dispatch_policy: Option<&'a Policy>,
+    #[serde(skip_serializing_if = "GroupQueueActivity::is_empty")]
+    queue_activity: &'a GroupQueueActivity,
     recipients: Vec<DocumentRecipient<'a>>,
 }
 
@@ -170,6 +173,7 @@ impl Report {
             label: &self.label,
             command: matches!(self.kind, Kind::Command).then_some(self.label.as_str()),
             dispatch_policy: self.dispatch_policy.as_ref(),
+            queue_activity: &self.queue_activity,
             recipients: self
                 .sections
                 .iter()

@@ -134,7 +134,8 @@ try {
     $null = Wait-Until 'the recording includes the cancelled delivery and finite limit' {
         $recorded = Read-GroupRecording $log
         $recorded -and $recorded.Contains('Cancelled before sending.') -and
-            $recorded.Contains("Dispatch${dot}parallel limit 1${dot}no delay")
+            $recorded.Contains("Dispatch${dot}parallel limit 1${dot}no delay") -and
+            $recorded.Contains('[Queue activity]') -and $recorded.Contains('Cancelled queued commands')
     }
     (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
     $null = Wait-CheckBox 'Stop queue on failure' On
@@ -152,6 +153,12 @@ try {
             (Find-Element "$($labels.East)${dot}Not sent${dot}Queue stopped after an unsuccessful host.") -and
             !(Find-Element 'Resume queue' $button)
     }
+
+    Click 'Show queue activity'
+    $null = Wait-Until 'the paused run records why it stopped' {
+        (Find-Element 'Paused queue') -and (Find-Element 'Stopped after an unsuccessful host')
+    }
+    Click 'Hide queue activity'
 
     Set-Command 'inspect'
     Click 'Send to 2 hosts'
@@ -175,6 +182,11 @@ try {
         Find-Element "$($labels.East)${dot}Sent to SSH channel"
     }
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
+    Click 'Show queue activity'
+    $null = Wait-Until 'the completed run retains pause and resume events' {
+        (Find-Element 'Paused queue') -and (Find-Element 'Resumed queue')
+    }
+    Click 'Hide queue activity'
 
     Select-GroupOption 'Parallel SSH commands' 'Unlimited'
     Select-GroupOption 'Canary host' $labels.East
@@ -237,7 +249,10 @@ try {
     $log = Join-Path $State 'ssh-group-output-5.txt'
     $null = Wait-Until 'the recording names the original canary' {
         $recorded = Read-GroupRecording $log
-        $recorded -and $recorded.Contains($canaryPolicy) -and $recorded.Contains('[Group run settled]')
+        if (!$recorded -or !$recorded.Contains($canaryPolicy) -or !$recorded.Contains('[Group run settled]')) { return }
+        $readyIndex = $recorded.IndexOf('Canary ready for approval')
+        $approveIndex = $recorded.IndexOf('Approved remaining hosts')
+        $readyIndex -ge 0 -and $approveIndex -gt $readyIndex
     }
 
     Set-Command 'canary-fails'

@@ -29,6 +29,7 @@ mod output_recording;
 mod parallel_limit;
 mod progress;
 mod prompt_setup;
+mod queue_activity;
 mod recent_commands;
 mod recipient_sets;
 mod reconnect;
@@ -132,6 +133,7 @@ struct Submission {
     saved_recordings: output_recording::saved::State,
     command_queue: Option<command_queue::Queue>,
     dispatch_policy: Option<dispatch_policy::Policy>,
+    show_queue_activity: bool,
 }
 
 #[derive(Clone)]
@@ -602,6 +604,7 @@ impl HostGroup {
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
+            show_queue_activity: false,
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -734,6 +737,7 @@ pub enum Action {
     EditCommandOrder(TabId, command_order::Edit),
     StopCommandQueueOnFailure(TabId, bool),
     CommandQueue(TabId, u64, command_queue::Action),
+    ShowQueueActivity(TabId, u64, bool),
 }
 
 impl TerminalApp {
@@ -1576,6 +1580,14 @@ impl TerminalApp {
             }
             Action::EditCommandOrder(id, edit) => self.edit_command_order(id, edit),
             Action::CommandQueue(id, run, action) => self.handle_command_queue(id, run, action),
+            Action::ShowQueueActivity(id, run, show) => {
+                if let Some(page) = self.host_group_mut(id).filter(|page| page.viewing == run)
+                    && let Some(submission) =
+                        page.submissions.iter_mut().find(|item| item.id == run)
+                {
+                    submission.show_queue_activity = show;
+                }
+            }
             Action::StopCommandQueueOnFailure(id, stop) => {
                 if let Some(page) = self
                     .host_group_mut(id)
@@ -2491,6 +2503,7 @@ impl TerminalApp {
                         completion::button(id, submission, ctx),
                     )),
                 command_queue::controls(id, submission, ctx),
+                queue_activity::view(id, submission, ctx),
                 retry::button(
                     id,
                     page,

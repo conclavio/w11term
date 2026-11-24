@@ -1,5 +1,5 @@
 use super::*;
-use w11term::events::GroupTranscriptHost;
+use w11term::events::{GroupQueueEventKind, GroupTranscriptHost};
 
 const FAILED_RESULT: &str = "Queue stopped after an unsuccessful host.";
 const CANARY_FAILED: &str = "Canary did not report a successful exit.";
@@ -239,12 +239,15 @@ impl TerminalApp {
                             let notify = std::mem::take(&mut queue.notify_canary);
                             if succeeded {
                                 queue.canary = Some(CanaryGate::AwaitingApproval(pane));
+                                run.transcript
+                                    .note_queue_activity(GroupQueueEventKind::CanaryReady);
                             } else {
-                                let reason = if result.is_some() {
-                                    CANARY_FAILED
+                                let (reason, event) = if result.is_some() {
+                                    (CANARY_FAILED, GroupQueueEventKind::CanaryFailed)
                                 } else {
-                                    FAILED_RESULT
+                                    (FAILED_RESULT, GroupQueueEventKind::StoppedOnFailure)
                                 };
+                                run.transcript.note_queue_activity(event);
                                 run.reject_queued_commands(reason);
                             }
                             if notify {
@@ -264,6 +267,8 @@ impl TerminalApp {
                     None => None,
                 };
                 if stopped {
+                    run.transcript
+                        .note_queue_activity(GroupQueueEventKind::StoppedOnFailure);
                     run.reject_queued_commands(FAILED_RESULT);
                     continue;
                 }
@@ -299,10 +304,15 @@ impl TerminalApp {
                     }
                 }
             }
+            let mut stopped_runs = BTreeSet::new();
             for (run, index, target, text, host, stop_after_failure) in jobs {
-                let delivery = if stop_after_failure
-                    .is_some_and(|transcript| transcript.has_unsuccessful_result())
-                {
+                let delivery = if let Some(transcript) =
+                    stop_after_failure.as_ref().filter(|transcript| {
+                        stopped_runs.contains(&run) || transcript.has_unsuccessful_result()
+                    }) {
+                    if stopped_runs.insert(run) {
+                        transcript.note_queue_activity(GroupQueueEventKind::StoppedOnFailure);
+                    }
                     host.delivery_receipt().reject(FAILED_RESULT);
                     Delivery {
                         target,
@@ -326,6 +336,17 @@ impl TerminalApp {
                         queue.last_dispatch = Some(*sent_at);
                     }
                     submission.results[index] = delivery;
+                }
+            }
+            if !stopped_runs.is_empty()
+                && let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
+            {
+                for run in page
+                    .submissions
+                    .iter_mut()
+                    .filter(|run| stopped_runs.contains(&run.id))
+                {
+                    run.reject_queued_commands(FAILED_RESULT);
                 }
             }
         }
@@ -352,11 +373,20 @@ impl TerminalApp {
         match action {
             Action::Cancel => {
                 queue.notify_canary = false;
+                submission
+                    .transcript
+                    .note_queue_activity(GroupQueueEventKind::Cancelled);
                 submission.reject_queued_commands("Cancelled before sending.");
             }
             Action::CancelCanaryNotice => queue.notify_canary = false,
-            Action::SetPaused(paused) if queue.canary.is_none() => {
+            Action::SetPaused(paused) if queue.canary.is_none() && queue.paused != paused => {
                 queue.paused = paused;
+                let event = if paused {
+                    GroupQueueEventKind::Paused
+                } else {
+                    GroupQueueEventKind::Resumed
+                };
+                submission.transcript.note_queue_activity(event);
                 if !paused {
                     self.poll_command_queues();
                 }
@@ -365,6 +395,9 @@ impl TerminalApp {
                 if matches!(queue.canary, Some(CanaryGate::AwaitingApproval(_))) =>
             {
                 queue.canary = None;
+                submission
+                    .transcript
+                    .note_queue_activity(GroupQueueEventKind::CanaryApproved);
                 self.poll_command_queues();
             }
             _ => {}

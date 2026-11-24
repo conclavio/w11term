@@ -1,10 +1,10 @@
 use super::{
     CommandLink, GroupExecution, GroupOutput, Submission, dispatch_policy, execution_caption,
-    execution_time_caption,
+    execution_time_caption, queue_activity,
 };
 use anyhow::{Context, Result};
 use std::{fmt::Write as _, io, sync::Arc, time::Instant};
-use w11term::events::GroupCommandResult;
+use w11term::events::{GroupCommandResult, GroupQueueActivity};
 use wezterm_term::CompletedCommand;
 
 mod json;
@@ -18,6 +18,7 @@ pub(super) struct Report {
     label: String,
     kind: json::Kind,
     dispatch_policy: Option<dispatch_policy::Policy>,
+    queue_activity: GroupQueueActivity,
     sections: Vec<Section>,
 }
 
@@ -163,12 +164,16 @@ impl Report {
                 json::Kind::Environment
             },
             dispatch_policy: submission.dispatch_policy.clone(),
+            queue_activity: submission.transcript.queue_activity(),
             sections,
         }
     }
 
     fn text_title(&self) -> String {
-        dispatch_policy::report_heading(&self.label, self.dispatch_policy.as_ref())
+        let mut header =
+            dispatch_policy::report_heading(&self.label, self.dispatch_policy.as_ref());
+        header.push_str(&queue_activity::text(&self.queue_activity));
+        header
     }
 
     pub(super) fn clipboard(&self, limit: usize) -> Result<String> {
@@ -236,6 +241,7 @@ mod tests {
     };
     use std::{collections::BTreeMap, time::Duration};
     use tokio::sync::{oneshot, watch};
+    use w11term::events::GroupQueueEventKind;
 
     fn captured(pane: u64, text: String, truncated: bool) -> Delivery {
         let capture = GroupCommandResult {
@@ -278,6 +284,7 @@ mod tests {
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
+            show_queue_activity: false,
             transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
@@ -300,6 +307,12 @@ mod tests {
             }
             .dispatch_policy(),
         );
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::CanaryReady);
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::CanaryApproved);
         let snapshot = Report::capture(&submission, |pane, link| {
             assert_eq!(
                 link,
@@ -317,7 +330,16 @@ mod tests {
                 })
             })
         });
+        submission
+            .transcript
+            .note_queue_activity(GroupQueueEventKind::Cancelled);
         let report = snapshot.clipboard(1024).unwrap();
+        assert!(report.contains("[Queue activity]"));
+        assert!(
+            report.find("Canary ready for approval").unwrap()
+                < report.find("Approved remaining hosts").unwrap()
+        );
+        assert!(!report.contains("Cancelled queued commands"));
         assert!(report.starts_with(
             "Submitted · show\r\nDispatch · parallel limit 2 · 500ms between sends · stop on failure · canary Host 7\r\n"
         ));
@@ -343,6 +365,15 @@ mod tests {
                 "canary": {"pane_id": 7, "label": "Host 7"}
             })
         );
+        let activity = &document["queue_activity"];
+        assert_eq!(activity["omitted"], 0);
+        let events = activity["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["kind"], "canary_ready");
+        assert_eq!(events[1]["kind"], "canary_approved");
+        assert!(
+            events[0]["elapsed_ms"].as_u64().unwrap() <= events[1]["elapsed_ms"].as_u64().unwrap()
+        );
         let hosts = document["recipients"].as_array().unwrap();
         assert_eq!(hosts[0]["name"], "Host 7");
         assert_eq!(hosts[0]["address"], "ops@lab.example:2222");
@@ -367,6 +398,7 @@ mod tests {
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
+            show_queue_activity: false,
             transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),
@@ -423,6 +455,7 @@ mod tests {
             saved_recordings: Default::default(),
             command_queue: None,
             dispatch_policy: None,
+            show_queue_activity: false,
             transcript: Default::default(),
             results: vec![captured(7, String::new(), false), running, pending],
         };
@@ -431,6 +464,7 @@ mod tests {
         assert_eq!(document["kind"], "environment");
         assert!(document["command"].is_null());
         assert!(document.get("dispatch_policy").is_none());
+        assert!(document.get("queue_activity").is_none());
         let hosts = document["recipients"].as_array().unwrap();
         assert_eq!(hosts[0]["pane_id"], 7);
         assert_eq!(hosts[0]["command"], "export POLYSH_RANK=0");
