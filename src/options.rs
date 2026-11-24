@@ -417,6 +417,25 @@ fn default_profiles_path() -> PathBuf {
 
 pub type SshRecipientSets = BTreeMap<String, Vec<String>>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshRosterOrder {
+    Label,
+    CheckedFirst,
+    AttentionFirst,
+    #[default]
+    #[serde(other)]
+    Tabs,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SshRosterDefaults {
+    pub order: SshRosterOrder,
+    pub show_last_output: bool,
+    pub require_all_ready: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profiles {
     pub profiles: BTreeMap<String, SshOptions>,
@@ -426,6 +445,7 @@ pub struct Profiles {
     pub startup_profile: Option<String>,
     pub ssh_host_groups: BTreeMap<String, Vec<String>>,
     pub ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
+    pub ssh_host_group_defaults: BTreeMap<String, SshRosterDefaults>,
     pub(crate) has_explicit_order: bool,
 }
 
@@ -439,6 +459,7 @@ impl Default for Profiles {
             startup_profile: None,
             ssh_host_groups: BTreeMap::new(),
             ssh_recipient_sets: BTreeMap::new(),
+            ssh_host_group_defaults: BTreeMap::new(),
             has_explicit_order: false,
         }
     }
@@ -527,6 +548,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         ssh_host_groups: BTreeMap<String, Vec<String>>,
         #[serde(default)]
         ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
+        #[serde(default)]
+        ssh_host_group_defaults: BTreeMap<String, SshRosterDefaults>,
     }
     let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
@@ -540,6 +563,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         startup_profile: document.startup_profile,
         ssh_host_groups: document.ssh_host_groups,
         ssh_recipient_sets: document.ssh_recipient_sets,
+        ssh_host_group_defaults: document.ssh_host_group_defaults,
         ..Profiles::default()
     };
     for (name, value) in document.profiles {

@@ -173,6 +173,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 57. **Require all selected recipients to be ready.** Wait for a verified prompt from every visible, checked host before offering a normal or recorded send. Recheck the reviewed prompts on dispatch.
 58. **Copy the visible roster as text.** Include host addresses, pane IDs, selection, and current states for checked and unchecked hosts shown by the active filters.
 59. **Sort the visible roster.** Order the display and copied report by tab, label, check state, or readiness. Use tab order for dispatch and ranked assignments.
+60. **Save roster defaults for a named group.** Remember sort order, output previews, and the all-recipient readiness setting across launches. Move those defaults with a group rename.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

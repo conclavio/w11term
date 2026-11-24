@@ -101,6 +101,8 @@ Choose **Copy shown roster** to copy a plain-text status report. It includes eve
 
 Use **Sort SSH roster** to display hosts in tab order, alphabetically by label, checked first, or with hosts needing attention first. The copied roster follows the display order. Command dispatch and `POLYSH_RANK` use tab order.
 
+In a named SSH group tab, choose **Save roster defaults** to remember its sort order, output preview, and readiness requirement. These defaults apply when you open the group again.
+
 When an SSH shell has exited or its connection attempts have ended, use **Reconnect** on its roster row or **Reconnect selected** for checked hosts shown by the filter. Each attempt starts a fresh SSH login in the same pane with its scrollback and selection intact. Previous submissions stay available, and the replacement shell needs a fresh prompt before it can receive another group command.
 
 After delivery, the group follows each host separately. Matching shell markers show when the command runs and give its captured output and exit status. **View full output** opens that command’s history entry while the pane still retains it. The group keeps the last eight submissions, each with an output preview per host. Use **Previous submission** and **Next submission** to revisit them while a slow command continues in the background.

@@ -5,6 +5,7 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt,
 };
+use w11term::options::{SshRosterDefaults, SshRosterOrder as RosterOrder};
 mod address;
 mod compare;
 mod completion;
@@ -45,9 +46,7 @@ pub(super) struct HostGroup {
     roster: Option<Box<MemberRoster>>,
     selected: BTreeSet<u64>,
     filter: filter::Filter,
-    roster_order: RosterOrder,
-    show_last_output: bool,
-    require_all_ready: bool,
+    roster_preferences: SshRosterDefaults,
     roster_copy_feedback: String,
     draft: String,
     previous_draft: Option<DraftBackup>,
@@ -207,43 +206,25 @@ impl RosterStatus {
     }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum RosterOrder {
-    #[default]
-    Tabs,
-    Label,
-    CheckedFirst,
-    AttentionFirst,
-}
+const ROSTER_ORDERS: [(RosterOrder, &str); 4] = [
+    (RosterOrder::Tabs, "Tab order"),
+    (RosterOrder::Label, "Host label"),
+    (RosterOrder::CheckedFirst, "Checked first"),
+    (RosterOrder::AttentionFirst, "Needs attention first"),
+];
 
-impl RosterOrder {
-    const OPTIONS: [Self; 4] = [
-        Self::Tabs,
-        Self::Label,
-        Self::CheckedFirst,
-        Self::AttentionFirst,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Tabs => "Tab order",
-            Self::Label => "Host label",
-            Self::CheckedFirst => "Checked first",
-            Self::AttentionFirst => "Needs attention first",
+fn sort_roster(order: RosterOrder, targets: &mut [&Target], selected: &BTreeSet<u64>) {
+    match order {
+        RosterOrder::Tabs => {}
+        RosterOrder::Label => {
+            targets.sort_by_cached_key(|target| target.names.label.to_lowercase())
         }
-    }
-
-    fn apply(self, targets: &mut [&Target], selected: &BTreeSet<u64>) {
-        match self {
-            Self::Tabs => {}
-            Self::Label => targets.sort_by_cached_key(|target| target.names.label.to_lowercase()),
-            Self::CheckedFirst => targets.sort_by_key(|target| !selected.contains(&target.pane)),
-            Self::AttentionFirst => targets.sort_by_key(|target| match target.state {
-                TargetState::Ready(_) | TargetState::Matched(_) => 2,
-                TargetState::InUse => 1,
-                _ => 0,
-            }),
-        }
+        RosterOrder::CheckedFirst => targets.sort_by_key(|target| !selected.contains(&target.pane)),
+        RosterOrder::AttentionFirst => targets.sort_by_key(|target| match target.state {
+            TargetState::Ready(_) | TargetState::Matched(_) => 2,
+            TargetState::InUse => 1,
+            _ => 0,
+        }),
     }
 }
 
@@ -433,7 +414,7 @@ impl HostGroup {
     }
 
     fn readiness_allows_send(&self, ready: usize, total: usize) -> bool {
-        ready > 0 && (!self.require_all_ready || ready == total)
+        ready > 0 && (!self.roster_preferences.require_all_ready || ready == total)
     }
 
     fn sending(&self) -> bool {
@@ -855,7 +836,7 @@ impl TerminalApp {
             && page.selected_shown(&roster) == selection
             && page.draft == text
             && w11term::saved_commands::valid_command_text(text)
-            && ((!verify_prompts && !page.require_all_ready)
+            && ((!verify_prompts && !page.roster_preferences.require_all_ready)
                 || targets.iter().all(|reviewed| {
                     roster.iter().any(|current| {
                         current.pane == reviewed.pane
@@ -1037,12 +1018,12 @@ impl TerminalApp {
             }
             Action::OrderRoster(id, order) => {
                 if let Some(page) = self.host_group_mut(id) {
-                    page.roster_order = order;
+                    page.roster_preferences.order = order;
                 }
             }
             Action::ShowLastOutput(id, show) => {
                 if let Some(page) = self.host_group_mut(id) {
-                    page.show_last_output = show;
+                    page.roster_preferences.show_last_output = show;
                 }
             }
             Action::RequireAllReady(id, require) => {
@@ -1050,7 +1031,7 @@ impl TerminalApp {
                     .host_group_mut(id)
                     .filter(|page| !page.recorded_send.pending())
                 {
-                    page.require_all_ready = require;
+                    page.roster_preferences.require_all_ready = require;
                 }
             }
             Action::CopyRoster(id, offered) => self.copy_host_group_roster(id, &offered),
@@ -1434,7 +1415,11 @@ impl TerminalApp {
             if selected.len() == 1 { "host" } else { "hosts" }
         );
         let mut roster_rows = shown.clone();
-        page.roster_order.apply(&mut roster_rows, &page.selected);
+        sort_roster(
+            page.roster_preferences.order,
+            &mut roster_rows,
+            &page.selected,
+        );
         let mut details: Vec<KeyedView> = roster_rows
             .into_iter()
             .map(|target| {
@@ -1466,7 +1451,7 @@ impl TerminalApp {
                                 reconnect::host_button(id, target.state, ctx),
                                 prompt_setup::button(id, target, ctx),
                             )),
-                        if page.show_last_output {
+                        if page.roster_preferences.show_last_output {
                             self.host_group_output_preview(id, target, ctx)
                                 .unwrap_or_else(View::empty)
                         } else {
@@ -1564,20 +1549,16 @@ impl TerminalApp {
                 ComboBox::new()
                     .grid_column(3)
                     .automation_name("Sort SSH roster")
-                    .items_source(
-                        RosterOrder::OPTIONS
-                            .map(|order| order.label().to_owned())
-                            .to_vec(),
-                    )
+                    .items_source(ROSTER_ORDERS.map(|(_, label)| label.to_owned()).to_vec())
                     .selected_index(
-                        RosterOrder::OPTIONS
+                        ROSTER_ORDERS
                             .iter()
-                            .position(|&order| order == page.roster_order),
+                            .position(|&(order, _)| order == page.roster_preferences.order),
                     )
                     .on_selection_changed(ctx.callback(move |index: Option<usize>| {
                         index
-                            .and_then(|index| RosterOrder::OPTIONS.get(index))
-                            .map_or(Message::ControlIdle, |&order| {
+                            .and_then(|index| ROSTER_ORDERS.get(index))
+                            .map_or(Message::ControlIdle, |&(order, _)| {
                                 Message::HostGroup(Action::OrderRoster(id, order))
                             })
                     })),
@@ -1606,6 +1587,7 @@ impl TerminalApp {
                         } else {
                             View::empty()
                         },
+                        saved::roster_defaults_button(id, page, ctx),
                     ))
             }),
             filter_error.map_or_else(View::empty, |error| {
@@ -1652,7 +1634,7 @@ impl TerminalApp {
                     environment::button(id, page, &selected, ctx),
                     CheckBox::new()
                         .automation_name("Show last command output")
-                        .is_checked(page.show_last_output)
+                        .is_checked(page.roster_preferences.show_last_output)
                         .on_is_checked_changed(ctx.callback(move |show| {
                             Message::HostGroup(Action::ShowLastOutput(id, show))
                         }))
@@ -1680,7 +1662,7 @@ impl TerminalApp {
         } else {
             let count = selected.len();
             let hosts = if count == 1 { "host" } else { "hosts" };
-            if page.require_all_ready && ready < count {
+            if page.roster_preferences.require_all_ready && ready < count {
                 format!("{ready} of {count} selected {hosts} ready · waiting for all")
             } else {
                 format!("{ready} of {count} selected {hosts} ready")
@@ -1765,7 +1747,7 @@ impl TerminalApp {
                         .children((
                             CheckBox::new()
                                 .automation_name(REQUIRE_READY)
-                                .is_checked(page.require_all_ready)
+                                .is_checked(page.roster_preferences.require_all_ready)
                                 .is_enabled(!page.recorded_send.pending())
                                 .on_is_checked_changed(ctx.callback(move |require| {
                                     Message::HostGroup(Action::RequireAllReady(id, require))
@@ -2157,7 +2139,7 @@ mod tests {
             (RosterOrder::AttentionFirst, [2, 3, 4, 1]),
         ] {
             let mut shown: Vec<_> = group.shown(&targets).collect();
-            order.apply(&mut shown, &group.selected);
+            sort_roster(order, &mut shown, &group.selected);
             assert!(shown.iter().map(|target| target.pane).eq(expected));
             assert!(
                 group
@@ -2176,7 +2158,7 @@ mod tests {
         assert!(!group.readiness_allows_send(0, 2));
         assert!(group.readiness_allows_send(1, 2));
 
-        group.require_all_ready = true;
+        group.roster_preferences.require_all_ready = true;
         assert!(!group.readiness_allows_send(0, 0));
         assert!(!group.readiness_allows_send(1, 2));
         assert!(group.readiness_allows_send(2, 2));

@@ -13,6 +13,7 @@ pub(super) struct SavedUi {
     pub(super) feedback: String,
     pub(super) reuse: reuse::State,
     roster_update: roster_update::State,
+    roster_defaults: SshRosterDefaults,
     pub(super) recipient_sets: super::recipient_sets::State,
 }
 
@@ -194,6 +195,34 @@ pub enum Action {
     },
     Draft(u64, DraftAction),
     UpdateRoster(RosterUpdateAction),
+    SaveRosterDefaults {
+        group: String,
+        defaults: SshRosterDefaults,
+    },
+}
+
+pub(super) fn roster_defaults_button(
+    id: TabId,
+    page: &HostGroup,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let Some((name, _)) = page.saved.origin() else {
+        return View::empty();
+    };
+    let group = name.to_owned();
+    let defaults = page.roster_preferences;
+    Button::new()
+        .is_enabled(defaults != page.saved.roster_defaults)
+        .on_click(ctx.callback(move |_| {
+            Message::HostGroup(HostAction::Saved(
+                id,
+                Action::SaveRosterDefaults {
+                    group: group.clone(),
+                    defaults,
+                },
+            ))
+        }))
+        .content("Save roster defaults")
 }
 
 pub enum DraftAction {
@@ -237,6 +266,9 @@ impl TerminalApp {
                 }
             }
             Action::NewFromSelection(offered) => self.new_saved_group_from_selection(id, offered),
+            Action::SaveRosterDefaults { group, defaults } => {
+                self.save_host_group_roster_defaults(id, &group, defaults);
+            }
             Action::Edit(name) => {
                 self.refresh_profiles();
                 let original = self
@@ -419,6 +451,46 @@ impl TerminalApp {
         self.bind_folder_shares();
     }
 
+    fn save_host_group_roster_defaults(
+        &mut self,
+        id: TabId,
+        offered_group: &str,
+        offered_defaults: SshRosterDefaults,
+    ) {
+        if self.host_group_command_target() != Some(id) {
+            return;
+        }
+        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
+            return;
+        };
+        let Some((name, members)) = page.saved.origin() else {
+            return;
+        };
+        let expected = page.saved.roster_defaults;
+        if name != offered_group
+            || page.roster_preferences != offered_defaults
+            || expected == offered_defaults
+        {
+            return;
+        }
+        let result = self
+            .store
+            .save_ssh_roster_defaults(name, members, expected, offered_defaults);
+        let feedback = match result {
+            Ok(catalog) => {
+                self.use_group_catalog(catalog);
+                if let Some(page) = self.host_group_mut(id) {
+                    page.saved.roster_defaults = offered_defaults;
+                }
+                "Saved roster defaults".into()
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        if let Some(page) = self.host_group_mut(id) {
+            page.saved.feedback = feedback;
+        }
+    }
+
     pub(super) fn load_expected_host_group(
         &self,
         name: &str,
@@ -448,11 +520,19 @@ impl TerminalApp {
         full_roster: bool,
         feedback: String,
     ) {
+        let defaults = self
+            .catalog
+            .ssh_host_group_defaults
+            .get(name)
+            .copied()
+            .unwrap_or_default();
         if let Some(page) = self.host_group_mut(id) {
             if page.roster.is_some() {
                 page.saved
                     .roster_update
                     .remember(name, members, full_roster);
+                page.saved.roster_defaults = defaults;
+                page.roster_preferences = defaults;
             }
             page.saved.selected = Some(name.into());
             page.saved.feedback = feedback;

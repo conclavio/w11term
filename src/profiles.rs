@@ -1,5 +1,5 @@
 //! Profile persistence preserves unrelated JSON fields and replaces the file atomically.
-use crate::options::{Profiles, SshOptions, SshRecipientSets, load_profiles};
+use crate::options::{Profiles, SshOptions, SshRecipientSets, SshRosterDefaults, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
@@ -36,6 +36,12 @@ const SHARE_EPOCH: &str = "folder_share_epoch";
 const STARTUP_PROFILE: &str = "startup_profile";
 const SSH_HOST_GROUPS: &str = "ssh_host_groups";
 const SSH_RECIPIENT_SETS: &str = "ssh_recipient_sets";
+const SSH_HOST_GROUP_DEFAULTS: &str = "ssh_host_group_defaults";
+
+enum RosterDefaultsEdit {
+    Set(String, SshRosterDefaults),
+    Move(String, Option<String>),
+}
 
 #[derive(Default)]
 struct CatalogEdit {
@@ -43,6 +49,7 @@ struct CatalogEdit {
     startup: Option<Option<String>>, // None leaves the setting untouched.
     ssh_host_groups: Option<BTreeMap<String, Vec<String>>>,
     ssh_recipient_sets: Option<BTreeMap<String, SshRecipientSets>>,
+    roster_defaults: Option<RosterDefaultsEdit>,
 }
 
 #[derive(Clone)]
@@ -245,9 +252,13 @@ impl ProfileStore {
             let ssh_recipient_sets = original
                 .filter(|(old, _)| *old != name)
                 .and_then(|(old, _)| recipient_sets_after_group_edit(catalog, old, Some(name)));
+            let roster_defaults = original
+                .filter(|(old, _)| *old != name)
+                .map(|(old, _)| RosterDefaultsEdit::Move(old.into(), Some(name.into())));
             Ok(CatalogEdit {
                 ssh_host_groups: Some(groups),
                 ssh_recipient_sets,
+                roster_defaults,
                 ..Default::default()
             })
         })
@@ -336,6 +347,35 @@ impl ProfileStore {
             Ok(CatalogEdit {
                 ssh_host_groups: Some(groups),
                 ssh_recipient_sets: recipient_sets_after_group_edit(catalog, name, None),
+                roster_defaults: Some(RosterDefaultsEdit::Move(name.into(), None)),
+                ..Default::default()
+            })
+        })
+    }
+
+    pub fn save_ssh_roster_defaults(
+        &self,
+        name: &str,
+        expected_members: &[String],
+        expected: SshRosterDefaults,
+        defaults: SshRosterDefaults,
+    ) -> Result<Profiles> {
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.ssh_host_groups.get(name).map(Vec::as_slice) == Some(expected_members),
+                "The SSH group changed on disk. Reopen it before saving roster defaults."
+            );
+            ensure!(
+                catalog
+                    .ssh_host_group_defaults
+                    .get(name)
+                    .copied()
+                    .unwrap_or_default()
+                    == expected,
+                "Roster defaults changed on disk. Reopen the SSH group before saving."
+            );
+            Ok(CatalogEdit {
+                roster_defaults: Some(RosterDefaultsEdit::Set(name.into(), defaults)),
                 ..Default::default()
             })
         })
@@ -928,6 +968,9 @@ impl ProfileStore {
                 fields.insert(SSH_RECIPIENT_SETS.into(), serde_json::to_value(groups)?);
             }
         }
+        if let Some(edit) = edit.roster_defaults {
+            patch_roster_defaults(fields, edit)?;
+        }
         // Return the catalog from the exact document being committed.
         let result = crate::options::parse_profiles(&serde_json::to_vec(&document)?, &self.path)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -946,6 +989,50 @@ impl ProfileStore {
         file.persist(&self.path).context("Saving profiles")?;
         Ok(result)
     }
+}
+
+fn patch_roster_defaults(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    edit: RosterDefaultsEdit,
+) -> Result<()> {
+    match edit {
+        RosterDefaultsEdit::Set(name, defaults) => {
+            let groups = fields
+                .entry(SSH_HOST_GROUP_DEFAULTS)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("SSH group defaults must be an object")?;
+            let entry = groups
+                .entry(name)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("Roster defaults must be an object")?;
+            let changes = serde_json::to_value(defaults)?;
+            let changes = changes
+                .as_object()
+                .context("Roster defaults must be an object")?;
+            entry.extend(changes.clone());
+        }
+        RosterDefaultsEdit::Move(from, to) => {
+            if let Some(groups) = fields
+                .get_mut(SSH_HOST_GROUP_DEFAULTS)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                let original = groups.remove(&from);
+                if let Some(to) = to {
+                    if let Some(original) = original {
+                        groups.insert(to, original);
+                    } else {
+                        groups.remove(&to);
+                    }
+                }
+                if groups.is_empty() {
+                    fields.remove(SSH_HOST_GROUP_DEFAULTS);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_recipient_set_name(name: &str) -> Result<()> {
@@ -1289,6 +1376,57 @@ mod tests {
         assert_eq!(sets["Pilots"], members);
         assert_eq!(sets["Reserved"], ["East"]);
         assert_eq!(catalog.ssh_host_groups["Fleet"], group);
+    }
+
+    #[test]
+    fn roster_defaults_follow_group_rename_and_reject_stale_writes() {
+        use crate::options::SshRosterOrder;
+        use serde_json::Value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{
+                "East":{"host":"east.test","user":"ops","auth":"none"},
+                "West":{"host":"west.test","user":"ops","auth":"none"}
+            },"ssh_host_groups":{"Fleet":["East"],"Other":["West"]},
+            "ssh_host_group_defaults":{"Fleet":{"layout_hint":7},"Other":{"show_last_output":true}}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let other = ProfileStore::new(path.clone()).unwrap();
+        let members = ["East".to_owned()];
+        let expected = store.catalog().unwrap().ssh_host_group_defaults["Fleet"];
+        assert_eq!(expected, SshRosterDefaults::default());
+        let defaults = SshRosterDefaults {
+            order: SshRosterOrder::CheckedFirst,
+            show_last_output: true,
+            require_all_ready: true,
+        };
+        assert!(
+            store
+                .save_ssh_roster_defaults("Fleet", &["West".to_owned()], expected, defaults)
+                .is_err()
+        );
+        store
+            .save_ssh_roster_defaults("Fleet", &members, expected, defaults)
+            .unwrap();
+        assert!(
+            other
+                .save_ssh_roster_defaults("Fleet", &members, expected, expected)
+                .is_err()
+        );
+        let renamed = other
+            .save_ssh_host_group("Renamed", &members, Some(("Fleet", &members)))
+            .unwrap();
+        assert_eq!(renamed.ssh_host_group_defaults["Renamed"], defaults);
+        assert!(!renamed.ssh_host_group_defaults.contains_key("Fleet"));
+        let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["ssh_host_group_defaults"]["Renamed"]["layout_hint"], 7);
+        let remaining = other.delete_ssh_host_group("Renamed", &members).unwrap();
+        assert_eq!(remaining.ssh_host_group_defaults.len(), 1);
+        assert!(remaining.ssh_host_group_defaults["Other"].show_last_output);
     }
 }
 

@@ -51,6 +51,31 @@ function Filter-GroupProfiles([string]$Query) {
     $field = Wait-Until 'saved group profile search' { Find-Element 'Find group profiles' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
 }
+function Roster-Order([string]$Name, [switch]$Choose) {
+    $comboType = [System.Windows.Automation.ControlType]::ComboBox
+    $listItem = [System.Windows.Automation.ControlType]::ListItem
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selection = [System.Windows.Automation.SelectionPattern]::Pattern
+    if ($Choose) {
+        $option = Wait-Until "the '$Name' roster sort option" {
+            $combo = Find-Element 'Sort SSH roster' $comboType
+            if (!$combo) { return }
+            $popup = $combo.GetCurrentPattern($expand)
+            if ($popup.Current.ExpandCollapseState -eq 'Collapsed') { $popup.Expand() }
+            $choice = Find-Element $Name $listItem
+            if ($choice -and !$choice.Current.IsOffscreen) { $choice }
+        }
+        $option.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    }
+    $combo = Wait-Until "roster sort is '$Name'" {
+        $item = Find-Element 'Sort SSH roster' $comboType
+        if (!$item) { return }
+        $items = $item.GetCurrentPattern($selection).Current.GetSelection()
+        if ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Name) { $item }
+    }
+    $popup = $combo.GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
 function Launch-Window {
     $launchArgs = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
     $script:app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -199,6 +224,40 @@ try {
         $null = Control @('wait-for-text','--pane',"$pane",'--timeout','15','ready')
     }
 
+    $saveDefaults = 'Save roster defaults'
+    $showOutput = 'Show last command output'
+    $allReady = 'Require all recipients ready'
+    Roster-Order 'Tab order'
+    Roster-Order 'Host label' -Choose
+    (Wait-CheckBox $allReady Off).Toggle()
+    (Wait-CheckBox $showOutput Off).Toggle()
+    $null = Wait-CheckBox $allReady On
+    $null = Wait-CheckBox $showOutput On
+    Click $saveDefaults
+    $null = Wait-Until 'the defaults are saved for Fleet' {
+        $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
+        (Find-Element 'Saved roster defaults') -and $savedDefaults.order -ceq 'label' -and
+            $savedDefaults.show_last_output -and $savedDefaults.require_all_ready
+    }
+    (Wait-CheckBox $showOutput On).Toggle()
+    $null = Wait-CheckBox $showOutput Off
+    Close-GroupWindow
+    Launch-Window
+    Open-FleetPalette
+    Click "Open SSH group${dot}Fleet"
+    $null = Wait-Until 'reopened Fleet with its own roster defaults' { Find-Element 'Opened 2 SSH panes for Fleet' }
+    Roster-Order 'Host label'
+    $null = Wait-CheckBox $allReady On
+    $null = Wait-CheckBox $showOutput On
+    $null = Wait-Until 'the loaded preferences match the saved defaults' {
+        $save = Find-Element $saveDefaults $button
+        $save -and !$save.Current.IsEnabled
+    }
+    $sessions = Wait-Until 'the restarted window has the group panes' {
+        $current = @((Control @('list')).sessions)
+        if ($current.Count -eq 3) { ,$current }
+    }
+
     Click 'Edit group'
     $null = Wait-CheckBox 'Group member East' On
     Filter-GroupProfiles 'west'
@@ -215,12 +274,16 @@ try {
     if ($groups.Fleet -or ($groups.'East only' -join ',') -cne 'East') {
         throw 'The renamed group has the wrong saved membership'
     }
+    $defaults = (Catalog).ssh_host_group_defaults
+    if ($defaults.Fleet -or $defaults.'East only'.order -cne 'label') {
+        throw 'Roster defaults did not follow the group rename'
+    }
     Click 'Edit group'
     Click 'Delete group'
     Click 'Confirm delete group'
     $null = Wait-Until 'group editor closes after delete' { Find-Element 'New group' $button }
     $saved = Catalog
-    if ($saved.ssh_host_groups -or !$saved.profiles.East -or !$saved.profiles.West -or $saved.other -ne 17) {
+    if ($saved.ssh_host_groups -or $saved.ssh_host_group_defaults -or !$saved.profiles.East -or !$saved.profiles.West -or $saved.other -ne 17) {
         throw 'The deletion changed unrelated profile data or left the group behind'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'Editing or deleting the group changed its running sessions' }
