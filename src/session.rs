@@ -970,8 +970,8 @@ async fn run(
                         let _ = reply.send(updated);
                         Ok(())
                     }
-                    Some(Command::SendGroupCommand { prompt, text, reply, execution, transcript }) => {
-                        let kind = terminal::ScopedInput::GroupCommand;
+                    Some(Command::SendGroupCommand { prompt, text, reply, execution, mut transcript }) => {
+                        let kind = terminal::ScopedInput::GroupCommand(transcript.require_delivery());
                         let ready = match events.shell_prompt() {
                             Some(ShellPrompt::Ready(current)) => current == prompt && terminal.at_shell_input_start(),
                             Some(ShellPrompt::Matched(current)) => current == prompt && prompt_matcher
