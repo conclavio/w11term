@@ -2652,6 +2652,7 @@ mod tests {
             selected: BTreeSet::from([1, 4]),
             ..Default::default()
         };
+        group.roster_preferences.command_limit = SshGroupParallelLimit::One;
         for (order, expected) in [
             (RosterOrder::Tabs, [1, 2, 3, 4]),
             (RosterOrder::Label, [2, 3, 4, 1]),
@@ -2678,7 +2679,22 @@ mod tests {
                         .filter(|pane| group.selected.contains(pane)))
             );
         }
-        group.roster_preferences.order = RosterOrder::Tabs;
+        group.roster_preferences.order = RosterOrder::Label;
+        group.roster_preferences.command_limit = SshGroupParallelLimit::Unlimited;
+        assert!(
+            command_order::recipients(&group, group.shown(&targets))
+                .iter()
+                .map(|target| target.pane)
+                .eq([1, 4])
+        );
+        group.roster_preferences.command_interval = SshGroupCommandInterval::HalfSecond;
+        assert!(
+            command_order::recipients(&group, group.shown(&targets))
+                .iter()
+                .map(|target| target.pane)
+                .eq([4, 1])
+        );
+        group.roster_preferences.command_interval = SshGroupCommandInterval::None;
         group.canary = Some(4);
         assert!(
             command_order::recipients(&group, group.shown(&targets))

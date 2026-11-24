@@ -7,7 +7,7 @@ pub enum Edit {
 
 fn sort_targets(page: &HostGroup, targets: &mut [&Target]) {
     page.sort_shown(targets);
-    if page.manual_command_order.is_empty() || !page.orders_commands() {
+    if page.manual_command_order.is_empty() {
         return;
     }
     let ranks: BTreeMap<_, _> = page
@@ -27,7 +27,9 @@ pub(super) fn recipients<'a>(
     let mut targets: Vec<_> = shown
         .filter(|target| page.selected.contains(&target.pane))
         .collect();
-    sort_targets(page, &mut targets);
+    if page.orders_commands() {
+        sort_targets(page, &mut targets);
+    }
     if let Some(index) = targets
         .iter()
         .position(|target| Some(target.pane) == page.canary)

@@ -97,7 +97,7 @@ Set **Parallel SSH commands** to run a submission in batches. The default is **U
 
 With a finite limit or a send interval, turn on **Stop queue on failure** to withhold the remaining commands as soon as a host settles without a confirmed zero exit status. Active commands continue. **Save roster defaults** remembers this choice for a named group.
 
-Use **Preview send order** to see how the checked, visible hosts will be dispatched. Finite queues follow the current roster sort, with a chosen canary promoted to the first send. The preview shows unavailable hosts and the concurrency that applies after canary approval. With a finite limit or a send interval, select **Earlier** or **Later** to move a ready host in the next run. **Use roster order** clears the draft order. Sending uses that order for the submitted queue and starts the next draft in roster order.
+Use **Preview send order** to see how the checked, visible hosts will be dispatched. Finite or paced queues follow the current roster sort, with a chosen canary promoted to the first send. Unlimited sends with no delay use tab order. The preview shows unavailable hosts and the concurrency that applies after canary approval. With a finite limit or a send interval, select **Earlier** or **Later** to move a ready host in the next run. **Use roster order** clears the draft order. Sending uses that order for the submitted queue and starts the next draft in roster order.
 
 Set **Time between sends** to leave a minimum gap between dispatches within each run. The first host can start immediately. Later hosts still need a free parallel slot and any required canary approval. **No delay** is the default.
 
