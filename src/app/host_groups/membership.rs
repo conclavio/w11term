@@ -271,7 +271,7 @@ mod tests {
             draft: "still editing".into(),
             previous_draft: Some(DraftBackup {
                 text: "previous".into(),
-                scope: Some(retry::Scope {
+                scope: Some(DraftScope {
                     selected: BTreeSet::from([2, 3, 4]),
                     filter: Default::default(),
                 }),

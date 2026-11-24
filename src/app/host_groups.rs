@@ -42,6 +42,7 @@ pub(super) struct HostGroup {
     draft: String,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
+    focus_loaded_command: bool,
     command_save: save_command::State,
     recorded_send: recorded_send::State,
     submissions: VecDeque<Submission>,
@@ -69,7 +70,12 @@ struct MemberRoster {
 
 struct DraftBackup {
     text: String,
-    scope: Option<retry::Scope>,
+    scope: Option<DraftScope>,
+}
+
+struct DraftScope {
+    selected: BTreeSet<u64>,
+    filter: filter::Filter,
 }
 
 struct Submission {
@@ -112,6 +118,7 @@ impl SubmissionContent {
 impl HostGroup {
     pub(super) fn deactivated(&mut self) {
         self.import.editor_unmounted();
+        self.focus_loaded_command = false;
     }
 }
 
@@ -378,6 +385,20 @@ impl HostGroup {
         }
     }
 
+    fn load_scoped_draft(&mut self, command: String, panes: BTreeSet<u64>) {
+        let previous = std::mem::replace(&mut self.draft, command);
+        let selected = std::mem::replace(&mut self.selected, panes);
+        let backup = self.previous_draft.get_or_insert(DraftBackup {
+            text: previous,
+            scope: None,
+        });
+        backup.scope.get_or_insert_with(|| DraftScope {
+            selected,
+            filter: self.filter.clone(),
+        });
+        self.retry_feedback.clear();
+    }
+
     fn restore_draft(&mut self) -> bool {
         let Some(previous) = self.previous_draft.take() else {
             return false;
@@ -423,6 +444,7 @@ pub enum Action {
     Transfer(TabId, transfer::Action),
     Environment(TabId, environment::Action),
     OpenSavedCommands(TabId),
+    FocusLoadedCommand(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
     SaveCommand(TabId, save_command::Action),
     RestoreDraft(TabId),
@@ -972,6 +994,14 @@ impl TerminalApp {
                     self.open_group_command_library(id, ctx);
                 }
             }
+            Action::FocusLoadedCommand(id) => {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
+                    && std::mem::take(&mut page.focus_loaded_command)
+                {
+                    let _ = page.command_editor.request_focus();
+                }
+            }
             Action::LoadSavedCommand(id, entry) => {
                 if self.host_group_command_target() == Some(id)
                     && self.confirm_saved_command(&entry)
@@ -1075,7 +1105,7 @@ impl TerminalApp {
         &self,
         id: TabId,
         page: &HostGroup,
-        ctx: &ViewContext<Self>,
+        ctx: &mut ViewContext<Self>,
     ) -> View {
         if page.environment.is_open() {
             return page
@@ -1124,6 +1154,13 @@ impl TerminalApp {
             && let Some(submission) = page.viewed_submission(output.submission)
         {
             return self.host_group_live_output(id, output, submission, ctx);
+        }
+        if page.focus_loaded_command {
+            let sender = ctx.sender();
+            ctx.use_effect("focus host group draft", id, move || {
+                sender.send(Message::HostGroup(Action::FocusLoadedCommand(id)));
+                None
+            });
         }
         let targets = self.host_group_targets();
         let shown: Vec<_> = page.shown(&targets).collect();

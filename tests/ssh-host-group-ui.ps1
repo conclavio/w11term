@@ -456,7 +456,15 @@ try {
     }
     Run-Palette 'SSH host group'
     $null = Wait-Until 'returning to the group restores the comparison view' { Find-Element 'SSH group result comparison' }
-    Click 'Back to results'
+    Click "Prepare follow-up for result group starting at pane $west${dot}Prepare follow-up (1 host)"
+    Wait-CommandDraft 'both'
+    $null = Wait-CheckBox $eastName Off
+    $null = Wait-CheckBox $westName On
+    $null = Wait-Until 'preparing a follow-up did not create a submission' { Find-Element "Submitted${dot}both" }
+    Click 'Restore draft'
+    Wait-CommandDraft 'draft before withheld retry'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     Outcome $westName 'Exit 17'
     Click $liveButton
     $null = Wait-Until 'completed West output in the earlier live feed' {
@@ -752,6 +760,18 @@ try {
         (Find-Element "Focus compared pane $west" $button)
     }
     Click 'Back to results'
+    Set-HostFilter 'west'
+    Click $compareButton
+    $firstComparedPane = [Math]::Min($east, $west)
+    Click "Prepare follow-up for result group starting at pane $firstComparedPane${dot}Prepare follow-up (1 of 2 hosts in roster)"
+    Wait-CommandDraft 'shared-status'
+    $null = Wait-CheckBox $westName On
+    Set-HostFilter ''
+    $null = Wait-CheckBox $eastName Off
+    Click 'Restore draft'
+    Set-HostFilter ''
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     Pane-Status $east "Connected$($dot)Ready"
     Pane-Status $west "Connected$($dot)Ready"
     $sendRecorded = 'Send and record' + [char]0x2026
