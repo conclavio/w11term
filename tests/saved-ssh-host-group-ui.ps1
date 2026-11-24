@@ -288,6 +288,68 @@ try {
             -not ((Catalog).ssh_host_groups.'Fleet copy')
     }
 
+    $definitionCatalog = Catalog
+    $definitionCatalog | Add-Member -NotePropertyName ssh_recipient_sets -NotePropertyValue @{ Fleet = @{ Canary = @('East') } }
+    [IO.File]::WriteAllText($profiles, ($definitionCatalog | ConvertTo-Json -Depth 30))
+    $definitionFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group.json'
+    Click ('Export group definition' + [char]0x2026)
+    $dialog = Wait-Until 'group definition save dialog' { Find-OwnedDialog 'Save SSH group definition' }
+    $null = Wait-Until 'save the group definition' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the versioned group definition is exported' { Test-Path -LiteralPath $definitionFile }
+    $exported = [IO.File]::ReadAllText($definitionFile) | ConvertFrom-Json
+    if ($exported.format -cne 'w11term-ssh-group' -or $exported.version -ne 1 -or
+        ($exported.group.members -join ',') -cne 'West,East' -or
+        ($exported.group.recipient_sets.Canary -join ',') -cne 'East' -or
+        !$exported.group.roster_defaults.show_last_output -or $exported.profiles) {
+        throw 'The group file did not preserve its portable definition'
+    }
+
+    Click ('Import group definition' + [char]0x2026)
+    $dialog = Wait-Until 'group definition open dialog' { Find-OwnedDialog 'Open SSH group definition' }
+    Select-DialogItem $dialog 'ssh-group.json'
+    $null = Wait-Until 'open the definition for review' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $westAddr = "West${dot}test@127.0.0.1:$($definitionCatalog.profiles.West.port)"
+    $null = Wait-Until 'the import resolves the current local West profile' { Find-Element $westAddr }
+    $nameField = Wait-Until 'imported group name field' { Find-Element 'Imported SSH group name' $edit }
+    $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Portable Fleet')
+    $changed = Catalog
+    $changed.profiles.West.port = 1
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Save imported group'
+    $null = Wait-Until 'the changed profile requires another review' {
+        Find-Element 'The SSH profiles changed on disk. Review the group definition again.'
+    }
+    if ((Catalog).ssh_host_groups.'Portable Fleet') { throw 'A stale profile review saved the group' }
+    $missing = Catalog
+    $missing.profiles.PSObject.Properties.Remove('West')
+    [IO.File]::WriteAllText($profiles, ($missing | ConvertTo-Json -Depth 30))
+    Click 'Refresh local profiles'
+    $null = Wait-Until 'the unavailable profile blocks saving' {
+        $save = Find-Element 'Save imported group' $button
+        ($save -and !$save.Current.IsEnabled) -and (Find-Element "West${dot}Local SSH profile unavailable")
+    }
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Refresh local profiles'
+    $null = Wait-Until 'the refreshed profile address is shown' { Find-Element "West${dot}test@127.0.0.1:1" }
+    Click 'Save imported group'
+    $null = Wait-Until 'the reviewed group is saved with its settings' {
+        $saved = Catalog
+        (Find-Element 'SSH group imported') -and
+            ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West,East' -and
+            ($saved.ssh_recipient_sets.'Portable Fleet'.Canary -join ',') -ceq 'East' -and
+            $saved.ssh_host_group_defaults.'Portable Fleet'.show_last_output
+    }
+    if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Importing the definition opened SSH panes' }
+    $restored = Catalog
+    $restored.profiles.West.port = $definitionCatalog.profiles.West.port
+    [IO.File]::WriteAllText($profiles, ($restored | ConvertTo-Json -Depth 30))
+    Click 'Edit group'
+    Click 'Delete group'
+    Click 'Confirm delete group'
+    $null = Wait-Until 'the imported group is removed while the source remains' {
+        (Find-Element 'Edit group' $button) -and -not ((Catalog).ssh_host_groups.'Portable Fleet')
+    }
+
     Click 'Edit group'
     $null = Wait-CheckBox 'Group member East' On
     Filter-GroupProfiles 'west'

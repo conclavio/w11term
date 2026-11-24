@@ -21,6 +21,7 @@ pub(super) enum Purpose {
     UploadFolder,
     SshConfig(PathBuf),
     OpenSshHostList,
+    OpenSshGroupDefinition,
     SshIdentity(Option<PathBuf>),
     Folder,
     DownloadFolder,
@@ -33,6 +34,7 @@ pub(super) enum Purpose {
     GroupOutputDiff(String),
     GroupLiveRecording(String),
     SshHostList,
+    SshGroupDefinition,
     StartRecording,
     OpenRecording,
 }
@@ -171,6 +173,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
                 | Purpose::OpenSshHostList
+                | Purpose::OpenSshGroupDefinition
                 | Purpose::SshIdentity(_)
                 | Purpose::Folder
                 | Purpose::DownloadFolder
@@ -239,6 +242,13 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 fixture_picker_folder(&dialog, "W11TERM_HOST_LIST_SMOKE_DIR")?;
                 None
             }
+            Purpose::OpenSshGroupDefinition => {
+                dialog.SetTitle(w!("Open SSH group definition"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                #[cfg(feature = "ui-smoke")]
+                fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")?;
+                None
+            }
             Purpose::SshIdentity(current) => {
                 dialog.SetTitle(w!("Choose SSH private key"))?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
@@ -298,6 +308,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             | Purpose::GroupJsonReport(_)
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
+            | Purpose::SshGroupDefinition
             | Purpose::SshHostList => {
                 #[cfg(feature = "ui-smoke")]
                 if fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")? {
@@ -330,6 +341,11 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                         w!("txt"),
                     ),
                     Purpose::SshHostList => (w!("Save SSH host list"), "ssh-hosts.txt", w!("txt")),
+                    Purpose::SshGroupDefinition => (
+                        w!("Save SSH group definition"),
+                        "ssh-group.json",
+                        w!("json"),
+                    ),
                     _ => (w!("Save scrollback as text"), "terminal.txt", w!("txt")),
                 };
                 dialog.SetTitle(title)?;

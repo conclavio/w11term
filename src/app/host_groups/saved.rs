@@ -1,6 +1,7 @@
 use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Result, ensure};
 
+mod definition;
 mod duplicate;
 mod roster_update;
 pub use roster_update::Action as RosterUpdateAction;
@@ -11,6 +12,7 @@ pub(super) struct SavedUi {
     selected: Option<String>,
     editor: Option<Editor>,
     duplicate: Option<Box<duplicate::Draft>>,
+    definition: Option<definition::State>,
     next_editor: u64,
     pub(super) feedback: String,
     pub(super) reuse: reuse::State,
@@ -145,6 +147,7 @@ impl SavedUi {
     pub(super) fn is_editing(&self) -> bool {
         self.editor.is_some()
             || self.duplicate.is_some()
+            || self.definition.is_some()
             || self.roster_update.is_open()
             || self.recipient_sets.is_open()
     }
@@ -200,6 +203,7 @@ pub enum Action {
     },
     Draft(u64, DraftAction),
     Duplicate(duplicate::Action),
+    Definition(definition::Action),
     UpdateRoster(RosterUpdateAction),
     SaveRosterDefaults {
         group: String,
@@ -308,6 +312,7 @@ impl TerminalApp {
             }
             Action::Draft(editor, action) => self.edit_saved_host_group(id, editor, action),
             Action::Duplicate(action) => self.handle_duplicate_group(id, action),
+            Action::Definition(action) => self.handle_group_definition(id, action, ctx),
             Action::UpdateRoster(action) => self.handle_roster_update(id, action),
         }
     }
@@ -767,6 +772,10 @@ impl TerminalApp {
                 .spacing(8.0)
                 .children((review_actions, import::saved_profiles_button(id, ctx))),
         ));
+        details.push(KeyedView::new(
+            "group-definition-actions",
+            definition::buttons(id, selected, self.export.pending.is_some(), ctx),
+        ));
         if !saved.feedback.is_empty() {
             details.push(KeyedView::new(
                 "feedback",
@@ -795,6 +804,9 @@ impl TerminalApp {
         saved: &SavedUi,
         ctx: &ViewContext<Self>,
     ) -> Option<View> {
+        if let Some(definition) = &saved.definition {
+            return Some(definition.view(id, &saved.feedback, ctx));
+        }
         if let Some(draft) = &saved.duplicate {
             return Some(draft.view(id, &saved.feedback, ctx));
         }

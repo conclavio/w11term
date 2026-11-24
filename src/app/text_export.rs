@@ -28,6 +28,7 @@ pub enum Subject {
         selected: u64,
     },
     SshHostList,
+    SshGroupDefinition,
 }
 
 impl Subject {
@@ -40,6 +41,7 @@ impl Subject {
             Self::HostGroupShownOutput(_) => "shown SSH group output".into(),
             Self::HostGroupDiff { .. } => "SSH group differences".into(),
             Self::SshHostList => "SSH host list".into(),
+            Self::SshGroupDefinition => "SSH group definition".into(),
         }
     }
 
@@ -68,6 +70,7 @@ impl Subject {
                 "ssh-group-diff-{submission}-{reference}-to-{selected}.txt"
             )),
             Self::SshHostList => file_picker::Purpose::SshHostList,
+            Self::SshGroupDefinition => file_picker::Purpose::SshGroupDefinition,
         }
     }
 }

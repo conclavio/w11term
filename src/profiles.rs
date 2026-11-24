@@ -7,6 +7,8 @@ mod bookmarks;
 pub use bookmarks::{BookmarkPeer, bookmark_directory};
 mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
+mod group_file;
+pub use group_file::{decode_group_file, encode_group_file, read_group_file};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileSnapshot {
@@ -42,13 +44,17 @@ enum RosterDefaultsEdit {
     Set(String, SshRosterDefaults),
     Move(String, Option<String>),
     Copy(String, String),
+    Replace(String, SshRosterDefaults),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SavedSshGroup {
     pub name: String,
     pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient_sets: Option<SshRecipientSets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roster_defaults: Option<SshRosterDefaults>,
 }
 
@@ -292,25 +298,39 @@ impl ProfileStore {
                 SavedSshGroup::capture(catalog, &source.name).as_ref() == Some(source),
                 "The source SSH group changed on disk. Reopen the copy before saving."
             );
-            ensure!(
-                !catalog.ssh_host_groups.contains_key(name),
-                "An SSH group named {name} already exists"
-            );
             catalog.resolve_ssh_host_group_members(&source.members)?;
-            let mut groups = catalog.ssh_host_groups.clone();
-            groups.insert(name.into(), source.members.clone());
-            let mut sets = catalog.ssh_recipient_sets.clone();
-            if let Some(recipient_sets) = &source.recipient_sets {
-                sets.insert(name.into(), recipient_sets.clone());
-            } else {
-                sets.remove(name);
-            }
-            Ok(CatalogEdit {
-                ssh_host_groups: Some(groups),
-                ssh_recipient_sets: Some(sets),
-                roster_defaults: Some(RosterDefaultsEdit::Copy(source.name.clone(), name.into())),
-                ..Default::default()
-            })
+            add_ssh_group(
+                catalog,
+                name,
+                source,
+                RosterDefaultsEdit::Copy(source.name.clone(), name.into()),
+            )
+        })
+    }
+
+    pub fn import_ssh_group_definition(
+        &self,
+        name: &str,
+        group: &SavedSshGroup,
+        reviewed: &[SshOptions],
+    ) -> Result<Profiles> {
+        validate_group_name(name)?;
+        group_file::validate(group)?;
+        self.modify(|_, catalog| {
+            let resolved = catalog.resolve_ssh_host_group_members(&group.members)?;
+            ensure!(
+                resolved.into_iter().eq(reviewed),
+                "The SSH profiles changed on disk. Review the group definition again."
+            );
+            add_ssh_group(
+                catalog,
+                name,
+                group,
+                match group.roster_defaults {
+                    Some(defaults) => RosterDefaultsEdit::Replace(name.into(), defaults),
+                    None => RosterDefaultsEdit::Move(name.into(), None),
+                },
+            )
         })
     }
 
@@ -1041,6 +1061,32 @@ impl ProfileStore {
     }
 }
 
+fn add_ssh_group(
+    catalog: &Profiles,
+    name: &str,
+    group: &SavedSshGroup,
+    roster_defaults: RosterDefaultsEdit,
+) -> Result<CatalogEdit> {
+    ensure!(
+        !catalog.ssh_host_groups.contains_key(name),
+        "An SSH group named {name} already exists"
+    );
+    let mut groups = catalog.ssh_host_groups.clone();
+    groups.insert(name.into(), group.members.clone());
+    let mut sets = catalog.ssh_recipient_sets.clone();
+    if let Some(recipient_sets) = &group.recipient_sets {
+        sets.insert(name.into(), recipient_sets.clone());
+    } else {
+        sets.remove(name);
+    }
+    Ok(CatalogEdit {
+        ssh_host_groups: Some(groups),
+        ssh_recipient_sets: Some(sets),
+        roster_defaults: Some(roster_defaults),
+        ..Default::default()
+    })
+}
+
 fn patch_roster_defaults(
     fields: &mut serde_json::Map<String, serde_json::Value>,
     edit: RosterDefaultsEdit,
@@ -1095,6 +1141,14 @@ fn patch_roster_defaults(
                     fields.remove(SSH_HOST_GROUP_DEFAULTS);
                 }
             }
+        }
+        RosterDefaultsEdit::Replace(name, defaults) => {
+            let groups = fields
+                .entry(SSH_HOST_GROUP_DEFAULTS)
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .context("SSH group defaults must be an object")?;
+            groups.insert(name, serde_json::to_value(defaults)?);
         }
     }
     Ok(())
