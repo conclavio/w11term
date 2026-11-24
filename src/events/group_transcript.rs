@@ -38,6 +38,36 @@ struct Transcript {
 struct ArmedOutputAlert {
     alert: GroupOutputAlert,
     incomplete: BTreeSet<u64>,
+    matched: BTreeSet<u64>,
+}
+
+impl ArmedOutputAlert {
+    fn expectation(&self, confirmed: &BTreeSet<u64>) -> Arc<GroupOutputExpectation> {
+        Arc::new(GroupOutputExpectation {
+            rule: self.alert.rule.clone(),
+            hosts: self
+                .alert
+                .hosts
+                .iter()
+                .map(|(&pane, name)| {
+                    let state = if self.matched.contains(&pane) {
+                        GroupOutputExpectationState::Matched
+                    } else if confirmed.contains(&pane) {
+                        GroupOutputExpectationState::Missing
+                    } else {
+                        GroupOutputExpectationState::Unverified
+                    };
+                    (
+                        pane,
+                        GroupOutputExpectationHost {
+                            name: name.clone(),
+                            state,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,14 +80,21 @@ pub enum GroupOutputAlertTrigger {
 #[derive(Debug)]
 pub struct GroupOutputExpectation {
     pub rule: Arc<GroupOutputAlertRule>,
-    pub hosts: Vec<UnmatchedOutputHost>,
+    pub hosts: BTreeMap<u64, GroupOutputExpectationHost>,
 }
 
 #[derive(Debug)]
-pub struct UnmatchedOutputHost {
-    pub pane: u64,
+pub struct GroupOutputExpectationHost {
     pub name: String,
-    pub confirmed: bool,
+    pub state: GroupOutputExpectationState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupOutputExpectationState {
+    Matched,
+    Missing,
+    Unverified,
 }
 
 #[derive(Debug)]
@@ -533,6 +570,7 @@ impl GroupTranscript {
             transcript.output_alert = Some(ArmedOutputAlert {
                 alert,
                 incomplete: BTreeSet::new(),
+                matched: BTreeSet::new(),
             });
         }
     }
@@ -674,12 +712,14 @@ impl GroupTranscript {
         });
         drop(transcript);
         if let Some((alert, expectation)) = unresolved_alert {
-            let missing = expectation
-                .hosts
-                .iter()
-                .filter(|host| host.confirmed)
-                .count();
-            let unverified = expectation.hosts.len() - missing;
+            let (mut missing, mut unverified) = (0, 0);
+            for host in expectation.hosts.values() {
+                match host.state {
+                    GroupOutputExpectationState::Matched => {}
+                    GroupOutputExpectationState::Missing => missing += 1,
+                    GroupOutputExpectationState::Unverified => unverified += 1,
+                }
+            }
             if alert.rule.trigger == GroupOutputAlertTrigger::MissingByHost {
                 alert.inbox.group_output_missing_by_host(
                     alert.tab,
@@ -796,38 +836,27 @@ impl GroupTranscriptHost {
 
 impl Transcript {
     fn finish_output_alert(&mut self) -> Option<(GroupOutputAlert, Arc<GroupOutputExpectation>)> {
-        let ArmedOutputAlert { alert, incomplete } = self.output_alert.take()?;
-        if alert.rule.trigger == GroupOutputAlertTrigger::Match {
+        let armed = self.output_alert.take()?;
+        if armed.alert.rule.trigger == GroupOutputAlertTrigger::Match {
             return None;
         }
         let confirmed: BTreeSet<_> = self
             .hosts
             .iter()
-            .filter(|host| host.confirmed_output() && !incomplete.contains(&host.pane))
+            .filter(|host| host.confirmed_output() && !armed.incomplete.contains(&host.pane))
             .map(|host| host.pane)
             .collect();
-        let expectation = Arc::new(GroupOutputExpectation {
-            rule: alert.rule.clone(),
-            hosts: alert
-                .hosts
-                .iter()
-                .map(|(&pane, name)| UnmatchedOutputHost {
-                    pane,
-                    name: name.clone(),
-                    confirmed: confirmed.contains(&pane),
-                })
-                .collect(),
-        });
-        if alert.rule.trigger == GroupOutputAlertTrigger::MissingByHost {
+        let expectation = armed.expectation(&confirmed);
+        if armed.alert.rule.trigger == GroupOutputAlertTrigger::MissingByHost {
             self.output_expectation = Some(expectation.clone());
         }
-        Some((alert, expectation))
+        Some((armed.alert, expectation))
     }
 
     fn observe_alert_line(&mut self) -> Option<(GroupOutputAlert, GroupTranscriptLine)> {
         let armed = self.output_alert.as_mut()?;
         let line = self.history.combined.snapshot.lines.back()?;
-        if !armed.alert.hosts.contains_key(&line.pane) {
+        if !armed.alert.hosts.contains_key(&line.pane) || armed.matched.contains(&line.pane) {
             return None;
         }
         let trigger = armed.alert.rule.trigger;
@@ -839,10 +868,12 @@ impl Transcript {
             return None;
         }
         if trigger == GroupOutputAlertTrigger::MissingByHost {
-            armed.alert.hosts.remove(&line.pane);
-            if !armed.alert.hosts.is_empty() {
-                return None;
+            armed.matched.insert(line.pane);
+            if armed.matched.len() == armed.alert.hosts.len() {
+                self.output_expectation = Some(armed.expectation(&BTreeSet::new()));
+                self.output_alert = None;
             }
+            return None;
         }
         let alert = self.output_alert.take().unwrap().alert;
         (trigger == GroupOutputAlertTrigger::Match).then(|| (alert, line.clone()))
@@ -1150,11 +1181,13 @@ mod tests {
             append(&east, "ready", false);
             append(&east, "ready", false);
             assert!(group.output_alert_rule().is_some());
+            assert!(group.output_expectation().is_none());
             drop(east);
             if all_matched {
                 append(&west, "ready", false);
                 append(&north, "ready", true);
                 assert!(group.output_alert_rule().is_none());
+                assert!(group.output_expectation().is_some());
             } else {
                 append(&west, "starting", false);
                 append(&north, "starting", true);
@@ -1162,19 +1195,25 @@ mod tests {
             drop(west);
             assert!(inbox.rows().is_empty());
             drop(north);
+            assert!(group.output_alert_rule().is_none());
+            let report = group.output_expectation().unwrap();
+            use GroupOutputExpectationState::{Matched, Missing, Unverified};
+            let (west, north) = if all_matched {
+                (Matched, Matched)
+            } else {
+                (Missing, Unverified)
+            };
+            assert_eq!(
+                report
+                    .hosts
+                    .iter()
+                    .map(|(&pane, host)| (pane, host.name.as_str(), host.state))
+                    .collect::<Vec<_>>(),
+                [(1, "East", Matched), (2, "West", west), (3, "North", north)]
+            );
             if all_matched {
                 assert!(inbox.rows().is_empty());
-                assert!(group.output_expectation().is_none());
             } else {
-                let report = group.output_expectation().unwrap();
-                assert_eq!(
-                    report
-                        .hosts
-                        .iter()
-                        .map(|host| (host.pane, host.name.as_str(), host.confirmed))
-                        .collect::<Vec<_>>(),
-                    [(2, "West", true), (3, "North", false)]
-                );
                 let rows = inbox.rows();
                 assert_eq!(rows.len(), 1);
                 assert_eq!(

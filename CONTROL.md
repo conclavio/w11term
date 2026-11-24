@@ -223,14 +223,23 @@ rows carry the same pane identity, delivery, execution, and interrupt
 statuses as saved group reports. Environment assignments appear in their
 recipient rows.
 
+When a per-recipient expected-output check resolves, `run.output_expectation`
+contains its `query`, `regex`, and `match_case` settings. Each checked
+recipient has its own `output_expectation` field with the value `matched`,
+`missing`, or `unverified`. Missing means capture completed with adequate
+coverage and no match. Unverified means delivery or capture could not establish
+whether the text appeared. Saved JSON reports use the same fields, with the
+check settings at the document root. An unresolved check has no result fields.
+
 The detail reply carries metadata. To read a completed recipient's retained
 output, use `get-command` with its `pane_id` and the
 `execution.command_id` and `execution.connection_generation` in the reply.
 The usual pane history retention rules apply.
 
 `wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]`
-returns the same detail reply once all recipients settle. It handles running,
-paused, and canary-gated queues in the background. The timeout defaults to
+returns the same detail reply once all recipients settle, including the result
+of any active per-recipient expected-output check. It handles running, paused,
+and canary-gated queues in the background. The timeout defaults to
 30 seconds and accepts 1 through 3600. A settled run returns immediately.
 Check the recipient statuses and exit codes to decide whether the run succeeded.
 Timeout, a closed window or tab, or an evicted run returns an error. A timeout

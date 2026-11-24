@@ -2759,11 +2759,10 @@ impl TerminalApp {
                 },
             )),
         ));
-        if let Some(expectation) = submission.transcript.output_expectation() {
-            details.push(KeyedView::new(
-                "output-expectation",
-                live_output::output_expectation_view(&expectation),
-            ));
+        if let Some(expectation) = submission.transcript.output_expectation()
+            && let Some(view) = live_output::output_expectation_view(&expectation)
+        {
+            details.push(KeyedView::new("output-expectation", view));
         }
         if shown.is_empty() {
             details.push(KeyedView::new(

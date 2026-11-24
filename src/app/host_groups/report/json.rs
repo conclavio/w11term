@@ -10,7 +10,7 @@ use std::{
     io::{self, Write},
     time::{Duration, Instant},
 };
-use w11term::events::GroupQueueActivity;
+use w11term::events::{GroupOutputExpectation, GroupOutputExpectationState, GroupQueueActivity};
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,6 +108,8 @@ pub(super) struct Recipient {
     delivery: DeliveryState,
     execution: Option<Execution>,
     interrupt: Option<DeliveryState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_expectation: Option<GroupOutputExpectationState>,
 }
 
 impl Recipient {
@@ -116,6 +118,7 @@ impl Recipient {
         content: &SubmissionContent,
         execution: Option<&GroupExecution>,
         now: Instant,
+        output_expectation: Option<GroupOutputExpectationState>,
     ) -> Self {
         let target = &delivery.target;
         Self {
@@ -127,6 +130,7 @@ impl Recipient {
             delivery: DeliveryState::from(&delivery.status),
             execution: execution.map(|execution| Execution::capture(execution, now)),
             interrupt: delivery.interrupt.as_ref().map(DeliveryState::from),
+            output_expectation,
         }
     }
 }
@@ -162,6 +166,23 @@ struct DocumentRecipient<'a> {
 }
 
 #[derive(Serialize)]
+struct OutputExpectation<'a> {
+    query: &'a str,
+    regex: bool,
+    match_case: bool,
+}
+
+impl<'a> From<&'a GroupOutputExpectation> for OutputExpectation<'a> {
+    fn from(check: &'a GroupOutputExpectation) -> Self {
+        Self {
+            query: &check.rule.query,
+            regex: check.rule.regex,
+            match_case: check.rule.match_case,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct Document<'a> {
     schema_version: u32,
     submission_id: u64,
@@ -172,6 +193,8 @@ struct Document<'a> {
     dispatch_policy: Option<&'a Policy>,
     #[serde(skip_serializing_if = "GroupQueueActivity::is_empty")]
     queue_activity: &'a GroupQueueActivity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_expectation: Option<OutputExpectation<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     total_recipient_count: Option<usize>,
     recipients: Vec<DocumentRecipient<'a>>,
@@ -212,6 +235,7 @@ pub(in crate::app::host_groups) fn describe_run(
     submission: &Submission,
     require_settlement: bool,
 ) -> Option<Value> {
+    let output_expectation = submission.transcript.output_expectation();
     let now = Instant::now();
     let mut outcomes = Summary::default();
     let recipients: Vec<_> = submission
@@ -223,20 +247,34 @@ pub(in crate::app::host_groups) fn describe_run(
                 &delivery.status,
                 execution.as_ref(),
             ));
-            Recipient::capture(delivery, &submission.content, execution.as_ref(), now)
+            let expected = output_expectation
+                .as_ref()
+                .and_then(|check| check.hosts.get(&delivery.target.pane))
+                .map(|host| host.state);
+            Recipient::capture(
+                delivery,
+                &submission.content,
+                execution.as_ref(),
+                now,
+                expected,
+            )
         })
         .collect();
     if require_settlement && outcomes.settled() != outcomes.total() {
         return None;
     }
-    Some(json!({
+    let mut run = json!({
         "schema_version": 1,
         "summary": RunSummary::new(submission, outcomes),
         "command": submission.content.command(),
         "dispatch_policy": submission.dispatch_policy,
         "queue_activity": submission.transcript.queue_activity(),
         "recipients": recipients,
-    }))
+    });
+    if let Some(check) = output_expectation.as_deref() {
+        run["output_expectation"] = json!(OutputExpectation::from(check));
+    }
+    Some(run)
 }
 
 impl Report {
@@ -252,6 +290,10 @@ impl Report {
             command: matches!(self.kind, Kind::Command).then_some(self.label.as_str()),
             dispatch_policy: self.dispatch_policy.as_ref(),
             queue_activity: &self.queue_activity,
+            output_expectation: self
+                .output_expectation
+                .as_deref()
+                .map(OutputExpectation::from),
             total_recipient_count: self.total_recipient_count,
             recipients: self
                 .sections

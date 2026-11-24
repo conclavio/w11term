@@ -1946,17 +1946,52 @@ try {
     (Wait-CheckBox 'Require a match from every host' Off).Toggle()
     $null = Wait-CheckBox 'Require a match from every host' On
     Click 'Send with alert'
+    $everyHostRun = $missingRun + 1
+    $runArgs = @('--window',"$groupWindow",'--tab',"$groupTab",'--run',"$everyHostRun")
+    $finished = (Control (@('wait-ssh-group-run') + $runArgs + @('--timeout','15'))).run
+    $details = (Control (@('get-ssh-group-run') + $runArgs)).run
+    foreach ($result in @($finished, $details)) {
+        $check = $result.output_expectation
+        $matched = $result.recipients | Where-Object pane_id -eq $east
+        $missing = $result.recipients | Where-Object pane_id -eq $west
+        if ($check.query -cne $expectedLine -or $check.regex -ne $false -or
+            $check.match_case -ne $false -or $matched.output_expectation -cne 'matched' -or
+            $missing.output_expectation -cne 'missing') {
+            throw "The run reply lost the resolved check: $($result | ConvertTo-Json -Depth 8 -Compress)"
+        }
+    }
     $null = Wait-Until 'a match on East leaves West under its own check' {
         (Find-Element "Submitted${dot}check-each-host") -and (Find-Element 'Attention inbox, 1 unread' $button)
     }
     Click 'Attention inbox, 1 unread'
-    $everyHostRun = $missingRun + 1
     Click "Unread${dot}SSH host group${dot}Run $everyHostRun${dot}Expected output missing on 1 host${dot}$expectedLine"
     $null = Wait-Until 'run results identify West as the host missing expected output' {
         (Find-Element "Submitted${dot}check-each-host") -and
             (Find-Element "Expected output missing${dot}$westName") -and
             !(Find-Element "Expected output missing${dot}$eastName") -and
             (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Click 'Copy results'
+    $null = Wait-Until 'the text report includes the expected output check and both outcomes' {
+        $text = Read-ClipboardFixture
+        $text -and $text.Contains("Expected output${dot}$expectedLine") -and
+            $text.Contains("  Expected output matched`r`n") -and $text.Contains("  Expected output missing`r`n")
+    }
+    $expectedJson = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'output check.json'
+    Click ('Save results as JSON' + [char]0x2026)
+    $dialog = Wait-Until 'owned expected output JSON save dialog' { Find-OwnedDialog 'Save SSH group results as JSON' }
+    $null = Wait-Until 'enter the expected output JSON destination' {
+        [FixtureDialog]::SetFilename($dialog, $expectedJson, "ssh-group-submission-$everyHostRun.json")
+    }
+    $null = Wait-Until 'save the expected output JSON report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the expected output JSON report is published' { [IO.File]::Exists($expectedJson) }
+    $saved = [IO.File]::ReadAllText($expectedJson) | ConvertFrom-Json
+    $matched = $saved.recipients | Where-Object pane_id -eq $east
+    $missing = $saved.recipients | Where-Object pane_id -eq $west
+    if ($saved.schema_version -ne 1 -or $saved.output_expectation.query -cne $expectedLine -or
+        $matched.output_expectation -cne 'matched' -or $missing.output_expectation -cne 'missing' -or
+        $missing.output.state -cne 'complete' -or !$missing.output.text.Contains('west-accepted check-each-host')) {
+        throw 'The JSON export lost the expected output check, its recipient outcomes, or the captured output'
     }
     Click 'Previous submission'
     $null = Wait-Until 'move back to the earlier missing-output check' { Find-Element "Submitted${dot}check-expected" }
