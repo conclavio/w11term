@@ -28,6 +28,12 @@ pub struct SshGroupExpectedOutput {
     pub match_case: bool,
 }
 
+#[derive(Debug)]
+pub struct SshGroupCommandOptions {
+    pub expect_output: Option<(SshGroupExpectedOutput, Regex)>,
+    pub record_output: Option<PathBuf>,
+}
+
 pub(super) struct GroupOutputQuery {
     pub(super) pane: Option<u64>,
     pub(super) after_line: Option<u64>,
@@ -128,8 +134,13 @@ impl Registry {
         pane_ids: Vec<u64>,
         command: String,
         expect_output: Option<SshGroupExpectedOutput>,
+        record_output: Option<PathBuf>,
     ) -> Result<Value> {
         validate_group_submission(&pane_ids, &command)?;
+        ensure!(
+            record_output.as_ref().is_none_or(|path| path.is_absolute()),
+            "group output recording path must be absolute"
+        );
         let expect_output = expect_output
             .map(|rule| {
                 let pattern = output_pattern(&rule.query, rule.regex, rule.match_case)?;
@@ -143,7 +154,10 @@ impl Registry {
             tab_id: tab,
             pane_ids,
             command,
-            expect_output,
+            options: SshGroupCommandOptions {
+                expect_output,
+                record_output,
+            },
             reply,
         });
         let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
@@ -628,13 +642,17 @@ mod tests {
                 tab_id,
                 pane_ids,
                 command,
-                expect_output,
+                options,
                 reply,
             } => {
                 assert_eq!(tab_id, 9);
                 assert_eq!(pane_ids, [8, 7]);
                 assert_eq!(command, "show  status");
-                let (rule, pattern) = expect_output.unwrap();
+                assert_eq!(
+                    options.record_output,
+                    Some(PathBuf::from(r"C:\fixture\capture.txt"))
+                );
+                let (rule, pattern) = options.expect_output.unwrap();
                 assert_eq!(rule.query, "^READY [0-9]+$");
                 assert!(pattern.is_match("READY 2"));
                 assert!(!pattern.is_match("ready 2"));
@@ -692,6 +710,7 @@ mod tests {
                     regex: true,
                     match_case: true,
                 }),
+                Some(PathBuf::from(r"C:\fixture\capture.txt")),
             )
             .await
             .unwrap();
@@ -701,7 +720,7 @@ mod tests {
         );
         assert!(
             second
-                .submit_ssh_group_command(3, 9, vec![7, 7], "show".into(), None)
+                .submit_ssh_group_command(3, 9, vec![7, 7], "show".into(), None, None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -719,11 +738,27 @@ mod tests {
                         regex: true,
                         match_case: false
                     }),
+                    None,
                 )
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("invalid expected output")
+        );
+        assert!(
+            second
+                .submit_ssh_group_command(
+                    5,
+                    9,
+                    vec![7],
+                    "show".into(),
+                    None,
+                    Some(PathBuf::from("relative.txt")),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recording path must be absolute")
         );
         assert_eq!(
             lookup,

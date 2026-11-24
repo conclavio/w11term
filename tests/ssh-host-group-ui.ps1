@@ -2022,6 +2022,13 @@ try {
     if ($LASTEXITCODE -eq 0 -or $badPattern.ok -or $badPattern.error -notlike '*invalid expected output*') {
         throw 'The CLI accepted an invalid expected-output regex'
     }
+    $existingRecording = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'recording exists.txt'
+    [IO.File]::WriteAllText($existingRecording, 'existing recording')
+    $badRecording = & $Cli --pid $app.Id @submitArgs --pane $west --record-output $existingRecording 'must-not-send' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $badRecording.ok -or $badRecording.error -notlike '*Could not prepare the recording*' -or
+        [IO.File]::ReadAllText($existingRecording) -cne 'existing recording') {
+        throw 'The CLI accepted an existing recording destination or changed its contents'
+    }
     $launched = Control ($submitArgs + @('--pane',"$west",'cli-only  west'))
     if ($launched.window_id -ne $groupWindow -or $launched.tab_id -ne $groupTab -or $launched.run_id -ne ($everyHostRun + 1)) {
         throw 'The CLI did not create exactly one retained run for the accepted request'
@@ -2029,7 +2036,7 @@ try {
     $verified = (Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
         '--run',"$($launched.run_id)",'--timeout','15')).run
     if ($verified.command -cne 'cli-only  west' -or $verified.recipients.Count -ne 1 -or
-        $null -ne $verified.output_expectation -or
+        $null -ne $verified.output_expectation -or $null -ne $verified.recording -or
         $verified.recipients[0].pane_id -ne $west -or $verified.recipients[0].delivery.state -cne 'sent' -or
         $verified.recipients[0].execution.exit_code -ne 17 -or
         [FixtureMessages]::GetForegroundWindow() -ne $submitForeground) {
@@ -2039,8 +2046,9 @@ try {
         ((Roster-Snapshot).hosts | Where-Object state -ceq 'ready' | Measure-Object).Count -eq 2
     }
     $cliPattern = '^west-accepted cli-expect$'
+    $cliRecording = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'cli output.txt'
     $checked = Control ($submitArgs + @('--pane',"$west",'--pane',"$east",
-        '--expect-output',$cliPattern,'--regex','--match-case','cli-expect'))
+        '--expect-output',$cliPattern,'--regex','--match-case','--record-output',$cliRecording,'cli-expect'))
     $cliCheck = (Control @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",
         '--run',"$($checked.run_id)",'--timeout','15')).run
     $first, $second = $cliCheck.recipients
@@ -2049,6 +2057,18 @@ try {
         !$cliCheck.output_expectation.match_case -or $first.pane_id -ne $west -or $second.pane_id -ne $east -or
         $first.output_expectation -cne 'matched' -or $second.output_expectation -cne 'missing') {
         throw "The checked CLI submission lost its rule, recipient order, or per-pane outcomes: $($cliCheck | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    if ($cliCheck.recording.state -cne 'saved' -or $cliCheck.recording.path -cne $cliRecording -or
+        $null -ne $cliCheck.recording.error) {
+        throw "The CLI run settled before its recording finished: $($cliCheck.recording | ConvertTo-Json -Compress)"
+    }
+    $cliLines = [IO.File]::ReadAllLines($cliRecording)
+    if ("$westName${dot}west-accepted cli-expect" -cnotin $cliLines -or
+        "$eastName${dot}east-accepted cli-expect" -cnotin $cliLines -or
+        "$westName${dot}Sent to SSH channel${dot}Exit 17" -cnotin $cliLines -or
+        "$eastName${dot}Sent to SSH channel${dot}Exit 0" -cnotin $cliLines -or
+        $cliLines[-1] -cne '[Group run settled]') {
+        throw 'The completed CLI transcript lost output, host outcomes, or its settlement footer'
     }
     Wait-Focus $east
     Run-Palette 'SSH host group'

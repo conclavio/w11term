@@ -237,7 +237,7 @@ Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
 background tab or window without changing selection or keyboard focus.
 
-`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--expect-output TEXT [--regex] [--match-case]] [--] COMMAND`
+`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND`
 sends one shell line of up to 4,096 UTF-8 bytes to explicitly named panes.
 Pass the command as one quoted argument to preserve spaces. Use `--` before
 a command beginning with two hyphens. The panes must be distinct, belong
@@ -264,6 +264,19 @@ pattern rejects the request before any command is sent. The settled run
 reports each pane as matched, missing, or unverified. Missing or unverified
 output also appears in the Attention inbox.
 
+Use `--record-output PATH` to create a UTF-8 transcript with host labels,
+output, and final outcomes. The CLI resolves relative paths from its working
+directory. Raw requests require an absolute path. The destination must be a
+new file in an existing directory. If preparation fails, no command is sent.
+If the request expires or a recipient changes after the file is prepared,
+the file may contain only `[No command was sent]`.
+
+Run replies include an optional `recording` object for CLI-started recordings.
+It has `path`, `state` (`opening`, `recording`, `saved`, or `failed`), and
+`error`, which is null unless the writer failed. The recorder starts before
+dispatch and writes through settlement. Stopping it from the GUI or closing
+or retiring the run ends capture early and marks that in the file footer.
+
 `get-ssh-group-run --window ID --tab ID --run ID` takes the three IDs from
 the listing. An evicted run or closed tab or window returns a lookup error.
 The reply includes `window_id`, `tab_id`, and a `run` object with
@@ -288,7 +301,8 @@ The usual pane history retention rules apply.
 
 `wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]`
 returns the same detail reply once all recipients settle, including the result
-of any active per-recipient expected-output check. It handles running, paused,
+of any active per-recipient expected-output check. For CLI-started recordings,
+it also waits for the file writer's final status. It handles running, paused,
 and canary-gated queues in the background. The timeout defaults to
 30 seconds and accepts 1 through 3600. A settled run returns immediately.
 Check the recipient statuses and exit codes to decide whether the run succeeded.
@@ -362,6 +376,7 @@ w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 -- "uname -a"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --expect-output '^READY$' --regex --match-case -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
@@ -380,6 +395,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"uname -a"}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","expect_output":{"query":"^READY$","regex":true,"match_case":true}}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}

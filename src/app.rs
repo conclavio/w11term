@@ -5422,18 +5422,13 @@ impl Component for TerminalApp {
                 tab_id,
                 pane_ids,
                 command,
-                expect_output,
+                options,
                 reply,
             }) => {
                 if !reply.is_closed() {
-                    let result = self.control_submit_ssh_group_command(
-                        tab_id,
-                        &pane_ids,
-                        command,
-                        expect_output,
+                    self.control_submit_ssh_group_command(
+                        tab_id, &pane_ids, command, options, reply, context,
                     );
-                    let _ = reply.send(result.map(Into::into));
-                    self.update_host_group_timer(context);
                 }
             }
             Message::Control(w11term::control::UiRequest::ReadSshGroupOutput {

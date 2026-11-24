@@ -274,6 +274,9 @@ pub(in crate::app::host_groups) fn describe_run(
     if let Some(check) = output_expectation.as_deref() {
         run["output_expectation"] = json!(OutputExpectation::from(check));
     }
+    if let Some(recording) = &submission.control_recording {
+        run["recording"] = recording.snapshot();
+    }
     Some(run)
 }
 

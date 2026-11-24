@@ -244,13 +244,20 @@ mod tests {
             "^READY [0-9]+$",
             "--regex",
             "--match-case",
+            "--record-output",
+            "capture output.txt",
             "--",
             "show  status",
         ])
         .unwrap();
+        let checked = serde_json::to_value(checked).unwrap();
         assert_eq!(
-            serde_json::to_value(checked).unwrap()["expect_output"],
+            checked["expect_output"],
             serde_json::json!({ "query":"^READY [0-9]+$", "regex":true, "match_case":true }),
+        );
+        assert_eq!(
+            checked["record_output"],
+            serde_json::to_value(std::path::absolute("capture output.txt").unwrap()).unwrap()
         );
         for invalid in [
             &["show"][..],
@@ -262,6 +269,16 @@ mod tests {
             &["--pane", "5", "--regex", "show"],
             &["--pane", "5", "--match-case", "show"],
             &["--pane", "5", "--expect-output"],
+            &["--pane", "5", "--record-output"],
+            &[
+                "--pane",
+                "5",
+                "--record-output",
+                "a",
+                "--record-output",
+                "b",
+                "show",
+            ],
             &[
                 "--pane",
                 "5",

@@ -1,9 +1,17 @@
 use super::*;
 use serde_json::{Value, json};
-use w11term::control::{SshGroupExpectedOutput, SshGroupOutput};
+use w11term::control::{SshGroupCommandOptions, SshGroupOutput};
 use w11term::events::GroupCompletionState;
 
 pub(in crate::app) type ControlReply = oneshot::Sender<Result<Value, String>>;
+
+pub struct PreparedControlRecording {
+    tab: TabId,
+    offer: CommandOffer,
+    alert: Option<alerted_send::Alert>,
+    file: Result<output_recording::PreparedFile, String>,
+    reply: ControlReply,
+}
 
 pub(super) struct ReadinessWait {
     checked: BTreeSet<u64>,
@@ -68,6 +76,10 @@ impl Submission {
         self.control_waiters.retain(|reply| !reply.is_closed());
         if self.control_waiters.is_empty()
             || self.transcript.completion_state() != GroupCompletionState::Settled
+            || self
+                .control_recording
+                .as_ref()
+                .is_some_and(|recording| !recording.finished())
         {
             return;
         }
@@ -86,8 +98,86 @@ impl TerminalApp {
         tab: TabId,
         pane_ids: &[u64],
         command: String,
-        expect_output: Option<(SshGroupExpectedOutput, regex::Regex)>,
-    ) -> Result<u64, String> {
+        options: SshGroupCommandOptions,
+        reply: ControlReply,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let offer = match self.control_command_offer(tab, pane_ids, command.into()) {
+            Ok(offer) => offer,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        let alert = options
+            .expect_output
+            .map(|(rule, pattern)| alerted_send::Alert::expected_output(rule, pattern));
+        let Some(path) = options.record_output else {
+            let result = self.dispatch_control_offer(tab, offer, alert, None);
+            let _ = reply.send(result.map(Into::into));
+            self.update_host_group_timer(ctx);
+            return;
+        };
+        ctx.spawn_background(move |cancel| {
+            if cancel.is_cancelled() || reply.is_closed() {
+                return Message::ControlIdle;
+            }
+            let file = output_recording::PreparedFile::open(path)
+                .map_err(|error| format!("Could not prepare the recording · {error:#}"));
+            Message::HostGroup(Action::ControlRecordingPrepared(Box::new(
+                PreparedControlRecording {
+                    tab,
+                    offer,
+                    alert,
+                    file,
+                    reply,
+                },
+            )))
+        });
+    }
+
+    pub(super) fn finish_control_recording(
+        &mut self,
+        prepared: PreparedControlRecording,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let PreparedControlRecording {
+            tab,
+            offer,
+            alert,
+            file,
+            reply,
+        } = prepared;
+        if reply.is_closed() {
+            return;
+        }
+        let result = file.and_then(|file| {
+            let panes: Vec<_> = offer.targets.iter().map(|target| target.pane).collect();
+            let latest = self.control_command_offer(tab, &panes, offer.text.clone())?;
+            if offer
+                .targets
+                .iter()
+                .zip(&latest.targets)
+                .any(|(before, after)| {
+                    before.state.prompt() != after.state.prompt() || before.name != after.name
+                })
+            {
+                return Err(
+                    "An SSH prompt or recipient changed while preparing the recording".into(),
+                );
+            }
+            self.dispatch_control_offer(tab, latest, alert, Some(file))
+        });
+        let _ = reply.send(result.map(Into::into));
+        self.update_host_group_timer(ctx);
+    }
+
+    fn control_command_offer(
+        &mut self,
+        tab: TabId,
+        pane_ids: &[u64],
+        command: Arc<str>,
+    ) -> Result<CommandOffer, String> {
         let targets = self.host_group_targets();
         let Some(Page::HostGroup(page)) = self.tabs.get_mut(tab).map(|tab| &mut tab.page) else {
             return Err(format!("unknown SSH group tab {tab} in this window"));
@@ -121,20 +211,30 @@ impl TerminalApp {
             "Include the configured canary at a fresh shell marker and at least one other ready SSH pane"
                 .to_owned()
         })?;
-        let offer = page.command_offer(command.into(), recipients);
+        Ok(page.command_offer(command, recipients))
+    }
+
+    fn dispatch_control_offer(
+        &mut self,
+        tab: TabId,
+        offer: CommandOffer,
+        alert: Option<alerted_send::Alert>,
+        file: Option<output_recording::PreparedFile>,
+    ) -> Result<u64, String> {
         let transcript = GroupTranscript::default();
-        if let Some((rule, pattern)) = expect_output {
-            let alert = alerted_send::Alert::expected_output(rule, pattern);
+        let recording = match file {
+            Some(file) => file.start(
+                &transcript,
+                dispatch_policy::report_heading(&offer.text, Some(&offer.dispatch_policy())),
+                output_recording::names(offer.targets.iter()),
+            )?,
+            None => Default::default(),
+        };
+        if let Some(alert) = alert {
             self.arm_group_send_alert(tab, &offer, alert, &transcript);
         }
-        self.submit_group_command(
-            tab,
-            offer,
-            transcript,
-            Default::default(),
-            SubmissionOrigin::Control,
-        )
-        .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))
+        self.submit_group_command(tab, offer, transcript, recording, SubmissionOrigin::Control)
+            .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))
     }
 
     pub(in crate::app) fn control_ssh_group_roster(
@@ -362,6 +462,42 @@ mod tests {
         );
         assert_eq!(group.selected, BTreeSet::from([1, 2]));
         assert!(group.ready_waiters.is_empty());
+    }
+
+    #[test]
+    fn settled_cli_run_waits_for_the_recording_result() {
+        use output_recording::{State, WriterStatus};
+        use std::path::PathBuf;
+
+        let (writer, worker) = watch::channel(WriterStatus::Recording);
+        let mut group = HostGroup::default();
+        let run = group.submit(
+            SubmissionContent::Command("show".into()),
+            Vec::new(),
+            GroupTranscript::default(),
+        );
+        run.control_recording = State::Writing {
+            path: PathBuf::from("capture.txt"),
+            worker,
+            recording: None,
+        }
+        .control_watcher();
+        assert_eq!(
+            run.transcript.completion_state(),
+            GroupCompletionState::Settled
+        );
+        let (reply, mut received) = oneshot::channel();
+        run.control_waiters.push(reply);
+        run.poll_control_waiters();
+        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
+
+        writer.send_replace(WriterStatus::Finished(Err("disk full".into())));
+        run.poll_control_waiters();
+        let snapshot = received.try_recv().unwrap().unwrap();
+        assert_eq!(
+            snapshot["recording"],
+            json!({ "path": "capture.txt", "state": "failed", "error": "disk full" })
+        );
     }
 
     #[test]

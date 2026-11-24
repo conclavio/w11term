@@ -173,7 +173,7 @@ From the command palette, choose **Find armed SSH output alerts…** to review a
 
 Choose **Send with alert…** to catch a match from the start of a command. Review the command and recipients, set the search rule, then choose **Send with alert**. w11term rechecks the command and prompts and arms the alert before dispatch, including for queued and canary runs.
 
-Turn on **Record full output** in the same review to choose a new text file before sending. The alert uses your search rule, and the recording captures all marked output and final outcomes until the run settles. Cancelling the file picker leaves the command unsent.
+Turn on **Record full output** in the same review to choose a new text file before sending. The alert uses your search rule, and the recording captures all marked output and final outcomes until the run settles. Cancelling the file picker leaves the command unsent. Scripts can use `submit-ssh-group-command --record-output PATH` and wait for the writer with `wait-ssh-group-run`.
 
 Open **Saved alert rules…** in Live output or the send-with-alert review to save a named copy of the current query and matching options. Select its name to fill in the search for a new run. The preset uses the current view's host scope, and you choose when to arm or send. Saved rules are available across windows and restarts.
 

@@ -113,6 +113,8 @@ pub enum Request {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect_output: Option<SshGroupExpectedOutput>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_output: Option<PathBuf>,
     },
     GetSshGroupRun {
         window_id: WindowId,
@@ -239,7 +241,7 @@ pub enum UiRequest {
         tab_id: u64,
         pane_ids: Vec<u64>,
         command: String,
-        expect_output: Option<(SshGroupExpectedOutput, regex::Regex)>,
+        options: SshGroupCommandOptions,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     GetSshGroupRun {
@@ -290,7 +292,7 @@ impl UiRequest {
 }
 
 pub use ssh_groups::validate_group_submission;
-pub use ssh_groups::{SshGroupExpectedOutput, SshGroupOutput};
+pub use ssh_groups::{SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput};
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -582,9 +584,17 @@ impl Registry {
                 pane_ids,
                 command,
                 expect_output,
+                record_output,
             } => {
-                self.submit_ssh_group_command(window_id, tab_id, pane_ids, command, expect_output)
-                    .await
+                self.submit_ssh_group_command(
+                    window_id,
+                    tab_id,
+                    pane_ids,
+                    command,
+                    expect_output,
+                    record_output,
+                )
+                .await
             }
             Request::WaitSshGroupRun {
                 window_id,
