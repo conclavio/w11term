@@ -1,6 +1,6 @@
 use super::{Action as HostAction, address, *};
 use anyhow::{Context, Result, ensure};
-use std::io::Write;
+use std::{fmt, io::Write};
 
 const LABEL: &str = "Export host list…";
 
@@ -9,9 +9,10 @@ pub(super) struct State {
     snapshot: Option<Snapshot>,
     revision: u64,
     feedback: String,
+    back_to_review: bool,
 }
 
-struct Snapshot {
+pub(super) struct Snapshot {
     text: Arc<str>,
     count: usize,
     ipv6: bool,
@@ -19,6 +20,7 @@ struct Snapshot {
 
 pub enum Action {
     Open(BTreeSet<u64>),
+    OpenSaved { name: String, members: Vec<String> },
     Review(u64, Change),
 }
 
@@ -28,14 +30,40 @@ pub enum Change {
     Back,
 }
 
+enum EndpointSource<'a> {
+    Pane(u64),
+    Profile(&'a str),
+}
+
+impl fmt::Display for EndpointSource<'_> {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pane(pane) => write!(output, "Pane {pane}"),
+            Self::Profile(profile) => write!(output, "SSH profile {profile}"),
+        }
+    }
+}
+
 impl Snapshot {
-    fn capture<'a>(hosts: impl IntoIterator<Item = (u64, &'a SshOptions)>) -> Result<Self> {
+    pub(super) fn profiles<'a>(
+        hosts: impl IntoIterator<Item = (&'a str, &'a SshOptions)>,
+    ) -> Result<Self> {
+        Self::capture(
+            hosts
+                .into_iter()
+                .map(|(name, options)| (EndpointSource::Profile(name), options)),
+        )
+    }
+
+    fn capture<'a>(
+        hosts: impl IntoIterator<Item = (EndpointSource<'a>, &'a SshOptions)>,
+    ) -> Result<Self> {
         let mut text = String::new();
         let mut seen = BTreeSet::new();
         let mut ipv6 = false;
-        for (pane, options) in hosts {
+        for (source, options) in hosts {
             let line = address::display(&options.user, &options.host, options.port);
-            let reason = || format!("Pane {pane} has no portable SSH address.");
+            let reason = || format!("{source} has no portable SSH address.");
             let parsed = SshOptions::from_destination(&line).with_context(reason)?;
             // A hosts file must contain literal addresses even if the consumer uses a shell.
             ensure!(
@@ -55,7 +83,7 @@ impl Snapshot {
         let count = seen.len();
         ensure!(
             count > 0,
-            "Check at least one shown SSH pane to export a host list."
+            "Choose at least one SSH address to export a host list."
         );
         Ok(Self {
             text: Arc::from(text),
@@ -90,6 +118,13 @@ pub(super) fn button(id: TabId, selected: &[Target], ctx: &ViewContext<TerminalA
 impl State {
     pub(super) fn is_open(&self) -> bool {
         self.snapshot.is_some()
+    }
+
+    pub(super) fn open(&mut self, snapshot: Snapshot, back_to_review: bool) {
+        self.revision += 1;
+        self.snapshot = Some(snapshot);
+        self.feedback.clear();
+        self.back_to_review = back_to_review;
     }
 
     pub(super) fn view(
@@ -153,7 +188,11 @@ impl State {
                                     .content("Save host list…"),
                                 Button::new()
                                     .on_click(ctx.callback(move |_| action(Change::Back)))
-                                    .content("Back to SSH group"),
+                                    .content(if self.back_to_review {
+                                        "Back to launch review"
+                                    } else {
+                                        "Back to SSH group"
+                                    }),
                             )),
                     )),
                 )),
@@ -173,12 +212,19 @@ impl TerminalApp {
                 let snapshot = self.capture_host_list(id, &selected);
                 if let Some(page) = self.host_group_mut(id) {
                     match snapshot {
-                        Ok(snapshot) => {
-                            let export = &mut page.host_list_export;
-                            export.revision += 1;
-                            export.snapshot = Some(snapshot);
-                            export.feedback.clear();
-                        }
+                        Ok(snapshot) => page.host_list_export.open(snapshot, false),
+                        Err(error) => page.saved.feedback = format!("{error:#}"),
+                    }
+                }
+            }
+            Action::OpenSaved { name, members } if self.host_group_command_target() == Some(id) => {
+                let snapshot = self.capture_saved_host_list(id, &name, &members);
+                if snapshot.is_err() {
+                    self.refresh_profiles();
+                }
+                if let Some(page) = self.host_group_mut(id) {
+                    match snapshot {
+                        Ok(snapshot) => page.host_list_export.open(snapshot, false),
                         Err(error) => page.saved.feedback = format!("{error:#}"),
                     }
                 }
@@ -236,8 +282,28 @@ impl TerminalApp {
                 return None;
             };
             let pane = live.session.pane_id;
-            selected.contains(&pane).then_some((pane, options))
+            selected
+                .contains(&pane)
+                .then_some((EndpointSource::Pane(pane), options))
         }))
+    }
+
+    fn capture_saved_host_list(
+        &self,
+        id: TabId,
+        name: &str,
+        members: &[String],
+    ) -> Result<Snapshot> {
+        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
+            anyhow::bail!("The SSH group tab has closed.");
+        };
+        ensure!(
+            page.saved.name(&self.catalog) == Some(name),
+            "Select the saved group again before exporting."
+        );
+        let catalog = self.load_expected_host_group(name, members)?;
+        let options = catalog.resolve_ssh_host_group_members(members)?;
+        Snapshot::profiles(members.iter().map(String::as_str).zip(options))
     }
 }
 
@@ -254,11 +320,11 @@ mod tests {
         let other_port = host("ops@web.example:22");
         let v6 = host("u@realm@[fe80::1%12]:2345");
         let snapshot = Snapshot::capture([
-            (1, &first),
-            (2, &duplicate),
-            (3, &other_user),
-            (4, &v6),
-            (5, &other_port),
+            (EndpointSource::Pane(1), &first),
+            (EndpointSource::Pane(2), &duplicate),
+            (EndpointSource::Pane(3), &other_user),
+            (EndpointSource::Pane(4), &v6),
+            (EndpointSource::Pane(5), &other_port),
         ])
         .unwrap();
         assert_eq!(snapshot.count, 4);
@@ -276,10 +342,24 @@ mod tests {
         for user in ["-flag", "ops\nother", "ops;other", "ops:secret", "ops*"] {
             invalid.user = user.into();
             assert!(
-                Snapshot::capture([(1, &ordinary), (2, &invalid)]).is_err(),
+                Snapshot::capture([
+                    (EndpointSource::Pane(1), &ordinary),
+                    (EndpointSource::Pane(2), &invalid)
+                ])
+                .is_err(),
                 "{user:?}"
             );
         }
         assert!(Snapshot::capture([]).is_err());
+    }
+
+    #[test]
+    fn a_saved_address_error_names_the_profile() {
+        let mut unsafe_profile = SshOptions::from_destination("ops@web:22").unwrap();
+        unsafe_profile.user = "ops;other".into();
+        let error = Snapshot::profiles([("Web", &unsafe_profile)])
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("SSH profile Web has no portable SSH address."));
     }
 }
