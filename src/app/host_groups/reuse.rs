@@ -166,11 +166,7 @@ impl Review {
             })
     }
 
-    fn validate(
-        &self,
-        catalog: &Profiles,
-        connection: impl Fn(Connection, &str, &SshOptions) -> bool,
-    ) -> Result<()> {
+    fn validate_profiles(&self, catalog: &Profiles) -> Result<()> {
         ensure!(
             self.members.iter().any(|member| member.included),
             "Include at least one SSH host."
@@ -182,22 +178,28 @@ impl Review {
                     .get(&self.name)
                     .and_then(|sets| sets.get(name))
                     == self.sets.get(name),
-                "Recipient set {name} changed. Refresh the review before opening this group."
+                "Recipient set {name} changed. Refresh the review before continuing."
             );
         }
         for member in self.members.iter().filter(|member| member.included) {
-            let expected = member
-                .options
-                .as_ref()
-                .filter(|expected| {
-                    catalog.ssh_host_group_member(&member.profile) == Some(*expected)
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "SSH profiles changed. Refresh the review before opening this group."
-                    )
-                })?;
-            if let Some(approved) = member.choice {
+            ensure!(
+                member.options.as_ref().is_some_and(|expected| {
+                    catalog.ssh_host_group_member(&member.profile) == Some(expected)
+                }),
+                "SSH profiles changed. Refresh the review before continuing."
+            );
+        }
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+        catalog: &Profiles,
+        connection: impl Fn(Connection, &str, &SshOptions) -> bool,
+    ) -> Result<()> {
+        self.validate_profiles(catalog)?;
+        for member in self.members.iter().filter(|member| member.included) {
+            if let (Some(approved), Some(expected)) = (member.choice, &member.options) {
                 ensure!(
                     connection(approved, &member.profile, expected),
                     "The reviewed SSH connection for {} changed. Refresh the review or choose a new pane.",
@@ -232,6 +234,7 @@ pub enum Change {
     IncludeMatches(Vec<usize>, MatchSelection),
     RecipientSet(String),
     Approve(Vec<Launch>, Option<String>),
+    Export(Vec<Launch>, Option<String>),
     Refresh,
     Back,
 }
@@ -327,6 +330,8 @@ impl State {
             .count();
         let skipped = offered.len() - reuse - new;
         let selected_set = review.selected_set.clone();
+        let export_offer = offered.clone();
+        let export_set = selected_set.clone();
         let set_names: Vec<_> = review
             .sets
             .iter()
@@ -466,6 +471,15 @@ impl State {
                                         ))
                                     }))
                                     .content("Open reviewed group"),
+                                Button::new()
+                                    .is_enabled(reuse + new > 0)
+                                    .on_click(ctx.callback(move |_| {
+                                        action(Change::Export(
+                                            export_offer.clone(),
+                                            export_set.clone(),
+                                        ))
+                                    }))
+                                    .content("Export included hosts…"),
                                 Button::new()
                                     .on_click(ctx.callback(move |_| action(Change::Refresh)))
                                     .content("Refresh review"),
@@ -621,6 +635,9 @@ impl TerminalApp {
         let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|tab| &tab.page) else {
             return;
         };
+        if page.host_list_export.is_open() {
+            return;
+        }
         let state = &page.saved.reuse;
         let Some(review) = state
             .review
@@ -720,8 +737,35 @@ impl TerminalApp {
                     review.feedback = format!("{error:#}");
                 }
             }
+            Change::Export(offered, set)
+                if review.choices() == offered && review.selected_set == set =>
+            {
+                let snapshot = self.capture_review_host_list(review);
+                if let Some(page) = self.host_group_mut(id) {
+                    match snapshot {
+                        Ok(snapshot) => page.host_list_export.open(snapshot, true),
+                        Err(error) => {
+                            if let Some(review) = page.saved.reuse.review.as_mut() {
+                                review.feedback = format!("{error:#}");
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    fn capture_review_host_list(&self, review: &Review) -> Result<host_list_export::Snapshot> {
+        let catalog = self.load_expected_host_group(&review.name, &review.profiles())?;
+        review.validate_profiles(&catalog)?;
+        host_list_export::Snapshot::profiles(
+            review
+                .members
+                .iter()
+                .filter(|member| member.included)
+                .filter_map(|member| Some((member.profile.as_str(), member.options.as_ref()?))),
+        )
     }
 
     fn saved_group_reuse_review(

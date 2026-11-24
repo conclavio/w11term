@@ -151,7 +151,7 @@ impl SavedUi {
         self.roster_update.origin()
     }
 
-    fn name<'a>(&'a self, catalog: &'a Profiles) -> Option<&'a str> {
+    pub(super) fn name<'a>(&'a self, catalog: &'a Profiles) -> Option<&'a str> {
         self.selected
             .as_deref()
             .filter(|name| catalog.ssh_host_groups.contains_key(*name))
@@ -567,9 +567,29 @@ impl TerminalApp {
         let selected = saved.name(&self.catalog);
         let selection = selected.and_then(|name| names.iter().position(|item| item == name));
         let members = selected.and_then(|name| self.catalog.ssh_host_groups.get(name));
-        let reuse = selected
-            .zip(members)
-            .map(|(name, members)| reuse::button(id, name, members, ctx));
+        let review_actions = selected.zip(members).map(|(name, members)| {
+            let launch = reuse::button(id, name, members, ctx);
+            let name = name.to_owned();
+            let members = members.clone();
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    launch,
+                    Button::new()
+                        .is_enabled(!members.is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            Message::HostGroup(HostAction::HostListExport(
+                                id,
+                                host_list_export::Action::OpenSaved {
+                                    name: name.clone(),
+                                    members: members.clone(),
+                                },
+                            ))
+                        }))
+                        .content("Export saved group hosts…"),
+                ))
+        });
         let action = move |action| Message::HostGroup(HostAction::Saved(id, action));
         let mut items = Vec::new();
         if let Some((name, members)) = selected.zip(members) {
@@ -648,8 +668,8 @@ impl TerminalApp {
                     .text_trimming(TextTrimming::CharacterEllipsis),
             ));
         }
-        if let Some(reuse) = reuse {
-            details.push(KeyedView::new("review-reuse", reuse));
+        if let Some(review_actions) = review_actions {
+            details.push(KeyedView::new("review-group-actions", review_actions));
         }
         if !saved.feedback.is_empty() {
             details.push(KeyedView::new(

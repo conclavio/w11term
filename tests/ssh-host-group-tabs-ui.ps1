@@ -3,8 +3,11 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = Join-Path $State 'exports'
+$null = [IO.Directory]::CreateDirectory($env:W11TERM_EXPORT_SMOKE_DIR)
 [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"command_palette":"F7","close_tab":"F6","find_tab":"F10"}}')
 $profiles = Join-Path $State 'profiles.json'
 $config = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
@@ -202,6 +205,18 @@ try {
             (Find-Element 'No SSH profiles match this search.') -and
             (Find-Element "0 to reuse${dot}1 to open${dot}29 skipped")
     }
+    $hostFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-hosts.txt'
+    $hostList = "test@127.0.0.1:$($config.East.port)`n"
+    Click ('Export included hosts' + [char]0x2026)
+    $null = Wait-Until 'launch host list preview' { Find-Element 'SSH host list preview' }
+    Click ('Save host list' + [char]0x2026)
+    $dialog = Wait-Until 'launch host list save dialog' { Find-OwnedDialog 'Save SSH host list' }
+    $null = Wait-Until 'save all included hosts even under an empty filter' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'only the selected hidden East address was saved' {
+        [IO.File]::Exists($hostFile) -and [IO.File]::ReadAllText($hostFile, [Text.UTF8Encoding]::new($false, $true)) -ceq $hostList
+    }
+    Click 'Back to launch review'
+    Expect-Field 'Find launch profiles' 'no matching fixture address'
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Opening the group review started an SSH session' }
     Click 'Cancel'
     Wait-Focus $origin
@@ -371,13 +386,13 @@ try {
     [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
     Click 'Open reviewed group'
     $null = Wait-Until 'changed settings require another review' {
-        Find-Element 'SSH profiles changed. Refresh the review before opening this group.'
+        Find-Element 'SSH profiles changed. Refresh the review before continuing.'
     }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'A stale review opened a session' }
     [IO.File]::WriteAllBytes($profiles, $original)
     Click 'Refresh review'
     $null = Wait-Until 'refresh clears the stale review message' {
-        !(Find-Element 'SSH profiles changed. Refresh the review before opening this group.')
+        !(Find-Element 'SSH profiles changed. Refresh the review before continuing.')
     }
     Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
     $generation = (Session 'East').connection_generation
@@ -541,13 +556,13 @@ try {
     [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
     Click 'Open reviewed group'
     $null = Wait-Until 'stale launch preset requires another review' {
-        Find-Element 'Recipient set Canaries changed. Refresh the review before opening this group.'
+        Find-Element 'Recipient set Canaries changed. Refresh the review before continuing.'
     }
     if (@((Control @('list')).sessions).Count -ne 4) { throw 'A stale recipient set opened a new SSH pane' }
     [IO.File]::WriteAllBytes($profiles, $beforePresetLaunch)
     Click 'Refresh review'
     $null = Wait-Until 'refreshed preset is ready' {
-        !(Find-Element 'Recipient set Canaries changed. Refresh the review before opening this group.')
+        !(Find-Element 'Recipient set Canaries changed. Refresh the review before continuing.')
     }
     Expect-Choice 'Launch recipient set' 'Canaries'
     Click 'Open reviewed group'

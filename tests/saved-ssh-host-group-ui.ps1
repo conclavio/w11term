@@ -3,8 +3,11 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = Join-Path $State 'exports'
+$null = [IO.Directory]::CreateDirectory($env:W11TERM_EXPORT_SMOKE_DIR)
 $profiles = Join-Path $State 'profiles.json'
 $dot = ' ' + [char]0xb7 + ' '
 $button = [System.Windows.Automation.ControlType]::Button
@@ -131,6 +134,24 @@ try {
     if (((Catalog).ssh_host_groups.Fleet -join ',') -cne 'West,East') { throw 'Both members were not saved in the reviewed order' }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Saving opened terminal sessions' }
     $original = [IO.File]::ReadAllBytes($profiles)
+    $catalog = Catalog
+    $hostList = "test@127.0.0.1:$($catalog.profiles.West.port)`ntest@127.0.0.1:$($catalog.profiles.East.port)`n"
+    $hostFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-hosts.txt'
+    Click ('Export saved group hosts' + [char]0x2026)
+    $null = Wait-Until 'saved host list preview' { Find-Element 'SSH host list preview' }
+    Click ('Save host list' + [char]0x2026)
+    $dialog = Wait-Until 'saved-group host list save dialog' { Find-OwnedDialog 'Save SSH host list' }
+    $changed = Catalog
+    $changed.profiles.West.port = 1
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    $null = Wait-Until 'save the reviewed addresses' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'export keeps the reviewed saved order through a catalog edit' {
+        [IO.File]::Exists($hostFile) -and [IO.File]::ReadAllText($hostFile, [Text.UTF8Encoding]::new($false, $true)) -ceq $hostList
+    }
+    [IO.File]::WriteAllBytes($profiles, $original)
+    Click 'Back to SSH group'
+    $null = Wait-Until 'the saved group toolbar is visible again' { Find-Element 'West, East' }
+    if (@((Control @('list')).sessions).Count -ne 1) { throw 'Exporting the saved group opened SSH sessions' }
     $changed = Catalog
     $changed.profiles.PSObject.Properties.Remove('West')
     [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
