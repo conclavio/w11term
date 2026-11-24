@@ -18,13 +18,41 @@ struct Section {
     output: Option<Output>,
 }
 
-struct Output {
+pub(super) struct Output {
     result: Arc<GroupCommandResult>,
     retained: Option<Arc<CompletedCommand>>,
 }
 
 impl Output {
-    fn text(&self) -> &str {
+    pub(super) fn capture(
+        result: Arc<GroupCommandResult>,
+        retained: impl FnOnce(CommandLink) -> Option<Arc<CompletedCommand>>,
+    ) -> Option<Self> {
+        let GroupOutput::Captured { truncated, .. } = &result.output else {
+            return None;
+        };
+        let full = truncated
+            .then(|| retained(result.link))
+            .flatten()
+            .filter(|command| command.output.is_ok());
+        Some(Self {
+            result,
+            retained: full,
+        })
+    }
+
+    pub(super) fn complete(&self) -> Option<&str> {
+        let preview = matches!(
+            &self.result.output,
+            GroupOutput::Captured {
+                truncated: true,
+                ..
+            }
+        );
+        (!preview || self.retained.is_some()).then(|| self.text())
+    }
+
+    pub(super) fn text(&self) -> &str {
         if let Some(retained) = &self.retained
             && let Ok(text) = &retained.output
         {
@@ -60,20 +88,17 @@ impl Report {
                         GroupOutput::Captured { text, .. } if text.is_empty() => {
                             heading.push_str("  No output captured\r\n");
                         }
-                        GroupOutput::Captured { truncated, .. } => {
-                            let full = truncated
-                                .then(|| retained(delivery.target.pane, result.link))
-                                .flatten()
-                                .filter(|command| command.output.is_ok());
-                            heading.push_str(if *truncated && full.is_none() {
-                                OUTPUT_PREVIEW
-                            } else {
-                                "  Output\r\n"
+                        GroupOutput::Captured { .. } => {
+                            output = Output::capture(result, |link| {
+                                retained(delivery.target.pane, link)
                             });
-                            output = Some(Output {
-                                result,
-                                retained: full,
-                            });
+                            if let Some(captured) = &output {
+                                heading.push_str(if captured.complete().is_some() {
+                                    "  Output\r\n"
+                                } else {
+                                    OUTPUT_PREVIEW
+                                });
+                            }
                         }
                         GroupOutput::Unavailable(reason) => {
                             let _ = writeln!(heading, "  Output unavailable · {reason}\r");

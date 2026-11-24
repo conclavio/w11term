@@ -304,7 +304,29 @@ try {
     Click 'Previous submission'
     $null = Wait-Until 'earlier submission' { Find-Element "Submitted${dot}both" }
     Outcome $westName 'Running'
+    $compareButton = 'Compare results' + [char]0x2026
+    Click $compareButton
+    $null = Wait-Until 'the comparison separates the still-running host' {
+        (Find-Element 'SSH group result comparison') -and
+        (Find-Element "1 distinct result${dot}1 host compared${dot}1 pending or unavailable") -and
+        (Find-Element "$westName${dot}Running")
+    }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-result'), '')
+    $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west-accepted both')
+    if (!(Find-Element "$westName${dot}Running")) { throw 'The comparison changed before refresh' }
+    Click 'Refresh comparison'
+    $null = Wait-Until 'refresh exposes the two distinct finished results' {
+        (Find-Element "2 distinct results${dot}2 hosts compared${dot}0 pending or unavailable") -and
+        (Find-Element "First different line from largest group${dot}1") -and
+        (Find-Element "View comparison output for pane $west" $button)
+    }
+    Click "View comparison output for pane $west"
+    $null = Wait-Until 'comparison links to the exact West command history entry' {
+        Find-Element "Selected, both${dot}exit 17" $button
+    }
+    Run-Palette 'SSH host group'
+    $null = Wait-Until 'returning to the group restores the comparison view' { Find-Element 'SSH group result comparison' }
+    Click 'Back to results'
     Outcome $westName 'Exit 17'
     Click $liveButton
     $null = Wait-Until 'completed West output in the earlier live feed' {
@@ -548,6 +570,17 @@ try {
     Click 'Send to 1 host'
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west-accepted snapshot  status')
     Outcome $westName 'Exit 17'
+    Pane-Status $west "Connected${dot}Ready"
+    Click 'Select shown'
+    Submit 'shared-status' 'Send to 2 hosts'
+    Outcome $eastName 'Exit 0'
+    Outcome $westName 'Exit 0'
+    Click $compareButton
+    $null = Wait-Until 'identical complete results from both hosts share one group' {
+        (Find-Element "1 distinct result${dot}2 hosts compared${dot}0 pending or unavailable") -and
+        (Find-Element 'fleet-status-ok') -and (Find-Element "Focus compared pane $east" $button) -and
+        (Find-Element "Focus compared pane $west" $button)
+    }
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
