@@ -1,6 +1,10 @@
 use super::{Action as HostAction, *};
 use anyhow::{Result, ensure};
 
+mod roster_update;
+pub use roster_update::Action as RosterUpdateAction;
+pub(super) use roster_update::update_button;
+
 #[derive(Default)]
 pub(super) struct SavedUi {
     selected: Option<String>,
@@ -8,6 +12,7 @@ pub(super) struct SavedUi {
     next_editor: u64,
     pub(super) feedback: String,
     pub(super) reuse: reuse::State,
+    roster_update: roster_update::State,
 }
 
 struct Editor {
@@ -23,6 +28,7 @@ struct Editor {
 struct Selection {
     members: Vec<String>,
     without_profile: usize,
+    matched_panes: usize,
 }
 
 impl Selection {
@@ -37,6 +43,7 @@ impl Selection {
             .iter()
             .filter(|target| selected.contains(&target.pane))
         {
+            selection.matched_panes += 1;
             match target.profile.as_deref().filter(|name| available(name)) {
                 Some(name) if seen.insert(name) => selection.members.push(name.into()),
                 Some(_) => {}
@@ -49,7 +56,11 @@ impl Selection {
 
 impl SavedUi {
     pub(super) fn is_editing(&self) -> bool {
-        self.editor.is_some()
+        self.editor.is_some() || self.roster_update.is_open()
+    }
+
+    pub(super) fn can_update_roster(&self) -> bool {
+        self.roster_update.has_origin()
     }
 
     fn name<'a>(&'a self, catalog: &'a Profiles) -> Option<&'a str> {
@@ -92,6 +103,7 @@ pub enum Action {
         new_tab: bool,
     },
     Draft(u64, DraftAction),
+    UpdateRoster(RosterUpdateAction),
 }
 
 pub enum DraftAction {
@@ -110,6 +122,11 @@ impl TerminalApp {
         action: Action,
         ctx: &ComponentContext<Self>,
     ) {
+        if matches!(action, Action::New | Action::Edit(_))
+            && self.host_group_command_target() != Some(id)
+        {
+            return;
+        }
         match action {
             Action::Select(name) => {
                 if self.catalog.ssh_host_groups.contains_key(&name)
@@ -158,6 +175,7 @@ impl TerminalApp {
                 }
             }
             Action::Draft(editor, action) => self.edit_saved_host_group(id, editor, action),
+            Action::UpdateRoster(action) => self.handle_roster_update(id, action),
         }
     }
 
@@ -295,8 +313,17 @@ impl TerminalApp {
         Ok((catalog, members))
     }
 
-    pub(super) fn remember_group_launch(&mut self, id: TabId, name: &str, feedback: String) {
+    pub(super) fn remember_group_launch(
+        &mut self,
+        id: TabId,
+        name: &str,
+        members: &[String],
+        feedback: String,
+    ) {
         if let Some(page) = self.host_group_mut(id) {
+            if page.roster.is_some() {
+                page.saved.roster_update.remember(name, members);
+            }
             page.saved.selected = Some(name.into());
             page.saved.feedback = feedback;
         }
@@ -366,6 +393,7 @@ impl TerminalApp {
         self.remember_group_launch(
             id,
             name,
+            expected,
             format!("Opened {} SSH panes for {name}", expected.len()),
         );
         Ok(())
@@ -506,6 +534,9 @@ impl TerminalApp {
         saved: &SavedUi,
         ctx: &ViewContext<Self>,
     ) -> Option<View> {
+        if let Some(review) = saved.roster_update.view(id, ctx) {
+            return Some(review);
+        }
         let draft = saved.editor.as_ref()?;
         let editor = draft.id;
         let action =

@@ -389,7 +389,8 @@ impl TerminalApp {
             return Ok(());
         };
         let name = review.name.clone();
-        let (catalog, current) = self.resolve_saved_host_group(&name, &review.profiles())?;
+        let profiles = review.profiles();
+        let (catalog, current) = self.resolve_saved_host_group(&name, &profiles)?;
         review.validate(&current, |approved, profile, expected| {
             self.group_reuse_connection(approved.pane, profile, expected) == Some(approved)
         })?;
@@ -413,7 +414,7 @@ impl TerminalApp {
         }
         let id = self.new_host_group_tab(Some(&name));
         self.start_host_group_panes(id, reused, fresh, ctx);
-        self.remember_group_launch(id, &name, feedback);
+        self.remember_group_launch(id, &name, &profiles, feedback);
         Ok(())
     }
 }

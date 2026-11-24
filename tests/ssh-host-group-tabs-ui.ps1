@@ -276,6 +276,77 @@ try {
     }
     Select-Tab $westTab
     $null = Wait-Until 'the source group retains its earlier result' { Find-Element "Submitted${dot}west-probe" }
+
+    Select-Tab $eastTab
+    Choose-SavedGroup 'Fleet Mixed'
+    Click $manage
+    (Wait-CheckBox "Include $westName" Off).Toggle()
+    $null = Wait-CheckBox "Include $westName" On
+    Click 'Apply membership'
+    $null = Wait-CheckBox $westName Off
+    (Field 'Group command').SetValue('retained roster draft')
+    (Field 'Host filter').SetValue('east')
+    Expect-Field 'Host filter' 'east'
+    $update = 'Update saved group' + [char]0x2026
+    $original = [IO.File]::ReadAllBytes($profiles)
+    Click $update
+    $null = Wait-Until 'the roster review targets its source group and includes unchecked, hidden West' {
+        (Find-Element "Update saved SSH group${dot}Fleet East") -and (Find-Element 'Add profile West')
+    }
+    Click 'Cancel'
+    $null = Wait-Until 'cancelling the roster review returns to the tab' { Find-Element $update $button }
+    if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($profiles)) -cne
+            [Convert]::ToBase64String($original)) { throw 'Cancelling the roster review edited the catalog' }
+
+    Click $update
+    $null = Wait-Until 'West is available at the start of the review' { Find-Element 'Add profile West' }
+    $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $changed.profiles.PSObject.Properties.Remove('West')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Save roster changes'
+    $null = Wait-Until 'the save refreshes the preview when a roster profile disappears' {
+        (Find-Element 'Live panes changed. Review the new membership before saving.') -and
+            (Find-Element 'Panes without an available saved SSH profile: 1') -and
+            !(Find-Element 'Add profile West')
+    }
+    [IO.File]::WriteAllBytes($profiles, $original)
+    Click 'Cancel'
+    $null = Wait-Until 'the updated preview closes' { Find-Element $update $button }
+
+    Click $update
+    $null = Wait-Until 'the roster review proposes West' { Find-Element 'Add profile West' }
+    $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $changed.ssh_host_groups.'Fleet East' = @('East', 'North')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Save roster changes'
+    $null = Wait-Until 'an external roster edit rejects the reviewed save' {
+        Find-Element 'The SSH group changed on disk. Reopen it before saving.'
+    }
+    $groups = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_host_groups
+    if (($groups.'Fleet East' -join ',') -cne 'East,North') { throw 'A stale review replaced the saved group' }
+    [IO.File]::WriteAllBytes($profiles, $original)
+    Click 'Save roster changes'
+    $null = Wait-Until 'the confirmed roster is saved' { Find-Element 'Saved live membership for Fleet East' }
+    $groups = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_host_groups
+    if (($groups.'Fleet East' -join ',') -cne 'East,West' -or
+            ($groups.'Fleet Mixed' -join ',') -cne 'East,North' -or
+            ($groups.'Fleet West' -join ',') -cne 'West') { throw 'The wrong saved group was updated' }
+    Expect-Field 'Group command' 'retained roster draft'
+    Expect-Field 'Host filter' 'east'
+    $null = Wait-Until 'the last command remains in the group' { Find-Element "Submitted${dot}shared-probe" }
+    (Field 'Host filter').SetValue('')
+    $null = Wait-CheckBox $westName Off
+    Click $manage
+    (Wait-CheckBox "Include $westName" On).Toggle()
+    $null = Wait-CheckBox "Include $westName" Off
+    Click 'Apply membership'
+    Click $update
+    $null = Wait-Until 'a second review uses the just-saved roster' { Find-Element 'Remove profile West' }
+    Click 'Save roster changes'
+    $null = Wait-Until 'the second update is saved' { Find-Element 'Saved live membership for Fleet East' }
+    $groups = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_host_groups
+    if (($groups.'Fleet East' -join ',') -cne 'East') { throw 'The second roster change did not persist' }
+    if (@((Control @('list')).sessions).Count -ne 4) { throw 'Updating a saved roster changed the SSH sessions' }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {
