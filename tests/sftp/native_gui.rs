@@ -1218,7 +1218,7 @@ async fn native_ssh_host_list_import_checks_profiles_and_opens_only_reviewed_hos
     )
     .unwrap();
     drive_gui("ssh-host-list-import-ui.ps1", state.path());
-    assert_eq!(east_opens.load(Ordering::Relaxed), 0);
+    assert_eq!(east_opens.load(Ordering::Relaxed), 1);
     assert_eq!(west_opens.load(Ordering::Relaxed), 1);
     assert_eq!(direct_opens.load(Ordering::Relaxed), 1);
     for server in [east_server, west_server, direct_server] {

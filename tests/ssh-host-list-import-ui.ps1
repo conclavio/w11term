@@ -86,6 +86,16 @@ function Expect-HostList([string]$Expected) {
         $text.Replace("`r`n", "`n").Replace("`r", "`n") -ceq $Expected
     }
 }
+function Expect-Connection([string]$HostLabel, [string]$Choice) {
+    $null = Wait-Until "'$HostLabel' chooses '$Choice'" {
+        $picker = Find-Element "Connection for $HostLabel" $combo
+        if ($picker) {
+            $selected = $picker.GetCurrentPattern(
+                [System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            $selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Choice
+        }
+    }
+}
 
 $launch = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -155,6 +165,53 @@ try {
     Click "Focus pane $directPane"
     Click 'Accept and save'
     $null = Control @('wait-for-text','--pane',"$directPane",'--timeout','15','ready')
+    $originalDirect = (Control @('list')).sessions | Where-Object id -eq $directPane
+
+    Run-Palette 'SSH host group'
+    Click $label
+    (Text-Field 'SSH host list').SetValue((@('West', $direct, 'East') -join [Environment]::NewLine))
+    Keyless
+    Click 'Preview hosts'
+    $null = Wait-Until 'import leaves matching connections alone by default' {
+        Find-Element "0 to reuse${dot}3 to open"
+    }
+    Expect-Connection $westChoice 'Open a new SSH pane'
+    Expect-Connection $directChoice 'Open a new SSH pane'
+    Click 'Reuse unique matches'
+    Expect-Connection $westChoice "Reuse${dot}West${dot}$west${dot}Pane $savedPane"
+    Expect-Connection $directChoice "Reuse${dot}$direct${dot}$direct${dot}Pane $directPane"
+    $null = Wait-Until 'mixed import review counts both existing panes' { Find-Element "2 to reuse${dot}1 to open" }
+    $tabType = [System.Windows.Automation.ControlType]::TabItem
+    $westTab = Wait-Until 'existing West SSH tab' { Find-Element 'West' $tabType }
+    $westTab.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'existing West SSH session is active' {
+        ((Control @('list')).sessions | Where-Object id -eq $savedPane).active
+    }
+    Run-Palette 'Enable read-only pane input'
+    $null = Wait-Until 'the reviewed West pane becomes read-only' {
+        ((Control @('list')).sessions | Where-Object id -eq $savedPane).read_only
+    }
+    Run-Palette 'SSH host group'
+    Click 'Use 3 checked hosts'
+    $null = Wait-Until 'a stale reused pane aborts the whole import' {
+        Find-Element "The reviewed SSH connection for $westChoice changed. Choose a new pane or preview the host list again."
+    }
+    if (@((Control @('list')).sessions).Count -ne 3) { throw 'Stale reuse opened a fresh connection' }
+    (Wait-CheckBox $westChoice On).Toggle()
+    $null = Wait-CheckBox $westChoice Off
+    Click 'Use 2 checked hosts'
+    $null = Wait-Until 'mixed launch is reported' { Find-Element "Reused 1${dot}Opened 1 from the host list" }
+    $sessions = @((Control @('list')).sessions)
+    $directAgain = $sessions | Where-Object id -eq $directPane
+    $eastPane = ($sessions | Where-Object label -ceq 'East').id
+    if ($sessions.Count -ne 4 -or !$eastPane -or !$directAgain -or
+            $directAgain.connection_generation -ne $originalDirect.connection_generation) {
+        throw 'The mixed import did not preserve the approved session and open exactly one fresh pane'
+    }
+    $null = Wait-CheckBox "East${dot}$east${dot}Pane $eastPane" On
+    $null = Wait-CheckBox "$direct${dot}$direct${dot}Pane $directPane" On
+    $null = Wait-CheckBox "West${dot}$west${dot}Pane $savedPane" Off
+    $null = Control @('wait-for-text','--pane',"$eastPane",'--timeout','15','ready')
     if ([IO.File]::ReadAllText($profiles) -cne $before) { throw 'Import changed the saved SSH profiles' }
 } catch {
     $failure = $_

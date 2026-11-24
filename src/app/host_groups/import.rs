@@ -5,6 +5,8 @@ use std::{cell::OnceCell, path::Path};
 mod file;
 mod list;
 mod ranges;
+mod review;
+use review::{Approval, Review};
 
 const LABEL: &str = "Import host list…";
 
@@ -28,11 +30,6 @@ struct Draft {
     error: Option<String>,
 }
 
-struct Review {
-    rows: Vec<list::Row>,
-    checked: BTreeSet<usize>,
-}
-
 pub enum Action {
     Begin,
     Form(u64, Change),
@@ -48,9 +45,11 @@ pub enum Change {
     Identity(String),
     Preview,
     Check(usize, bool),
+    Connection(usize, Option<reuse::Connection>),
+    ReuseUnique,
     Edit,
     Cancel,
-    Open(BTreeSet<usize>),
+    Open(Approval),
 }
 
 impl Draft {
@@ -122,62 +121,7 @@ impl State {
             .on_click(ctx.callback(move |_| action(Change::Cancel)))
             .content("Cancel import");
         if let Some(review) = &draft.review {
-            let rows = review.rows.iter().enumerate().map(|(index, row)| {
-                let view = match &row.target {
-                    Ok(target) => {
-                        let label = target.label();
-                        CheckBox::new()
-                            .automation_name(&label)
-                            .is_checked(review.checked.contains(&index))
-                            .on_is_checked_changed(
-                                ctx.callback(move |checked| action(Change::Check(index, checked))),
-                            )
-                            .content(label)
-                    }
-                    Err(error) => TextBlock::new()
-                        .text(format!("Line {} · {error}", row.line))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .into(),
-                };
-                KeyedView::new(index.to_string(), view)
-            });
-            let checked = review.checked.clone();
-            let label = match checked.len() {
-                1 => "Open 1 checked host".to_owned(),
-                count => format!("Open {count} checked hosts"),
-            };
-            return Some(
-                Grid::new()
-                    .margin(16.0)
-                    .row_spacing(8.0)
-                    .rows([GridLength::Auto, GridLength::STAR])
-                    .children((
-                        StackPanel::new().spacing(6.0).children((
-                            TextBlock::new().font_size(24.0).text("Review SSH hosts"),
-                            TextBlock::new().text("Each checked host opens in a new SSH tab."),
-                            StackPanel::new()
-                                .orientation(Orientation::Horizontal)
-                                .spacing(8.0)
-                                .children((
-                                    Button::new()
-                                        .style(ButtonStyle::Accent)
-                                        .is_enabled(!checked.is_empty())
-                                        .on_click(ctx.callback(move |_| {
-                                            action(Change::Open(checked.clone()))
-                                        }))
-                                        .content(label),
-                                    Button::new()
-                                        .on_click(ctx.callback(move |_| action(Change::Edit)))
-                                        .content("Edit host list"),
-                                    cancel,
-                                )),
-                            error_text(draft),
-                        )),
-                        ScrollViewer::new()
-                            .grid_row(1)
-                            .content(StackPanel::new().spacing(4.0).keyed_children(rows)),
-                    )),
-            );
+            return Some(review.view(action, cancel, error_text(draft), ctx));
         }
         let key = if draft.authentication == PRIVATE_KEY_AUTH {
             TextBox::new()
@@ -281,13 +225,17 @@ impl TerminalApp {
         if self.tabs.active_id() != Some(id) {
             return;
         }
+        match change {
+            Change::Preview => return self.preview_host_import(id, revision),
+            Change::Open(approval) => return self.open_host_import(id, revision, approval, ctx),
+            _ => {}
+        }
         let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
             return;
         };
         if page.import.revision != revision {
             return;
         }
-        let catalog_store = &self.store;
         let state = &mut page.import;
         let Some(draft) = &mut state.draft else {
             return;
@@ -362,24 +310,6 @@ impl TerminalApp {
                 draft.identity = identity;
                 draft.error = None;
             }
-            Change::Preview if draft.review.is_none() && !draft.loading_file => {
-                let rows = catalog_store
-                    .catalog()
-                    .and_then(|catalog| draft.rows(&catalog, catalog_store.path()));
-                match rows {
-                    Ok(rows) => {
-                        let checked = rows
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(index, row)| row.target.is_ok().then_some(index))
-                            .collect();
-                        draft.review = Some(Review { rows, checked });
-                        draft.error = None;
-                        state.revision += 1;
-                    }
-                    Err(error) => draft.error = Some(format!("{error:#}")),
-                }
-            }
             Change::Check(index, checked) => {
                 if let Some(review) = &mut draft.review
                     && review.rows.get(index).is_some_and(|row| row.target.is_ok())
@@ -392,59 +322,21 @@ impl TerminalApp {
                     draft.error = None;
                 }
             }
+            Change::Connection(index, connection) => {
+                if let Some(review) = &mut draft.review {
+                    review.choose(index, connection);
+                    draft.error = None;
+                }
+            }
+            Change::ReuseUnique => {
+                if let Some(review) = &mut draft.review {
+                    review.reuse_unique();
+                    draft.error = None;
+                }
+            }
             Change::Edit if draft.review.is_some() => {
                 draft.return_to_editor(None);
                 state.revision += 1;
-            }
-            Change::Open(checked) if !checked.is_empty() => {
-                let Some(review) = draft
-                    .review
-                    .as_ref()
-                    .filter(|review| review.checked == checked)
-                else {
-                    return;
-                };
-                let catalog = match catalog_store.catalog() {
-                    Ok(catalog) => catalog,
-                    Err(error) => {
-                        draft.error = Some(format!("{error:#}"));
-                        return;
-                    }
-                };
-                let launch = draft.rows(&catalog, catalog_store.path()).and_then(|rows| {
-                    ensure!(
-                        rows == review.rows,
-                        "SSH profiles changed. Preview the host list again."
-                    );
-                    Ok(rows
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(index, _)| checked.contains(index))
-                        .filter_map(|(_, row)| {
-                            row.target.ok().map(|target| (target.profile, target.ssh))
-                        })
-                        .collect::<Vec<_>>())
-                });
-                match launch {
-                    Ok(launch) => {
-                        let count = launch.len();
-                        state.draft = None;
-                        state.revision += 1;
-                        self.use_group_catalog(catalog);
-                        self.start_host_group_panes(id, BTreeSet::new(), launch, ctx);
-                        if let Some(page) = self.host_group_mut(id) {
-                            page.import.feedback = if count == 1 {
-                                "Opened 1 SSH pane from the host list".into()
-                            } else {
-                                format!("Opened {count} SSH panes from the host list")
-                            };
-                        }
-                    }
-                    Err(error) => {
-                        draft.return_to_editor(Some(format!("{error:#}")));
-                        state.revision += 1;
-                    }
-                }
             }
             _ => {}
         }
