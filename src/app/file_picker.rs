@@ -21,6 +21,7 @@ pub(super) enum Purpose {
     UploadFiles,
     UploadFolder,
     SshConfig(PathBuf),
+    OpenSshHostList,
     SshIdentity(Option<PathBuf>),
     Folder,
     DownloadFolder,
@@ -167,6 +168,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 | Purpose::UploadFolder
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
+                | Purpose::OpenSshHostList
                 | Purpose::SshIdentity(_)
                 | Purpose::Folder
                 | Purpose::DownloadFolder
@@ -233,6 +235,13 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);
                 }
+                None
+            }
+            Purpose::OpenSshHostList => {
+                dialog.SetTitle(w!("Open SSH host list"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                #[cfg(feature = "ui-smoke")]
+                fixture_picker_folder(&dialog, "W11TERM_HOST_LIST_SMOKE_DIR")?;
                 None
             }
             Purpose::SshIdentity(current) => {

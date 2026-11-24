@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, path::Path};
 use w11term::options::{Authentication, Profiles, SshOptions};
 
-const MAX_BYTES: usize = 32 * 1024;
+pub(super) const MAX_BYTES: usize = 32 * 1024;
 const MAX_TARGETS: usize = 64;
 
 #[derive(Debug, PartialEq)]
@@ -39,10 +39,7 @@ pub(super) fn build(
     catalog_path: &Path,
     authentication: Result<Authentication, String>,
 ) -> Result<Vec<Row>> {
-    ensure!(
-        input.len() <= MAX_BYTES,
-        "The host list is limited to 32 KiB."
-    );
+    check_size(input.len())?;
     let mut profiles = BTreeMap::<(String, u16), Vec<&str>>::new();
     for (name, ssh) in &catalog.profiles {
         let endpoint = Endpoint::from(ssh);
@@ -114,6 +111,11 @@ pub(super) fn build(
         "Enter at least one SSH profile or address."
     );
     Ok(rows)
+}
+
+pub(super) fn check_size(bytes: usize) -> Result<()> {
+    ensure!(bytes <= MAX_BYTES, "The host list is limited to 32 KiB.");
+    Ok(())
 }
 
 fn push(
