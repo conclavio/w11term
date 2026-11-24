@@ -1,5 +1,5 @@
 //! Profile persistence preserves unrelated JSON fields and replaces the file atomically.
-use crate::options::{Profiles, SshOptions, load_profiles};
+use crate::options::{Profiles, SshOptions, SshRecipientSets, load_profiles};
 use anyhow::{Context, Result, ensure};
 use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
@@ -24,12 +24,14 @@ const SHARE_TOKEN: &str = "folder_share_id";
 const SHARE_EPOCH: &str = "folder_share_epoch";
 const STARTUP_PROFILE: &str = "startup_profile";
 const SSH_HOST_GROUPS: &str = "ssh_host_groups";
+const SSH_RECIPIENT_SETS: &str = "ssh_recipient_sets";
 
 #[derive(Default)]
 struct CatalogEdit {
     order: Option<Vec<String>>,
     startup: Option<Option<String>>, // None leaves the setting untouched.
     ssh_host_groups: Option<BTreeMap<String, Vec<String>>>,
+    ssh_recipient_sets: Option<BTreeMap<String, SshRecipientSets>>,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,23 @@ fn ssh_profile_identity_edit(
     new: Option<&str>,
 ) -> CatalogEdit {
     let mut edit = profile_identity_edit(catalog, old, new);
+    if let (Some(old), Some(new)) = (old, new)
+        && old != new
+        && catalog.ssh_recipient_sets.values().any(|sets| {
+            sets.values()
+                .any(|members| members.iter().any(|name| name == old))
+        })
+    {
+        let mut groups = catalog.ssh_recipient_sets.clone();
+        for members in groups
+            .values_mut()
+            .flat_map(BTreeMap::values_mut)
+            .filter(|members| members.iter().any(|name| name == old))
+        {
+            replace_profile_member(members, old, Some(new));
+        }
+        edit.ssh_recipient_sets = Some(groups);
+    }
     if let Some(old) = old
         && Some(old) != new
         && catalog
@@ -115,18 +134,22 @@ fn ssh_profile_identity_edit(
             .values_mut()
             .filter(|members| members.iter().any(|name| name == old))
         {
-            let mut seen = std::collections::HashSet::new();
-            members.retain_mut(|name| {
-                if name == old {
-                    let Some(new) = new else { return false };
-                    *name = new.to_owned();
-                }
-                seen.insert(name.clone())
-            });
+            replace_profile_member(members, old, new);
         }
         edit.ssh_host_groups = Some(groups);
     }
     edit
+}
+
+fn replace_profile_member(members: &mut Vec<String>, old: &str, new: Option<&str>) {
+    let mut seen = std::collections::HashSet::new();
+    members.retain_mut(|name| {
+        if name == old {
+            let Some(new) = new else { return false };
+            *name = new.to_owned();
+        }
+        seen.insert(name.clone())
+    });
 }
 
 impl ProfileStore {
@@ -176,8 +199,12 @@ impl ProfileStore {
             );
             catalog.resolve_ssh_host_group_members(members)?;
             groups.insert(name.to_owned(), members.to_vec());
+            let ssh_recipient_sets = original
+                .filter(|(old, _)| *old != name)
+                .and_then(|(old, _)| recipient_sets_after_group_edit(catalog, old, Some(name)));
             Ok(CatalogEdit {
                 ssh_host_groups: Some(groups),
+                ssh_recipient_sets,
                 ..Default::default()
             })
         })
@@ -193,6 +220,53 @@ impl ProfileStore {
             groups.remove(name);
             Ok(CatalogEdit {
                 ssh_host_groups: Some(groups),
+                ssh_recipient_sets: recipient_sets_after_group_edit(catalog, name, None),
+                ..Default::default()
+            })
+        })
+    }
+
+    pub fn change_ssh_recipient_set(
+        &self,
+        group: &str,
+        expected_group: &[String],
+        name: &str,
+        expected: Option<&[String]>,
+        replacement: Option<&[String]>,
+    ) -> Result<Profiles> {
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 128
+                && name == name.trim()
+                && !name.chars().any(char::is_control),
+            "Enter a recipient set name on one line and within 128 bytes"
+        );
+        self.modify(|_, catalog| {
+            ensure!(
+                catalog.ssh_host_groups.get(group).map(Vec::as_slice) == Some(expected_group),
+                "The SSH group changed on disk. Reopen the group before editing recipient sets."
+            );
+            let mut groups = catalog.ssh_recipient_sets.clone();
+            let sets = groups.entry(group.to_owned()).or_default();
+            ensure!(
+                sets.get(name).map(Vec::as_slice) == expected,
+                "This name is already in use or the recipient set changed. Reopen recipient sets."
+            );
+            if let Some(members) = replacement {
+                catalog.resolve_ssh_host_group_members(members)?;
+                ensure!(
+                    members.iter().all(|member| expected_group.contains(member)),
+                    "Every recipient must belong to the saved SSH group"
+                );
+                sets.insert(name.to_owned(), members.to_vec());
+            } else {
+                sets.remove(name);
+            }
+            if sets.is_empty() {
+                groups.remove(group);
+            }
+            Ok(CatalogEdit {
+                ssh_recipient_sets: Some(groups),
                 ..Default::default()
             })
         })
@@ -699,6 +773,13 @@ impl ProfileStore {
                 fields.insert(SSH_HOST_GROUPS.into(), serde_json::to_value(groups)?);
             }
         }
+        if let Some(groups) = edit.ssh_recipient_sets {
+            if groups.is_empty() {
+                fields.remove(SSH_RECIPIENT_SETS);
+            } else {
+                fields.insert(SSH_RECIPIENT_SETS.into(), serde_json::to_value(groups)?);
+            }
+        }
         // Return the catalog from the exact document being committed.
         let result = crate::options::parse_profiles(&serde_json::to_vec(&document)?, &self.path)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -717,6 +798,20 @@ impl ProfileStore {
         file.persist(&self.path).context("Saving profiles")?;
         Ok(result)
     }
+}
+
+fn recipient_sets_after_group_edit(
+    catalog: &Profiles,
+    old: &str,
+    new: Option<&str>,
+) -> Option<BTreeMap<String, SshRecipientSets>> {
+    let sets = catalog.ssh_recipient_sets.get(old)?;
+    let mut groups = catalog.ssh_recipient_sets.clone();
+    groups.remove(old);
+    if let Some(new) = new {
+        groups.insert(new.to_owned(), sets.clone());
+    }
+    Some(groups)
 }
 
 #[cfg(test)]
@@ -861,6 +956,74 @@ mod tests {
         assert_eq!(doc["other"], 17);
         assert!(doc.get(SSH_HOST_GROUPS).is_none());
         assert_eq!(doc["profiles"]["East Coast"]["host"], "east.test");
+    }
+
+    #[test]
+    fn recipient_sets_validate_group_members_and_preserve_identity_across_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::write(
+            &path,
+            br#"{"profiles":{
+            "East":{"host":"east.test","user":"ops","auth":"none"},
+            "West":{"host":"west.test","user":"ops","auth":"none"},
+            "Other":{"host":"other.test","user":"ops","auth":"none"}
+        },"ssh_host_groups":{"Fleet":["East","West"]}}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::new(path.clone()).unwrap();
+        let other = ProfileStore::new(path).unwrap();
+        let group = ["East".into(), "West".into()];
+        let east = ["East".into()];
+        let west = ["West".into()];
+        assert!(store.catalog().unwrap().ssh_recipient_sets.is_empty());
+        for invalid in [
+            Vec::new(),
+            vec!["Other".into()],
+            vec!["East".into(), "East".into()],
+        ] {
+            assert!(
+                store
+                    .change_ssh_recipient_set("Fleet", &group, "Canary", None, Some(&invalid))
+                    .is_err()
+            );
+        }
+        store
+            .change_ssh_recipient_set("Fleet", &group, "Canary", None, Some(&east))
+            .unwrap();
+        assert_eq!(
+            other.catalog().unwrap().ssh_recipient_sets["Fleet"]["Canary"],
+            east
+        );
+        other
+            .change_ssh_recipient_set("Fleet", &group, "Canary", Some(&east), Some(&west))
+            .unwrap();
+        assert!(
+            store
+                .change_ssh_recipient_set("Fleet", &group, "Canary", Some(&east), None)
+                .is_err()
+        );
+        let (_, profile) = store.inspect("West").unwrap();
+        store
+            .edit("West", "West Coast", &profile.options, &profile.options)
+            .unwrap();
+        let updated = ["East".into(), "West Coast".into()];
+        assert!(
+            other
+                .change_ssh_recipient_set("Fleet", &group, "Old", None, Some(&east))
+                .is_err()
+        );
+        store
+            .save_ssh_host_group("Renamed", &updated, Some(("Fleet", &updated)))
+            .unwrap();
+        let catalog = other.catalog().unwrap();
+        assert!(!catalog.ssh_recipient_sets.contains_key("Fleet"));
+        assert_eq!(
+            catalog.ssh_recipient_sets["Renamed"]["Canary"],
+            ["West Coast"]
+        );
+        store.delete_ssh_host_group("Renamed", &updated).unwrap();
+        assert!(other.catalog().unwrap().ssh_recipient_sets.is_empty());
     }
 }
 

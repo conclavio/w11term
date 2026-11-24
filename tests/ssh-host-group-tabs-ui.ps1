@@ -334,19 +334,70 @@ try {
     Expect-Field 'Group command' 'retained roster draft'
     Expect-Field 'Host filter' 'east'
     $null = Wait-Until 'the last command remains in the group' { Find-Element "Submitted${dot}shared-probe" }
+
+    $setsButton = 'Recipient sets' + [char]0x2026
+    (Wait-CheckBox $eastName Off).Toggle()
+    $null = Wait-CheckBox $eastName On
+    Click $setsButton
+    $null = Wait-Until 'recipient sets belong to the tab source group' {
+        (Find-Element "Recipient sets${dot}Fleet East") -and (Find-Element "Current selection${dot}East")
+    }
+    (Field 'Recipient set name').SetValue('Canaries')
+    Click 'Save recipient set'
+    $null = Wait-Until 'the canary set is saved' { Find-Element 'Saved recipient set Canaries' }
+    Click 'Back to SSH group'
     (Field 'Host filter').SetValue('')
+    (Wait-CheckBox $westName Off).Toggle()
+    $null = Wait-CheckBox $westName On
+    Click $setsButton
+    (Field 'Recipient set name').SetValue('Fleet')
+    Click 'Save recipient set'
+    $null = Wait-Until 'the fleet set is saved' { Find-Element 'Saved recipient set Fleet' }
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets.'Fleet East'
+    if (($sets.Canaries -join ',') -cne 'East' -or ($sets.Fleet -join ',') -cne 'East,West') {
+        throw 'Saved sets do not match the reviewed profile selections'
+    }
+    Click 'Back to SSH group'
+
+    $null = Wait-CheckBox 'Show all window SSH panes' On
+    (Field 'Host filter').SetValue('west')
+    Expect-Field 'Host filter' 'west'
+    Click $setsButton
+    Click 'Apply recipient set Canaries'
+    $null = Wait-CheckBox 'Show all window SSH panes' Off
+    Expect-Field 'Host filter' ''
+    Expect-Field 'Group command' 'retained roster draft'
+    $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName Off
+    Click $setsButton
+    Click 'Apply recipient set Fleet'
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
     Click $manage
     (Wait-CheckBox "Include $westName" On).Toggle()
     $null = Wait-CheckBox "Include $westName" Off
     Click 'Apply membership'
+    Click $setsButton
+    Click 'Apply recipient set Fleet'
+    $null = Wait-Until 'a missing roster member blocks the whole preset' {
+        Find-Element 'West has no matching live pane in this roster.'
+    }
+    Click 'Back to SSH group'
+    $null = Wait-CheckBox $eastName On
     Click $update
     $null = Wait-Until 'a second review uses the just-saved roster' { Find-Element 'Remove profile West' }
     Click 'Save roster changes'
     $null = Wait-Until 'the second update is saved' { Find-Element 'Saved live membership for Fleet East' }
     $groups = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_host_groups
     if (($groups.'Fleet East' -join ',') -cne 'East') { throw 'The second roster change did not persist' }
-    if (@((Control @('list')).sessions).Count -ne 4) { throw 'Updating a saved roster changed the SSH sessions' }
+    Click $setsButton
+    Click 'Delete recipient set Fleet'
+    Click 'Confirm delete recipient set Fleet'
+    $null = Wait-Until 'the invalidated set can be removed' { Find-Element 'Deleted recipient set Fleet' }
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets.'Fleet East'
+    if ($sets.Fleet -or ($sets.Canaries -join ',') -cne 'East') { throw 'Deleting a set edited another set' }
+    Click 'Back to SSH group'
+    if (@((Control @('list')).sessions).Count -ne 4) { throw 'Roster and recipient edits changed the SSH sessions' }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

@@ -13,6 +13,7 @@ pub(super) struct SavedUi {
     pub(super) feedback: String,
     pub(super) reuse: reuse::State,
     roster_update: roster_update::State,
+    pub(super) recipient_sets: super::recipient_sets::State,
 }
 
 struct Editor {
@@ -56,11 +57,15 @@ impl Selection {
 
 impl SavedUi {
     pub(super) fn is_editing(&self) -> bool {
-        self.editor.is_some() || self.roster_update.is_open()
+        self.editor.is_some() || self.roster_update.is_open() || self.recipient_sets.is_open()
     }
 
     pub(super) fn can_update_roster(&self) -> bool {
         self.roster_update.has_origin()
+    }
+
+    pub(super) fn origin(&self) -> Option<(&str, &[String])> {
+        self.roster_update.origin()
     }
 
     fn name<'a>(&'a self, catalog: &'a Profiles) -> Option<&'a str> {

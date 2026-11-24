@@ -12,6 +12,7 @@ mod live_output;
 mod membership;
 mod progress;
 mod prompt_setup;
+mod recipient_sets;
 mod reconnect;
 mod report;
 mod retry;
@@ -339,6 +340,7 @@ pub enum Action {
     FilterWildcards(TabId, bool),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
+    RecipientSets(TabId, recipient_sets::Action),
     Reuse(TabId, reuse::Action),
     Select(TabId, u64, bool),
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
@@ -686,6 +688,7 @@ impl TerminalApp {
             Action::Reuse(id, action) => self.handle_host_group_reuse(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
+            Action::RecipientSets(id, action) => self.handle_recipient_sets(id, action),
             Action::Transfer(id, action) => self.handle_host_group_transfer(id, action, ctx),
             Action::Tick => {
                 if !matches!(
@@ -955,6 +958,9 @@ impl TerminalApp {
         if let Some(view) = page.saved.reuse.view(id, ctx) {
             return view;
         }
+        if let Some(view) = page.saved.recipient_sets.view(id, ctx) {
+            return view;
+        }
         if let Some(roster) = page
             .roster
             .as_ref()
@@ -1150,6 +1156,11 @@ impl TerminalApp {
                 .children((
                     transfer::button(id, &selected, transfer::Direction::Upload, ctx),
                     transfer::button(id, &selected, transfer::Direction::Download, ctx),
+                    if page.saved.origin().is_some() {
+                        recipient_sets::button(id, ctx)
+                    } else {
+                        View::empty()
+                    },
                 )),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
