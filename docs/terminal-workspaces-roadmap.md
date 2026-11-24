@@ -160,6 +160,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 44. **Create a group from OpenSSH aliases.** Filter and check aliases in the config preview. Review their resolved destinations and jump routes, reuse exact saved profiles, and save the group and any new profiles together.
 45. **Launch a subset of a saved group.** Review checked profiles or a saved recipient set before opening a named roster. Choose when to reuse an existing connection, recheck the included profiles and set on confirmation, and keep the full saved membership for later launches.
 46. **Review a group launch from the keyboard.** Find a saved group or recipient set in the command palette. Check the offered membership before opening a review, and use that same tab for the live roster after approval.
+47. **Name new OpenSSH profiles during group import.** Give a conflicting alias its own profile name, validate checked names across filters, and save the reviewed group and profiles together.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

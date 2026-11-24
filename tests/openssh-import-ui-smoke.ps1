@@ -180,15 +180,49 @@ Host web
         !(Find-Element 'Include OpenSSH alias gateway' $checkBox) -and
             (Find-Element "2 checked $dot 1 new $dot 1 existing $dot Page 1 of 1")
     }
+    (Field 'Filter OpenSSH aliases').SetValue('VIA')
+    $null = Wait-Until 'filter isolates the conflicting alias' {
+        (Find-Element 'Include OpenSSH alias via' $checkBox) -and
+            !(Find-Element 'Include OpenSSH alias web' $checkBox)
+    }
+    (Field 'Profile name for OpenSSH alias via').SetValue('web')
+    (Wait-CheckBox 'Include OpenSSH alias via' Off).Toggle()
+    $null = Wait-Until 'duplicate draft names are flagged even when one alias is hidden' {
+        $save = Find-Element 'Save SSH group' $button
+        ($save -and !$save.Current.IsEnabled) -and (Find-Element 'Profile web is selected more than once')
+    }
+    (Field 'Profile name for OpenSSH alias via').SetValue('via with jump')
+    $null = Wait-Until 'the corrected draft can save all three profiles' {
+        $save = Find-Element 'Save SSH group' $button
+        ($save -and $save.Current.IsEnabled) -and (Find-Element "3 checked $dot 2 new $dot 1 existing $dot Page 1 of 1")
+    }
+    $concurrent = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $concurrent.profiles | Add-Member -NotePropertyName 'web' -NotePropertyValue $concurrent.profiles.via
+    [IO.File]::WriteAllText($profiles, ($concurrent | ConvertTo-Json -Depth 30), $utf8)
+    Click 'Save SSH group'
+    $null = Wait-Until 'a late name collision is reported without closing the review' {
+        Find-Element 'Profile web already exists'
+    }
+    $afterRace = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    if ($afterRace.ssh_host_groups.'Imported fleet' -or $afterRace.profiles.'via with jump' -or
+            @($afterRace.profiles.psobject.Properties).Count -ne 3) {
+        throw 'A late profile collision saved part of the group'
+    }
+    (Field 'Filter OpenSSH aliases').SetValue('WEB')
+    (Field 'Profile name for OpenSSH alias web').SetValue('Imported web')
     Click 'Save SSH group'
     $null = Wait-Until 'saved imported group' { Find-Element 'Saved SSH group Imported fleet' }
     $catalog = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
-    if (($catalog.ssh_host_groups.'Imported fleet' -join ',') -cne 'gateway,web' -or
-        @($catalog.profiles.psobject.Properties).Count -ne 3 -or
+    if (($catalog.ssh_host_groups.'Imported fleet' -join ',') -cne 'gateway,via with jump,Imported web' -or
+        @($catalog.profiles.psobject.Properties).Count -ne 5 -or
         $catalog.profiles.gateway.host_key_alias -cne 'bastion.key.test' -or
-        $catalog.profiles.web.host -cne 'web.test' -or $catalog.profiles.web.port -ne 2300 -or
-        $catalog.profiles.web.host_key_alias -cne 'web.key.test' -or
-        $catalog.profiles.via.terminal_type -cne 'xterm-sixel') {
+        $catalog.profiles.'Imported web'.host -cne 'web.test' -or $catalog.profiles.'Imported web'.port -ne 2300 -or
+        $catalog.profiles.'Imported web'.host_key_alias -cne 'web.key.test' -or
+        $catalog.profiles.via.terminal_type -cne 'xterm-sixel' -or
+        $catalog.profiles.web.terminal_type -cne 'xterm-sixel' -or
+        $catalog.profiles.'via with jump'.host -cne 'target.test' -or
+        $catalog.profiles.'via with jump'.host_key_alias -cne 'build.key.test' -or
+        $catalog.profiles.'via with jump'.proxy_jump[0].host_key_alias -cne 'bastion.key.test') {
         throw "Unexpected saved group membership or profile options. See $profiles"
     }
     Write-Output "OpenSSH import native smoke passed. Artifacts in $state"
