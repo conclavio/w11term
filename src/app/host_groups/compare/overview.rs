@@ -26,9 +26,13 @@ pub enum Action {
     SaveSummary {
         revision: u64,
     },
-    ShowUnchanged {
+    SearchHosts {
         revision: u64,
-        show: bool,
+        query: String,
+    },
+    FilterHosts {
+        revision: u64,
+        selection: usize,
     },
     Back {
         revision: u64,
@@ -38,7 +42,8 @@ pub enum Action {
 pub(super) struct Open {
     run: u64,
     baseline: Option<u64>,
-    show_unchanged: bool,
+    host_search: filter::Filter,
+    scope: Scope,
     comparison: ComparisonState,
     export_feedback: Option<String>,
 }
@@ -74,6 +79,44 @@ impl Change {
             Self::EarlierOnly => "Earlier run only",
             Self::CurrentOnly => "Current run only",
             Self::Unavailable => "Comparison unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum Scope {
+    #[default]
+    Differences,
+    All,
+    Only(Change),
+}
+
+const SCOPES: [Scope; 9] = [
+    Scope::Differences,
+    Scope::All,
+    Scope::Only(Change::Output),
+    Scope::Only(Change::ExitCode),
+    Scope::Only(Change::OutputAndExit),
+    Scope::Only(Change::EarlierOnly),
+    Scope::Only(Change::CurrentOnly),
+    Scope::Only(Change::Unavailable),
+    Scope::Only(Change::Unchanged),
+];
+
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Differences => "Differences and unavailable",
+            Self::All => "All hosts",
+            Self::Only(change) => change.label(),
+        }
+    }
+
+    fn includes(self, change: Change) -> bool {
+        match self {
+            Self::Differences => change != Change::Unchanged,
+            Self::All => true,
+            Self::Only(selected) => selected == change,
         }
     }
 }
@@ -215,7 +258,8 @@ impl TerminalApp {
                     page.comparison.overview = Some(Box::new(Open {
                         run,
                         baseline: None,
-                        show_unchanged: false,
+                        host_search: filter::Filter::default(),
+                        scope: Scope::default(),
                         comparison: ComparisonState::Idle,
                         export_feedback: None,
                     }));
@@ -265,7 +309,7 @@ impl TerminalApp {
                 };
                 let sides = rows
                     .iter()
-                    .filter(|row| row.pane == pane)
+                    .filter(|row| row.pane == pane && open.includes(row))
                     .find_map(|row| row.sides.clone());
                 if let Some(sides) = sides {
                     self.open_overview_run_diff(tab, run, baseline, pane, sides, ctx);
@@ -275,11 +319,22 @@ impl TerminalApp {
             Action::SaveSummary { revision } => {
                 self.save_run_comparison_report(tab, run, revision, ctx)
             }
-            Action::ShowUnchanged { revision, show } => {
+            Action::SearchHosts { revision, query } => {
                 if let Some(page) = self.host_group_mut(tab)
                     && let Some(open) = page.comparison.overview_mut(run, revision)
                 {
-                    open.show_unchanged = show;
+                    open.host_search.set_query(query);
+                }
+            }
+            Action::FilterHosts {
+                revision,
+                selection,
+            } => {
+                if let Some(scope) = SCOPES.get(selection)
+                    && let Some(page) = self.host_group_mut(tab)
+                    && let Some(open) = page.comparison.overview_mut(run, revision)
+                {
+                    open.scope = *scope;
                 }
             }
             Action::Back { revision } => {
@@ -386,6 +441,13 @@ impl State {
 }
 
 impl Open {
+    fn includes(&self, row: &Row) -> bool {
+        self.scope.includes(row.change)
+            && self
+                .host_search
+                .matches_profile(&row.names.label, Some(row.names.address()))
+    }
+
     pub(super) fn view(
         &self,
         tab: TabId,
@@ -422,19 +484,49 @@ impl Open {
                 (TextBlock::new().text(*error).into(), View::empty())
             }
             ComparisonState::Ready(Ok(rows)) => {
+                let shown: Vec<_> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| self.includes(row))
+                    .collect();
                 let status = StackPanel::new().spacing(4.0).children((
                     TextBlock::new()
                         .text(Counts::capture(rows).caption())
                         .text_wrapping(TextWrapping::Wrap),
-                    CheckBox::new()
-                        .automation_name("Show unchanged hosts")
-                        .is_checked(self.show_unchanged)
-                        .on_is_checked_changed(
-                            ctx.callback(move |show| {
-                                send(Action::ShowUnchanged { revision, show })
-                            }),
-                        )
-                        .content("Show unchanged hosts"),
+                    Grid::new()
+                        .column_spacing(8.0)
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .children((
+                            TextBox::new()
+                                .automation_name("Find compared hosts")
+                                .placeholder_text("Find compared hosts")
+                                .text(self.host_search.query())
+                                .on_text_changed(ctx.callback(move |query| {
+                                    send(Action::SearchHosts { revision, query })
+                                })),
+                            ComboBox::new()
+                                .grid_column(1)
+                                .automation_name("Filter compared hosts")
+                                .items_source(SCOPES.map(Scope::label))
+                                .selected_index(
+                                    SCOPES.iter().position(|scope| *scope == self.scope),
+                                )
+                                .on_selection_changed(ctx.callback(
+                                    move |selection: Option<usize>| {
+                                        selection.map_or(Message::ControlIdle, |selection| {
+                                            send(Action::FilterHosts {
+                                                revision,
+                                                selection,
+                                            })
+                                        })
+                                    },
+                                )),
+                        )),
+                    TextBlock::new().text(format!(
+                        "Showing {} of {} hosts",
+                        shown.len(),
+                        rows.len()
+                    )),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
@@ -460,19 +552,14 @@ impl Open {
                                 .into()
                         }),
                 ));
-                let shown = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, row)| self.show_unchanged || row.change != Change::Unchanged);
-                let empty = shown.clone().next().is_none();
-                let entries =
-                    shown.map(|(index, row)| KeyedView::new(index, row.view(revision, send, ctx)));
-                let entries = if empty {
-                    TextBlock::new()
-                        .text("No changed or unavailable hosts")
-                        .into()
+                let entries = if shown.is_empty() {
+                    TextBlock::new().text("No hosts match these filters").into()
                 } else {
-                    StackPanel::new().spacing(10.0).keyed_children(entries)
+                    StackPanel::new().spacing(10.0).keyed_children(
+                        shown.into_iter().map(|(index, row)| {
+                            KeyedView::new(index, row.view(revision, send, ctx))
+                        }),
+                    )
                 };
                 (status, entries)
             }
@@ -557,6 +644,16 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_scopes_distinguish_unchanged_and_unavailable_hosts() {
+        assert!(!Scope::Differences.includes(Change::Unchanged));
+        assert!(Scope::Differences.includes(Change::Unavailable));
+        assert!(Scope::All.includes(Change::Unchanged));
+        assert!(Scope::Only(Change::EarlierOnly).includes(Change::EarlierOnly));
+        assert!(!Scope::Only(Change::EarlierOnly).includes(Change::CurrentOnly));
+        assert!(!Scope::Only(Change::ExitCode).includes(Change::OutputAndExit));
+    }
 
     #[test]
     fn pairs_recipients_by_pane_and_address_in_current_then_earlier_order() {

@@ -557,6 +557,15 @@ try {
             (Find-Element "$westName${dot}Comparison unavailable") -and
             !(Find-Element "View run differences for pane $west" $button)
     }
+    $comparisonField = 'Find compared hosts'
+    $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
+    $westSearch = "WEST $($profileData.West.port)"
+    (Find-Element $comparisonField $edit).GetCurrentPattern($valuePattern).SetValue($westSearch)
+    $null = Wait-Until 'the comparison search matches the host label and endpoint' {
+        (Find-Element 'Showing 1 of 2 hosts') -and (Find-Element $overviewSummary) -and
+            (Find-Element "$westName${dot}Comparison unavailable") -and
+            !(Find-Element "$eastName${dot}Output changed")
+    }
     Click 'Copy comparison'
     $null = Wait-Until 'the clipboard includes both run labels and all host classifications' {
         $report = Read-ClipboardFixture
@@ -590,6 +599,15 @@ try {
         $comparisonText.Contains('east-report-tail')) {
         throw 'The JSON comparison did not preserve the run and host classifications'
     }
+    Select-ComboValue 'Filter compared hosts' 'Output changed'
+    $null = Wait-Until 'classification and text filters are combined' {
+        (Find-Element 'Showing 0 of 2 hosts') -and (Find-Element 'No hosts match these filters')
+    }
+    (Find-Element $comparisonField $edit).GetCurrentPattern($valuePattern).SetValue('EAST')
+    $null = Wait-Until 'the filtered comparison offers only the matching host diff' {
+        (Find-Element "View run differences for pane $east" $button) -and (Find-Element 'Showing 1 of 2 hosts') -and
+            !(Find-Element "$westName${dot}Comparison unavailable")
+    }
     Click "View run differences for pane $east"
     $null = Wait-Until 'the group overview opens the same pane diff' {
         (Find-Element 'SSH output across runs') -and (Find-Element 'Back to run overview' $button) -and
@@ -606,8 +624,11 @@ try {
             $diff.Contains('east-report-tail') -and ([regex]::Matches($diff, 'east-report-line')).Count -eq 35
     }
     Click 'Back to run overview'
-    $null = Wait-Until 'the overview preserves the baseline and classifications' {
-        (Find-Element 'SSH group run comparison') -and (Find-Element $overviewSummary)
+    $null = Wait-Until 'the overview preserves its baseline and host filters' {
+        $search = Find-Element $comparisonField $edit
+        $search -and $search.GetCurrentPattern($valuePattern).Current.Value -ceq 'EAST' -and
+            (Find-Element 'SSH group run comparison') -and (Find-Element $overviewSummary) -and
+            (Find-Element 'Showing 1 of 2 hosts') -and !(Find-Element "$westName${dot}Comparison unavailable")
     }
     Click 'Back to results'
     $null = Wait-Until 'the cross-run comparison returns to the current submission' {
