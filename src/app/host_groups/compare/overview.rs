@@ -1,5 +1,6 @@
 use super::runs::Side;
 use super::*;
+mod report;
 
 pub enum Action {
     Open,
@@ -19,6 +20,12 @@ pub enum Action {
         revision: u64,
         pane: u64,
     },
+    CopySummary {
+        revision: u64,
+    },
+    SaveSummary {
+        revision: u64,
+    },
     ShowUnchanged {
         revision: u64,
         show: bool,
@@ -33,6 +40,7 @@ pub(super) struct Open {
     baseline: Option<u64>,
     show_unchanged: bool,
     comparison: ComparisonState,
+    export_feedback: Option<String>,
 }
 
 enum ComparisonState {
@@ -41,11 +49,15 @@ enum ComparisonState {
     Ready(Result<Vec<Row>, &'static str>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 enum Change {
     Unchanged,
+    #[serde(rename = "output_changed")]
     Output,
+    #[serde(rename = "exit_code_changed")]
     ExitCode,
+    #[serde(rename = "output_and_exit_code_changed")]
     OutputAndExit,
     EarlierOnly,
     CurrentOnly,
@@ -68,7 +80,7 @@ impl Change {
 
 struct Candidate {
     pane: u64,
-    name: String,
+    names: filter::Names,
     sides: Contents,
 }
 
@@ -80,7 +92,7 @@ enum Contents {
 
 pub struct Row {
     pane: u64,
-    name: String,
+    names: filter::Names,
     change: Change,
     sides: Option<(Side, Side)>,
     detail: Option<String>,
@@ -136,7 +148,7 @@ impl From<Candidate> for Row {
         };
         Self {
             pane: candidate.pane,
-            name: candidate.name,
+            names: candidate.names,
             change,
             sides,
             detail,
@@ -144,22 +156,36 @@ impl From<Candidate> for Row {
     }
 }
 
-fn summary(rows: &[Row]) -> String {
-    let mut totals = [0; 5];
-    for row in rows {
-        let index = match row.change {
-            Change::Output | Change::ExitCode | Change::OutputAndExit => 0,
-            Change::Unchanged => 1,
-            Change::EarlierOnly => 2,
-            Change::CurrentOnly => 3,
-            Change::Unavailable => 4,
-        };
-        totals[index] += 1;
+#[derive(Default, serde::Serialize)]
+struct Counts {
+    changed: usize,
+    unchanged: usize,
+    earlier_only: usize,
+    current_only: usize,
+    unavailable: usize,
+}
+
+impl Counts {
+    fn capture(rows: &[Row]) -> Self {
+        let mut counts = Self::default();
+        for row in rows {
+            match row.change {
+                Change::Output | Change::ExitCode | Change::OutputAndExit => counts.changed += 1,
+                Change::Unchanged => counts.unchanged += 1,
+                Change::EarlierOnly => counts.earlier_only += 1,
+                Change::CurrentOnly => counts.current_only += 1,
+                Change::Unavailable => counts.unavailable += 1,
+            }
+        }
+        counts
     }
-    let [changed, unchanged, earlier, current, unavailable] = totals;
-    format!(
-        "{changed} changed · {unchanged} unchanged · {earlier} earlier only · {current} current only · {unavailable} unavailable"
-    )
+
+    fn caption(&self) -> String {
+        format!(
+            "{} changed · {} unchanged · {} earlier only · {} current only · {} unavailable",
+            self.changed, self.unchanged, self.earlier_only, self.current_only, self.unavailable,
+        )
+    }
 }
 
 fn message(tab: TabId, run: u64, action: Action) -> Message {
@@ -191,6 +217,7 @@ impl TerminalApp {
                         baseline: None,
                         show_unchanged: false,
                         comparison: ComparisonState::Idle,
+                        export_feedback: None,
                     }));
                 }
             }
@@ -208,6 +235,7 @@ impl TerminalApp {
                 {
                     open.baseline = baseline;
                     open.comparison = ComparisonState::Idle;
+                    open.export_feedback = None;
                     page.comparison.revision += 1;
                 }
             }
@@ -242,6 +270,10 @@ impl TerminalApp {
                 if let Some(sides) = sides {
                     self.open_overview_run_diff(tab, run, baseline, pane, sides, ctx);
                 }
+            }
+            Action::CopySummary { revision } => self.copy_run_comparison_report(tab, run, revision),
+            Action::SaveSummary { revision } => {
+                self.save_run_comparison_report(tab, run, revision, ctx)
             }
             Action::ShowUnchanged { revision, show } => {
                 if let Some(page) = self.host_group_mut(tab)
@@ -311,7 +343,7 @@ impl TerminalApp {
                 };
                 Candidate {
                     pane: row.target.pane,
-                    name: row.target.name.clone(),
+                    names: row.target.names.clone(),
                     sides,
                 }
             })
@@ -323,6 +355,7 @@ impl TerminalApp {
             return;
         };
         open.comparison = ComparisonState::Pending;
+        open.export_feedback = None;
         page.comparison.revision += 1;
         let revision = page.comparison.revision;
         let ready = move |result| message(tab, run, Action::Ready { revision, result });
@@ -357,6 +390,7 @@ impl Open {
         &self,
         tab: TabId,
         page: &HostGroup,
+        can_save: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> Option<View> {
         let current = page.viewed_submission(self.run)?;
@@ -388,19 +422,44 @@ impl Open {
                 (TextBlock::new().text(*error).into(), View::empty())
             }
             ComparisonState::Ready(Ok(rows)) => {
-                let status =
-                    StackPanel::new().spacing(4.0).children((
-                        TextBlock::new()
-                            .text(summary(rows))
-                            .text_wrapping(TextWrapping::Wrap),
-                        CheckBox::new()
-                            .automation_name("Show unchanged hosts")
-                            .is_checked(self.show_unchanged)
-                            .on_is_checked_changed(ctx.callback(move |show| {
+                let status = StackPanel::new().spacing(4.0).children((
+                    TextBlock::new()
+                        .text(Counts::capture(rows).caption())
+                        .text_wrapping(TextWrapping::Wrap),
+                    CheckBox::new()
+                        .automation_name("Show unchanged hosts")
+                        .is_checked(self.show_unchanged)
+                        .on_is_checked_changed(
+                            ctx.callback(move |show| {
                                 send(Action::ShowUnchanged { revision, show })
-                            }))
-                            .content("Show unchanged hosts"),
-                    ));
+                            }),
+                        )
+                        .content("Show unchanged hosts"),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .on_click(
+                                    ctx.callback(move |_| send(Action::CopySummary { revision })),
+                                )
+                                .content("Copy comparison"),
+                            Button::new()
+                                .is_enabled(can_save)
+                                .on_click(
+                                    ctx.callback(move |_| send(Action::SaveSummary { revision })),
+                                )
+                                .content("Save comparison as JSON…"),
+                        )),
+                    self.export_feedback
+                        .as_ref()
+                        .map_or_else(View::empty, |feedback| {
+                            TextBlock::new()
+                                .text(feedback)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .into()
+                        }),
+                ));
                 let shown = rows
                     .iter()
                     .enumerate()
@@ -471,7 +530,11 @@ impl Row {
         let pane = self.pane;
         StackPanel::new().spacing(4.0).children((
             TextBlock::new()
-                .text(format!("{} · {}", self.name, self.change.label()))
+                .text(format!(
+                    "{} · {}",
+                    self.names.display(pane),
+                    self.change.label()
+                ))
                 .text_wrapping(TextWrapping::Wrap),
             self.detail.as_ref().map_or_else(View::empty, |detail| {
                 TextBlock::new()

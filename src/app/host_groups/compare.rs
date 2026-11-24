@@ -584,7 +584,7 @@ impl TerminalApp {
             return open.view(id, page, self.export.pending.is_none(), ctx);
         }
         if let Some(open) = &page.comparison.overview {
-            return open.view(id, page, ctx);
+            return open.view(id, page, self.export.pending.is_none(), ctx);
         }
         let open = page.comparison.open.as_ref()?;
         let submission_id = open.submission;

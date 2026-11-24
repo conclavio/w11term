@@ -31,6 +31,7 @@ pub(super) enum Purpose {
     GroupReport(String),
     SshLoginReport(String),
     GroupJsonReport(String),
+    GroupRunComparison(String),
     GroupOutputExcerpt(String),
     GroupOutputDiff(String),
     GroupLiveRecording(String),
@@ -308,6 +309,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             | Purpose::GroupReport(_)
             | Purpose::SshLoginReport(_)
             | Purpose::GroupJsonReport(_)
+            | Purpose::GroupRunComparison(_)
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
             | Purpose::SshGroupDefinition
@@ -332,6 +334,11 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                     }
                     Purpose::GroupJsonReport(suggestion) => (
                         w!("Save SSH group results as JSON"),
+                        suggestion.as_str(),
+                        w!("json"),
+                    ),
+                    Purpose::GroupRunComparison(suggestion) => (
+                        w!("Save SSH group run comparison as JSON"),
                         suggestion.as_str(),
                         w!("json"),
                     ),

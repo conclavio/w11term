@@ -225,6 +225,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 109. **Find a retained group run.** Search by full command text or exact run number, including repeated commands. Jump directly to the selected results while keeping the draft and roster selection.
 110. **Compare a host across group runs.** Pick an earlier capture for the same pane and SSH address, show output changes with original line numbers and exit codes, and export the full diff.
 111. **Compare two group runs across hosts.** Summarize changes to output, exit status, and participation. Open a specific host's diff and return to the same comparison.
+112. **Share a group run comparison.** Copy the summary or export versioned JSON with both runs, counts and every host classification.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

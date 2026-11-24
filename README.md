@@ -213,6 +213,8 @@ Use **Compare with earlier run…** on a completed host result to compare the sa
 
 Use **Compare runs…** to see those changes across the entire group. The overview separates changes in output and exit status, hosts in one run only, and unavailable comparisons. Turn on **Show unchanged hosts** to include identical results. Choose **Compare runs** again to refresh the captures. Open **View differences** on a comparable host for the detailed diff and return to the same overview when finished.
 
+Use **Copy comparison** or **Save comparison as JSON…** to share the run labels, counts and every host classification, including unchanged hosts hidden in the overview. The JSON report uses `schema_version` 1 and includes `earlier` and `current` runs, `counts` and `hosts`. Each host entry identifies its pane, profile label, SSH address and classification. Exit codes are available when both runs provided comparable captures. An unavailable comparison includes a detail message.
+
 Choose **Use as reference** on a result group when a particular host is the expected baseline. Refresh keeps that choice while the host still belongs to a comparable group. **Use largest group** restores automatic selection.
 
 In the diff view, choose **Save full differences…** to write a UTF-8 report of the current comparison. It includes the command, both hosts and exit codes, and changed lines at full length. If the changed sections are too large to align, the report includes both full unmatched sections in source order.

@@ -557,6 +557,39 @@ try {
             (Find-Element "$westName${dot}Comparison unavailable") -and
             !(Find-Element "View run differences for pane $west" $button)
     }
+    Click 'Copy comparison'
+    $null = Wait-Until 'the clipboard includes both run labels and all host classifications' {
+        $report = Read-ClipboardFixture
+        (Find-Element 'Copied comparison') -and $report -and
+            $report.Contains("Earlier${dot}Run 2${dot}both") -and
+            $report.Contains("Current${dot}Run 3${dot}while-slow") -and
+            $report.Contains($overviewSummary) -and
+            $report.Contains("$eastName${dot}Output changed") -and
+            $report.Contains("$westName${dot}Comparison unavailable") -and
+            !$report.Contains('east-report-tail')
+    }
+    Click ('Save comparison as JSON' + [char]0x2026)
+    $dialog = Wait-Until 'owned group run comparison save dialog' { Find-OwnedDialog 'Save SSH group run comparison as JSON' }
+    $null = Wait-Until 'save the group run comparison JSON' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $comparisonPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-run-comparison-2-to-3.json'
+    $null = Wait-Until 'the group run comparison JSON is published' { [IO.File]::Exists($comparisonPath) }
+    $comparisonText = [IO.File]::ReadAllText($comparisonPath, [Text.UTF8Encoding]::new($false, $true))
+    $comparison = $comparisonText | ConvertFrom-Json
+    $eastComparison = $comparison.hosts | Where-Object pane_id -EQ $east
+    $westComparison = $comparison.hosts | Where-Object pane_id -EQ $west
+    if ($comparison.schema_version -ne 1 -or $comparison.earlier.run_id -ne 2 -or
+        $comparison.earlier.label -cne 'both' -or $comparison.current.run_id -ne 3 -or
+        $comparison.current.label -cne 'while-slow' -or $comparison.hosts.Count -ne 2 -or
+        $comparison.counts.changed -ne 1 -or $comparison.counts.unavailable -ne 1 -or
+        $eastComparison.name -cne 'East' -or $eastComparison.address -cne "test@127.0.0.1:$($profileData.East.port)" -or
+        $eastComparison.change -cne 'output_changed' -or
+        $eastComparison.earlier_exit_code -ne 0 -or $eastComparison.current_exit_code -ne 0 -or
+        $westComparison.name -cne 'West' -or $westComparison.address -cne "test@127.0.0.1:$($profileData.West.port)" -or
+        $westComparison.change -cne 'unavailable' -or $westComparison.detail -notlike '*Run 2*' -or
+        $null -ne $westComparison.earlier_exit_code -or $null -ne $westComparison.current_exit_code -or
+        $comparisonText.Contains('east-report-tail')) {
+        throw 'The JSON comparison did not preserve the run and host classifications'
+    }
     Click "View run differences for pane $east"
     $null = Wait-Until 'the group overview opens the same pane diff' {
         (Find-Element 'SSH output across runs') -and (Find-Element 'Back to run overview' $button) -and
