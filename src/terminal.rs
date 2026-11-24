@@ -709,6 +709,26 @@ impl Snapshot {
             .find(|command| command.id == link.id)
     }
 
+    /// Summarize the newest completed command and identify its retained history entry.
+    pub fn latest_command_output_preview(&self) -> Option<(crate::events::CommandLink, String)> {
+        let command = self.command_history.back()?;
+        let status = command.exit_code.map_or_else(
+            || "Exit status unavailable".to_owned(),
+            |code| format!("Exit {code}"),
+        );
+        let line = match &command.output {
+            Ok(text) => command_output_tail(text),
+            Err(_) => "Output unavailable".to_owned(),
+        };
+        Some((
+            crate::events::CommandLink {
+                generation: self.connection_generation,
+                id: command.id,
+            },
+            format!("{status} · {line}"),
+        ))
+    }
+
     /// A bounded single-line caption from the application's window title.
     /// A shell that has only set an icon title still uses its profile label.
     pub fn application_title(&self) -> Option<&str> {
@@ -981,6 +1001,24 @@ impl Snapshot {
                 .iter()
                 .all(|(id, image)| old.images.get(id).is_some_and(|old| old.hash == image.hash))
     }
+}
+
+fn command_output_tail(text: &str) -> String {
+    const SCAN_BYTES: usize = 4096;
+    let start = text.ceil_char_boundary(text.len().saturating_sub(SCAN_BYTES));
+    text[start..]
+        .rsplit(['\r', '\n', '\u{2028}', '\u{2029}'])
+        .find_map(|line| {
+            let caption = crate::events::display_field(line.trim());
+            (!caption.is_empty()).then_some(caption)
+        })
+        .unwrap_or_else(|| {
+            if start == 0 {
+                "No output".to_owned()
+            } else {
+                "Open history for earlier output".to_owned()
+            }
+        })
 }
 
 /// Only an immutable frame crosses onto the UI thread. Output is never queued as frames.
@@ -1710,6 +1748,36 @@ mod tests {
             assert_eq!(recorded.len(), index + 1);
             assert_eq!(recorded[index], serde_json::json!({"exit_code": 17}));
         }
+    }
+
+    #[test]
+    fn latest_command_preview_uses_the_last_completed_output_and_its_link() {
+        let (mut term, _) = engine();
+        term.advance_bytes(
+            b"\x1b]133;C\x07older\r\n\x1b]133;D;0\x07\x1b]133;C\x07first\r\nlast\r\n\x1b]133;D;17\x07",
+        );
+        let mut frame = Snapshot::capture(&term, None, 0, 0, String::new(), 0);
+        frame.connection_generation = 3;
+        let (link, preview) = frame.latest_command_output_preview().unwrap();
+        assert_eq!(link.generation, 3);
+        assert_eq!(link.id, term.last_command().unwrap().id);
+        assert_eq!(frame.command_for_link(link).unwrap().exit_code, Some(17));
+        assert_eq!(preview, "Exit 17 · last");
+    }
+
+    #[test]
+    fn command_output_tail_is_plain_text_and_bounds_its_unicode_scan() {
+        assert_eq!(
+            command_output_tail("first\r\n\tlast  \u{202e}雪\r\n\r\n"),
+            "last 雪"
+        );
+        assert_eq!(command_output_tail(" \r\n\t"), "No output");
+        assert_eq!(
+            command_output_tail(&format!("earlier\n{}", " ".repeat(4096))),
+            "Open history for earlier output"
+        );
+        let long = "雪".repeat(2048);
+        assert_eq!(command_output_tail(&long), "雪".repeat(200));
     }
 
     #[test]

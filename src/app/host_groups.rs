@@ -43,6 +43,7 @@ pub(super) struct HostGroup {
     roster: Option<Box<MemberRoster>>,
     selected: BTreeSet<u64>,
     filter: filter::Filter,
+    show_last_output: bool,
     draft: String,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
@@ -485,6 +486,7 @@ pub enum Action {
     Filter(TabId, String),
     FilterWildcards(TabId, bool),
     FilterStatus(TabId, RosterStatus),
+    ShowLastOutput(TabId, bool),
     ShowWindowRoster(TabId, bool),
     Membership(TabId, membership::Action),
     RecipientSets(TabId, recipient_sets::Action),
@@ -966,6 +968,11 @@ impl TerminalApp {
                     page.filter.set_status(status);
                 }
             }
+            Action::ShowLastOutput(id, show) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.show_last_output = show;
+                }
+            }
             Action::ShowWindowRoster(id, show) => {
                 if self.host_group_command_target() == Some(id)
                     && let Some(page) = self.host_group_mut(id)
@@ -1210,6 +1217,57 @@ impl TerminalApp {
         }
     }
 
+    fn host_group_output_preview(
+        &self,
+        id: TabId,
+        target: &Target,
+        ctx: &ViewContext<Self>,
+    ) -> Option<View> {
+        if !target.connected
+            || matches!(
+                target.state,
+                TargetState::Authentication | TargetState::Alternate
+            )
+        {
+            return None;
+        }
+        let pane = target.pane;
+        let Page::Terminal(live) = &self.tabs.get(self.tab_for_pane(pane)?)?.page else {
+            return None;
+        };
+        let frame = live.session.frames.load();
+        if frame.alternate
+            || frame.prompt.is_some()
+            || live
+                .session
+                .ssh_connection_at(frame.connection_generation)
+                .is_none()
+        {
+            return None;
+        }
+        let (link, caption) = frame.latest_command_output_preview()?;
+        let caption = format!("Last command · {caption}");
+        Some(
+            Grid::new()
+                .column_spacing(8.0)
+                .columns([GridLength::STAR, GridLength::Auto])
+                .children((
+                    TextBlock::new()
+                        .automation_name(format!("Pane {pane} · {caption}"))
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .text_trimming(TextTrimming::CharacterEllipsis)
+                        .text(caption),
+                    Button::new()
+                        .grid_column(1)
+                        .automation_name(format!("Open last command for pane {pane}"))
+                        .on_click(ctx.callback(move |_| {
+                            Message::HostGroup(Action::ViewOutput(id, pane, link))
+                        }))
+                        .content("Open history"),
+                )),
+        )
+    }
+
     pub(super) fn host_group_view(
         &self,
         id: TabId,
@@ -1325,6 +1383,12 @@ impl TerminalApp {
                                 reconnect::host_button(id, target.state, ctx),
                                 prompt_setup::button(id, target, ctx),
                             )),
+                        if page.show_last_output {
+                            self.host_group_output_preview(id, target, ctx)
+                                .unwrap_or_else(View::empty)
+                        } else {
+                            View::empty()
+                        },
                     )),
                 )
             })
@@ -1473,7 +1537,19 @@ impl TerminalApp {
                     },
                     host_list_export::button(id, &selected, ctx),
                 )),
-            environment::button(id, page, &selected, ctx),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    environment::button(id, page, &selected, ctx),
+                    CheckBox::new()
+                        .automation_name("Show last command output")
+                        .is_checked(page.show_last_output)
+                        .on_is_checked_changed(ctx.callback(move |show| {
+                            Message::HostGroup(Action::ShowLastOutput(id, show))
+                        }))
+                        .content("Show last command output"),
+                )),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes.".into()

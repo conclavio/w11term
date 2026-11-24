@@ -218,6 +218,23 @@ try {
     Submit 'one' 'Send to 1 host'
     Outcome $eastName 'Sent to SSH channel'
     Pane-Status $east "Connected${dot}Ready"
+    $showLastOutput = 'Show last command output'
+    $openEastOutput = "Open last command for pane $east"
+    $openWestOutput = "Open last command for pane $west"
+    if (Find-Element $openEastOutput $button) { throw 'The roster output preview was on by default' }
+    (Wait-CheckBox $showLastOutput Off).Toggle()
+    $null = Wait-Until 'the checked preview shows the last completed output on East' {
+        Find-Element "Pane $east${dot}Last command${dot}Exit 0${dot}east-accepted one"
+    }
+    Click $openEastOutput
+    $null = Wait-Until 'the roster preview opens that exact command history entry' {
+        Find-Element "Selected, one${dot}exit 0" $button
+    }
+    Run-Palette 'SSH host group'
+    (Wait-CheckBox $showLastOutput On).Toggle()
+    $null = Wait-Until 'turning off the preview hides the history shortcut' {
+        !(Find-Element $openEastOutput $button)
+    }
     Click 'Deselect shown'
     $null = Wait-CheckBox $eastName Off
     Set-HostFilter ''
@@ -693,6 +710,10 @@ try {
     Submit 'while-alt' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Alternate screen"
+    (Wait-CheckBox $showLastOutput Off).Toggle()
+    $null = Wait-Until 'the alternate-screen host has no roster preview' {
+        (Find-Element $openEastOutput $button) -and !(Find-Element $openWestOutput $button)
+    }
     $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Ready'
     $null = Wait-Until 'the ready filter scopes the roster and send count to East' {
@@ -718,12 +739,16 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     Select-ComboValue $hostStateFilter 'All host states'
+    $null = Wait-Until 'the retained preview returns when West leaves the alternate screen' {
+        Find-Element $openWestOutput $button
+    }
     $previous = (Control @('inspect','--pane',"$west")).connection_generation
     Send-Raw $west 'drop'
     $null = Wait-Until 'replacement SSH transport' {
         (Control @('inspect','--pane',"$west")).connection_generation -gt $previous
     }
     Pane-Status $west "Connected${dot}Prompt unverified"
+    if (Find-Element $openWestOutput $button) { throw 'The roster preview carried across an SSH reconnect' }
     Submit 'while-reconnecting' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Prompt unverified"
@@ -732,6 +757,10 @@ try {
     Submit 'after-reconnect' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Exit 17'
+    $null = Wait-Until 'the roster preview uses the replacement SSH connection output' {
+        Find-Element "Pane $west${dot}Last command${dot}Exit 17${dot}west-accepted after-reconnect"
+    }
+    (Wait-CheckBox $showLastOutput On).Toggle()
     $null = Wait-Until 'finished results cannot be interrupted' {
         $entry = Find-Element 'Interrupt selected' $button
         $entry -and !$entry.Current.IsEnabled
