@@ -213,6 +213,59 @@ try {
     $null = Wait-CheckBox "West${dot}$west${dot}Pane $savedPane" Off
     $null = Control @('wait-for-text','--pane',"$eastPane",'--timeout','15','ready')
     if ([IO.File]::ReadAllText($profiles) -cne $before) { throw 'Import changed the saved SSH profiles' }
+
+    Click $label
+    (Text-Field 'SSH host list').SetValue((@('West', $direct) -join [Environment]::NewLine))
+    Keyless
+    Click 'Preview hosts'
+    $null = Wait-CheckBox $westChoice On
+    $null = Wait-CheckBox $directChoice On
+    Click ('Save checked hosts as group' + [char]0x2026)
+    (Text-Field 'Imported SSH group name').SetValue('Fleet from file')
+    $profileField = "Profile name for $direct"
+    $null = Wait-Until 'the new profile defaults to its reviewed address' {
+        (Text-Field $profileField).Current.Value -ceq $direct
+    }
+    $null = Wait-Until 'West is reviewed as an existing profile' { Find-Element "Use saved profile West${dot}$west" }
+    (Text-Field $profileField).SetValue('West')
+    Click 'Save SSH group'
+    $null = Wait-Until 'a profile name collision refuses the whole save' { Find-Element 'Profile West already exists' }
+    if ([IO.File]::ReadAllText($profiles) -cne $before) { throw 'A name collision partially saved the host group' }
+
+    (Text-Field $profileField).SetValue('Imported relay')
+    $appeared = $before | ConvertFrom-Json
+    $appeared.profiles | Add-Member -NotePropertyName 'Already saved relay' -NotePropertyValue @{
+        host = '127.0.0.1'; user = 'test'; port = [int]$port; auth = 'none'
+    }
+    $concurrent = $appeared | ConvertTo-Json -Depth 30
+    [IO.File]::WriteAllText($profiles, $concurrent)
+    Click 'Save SSH group'
+    $null = Wait-Until 'a new profile match invalidates the saved review' {
+        Find-Element 'SSH profiles changed. Preview the host list again.'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $concurrent) { throw 'A stale import changed the profiles catalog' }
+    [IO.File]::WriteAllText($profiles, $before)
+    Click 'Save SSH group'
+    $null = Wait-Until 'the reviewed host group is saved' { Find-Element 'Saved SSH group Fleet from file' }
+    $saved = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $relay = $saved.profiles.'Imported relay'
+    $originalWest = ($before | ConvertFrom-Json).profiles.West
+    if (($saved.ssh_host_groups.'Fleet from file' -join ',') -cne 'West,Imported relay' -or
+            $relay.host -cne '127.0.0.1' -or $relay.user -cne 'test' -or $relay.port -ne [int]$port -or
+            $relay.auth -cne 'none' -or $saved.profiles.West.port -ne $originalWest.port) {
+        throw 'The saved group or reviewed profile differs from the import'
+    }
+    $null = Wait-Until 'the saved group is available in the chooser' {
+        $picker = Find-Element 'Saved SSH groups' $combo
+        if ($picker) {
+            $selection = $picker.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            $selection.Count -eq 1 -and $selection[0].Current.Name -ceq 'Fleet from file'
+        }
+    }
+    $current = (Control @('list')).sessions
+    if ((($current.id | Sort-Object) -join ',') -cne (($sessions.id | Sort-Object) -join ',')) {
+        throw 'Saving the reviewed group opened or closed SSH panes'
+    }
 } catch {
     $failure = $_
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
