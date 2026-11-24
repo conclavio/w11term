@@ -1,7 +1,7 @@
 use super::*;
 use std::path::PathBuf;
 use w11term::sftp::{
-    GroupUploadSet, TransferProgress, group_download_name, validate_group_upload_path,
+    GroupUploadFile, GroupUploadSet, TransferProgress, group_download_name, group_download_paths,
 };
 
 mod run;
@@ -32,6 +32,19 @@ pub enum Local {
     Download(PathBuf),
 }
 
+enum Plan {
+    Upload(Vec<(GroupUploadFile, String)>),
+    Download {
+        parent: PathBuf,
+        files: Vec<DownloadFile>,
+    },
+}
+
+struct DownloadFile {
+    remote: String,
+    number: Option<usize>,
+}
+
 impl Local {
     fn paths(&self) -> Vec<PathBuf> {
         match self {
@@ -44,7 +57,7 @@ impl Local {
         }
     }
 
-    fn upload_files(&self) -> &[w11term::sftp::GroupUploadFile] {
+    fn upload_files(&self) -> &[GroupUploadFile] {
         match self {
             Self::Upload(set) => set.files(),
             Self::Download(_) => &[],
@@ -54,8 +67,35 @@ impl Local {
     fn valid_remote(&self, remote: &str) -> bool {
         match self {
             Self::Upload(set) => set.destinations(remote).is_ok(),
-            Self::Download(_) => validate_group_upload_path(remote).is_ok(),
+            Self::Download(_) => group_download_paths(remote).is_ok(),
         }
+    }
+
+    fn plan(&self, remote: &str) -> anyhow::Result<Plan> {
+        Ok(match self {
+            Self::Upload(set) => Plan::Upload(
+                set.files()
+                    .iter()
+                    .cloned()
+                    .zip(set.destinations(remote)?)
+                    .collect(),
+            ),
+            Self::Download(parent) => {
+                let paths = group_download_paths(remote)?;
+                let multiple = paths.len() > 1;
+                Plan::Download {
+                    parent: parent.clone(),
+                    files: paths
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, path)| DownloadFile {
+                            remote: path.to_owned(),
+                            number: multiple.then_some(index + 1),
+                        })
+                        .collect(),
+                }
+            }
+        })
     }
 
     fn label(&self) -> String {
@@ -106,8 +146,8 @@ struct Report {
 }
 
 struct Row {
-    pane: u64,
     name: String,
+    filename: Option<String>,
     progress: watch::Receiver<TransferProgress>,
 }
 
@@ -197,7 +237,7 @@ impl Review {
                 "Download from selected SSH hosts",
                 "Choose local folder…",
                 "Choose the local folder for the downloaded files.",
-                "Use an absolute path with a filename. Each host gets a separate file in a new folder.",
+                "Enter one absolute file path per line. The files are saved in a new local folder.",
                 "Download from",
             ),
         };
@@ -205,10 +245,24 @@ impl Review {
         let label = format!("{destination} {count} {hosts}");
         let local_label = local.map_or_else(|| empty.into(), Local::label);
         let local_paths = local.map(Local::paths);
-        let path_label = if multiple {
-            "Remote directory"
+        let path_label = match self.direction {
+            Direction::Download => "Remote file paths",
+            Direction::Upload if multiple => "Remote directory",
+            Direction::Upload => "Remote file path",
+        };
+        let path_editor = TextBox::new()
+            .automation_name(path_label)
+            .placeholder_text(if multiple {
+                "/srv/incoming"
+            } else {
+                "/srv/incoming/report.txt"
+            })
+            .text(&self.remote)
+            .on_text_changed(ctx.callback(move |text| action(Form::Remote(text))));
+        let path_editor = if self.direction == Direction::Download {
+            path_editor.height(88.0).accepts_return(true)
         } else {
-            "Remote file path"
+            path_editor
         };
         let paths = files
             .iter()
@@ -241,15 +295,7 @@ impl Review {
                         .on_click(ctx.callback(move |_| action(Form::Pick)))
                         .content(picker),
                     TextBlock::new().text(path_label),
-                    TextBox::new()
-                        .automation_name(path_label)
-                        .placeholder_text(if multiple {
-                            "/srv/incoming"
-                        } else {
-                            "/srv/incoming/report.txt"
-                        })
-                        .text(&self.remote)
-                        .on_text_changed(ctx.callback(move |text| action(Form::Remote(text)))),
+                    path_editor,
                     context_label(help),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
@@ -312,7 +358,11 @@ impl Report {
             ),
             Direction::Download => (
                 "SSH group download results",
-                "downloaded",
+                if self.multiple {
+                    "files downloaded"
+                } else {
+                    "downloaded"
+                },
                 "Cancel downloads",
                 "Cancelling downloads…",
             ),
@@ -328,9 +378,9 @@ impl Report {
             .enumerate()
             .map(|(index, (row, outcome))| {
                 let mut caption = outcome.caption(self.direction, *row.progress.borrow());
-                if self.direction == Direction::Download && matches!(outcome, Outcome::Complete(_))
+                if let Some(filename) = &row.filename
+                    && matches!(outcome, Outcome::Complete(_))
                 {
-                    let filename = group_download_name(row.pane, &self.remote);
                     caption.push_str(&format!(" · {filename}"));
                 }
                 KeyedView::new(
@@ -350,11 +400,7 @@ impl Report {
                             .folder()
                             .map_or_else(|| self.local.clone(), |path| path.display().to_string()),
                     ),
-                    context_label(format!(
-                        "Remote {} · {}",
-                        if self.multiple { "directory" } else { "file" },
-                        self.remote
-                    )),
+                    context_label(&self.remote),
                     TextBlock::new().text(status),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
@@ -398,7 +444,7 @@ pub(super) fn button(
         }))
         .content(match direction {
             Direction::Upload => "Upload files…",
-            Direction::Download => "Download file…",
+            Direction::Download => "Download files…",
         })
 }
 
@@ -536,22 +582,29 @@ impl TerminalApp {
         let Some(review) = page.transfer.review_mut(revision) else {
             return;
         };
-        if review.remote != remote
-            || review.choosing
-            || review
-                .local
-                .as_ref()
-                .is_none_or(|local| local.paths() != selected_paths || !local.valid_remote(&remote))
-        {
+        let Some(local) = review.local.as_ref() else {
+            return;
+        };
+        if review.remote != remote || review.choosing || local.paths() != selected_paths {
             return;
         }
-        let Some(local) = review.local.take() else {
+        let Ok(plan) = local.plan(&remote) else {
             return;
         };
         let direction = review.direction;
         let offers = review.offers.clone();
-        let files = local.upload_files();
-        let multiple = files.len() > 1;
+        let local = local.label();
+        let (file_count, remote) = match &plan {
+            Plan::Upload(files) if files.len() > 1 => {
+                (files.len(), format!("Remote directory · {remote}"))
+            }
+            Plan::Upload(_) => (1, format!("Remote file · {remote}")),
+            Plan::Download { files, .. } if files.len() > 1 => {
+                (files.len(), format!("{} remote files", files.len()))
+            }
+            Plan::Download { files, .. } => (1, format!("Remote file · {}", files[0].remote)),
+        };
+        let multiple = file_count > 1;
         let mut states = Vec::new();
         let mut rows = Vec::new();
         let mut tasks = Vec::new();
@@ -572,25 +625,39 @@ impl TerminalApp {
                     }),
             };
             let mut items = Vec::new();
-            for file in 0..files.len().max(1) {
+            for file in 0..file_count {
+                let (label, filename, total) = match &plan {
+                    Plan::Upload(files) => {
+                        let source = &files[file].0;
+                        let label = multiple.then(|| {
+                            source
+                                .path()
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        });
+                        (label, None, Some(source.size()))
+                    }
+                    Plan::Download { files, .. } => {
+                        let file = &files[file];
+                        (
+                            multiple.then(|| file.remote.as_str().into()),
+                            Some(group_download_name(offer.pane, &file.remote, file.number)),
+                            None,
+                        )
+                    }
+                };
                 let (progress, displayed) = watch::channel(TransferProgress {
                     bytes: 0,
-                    total: files.get(file).map(w11term::sftp::GroupUploadFile::size),
+                    total,
                     files: None,
                 });
-                let name = if multiple {
-                    let filename = files[file]
-                        .path()
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
-                    format!("{} · {filename}", offer.name)
-                } else {
-                    offer.name.clone()
-                };
                 rows.push(Row {
-                    pane: offer.pane,
-                    name,
+                    name: label.map_or_else(
+                        || offer.name.clone(),
+                        |label| format!("{} · {label}", offer.name),
+                    ),
+                    filename,
                     progress: displayed,
                 });
                 if connection.is_ok() {
@@ -620,8 +687,8 @@ impl TerminalApp {
         };
         page.transfer.view = Some(Current::Results(Report {
             direction,
-            local: local.label(),
-            remote: remote.clone(),
+            local,
+            remote,
             multiple,
             batch: batch.clone(),
             rows,
@@ -632,7 +699,7 @@ impl TerminalApp {
                     if cancel.is_cancelled() {
                         batch.cancel.cancel()
                     }
-                    batch.run(tasks, local, remote);
+                    batch.run(tasks, plan);
                     Message::ControlIdle
                 },
                 Message::HostGroup(super::Action::Transfer(

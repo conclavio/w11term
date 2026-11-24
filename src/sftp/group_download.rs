@@ -1,6 +1,10 @@
-use super::directory::{pin_directory, valid_component};
+use super::{
+    directory::{pin_directory, valid_component},
+    group_upload::validate_group_upload_path,
+};
 use anyhow::{Context, Result, ensure};
 use std::{
+    collections::HashSet,
     fs::{self, File},
     path::{Path, PathBuf},
 };
@@ -46,18 +50,38 @@ impl GroupDownloadFolder {
         &self.display
     }
 
-    pub fn destination(&self, pane: u64, remote: &str) -> PathBuf {
-        self.root.join(group_download_name(pane, remote))
+    pub fn destination(&self, pane: u64, remote: &str, index: Option<usize>) -> PathBuf {
+        self.root.join(group_download_name(pane, remote, index))
     }
 }
 
-pub fn group_download_name(pane: u64, remote: &str) -> String {
+pub fn group_download_paths(input: &str) -> Result<Vec<&str>> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for path in input.lines().flat_map(|line| line.split('\r')) {
+        if !path.trim().is_empty() && seen.insert(path) {
+            validate_group_upload_path(path)?;
+            paths.push(path);
+        }
+    }
+    ensure!(
+        !paths.is_empty(),
+        "Enter at least one absolute remote file path"
+    );
+    Ok(paths)
+}
+
+pub fn group_download_name(pane: u64, remote: &str, index: Option<usize>) -> String {
     let leaf = remote.rsplit('/').next().unwrap_or_default();
-    let name = format!("pane-{pane}-{leaf}");
+    let prefix = match index {
+        Some(index) => format!("pane-{pane}-{index}"),
+        None => format!("pane-{pane}"),
+    };
+    let name = format!("{prefix}-{leaf}");
     if !leaf.is_empty() && valid_component(&name) {
         name
     } else {
-        format!("pane-{pane}.download")
+        format!("{prefix}.download")
     }
 }
 
@@ -68,14 +92,14 @@ mod tests {
     #[test]
     fn names_are_disjoint_and_restrict_the_local_file_to_one_component() {
         assert_eq!(
-            group_download_name(5, "/host/report.txt"),
+            group_download_name(5, "/host/report.txt", None),
             "pane-5-report.txt"
         );
         assert_eq!(
-            group_download_name(6, "/host/report.txt"),
+            group_download_name(6, "/host/report.txt", None),
             "pane-6-report.txt"
         );
-        assert_eq!(group_download_name(5, "/host/AUX"), "pane-5-AUX");
+        assert_eq!(group_download_name(5, "/host/AUX", None), "pane-5-AUX");
         for path in [
             "/host/a:b",
             "/host/a\\b",
@@ -83,12 +107,43 @@ mod tests {
             "/host/end. ",
             "/host/",
         ] {
-            assert_eq!(group_download_name(5, path), "pane-5.download");
+            assert_eq!(group_download_name(5, path, None), "pane-5.download");
         }
         assert_eq!(
-            group_download_name(5, &format!("/{}", "雪".repeat(255))),
+            group_download_name(5, &format!("/{}", "雪".repeat(255)), None),
             "pane-5.download"
         );
+    }
+
+    #[test]
+    fn lists_keep_remote_path_spelling_and_assign_distinct_local_names() -> Result<()> {
+        let paths = group_download_paths(
+            "/daily/Report.txt\r\n\r\n/weekly/report.txt\r/daily/Report.txt\n/weekly/spaced.txt ",
+        )?;
+        assert_eq!(
+            paths,
+            [
+                "/daily/Report.txt",
+                "/weekly/report.txt",
+                "/weekly/spaced.txt "
+            ]
+        );
+        for (offset, name) in [
+            "pane-5-1-Report.txt",
+            "pane-5-2-report.txt",
+            "pane-5-3.download",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                group_download_name(5, paths[offset], Some(offset + 1)),
+                name
+            );
+        }
+        assert!(group_download_paths("\r\n  \n").is_err());
+        assert!(group_download_paths("/daily/Report.txt\n../report.txt").is_err());
+        Ok(())
     }
 
     #[test]
@@ -99,13 +154,13 @@ mod tests {
         let first = GroupDownloadFolder::create(root.path())?;
         let second = GroupDownloadFolder::create(root.path())?;
         assert_ne!(first.path(), second.path());
-        let received = first.destination(3, "/report.txt");
+        let received = first.destination(3, "/report.txt", None);
         let mut staged = tempfile::NamedTempFile::new_in(first.path())?;
         staged.write_all(b"contents")?;
         staged
             .persist_noclobber(&received)
             .context("installing a complete file inside the pinned folder")?;
-        assert!(!second.destination(3, "/report.txt").exists());
+        assert!(!second.destination(3, "/report.txt", None).exists());
         let moved = root.path().join("moved");
         assert!(fs::rename(first.path(), &moved).is_err());
         let path = first.path().to_owned();

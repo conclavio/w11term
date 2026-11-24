@@ -89,7 +89,7 @@ try {
     $null = Wait-Until 'Witness is hidden by the roster filter' {
         Find-Element '1 selected host is hidden by the filter.'
     }
-    Click "Download file$ellipsis"
+    Click "Download files$ellipsis"
     $null = Wait-Until 'download review includes the four shown hosts' {
         (Find-Element 'Download from selected SSH hosts') -and
         (Find-Element $targets['Fetch East']) -and (Find-Element $targets['Fetch West']) -and
@@ -97,12 +97,12 @@ try {
         !(Find-Element $targets['Witness'])
     }
     Choose-Parent
-    Set-Field 'Remote file path' '../snapshot.bin'
+    Set-Field 'Remote file paths' '../snapshot.bin'
     $null = Wait-Until 'relative path cannot start a download' {
         $submit = Find-Element 'Download from 4 hosts' $button
         $submit -and !$submit.Current.IsEnabled
     }
-    Set-Field 'Remote file path' '/reports/snapshot.bin'
+    Set-Field 'Remote file paths' '/reports/snapshot.bin'
     $stale = $sessions | Where-Object label -eq 'Fetch Stale'
     $null = Control @('send-text','--pane',"$($stale.id)",'--no-paste','--base64','BA==')
     $token = Wait-Until 'the reviewed shell exits' { (Control @('events','--pane',"$($stale.id)")).restart_token }
@@ -126,13 +126,42 @@ try {
         throw 'The bytes were not saved under the expected pane IDs'
     }
     Click 'Back to host group'
+    (Wait-CheckBox $targets['Fetch Missing'] On).Toggle()
+    (Wait-CheckBox $targets['Fetch Stale'] On).Toggle()
+    $null = Wait-CheckBox $targets['Fetch Missing'] Off
+    $null = Wait-CheckBox $targets['Fetch Stale'] Off
+    Click "Download files$ellipsis"
+    Choose-Parent
+    Set-Field 'Remote file paths' ('/archive/snapshot.bin' + [Environment]::NewLine +
+        [Environment]::NewLine + '/reports/snapshot.bin' + [Environment]::NewLine + '/archive/snapshot.bin')
+    Click 'Download from 2 hosts'
+    $null = Wait-Until 'two distinct remote paths in the batch' { Find-Element '2 remote files' }
+    $eastSecond = "pane-$($panes['Fetch East'])-2-snapshot.bin"
+    $westFirst = "pane-$($panes['Fetch West'])-1-snapshot.bin"
+    $westSecond = "pane-$($panes['Fetch West'])-2-snapshot.bin"
+    Wait-Result "$($targets['Fetch East'])${dot}/archive/snapshot.bin${dot}Download failed${dot}"
+    Wait-Result "$($targets['Fetch East'])${dot}/reports/snapshot.bin${dot}Downloaded${dot}84000 bytes${dot}$eastSecond"
+    Wait-Result "$($targets['Fetch West'])${dot}/archive/snapshot.bin${dot}Downloaded${dot}13 bytes${dot}$westFirst"
+    Wait-Result "$($targets['Fetch West'])${dot}/reports/snapshot.bin${dot}Downloaded${dot}42000 bytes${dot}$westSecond"
+    $null = Wait-Until 'one failure and three completed files' {
+        Find-Element "3 files downloaded${dot}0 pending${dot}1 skipped, failed or cancelled"
+    }
+    $batchFolder = @(Get-ChildItem -LiteralPath $picked -Directory -Filter 'ssh-group-download-*' |
+        Where-Object FullName -ne $directories[0].FullName)
+    if ($batchFolder.Count -ne 1 -or
+        [IO.File]::ReadAllText((Join-Path $batchFolder[0].FullName $westFirst)) -ne 'archived west' -or
+        (Get-Item -LiteralPath (Join-Path $batchFolder[0].FullName $westSecond)).Length -ne 42000 -or
+        (Get-Item -LiteralPath (Join-Path $batchFolder[0].FullName $eastSecond)).Length -ne 84000) {
+        throw 'The multi-file download was not saved to distinct destinations'
+    }
+    Click 'Back to host group'
     Set-Field 'Host filter' 'Fetch East'
     $null = Wait-CheckBox $targets['Fetch East'] On
-    Click "Download file$ellipsis"
+    Click "Download files$ellipsis"
     Choose-Parent
     [IO.File]::WriteAllText($gate, '')
     $start = (Read-PeerTrace $reader).Length
-    Set-Field 'Remote file path' '/reports/cancel.bin'
+    Set-Field 'Remote file paths' '/reports/cancel.bin'
     Click 'Download from 1 host'
     $null = Wait-Until 'a second read is waiting in the cancelled batch' {
         $trace = Read-PeerTrace $reader

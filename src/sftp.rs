@@ -26,7 +26,7 @@ use tokio::{
 
 mod directory;
 mod group_download;
-pub use group_download::{GroupDownloadFolder, group_download_name};
+pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
 mod group_upload;
 pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_path};
 mod drop_source;
