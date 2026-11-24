@@ -1074,6 +1074,15 @@ impl Performer<'_> {
                 self.set_hyperlink(link);
             }
             OperatingSystemCommand::Unspecified(unspec) => {
+                if let [selector, body] = unspec.as_slice() {
+                    if selector == b"21" {
+                        self.perform_kitty_colors(body);
+                        return;
+                    }
+                }
+                if self.kitty_palette_stack(&unspec) {
+                    return;
+                }
                 if unspec.first().is_some_and(|part| part == b"440") {
                     if let Some(handler) = self.alert_handler.as_mut() {
                         handler.alert(Alert::W11termOsc440(unspec));
@@ -1284,7 +1293,9 @@ impl Performer<'_> {
                     };
                     match color {
                         ColorOrQuery::Query => {
-                            let value = *slot.field(&mut self.palette());
+                            let value = *slot
+                                .field(&mut self.palette())
+                                .expect("legacy dynamic color slot");
                             let response = OperatingSystemCommand::ChangeDynamicColors(
                                 number,
                                 vec![ColorOrQuery::Color(value)],

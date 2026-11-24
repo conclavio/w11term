@@ -34,6 +34,7 @@ mod image;
 mod iterm;
 mod keyboard;
 mod kitty;
+mod kitty_colors;
 mod mouse;
 mod palette;
 pub(crate) mod performer;
@@ -1176,11 +1177,14 @@ impl TerminalState {
     /// sequences we'll fork a copy of the palette at that time
     /// so that we can start tracking those changes.
     pub fn palette(&self) -> ColorPalette {
-        self.palette
+        let mut palette = self
+            .palette
             .effective
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| self.config.color_palette())
+            .unwrap_or_else(|| self.config.color_palette());
+        self.palette.resolve_cursor_colors(&mut palette);
+        palette
     }
 
     /// Edit the effective palette directly. Changes made through this reference

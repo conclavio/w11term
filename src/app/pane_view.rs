@@ -503,7 +503,12 @@ impl TerminalApp {
                 let offset = renderer.draw_preedit(ctx, &frame, &preedit.text, preedit.cursor)?;
                 crate::input::ime::position_after_draw(offset, measured.scale);
             }
-            visual_bell::draw(ctx, bell.get().visible, &mut bell_brush.borrow_mut());
+            visual_bell::draw(
+                ctx,
+                bell.get().visible,
+                frame.visual_bell_color.map(w11term::terminal::rgba),
+                &mut bell_brush.borrow_mut(),
+            );
             let window_mode = window_grid.get();
             if matches!(window_mode, WindowGrid::Terminal) {
                 if initial_grid

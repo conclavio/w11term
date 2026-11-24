@@ -87,7 +87,12 @@ impl TerminalApp {
     }
 }
 
-pub(super) fn draw(ctx: &DrawContext<'_>, visible: bool, brush: &mut Option<Brush>) {
+pub(super) fn draw(
+    ctx: &DrawContext<'_>,
+    visible: bool,
+    color: Option<w11term::terminal::Rgba>,
+    brush: &mut Option<Brush>,
+) {
     if ctx.device_changed() {
         *brush = None;
     }
@@ -102,7 +107,8 @@ pub(super) fn draw(ctx: &DrawContext<'_>, visible: bool, brush: &mut Option<Brus
         // The dark edge keeps the signal visible on light and dark backgrounds.
         brush.set_color(ColorF::new(0.16, 0.10, 0.02, 1.0));
         ctx.draw_rect(&bounds, brush, 4.0);
-        brush.set_color(ColorF::new(1.0, 0.73, 0.23, 1.0));
+        let [r, g, b, a] = color.unwrap_or([1.0, 0.73, 0.23, 1.0]);
+        brush.set_color(ColorF::new(r, g, b, a));
         ctx.draw_rect(&bounds, brush, 2.0);
     }
 }

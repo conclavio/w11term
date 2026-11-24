@@ -103,6 +103,10 @@ The original MIT license is preserved in `LICENSE.md`.
   restoring a slot keeps inheritance from the pane's current theme. A new
   transport drops the previous stack.
 
+- Kitty OSC 21 processes batched palette assignments, resets and queries. The
+  sibling vtparse crate retains its literal body within 16 KiB so a batch can
+  reach every palette index. OSC 30001 and 30101 use the xterm stack.
+
 - XTSAVE and XTRESTORE preserve supported DEC private modes, including the
   alternate-buffer selector and the mouse reporting and encoding modes. Saved
   values are scoped to the connection and cleared by full reset.

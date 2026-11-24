@@ -650,6 +650,7 @@ pub struct Snapshot {
     row_wraps: Vec<bool>,
     pub palette: ColorPalette,
     pub selection_colors: SelectionColors,
+    pub visual_bell_color: Option<SrgbaTuple>,
     pub cursor: CursorPosition,
     pub cursor_visible: bool,
     pub cols: usize,
@@ -900,6 +901,7 @@ impl Snapshot {
             row_wraps,
             palette,
             selection_colors: terminal.selection_color_overrides(),
+            visual_bell_color: terminal.visual_bell_color(),
             cursor,
             cursor_visible: offset == 0
                 && cursor.visibility == termwiz::surface::CursorVisibility::Visible,
@@ -1017,6 +1019,7 @@ impl Snapshot {
             )
             && self.palette == old.palette
             && self.selection_colors == old.selection_colors
+            && self.visual_bell_color == old.visual_bell_color
             && self.title == old.title
             && self.application_title() == old.application_title()
             && Arc::ptr_eq(&self.command_history, &old.command_history)

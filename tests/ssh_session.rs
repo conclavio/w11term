@@ -160,6 +160,7 @@ impl server::Handler for Peer {
                     "\x1bP2$t4/12\x1b\\\x1b[2$w",
                     "\x1b7\x1b[6G\x1b[5;0W\x1b[2$w\x1b[?5W\x1b[2$w\x1b8",
                     "\x1b[#P\x1b[#R\x1b[#Q\x1b[#R",
+                    "\x1b]21;cursor=#123456;cursor=?;x=?\x07",
                 )
                 .as_bytes(),
             )?;
@@ -330,6 +331,8 @@ async fn roundtrip(
         for expected in [b"\x1b[?1;1#Q", b"\x1b[?0;1#Q"] {
             assert_eq!(next(&mut observed, &session).await, Observed::Data(expected.to_vec()));
         }
+        assert_eq!(next(&mut observed, &session).await,
+            Observed::Data(b"\x1b]21;cursor=rgb:12/34/56;unknown=eA\x1b\\".to_vec()));
         let generation = session.events.shell_generation().expect("running shell");
         for (text, connection) in [
             ("stale input", generation + 1),
@@ -552,7 +555,9 @@ async fn roundtrip(
         let saved = echoed(&session, &mut output, b"\x1b]11;#123456\x07").await;
         let pushed = echoed(&session, &mut output, b"\x1b[#P").await;
         assert_eq!(pushed.generation, saved.generation);
-        let temporary = echoed(&session, &mut output, b"\x1b]11;#fedcba\x07").await;
+        let unchanged = echoed(&session, &mut output, b"\x1b]21;background=red;background=#123456\x07").await;
+        assert_eq!(unchanged.generation, saved.generation);
+        let temporary = echoed(&session, &mut output, b"\x1b]21;background=#fedcba\x07").await;
         assert_ne!(temporary.palette, saved.palette);
         let held = echoed(&session, &mut output, b"\x1b[?2026h\x1b[#Q").await;
         assert_eq!(held.generation, temporary.generation);

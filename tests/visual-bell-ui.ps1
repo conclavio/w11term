@@ -42,13 +42,15 @@ function Measure-TopEdge([int]$Pane, [string]$Marker) {
        Y = $cell.Y - [int][Math]::Round(11 * $scale)
        Height = [int][Math]::Ceiling(4 * $scale) }
 }
-function Has-Outline($Edge) {
+function Has-Outline($Edge, [switch]$Green) {
     $pixels = [CursorCellProbe]::ReadPixels($window,$window,$Edge.X,$Edge.Y,8,$Edge.Height)
     foreach ($pixel in $pixels) {
         $r = ($pixel -shr 16) -band 255
         $g = ($pixel -shr 8) -band 255
         $b = $pixel -band 255
-        if ($r -gt 185 -and $g -gt 105 -and $g -lt 220 -and $b -lt 100) { return $true }
+        if ($Green) {
+            if ($r -lt 80 -and $g -gt 190 -and $b -lt 125) { return $true }
+        } elseif ($r -gt 185 -and $g -gt 105 -and $g -lt 220 -and $b -lt 100) { return $true }
     }
     return $false
 }
@@ -110,6 +112,7 @@ try {
     Show-CursorWindow
     $before = (Control @('get-text','--pane',"$left")).generation
     $since = Bell-Cursor $left
+    $timer.Restart()
     Send-Sequence $left $bell
     $null = Wait-Until 'gold outline on the left pane only' {
         if (Has-Outline $rightEdge) { throw 'Bell drew on the focused neighbor' }
@@ -122,6 +125,14 @@ try {
     if ((Control @('get-text','--pane',"$left")).generation -ne $before) {
         throw 'Visual bell changed committed terminal contents'
     }
+    $null = Wait-Until 'the per-pane bell cooldown has elapsed' { $timer.ElapsedMilliseconds -ge 1050 }
+    Send-Sequence $left ($esc + ']21;visual_bell=#00e850' + $esc + '\' + $bell)
+    $null = Wait-Until 'application-set green outline on the left pane only' {
+        if (Has-Outline $rightEdge -Green) { throw 'Custom bell drew on the focused neighbor' }
+        Has-Outline $leftEdge -Green
+    }
+    $null = Wait-Until 'custom outline expires with idle output' { !(Has-Outline $leftEdge -Green) }
+    Wait-Focus $right
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

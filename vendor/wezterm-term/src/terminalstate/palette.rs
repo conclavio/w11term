@@ -5,7 +5,22 @@ use wezterm_escape_parser::osc::DynamicColorNumber;
 
 const STACK_CAPACITY: i64 = 10;
 
-type Assignments = HashMap<Slot, SrgbaTuple>;
+pub(super) type Assignments = HashMap<Slot, Assignment>;
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Assignment {
+    Fixed(SrgbaTuple),
+    Automatic,
+}
+
+impl Assignment {
+    pub(super) fn fixed(&self) -> Option<SrgbaTuple> {
+        match self {
+            Self::Fixed(color) => Some(*color),
+            Self::Automatic => None,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct PaletteStack {
@@ -88,6 +103,21 @@ pub(super) struct PaletteOverrides {
     pub(super) borrowed_mutably: bool,
 }
 
+impl PaletteOverrides {
+    pub(super) fn resolve_cursor_colors(&self, palette: &mut ColorPalette) {
+        if self.assigned.is_empty() {
+            return;
+        }
+        if self.assigned.get(&Slot::CursorBackground) == Some(&Assignment::Automatic) {
+            palette.cursor_bg = palette.foreground;
+            palette.cursor_border = palette.foreground;
+        }
+        if self.assigned.get(&Slot::CursorForeground) == Some(&Assignment::Automatic) {
+            palette.cursor_fg = palette.background;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 pub(super) enum Slot {
     Indexed(u8),
@@ -98,6 +128,7 @@ pub(super) enum Slot {
     CursorBorder,
     SelectionBackground,
     SelectionForeground,
+    VisualBell,
     ScrollbarThumb,
     Split,
 }
@@ -114,8 +145,8 @@ impl Slot {
         })
     }
 
-    pub(super) fn field(self, palette: &mut ColorPalette) -> &mut SrgbaTuple {
-        match self {
+    pub(super) fn field(self, palette: &mut ColorPalette) -> Option<&mut SrgbaTuple> {
+        Some(match self {
             Self::Indexed(index) => &mut palette.colors.0[index as usize],
             Self::Foreground => &mut palette.foreground,
             Self::Background => &mut palette.background,
@@ -126,7 +157,8 @@ impl Slot {
             Self::SelectionForeground => &mut palette.selection_fg,
             Self::ScrollbarThumb => &mut palette.scrollbar_thumb,
             Self::Split => &mut palette.split,
-        }
+            Self::VisualBell => return None,
+        })
     }
 }
 
@@ -137,13 +169,20 @@ impl TerminalState {
                 .palette
                 .assigned
                 .get(&Slot::SelectionForeground)
-                .copied(),
+                .and_then(Assignment::fixed),
             background: self
                 .palette
                 .assigned
                 .get(&Slot::SelectionBackground)
-                .copied(),
+                .and_then(Assignment::fixed),
         }
+    }
+
+    pub fn visual_bell_color(&self) -> Option<SrgbaTuple> {
+        self.palette
+            .assigned
+            .get(&Slot::VisualBell)
+            .and_then(Assignment::fixed)
     }
 
     pub(super) fn perform_palette_stack(&mut self, operation: PaletteOperation) {
@@ -185,8 +224,10 @@ impl TerminalState {
 
     pub(super) fn set_palette_slot(&mut self, slot: Slot, color: SrgbaTuple) {
         self.collect_palette_edits();
-        *slot.field(self.materialize_palette()) = color;
-        self.palette.assigned.insert(slot, color);
+        *slot
+            .field(self.materialize_palette())
+            .expect("palette color slot") = color;
+        self.palette.assigned.insert(slot, Assignment::Fixed(color));
     }
 
     pub(super) fn reset_palette_slots(&mut self, slots: impl Iterator<Item = Slot>) {
@@ -224,13 +265,20 @@ impl TerminalState {
             Slot::ScrollbarThumb,
             Slot::Split,
         ]) {
-            let value = *slot.field(current);
-            let default = *slot.field(&mut base);
-            if self.palette.assigned.get(&slot).copied().unwrap_or(default) != value {
+            let value = *slot.field(current).expect("palette color slot");
+            let default = *slot.field(&mut base).expect("palette color slot");
+            if self
+                .palette
+                .assigned
+                .get(&slot)
+                .and_then(Assignment::fixed)
+                .unwrap_or(default)
+                != value
+            {
                 if value == default {
                     self.palette.assigned.remove(&slot);
                 } else {
-                    self.palette.assigned.insert(slot, value);
+                    self.palette.assigned.insert(slot, Assignment::Fixed(value));
                 }
             }
         }
@@ -241,8 +289,10 @@ impl TerminalState {
             None
         } else {
             let mut merged = self.config.color_palette();
-            for (&slot, &value) in &self.palette.assigned {
-                *slot.field(&mut merged) = value;
+            for (&slot, assignment) in &self.palette.assigned {
+                if let (Some(field), Some(color)) = (slot.field(&mut merged), assignment.fixed()) {
+                    *field = color;
+                }
             }
             Some(merged)
         };
