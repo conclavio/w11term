@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
-[IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"command_palette":"F7","close_tab":"F6","find_tab":"F5"}}')
+[IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH, '{"shortcuts":{"command_palette":"F7","close_tab":"F6","find_tab":"F10"}}')
 $profiles = Join-Path $State 'profiles.json'
 $config = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).profiles
 $dot = ' ' + [char]0xb7 + ' '
@@ -576,21 +576,21 @@ try {
     Expect-Field 'Group command' ''
     (Field 'Group command').SetValue('overflow roster draft')
     Expect-Field 'Group command' 'overflow roster draft'
-    Press-Key 0x74
+    Press-Key 0x79
     Select-TabSearchResult 'WEST' 'West'
     Wait-Focus $west
-    Press-Key 0x74
+    Press-Key 0x79
     (Field 'Search tabs').SetValue('a tab that does not exist')
     $null = Wait-Until 'the tab search reports an empty result' { Find-Element 'No matching tabs' }
     Press-Key 27
     $null = Wait-Until 'Escape closes tab search' { !(Find-Element 'Search tabs' $edit) }
     Wait-Focus $west
 
-    Choose-GroupCommand ("Find tab$([char]0x2026)    F5")
+    Choose-GroupCommand ("Find tab$([char]0x2026)    F10")
     Select-TabSearchResult 'TAB 10' 'SSH host group (2)'
     Expect-Field 'Group command' 'overflow roster draft'
     if (@((Control @('list')).sessions).Count -ne 4) { throw 'Navigating the tab picker changed the SSH sessions' }
-    Press-Key 0x74
+    Press-Key 0x79
     Select-TabSearchResult $eastTab $eastTab
     Expect-Field 'Group command' 'retained roster draft'
     Click $manage
