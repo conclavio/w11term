@@ -17,12 +17,17 @@ pub enum Action {
         pane: u64,
     },
     CloseDiff,
+    SetReference {
+        revision: u64,
+        pane: Option<u64>,
+    },
     DiffReady {
         revision: u64,
         result: Result<diff::Difference, &'static str>,
     },
     Ready {
         revision: u64,
+        preferred: Option<u64>,
         comparison: Result<Comparison, &'static str>,
     },
 }
@@ -38,6 +43,7 @@ struct Open {
     comparison: Option<Result<Comparison, &'static str>>,
     feedback: Option<&'static str>,
     diff: Option<diff::Panel>,
+    updating_reference: bool,
 }
 
 impl State {
@@ -64,11 +70,13 @@ struct Sample {
     output: report::Output,
 }
 
+#[derive(Clone)]
 struct Unavailable {
     pane: u64,
     label: String,
 }
 
+#[derive(Clone)]
 struct Group {
     members: Vec<Member>,
     exit_code: i32,
@@ -95,9 +103,12 @@ pub struct FollowUp {
     panes: BTreeSet<u64>,
 }
 
+#[derive(Clone)]
 pub struct Comparison {
     compared: usize,
+    largest: Option<u64>,
     reference: Option<u64>,
+    preferred: Option<u64>,
     groups: Vec<Group>,
     unavailable: Vec<Unavailable>,
 }
@@ -167,7 +178,7 @@ fn first_difference(baseline: &str, text: &str) -> Option<usize> {
 }
 
 impl Comparison {
-    fn build(samples: Vec<Sample>, unavailable: Vec<Unavailable>) -> Self {
+    fn build(samples: Vec<Sample>, unavailable: Vec<Unavailable>, preferred: Option<u64>) -> Self {
         let compared = samples.len();
         let mut grouped: Vec<Vec<usize>> = Vec::new();
         let mut exact = HashMap::new();
@@ -184,23 +195,11 @@ impl Comparison {
             .enumerate()
             .max_by_key(|(index, items)| (items.len(), Reverse(*index)))
             .map(|(index, _)| index);
-        let reference = baseline.map(|index| samples[grouped[index][0]].member.pane);
+        let largest = baseline.map(|index| samples[grouped[index][0]].member.pane);
         let mut groups = Vec::with_capacity(grouped.len());
-        for (index, members) in grouped.iter().enumerate() {
+        for members in &grouped {
             let sample = &samples[members[0]];
             let text = sample.output.text();
-            let note = match baseline {
-                Some(_) if grouped.len() == 1 => None,
-                Some(baseline) if baseline == index => Some("Largest result group".into()),
-                Some(baseline) => {
-                    let reference = samples[grouped[baseline][0]].output.text();
-                    Some(match first_difference(reference, text) {
-                        Some(line) => format!("First different line from largest group · {line}"),
-                        None => "Same output as largest group".into(),
-                    })
-                }
-                None => None,
-            };
             groups.push(Group {
                 members: members
                     .iter()
@@ -209,16 +208,59 @@ impl Comparison {
                 exit_code: sample.exit_code,
                 size: text.len(),
                 preview: preview(text),
-                note,
+                note: None,
                 output: sample.output.clone(),
             });
         }
         groups.sort_by_key(|group| group.members.len());
-        Self {
+        let mut comparison = Self {
             compared,
-            reference,
+            largest,
+            reference: None,
+            preferred: None,
             groups,
             unavailable,
+        };
+        comparison.set_reference(preferred);
+        comparison
+    }
+
+    fn set_reference(&mut self, preferred: Option<u64>) {
+        let selected = preferred.and_then(|pane| {
+            let group = self
+                .groups
+                .iter()
+                .find(|group| group.members.iter().any(|member| member.pane == pane))?;
+            Some((pane, group.members[0].pane))
+        });
+        self.preferred = selected.map(|(pane, _)| pane);
+        self.reference = selected.map(|(_, group)| group).or(self.largest);
+        let Some(reference) = self.reference.and_then(|pane| self.group(pane)) else {
+            return;
+        };
+        let pane = reference.members[0].pane;
+        let output = reference.output.clone();
+        let manual = self.preferred.is_some();
+        let reference_label = if manual {
+            "selected reference"
+        } else {
+            "largest group"
+        };
+        let show_notes = self.groups.len() > 1 || manual;
+        for group in &mut self.groups {
+            group.note = show_notes.then(|| {
+                if group.members[0].pane == pane {
+                    return if manual {
+                        "Selected reference group".into()
+                    } else {
+                        "Largest result group".into()
+                    };
+                }
+                match first_difference(output.text(), group.output.text()) {
+                    Some(line) => format!("First different line from {reference_label} · {line}"),
+                    None => format!("Same output as {reference_label}"),
+                }
+            });
         }
     }
 
@@ -307,7 +349,9 @@ impl TerminalApp {
             Action::Refresh => {
                 if self.host_group_mut(id).is_some_and(|page| {
                     page.comparison.open.as_ref().is_some_and(|open| {
-                        open.submission == submission_id && open.comparison.is_some()
+                        open.submission == submission_id
+                            && open.comparison.is_some()
+                            && !open.updating_reference
                     })
                 }) {
                     self.begin_host_group_comparison(id, submission_id, ctx);
@@ -333,6 +377,9 @@ impl TerminalApp {
             Action::OpenDiff { revision, pane } => {
                 self.open_group_diff(id, submission_id, revision, pane, ctx);
             }
+            Action::SetReference { revision, pane } => {
+                self.set_group_comparison_reference(id, submission_id, revision, pane, ctx);
+            }
             Action::CloseDiff => {
                 if let Some(page) = self.host_group_mut(id)
                     && let Some(open) = page.comparison.open.as_mut()
@@ -353,6 +400,7 @@ impl TerminalApp {
             }
             Action::Ready {
                 revision,
+                preferred,
                 comparison,
             } => {
                 if let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
@@ -360,7 +408,21 @@ impl TerminalApp {
                     && let Some(open) = &mut page.comparison.open
                     && open.submission == submission_id
                 {
-                    open.comparison = Some(comparison);
+                    let changing = std::mem::take(&mut open.updating_reference);
+                    open.feedback = match &comparison {
+                        Err(message) if changing => Some(*message),
+                        Ok(comparison) if preferred.is_some() && comparison.preferred.is_none() => {
+                            Some(if comparison.reference.is_some() {
+                                "The selected host no longer has a comparable result. Using the largest group."
+                            } else {
+                                "The selected host no longer has a comparable result."
+                            })
+                        }
+                        _ => None,
+                    };
+                    if !changing || comparison.is_ok() {
+                        open.comparison = Some(comparison);
+                    }
                 }
             }
             _ => {}
@@ -379,6 +441,12 @@ impl TerminalApp {
         let Some(submission) = page.viewed_submission(submission_id) else {
             return;
         };
+        let preferred = page
+            .comparison
+            .open
+            .as_ref()
+            .filter(|open| open.submission == submission_id)
+            .and_then(|open| open.comparison.as_ref()?.as_ref().ok()?.preferred);
         let mut samples = Vec::new();
         let mut unavailable = Vec::new();
         for delivery in &submission.results {
@@ -400,14 +468,67 @@ impl TerminalApp {
             comparison: None,
             feedback: None,
             diff: None,
+            updating_reference: false,
         }));
         let revision = state.revision;
+        Self::queue_comparison(id, submission_id, revision, preferred, ctx, move || {
+            Comparison::build(samples, unavailable, preferred)
+        });
+    }
+
+    fn set_group_comparison_reference(
+        &mut self,
+        id: TabId,
+        submission: u64,
+        revision: u64,
+        preferred: Option<u64>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some(page) = self.host_group_mut(id) else {
+            return;
+        };
+        let state = &mut page.comparison;
+        if state.revision != revision {
+            return;
+        }
+        let Some(open) = state.open.as_mut().filter(|open| {
+            open.submission == submission && !open.updating_reference && open.diff.is_none()
+        }) else {
+            return;
+        };
+        let Some(Ok(comparison)) = &open.comparison else {
+            return;
+        };
+        if preferred == comparison.preferred
+            || preferred.is_some_and(|pane| comparison.group(pane).is_none())
+        {
+            return;
+        }
+        let mut comparison = comparison.clone();
+        open.updating_reference = true;
+        open.feedback = None;
+        state.revision += 1;
+        Self::queue_comparison(id, submission, state.revision, preferred, ctx, move || {
+            comparison.set_reference(preferred);
+            comparison
+        });
+    }
+
+    fn queue_comparison(
+        id: TabId,
+        submission_id: u64,
+        revision: u64,
+        preferred: Option<u64>,
+        ctx: &ComponentContext<Self>,
+        build: impl FnOnce() -> Comparison + Send + 'static,
+    ) {
         let ready = move |comparison| {
             Message::HostGroup(super::Action::Compare(
                 id,
                 submission_id,
                 Action::Ready {
                     revision,
+                    preferred,
                     comparison,
                 },
             ))
@@ -417,7 +538,7 @@ impl TerminalApp {
                 let comparison = if cancel.is_cancelled() {
                     Err("Comparison cancelled.")
                 } else {
-                    Ok(Comparison::build(samples, unavailable))
+                    Ok(build())
                 };
                 ready(comparison)
             },
@@ -440,19 +561,32 @@ impl TerminalApp {
             return Some(diff.view(submission.content.label(), action, ctx));
         }
         let mut rows = Vec::new();
+        let mut reset_reference = View::empty();
         let status = match &open.comparison {
             Some(Ok(comparison)) => {
                 let targets = self.host_group_targets();
                 let visible = page.visible_comparison_addresses(&targets);
+                let revision = page.comparison.revision;
+                if comparison.preferred.is_some() {
+                    reset_reference = Button::new()
+                        .is_enabled(!open.updating_reference)
+                        .on_click(ctx.callback(move |_| {
+                            action(Action::SetReference {
+                                revision,
+                                pane: None,
+                            })
+                        }))
+                        .content("Use largest group");
+                }
                 for group in &comparison.groups {
                     let pane = group.members[0].pane;
-                    let revision = page.comparison.revision;
                     let difference = if comparison
                         .reference
                         .is_some_and(|reference| reference != pane)
                     {
                         Button::new()
                             .automation_name(format!("View differences for pane {pane}"))
+                            .is_enabled(!open.updating_reference)
                             .on_click(
                                 ctx.callback(move |_| action(Action::OpenDiff { revision, pane })),
                             )
@@ -460,6 +594,21 @@ impl TerminalApp {
                     } else {
                         View::empty()
                     };
+                    let choose_reference =
+                        if comparison.preferred.is_none() || comparison.reference != Some(pane) {
+                            Button::new()
+                                .automation_name(format!("Use pane {pane} as comparison reference"))
+                                .is_enabled(!open.updating_reference)
+                                .on_click(ctx.callback(move |_| {
+                                    action(Action::SetReference {
+                                        revision,
+                                        pane: Some(pane),
+                                    })
+                                }))
+                                .content("Use as reference")
+                        } else {
+                            View::empty()
+                        };
                     let follow_up = submission.content.command().map(|_| FollowUp {
                         revision,
                         group: pane,
@@ -467,7 +616,17 @@ impl TerminalApp {
                     });
                     rows.push(KeyedView::new(
                         format!("group-{pane}"),
-                        self.comparison_group(id, submission_id, group, follow_up, difference, ctx),
+                        self.comparison_group(
+                            id,
+                            submission_id,
+                            group,
+                            follow_up,
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(8.0)
+                                .children((difference, choose_reference)),
+                            ctx,
+                        ),
                     ));
                 }
                 if !comparison.unavailable.is_empty() {
@@ -486,7 +645,11 @@ impl TerminalApp {
                         ));
                     }
                 }
-                comparison.caption()
+                if open.updating_reference {
+                    "Updating comparison reference…".into()
+                } else {
+                    comparison.caption()
+                }
             }
             Some(Err(message)) => (*message).into(),
             None => "Comparing command results…".into(),
@@ -521,9 +684,12 @@ impl TerminalApp {
                                     .on_click(ctx.callback(move |_| action(Action::Back)))
                                     .content("Back to results"),
                                 Button::new()
-                                    .is_enabled(open.comparison.is_some())
+                                    .is_enabled(
+                                        open.comparison.is_some() && !open.updating_reference,
+                                    )
                                     .on_click(ctx.callback(move |_| action(Action::Refresh)))
                                     .content("Refresh comparison"),
+                                reset_reference,
                             )),
                     )),
                     ScrollViewer::new()
@@ -539,7 +705,7 @@ impl TerminalApp {
         submission: u64,
         group: &Group,
         follow_up: Option<FollowUp>,
-        difference: View,
+        reference_actions: View,
         ctx: &ViewContext<Self>,
     ) -> View {
         let count = group.members.len();
@@ -606,7 +772,7 @@ impl TerminalApp {
                     }))
                     .content("View full output")
             }),
-            difference,
+            reference_actions,
             follow_up,
             StackPanel::new().spacing(3.0).keyed_children(members),
         ))
@@ -681,9 +847,10 @@ mod tests {
             revision: 2,
             open: Some(Box::new(Open {
                 submission: 1,
-                comparison: Some(Ok(Comparison::build(samples, Vec::new()))),
+                comparison: Some(Ok(Comparison::build(samples, Vec::new(), None))),
                 feedback: None,
                 diff: None,
+                updating_reference: false,
             })),
         };
         let offer = FollowUp {
@@ -734,7 +901,7 @@ mod tests {
             .iter()
             .map(|item| sample(item, |_| None).unwrap())
             .collect();
-        let results = Comparison::build(samples, Vec::new());
+        let results = Comparison::build(samples, Vec::new(), None);
         assert_eq!(
             results.caption(),
             "3 distinct results · 4 hosts compared · 0 pending or unavailable"
@@ -800,12 +967,54 @@ mod tests {
                 sample(&b, |link| retained(link, "same preview\nsecond tail")).unwrap(),
             ],
             Vec::new(),
+            None,
         );
         assert_eq!(results.groups.len(), 2);
         assert_eq!(
             results.groups[1].note.as_deref(),
             Some("First different line from largest group · 2")
         );
+    }
+
+    #[test]
+    fn chosen_host_remains_the_reference_when_its_group_gains_an_earlier_member() {
+        let build = |entries: &[(u64, &str)], preferred| {
+            let samples = entries
+                .iter()
+                .map(|&(pane, text)| {
+                    sample(&completed(pane, Some(0), capture(text, false)), |_| None).unwrap()
+                })
+                .collect();
+            Comparison::build(samples, Vec::new(), preferred)
+        };
+        let mut results = build(&[(1, "common"), (2, "common"), (3, "outlier")], None);
+        assert_eq!(results.reference, Some(1));
+        results.set_reference(Some(3));
+        assert_eq!(results.reference, Some(3));
+        assert_eq!(
+            results.group(3).unwrap().note.as_deref(),
+            Some("Selected reference group")
+        );
+        assert_eq!(
+            results.group(1).unwrap().note.as_deref(),
+            Some("First different line from selected reference · 1")
+        );
+        let mut refreshed = build(
+            &[(1, "common"), (2, "common"), (4, "outlier"), (3, "outlier")],
+            results.preferred,
+        );
+        assert_eq!(refreshed.preferred, Some(3));
+        assert_eq!(refreshed.reference, Some(4));
+        refreshed.set_reference(None);
+        assert_eq!(refreshed.reference, Some(1));
+        assert!(refreshed.preferred.is_none());
+
+        let expired = build(&[(1, "common"), (2, "different")], Some(3));
+        assert_eq!(expired.reference, Some(1));
+        assert!(expired.preferred.is_none());
+        let unavailable = build(&[], Some(3));
+        assert!(unavailable.reference.is_none());
+        assert!(unavailable.preferred.is_none());
     }
 
     #[test]

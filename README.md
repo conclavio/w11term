@@ -141,6 +141,8 @@ Choose **Compare results…** to group the viewed submission by exact captured o
 
 Choose **View differences** on a result to see added and removed lines against the reference group with original line numbers and both exit codes. Large differences show a bounded excerpt. Use **View full output** from the comparison to inspect a longer result in its command history.
 
+Choose **Use as reference** on a result group when a particular host is the expected baseline. Refresh keeps that choice while the host still belongs to a comparable group. **Use largest group** restores automatic selection.
+
 Choose **Prepare follow-up** on a result group to return to the roster with the original command in the editor and that group’s visible, matching panes checked. The button shows how many hosts are in scope when the roster excludes some members. Edit the draft if needed, then use **Send to _n_ hosts** when the intended shells are ready. **Restore draft** brings back the previous draft, roster filter, and checked hosts.
 
 While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its selected hosts that still report the matching command as running. The result shows Ctrl+C delivery and the command’s eventual exit status separately. w11term uses each pane’s current keyboard mode.

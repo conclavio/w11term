@@ -246,11 +246,9 @@ impl TerminalApp {
         if state.revision != revision {
             return;
         }
-        let Some(open) = state
-            .open
-            .as_mut()
-            .filter(|open| open.submission == submission && open.diff.is_none())
-        else {
+        let Some(open) = state.open.as_mut().filter(|open| {
+            open.submission == submission && open.diff.is_none() && !open.updating_reference
+        }) else {
             return;
         };
         let Some(Ok(comparison)) = &open.comparison else {
@@ -263,10 +261,14 @@ impl TerminalApp {
         else {
             return;
         };
+        let reference_member = comparison
+            .preferred
+            .and_then(|pane| before.members.iter().find(|member| member.pane == pane))
+            .unwrap_or(&before.members[0]);
         open.diff = Some(Panel {
             reference: format!(
                 "Reference · {} · Exit {}",
-                before.members[0].name, before.exit_code
+                reference_member.name, before.exit_code
             ),
             selected: format!(
                 "Selected · {} · Exit {}",
