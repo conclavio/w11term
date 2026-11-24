@@ -540,6 +540,28 @@ try {
             (Find-Element "Removed line 1${dot}east-accepted both") -and
             (Find-Element "Added line 1${dot}east-accepted while-slow")
     }
+    Click 'Back to results'
+    Click ('Compare runs' + [char]0x2026)
+    $null = Wait-Until 'group run comparison opens' { Find-Element 'SSH group run comparison' }
+    Select-ComboValue 'Earlier group run' "Run 1${dot}one"
+    Click 'Compare runs'
+    $null = Wait-Until 'the comparison separates hosts only in the current run' {
+        (Find-Element "1 changed${dot}0 unchanged${dot}0 earlier only${dot}1 current only${dot}0 unavailable") -and
+            (Find-Element "$westName${dot}Current run only")
+    }
+    Select-ComboValue 'Earlier group run' "Run 2${dot}both"
+    Click 'Compare runs'
+    $overviewSummary = "1 changed${dot}0 unchanged${dot}0 earlier only${dot}0 current only${dot}1 unavailable"
+    $null = Wait-Until 'the comparison separates an unavailable shared host from changed output' {
+        (Find-Element $overviewSummary) -and (Find-Element "$eastName${dot}Output changed") -and
+            (Find-Element "$westName${dot}Comparison unavailable") -and
+            !(Find-Element "View run differences for pane $west" $button)
+    }
+    Click "View run differences for pane $east"
+    $null = Wait-Until 'the group overview opens the same pane diff' {
+        (Find-Element 'SSH output across runs') -and (Find-Element 'Back to run overview' $button) -and
+            (Find-Element "Added line 1${dot}east-accepted while-slow")
+    }
     Click ('Save full run differences' + [char]0x2026)
     $dialog = Wait-Until 'owned run differences save dialog' { Find-OwnedDialog 'Save SSH group differences' }
     $null = Wait-Until 'save the cross-run differences' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -549,6 +571,10 @@ try {
         $diff = [IO.File]::ReadAllText($runDiffPath)
         $diff.Contains("Run 2${dot}both${dot}Exit 0") -and $diff.Contains("Run 3${dot}while-slow${dot}Exit 0") -and
             $diff.Contains('east-report-tail') -and ([regex]::Matches($diff, 'east-report-line')).Count -eq 35
+    }
+    Click 'Back to run overview'
+    $null = Wait-Until 'the overview preserves the baseline and classifications' {
+        (Find-Element 'SSH group run comparison') -and (Find-Element $overviewSummary)
     }
     Click 'Back to results'
     $null = Wait-Until 'the cross-run comparison returns to the current submission' {

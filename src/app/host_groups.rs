@@ -2682,6 +2682,16 @@ impl TerminalApp {
                                 ))
                             }))
                             .content("Compare results…"),
+                        Button::new()
+                            .is_enabled(index > 0)
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(Action::Compare(
+                                    id,
+                                    submission_id,
+                                    compare::Action::RunOverview(compare::RunOverviewAction::Open),
+                                ))
+                            }))
+                            .content("Compare runs…"),
                         save(
                             text_export::GROUP_JSON_LABEL,
                             text_export::GroupReportFormat::Json,

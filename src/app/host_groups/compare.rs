@@ -3,7 +3,9 @@ use std::{cmp::Reverse, collections::HashMap};
 use wezterm_term::CompletedCommand;
 
 mod diff;
+mod overview;
 mod runs;
+pub use overview::Action as RunOverviewAction;
 pub use runs::Action as RunDiffAction;
 
 const PREVIEW_BYTES: usize = 1024;
@@ -23,6 +25,7 @@ pub enum Action {
         revision: u64,
     },
     Runs(RunDiffAction),
+    RunOverview(RunOverviewAction),
     SetReference {
         revision: u64,
         pane: Option<u64>,
@@ -43,6 +46,7 @@ pub(super) struct State {
     revision: u64,
     open: Option<Box<Open>>,
     runs: Option<Box<runs::Open>>,
+    overview: Option<Box<overview::Open>>,
 }
 
 struct Open {
@@ -55,12 +59,13 @@ struct Open {
 
 impl State {
     pub(super) fn is_open(&self) -> bool {
-        self.open.is_some() || self.runs.is_some()
+        self.open.is_some() || self.runs.is_some() || self.overview.is_some()
     }
 
     pub(super) fn close(&mut self) {
         self.open = None;
         self.runs = None;
+        self.overview = None;
     }
 }
 
@@ -360,6 +365,9 @@ impl TerminalApp {
     ) {
         match action {
             Action::Runs(action) => self.handle_group_run_diff(id, submission_id, action, ctx),
+            Action::RunOverview(action) => {
+                self.handle_group_run_overview(id, submission_id, action, ctx)
+            }
             Action::Open if self.host_group_command_target() == Some(id) => {
                 self.begin_host_group_comparison(id, submission_id, ctx);
             }
@@ -574,6 +582,9 @@ impl TerminalApp {
     ) -> Option<View> {
         if let Some(open) = &page.comparison.runs {
             return open.view(id, page, self.export.pending.is_none(), ctx);
+        }
+        if let Some(open) = &page.comparison.overview {
+            return open.view(id, page, ctx);
         }
         let open = page.comparison.open.as_ref()?;
         let submission_id = open.submission;

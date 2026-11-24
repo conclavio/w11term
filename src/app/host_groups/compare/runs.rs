@@ -38,10 +38,10 @@ struct Pair {
 }
 
 #[derive(Clone)]
-struct Side {
+pub(super) struct Side {
     heading: String,
-    exit_code: i32,
-    output: report::Output,
+    pub(super) exit_code: i32,
+    pub(super) output: report::Output,
 }
 
 fn earlier_runs<'a>(
@@ -186,7 +186,11 @@ impl TerminalApp {
         }
     }
 
-    fn capture_run_side(&self, run: &Submission, row: &Delivery) -> Result<Side, String> {
+    pub(super) fn capture_run_side(
+        &self,
+        run: &Submission,
+        row: &Delivery,
+    ) -> Result<Side, String> {
         let (exit_code, _, output) = capture_output(row, |link| {
             self.history_frame(row.target.pane)?
                 .command_for_link(link)
@@ -265,20 +269,37 @@ impl TerminalApp {
                 return;
             }
         };
-        let before = pair.earlier.output.clone();
-        let after = pair.current.output.clone();
+        build_diff(tab, run, revision, &pair, ctx);
         open.comparison = Some(pair);
-        let ready = move |result| message(tab, run, Action::Ready { revision, result });
-        ctx.spawn_background_with_rejection(
-            move |cancel| {
-                if cancel.is_cancelled() {
-                    ready(Err("Output comparison cancelled."))
-                } else {
-                    ready(Ok(diff::Difference::build(before.text(), after.text())))
-                }
-            },
-            ready(Err("Could not start the output comparison.")),
-        );
+    }
+
+    pub(super) fn open_overview_run_diff(
+        &mut self,
+        tab: TabId,
+        run: u64,
+        baseline: u64,
+        pane: u64,
+        (earlier, current): (Side, Side),
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some(page) = self.host_group_mut(tab) else {
+            return;
+        };
+        page.comparison.revision += 1;
+        let revision = page.comparison.revision;
+        let comparison = Pair {
+            earlier,
+            current,
+            result: None,
+        };
+        build_diff(tab, run, revision, &comparison, ctx);
+        page.comparison.runs = Some(Box::new(Open {
+            run,
+            pane,
+            baseline: Some(baseline),
+            comparison: Some(comparison),
+            feedback: None,
+        }));
     }
 
     fn save_group_run_diff(
@@ -337,6 +358,56 @@ impl TerminalApp {
     }
 }
 
+fn build_diff(
+    tab: TabId,
+    run: u64,
+    revision: u64,
+    pair: &Pair,
+    ctx: &ComponentContext<TerminalApp>,
+) {
+    let before = pair.earlier.output.clone();
+    let after = pair.current.output.clone();
+    let ready = move |result| message(tab, run, Action::Ready { revision, result });
+    ctx.spawn_background_with_rejection(
+        move |cancel| {
+            if cancel.is_cancelled() {
+                ready(Err("Output comparison cancelled."))
+            } else {
+                ready(Ok(diff::Difference::build(before.text(), after.text())))
+            }
+        },
+        ready(Err("Could not start the output comparison.")),
+    );
+}
+
+pub(super) fn baseline_picker(
+    choices: &[&Submission],
+    baseline: Option<u64>,
+    choose: impl Fn(Option<u64>) -> Message + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let chosen = baseline.and_then(|id| choices.iter().position(|run| run.id == id));
+    let ids: Vec<_> = choices.iter().map(|run| run.id).collect();
+    ComboBox::new()
+        .automation_name("Earlier group run")
+        .items_source(
+            std::iter::once("Choose an earlier run".to_owned()).chain(
+                choices
+                    .iter()
+                    .map(|run| format!("Run {} · {}", run.id, run.content.label())),
+            ),
+        )
+        .selected_index(Some(chosen.map_or(0, |index| index + 1)))
+        .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+            let baseline = index
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| ids.get(i))
+                .copied();
+            choose(baseline)
+        }))
+        .into()
+}
+
 impl Open {
     pub(super) fn view(
         &self,
@@ -355,27 +426,15 @@ impl Open {
         let choices: Vec<_> = earlier_runs(page, current, self.pane)
             .map(|(earlier, _)| earlier)
             .collect();
-        let chosen = self
+        let baseline = self
             .baseline
-            .and_then(|baseline| choices.iter().position(|run| run.id == baseline));
-        let ids: Vec<_> = choices.iter().map(|run| run.id).collect();
-        let picker = ComboBox::new()
-            .automation_name("Earlier group run")
-            .items_source(
-                std::iter::once("Choose an earlier run".to_owned()).chain(
-                    choices
-                        .iter()
-                        .map(|run| format!("Run {} · {}", run.id, run.content.label())),
-                ),
-            )
-            .selected_index(Some(chosen.map_or(0, |index| index + 1)))
-            .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                let baseline = index
-                    .and_then(|i| i.checked_sub(1))
-                    .and_then(|i| ids.get(i))
-                    .copied();
-                message(tab, run, Action::Choose { revision, baseline })
-            }));
+            .filter(|id| choices.iter().any(|run| run.id == *id));
+        let picker = baseline_picker(
+            &choices,
+            baseline,
+            move |baseline| message(tab, run, Action::Choose { revision, baseline }),
+            ctx,
+        );
         let heading = |value| {
             TextBlock::new()
                 .text(value)
@@ -405,7 +464,11 @@ impl Open {
                 false,
             )
         };
-        let baseline = chosen.and(self.baseline);
+        let back = if page.comparison.overview.is_some() {
+            "Back to run overview"
+        } else {
+            "Back to results"
+        };
         let comparing = self
             .comparison
             .as_ref()
@@ -432,7 +495,7 @@ impl Open {
                                     .on_click(ctx.callback(move |_| {
                                         message(tab, run, Action::Back { revision })
                                     }))
-                                    .content("Back to results"),
+                                    .content(back),
                                 Button::new()
                                     .is_enabled(baseline.is_some() && !comparing)
                                     .on_click(ctx.callback(move |_| {

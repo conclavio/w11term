@@ -211,6 +211,8 @@ Choose **View differences** on a result to see added and removed lines against t
 
 Use **Compare with earlier run…** on a completed host result to compare the same pane and SSH address across two retained runs. Pick the earlier run and choose **Compare output**. Both sides need complete output and a reported exit code. The view shows the two run IDs, command labels, and exit codes. Choose **Save full run differences…** to export the complete line changes.
 
+Use **Compare runs…** to see those changes across the entire group. The overview separates changes in output and exit status, hosts in one run only, and unavailable comparisons. Turn on **Show unchanged hosts** to include identical results. Choose **Compare runs** again to refresh the captures. Open **View differences** on a comparable host for the detailed diff and return to the same overview when finished.
+
 Choose **Use as reference** on a result group when a particular host is the expected baseline. Refresh keeps that choice while the host still belongs to a comparable group. **Use largest group** restores automatic selection.
 
 In the diff view, choose **Save full differences…** to write a UTF-8 report of the current comparison. It includes the command, both hosts and exit codes, and changed lines at full length. If the changed sections are too large to align, the report includes both full unmatched sections in source order.
