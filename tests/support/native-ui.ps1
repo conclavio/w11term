@@ -202,7 +202,7 @@ function Open-Palette([string]$Command) {
     Press-Key 0x76 # F7 in the fixture's keymap
     Wait-PickerEditor 'Search commands' "F7 for '$Command'"
 }
-function Run-Palette([string]$Command) {
+function Run-Palette([string]$Command, [switch]$Enter) {
     $field = Open-Palette $Command
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
     # UI Automation can expose the button name while WinUI is replacing its
@@ -213,7 +213,7 @@ function Run-Palette([string]$Command) {
             $provider = $null
             if ($row -and $row.Current.IsEnabled -and
                 $row.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$provider)) {
-                $provider.Invoke()
+                if ($Enter) { Press-Key 13 } else { $provider.Invoke() }
                 return $true
             }
         } catch {

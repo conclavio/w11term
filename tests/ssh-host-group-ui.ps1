@@ -759,7 +759,7 @@ try {
             (Find-Element '1 selected host is hidden by the filter.')
     }
     Select-ComboValue $hostStateFilter 'Alternate screen'
-    Click $copyRoster
+    Run-Palette 'Copy shown SSH roster'
     $null = Wait-Until 'only the host shown by the state filter is copied' {
         $report = Read-ClipboardFixture
         (Find-Element 'Copied roster with 1 host') -and $report -and

@@ -29,8 +29,12 @@ function Wait-Reconnect([int]$Pane, [int]$Generation) {
         (Get-Session $Pane).connection_generation -gt $Generation
     }
 }
-function Open-Review {
-    Click "Disconnect selected$ellipsis"
+function Open-Review([switch]$Palette) {
+    if ($Palette) {
+        Run-Palette 'Review disconnect for selected SSH hosts' -Enter
+    } else {
+        Click "Disconnect selected$ellipsis"
+    }
     $null = Wait-Until 'review lists only the two visible checked hosts' {
         (Find-Element $eastName) -and (Find-Element $westName) -and !(Find-Element $witnessName) -and
             (Find-Element 'Disconnect 2 SSH shells' $button)
@@ -44,6 +48,13 @@ try {
     $null = Wait-Until 'the control pipe' {
         Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json")
     }
+    $search = Open-Palette 'roster commands outside a group'
+    $search.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Copy shown SSH roster')
+    $null = Wait-Until 'roster actions remain unavailable on the terminal tab' {
+        Find-Element 'No matching commands'
+    }
+    Press-Key 27
+    $null = Wait-Until 'command palette closes on Escape' { !(Find-Element 'Search commands' $edit) }
     Run-Palette "Open SSH group${dot}Disconnect review"
     $sessions = Wait-Until 'all three SSH panes connected' {
         $live = @((Control @('list')).sessions | Where-Object connection_generation -gt 0 | Where-Object label -ne 'Terminal lab')
@@ -68,7 +79,7 @@ try {
     $null = Wait-CheckBox $eastName On
     if ((Get-ExitToken $east) -or (Get-ExitToken $west)) { throw 'Cancel disconnected an SSH shell' }
 
-    Open-Review
+    Open-Review -Palette
     $null = Control @('send-text','--pane',"$east",'--no-paste','--base64','BA==')
     $token = Wait-Until 'the reviewed shell exits' { Get-ExitToken $east }
     $null = Control @('restart','--pane',"$east",'--exit-token',"$token")
@@ -99,7 +110,7 @@ try {
         ((Get-Session $witness).connection_generation -eq $witnessSession.connection_generation) -and
             ((Control @('get-text','--pane',"$witness")).text -match 'witness-still-live')
     }
-    Click 'Reconnect selected'
+    Run-Palette 'Reconnect selected SSH hosts' -Enter
     Wait-Reconnect $east $eastReplacement
     Wait-Reconnect $west $westSession.connection_generation
 } catch {

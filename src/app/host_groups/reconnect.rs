@@ -79,6 +79,14 @@ fn host_count(count: usize) -> String {
     format!("{count} {noun}")
 }
 
+pub(super) fn selected_exits(page: &HostGroup, shown: &[&Target]) -> Vec<ExitedPane> {
+    shown
+        .iter()
+        .filter(|target| page.selected.contains(&target.pane))
+        .filter_map(|target| target.state.exit())
+        .collect()
+}
+
 pub(super) fn host_button(id: TabId, state: TargetState, ctx: &ViewContext<TerminalApp>) -> View {
     let Some(exit) = state.exit() else {
         return View::empty();
@@ -101,11 +109,7 @@ pub(super) fn selection_controls(
     if !visible_exit && page.reconnect_feedback.is_empty() {
         return View::empty();
     }
-    let exits: Vec<_> = shown
-        .iter()
-        .filter(|target| page.selected.contains(&target.pane))
-        .filter_map(|target| target.state.exit())
-        .collect();
+    let exits = selected_exits(page, shown);
     let button = if visible_exit {
         let caption = if exits.is_empty() {
             "Reconnect selected".to_owned()

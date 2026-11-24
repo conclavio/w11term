@@ -33,6 +33,10 @@ impl State {
             .any(|(_, status)| matches!(status, DeliveryStatus::Pending(..)))
     }
 
+    pub(super) fn can_review(&self) -> bool {
+        !self.is_reviewing() && !self.pending()
+    }
+
     pub(super) fn poll(&mut self) {
         for (_, status) in &mut self.results {
             status.poll();
@@ -51,7 +55,7 @@ impl State {
         let offered = recipients.len();
         let button = Button::new()
             .automation_name(LABEL)
-            .is_enabled(offered > 0 && !self.pending())
+            .is_enabled(offered > 0 && self.can_review())
             .on_click(ctx.callback(move |_| {
                 Message::HostGroup(super::Action::Disconnect(
                     id,
@@ -212,7 +216,7 @@ impl TerminalApp {
                     return;
                 };
                 let state = &mut page.disconnect;
-                if state.offered.is_none() && !state.pending() {
+                if state.can_review() {
                     state.changed = !unchanged;
                     if unchanged {
                         state.offered = Some(recipients.into());

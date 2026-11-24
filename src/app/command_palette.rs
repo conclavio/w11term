@@ -67,6 +67,7 @@ pub enum CommandId {
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
     ManageRecipientSets(TabId, String),
     ApplyRecipientSet(TabId, host_groups::RecipientSetOffer),
+    SshRoster(TabId, host_groups::RosterCommand),
     TabAction(Shortcut, Option<TabId>),
     SetTabPinned(Option<TabId>, bool),
     SetTabColor(TabId, Option<TabColor>),
@@ -556,6 +557,12 @@ impl TerminalApp {
         }
         if let Some(group) = self.host_group_command_target() {
             rows.extend(self.group_saved_rows(group));
+            rows.extend(self.roster_commands(group).into_iter().map(|command| Row {
+                label: command.label().into(),
+                id: CommandId::SshRoster(group, command),
+                chord: String::new(),
+                enabled: true,
+            }));
             rows.push(Row {
                 id: CommandId::SearchGroupRecentCommands(group),
                 label: host_groups::RECENT_COMMANDS_LABEL.into(),
@@ -673,6 +680,7 @@ impl TerminalApp {
                     host_groups::RecipientSetAction::ApplyFromPalette(offer),
                 ))
             }
+            CommandId::SshRoster(group, command) => Message::HostGroup(command.into_action(group)),
             CommandId::TabAction(shortcut, group) => {
                 bind_tab_action(Message::Shortcut(shortcut), group)
             }

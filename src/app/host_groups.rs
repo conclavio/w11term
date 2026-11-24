@@ -27,6 +27,7 @@ mod recorded_send;
 mod report;
 mod retry;
 mod reuse;
+mod roster_commands;
 mod roster_report;
 mod save_command;
 mod saved;
@@ -34,6 +35,7 @@ mod transfer;
 
 pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffer};
 pub use reuse::Offer as LaunchReviewOffer;
+pub use roster_commands::RosterCommand;
 
 pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
@@ -152,6 +154,10 @@ pub struct Target {
 }
 
 impl Target {
+    fn pending_prompt(&self) -> Option<(u64, u64)> {
+        Some((self.pane, self.state.authentication_prompt()?))
+    }
+
     fn status_caption(&self) -> Cow<'static, str> {
         let state = self.state.label();
         if self.connected {
@@ -446,6 +452,10 @@ impl HostGroup {
         targets
             .iter()
             .filter(move |target| self.includes_pane(target.pane) && self.filter.matches(target))
+    }
+
+    fn sort_shown(&self, targets: &mut [&Target]) {
+        sort_roster(self.roster_preferences.order, targets, &self.selected);
     }
 
     fn selected_shown(&self, targets: &[Target]) -> BTreeSet<u64> {
@@ -1507,14 +1517,11 @@ impl TerminalApp {
             if selected.len() == 1 { "host" } else { "hosts" }
         );
         let mut roster_rows = shown.clone();
-        sort_roster(
-            page.roster_preferences.order,
-            &mut roster_rows,
-            &page.selected,
-        );
+        page.sort_shown(&mut roster_rows);
         let mut prompts = roster_rows
             .iter()
-            .filter_map(|target| Some((target.pane, target.state.authentication_prompt()?)));
+            .copied()
+            .filter_map(Target::pending_prompt);
         let next_prompt =
             prompts.next().map_or_else(View::empty, |(pane, prompt)| {
                 let count = 1 + prompts.count();

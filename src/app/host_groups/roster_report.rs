@@ -64,7 +64,7 @@ impl TerminalApp {
         let feedback = if current != *offered {
             "The shown roster changed. Copy it again.".into()
         } else {
-            sort_roster(page.roster_preferences.order, &mut shown, &page.selected);
+            page.sort_shown(&mut shown);
             match roster_text(label, &shown, &page.selected, w11term::clipboard::MAX_TEXT)
                 .and_then(|text| w11term::clipboard::write(&text))
             {

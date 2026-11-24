@@ -76,7 +76,7 @@ try {
     $null = Wait-CheckBox $loginName Off
     Set-HostSearch 'PASSWORD'
     $null = Wait-Until 'the host search hides the trust prompt' { !(Find-Element "Focus pane $trust" $button) }
-    Click $next
+    Run-Palette 'Open next SSH sign-in or host-key prompt' -Enter
     Wait-Focus $login
     $null = Wait-Until 'the unchecked host opens its real sign-in dialog' {
         Find-Element 'Sign in' $button
