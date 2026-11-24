@@ -95,6 +95,8 @@ Turn on **Require all recipients ready** to wait for every visible, checked host
 
 Use the host-state dropdown to show ready shells, disconnected panes, or another current state. The state filter combines with the name or wildcard filter and keeps checks on hidden hosts. Sending and other actions on checked hosts use the visible selection.
 
+The live state count summarizes every host matching the name or wildcard filter. When a state filter hides hosts, the summary shows how many are visible out of the matching total.
+
 The roster shows **Connecting** while the first shell opens and **Reconnecting** during a retry. Automatic retries show their attempt number. These states are available in the host-state filter and the copied roster.
 
 Filter by **Connection failed** to find panes whose SSH attempt ended with an error. Each failed row shows a short diagnostic and offers **Reconnect** when the pane can restart.

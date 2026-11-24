@@ -185,7 +185,7 @@ enum TargetState {
     Matched(PromptToken),
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RosterStatus {
     #[default]
     All,
@@ -430,6 +430,33 @@ fn execution_time_caption(result: &GroupExecution, now: Instant) -> Option<Strin
     })
 }
 
+fn roster_state_summary(matching: &[&Target], shown: usize) -> Option<String> {
+    let total = matching.len();
+    if total == 0 {
+        return None;
+    }
+    let mut counts = BTreeMap::<RosterStatus, usize>::new();
+    for target in matching {
+        *counts.entry(target.state.status()).or_default() += 1;
+    }
+    let hosts = if total == 1 { "host" } else { "hosts" };
+    let scope = if shown == total {
+        format!("{total} matching {hosts}")
+    } else {
+        format!("Showing {shown} of {total} matching {hosts}")
+    };
+    let breakdown = RosterStatus::OPTIONS.into_iter().filter_map(|status| {
+        let count = counts.get(&status)?;
+        Some(format!("{} ({count})", status.label()))
+    });
+    Some(
+        std::iter::once(scope)
+            .chain(breakdown)
+            .collect::<Vec<_>>()
+            .join(" · "),
+    )
+}
+
 impl HostGroup {
     fn includes_pane(&self, pane: u64) -> bool {
         self.roster
@@ -448,10 +475,20 @@ impl HostGroup {
         }
     }
 
-    fn shown<'a>(&self, targets: &'a [Target]) -> impl Iterator<Item = &'a Target> {
+    fn scoped_targets<'a>(&self, targets: &'a [Target]) -> impl Iterator<Item = &'a Target> {
         targets
             .iter()
-            .filter(move |target| self.includes_pane(target.pane) && self.filter.matches(target))
+            .filter(move |target| self.includes_pane(target.pane))
+    }
+
+    fn shown<'a>(&self, targets: &'a [Target]) -> impl Iterator<Item = &'a Target> {
+        self.scoped_targets(targets)
+            .filter(move |target| self.filter.matches(target))
+    }
+
+    fn matching_query<'a>(&self, targets: &'a [Target]) -> impl Iterator<Item = &'a Target> {
+        self.scoped_targets(targets)
+            .filter(move |target| self.filter.matches_query(target))
     }
 
     fn sort_shown(&self, targets: &mut [&Target]) {
@@ -1494,7 +1531,12 @@ impl TerminalApp {
             });
         }
         let targets = self.host_group_targets();
-        let shown: Vec<_> = page.shown(&targets).collect();
+        let matching: Vec<_> = page.matching_query(&targets).collect();
+        let shown: Vec<_> = matching
+            .iter()
+            .copied()
+            .filter(|target| page.filter.matches_state(target))
+            .collect();
         let selected: Vec<_> = shown
             .iter()
             .copied()
@@ -1690,6 +1732,12 @@ impl TerminalApp {
             ));
         let filter = StackPanel::new().grid_row(2).spacing(6.0).children((
             filter_input,
+            roster_state_summary(&matching, shown.len()).map_or_else(View::empty, |summary| {
+                TextBlock::new()
+                    .text(summary)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            }),
             page.roster.as_ref().map_or_else(View::empty, |roster| {
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
@@ -2361,6 +2409,56 @@ mod tests {
         assert_eq!(group.selected, BTreeSet::from([1, 3]));
         group.filter.clear();
         assert_eq!(group.selected_shown(&targets), BTreeSet::from([1, 3]));
+    }
+
+    #[test]
+    fn state_counts_keep_query_matches_hidden_by_the_state_filter() {
+        let roster = [
+            (1, "web-east", TargetState::HostKey(1)),
+            (2, "web-west", TargetState::Connecting),
+            (3, "web-external", TargetState::Connecting),
+            (4, "db-east", TargetState::Failed(None)),
+        ]
+        .map(|(pane, name, state)| Target {
+            pane,
+            name: name.into(),
+            names: filter::Names::new(name, "lab.example", "ops", 22),
+            profile: None,
+            connected: false,
+            state,
+        });
+        let mut group = HostGroup {
+            roster: Some(Box::new(MemberRoster {
+                panes: BTreeSet::from([1, 2, 4]),
+                ..Default::default()
+            })),
+            selected: BTreeSet::from([1]),
+            ..Default::default()
+        };
+        group.filter.set_wildcards(true);
+        group.filter.set_query("web-*".into());
+        group.filter.set_status(RosterStatus::Connecting);
+        let summarize = |group: &HostGroup| {
+            roster_state_summary(
+                &group.matching_query(&roster).collect::<Vec<_>>(),
+                group.shown(&roster).count(),
+            )
+        };
+        assert_eq!(
+            summarize(&group).as_deref(),
+            Some(
+                "Showing 1 of 2 matching hosts · Connecting (1) · Host key verification required (1)"
+            )
+        );
+        group.show_window_roster(true);
+        assert_eq!(
+            summarize(&group).as_deref(),
+            Some(
+                "Showing 2 of 3 matching hosts · Connecting (2) · Host key verification required (1)"
+            )
+        );
+        group.filter.set_query("cache-*".into());
+        assert_eq!(summarize(&group), None);
     }
 
     #[test]

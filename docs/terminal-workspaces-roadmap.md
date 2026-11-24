@@ -180,6 +180,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 64. **Open pending SSH prompts from the roster.** Show host-key verification and sign-in states separately. Open the first visible pending prompt in roster order and recheck its identity on click.
 65. **Disconnect selected SSH shells.** Review the checked, shown connections before ending them. Recheck each approved connection generation and keep the panes, scrollback, and roster selection available for reconnect.
 66. **Use roster actions from the command palette.** Copy the shown hosts, open the next pending prompt in roster order, reconnect selected hosts, and review a disconnect from the keyboard. Use the active group's filters and recheck the same recipients and connections as the roster buttons.
+67. **Count matching hosts by live state.** Follow the active group and host query. Show the count in each state and how many matches are visible under the state filter.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

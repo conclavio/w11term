@@ -736,6 +736,9 @@ try {
     Pane-Status $east "Connected${dot}Ready"
     (Wait-CheckBox $westName On).Toggle()
     $null = Wait-CheckBox $westName Off
+    $null = Wait-Until 'the roster summarizes both ready and alternate-screen hosts' {
+        Find-Element "2 matching hosts${dot}Ready (1)${dot}Alternate screen (1)"
+    }
     Click $copyRoster
     $null = Wait-Until 'the copied roster includes both the ready and unchecked alternate-screen host' {
         $report = Read-ClipboardFixture
@@ -756,7 +759,8 @@ try {
         $send = Find-Element 'Send to 1 host' $button
         $send -and $send.Current.IsEnabled -and (Find-Element "Focus pane $east" $button) -and
             !(Find-Element "Focus pane $west" $button) -and
-            (Find-Element '1 selected host is hidden by the filter.')
+            (Find-Element '1 selected host is hidden by the filter.') -and
+            (Find-Element "Showing 1 of 2 matching hosts${dot}Ready (1)${dot}Alternate screen (1)")
     }
     Select-ComboValue $hostStateFilter 'Alternate screen'
     Run-Palette 'Copy shown SSH roster'
@@ -770,7 +774,8 @@ try {
     Set-HostFilter 'east'
     $null = Wait-Until 'the text filter still applies inside the selected host state' {
         $copy = Find-Element $copyRoster $button
-        (Find-Element 'No SSH panes match this filter.') -and $copy -and !$copy.Current.IsEnabled
+        (Find-Element 'No SSH panes match this filter.') -and $copy -and !$copy.Current.IsEnabled -and
+            (Find-Element "Showing 0 of 1 matching host${dot}Ready (1)")
     }
     Set-HostFilter ''
     $null = Wait-CheckBox $westName On

@@ -118,9 +118,14 @@ impl Filter {
     }
 
     pub(super) fn matches(&self, target: &Target) -> bool {
-        if self.status != RosterStatus::All && self.status != target.state.status() {
-            return false;
-        }
+        self.matches_state(target) && self.matches_query(target)
+    }
+
+    pub(super) fn matches_state(&self, target: &Target) -> bool {
+        self.status == RosterStatus::All || self.status == target.state.status()
+    }
+
+    pub(super) fn matches_query(&self, target: &Target) -> bool {
         match &self.matcher {
             Matcher::All => true,
             Matcher::Invalid(_) => false,
