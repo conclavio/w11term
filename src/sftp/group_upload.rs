@@ -1,6 +1,7 @@
 use super::upload_directory::{Source, open_source};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    collections::BTreeSet,
     fs::File,
     os::windows::io::{AsRawHandle, FromRawHandle},
     path::{Path, PathBuf},
@@ -49,6 +50,60 @@ impl GroupUploadFile {
         .context("opening an independent reader for the selected file")?;
         // ReOpenFile transfers ownership of a new handle to this reader.
         Ok(unsafe { File::from_raw_handle(reopened.0) })
+    }
+}
+
+pub struct GroupUploadSet(Vec<GroupUploadFile>);
+
+impl GroupUploadSet {
+    pub fn open(paths: Vec<PathBuf>) -> Result<Self> {
+        ensure!(!paths.is_empty(), "Choose at least one local file");
+        let mut names = BTreeSet::new();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                ensure!(
+                    names.insert(name.to_lowercase()),
+                    "Choose files with distinct names. More than one file is named {name}."
+                );
+            }
+            files.push(GroupUploadFile::open(path)?);
+        }
+        Ok(Self(files))
+    }
+
+    pub fn files(&self) -> &[GroupUploadFile] {
+        &self.0
+    }
+
+    pub fn destinations(&self, remote: &str) -> Result<Vec<String>> {
+        if self.0.len() == 1 {
+            validate_group_upload_path(remote)?;
+            return Ok(vec![remote.to_owned()]);
+        }
+        let drive = remote.strip_prefix('/').unwrap_or(remote).as_bytes();
+        ensure!(
+            (remote.starts_with('/')
+                || matches!(drive, [letter, b':', b'/', ..] if letter.is_ascii_alphabetic()))
+                && !remote.ends_with(':'),
+            "Enter an absolute remote directory, such as /srv/incoming"
+        );
+        let directory = remote.strip_suffix('/').unwrap_or(remote);
+        self.0
+            .iter()
+            .map(|file| {
+                let name = file
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("Local file has no Unicode filename")?;
+                let path = format!("{directory}/{name}");
+                validate_group_upload_path(&path).context(
+                    "Choose an absolute directory that can contain every selected filename",
+                )?;
+                Ok(path)
+            })
+            .collect()
     }
 }
 
@@ -127,5 +182,40 @@ mod tests {
         ] {
             assert!(validate_group_upload_path(path).is_err(), "{path}");
         }
+    }
+
+    #[test]
+    fn grouped_uploads_keep_basenames_and_reject_ambiguous_destinations() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let first = scratch.path().join("one.txt");
+        let second = scratch.path().join("two files.txt");
+        std::fs::write(&first, b"one")?;
+        std::fs::write(&second, b"two")?;
+        assert!(GroupUploadSet::open(vec![first.clone(), first.clone()]).is_err());
+        let set = GroupUploadSet::open(vec![first.clone(), second])?;
+        for directory in ["/incoming", "/incoming/", "C:/incoming", "/C:/incoming/"] {
+            let base = directory.trim_end_matches('/');
+            assert_eq!(
+                set.destinations(directory)?,
+                [format!("{base}/one.txt"), format!("{base}/two files.txt"),]
+            );
+        }
+        assert_eq!(set.destinations("/")?, ["/one.txt", "/two files.txt"]);
+        for invalid in [
+            "",
+            "incoming",
+            "C:",
+            "/C:",
+            "/dir//",
+            "/dir/../other",
+            "C:/name.",
+        ] {
+            assert!(set.destinations(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            GroupUploadSet::open(vec![first])?.destinations("/renamed.txt")?,
+            ["/renamed.txt"]
+        );
+        Ok(())
     }
 }

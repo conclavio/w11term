@@ -85,7 +85,7 @@ function Find-OwnedDialog([string]$Title) {
         if ($element.Current.ClassName -eq '#32770' -and $element.Current.Name -eq $Title) { return $hwnd }
     }
 }
-function Select-DialogItem([IntPtr]$Dialog, [string]$Name) {
+function Select-DialogItem([IntPtr]$Dialog, [string]$Name, [switch]$Add) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($Dialog)
     $byName = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
@@ -96,7 +96,9 @@ function Select-DialogItem([IntPtr]$Dialog, [string]$Name) {
         $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $match)
         if ($item) {
             $selection = $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-            if (!$selection.Current.IsSelected) { $selection.Select() }
+            if (!$selection.Current.IsSelected) {
+                if ($Add) { $selection.AddToSelection() } else { $selection.Select() }
+            }
             return $selection.Current.IsSelected
         }
     }

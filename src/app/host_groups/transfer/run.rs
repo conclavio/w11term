@@ -2,7 +2,8 @@ use super::*;
 use std::sync::Mutex;
 use tokio::{sync::mpsc, task::JoinSet};
 use w11term::sftp::{
-    DEFAULT_TIMEOUT, GroupDownloadFolder, Job, Operation, TransferCancel, TransferProgress,
+    DEFAULT_TIMEOUT, GroupDownloadFolder, GroupUploadFile, Job, Operation, TransferCancel,
+    TransferProgress,
 };
 
 const PARALLEL_HOSTS: usize = 4;
@@ -59,24 +60,28 @@ impl Outcome {
 }
 
 pub(super) struct Task {
-    pub index: usize,
     pub pane: u64,
     pub generation: u64,
     pub input: mpsc::UnboundedSender<Command>,
+    pub items: Vec<Item>,
+}
+
+pub(super) struct Item {
+    pub index: usize,
     pub progress: watch::Sender<TransferProgress>,
 }
 
 enum Prepared {
-    Upload(GroupUploadFile),
+    Upload(Vec<(GroupUploadFile, String)>),
     Download(GroupDownloadFolder),
 }
 
 impl Prepared {
-    fn operation(&self, pane: u64, remote: &str) -> Operation {
+    fn operation(&self, pane: u64, file: usize, remote: &str) -> Operation {
         match self {
-            Self::Upload(source) => Operation::PutGroupFile {
-                source: source.clone(),
-                remote: remote.to_owned(),
+            Self::Upload(files) => Operation::PutGroupFile {
+                source: files[file].0.clone(),
+                remote: files[file].1.clone(),
             },
             Self::Download(folder) => Operation::Get {
                 remote: remote.to_owned(),
@@ -129,13 +134,21 @@ impl Batch {
     pub(super) fn run(self, tasks: Vec<Task>, local: Local, remote: String) {
         if self.cancel.is_cancelled() {
             let mut progress = self.progress.lock().unwrap();
-            for task in tasks {
-                progress.outcomes[task.index] = CANCELLED_BEFORE_START;
+            for item in tasks.into_iter().flat_map(|task| task.items) {
+                progress.outcomes[item.index] = CANCELLED_BEFORE_START;
             }
             return;
         }
         let prepared = match local {
-            Local::Upload(source) => Prepared::Upload(source),
+            Local::Upload(set) => match set.destinations(&remote) {
+                Ok(destinations) => {
+                    Prepared::Upload(set.files().iter().cloned().zip(destinations).collect())
+                }
+                Err(error) => {
+                    self.fail_pending(&format!("{error:#}"));
+                    return;
+                }
+            },
             Local::Download(parent) => match GroupDownloadFolder::create(&parent) {
                 Ok(folder) => {
                     self.progress.lock().unwrap().folder = Some(folder.path().to_owned());
@@ -147,6 +160,8 @@ impl Batch {
                 }
             },
         };
+        let prepared = Arc::new(prepared);
+        let remote: Arc<str> = remote.into();
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -164,36 +179,48 @@ impl Batch {
                     active.join_next().await;
                 }
                 let batch = self.clone();
-                let operation = prepared.operation(task.pane, &remote);
-                active.spawn(batch.run_one(task, operation));
+                active.spawn(batch.run_host(task, Arc::clone(&prepared), Arc::clone(&remote)));
             }
             while active.join_next().await.is_some() {}
         });
         self.fail_pending("The transfer stopped before the destination was confirmed.");
     }
 
-    async fn run_one(self, task: Task, operation: Operation) {
-        let index = task.index;
-        let outcome = if self.cancel.is_cancelled() {
-            CANCELLED_BEFORE_START
-        } else {
-            self.progress.lock().unwrap().outcomes[index] = Outcome::Active;
-            self.send(task, operation).await
-        };
-        self.progress.lock().unwrap().outcomes[index] = outcome;
+    async fn run_host(self, task: Task, prepared: Arc<Prepared>, remote: Arc<str>) {
+        for (file, item) in task.items.into_iter().enumerate() {
+            let outcome = if self.cancel.is_cancelled() {
+                CANCELLED_BEFORE_START
+            } else {
+                self.progress.lock().unwrap().outcomes[item.index] = Outcome::Active;
+                self.send(
+                    &task.input,
+                    task.generation,
+                    item.progress,
+                    prepared.operation(task.pane, file, &remote),
+                )
+                .await
+            };
+            self.progress.lock().unwrap().outcomes[item.index] = outcome;
+        }
     }
 
-    async fn send(&self, task: Task, operation: Operation) -> Outcome {
+    async fn send(
+        &self,
+        input: &mpsc::UnboundedSender<Command>,
+        generation: u64,
+        progress: watch::Sender<TransferProgress>,
+        operation: Operation,
+    ) -> Outcome {
         let (reply, receive) = oneshot::channel();
         let job = Job {
-            expected_generation: Some(task.generation),
+            expected_generation: Some(generation),
             operation,
             deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
             reply,
-            progress: Some(task.progress),
+            progress: Some(progress),
             cancel: Some(self.cancel.clone()),
         };
-        if task.input.send(Command::Sftp(job)).is_err() {
+        if input.send(Command::Sftp(job)).is_err() {
             return Outcome::Unavailable("The pane closed before transfer.");
         }
         match receive.await {
@@ -229,16 +256,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source");
         std::fs::write(&path, b"file").unwrap();
-        let source = GroupUploadFile::open(path).unwrap();
+        let source = GroupUploadSet::open(vec![path]).unwrap();
         let count = PARALLEL_HOSTS + 1;
         let (input, mut commands) = mpsc::unbounded_channel();
         let tasks = (0..count)
             .map(|index| Task {
-                index,
                 pane: index as u64 + 10,
                 generation: index as u64 + 1,
                 input: input.clone(),
-                progress: watch::channel(TransferProgress::default()).0,
+                items: vec![Item {
+                    index,
+                    progress: watch::channel(TransferProgress::default()).0,
+                }],
             })
             .collect();
         drop(input);
@@ -289,5 +318,63 @@ mod tests {
                 partial: false
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_host_batch_keeps_its_completed_file_and_stops_later_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ["first", "second"].map(|name| directory.path().join(name));
+        for path in &paths {
+            std::fs::write(path, b"file").unwrap();
+        }
+        let set = GroupUploadSet::open(paths.into()).unwrap();
+        let (input, mut commands) = mpsc::unbounded_channel();
+        let task = Task {
+            pane: 10,
+            generation: 5,
+            input,
+            items: (0..2)
+                .map(|index| Item {
+                    index,
+                    progress: watch::channel(TransferProgress::default()).0,
+                })
+                .collect(),
+        };
+        let batch = Batch::new(vec![Outcome::Queued; 2]);
+        let worker = batch.clone();
+        let run = tokio::task::spawn_blocking(move || {
+            worker.run(vec![task], Local::Upload(set), "/incoming/".into());
+        });
+        let Command::Sftp(job) = tokio::time::timeout(Duration::from_secs(5), commands.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected a group SFTP job");
+        };
+        assert_eq!(job.expected_generation, Some(5));
+        assert!(
+            matches!(&job.operation, Operation::PutGroupFile { remote, .. } if remote == "/incoming/first")
+        );
+        assert!(matches!(batch.snapshot()[1], Outcome::Queued));
+        batch.cancel.cancel();
+        job.reply
+            .send(Ok(serde_json::json!({"bytes_transferred": 4})))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(commands.recv().await.is_none());
+        assert!(matches!(
+            &batch.snapshot()[..],
+            [
+                Outcome::Complete(4),
+                Outcome::Cancelled {
+                    bytes: 0,
+                    partial: false
+                }
+            ]
+        ));
     }
 }

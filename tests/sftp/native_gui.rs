@@ -1245,6 +1245,11 @@ async fn native_ssh_host_group_uploads_to_reviewed_connections() {
                 b"keep this file",
             )
             .unwrap();
+            fs::write(
+                directory.path().join("incoming/fleet-source"),
+                b"keep the batch collision",
+            )
+            .unwrap();
         }
         if name == "Fleet Stale" {
             fs::write(directory.path().join("exit-on-eot"), []).unwrap();
@@ -1256,6 +1261,7 @@ async fn native_ssh_host_group_uploads_to_reviewed_connections() {
     let picker = state.path().join("picker");
     fs::create_dir(&picker).unwrap();
     fs::write(picker.join("fleet-source"), &bytes).unwrap();
+    fs::write(picker.join("second-source"), b"next upload").unwrap();
     fs::write(
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({"profiles": profiles})).unwrap(),
@@ -1270,6 +1276,22 @@ async fn native_ssh_host_group_uploads_to_reviewed_connections() {
             _ => assert!(
                 !path.exists(),
                 "{name} was outside the confirmed live scope"
+            ),
+        }
+        let first = root.path().join("incoming/fleet-source");
+        let second = root.path().join("incoming/second-source");
+        match name {
+            "Fleet East" => {
+                assert_eq!(fs::read(first).unwrap(), bytes);
+                assert_eq!(fs::read(second).unwrap(), b"next upload");
+            }
+            "Fleet West" => {
+                assert_eq!(fs::read(first).unwrap(), b"keep the batch collision");
+                assert_eq!(fs::read(second).unwrap(), b"next upload");
+            }
+            _ => assert!(
+                !first.exists() && !second.exists(),
+                "{name} received a batch file"
             ),
         }
         // One shell plus SFTP on the approved hosts, two shells on the
