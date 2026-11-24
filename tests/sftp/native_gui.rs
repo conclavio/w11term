@@ -831,6 +831,7 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         let peer_trace = trace.clone();
         let release_preview = state.path().join("release-west-preview");
         let release_paused = state.path().join("release-west-paused");
+        let release_away = state.path().join("release-west-away");
         let release_slow = state.path().join("release-west-result");
         let responder = tokio::spawn(async move {
             use in_band_resize::Wire;
@@ -926,12 +927,14 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                     .concat();
                                     let preview_gate = release_preview.clone();
                                     let paused_gate = release_paused.clone();
+                                    let away_gate = release_away.clone();
                                     let gate = release_slow.clone();
                                     let handle = handle.clone();
                                     tokio::spawn(async move {
                                         for (gate, text) in [
                                             (preview_gate, b"west live first\r\n".as_slice()),
                                             (paused_gate, b"west while paused\r\n".as_slice()),
+                                            (away_gate, b"west while away\r\n".as_slice()),
                                             (gate, finish.as_slice()),
                                         ] {
                                             while !gate.is_file() {

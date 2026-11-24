@@ -28,6 +28,7 @@ pub(super) enum Purpose {
     Scrollback,
     CommandOutput(String),
     GroupReport(String),
+    GroupLiveRecording(String),
     SshHostList,
     StartRecording,
     OpenRecording,
@@ -273,6 +274,19 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 }
                 let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
+                None
+            }
+            Purpose::GroupLiveRecording(suggestion) => {
+                #[cfg(feature = "ui-smoke")]
+                if fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")? {
+                    options |= FOS_DONTADDTORECENT;
+                }
+                dialog.SetTitle(w!("Record SSH group output"))?;
+                let wide: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
+                dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
+                dialog.SetDefaultExtension(w!("txt"))?;
+                options &= !FOS_OVERWRITEPROMPT;
+                options |= FOS_PATHMUSTEXIST | FOS_NOTESTFILECREATE;
                 None
             }
             Purpose::Scrollback

@@ -112,9 +112,33 @@ function Click([string]$Name) {
     $invoke.Invoke()
 }
 
+function Wait-RecordingStatus([string]$Prefix, [string]$Path) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $text = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Text)
+    $last = @{ Status = @() }
+    try {
+        $null = Wait-Until "$Prefix$Path" {
+            $last.Status = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
+                ForEach-Object { $_.Current.Name } |
+                Where-Object { $_ -match 'recording|record live output|live output to|output file' })
+            foreach ($name in $last.Status) {
+                if ($name.StartsWith($Prefix, [StringComparison]::Ordinal) -and
+                    [FixtureDialog]::SameFile($Path, $name.Substring($Prefix.Length))) {
+                    return $true
+                }
+            }
+        }
+    } catch {
+        throw "$($_.Exception.Message). Recording statuses: $($last.Status -join ' | '). Expected file exists: $([IO.File]::Exists($Path))."
+    }
+}
+
 $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+$logReader = $null
 try {
     $window = Wait-InputWindow
     $sessions = (Control @('list')).sessions
@@ -188,6 +212,22 @@ try {
         (Find-Element 'SSH group live output') -and
             (Find-Element 'east-accepted both') -and (Find-Element "Focus output pane $east" $button)
     }
+    $recordOutput = 'Record output' + [char]0x2026
+    $logFile = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'live-both.txt'
+    Click $recordOutput
+    $dialog = Wait-Until 'owned live output save dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'cancel the output recording' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'recording dialog closes after cancel' { !(Find-OwnedDialog 'Record SSH group output') }
+    if ([IO.File]::Exists($logFile)) { throw 'Cancelling created an output recording' }
+    Click $recordOutput
+    $dialog = Wait-Until 'owned output recording dialog reopens' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'enter the exact output recording destination' {
+        [FixtureDialog]::SetFilename($dialog, $logFile, 'ssh-group-output-2.txt')
+    }
+    $null = Wait-Until 'accept the output recording file' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'output recording picker is dismissed after Save' { !(Find-OwnedDialog 'Record SSH group output') }
+    Wait-RecordingStatus 'Recording live output to ' $logFile
+    $logReader = Open-PeerTraceReader $logFile
     [IO.File]::WriteAllText((Join-Path $State 'release-west-preview'), '')
     $null = Wait-Until 'running West output appears above the earlier East output' {
         $westLine = Find-Element 'west live first'
@@ -198,6 +238,9 @@ try {
     $null = Wait-Until 'output is paused' { Find-Element 'Resume output' $button }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-paused'), '')
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west while paused')
+    $null = Wait-Until 'the recorder keeps writing while the display is paused' {
+        [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains("$westName$($dot)west while paused")
+    }
     $until = [DateTime]::UtcNow.AddMilliseconds(650)
     do {
         if (Find-Element 'west while paused') { throw 'Output changed while paused' }
@@ -207,9 +250,29 @@ try {
     $null = Wait-Until 'output received while paused is available on resume' { Find-Element 'west while paused' }
     Click "Focus output pane $west"
     Wait-Focus $west
+    [IO.File]::WriteAllText((Join-Path $State 'release-west-away'), '')
+    $null = Wait-Until 'the recorder keeps writing while the terminal tab is focused' {
+        [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains("$westName$($dot)west while away")
+    }
     Run-Palette 'SSH host group'
     $null = Wait-Until 'the same output view returns after focusing its source pane' {
         (Find-Element 'SSH group live output') -and (Find-Element 'west while paused')
+    }
+    Click 'Stop recording'
+    Wait-RecordingStatus 'Saved live output to ' $logFile
+    $logReader.Dispose()
+    $logReader = $null
+    $recorded = [IO.File]::ReadAllText($logFile)
+    $expectedLines = @(
+        "Submitted$($dot)both", "$eastName$($dot)east-accepted both",
+        "$westName$($dot)west live first", "$westName$($dot)west while paused",
+        "$westName$($dot)west while away", '[Recording stopped]'
+    )
+    # Refocusing a terminal can reflow it, which adds a host-specific gap notice.
+    $gap = 'A portion of this host' + [char]0x2019 + 's output was skipped.'
+    $withNoGaps = $recorded.Replace("$eastName$($dot)$gap`r`n", '').Replace("$westName$($dot)$gap`r`n", '')
+    if ($withNoGaps -cne (($expectedLines -join "`r`n") + "`r`n")) {
+        throw "The output log lost, repeated, or reordered a line: $recorded"
     }
     Click 'Back to results'
     Outcome $westName 'Running'
@@ -338,6 +401,7 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-result'), '')
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west-accepted both')
+    if ([IO.File]::ReadAllText($logFile) -cne $recorded) { throw 'Output was added after recording stopped' }
     if (!(Find-Element "$westName${dot}Running")) { throw 'The comparison changed before refresh' }
     Click 'Refresh comparison'
     $null = Wait-Until 'refresh exposes the two distinct finished results' {
@@ -609,6 +673,7 @@ try {
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
+    if ($logReader) { $logReader.Dispose() }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
