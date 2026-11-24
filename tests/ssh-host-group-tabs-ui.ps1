@@ -61,6 +61,16 @@ function Choose-SavedGroup([string]$Name) {
     }
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
+function Expect-Choice([string]$FieldName, [string]$Choice) {
+    $null = Wait-Until "'$FieldName' selects '$Choice'" {
+        $field = Find-Element $FieldName $comboBox
+        if ($field) {
+            $selection = $field.GetCurrentPattern(
+                [System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+            $selection.Count -eq 1 -and $selection[0].Current.Name -ceq $Choice
+        }
+    }
+}
 function Session([string]$Name) {
     Wait-Until "SSH pane '$Name'" { (Control @('list')).sessions | Where-Object label -ceq $Name }
 }
@@ -212,6 +222,60 @@ try {
     if ($current.id -ne $west -or @((Control @('list')).sessions).Count -ne 3) {
         throw 'Editing membership replaced a running SSH session'
     }
+
+    Choose-SavedGroup 'Fleet Mixed'
+    $reuse = 'Review connection reuse' + [char]0x2026
+    Click $reuse
+    $null = Wait-Until 'review offers to reuse East and open North' {
+        (Find-Element "Review SSH group${dot}Fleet Mixed") -and
+            (Find-Element "1 to reuse${dot}1 to open")
+    }
+    Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
+    Expect-Choice 'Connection for North' 'Open a new SSH pane'
+    Click 'Cancel'
+    $null = Wait-Until 'cancelling the launch review returns to the group' { Find-Element $reuse $button }
+    if (@((Control @('list')).sessions).Count -ne 3) { throw 'Cancelling the review opened a session' }
+
+    Click $reuse
+    Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
+    $original = [IO.File]::ReadAllBytes($profiles)
+    $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $changed.profiles.East.host = 'localhost'
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Open reviewed group'
+    $null = Wait-Until 'changed settings require another review' {
+        Find-Element 'SSH profiles changed. Refresh the review before opening this group.'
+    }
+    if (@((Control @('list')).sessions).Count -ne 3) { throw 'A stale review opened a session' }
+    [IO.File]::WriteAllBytes($profiles, $original)
+    Click 'Refresh review'
+    $null = Wait-Until 'refresh clears the stale review message' {
+        !(Find-Element 'SSH profiles changed. Refresh the review before opening this group.')
+    }
+    Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
+    $generation = (Session 'East').connection_generation
+    Click 'Open reviewed group'
+    Wait-Tab "SSH group${dot}Fleet Mixed"
+    $north = (Session 'North').id
+    $northName = Target-Label 'North' $north
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $northName On
+    $null = Wait-Until 'the new group reports its mixed launch' {
+        Find-Element "Reused 1${dot}Opened 1 for Fleet Mixed"
+    }
+    $eastStill = (Session 'East')
+    if ($eastStill.id -ne $east -or $eastStill.connection_generation -ne $generation -or
+            @((Control @('list')).sessions).Count -ne 4) {
+        throw 'The launch created a second East SSH session'
+    }
+    (Wait-CheckBox $northName On).Toggle()
+    $null = Wait-CheckBox $northName Off
+    Submit 'reuse-probe'
+    $null = Wait-Until 'the reviewed East session accepts the new group command' {
+        Find-Element "$eastName${dot}Exit 0"
+    }
+    Select-Tab $westTab
+    $null = Wait-Until 'the source group retains its earlier result' { Find-Element "Submitted${dot}west-probe" }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

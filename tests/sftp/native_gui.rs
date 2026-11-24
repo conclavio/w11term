@@ -1019,7 +1019,7 @@ async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
     let state = tempfile::tempdir().unwrap();
     let mut peers = Vec::new();
     let mut profiles = serde_json::Map::new();
-    for name in ["East", "West"] {
+    for name in ["East", "West", "North"] {
         let (wire, mut received) = tokio::sync::mpsc::unbounded_channel();
         let (Source::Ssh(ssh), root, opens, server) =
             fixture_with_wire(false, 1, Arc::default(), Some(wire)).await
@@ -1071,7 +1071,9 @@ async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({
             "profiles": profiles,
-            "ssh_host_groups": {"Fleet East": ["East"], "Fleet West": ["West"]}
+            "ssh_host_groups": {
+                "Fleet East": ["East"], "Fleet West": ["West"], "Fleet Mixed": ["East", "North"]
+            }
         }))
         .unwrap(),
     )
@@ -1079,10 +1081,10 @@ async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
     drive_gui("ssh-host-group-tabs-ui.ps1", state.path());
     for (name, _root, opens, server, responder, input) in peers {
         assert_eq!(opens.load(Ordering::Relaxed), 1, "{name}");
-        let expected = if name == "East" {
-            b"east-probe\r".as_slice()
-        } else {
-            b"west-probe\rshared-probe\r".as_slice()
+        let expected = match name {
+            "East" => b"east-probe\rreuse-probe\r".as_slice(),
+            "West" => b"west-probe\rshared-probe\r".as_slice(),
+            _ => b"".as_slice(),
         };
         assert_eq!(*input.lock().unwrap(), expected, "{name}");
         responder.abort();
