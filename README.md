@@ -111,6 +111,8 @@ Choose **Send and record…** beside the group command to attach a recorder befo
 
 The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status. Result filters apply to **Interrupt selected**. **Copy results** includes the full submission.
 
+Choose **Notify when run finishes** on a pending submission to get one entry in the Attention inbox once all its hosts settle. The alert includes success and attention counts, and selecting it takes you back to the retained submission. If another application has focus, the owning taskbar button flashes. Use **Cancel run notification** to disarm it while the run is pending.
+
 Use **Sort submission results** to show the longest or shortest shell times first. The sort compares live elapsed time with completed durations. Ties keep their submission order and untimed results appear last. The sort stays with the group tab as you move between submissions. Exports keep the original submission order.
 
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.

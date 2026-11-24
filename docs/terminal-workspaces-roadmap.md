@@ -151,6 +151,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 37. **Sort results by shell time.** Rank running and completed hosts by observed duration while honoring the result filter. Keep untimed results last and preserve the original order in exports.
 38. **Find live output by text and host.** Filter the retained live or paused feed by literal text and SSH pane. Show the match count and keep recording all output.
 39. **Share the shown live output.** Copy or save a text excerpt of the matching retained lines in display order, with source labels and retention notices.
+40. **Notify when a run finishes.** Arm a submission for one Attention inbox entry after all recipients settle. Include final success and attention counts and link to the retained run.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

@@ -231,6 +231,12 @@ try {
     Outcome $westName 'Sent to SSH channel'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Running'
+    Click 'Notify when run finishes'
+    Click 'Cancel run notification'
+    Click 'Notify when run finishes'
+    $null = Wait-Until 'the current run is armed for completion' {
+        Find-Element 'Cancel run notification' $button
+    }
     $runningPrefix = [regex]::Escape("$westName${dot}Running for ")
     $null = Wait-Until 'the held West result reports live elapsed time' {
         (Result-Timing $west) -match ($runningPrefix + '[1-9][0-9]* s$')
@@ -514,8 +520,15 @@ try {
         (Find-Element "1 distinct result${dot}1 host compared${dot}1 pending or unavailable") -and
         (Find-Element "$westName${dot}Running")
     }
+    Click "Focus compared pane $east"
+    Wait-Focus $east
     [IO.File]::WriteAllText((Join-Path $State 'release-west-result'), '')
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','west-accepted both')
+    $null = Wait-Until 'an inactive group posts one completion notice' {
+        Find-Element 'Attention inbox, 1 unread' $button
+    }
+    Wait-Focus $east
+    Run-Palette 'SSH host group'
     if ([IO.File]::ReadAllText($logFile) -cne $recorded) { throw 'Output was added after recording stopped' }
     if (!(Find-Element "$westName${dot}Running")) { throw 'The comparison changed before refresh' }
     Click 'Refresh comparison'
@@ -615,6 +628,16 @@ try {
     Outcome $westName 'Exit 17'
     Click 'Next submission'
     $null = Wait-Until 'later submission restored' { Find-Element "Submitted${dot}while-slow" }
+    Click 'Attention inbox, 1 unread'
+    Click "Unread${dot}SSH host group${dot}Run 2${dot}Group run finished${dot}1 succeeded${dot}1 needs attention"
+    $null = Wait-Until 'the alert opens its original run and marks the inbox read' {
+        (Find-Element "Submitted${dot}both") -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Outcome $westName 'Exit 17'
+    Click 'Next submission'
+    $null = Wait-Until 'return to the later submission after visiting the alert' {
+        Find-Element "Submitted${dot}while-slow"
+    }
     Send-Raw $west 'part'
     Pane-Status $west "Connected${dot}Waiting for a fresh prompt"
     Submit 'while-edit' 'Send to 2 hosts'

@@ -1,7 +1,7 @@
-use super::GroupExecution;
+use super::{GroupExecution, Inbox};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 use tokio::sync::{broadcast, oneshot};
 use wezterm_term::LiveOutputBatch;
@@ -20,6 +20,22 @@ struct Transcript {
     hosts: Vec<HostRecord>,
     active_hosts: usize,
     dispatch_finished: bool,
+    completion_notice: Option<CompletionNotice>,
+}
+
+#[derive(Debug)]
+struct CompletionNotice {
+    inbox: Inbox,
+    tab: u64,
+    submission: u64,
+    source: Arc<str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupCompletionState {
+    Available,
+    Armed,
+    Settled,
 }
 
 #[derive(Debug)]
@@ -178,7 +194,37 @@ impl GroupTranscript {
     pub fn finish_dispatch(&self) {
         let mut transcript = self.0.lock().unwrap();
         transcript.dispatch_finished = true;
-        transcript.finish_if_settled();
+        Self::finish_if_settled(transcript);
+    }
+
+    pub fn completion_state(&self) -> GroupCompletionState {
+        let transcript = self.0.lock().unwrap();
+        if transcript.settled() {
+            GroupCompletionState::Settled
+        } else if transcript.completion_notice.is_some() {
+            GroupCompletionState::Armed
+        } else {
+            GroupCompletionState::Available
+        }
+    }
+
+    pub fn set_completion_notice(
+        &self,
+        armed: bool,
+        inbox: &Inbox,
+        tab: u64,
+        submission: u64,
+        source: &str,
+    ) {
+        let mut transcript = self.0.lock().unwrap();
+        if !transcript.settled() {
+            transcript.completion_notice = armed.then(|| CompletionNotice {
+                inbox: inbox.clone(),
+                tab,
+                submission,
+                source: source.into(),
+            });
+        }
     }
 
     pub fn snapshot(&self) -> GroupTranscriptSnapshot {
@@ -214,8 +260,43 @@ impl GroupTranscript {
             transcript: self.clone(),
             id,
         };
-        transcript.finish_if_settled();
+        Self::finish_if_settled(transcript);
         Some((recording, stream))
+    }
+
+    fn finish_if_settled(mut transcript: MutexGuard<'_, Transcript>) {
+        if !transcript.settled() {
+            return;
+        }
+        if transcript
+            .recording
+            .as_ref()
+            .is_some_and(|recording| recording.mode == GroupRecordingMode::UntilSettled)
+        {
+            transcript.finish_recording(GroupRecordingEnd::Settled);
+        }
+        if let Some(notice) = transcript.completion_notice.take() {
+            let succeeded = transcript
+                .hosts
+                .iter()
+                .filter(|host| {
+                    matches!(
+                        host.outcome(),
+                        GroupRecordingOutcome::Sent(Some(GroupExecution::Finished(result)))
+                            if result.exit_code == Some(0)
+                    )
+                })
+                .count();
+            let attention = transcript.hosts.len() - succeeded;
+            drop(transcript);
+            notice.inbox.group_finished(
+                notice.tab,
+                notice.submission,
+                &notice.source,
+                succeeded,
+                attention,
+            );
+        }
     }
 }
 
@@ -224,7 +305,7 @@ impl Drop for GroupTranscriptHost {
         let mut transcript = self.transcript.0.lock().unwrap();
         transcript.hosts[self.index].active = false;
         transcript.active_hosts -= 1;
-        transcript.finish_if_settled();
+        GroupTranscript::finish_if_settled(transcript);
     }
 }
 
@@ -269,16 +350,8 @@ impl GroupTranscriptHost {
 }
 
 impl Transcript {
-    fn finish_if_settled(&mut self) {
-        if self.dispatch_finished
-            && self.active_hosts == 0
-            && self
-                .recording
-                .as_ref()
-                .is_some_and(|recording| recording.mode == GroupRecordingMode::UntilSettled)
-        {
-            self.finish_recording(GroupRecordingEnd::Settled);
-        }
+    fn settled(&self) -> bool {
+        self.dispatch_finished && self.active_hosts == 0
     }
 
     fn finish_recording(&mut self, reason: GroupRecordingEnd) {
@@ -319,7 +392,68 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{CommandLink, GroupCommandResult, GroupOutput, NoticeTarget};
     use wezterm_term::LiveOutputLine;
+
+    #[test]
+    fn armed_completion_reports_the_final_recipient_outcomes_once() {
+        let inbox = Inbox::new(|| {});
+        let group = GroupTranscript::default();
+        let east = group.host(1);
+        let west = group.host(2);
+        west.delivery_receipt().reject("Not ready");
+        group.finish_dispatch();
+        assert_eq!(group.completion_state(), GroupCompletionState::Available);
+        group.set_completion_notice(true, &inbox, 8, 4, "Fleet");
+        assert_eq!(group.completion_state(), GroupCompletionState::Armed);
+        east.delivery_receipt().acknowledge();
+        east.set_execution(&GroupExecution::Finished(Arc::new(GroupCommandResult {
+            link: CommandLink {
+                generation: 1,
+                id: 2,
+            },
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+            output: GroupOutput::Captured {
+                text: String::new(),
+                truncated: false,
+            },
+        })));
+        drop(east);
+        assert!(inbox.rows().is_empty());
+        drop(west);
+        assert_eq!(group.completion_state(), GroupCompletionState::Settled);
+        group.set_completion_notice(true, &inbox, 8, 4, "Fleet");
+        let rows = inbox.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].target,
+            NoticeTarget::GroupRun {
+                tab: 8,
+                submission: 4
+            }
+        );
+        assert_eq!(
+            rows[0].message,
+            "Group run finished · 1 succeeded · 1 needs attention"
+        );
+        assert!(inbox.acknowledge_wake());
+        assert!(inbox.mark_target_read(rows[0].target));
+        assert_eq!(inbox.unread_count(), 0);
+        assert!(!inbox.acknowledge_wake());
+    }
+
+    #[test]
+    fn cancelling_the_completion_notice_keeps_a_settled_run_quiet() {
+        let inbox = Inbox::new(|| {});
+        let group = GroupTranscript::default();
+        let host = group.host(1);
+        group.finish_dispatch();
+        group.set_completion_notice(true, &inbox, 8, 4, "Fleet");
+        group.set_completion_notice(false, &inbox, 8, 4, "Fleet");
+        drop(host);
+        assert!(inbox.rows().is_empty());
+    }
 
     #[test]
     fn live_transcript_keeps_recent_lines_in_arrival_order_and_snapshots_stay_fixed() {

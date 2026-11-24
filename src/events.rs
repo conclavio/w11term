@@ -15,12 +15,12 @@ mod inbox;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
-    GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
-    GroupTranscript, GroupTranscriptHost, GroupTranscriptLine, GroupTranscriptRecording,
-    GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
+    GroupCompletionState, GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome,
+    GroupRecordingSummary, GroupTranscript, GroupTranscriptHost, GroupTranscriptLine,
+    GroupTranscriptRecording, GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
 };
-pub use inbox::Inbox;
 pub(crate) use inbox::display_field;
+pub use inbox::{Inbox, NoticeTarget};
 
 const CAPACITY: usize = 4096;
 const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);
@@ -832,7 +832,13 @@ mod tests {
         let last = pane.since(0).events.pop().unwrap();
         assert_eq!(last.kind, "recording-error");
         assert_eq!(last.data["error"], reason);
-        assert_eq!(last.sequence, notice.sequence);
+        assert_eq!(
+            notice.target,
+            NoticeTarget::Pane {
+                pane: 11,
+                sequence: last.sequence,
+            }
+        );
     }
 
     #[test]

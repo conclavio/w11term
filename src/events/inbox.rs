@@ -7,13 +7,18 @@ use std::{
 
 const CAPACITY: usize = 128;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeTarget {
+    Pane { pane: u64, sequence: u64 },
+    GroupRun { tab: u64, submission: u64 },
+}
+
 #[derive(Clone, Debug)]
 pub struct Notice {
     arrival: u64,
     flash_pending: bool,
-    pub pane: u64,
+    pub target: NoticeTarget,
     pub source: Arc<str>,
-    pub sequence: u64,
     pub message: String,
     pub unread: bool,
     pub command: Option<CommandLink>,
@@ -99,6 +104,44 @@ impl Inbox {
                 .map_or_else(|| notification_text(&event.data), str::to_owned),
             _ => return,
         };
+        self.push(
+            NoticeTarget::Pane {
+                pane,
+                sequence: event.sequence,
+            },
+            source.clone(),
+            message,
+            event.command,
+            live && event.kind == "command-finished",
+        );
+    }
+
+    pub(super) fn group_finished(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        succeeded: usize,
+        attention: usize,
+    ) {
+        let attention_verb = if attention == 1 { "needs" } else { "need" };
+        self.push(
+            NoticeTarget::GroupRun { tab, submission },
+            display_field(source).into(),
+            format!("Group run finished · {succeeded} succeeded · {attention} {attention_verb} attention"),
+            None,
+            true,
+        );
+    }
+
+    fn push(
+        &self,
+        target: NoticeTarget,
+        source: Arc<str>,
+        message: String,
+        command: Option<CommandLink>,
+        flash_pending: bool,
+    ) {
         let mut state = self.state.lock().unwrap();
         if state.rows.len() == CAPACITY {
             state.rows.pop_front();
@@ -108,13 +151,12 @@ impl Inbox {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
-            pane,
-            flash_pending: live && event.kind == "command-finished",
-            source: source.clone(),
-            sequence: event.sequence,
+            target,
+            flash_pending,
+            source,
             message,
             unread: true,
-            command: event.command,
+            command,
         });
         self.wake_ui(state);
     }
@@ -124,12 +166,10 @@ impl Inbox {
         pane: u64,
         changed: impl Fn(CommandLink) -> bool,
     ) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .rows
-            .iter()
-            .any(|row| row.pane == pane && row.command.is_some_and(&changed))
+        self.state.lock().unwrap().rows.iter().any(|row| {
+            matches!(row.target, NoticeTarget::Pane { pane: from, .. } if from == pane)
+                && row.command.is_some_and(&changed)
+        })
     }
 
     pub(crate) fn refresh(&self) {
@@ -165,7 +205,7 @@ impl Inbox {
     pub(super) fn move_pane_to(&self, pane: u64, target: &Self) {
         let mut moved = Vec::new();
         self.state.lock().unwrap().rows.retain(|notice| {
-            if notice.pane == pane {
+            if matches!(notice.target, NoticeTarget::Pane { pane: from, .. } if from == pane) {
                 moved.push(notice.clone());
                 false
             } else {
@@ -215,17 +255,17 @@ impl Inbox {
             .unwrap()
             .rows
             .iter()
-            .find(|row| row.pane == pane && row.sequence == sequence)?
+            .find(|row| row.target == NoticeTarget::Pane { pane, sequence })?
             .command
     }
 
     pub fn mark_read(&self, pane: u64, sequence: u64) -> bool {
+        self.mark_target_read(NoticeTarget::Pane { pane, sequence })
+    }
+
+    pub fn mark_target_read(&self, target: NoticeTarget) -> bool {
         let mut state = self.state.lock().unwrap();
-        if let Some(row) = state
-            .rows
-            .iter_mut()
-            .find(|row| row.pane == pane && row.sequence == sequence)
-        {
+        if let Some(row) = state.rows.iter_mut().find(|row| row.target == target) {
             row.unread = false;
             return true;
         }
@@ -304,12 +344,12 @@ mod tests {
         b.push("bell", Value::Null);
         assert!(source.rows().is_empty());
         assert_eq!(target.unread_count(), 3);
-        let rows: Vec<_> = target
-            .rows()
-            .into_iter()
-            .map(|n| (n.pane, n.sequence))
-            .collect();
-        assert_eq!(rows, [(2, 2), (1, 2), (2, 1), (1, 1)]);
+        let rows: Vec<_> = target.rows().into_iter().map(|n| n.target).collect();
+        assert_eq!(
+            rows,
+            [(2, 2), (1, 2), (2, 1), (1, 1)]
+                .map(|(pane, sequence)| NoticeTarget::Pane { pane, sequence })
+        );
     }
 
     #[test]
