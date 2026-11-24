@@ -97,6 +97,8 @@ While a verified command runs, its result shows elapsed time. On completion it s
 
 Choose **Live output…** on a submission to follow recent output from all its hosts, newest first. Each line identifies its source and lets you focus that pane. **Pause output** freezes the view while the shells continue, and **Resume output** catches up to the newest retained lines. The feed keeps 128 lines per submission and marks skipped or shortened output. It shows completed text lines from verified shell markers and the final line when the command ends. For prompt-only appliances or a full transcript, open the source pane or its command history.
 
+Use **Find in live output** for a literal, case-insensitive text search and the host dropdown to narrow the retained lines to one SSH pane. The view shows the number of matching lines and keeps the filters when you pause, resume, or visit an originating pane. **Clear output filters** restores all retained lines.
+
 In **Live output…**, choose **Record output…** to write that submission's host-labeled output to a new UTF-8 text file in arrival order. The recording starts with the retained lines and continues while the view is paused or another tab is focused. Missing or shortened lines are marked in the file. Choose **Stop recording** to finish writing and see the saved path.
 
 At the end of a recording, **Host outcomes** lists each checked host's delivery status and the shell result known at the time. A host still running when you stop is shown as running. For confirmed completions the file includes the exit code when the shell reported one.

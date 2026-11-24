@@ -54,7 +54,7 @@ pub(super) struct HostGroup {
     copy_feedback: String,
     result_filter: progress::Filter,
     result_order: progress::ResultOrder,
-    live_output: Option<live_output::State>,
+    live_output: Option<Box<live_output::State>>,
     comparison: compare::State,
     import: import::State,
     host_list_export: Box<host_list_export::State>,

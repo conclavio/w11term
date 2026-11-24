@@ -149,6 +149,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 35. **Search recent group commands.** Keep the last 50 distinct submitted lines in each group tab. Search the full lines even after their detailed results expire. Load a match as a draft without changing the roster or sending to any shell.
 36. **Show per-host command timing.** Use the observed shell markers to time attributed commands, update running results live, and include the elapsed or completed duration in text and JSON snapshots.
 37. **Sort results by shell time.** Rank running and completed hosts by observed duration while honoring the result filter. Keep untimed results last and preserve the original order in exports.
+38. **Find live output by text and host.** Filter the retained live or paused feed by literal text and SSH pane. Show the match count and keep recording all output.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
