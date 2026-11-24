@@ -199,6 +199,8 @@ To open just a subset or a recipient set in its own window, use **Review group l
 
 Set **Parallel SSH logins** in the launch review to limit how many fresh connections authenticate at once. The default is **Unlimited**. A queued pane shows **Waiting to connect** and can be stopped from the roster. A slot becomes available after login and opening an SSH session channel, so active shells do not count against the limit.
 
+The server has 15 seconds to open a session channel and another 15 seconds to acknowledge terminal setup. If either stage times out, the roster reports the SSH error or retry. These limits start after authentication.
+
 Choose **Save as default** beside the login limit to use it in future reviews and when opening the saved group directly in a tab or window.
 
 In a saved group's roster, **Reconnect selected** uses the same saved limit. Overlapping batches in the same roster share the queue. Each queued retry keeps its original pane and can be stopped from the roster.

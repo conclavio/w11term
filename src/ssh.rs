@@ -21,3 +21,5 @@ pub use sharing::ConnectionShare;
 pub(crate) use sharing::{LoginGate, NETWORK, ShareSlot, Sharing};
 pub(crate) use transport::{AttemptStopped, Handler, run_with_sharing};
 pub use transport::{Event, run, run_configured};
+
+const SESSION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);

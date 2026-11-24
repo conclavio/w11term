@@ -48,6 +48,10 @@ impl server::Handler for Peer {
         _: &mut server::Session,
     ) -> anyhow::Result<()> {
         self.opens.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "ui-smoke")]
+        while self.root.join("hold-session-channel").is_file() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         self.channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
@@ -1450,6 +1454,88 @@ async fn queued_group_connection_can_be_stopped_before_using_a_launch_slot() {
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
     assert_eq!(gate.available_permits(), 1);
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "ui-smoke")]
+async fn ssh_shell_setup_times_out_and_releases_the_group_login_slot() {
+    use w11term::events::SshConnectionPhase;
+
+    async fn failure(pane: &Session) -> Arc<str> {
+        loop {
+            if let Some(SshConnectionPhase::Failed(reason)) = pane.events.ssh_connection_phase() {
+                return reason;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    let (Source::Ssh(mut stalled_open), open_root, open_requests, open_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(mut stalled_setup), setup_root, _, setup_server) = fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    let (Source::Ssh(healthy), _healthy_root, healthy_opens, healthy_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    stalled_open.player.reconnect = false;
+    stalled_setup.player.reconnect = false;
+    fs::write(open_root.path().join("hold-session-channel"), []).unwrap();
+    fs::write(setup_root.path().join("hold-shell-request"), []).unwrap();
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let start = |options| {
+        Session::start_group_ssh(
+            options,
+            wezterm_term::TerminalSize::default(),
+            false,
+            gate.clone(),
+        )
+    };
+    let opening = start(stalled_open);
+    let setting_up = Session::start(Source::Ssh(stalled_setup));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while open_requests.load(Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first host did not request a session channel");
+    let waiting = start(healthy);
+    assert_eq!(
+        waiting.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Queued)
+    );
+    assert_eq!(healthy_opens.load(Ordering::Relaxed), 0);
+
+    let (open_error, setup_error, ()) = tokio::time::timeout(Duration::from_secs(25), async {
+        tokio::join!(failure(&opening), failure(&setting_up), async {
+            while waiting.events.ssh_connection_phase() != Some(SshConnectionPhase::Connected) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    })
+    .await
+    .expect("the stalled hosts did not time out or the queued host did not connect");
+    assert!(
+        open_error.contains("SSH session channel open timed out"),
+        "{open_error}"
+    );
+    assert!(
+        setup_error.contains("SSH PTY or shell setup timed out"),
+        "{setup_error}"
+    );
+    assert_eq!(healthy_opens.load(Ordering::Relaxed), 1);
+    assert_eq!(gate.available_permits(), 1);
+    open_server.abort();
+    setup_server.abort();
+    healthy_server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

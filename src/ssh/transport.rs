@@ -1,3 +1,4 @@
+use super::SESSION_SETUP_TIMEOUT;
 use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
@@ -925,19 +926,26 @@ async fn run_channel(
         sftp_rx,
         cleanup_rx,
     ));
+    let setup_deadline = tokio::time::Instant::now() + SESSION_SETUP_TIMEOUT;
+    const SETUP_TIMEOUT: &str = "SSH PTY or shell setup timed out";
     if !managed {
-        request_terminal(channel, options, *size).await?;
-        if let Some(probe) = &probe {
-            channel
-                .set_env(false, game_resume::ENVIRONMENT, probe.marker())
-                .await?;
-        }
-        if let Some(startup) = &sharing.startup {
-            *command_dispatched = !startup.command.is_empty();
-            channel.exec(true, startup.exec_request()).await?;
-        } else {
-            channel.request_shell(true).await?;
-        }
+        tokio::time::timeout_at(setup_deadline, async {
+            request_terminal(channel, options, *size).await?;
+            if let Some(probe) = &probe {
+                channel
+                    .set_env(false, game_resume::ENVIRONMENT, probe.marker())
+                    .await?;
+            }
+            if let Some(startup) = &sharing.startup {
+                *command_dispatched = !startup.command.is_empty();
+                channel.exec(true, startup.exec_request()).await?;
+            } else {
+                channel.request_shell(true).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context(SETUP_TIMEOUT)??;
     } else if size.cols != original_size.cols
         || size.rows != original_size.rows
         || size.pixel_width != original_size.pixel_width
@@ -953,6 +961,8 @@ async fn run_channel(
             .await?;
     }
     let mut pending = if managed { 0 } else { 2u8 };
+    let setup_timeout = tokio::time::sleep_until(setup_deadline);
+    tokio::pin!(setup_timeout);
     let (auth, mut auth_rx) = tokio::sync::oneshot::channel();
     let mut probing = probe.is_some();
     let mut auth_pending = probing;
@@ -981,6 +991,7 @@ async fn run_channel(
     }
     loop {
         tokio::select! {
+            _ = &mut setup_timeout, if pending > 0 => anyhow::bail!(SETUP_TIMEOUT),
             (redeeming, outcome, follow_up) = &mut sideband, if probing => {
                 if waiting_for_resume {
                     queued_before_unlock = input.len();

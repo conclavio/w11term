@@ -1,6 +1,6 @@
 //! A pane can explicitly lend an authenticated connection to a new shell
 //! channel. No global host cache or saved authentication answers are involved.
-use super::Handler;
+use super::{Handler, SESSION_SETUP_TIMEOUT};
 use crate::{events::SshConnectionPhase, options::SshOptions, prompts::Prompts};
 use anyhow::{Context, Result};
 use russh::{Channel, client};
@@ -115,7 +115,10 @@ impl ConnectionShare {
                 });
             let _ = send.send(result);
         });
-        Ok(receive.await.context("SSH channel opener stopped")??)
+        Ok(tokio::time::timeout(SESSION_SETUP_TIMEOUT, receive)
+            .await
+            .context("SSH session channel open timed out")?
+            .context("SSH channel opener stopped")??)
     }
 }
 
