@@ -1,4 +1,5 @@
 use super::*;
+use w11term::events::NoticeTarget;
 
 pub(super) const LONG_COMMANDS: &str = "Notify for long commands";
 
@@ -21,6 +22,7 @@ pub enum Action {
     WatchCommand(bool),
     LongCommands(clipboard_paste::Origin, bool),
     Visit { pane: u64, sequence: u64 },
+    VisitGroup { tab: TabId, submission: u64 },
     ViewCommand { pane: u64, sequence: u64 },
     MarkAllRead,
     Clear,
@@ -81,6 +83,16 @@ impl TerminalApp {
                     self.find(true, None, ctx);
                 }
             }
+            Action::VisitGroup { tab, submission } => {
+                if !self.group_run_retained(tab, submission)
+                    || !self
+                        .inbox
+                        .mark_target_read(NoticeTarget::GroupRun { tab, submission })
+                {
+                    return;
+                }
+                self.show_group_run(tab, submission);
+            }
             Action::ViewCommand { pane, sequence } => {
                 if let Some(link) = self.inbox.command_link(pane, sequence)
                     && self.open_command_history(pane, Some(link), ctx)
@@ -124,14 +136,45 @@ impl TerminalApp {
         } else {
             ScrollViewer::new().content(StackPanel::new().spacing(4.0).keyed_children(
                 rows.iter().map(|row| {
-                    let pane = row.pane;
-                    let sequence = row.sequence;
+                    let status = if row.unread { "Unread" } else { "Read" };
+                    let (pane, sequence) = match row.target {
+                        NoticeTarget::Pane { pane, sequence } => (pane, sequence),
+                        NoticeTarget::GroupRun { tab, submission } => {
+                            let enabled = self.group_run_retained(tab, submission);
+                            let source = self
+                                .tabs
+                                .get(tab)
+                                .map_or(row.source.as_ref(), |tab| tab.label.as_str());
+                            let expired = if enabled {
+                                ""
+                            } else {
+                                " (results unavailable)"
+                            };
+                            let label = format!(
+                                "{status} · {source} · Run {submission}{expired} · {}",
+                                row.message
+                            );
+                            return KeyedView::new(
+                                format!("group-{tab}/{submission}"),
+                                Button::new()
+                                    .automation_name(label.clone())
+                                    .is_enabled(enabled)
+                                    .on_click(ctx.callback(move |_| {
+                                        Message::Attention(Action::VisitGroup { tab, submission })
+                                    }))
+                                    .content(
+                                        TextBlock::new()
+                                            .text(label)
+                                            .text_wrapping(TextWrapping::Wrap),
+                                    ),
+                            );
+                        }
+                    };
                     let tab = self.tab_for_pane(pane).and_then(|id| self.tabs.get(id));
                     let source = tab.map_or_else(
                         || format!("{} (closed)", row.source),
                         |tab| tab.label.clone(),
                     );
-                    let status = if row.unread { "Unread" } else { "Read" };
                     let label = format!("{status} · {source} · Pane {pane} · {}", row.message);
                     let visit = Button::new()
                         .automation_name(label.clone())

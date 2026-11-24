@@ -7,6 +7,7 @@ use w11term::events::{
 };
 mod address;
 mod compare;
+mod completion;
 mod environment;
 mod filter;
 mod host_list_export;
@@ -444,6 +445,7 @@ pub enum Action {
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
+    NotifyCompletion(TabId, u64, bool),
     LiveOutput(TabId, u64, live_output::Action),
     RecordOutput(TabId, u64, output_recording::Action),
     RecordedSend(TabId, recorded_send::Action),
@@ -965,6 +967,9 @@ impl TerminalApp {
                     page.result_filter = progress::Filter::All;
                     page.copy_feedback.clear();
                 }
+            }
+            Action::NotifyCompletion(id, submission, armed) => {
+                self.set_group_run_completion_notice(id, submission, armed);
             }
             Action::LiveOutput(id, submission, action) => {
                 if matches!(
@@ -1683,6 +1688,7 @@ impl TerminalApp {
                                 ))
                             }))
                             .content(text_export::GROUP_JSON_LABEL),
+                        completion::button(id, submission, ctx),
                     )),
                 retry::button(
                     id,

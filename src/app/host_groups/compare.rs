@@ -32,6 +32,10 @@ impl State {
     pub(super) fn is_open(&self) -> bool {
         self.open.is_some()
     }
+
+    pub(super) fn close(&mut self) {
+        self.open = None;
+    }
 }
 
 #[derive(Clone)]

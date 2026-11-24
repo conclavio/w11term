@@ -3252,7 +3252,10 @@ mod tests {
         assert!(events.set_command_watch(true));
         term.advance_bytes(b"\x1b]133;C\x07first result\x1b]133;D;17\x07");
         let notice = &inbox.rows()[0];
-        let link = inbox.command_link(42, notice.sequence).unwrap();
+        let crate::events::NoticeTarget::Pane { pane: 42, sequence } = notice.target else {
+            panic!("expected a pane notice");
+        };
+        let link = inbox.command_link(42, sequence).unwrap();
         assert_eq!(link.generation, 7);
         let first = term.command_history().front().unwrap();
         assert_eq!(link.id, first.id);
