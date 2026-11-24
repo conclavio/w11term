@@ -122,6 +122,7 @@ pub enum CSI {
     /// Xterm's SGR stack. An empty list saves all supported attributes.
     PushSgr(Vec<i64>),
     PopSgr,
+    PaletteStack(PaletteStack),
 
     /// CSI codes that relate to the cursor
     Cursor(Cursor),
@@ -145,6 +146,32 @@ pub enum CSI {
     /// large, so it is boxed and kept outside of the enum
     /// body to help reduce space usage in the common cases.
     Unspecified(Box<Unspecified>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaletteStack {
+    Push(Vec<Option<i64>>),
+    Pop(Vec<Option<i64>>),
+    Report,
+}
+
+impl Display for PaletteStack {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), FmtError> {
+        let (params, final_char) = match self {
+            Self::Push(params) => (params, 'P'),
+            Self::Pop(params) => (params, 'Q'),
+            Self::Report => return write!(f, "#R"),
+        };
+        for (index, param) in params.iter().enumerate() {
+            if index > 0 {
+                write!(f, ";")?;
+            }
+            if let Some(value) = param {
+                write!(f, "{value}")?;
+            }
+        }
+        write!(f, "#{final_char}")
+    }
 }
 
 #[cfg(all(test, target_pointer_width = "64"))]
@@ -234,6 +261,7 @@ impl Display for CSI {
                 write!(f, "#{{")?;
             }
             CSI::PopSgr => write!(f, "#}}")?,
+            CSI::PaletteStack(palette) => palette.fmt(f)?,
             CSI::Cursor(c) => c.fmt(f)?,
             CSI::Edit(e) => e.fmt(f)?,
             CSI::Mode(mode) => mode.fmt(f)?,
@@ -2095,6 +2123,27 @@ impl<'a> CSIParser<'a> {
                 Ok(CSI::PushSgr(parameters))
             }
             ('q' | '}', [CsiParam::P(b'#')]) if !self.parameters_truncated => Ok(CSI::PopSgr),
+            ('P' | 'Q' | 'R', [parameters @ .., CsiParam::P(b'#')])
+                if !self.parameters_truncated =>
+            {
+                let parameters = if parameters.is_empty() {
+                    Vec::new()
+                } else {
+                    parameters
+                        .split(|param| *param == CsiParam::P(b';'))
+                        .map(|param| match param {
+                            [CsiParam::Integer(value)] => Ok(Some(*value)),
+                            [] => Ok(None),
+                            _ => Err(()),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                Ok(CSI::PaletteStack(match self.control {
+                    'P' => PaletteStack::Push(parameters),
+                    'Q' => PaletteStack::Pop(parameters),
+                    _ => PaletteStack::Report,
+                }))
+            }
             ('|', [parameters @ .., CsiParam::P(b'#')])
             | ('{' | 'z' | 'x', [parameters @ .., CsiParam::P(b'$')])
                 if !self.parameters_truncated =>

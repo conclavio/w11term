@@ -1,13 +1,90 @@
 use super::*;
 use crate::color::SrgbaTuple;
+use wezterm_escape_parser::csi::PaletteStack as PaletteOperation;
 use wezterm_escape_parser::osc::DynamicColorNumber;
+
+const STACK_CAPACITY: i64 = 10;
+
+type Assignments = HashMap<Slot, SrgbaTuple>;
+
+#[derive(Default)]
+pub(super) struct PaletteStack {
+    slots: Vec<Option<Assignments>>,
+    position: usize,
+    high_water: usize,
+}
+
+impl PaletteStack {
+    fn push(&mut self, parameter: Option<i64>, colors: &Assignments) {
+        let index = match parameter {
+            None | Some(0) => self.position,
+            Some(slot @ 1..=STACK_CAPACITY) => slot as usize - 1,
+            _ => return,
+        };
+        if index >= STACK_CAPACITY as usize {
+            return;
+        }
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+        self.slots[index]
+            .get_or_insert_with(HashMap::new)
+            .clone_from(colors);
+        // xterm numbers slots from one and retains them after a pop. A bare
+        // push can grow the high-water mark. An explicit zero rewinds the
+        // position after writing the next slot.
+        self.position = match parameter {
+            Some(0) => 0,
+            _ => index + 1,
+        };
+        if parameter.is_none() {
+            self.high_water = self.high_water.max(self.position);
+        }
+    }
+
+    fn pop(&mut self, parameter: Option<i64>) -> Option<usize> {
+        let index = match parameter {
+            None | Some(0) => self.position.checked_sub(1)?,
+            Some(slot @ 1..=STACK_CAPACITY) => slot as usize - 1,
+            _ => return None,
+        };
+        self.slots.get(index)?.as_ref()?;
+        self.position = index;
+        Some(index)
+    }
+
+    fn restore(&mut self, params: &[Option<i64>], colors: &mut Assignments) -> bool {
+        let mut last = None;
+        for &param in params {
+            if let Some(index) = self.pop(param) {
+                last = Some(index);
+            }
+        }
+        let Some(saved) = last.and_then(|index| self.slots[index].as_ref()) else {
+            return false;
+        };
+        if *colors == *saved {
+            return false;
+        }
+        colors.clone_from(saved);
+        true
+    }
+}
+
+fn with_default(params: &[Option<i64>]) -> &[Option<i64>] {
+    if params.is_empty() {
+        &[None]
+    } else {
+        params
+    }
+}
 
 /// Keep the resolved palette cheap to snapshot. The assignment table distinguishes
 /// an application's deliberate choice of the current default from an inherited slot.
 #[derive(Default)]
 pub(super) struct PaletteOverrides {
     pub(super) effective: Option<ColorPalette>,
-    pub(super) assigned: HashMap<Slot, SrgbaTuple>,
+    pub(super) assigned: Assignments,
     pub(super) borrowed_mutably: bool,
 }
 
@@ -54,6 +131,36 @@ impl Slot {
 }
 
 impl TerminalState {
+    pub(super) fn perform_palette_stack(&mut self, operation: PaletteOperation) {
+        match operation {
+            PaletteOperation::Push(params) => {
+                self.collect_palette_edits();
+                for &param in with_default(&params) {
+                    self.palette_stack.push(param, &self.palette.assigned);
+                }
+            }
+            PaletteOperation::Pop(params) => {
+                self.collect_palette_edits();
+                if self
+                    .palette_stack
+                    .restore(with_default(&params), &mut self.palette.assigned)
+                {
+                    self.rebuild_palette();
+                    self.palette_did_change();
+                }
+            }
+            PaletteOperation::Report => {
+                write!(
+                    self.writer,
+                    "\x1b[?{};{}#Q",
+                    self.palette_stack.position, self.palette_stack.high_water
+                )
+                .ok();
+                self.writer.flush().ok();
+            }
+        }
+    }
+
     pub(super) fn materialize_palette(&mut self) -> &mut ColorPalette {
         let config = &self.config;
         self.palette

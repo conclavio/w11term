@@ -465,6 +465,7 @@ pub struct TerminalState {
     progress_value: u8,
 
     palette: palette::PaletteOverrides,
+    palette_stack: palette::PaletteStack,
 
     pixel_width: usize,
     pixel_height: usize,
@@ -663,6 +664,7 @@ impl TerminalState {
         self.inactive_kitty_img = Default::default();
         self.image_cache.clear();
         self.sgr_stack = Default::default();
+        self.palette_stack = Default::default();
         self.screen.screen = primary;
         self.activate_screen(false);
     }
@@ -751,6 +753,7 @@ impl TerminalState {
             icon_title: None,
             saved_titles: Default::default(),
             palette: Default::default(),
+            palette_stack: Default::default(),
             pixel_height: size.pixel_height,
             pixel_width: size.pixel_width,
             dpi: size.dpi,

@@ -98,6 +98,11 @@ The original MIT license is preserved in `LICENSE.md`.
 - XTPUSHSGR and XTPOPSGR use a bounded text-style stack with selective
   restoration. A new transport starts with an empty stack.
 
+- XTPUSHCOLORS, XTPOPCOLORS and XTREPORTCOLORS implement xterm's ten
+  indexed palette slots and report. The stack saves palette assignments so
+  restoring a slot keeps inheritance from the pane's current theme. A new
+  transport drops the previous stack.
+
 - XTSAVE and XTRESTORE preserve supported DEC private modes, including the
   alternate-buffer selector and the mouse reporting and encoding modes. Saved
   values are scoped to the connection and cleared by full reset.
