@@ -99,6 +99,8 @@ In **Live output…**, choose **Record output…** to write that submission's ho
 
 At the end of a recording, **Host outcomes** lists each checked host's delivery status and the shell result known at the time. A host still running when you stop is shown as running. For confirmed completions the file includes the exit code when the shell reported one.
 
+After saving, choose **Show in File Explorer** to select the file or **Copy recording path** to copy its full path. If you save several recordings of the same submission, use the **Saved recordings** selector to revisit an earlier file from the results or the live output view.
+
 Choose **Send and record…** beside the group command to attach a recorder before dispatch. Pick a new text file and w11term will recheck the command, checked hosts, and their prompts before sending. Cancelling the picker or choosing an existing file leaves the command unsent. If the checked scope changes while the file is being prepared, it records that no command was sent. The recorder saves automatically once every host finishes, rejects the send, or loses its connection, even while another tab is active. To finish sooner, choose **Stop recording** in the live output view.
 
 The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status. Result filters apply to **Interrupt selected**. **Copy results** includes the full submission.

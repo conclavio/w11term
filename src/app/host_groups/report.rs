@@ -216,6 +216,7 @@ mod tests {
             id: 1,
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
+            saved_recordings: Default::default(),
             transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
@@ -258,6 +259,7 @@ mod tests {
             id: 1,
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
+            saved_recordings: Default::default(),
             transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),

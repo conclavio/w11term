@@ -165,7 +165,7 @@ impl TerminalApp {
                             output_recording::button(id, submission, ctx),
                         )),
                     TextBlock::new().text(status),
-                    submission.recording.status_view(),
+                    output_recording::status_view(id, submission, ctx),
                     retention,
                 )),
                 ScrollViewer::new().grid_row(1).content(content),
