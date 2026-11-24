@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{CommandStatus, Request, SshGroupExpectedOutput, validate_group_submission};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--expect-output TEXT [--regex] [--match-case]] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--expect-output TEXT [--regex] [--match-case]] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -34,6 +34,7 @@ pub fn parse(
     let mut run_id = None;
     let mut pane_ids = Vec::new();
     let mut expected_query = None;
+    let mut group_name = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
             args.next()
@@ -60,6 +61,10 @@ pub fn parse(
                 rows = Some(value(&mut args)?.parse()?)
             }
             "--profile" if verb == "open" => profile = Some(value(&mut args)?),
+            "--name" if verb == "open-ssh-group" => {
+                ensure!(group_name.is_none(), "specify --name only once");
+                group_name = Some(value(&mut args)?);
+            }
             "--activate" if verb == "open" => activate = true,
             "--regex"
                 if matches!(
@@ -138,17 +143,18 @@ pub fn parse(
                 connection_generation = Some(value(&mut args)?.parse()?)
             }
             "--window" | "--tab" | "--run"
-                if matches!(
-                    verb,
-                    "get-ssh-group-roster"
-                        | "get-ssh-group-run"
-                        | "get-ssh-group-output"
-                        | "follow-ssh-group-output"
-                        | "wait-ssh-group-run"
-                        | "wait-ssh-group-ready"
-                        | "wait-ssh-group-output"
-                        | "submit-ssh-group-command"
-                ) =>
+                if (verb == "open-ssh-group" && arg == "--window")
+                    || matches!(
+                        verb,
+                        "get-ssh-group-roster"
+                            | "get-ssh-group-run"
+                            | "get-ssh-group-output"
+                            | "follow-ssh-group-output"
+                            | "wait-ssh-group-run"
+                            | "wait-ssh-group-ready"
+                            | "wait-ssh-group-output"
+                            | "submit-ssh-group-command"
+                    ) =>
             {
                 ensure!(
                     !matches!(
@@ -270,6 +276,15 @@ pub fn parse(
         "list-ssh-groups" => {
             ensure!(pane.is_none(), "list-ssh-groups does not accept --pane");
             Request::ListSshGroups
+        }
+        "open-ssh-group" => {
+            ensure!(pane.is_none(), "open-ssh-group does not accept --pane");
+            let name = group_name.context("--name is required")?;
+            ensure!(!name.trim().is_empty(), "provide a saved SSH group name");
+            Request::OpenSshGroup {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                name,
+            }
         }
         "submit-ssh-group-command" => {
             ensure!(

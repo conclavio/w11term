@@ -102,6 +102,17 @@ pub fn validate_group_submission(pane_ids: &[u64], command: &str) -> Result<()> 
 }
 
 impl Registry {
+    pub(super) async fn open_ssh_group(&self, window: WindowId, name: String) -> Result<Value> {
+        ensure!(!name.trim().is_empty(), "provide a saved SSH group name");
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::OpenSshGroup { name, reply });
+        let Ok(Ok(group)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group launch was not acknowledged. Check list-ssh-groups before retrying");
+        };
+        group.map_err(anyhow::Error::msg)
+    }
+
     pub(super) async fn submit_ssh_group_command(
         &self,
         window: WindowId,
@@ -579,6 +590,12 @@ mod tests {
                     .send(Ok(json!([{ "tab_id": 9, "runs": [{ "run_id": 2 }] }])))
                     .unwrap();
             }
+            UiRequest::OpenSshGroup { name, reply } => {
+                assert_eq!(name, "East Fleet");
+                reply
+                    .send(Ok(json!({ "window_id": 3, "tab_id": 10 })))
+                    .unwrap();
+            }
             UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,
@@ -633,6 +650,16 @@ mod tests {
             ])
         );
         let lookup = second.query_ssh_group_run(3, 9, 2, None).await.unwrap();
+        let opened = second.open_ssh_group(3, "East Fleet".into()).await.unwrap();
+        assert_eq!(opened, json!({ "window_id": 3, "tab_id": 10 }));
+        assert!(
+            second
+                .open_ssh_group(99, "East Fleet".into())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unknown window 99")
+        );
         let submission = second
             .submit_ssh_group_command(
                 3,

@@ -181,6 +181,21 @@ each window. A group has `tab_id`, `label`, and `runs` in submission order,
 oldest first. A tab retains the eight newest runs. A group can have an empty
 run list.
 
+`open-ssh-group --window ID --name NAME` opens a fresh copy of a saved SSH
+group in an existing window from that list. Pass the exact saved name as one
+argument. The new SSH tabs follow the saved member order. The group applies
+its saved defaults, including the parallel login limit, and starts with all
+of its members checked. The current tab and window focus
+stay in place. An unknown group or a group with an unavailable profile is
+rejected before any tabs or sessions are created.
+
+The reply contains `window_id`, the new group's `tab_id`, its saved `name`,
+and a `members` array in saved order. Each member has `profile`, `pane_id`,
+and `tab_id`. A successful reply acknowledges the launch while connections
+may still be queued or in progress. Pass the group ID to
+`wait-ssh-group-ready` to wait for verified prompts. If the launch is
+unacknowledged, check `list-ssh-groups` before retrying.
+
 `get-ssh-group-roster --window ID --tab ID` returns the current roster for
 those IDs. The reply includes `window_id`, `tab_id`, and a `roster` object
 with `schema_version: 1`, `label`, `scope` (`group` or `window`), `sort`,
@@ -333,6 +348,7 @@ for recipient exit statuses.
 
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
+w11term-cli --pid 12345 open-ssh-group --window 1 --name "Fleet Ops"
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 -- "uname -a"
@@ -349,6 +365,7 @@ Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-ssh-groups"}
+{"verb":"open-ssh-group","window_id":1,"name":"Fleet Ops"}
 {"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"uname -a"}

@@ -40,6 +40,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "inspect"
             | "playback"
             | "list-ssh-groups"
+            | "open-ssh-group"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
             | "submit-ssh-group-command"
@@ -271,6 +272,43 @@ mod tests {
             ],
         ] {
             assert!(submit(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn parses_saved_ssh_group_launch_with_an_explicit_window() {
+        let (pid, request) = parse(
+            [
+                "--pid",
+                "7",
+                "open-ssh-group",
+                "--name",
+                "Fleet Ops",
+                "--window",
+                "3",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"open-ssh-group", "window_id":3, "name":"Fleet Ops"}),
+        );
+        for invalid in [
+            "open-ssh-group --name Fleet",
+            "open-ssh-group --window 3",
+            "open-ssh-group --window 0 --name Fleet",
+            "open-ssh-group --window 3 --name Fleet --name Other",
+            "open-ssh-group --window 3 --window 4 --name Fleet",
+            "open-ssh-group --window 3 --name Fleet --tab 4",
+            "open-ssh-group --window 3 --name Fleet --pane 4",
+        ] {
+            assert!(
+                parse(invalid.split_whitespace().map(str::to_owned)).is_err(),
+                "{invalid}"
+            );
         }
     }
 

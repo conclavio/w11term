@@ -121,6 +121,11 @@ enum PaneLaunch {
     Add,
 }
 
+struct LaunchedGroupPane {
+    pane_id: u64,
+    tab_id: TabId,
+}
+
 pub(super) struct WindowGroup {
     pub(super) name: String,
     pub(super) profiles: Vec<String>,
@@ -907,15 +912,30 @@ impl TerminalApp {
     fn start_host_group_panes(
         &mut self,
         id: TabId,
-        mut opened: BTreeSet<u64>,
+        opened: BTreeSet<u64>,
         targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
         mode: PaneLaunch,
         login_limit: Option<usize>,
         ctx: &ComponentContext<Self>,
     ) {
+        self.install_host_group_panes(id, opened, targets, mode, login_limit);
+        self.tabs.select(id);
+        self.sync_selection(ctx);
+        self.activate(ctx);
+    }
+
+    fn install_host_group_panes(
+        &mut self,
+        id: TabId,
+        mut opened: BTreeSet<u64>,
+        targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
+        mode: PaneLaunch,
+        login_limit: Option<usize>,
+    ) -> Vec<LaunchedGroupPane> {
         let launch_gate = self
-            .host_group_mut(id)
+            .host_group_by_id_mut(id)
             .and_then(|page| page.login_permits(login_limit));
+        let mut launched = Vec::new();
         for (profile, ssh) in targets {
             let session = launch_gate.as_ref().map(|gate| {
                 Session::start_group_ssh(
@@ -935,13 +955,12 @@ impl TerminalApp {
                 Some(session) => live_tab_for_session(label, source, session).with_profile(profile),
                 None => self.make_live_tab(label, source, profile),
             };
-            if let Some(pane) = tab.pane_id() {
-                opened.insert(pane);
-            }
-            self.tabs.insert(tab);
+            let pane_id = tab.pane_id().expect("an SSH tab has a terminal pane");
+            opened.insert(pane_id);
+            let tab_id = self.tabs.insert(tab);
+            launched.push(LaunchedGroupPane { pane_id, tab_id });
         }
-        self.tabs.select(id);
-        if let Some(page) = self.host_group_mut(id) {
+        if let Some(page) = self.host_group_by_id_mut(id) {
             if let Some(roster) = &mut page.roster {
                 roster.panes.extend(opened.iter().copied());
             }
@@ -953,8 +972,7 @@ impl TerminalApp {
                 page.reconnect_feedback.clear();
             }
         }
-        self.sync_selection(ctx);
-        self.activate(ctx);
+        launched
     }
 
     pub(super) fn update_host_group_timer(&mut self, ctx: &ComponentContext<Self>) {
@@ -994,6 +1012,10 @@ impl TerminalApp {
         if self.tabs.active_id() != Some(id) {
             return None;
         }
+        self.host_group_by_id_mut(id)
+    }
+
+    fn host_group_by_id_mut(&mut self, id: TabId) -> Option<&mut HostGroup> {
         match &mut self.tabs.get_mut(id)?.page {
             Page::HostGroup(page) => Some(page),
             _ => None,

@@ -51,10 +51,16 @@ impl server::Handler for Peer {
     ) -> anyhow::Result<()> {
         self.opens.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "ui-smoke")]
-        if self.root.join("withhold-session-open").is_file() {
-            // Keep the SSH connection responsive while leaving the request unanswered.
-            self.withheld_session_open = Some(reply);
-            return Ok(());
+        {
+            let gate = self.root.join("hold-session-open");
+            while gate.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if self.root.join("withhold-session-open").is_file() {
+                // Keep the SSH connection responsive while leaving the request unanswered.
+                self.withheld_session_open = Some(reply);
+                return Ok(());
+            }
         }
         self.channels.insert(channel.id(), channel);
         reply.accept().await;

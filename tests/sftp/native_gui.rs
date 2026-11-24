@@ -1456,6 +1456,56 @@ async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens saved SSH groups in the background with the real CLI and WinUI"]
+async fn native_cli_opens_saved_ssh_groups_without_switching_tabs() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["West", "East"] {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (Source::Ssh(ssh), root, _, server) =
+            fixture_counting_accepts(false, 2, accepted.clone()).await
+        else {
+            unreachable!()
+        };
+        fs::write(
+            root.path().join("copy-history.vt"),
+            b"\x1b]133;A\x07ready$ \x1b]133;B\x07",
+        )
+        .unwrap();
+        let gate = root.path().join("hold-session-open");
+        fs::write(&gate, b"").unwrap();
+        fs::write(
+            state.path().join(format!("{name}-gate")),
+            gate.to_str().unwrap(),
+        )
+        .unwrap();
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((root, accepted, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {
+                "Fleet Ops": ["West", "East"],
+                "Broken Ops": ["West", "not-in-catalog"],
+            },
+            "ssh_host_group_defaults": {
+                "Fleet Ops": {"login_limit":"one", "require_all_ready":true},
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-cli-open-ui.ps1", state.path());
+    for (_, accepted, server) in peers {
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "opens a saved group in a second native window and closes just its sessions"]
 async fn native_saved_ssh_group_opens_in_an_independent_window() {
     let state = tempfile::tempdir().unwrap();
