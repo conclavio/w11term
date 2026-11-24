@@ -13,6 +13,7 @@ mod host_list_export;
 mod import;
 mod live_output;
 mod membership;
+mod output_recording;
 mod progress;
 mod prompt_setup;
 mod recipient_sets;
@@ -74,6 +75,7 @@ struct Submission {
     content: SubmissionContent,
     results: Vec<Delivery>,
     transcript: GroupTranscript,
+    recording: output_recording::State,
 }
 
 enum SubmissionContent {
@@ -331,6 +333,7 @@ impl HostGroup {
             content,
             results,
             transcript,
+            recording: Default::default(),
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -399,6 +402,7 @@ pub enum Action {
     Visit(TabId, u64),
     ViewSubmission(TabId, u64),
     LiveOutput(TabId, u64, live_output::Action),
+    RecordOutput(TabId, u64, output_recording::Action),
     Compare(TabId, u64, compare::Action),
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
@@ -774,6 +778,7 @@ impl TerminalApp {
                         page.selected.retain(|pane| panes.contains(pane));
                         page.prompt_setup.poll();
                         for submission in &mut page.submissions {
+                            submission.recording.poll();
                             for delivery in &mut submission.results {
                                 delivery.poll();
                             }
@@ -862,6 +867,9 @@ impl TerminalApp {
                 if let Some(page) = self.host_group_mut(id) {
                     page.update_live_output(submission, action);
                 }
+            }
+            Action::RecordOutput(id, submission, action) => {
+                self.handle_group_output_recording(id, submission, action, ctx);
             }
             Action::Compare(id, submission, action) => {
                 self.handle_host_group_comparison(id, submission, action, ctx);
@@ -1388,6 +1396,7 @@ impl TerminalApp {
                 TextBlock::new()
                     .text(summary.caption())
                     .text_wrapping(TextWrapping::Wrap),
+                submission.recording.status_view(),
                 ProgressBar::new()
                     .automation_name("SSH group submission progress")
                     .maximum(summary.total().max(1) as f64)

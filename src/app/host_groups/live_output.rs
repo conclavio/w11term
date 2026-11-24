@@ -162,8 +162,10 @@ impl TerminalApp {
                                     ))
                                 }))
                                 .content(pause_label),
+                            output_recording::button(id, submission, ctx),
                         )),
                     TextBlock::new().text(status),
+                    submission.recording.status_view(),
                     retention,
                 )),
                 ScrollViewer::new().grid_row(1).content(content),
