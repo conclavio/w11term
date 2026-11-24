@@ -1,5 +1,6 @@
 use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
+use serde_json::{Value, json};
 
 mod definition;
 mod duplicate;
@@ -705,14 +706,45 @@ impl TerminalApp {
         )
     }
 
+    pub(in crate::app) fn control_list_saved_host_groups(&self) -> Result<Value> {
+        let catalog = self.store.catalog()?;
+        let groups: Vec<_> = catalog
+            .ssh_host_groups
+            .iter()
+            .map(|(name, profiles)| {
+                let members: Vec<_> = profiles
+                    .iter()
+                    .map(|profile| {
+                        json!({
+                            "profile": profile,
+                            "available": catalog.ssh_host_group_member(profile).is_some(),
+                        })
+                    })
+                    .collect();
+                let launch_error = catalog
+                    .resolve_ssh_host_group_members(profiles)
+                    .err()
+                    .map(|error| format!("{error:#}"));
+                json!({
+                    "name": name,
+                    "members": members,
+                    "launchable": launch_error.is_none(),
+                    "launch_error": launch_error,
+                    "defaults": catalog.ssh_roster_defaults(name),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "window_id": self.registry.window_id(),
+            "groups": groups,
+        }))
+    }
+
     pub(in crate::app) fn control_open_saved_host_group(
         &mut self,
         name: &str,
         ctx: &ComponentContext<Self>,
-    ) -> Result<serde_json::Value> {
-        use anyhow::Context as _;
-        use serde_json::json;
-
+    ) -> Result<Value> {
         let catalog = self.store.catalog()?;
         let profiles = catalog
             .ssh_host_groups

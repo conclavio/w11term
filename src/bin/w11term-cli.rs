@@ -40,6 +40,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "inspect"
             | "playback"
             | "list-ssh-groups"
+            | "list-saved-ssh-groups"
             | "open-ssh-group"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
@@ -277,6 +278,14 @@ mod tests {
 
     #[test]
     fn parses_saved_ssh_group_launch_with_an_explicit_window() {
+        let (pid, catalog) =
+            parse(["--pid", "7", "list-saved-ssh-groups", "--window", "3"].map(str::to_owned))
+                .unwrap();
+        assert_eq!(pid, Some(7));
+        assert_eq!(
+            serde_json::to_value(catalog).unwrap(),
+            serde_json::json!({"verb":"list-saved-ssh-groups", "window_id":3}),
+        );
         let (pid, request) = parse(
             [
                 "--pid",
@@ -297,6 +306,10 @@ mod tests {
             serde_json::json!({"verb":"open-ssh-group", "window_id":3, "name":"Fleet Ops"}),
         );
         for invalid in [
+            "list-saved-ssh-groups",
+            "list-saved-ssh-groups --window 0",
+            "list-saved-ssh-groups --window 3 --name Fleet",
+            "list-saved-ssh-groups --window 3 --pane 4",
             "open-ssh-group --name Fleet",
             "open-ssh-group --window 3",
             "open-ssh-group --window 0 --name Fleet",

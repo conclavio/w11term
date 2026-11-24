@@ -102,6 +102,14 @@ pub fn validate_group_submission(pane_ids: &[u64], command: &str) -> Result<()> 
 }
 
 impl Registry {
+    pub(super) async fn list_saved_ssh_groups(&self, window: WindowId) -> Result<Value> {
+        let deadline = Instant::now() + TIMEOUT;
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::ListSavedSshGroups { reply });
+        receive(window, response, deadline).await
+    }
+
     pub(super) async fn open_ssh_group(&self, window: WindowId, name: String) -> Result<Value> {
         ensure!(!name.trim().is_empty(), "provide a saved SSH group name");
         let ui = self.window_ui(window)?;
@@ -596,6 +604,14 @@ mod tests {
                     .send(Ok(json!({ "window_id": 3, "tab_id": 10 })))
                     .unwrap();
             }
+            UiRequest::ListSavedSshGroups { reply } => {
+                reply
+                    .send(Ok(json!({
+                        "window_id": 3,
+                        "groups": [{ "name": "East Fleet" }],
+                    })))
+                    .unwrap();
+            }
             UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,
@@ -652,6 +668,11 @@ mod tests {
         let lookup = second.query_ssh_group_run(3, 9, 2, None).await.unwrap();
         let opened = second.open_ssh_group(3, "East Fleet".into()).await.unwrap();
         assert_eq!(opened, json!({ "window_id": 3, "tab_id": 10 }));
+        let saved = second.list_saved_ssh_groups(3).await.unwrap();
+        assert_eq!(
+            saved,
+            json!({ "window_id": 3, "groups": [{ "name": "East Fleet" }] })
+        );
         assert!(
             second
                 .open_ssh_group(99, "East Fleet".into())

@@ -5387,6 +5387,12 @@ impl Component for TerminalApp {
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
             }
+            Message::Control(w11term::control::UiRequest::ListSavedSshGroups { reply }) => {
+                if !reply.is_closed() {
+                    let result = self.control_list_saved_host_groups();
+                    let _ = reply.send(result.map_err(|error| format!("{error:#}")));
+                }
+            }
             Message::Control(w11term::control::UiRequest::GetSshGroupRoster {
                 tab_id,
                 wait_for_readiness,

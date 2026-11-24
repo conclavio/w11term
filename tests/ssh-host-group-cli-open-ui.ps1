@@ -18,6 +18,30 @@ try {
     if (!$initial -or !$initial.window_id) { throw 'The initial terminal pane has no window ID' }
     $owner = "$($initial.window_id)"
     $foreground = [FixtureMessages]::GetForegroundWindow()
+    $discover = @('list-saved-ssh-groups','--window',$owner)
+    $saved = Control $discover
+    $fleet = $saved.groups | Where-Object name -ceq 'Fleet Ops'
+    $broken = $saved.groups | Where-Object name -ceq 'Broken Ops'
+    if ($saved.window_id -ne $owner -or ($saved.groups.name -join ',') -cne 'Broken Ops,Fleet Ops' -or
+        !$fleet.launchable -or $null -ne $fleet.launch_error -or
+        ($fleet.members.profile -join ',') -cne 'West,East' -or @($fleet.members | Where-Object available).Count -ne 2 -or
+        $fleet.defaults.login_limit -cne 'one' -or !$fleet.defaults.require_all_ready -or
+        $broken.launchable -or $broken.launch_error -notlike '*SSH profile not-in-catalog is unavailable*' -or
+        ($broken.members.profile -join ',') -cne 'West,not-in-catalog' -or
+        !$broken.members[0].available -or $broken.members[1].available) {
+        throw "The CLI catalog lost saved group names, member order, defaults, or availability: $($saved | ConvertTo-Json -Depth 8 -Compress)"
+    }
+
+    $updated = [IO.File]::ReadAllText($profiles) | ConvertFrom-Json
+    $updated.ssh_host_groups | Add-Member -NotePropertyName 'Late Shift' -NotePropertyValue @('East')
+    $updatedText = $updated | ConvertTo-Json -Depth 30
+    [IO.File]::WriteAllText($profiles, $updatedText)
+    $fresh = (Control $discover).groups | Where-Object name -ceq 'Late Shift'
+    if (!$fresh.launchable -or $fresh.members.Count -ne 1 -or $fresh.members[0].profile -cne 'East' -or
+        [IO.File]::ReadAllText($profiles) -cne $updatedText -or
+        [FixtureMessages]::GetForegroundWindow() -ne $foreground) {
+        throw 'Discovery missed a live catalog edit, rewrote the file, or changed the foreground window'
+    }
     $openArgs = @('open-ssh-group','--window',$owner,'--name')
     foreach ($failure in @(@('Missing Ops', '*Unknown saved SSH group*'), @('Broken Ops', '*SSH profile not-in-catalog is unavailable*'))) {
         $rejected = & $Cli --pid $app.Id @openArgs $failure[0] | ConvertFrom-Json
@@ -30,7 +54,7 @@ try {
         throw 'A failed launch created a tab or partial sessions'
     }
 
-    $opened = Control ($openArgs + @('Fleet Ops'))
+    $opened = Control ($openArgs + @($fleet.name))
     if ($opened.window_id -ne $owner -or !$opened.tab_id -or $opened.name -cne 'Fleet Ops' -or
         ($opened.members.profile -join ',') -cne 'West,East' -or
         @($opened.members.tab_id | Sort-Object -Unique).Count -ne 2 -or

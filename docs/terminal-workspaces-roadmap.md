@@ -250,6 +250,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 134. **Submit SSH group commands from the CLI.** Validate an explicit list of ready panes in an existing group, then return a run ID for settlement and output queries. Preserve the active tab and the group's draft and selection.
 135. **Arm output checks on CLI submissions.** Attach a literal or regular-expression expectation before dispatch and report whether each named host produced it.
 136. **Open saved SSH groups from the CLI.** Launch the saved roster in an explicit window with its own login limit and defaults. Return the new group's ID and ordered pane IDs while leaving the active tab in place.
+137. **Discover saved SSH groups from the CLI.** Read a window's current catalog and return exact group names, ordered profiles, saved defaults, and launch eligibility.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

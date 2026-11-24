@@ -181,6 +181,14 @@ each window. A group has `tab_id`, `label`, and `runs` in submission order,
 oldest first. A tab retains the eight newest runs. A group can have an empty
 run list.
 
+`list-saved-ssh-groups --window ID` reads the selected window's current
+profile catalog from disk and returns `window_id` and `groups`, ordered by
+saved name. Each group contains its exact `name`, the `members` in saved
+order, and the effective saved roster `defaults`. A member has `profile`
+and `available`. A group has `launchable: true` when its saved definition
+passes launch validation. Otherwise, `launch_error` explains the first
+problem. Discovery leaves the window and saved catalog in place.
+
 `open-ssh-group --window ID --name NAME` opens a fresh copy of a saved SSH
 group in an existing window from that list. Pass the exact saved name as one
 argument. The new SSH tabs follow the saved member order. The group applies
@@ -348,6 +356,7 @@ for recipient exit statuses.
 
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
+w11term-cli --pid 12345 list-saved-ssh-groups --window 1
 w11term-cli --pid 12345 open-ssh-group --window 1 --name "Fleet Ops"
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
@@ -365,6 +374,7 @@ Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-ssh-groups"}
+{"verb":"list-saved-ssh-groups","window_id":1}
 {"verb":"open-ssh-group","window_id":1,"name":"Fleet Ops"}
 {"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
