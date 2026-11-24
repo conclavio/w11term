@@ -291,6 +291,10 @@ impl TerminalApp {
                 !page.prompt_setup.is_open(),
                 "Finish prompt setup before opening another group."
             );
+            ensure!(
+                !page.upload.is_open(),
+                "Return from the group upload before opening another group."
+            );
         }
         let catalog = self.store.catalog()?;
         ensure!(

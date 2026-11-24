@@ -1136,6 +1136,63 @@ async fn native_ssh_host_list_import_checks_profiles_and_opens_only_reviewed_hos
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives the native group file picker and verifies upload scope, collisions and stale connections"]
+async fn native_ssh_host_group_uploads_to_reviewed_connections() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["Fleet East", "Fleet West", "Fleet Stale", "Witness"] {
+        let (Source::Ssh(ssh), directory, opens, server) =
+            fixture_connections(false, if name == "Fleet Stale" { 2 } else { 1 }).await
+        else {
+            unreachable!()
+        };
+        fs::create_dir(directory.path().join("incoming")).unwrap();
+        if name == "Fleet West" {
+            fs::write(
+                directory.path().join("incoming/report.bin"),
+                b"keep this file",
+            )
+            .unwrap();
+        }
+        if name == "Fleet Stale" {
+            fs::write(directory.path().join("exit-on-eot"), []).unwrap();
+        }
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, directory, opens, server));
+    }
+    let bytes: Vec<u8> = (0..97_000).map(|offset| (offset % 251) as u8).collect();
+    let picker = state.path().join("picker");
+    fs::create_dir(&picker).unwrap();
+    fs::write(picker.join("fleet-source"), &bytes).unwrap();
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles": profiles})).unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-upload-ui.ps1", state.path());
+    for (name, root, opens, server) in peers {
+        let path = root.path().join("incoming/report.bin");
+        match name {
+            "Fleet East" => assert_eq!(fs::read(path).unwrap(), bytes),
+            "Fleet West" => assert_eq!(fs::read(path).unwrap(), b"keep this file"),
+            _ => assert!(
+                !path.exists(),
+                "{name} was outside the confirmed live scope"
+            ),
+        }
+        // One shell plus SFTP on the approved hosts, two shells on the
+        // restarted host, and only a shell on the filtered-out witness.
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            if name == "Witness" { 1 } else { 2 },
+            "{name}"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks actual tab and window titles while native Settings, SSH and PowerShell change the active title"]
 async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manual_name() {
     let input = concat!(

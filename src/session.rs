@@ -922,6 +922,10 @@ async fn run(
                 } else { command };
                 let command = if read_only {
                     match command {
+                        Some(Command::Sftp(job)) if matches!(job.operation, crate::sftp::Operation::PutGroupFile { .. }) => {
+                            let _ = job.reply.send(Err("Pane is read-only; upload was not started".into()));
+                            continue;
+                        }
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("Pane input is read-only".into())); continue; }
                         Some(Command::SendGroupCommand { reply, .. } | Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
                         Some(Command::Raw(_, reply)) => {
