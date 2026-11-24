@@ -237,6 +237,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 121. **Resume group output waits from a line ID.** Wait for the next marker in the same run and report gaps in the combined or pane-specific retained feed.
 122. **Read retained group output in batches.** Return ordered host-labeled lines, retention gaps, and a cursor the next read or wait can use.
 123. **Follow group output from the CLI.** Stream retained and incoming lines in order over one connection, with a final settlement cursor and explicit history gaps or errors.
+124. **Notify on a live group output match.** Arm a one-shot alert using the current search and host filter. Show the matching host and a short excerpt in the window's Attention inbox, linked to the original run.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

@@ -1,4 +1,4 @@
-use super::{CommandLink, Event, PendingSshAttempt, SshAttemptOutcome};
+use super::{CommandLink, Event, GroupTranscriptLine, PendingSshAttempt, SshAttemptOutcome};
 use std::{
     collections::VecDeque,
     fmt,
@@ -9,10 +9,27 @@ const CAPACITY: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeTarget {
-    Pane { pane: u64, sequence: u64 },
-    GroupRun { tab: u64, submission: u64 },
-    GroupCanary { tab: u64, submission: u64 },
-    GroupLogins { tab: u64, sequence: u64 },
+    Pane {
+        pane: u64,
+        sequence: u64,
+    },
+    GroupRun {
+        tab: u64,
+        submission: u64,
+    },
+    GroupCanary {
+        tab: u64,
+        submission: u64,
+    },
+    GroupOutput {
+        tab: u64,
+        submission: u64,
+        line_id: u64,
+    },
+    GroupLogins {
+        tab: u64,
+        sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -199,6 +216,34 @@ impl Inbox {
             format!("SSH logins finished · {connected} connected · {failed} failed · {stopped} stopped · {closed} closed"),
             None,
             Some(results.into()),
+            true,
+        );
+    }
+
+    pub(super) fn group_output_matched(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        host: &str,
+        line: &GroupTranscriptLine,
+    ) {
+        let host = display_field(host);
+        let excerpt = display_field(&line.text);
+        let mut message = format!("Matched output · {host}");
+        if !excerpt.is_empty() {
+            message.push_str(&format!(" · {excerpt}"));
+        }
+        self.push(
+            NoticeTarget::GroupOutput {
+                tab,
+                submission,
+                line_id: line.id,
+            },
+            display_field(source).into(),
+            message,
+            None,
+            None,
             true,
         );
     }

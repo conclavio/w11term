@@ -128,8 +128,10 @@ impl TerminalApp {
             Action::VisitGroup(target) => match target {
                 NoticeTarget::GroupRun { tab, submission }
                 | NoticeTarget::GroupCanary { tab, submission }
-                    if self.group_run_retained(tab, submission)
-                        && self.inbox.mark_target_read(target) =>
+                | NoticeTarget::GroupOutput {
+                    tab, submission, ..
+                } if self.group_run_retained(tab, submission)
+                    && self.inbox.mark_target_read(target) =>
                 {
                     self.show_group_run(tab, submission);
                 }
@@ -262,14 +264,18 @@ impl TerminalApp {
                         NoticeTarget::Pane { pane, sequence } => (pane, sequence),
                         target @ (NoticeTarget::GroupRun { tab, .. }
                         | NoticeTarget::GroupCanary { tab, .. }
+                        | NoticeTarget::GroupOutput { tab, .. }
                         | NoticeTarget::GroupLogins { tab, .. }) => {
                             let (enabled, detail, key) = match target {
                                 NoticeTarget::GroupRun { submission, .. }
-                                | NoticeTarget::GroupCanary { submission, .. } => {
-                                    let kind = if matches!(target, NoticeTarget::GroupCanary { .. }) {
-                                        "canary"
-                                    } else {
-                                        "run"
+                                | NoticeTarget::GroupCanary { submission, .. }
+                                | NoticeTarget::GroupOutput { submission, .. } => {
+                                    let key = match target {
+                                        NoticeTarget::GroupCanary { .. } => format!("group-canary-{tab}/{submission}"),
+                                        NoticeTarget::GroupOutput { line_id, .. } => {
+                                            format!("group-output-{tab}/{submission}/{line_id}")
+                                        }
+                                        _ => format!("group-run-{tab}/{submission}"),
                                     };
                                     let enabled = self.group_run_retained(tab, submission);
                                     let expired = if enabled {
@@ -280,7 +286,7 @@ impl TerminalApp {
                                     (
                                         enabled,
                                         format!(" · Run {submission}{expired}"),
-                                        format!("group-{kind}-{tab}/{submission}"),
+                                        key,
                                     )
                                 }
                                 NoticeTarget::GroupLogins { sequence, .. } => {

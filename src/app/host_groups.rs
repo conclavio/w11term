@@ -144,6 +144,12 @@ struct Submission {
     output_lifetime: Option<watch::Sender<()>>,
 }
 
+impl Drop for Submission {
+    fn drop(&mut self) {
+        self.transcript.cancel_output_alert();
+    }
+}
+
 #[derive(Clone)]
 pub struct CommandOffer {
     text: Arc<str>,
@@ -1469,6 +1475,10 @@ impl TerminalApp {
                 self.set_group_run_completion_notice(id, submission, armed);
             }
             Action::LiveOutput(id, submission, action) => {
+                if let live_output::Action::OutputAlert(armed) = action {
+                    self.set_group_output_alert(id, submission, armed);
+                    return;
+                }
                 if matches!(
                     action,
                     live_output::Action::CopyShown | live_output::Action::SaveShown

@@ -16,10 +16,10 @@ mod ssh_attempt;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
-    GroupCompletionState, GroupQueueActivity, GroupQueueEvent, GroupQueueEventKind,
-    GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
-    GroupTranscript, GroupTranscriptHistory, GroupTranscriptHost, GroupTranscriptLine,
-    GroupTranscriptOutput, GroupTranscriptRecording, GroupTranscriptSnapshot,
+    GroupCompletionState, GroupOutputAlert, GroupQueueActivity, GroupQueueEvent,
+    GroupQueueEventKind, GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome,
+    GroupRecordingSummary, GroupTranscript, GroupTranscriptHistory, GroupTranscriptHost,
+    GroupTranscriptLine, GroupTranscriptOutput, GroupTranscriptRecording, GroupTranscriptSnapshot,
     GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;

@@ -1,4 +1,5 @@
 use super::{GroupExecution, Inbox};
+use regex::Regex;
 use serde::Serialize;
 use std::{
     borrow::Cow,
@@ -29,6 +30,17 @@ struct Transcript {
     active_hosts: usize,
     dispatch_finished: bool,
     completion_notice: Option<CompletionNotice>,
+    output_alert: Option<GroupOutputAlert>,
+}
+
+#[derive(Debug)]
+pub struct GroupOutputAlert {
+    pub inbox: Inbox,
+    pub tab: u64,
+    pub submission: u64,
+    pub source: String,
+    pub hosts: BTreeMap<u64, String>,
+    pub pattern: Regex,
 }
 
 #[derive(Debug)]
@@ -463,6 +475,21 @@ impl GroupTranscript {
         }
     }
 
+    pub fn output_alert_armed(&self) -> bool {
+        self.0.lock().unwrap().output_alert.is_some()
+    }
+
+    pub fn arm_output_alert(&self, alert: GroupOutputAlert) {
+        let mut transcript = self.0.lock().unwrap();
+        if !transcript.settled() && transcript.output_alert.is_none() && !alert.hosts.is_empty() {
+            transcript.output_alert = Some(alert);
+        }
+    }
+
+    pub fn cancel_output_alert(&self) {
+        self.0.lock().unwrap().output_alert = None;
+    }
+
     pub fn note_queue_activity(&self, kind: GroupQueueEventKind) {
         self.0
             .lock()
@@ -557,6 +584,7 @@ impl GroupTranscript {
             return;
         }
         transcript.output_watch = None;
+        transcript.output_alert = None;
         if transcript
             .recording
             .as_ref()
@@ -646,13 +674,37 @@ impl GroupTranscriptHost {
                 false,
             );
         }
+        let mut matched = None;
         for line in batch.lines {
             transcript.push(self.pane, elapsed_ms, line.text, line.shortened);
+            if matched.is_none() {
+                matched = transcript.take_matching_alert();
+            }
+        }
+        drop(transcript);
+        if let Some((alert, line)) = matched {
+            alert.inbox.group_output_matched(
+                alert.tab,
+                alert.submission,
+                &alert.source,
+                &alert.hosts[&line.pane],
+                &line,
+            );
         }
     }
 }
 
 impl Transcript {
+    fn take_matching_alert(&mut self) -> Option<(GroupOutputAlert, GroupTranscriptLine)> {
+        let alert = self.output_alert.as_ref()?;
+        let line = self.history.combined.snapshot.lines.back()?;
+        if alert.hosts.contains_key(&line.pane) && alert.pattern.is_match(&line.text) {
+            Some((self.output_alert.take().unwrap(), line.clone()))
+        } else {
+            None
+        }
+    }
+
     fn settled(&self) -> bool {
         self.dispatch_finished && self.active_hosts == 0
     }
@@ -708,6 +760,69 @@ mod tests {
     use super::*;
     use crate::events::{CommandLink, GroupCommandResult, GroupOutput, NoticeTarget};
     use wezterm_term::LiveOutputLine;
+
+    #[test]
+    fn output_alert_consumes_the_first_new_line_from_its_host_scope() {
+        let inbox = Inbox::new(|| {});
+        let group = GroupTranscript::default();
+        let east = group.host(1);
+        let west = group.host(2);
+        group.finish_dispatch();
+        let arm = || {
+            group.arm_output_alert(GroupOutputAlert {
+                inbox: inbox.clone(),
+                tab: 8,
+                submission: 5,
+                source: "Fleet".into(),
+                hosts: BTreeMap::from([(2, "West".into())]),
+                pattern: Regex::new("skipped|ready").unwrap(),
+            });
+        };
+        let append = |host: &GroupTranscriptHost, texts: &[&str], gap| {
+            host.append(LiveOutputBatch {
+                lines: texts
+                    .iter()
+                    .map(|text| LiveOutputLine {
+                        text: (*text).into(),
+                        shortened: false,
+                    })
+                    .collect(),
+                gap,
+            });
+        };
+        append(&west, &["ready before arming"], false);
+        arm();
+        append(&east, &["ready on another host"], false);
+        append(&west, &["still waiting"], true);
+        assert!(inbox.rows().is_empty());
+        assert!(group.output_alert_armed());
+
+        append(&west, &["ready now", "ready again"], false);
+        let rows = inbox.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].target,
+            NoticeTarget::GroupOutput {
+                tab: 8,
+                submission: 5,
+                line_id: 5
+            }
+        );
+        assert_eq!(rows[0].message, "Matched output · West · ready now");
+        assert!(!group.output_alert_armed());
+
+        arm();
+        group.cancel_output_alert();
+        append(&west, &["ready after cancellation"], false);
+        assert_eq!(inbox.rows().len(), 1);
+
+        arm();
+        drop(west);
+        drop(east);
+        assert!(!group.output_alert_armed());
+        arm();
+        assert!(!group.output_alert_armed());
+    }
 
     #[test]
     fn queue_activity_retains_recent_events_in_elapsed_order() {

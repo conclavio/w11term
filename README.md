@@ -165,6 +165,8 @@ Choose **Oldest first** to read the output in the order w11term received it. **S
 
 Scripts can use `w11term-cli wait-ssh-group-output` to wait for a matching line and get its host and capture time. Use `get-ssh-group-output` to read available lines in batches or `follow-ssh-group-output` to stream retained and live lines as JSON Lines. Pass a returned cursor or line ID as `--after-line` to continue in the same run. [Control protocol](CONTROL.md#ssh-group-rosters-and-runs)
 
+While a run is active, enter a search and choose **Notify on next match**. The alert uses the search options and host filter selected when you arm it. It watches new output even when the view is paused or another tab is active. The first match adds the host and a short excerpt to the Attention inbox. Open the notice to return to that run's results, or choose **Cancel output alert** before it fires.
+
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.

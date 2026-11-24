@@ -2,7 +2,10 @@ use super::*;
 use regex::Regex;
 use std::{collections::BTreeMap, fmt::Write as _, io::Write as _};
 use w11term::{
-    events::{GroupTranscriptHistory, GroupTranscriptLine, GroupTranscriptSnapshot},
+    events::{
+        GroupCompletionState, GroupOutputAlert, GroupTranscriptHistory, GroupTranscriptLine,
+        GroupTranscriptSnapshot,
+    },
     search::{MAX_QUERY_BYTES, compile_regex},
 };
 
@@ -23,6 +26,7 @@ pub enum Action {
     ShowElapsed(bool),
     FilterHost(Option<u64>),
     ClearFilters,
+    OutputAlert(bool),
     CopyShown,
     SaveShown,
 }
@@ -390,6 +394,57 @@ impl HostGroup {
 }
 
 impl TerminalApp {
+    pub(super) fn set_group_output_alert(&self, id: TabId, run: u64, armed: bool) {
+        if self.tabs.active_id() != Some(id) {
+            return;
+        }
+        let Some(AppTab {
+            label,
+            page: Page::HostGroup(page),
+        }) = self.tabs.get(id)
+        else {
+            return;
+        };
+        let Some(submission) = page.viewed_submission(run) else {
+            return;
+        };
+        let Some(output) = page
+            .live_output
+            .as_ref()
+            .filter(|output| output.submission == run)
+        else {
+            return;
+        };
+        if !armed {
+            submission.transcript.cancel_output_alert();
+            return;
+        }
+        let Some(Ok(pattern)) = &output.filter.matcher else {
+            return;
+        };
+        let hosts = submission
+            .results
+            .iter()
+            .filter_map(|delivery| {
+                let target = &delivery.target;
+                output
+                    .filter
+                    .host
+                    .as_ref()
+                    .is_none_or(|host| host.matches(target.pane, target.names.address()))
+                    .then(|| (target.pane, target.name.clone()))
+            })
+            .collect();
+        submission.transcript.arm_output_alert(GroupOutputAlert {
+            inbox: self.inbox.clone(),
+            tab: id,
+            submission: run,
+            source: label.clone(),
+            hosts,
+            pattern: pattern.clone(),
+        });
+    }
+
     pub(super) fn share_group_live_output(
         &mut self,
         id: TabId,
@@ -521,6 +576,22 @@ impl TerminalApp {
             host_labels.push(Cow::Borrowed(target.name.as_str()));
         }
         let host_absent = selected_host == 0 && output.filter.host.is_some();
+        let output_alert = if submission.transcript.completion_state()
+            == GroupCompletionState::Settled
+        {
+            View::empty()
+        } else {
+            let armed = submission.transcript.output_alert_armed();
+            let can_arm = !host_absent && output.filter.matcher.as_ref().is_some_and(Result::is_ok);
+            Button::new()
+                .is_enabled(armed || can_arm)
+                .on_click(ctx.callback(move |_| send(Action::OutputAlert(!armed))))
+                .content(if armed {
+                    "Cancel output alert"
+                } else {
+                    "Notify on next match"
+                })
+        };
         if let Some(host) = output.filter.host.as_ref().filter(|_| host_absent) {
             selected_host = host_labels.len();
             host_labels.push(Cow::Owned(format!("{} · absent from this run", host.label)));
@@ -676,6 +747,7 @@ impl TerminalApp {
                                 .on_click(ctx.callback(move |_| send(pause_action.clone())))
                                 .content(pause_label),
                             output_recording::button(id, submission, ctx),
+                            output_alert,
                         )),
                     search,
                     search_options,

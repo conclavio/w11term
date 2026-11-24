@@ -1574,6 +1574,22 @@ try {
         $captured = [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader))
         $captured.Contains("$eastName$($dot)east record row 79") -and !$captured.Contains('[Group run settled]')
     }
+    Click $liveButton
+    $null = Wait-Until 'retained burst output is shown before arming an alert' {
+        Find-Element 'east record row 79'
+    }
+    Click 'Pause output'
+    (Command-Editor $outputSearch).SetValue('record row')
+    $null = Wait-Until 'the paused view has a valid search for a live alert' {
+        $armAlert = Find-Element 'Notify on next match' $button
+        $armAlert -and $armAlert.Current.IsEnabled
+    }
+    Click 'Notify on next match'
+    $null = Wait-Until 'the alert arms without matching the retained East rows' {
+        (Find-Element 'Cancel output alert' $button) -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Click 'Clear output filters'
+    Click 'Back to results'
     Click "Focus pane $west"
     Wait-Focus $west
     $followPath = Join-Path $State 'follow-burst.jsonl'
@@ -1612,7 +1628,12 @@ try {
     }
     $logReader.Dispose()
     $logReader = $null
-    Run-Palette 'SSH host group'
+    Click 'Attention inbox, 1 unread'
+    $outputNotice = "Unread${dot}SSH host group${dot}Run $burstRunId${dot}Matched output${dot}$westName${dot}west record row 00"
+    Click $outputNotice
+    $null = Wait-Until 'the one-shot alert opens its original run and marks the inbox read' {
+        (Find-Element "Submitted${dot}record-fast") -and (Find-Element 'Attention inbox, 0 unread' $button)
+    }
     Outcome $westName 'Exit 17'
     Wait-RecordingStatus 'Saved live output to ' $burstPath
     $burst = [IO.File]::ReadAllLines($burstPath)
