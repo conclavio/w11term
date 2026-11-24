@@ -5,12 +5,19 @@ use tokio::sync::oneshot;
 pub(super) const SCROLLBACK_LABEL: &str = "Save scrollback as text…";
 pub(super) const COMMAND_OUTPUT_LABEL: &str = "Save output as text…";
 pub(super) const GROUP_REPORT_LABEL: &str = "Save results…";
+pub(super) const GROUP_JSON_LABEL: &str = "Save results as JSON…";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupReportFormat {
+    Text,
+    Json,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {
     Scrollback(u64),
     CommandOutput { pane: u64, command: u64 },
-    HostGroupResults(u64),
+    HostGroupResults(u64, GroupReportFormat),
     SshHostList,
 }
 
@@ -19,7 +26,8 @@ impl Subject {
         match self {
             Self::Scrollback(pane) => format!("scrollback for pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
-            Self::HostGroupResults(_) => "SSH group results".into(),
+            Self::HostGroupResults(_, GroupReportFormat::Text) => "SSH group results".into(),
+            Self::HostGroupResults(_, GroupReportFormat::Json) => "SSH group JSON results".into(),
             Self::SshHostList => "SSH host list".into(),
         }
     }
@@ -30,8 +38,13 @@ impl Subject {
             Self::CommandOutput { pane, command } => {
                 file_picker::Purpose::CommandOutput(format!("pane-{pane}-command-{command}.txt"))
             }
-            Self::HostGroupResults(submission) => {
+            Self::HostGroupResults(submission, GroupReportFormat::Text) => {
                 file_picker::Purpose::GroupReport(format!("ssh-group-submission-{submission}.txt"))
+            }
+            Self::HostGroupResults(submission, GroupReportFormat::Json) => {
+                file_picker::Purpose::GroupJsonReport(format!(
+                    "ssh-group-submission-{submission}.json"
+                ))
             }
             Self::SshHostList => file_picker::Purpose::SshHostList,
         }

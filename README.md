@@ -117,6 +117,12 @@ Choose **Copy results** to copy the viewed submission as plain text, including e
 
 Choose **Save results…** to write a UTF-8 report of the viewed submission. It includes every recipient and all retained output from completed commands, even when the roster or result filters hide a host. A host still running appears with its status at the time you opened the Save dialog.
 
+**Save results as JSON…** exports the same snapshot for scripts. The document has `schema_version: 1`, a `submission_id` scoped to its group tab, `kind` (`command` or `environment`), `label`, `command`, and an ordered `recipients` array. Each recipient has `pane_id`, `name`, `profile`, `address`, and `command`. A command submission puts the shared command at the top level. An environment export puts the commands on the recipients.
+
+- `delivery.state` and `interrupt.state` use `pending`, `sent`, `rejected`, or `unconfirmed`. A rejection includes `reason`. The `interrupt` field is `null` until an interrupt is requested.
+- `execution.state` uses `awaiting_markers`, `awaiting_prompt`, `running`, `prompt_returned`, `completed`, or `unavailable`. A completed execution includes `connection_generation`, `command_id`, and `exit_code`. The exit code is `null` when the shell supplied none.
+- `output.state` uses `complete` or `preview` with `text`, or `unavailable` with `reason`. A run without a completed capture has `output: null`. A complete, empty capture uses an empty `text` string.
+
 Choose **Compare results…** to group the viewed submission by exact captured output and verified exit code. Smaller groups appear first. Each distinct result shows its hosts, an output preview, and where its output first differs from the largest group. If sizes tie, the earliest group in the submission is the reference. Running commands, unverified exits, and results with only a truncated preview are listed separately. Use **Refresh comparison** to include results that arrived after opening the view.
 
 While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its selected hosts that still report the matching command as running. The result shows Ctrl+C delivery and the command’s eventual exit status separately. w11term uses each pane’s current keyboard mode.

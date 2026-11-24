@@ -50,6 +50,10 @@ impl Names {
         format!("{} · {} · Pane {pane}", self.label, self.address)
     }
 
+    pub(super) fn address(&self) -> &str {
+        &self.address
+    }
+
     fn values(&self) -> [&str; 4] {
         let (login, _) = self.address.rsplit_once(':').unwrap_or_default();
         [&self.label, &self.host, login, &self.address]
