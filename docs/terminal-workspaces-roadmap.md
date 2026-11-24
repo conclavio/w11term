@@ -195,6 +195,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 79. **Open a reviewed group subset in its own window.** Launch only the included profiles or selected recipient set with fresh panes. Recheck the review and keep the partial roster from replacing the saved membership.
 80. **Limit simultaneous logins for a reviewed SSH group.** Let the operator choose a limit for fresh connections, show queued panes in the roster, and allow a queued attempt to be stopped.
 81. **Save a group login limit.** Let the operator keep the reviewed limit for later launches, including direct launches in a tab or window.
+82. **Queue bulk SSH reconnects.** Use the saved limit for **Reconnect selected**, share slots across batches in the same roster, and keep the stopped attempt and its scrollback in its original pane.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

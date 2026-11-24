@@ -34,7 +34,10 @@ use presentation::Presentation;
 pub use timed_replay::{ReplayAction, ReplayState, ReplayStatus};
 
 #[derive(Debug)]
-pub struct ClaimedRestart(pub(crate) u64);
+pub struct ClaimedRestart {
+    pub(crate) token: u64,
+    pub(crate) login_permits: Option<Arc<tokio::sync::Semaphore>>,
+}
 
 #[derive(Debug)]
 pub enum Command {
@@ -295,6 +298,16 @@ impl Session {
 
     pub fn restart_exited(&self, token: u64) -> anyhow::Result<()> {
         self.events.restart_exited(&self.input, token)
+    }
+
+    pub fn restart_group_ssh(
+        &self,
+        token: u64,
+        login_permits: Arc<tokio::sync::Semaphore>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_direct_ssh_shell(), "Pane is not a direct SSH shell");
+        self.events
+            .queue_restart(&self.input, token, Some(login_permits))
     }
 
     /// Claim the reviewed exit before immediately removing the SSH pane.
@@ -622,7 +635,10 @@ impl Session {
             lifecycle,
             startup,
         );
-        sharing.launch_gate = launch_gate;
+        sharing.launch_gate = launch_gate.map(|permits| ssh::LoginGate {
+            permits,
+            admitted_phase: crate::events::SshConnectionPhase::Connecting,
+        });
         let worker = thread::Builder::new()
             .name("terminal-session".into())
             .spawn(move || {
@@ -761,7 +777,7 @@ async fn run(
     let mut transports = tokio::task::JoinSet::new();
     match source {
         Source::Local(_) | Source::Ssh(_) => {
-            status = launch.start(&mut transports, size, transport_input, output_tx);
+            status = launch.start(&mut transports, size, transport_input, output_tx, None);
         }
         Source::Replay(ref path) | Source::ViewRecording(ref path) => {
             let capture = if matches!(source, Source::ViewRecording(_)) {
@@ -1166,7 +1182,7 @@ async fn run(
                         }
                         Ok(())
                     }
-                    Some(Command::RestartExited(ClaimedRestart(token))) => {
+                    Some(Command::RestartExited(ClaimedRestart { token, login_permits })) => {
                         if phase == Phase::Exited && restartable && token == launch_id {
                             launch_id += 1;
                             phase = Phase::Restarting { reset: true };
@@ -1180,7 +1196,11 @@ async fn run(
                             writer = tx;
                             let (output_tx, new_output) = mpsc::channel(32);
                             output = new_output;
-                            status = launch.start(&mut transports, size, rx, output_tx);
+                            let gate = login_permits.map(|permits| ssh::LoginGate {
+                                permits,
+                                admitted_phase: crate::events::SshConnectionPhase::Reconnecting { attempt: None },
+                            });
+                            status = launch.start(&mut transports, size, rx, output_tx, gate);
                             presentation.dirty = true;
                             search.refresh(&terminal, scroll_offset);
                         }

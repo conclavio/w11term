@@ -319,21 +319,35 @@ impl Events {
         input: &tokio::sync::mpsc::UnboundedSender<crate::session::Command>,
         token: u64,
     ) -> anyhow::Result<()> {
+        self.queue_restart(input, token, None)
+    }
+
+    pub(crate) fn queue_restart(
+        &self,
+        input: &tokio::sync::mpsc::UnboundedSender<crate::session::Command>,
+        token: u64,
+        login_permits: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         anyhow::ensure!(
             state.restart_token == Some(token),
             "Pane is running, unavailable, or the exit token has expired"
         );
         state.restart_token = None;
+        let phase = if login_permits.is_some() {
+            SshConnectionPhase::Queued
+        } else {
+            SshConnectionPhase::Reconnecting { attempt: None }
+        };
         let sent = input.send(crate::session::Command::RestartExited(
-            crate::session::ClaimedRestart(token),
+            crate::session::ClaimedRestart {
+                token,
+                login_permits,
+            },
         ));
         let changed = sent.is_ok()
             && state.ssh_connection_phase.is_some()
-            && Self::record_ssh_phase(
-                &mut state,
-                SshConnectionPhase::Reconnecting { attempt: None },
-            );
+            && Self::record_ssh_phase(&mut state, phase);
         if let Some((_, _, inbox)) = &state.inbox {
             inbox.refresh();
         }

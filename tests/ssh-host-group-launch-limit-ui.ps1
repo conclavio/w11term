@@ -57,12 +57,12 @@ function Stop-HostLogin($Pane, $OtherPane) {
     }
 }
 
-function Check-QueuedLogins {
-    $limits = Wait-Until 'one login awaits a password and the other remains queued' {
+function Wait-QueuedLogins([string]$Phase) {
+    Wait-Until "one $Phase login awaits a password and the other remains queued" {
         $logins = @((Control @('list')).sessions | Where-Object label -like 'Login *')
         $queued = $logins | Where-Object { $_.ssh_connection.phase -eq 'queued' }
         $auth = $logins | Where-Object {
-            $_.ssh_connection.phase -eq 'connecting' -and
+            $_.ssh_connection.phase -eq $Phase -and
                 (Find-Element "Pane $($_.id)${dot}Authentication required")
         }
         if ($logins.Count -eq 2 -and $queued -and $auth -and
@@ -70,16 +70,47 @@ function Check-QueuedLogins {
             @{ queued = $queued; auth = $auth }
         }
     }
-    Stop-HostLogin $limits.auth $limits.queued
+}
+function Clear-HostFilter {
     $field = Wait-Until 'the roster filter' { Find-Element 'Host filter' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('')
+}
+function Finish-QueuedLogins($Limits, [string]$Phase) {
+    Stop-HostLogin $Limits.auth $Limits.queued
+    Clear-HostFilter
     $null = Wait-Until 'the queued login receives the released slot' {
-        (Control @('events','--pane',"$($limits.queued.id)")).ssh_connection.phase -eq 'connecting' -and
-            (Find-Element "Pane $($limits.queued.id)${dot}Authentication required")
+        (Control @('events','--pane',"$($Limits.queued.id)")).ssh_connection.phase -eq $Phase -and
+            (Find-Element "Pane $($Limits.queued.id)${dot}Authentication required")
     }
-    Stop-HostLogin $limits.queued $limits.auth
+    Stop-HostLogin $Limits.queued $Limits.auth
+}
+function Check-InitialLogins {
+    $limits = Wait-QueuedLogins 'connecting'
+    Finish-QueuedLogins $limits 'connecting'
     $ready = (Control @('list')).sessions | Where-Object label -ceq 'Ready'
     $null = Control @('wait-for-text','--pane',"$($ready.id)",'--timeout','15','ready')
+    return $limits
+}
+function Check-BulkReconnect($Initial) {
+    Clear-HostFilter
+    $null = Wait-Until 'both stopped hosts are shown' {
+        (Find-Element "Focus pane $($Initial.queued.id)" $button) -and
+            (Find-Element "Focus pane $($Initial.auth.id)" $button)
+    }
+    Click-Button 'Reconnect selected'
+    $limits = Wait-QueuedLogins 'reconnecting'
+    $initialIds = @($Initial.auth.id, $Initial.queued.id)
+    if ($limits.auth.id -notin $initialIds -or $limits.queued.id -notin $initialIds) {
+        throw 'Bulk reconnect replaced the SSH panes'
+    }
+    Stop-HostLogin $limits.queued $limits.auth
+    Click-Button 'Reconnect selected'
+    Clear-HostFilter
+    $overlap = Wait-QueuedLogins 'reconnecting'
+    if ($overlap.auth.id -ne $limits.auth.id -or $overlap.queued.id -ne $limits.queued.id) {
+        throw 'An overlapping reconnect changed the active login'
+    }
+    Finish-QueuedLogins $overlap 'reconnecting'
 }
 
 $launch = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
@@ -106,7 +137,7 @@ try {
             $_ -ne $origin -and [FixtureDialog]::GetWindow($_, 4) -eq [IntPtr]::Zero
         } | Select-Object -First 1
     }
-    Check-QueuedLogins
+    $null = Check-InitialLogins
     $groupWindow = $window
     $null = [FixtureMessages]::PostMessage($groupWindow, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero)
     $window = $origin
@@ -114,7 +145,8 @@ try {
         [FixtureDialog]::Windows($app.Id) -notcontains $groupWindow
     }
     Run-Palette "Open SSH group${dot}Limited" -Enter
-    Check-QueuedLogins
+    $initial = Check-InitialLogins
+    Check-BulkReconnect $initial
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

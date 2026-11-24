@@ -1,6 +1,6 @@
 use super::*;
 use std::{borrow::Cow, collections::BTreeSet};
-use tokio::sync::{oneshot, oneshot::error::TryRecvError, watch};
+use tokio::sync::{Semaphore, oneshot, oneshot::error::TryRecvError, watch};
 use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt, SshConnectionPhase,
@@ -52,6 +52,7 @@ pub(super) struct HostGroup {
     selected: BTreeSet<u64>,
     filter: filter::Filter,
     roster_preferences: SshRosterDefaults,
+    login_queue: Option<(usize, Arc<Semaphore>)>,
     roster_copy_feedback: String,
     draft: String,
     previous_draft: Option<DraftBackup>,
@@ -717,10 +718,10 @@ impl TerminalApp {
         let label = self.unique_host_group_label(base.as_deref().unwrap_or(LABEL), None);
         self.tabs.insert(AppTab {
             label,
-            page: Page::HostGroup(HostGroup {
+            page: Page::HostGroup(Box::new(HostGroup {
                 roster: name.map(|_| Box::default()),
                 ..Default::default()
-            }),
+            })),
         })
     }
 
@@ -756,7 +757,9 @@ impl TerminalApp {
         login_limit: Option<usize>,
         ctx: &ComponentContext<Self>,
     ) {
-        let launch_gate = login_limit.map(|limit| Arc::new(tokio::sync::Semaphore::new(limit)));
+        let launch_gate = self
+            .host_group_mut(id)
+            .and_then(|page| page.login_permits(login_limit));
         for (profile, ssh) in targets {
             let session = launch_gate.as_ref().map(|gate| {
                 Session::start_group_ssh(

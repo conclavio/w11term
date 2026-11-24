@@ -746,15 +746,14 @@ impl Driver {
                 );
                 let future = async {
                     // The slot covers login and opening the SSH channel. Active
-                    // shells and future reconnects do not occupy a launch slot.
+                    // shells and automatic retries do not occupy a slot.
                     let _permit = if let Some(gate) = launch_gate {
                         let permit = gate
+                            .permits
                             .acquire_owned()
                             .await
-                            .context("The SSH group launch ended")?;
-                        events.set_ssh_connection_phase(
-                            crate::events::SshConnectionPhase::Connecting,
-                        );
+                            .context("The SSH group login queue closed")?;
+                        events.set_ssh_connection_phase(gate.admitted_phase);
                         Some(permit)
                     } else {
                         None

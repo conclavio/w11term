@@ -383,7 +383,7 @@ enum Page {
     SharedFolders(folder_shares::Panel),
     Attention,
     CommandHistory(command_history::HistoryPage),
-    HostGroup(host_groups::HostGroup),
+    HostGroup(Box<host_groups::HostGroup>),
     Terminal(LiveTab),
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
@@ -2506,7 +2506,11 @@ impl TerminalApp {
             .map(|tab| tab.id)
     }
 
-    fn restart_exited_pane(&mut self, exit: ExitedPane) -> anyhow::Result<bool> {
+    fn restart_exited_pane(
+        &mut self,
+        exit: ExitedPane,
+        login_permits: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> anyhow::Result<bool> {
         let Some(id) = self.tab_for_pane(exit.pane) else {
             return Ok(false);
         };
@@ -2516,7 +2520,11 @@ impl TerminalApp {
         if live.session.events.restart_token() != Some(exit.token) {
             return Ok(false);
         }
-        live.session.restart_exited(exit.token)?;
+        if let Some(permits) = login_permits {
+            live.session.restart_group_ssh(exit.token, permits)?;
+        } else {
+            live.session.restart_exited(exit.token)?;
+        }
         self.clipboard.connection_changed(exit.pane, 0, true);
         live.reset_transport_input(&self.keyboard);
         Ok(true)
@@ -4958,7 +4966,7 @@ impl Component for TerminalApp {
             }
             Message::RestartExited(exit) => {
                 // A native menu may still be delivering a callback for a previous exit or pane.
-                if let Err(error) = self.restart_exited_pane(exit) {
+                if let Err(error) = self.restart_exited_pane(exit, None) {
                     self.window_error =
                         Some(format!("Could not restart pane {}: {error:#}", exit.pane));
                 }

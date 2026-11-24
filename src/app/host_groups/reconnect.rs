@@ -38,6 +38,20 @@ impl TargetState {
     }
 }
 
+impl HostGroup {
+    pub(super) fn login_permits(&mut self, limit: Option<usize>) -> Option<Arc<Semaphore>> {
+        let limit = limit?;
+        let (current, permits) = self
+            .login_queue
+            .get_or_insert_with(|| (limit, Arc::new(Semaphore::new(limit))));
+        if *current != limit {
+            *current = limit;
+            *permits = Arc::new(Semaphore::new(limit));
+        }
+        Some(permits.clone())
+    }
+}
+
 impl TerminalApp {
     pub(super) fn pending_attempts(&self, page: &HostGroup, shown: &[&Target]) -> Vec<Attempt> {
         shown
@@ -101,6 +115,12 @@ impl TerminalApp {
             return;
         };
         let eligible = request.eligible(page, &roster);
+        let login_permits = match request {
+            Request::Selection(_) => {
+                page.login_permits(page.roster_preferences.login_limit.concurrency())
+            }
+            Request::Host(_) => None,
+        };
         let mut started = 0;
         let mut skipped = 0;
         let mut feedback = Vec::new();
@@ -109,7 +129,7 @@ impl TerminalApp {
                 skipped += 1;
                 continue;
             }
-            match self.restart_exited_pane(exit) {
+            match self.restart_exited_pane(exit, login_permits.clone()) {
                 Ok(true) => started += 1,
                 Ok(false) => skipped += 1,
                 Err(error) => feedback.push(format!(

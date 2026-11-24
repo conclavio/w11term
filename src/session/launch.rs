@@ -50,6 +50,7 @@ impl Launcher {
         size: TerminalSize,
         input: mpsc::UnboundedReceiver<TransportInput>,
         output: mpsc::Sender<ssh::Event>,
+        reconnect_gate: Option<ssh::LoginGate>,
     ) -> String {
         match &self.source {
             Source::Local(shell) => {
@@ -80,7 +81,10 @@ impl Launcher {
                     options.user, options.host, options.port
                 );
                 let options = options.clone();
-                let sharing = self.sharing.for_launch();
+                let mut sharing = self.sharing.for_launch();
+                if reconnect_gate.is_some() {
+                    sharing.launch_gate = reconnect_gate;
+                }
                 let prompts = self.prompts.clone();
                 let events = self.events.clone();
                 tasks.spawn_on(

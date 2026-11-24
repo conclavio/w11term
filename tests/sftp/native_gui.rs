@@ -1482,7 +1482,7 @@ async fn native_saved_ssh_group_opens_in_an_independent_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "applies a saved limit to reviewed and direct group launches and advances stopped logins"]
+#[ignore = "queues limited group launches and overlapping bulk reconnects in the original SSH panes"]
 async fn native_reviewed_ssh_group_limits_parallel_logins() {
     let state = tempfile::tempdir().unwrap();
     let mut peers = Vec::new();
@@ -1490,7 +1490,8 @@ async fn native_reviewed_ssh_group_limits_parallel_logins() {
     for (name, needs_password) in [("Login East", true), ("Login West", true), ("Ready", false)] {
         let accepted = Arc::new(AtomicUsize::new(0));
         let (Source::Ssh(mut ssh), root, opens, server) =
-            fixture_counting_accepts(false, 2, accepted.clone()).await
+            fixture_counting_accepts(false, if needs_password { 3 } else { 2 }, accepted.clone())
+                .await
         else {
             unreachable!()
         };
@@ -1511,7 +1512,11 @@ async fn native_reviewed_ssh_group_limits_parallel_logins() {
     .unwrap();
     drive_gui("ssh-host-group-launch-limit-ui.ps1", state.path());
     for (name, needs_password, accepted, _, opens, server) in peers {
-        assert_eq!(accepted.load(Ordering::Relaxed), 2, "{name}");
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
+            if needs_password { 3 } else { 2 },
+            "{name}"
+        );
         assert_eq!(
             opens.load(Ordering::Relaxed),
             2 * usize::from(!needs_password),
