@@ -197,6 +197,8 @@ To open just a subset or a recipient set in its own window, use **Review group l
 
 Set **Parallel SSH logins** in the launch review to limit how many fresh connections authenticate at once. The default is **Unlimited**. A queued pane shows **Waiting to connect** and can be stopped from the roster. A slot becomes available after login and opening an SSH session channel, so active shells do not count against the limit.
 
+Choose **Save as default** beside the login limit to use it in future reviews and when opening the saved group directly in a tab or window.
+
 When creating or editing a group, filter by profile name or SSH address. **Check matches** and **Uncheck matches** apply to every matching profile across pages. **Move up** and **Move down** change a checked profile’s position in the full group. Fresh tabs open in the saved order.
 
 Group tabs keep their own drafts, filters, host selections, and results. A named tab shows the panes opened for that group and panes added with **Import host list…**. Turn on **Show all window SSH panes** to include other connections in the roster. Turning it off clears checks on those other panes. **New SSH group tab** opens an independent window-wide roster with an empty selection. **SSH host group** returns to the most recently used group tab.

@@ -429,12 +429,38 @@ pub enum SshRosterOrder {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshGroupLoginLimit {
+    #[default]
+    Unlimited,
+    One,
+    Two,
+    Four,
+    Eight,
+    Sixteen,
+}
+
+impl SshGroupLoginLimit {
+    pub fn concurrency(self) -> Option<usize> {
+        match self {
+            Self::Unlimited => None,
+            Self::One => Some(1),
+            Self::Two => Some(2),
+            Self::Four => Some(4),
+            Self::Eight => Some(8),
+            Self::Sixteen => Some(16),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SshRosterDefaults {
     pub order: SshRosterOrder,
     pub show_last_output: bool,
     pub show_terminal_line: bool,
     pub require_all_ready: bool,
+    pub login_limit: SshGroupLoginLimit,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -494,6 +520,13 @@ impl Profiles {
         self.profiles
             .get(name)
             .filter(|options| !options.durable && !options.player.rustmush)
+    }
+
+    pub fn ssh_roster_defaults(&self, name: &str) -> SshRosterDefaults {
+        self.ssh_host_group_defaults
+            .get(name)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn resolve_ssh_host_group_members<'a>(

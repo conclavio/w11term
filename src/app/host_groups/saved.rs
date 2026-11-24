@@ -1,5 +1,6 @@
 use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Result, ensure};
+use w11term::options::SshGroupLoginLimit;
 
 mod definition;
 mod duplicate;
@@ -478,6 +479,31 @@ impl TerminalApp {
         self.bind_folder_shares();
     }
 
+    pub(super) fn save_saved_group_login_limit(
+        &mut self,
+        id: TabId,
+        name: &str,
+        members: &[String],
+        expected: SshRosterDefaults,
+        login_limit: SshGroupLoginLimit,
+    ) -> Result<()> {
+        let updated = SshRosterDefaults {
+            login_limit,
+            ..expected
+        };
+        let catalog = self
+            .store
+            .save_ssh_roster_defaults(name, members, expected, updated)?;
+        self.use_group_catalog(catalog);
+        if let Some(page) = self.host_group_mut(id)
+            && page.saved.origin() == Some((name, members))
+        {
+            page.saved.roster_defaults.login_limit = login_limit;
+            page.roster_preferences.login_limit = login_limit;
+        }
+        Ok(())
+    }
+
     fn save_host_group_roster_defaults(
         &mut self,
         id: TabId,
@@ -547,12 +573,7 @@ impl TerminalApp {
         full_roster: bool,
         feedback: String,
     ) {
-        let defaults = self
-            .catalog
-            .ssh_host_group_defaults
-            .get(name)
-            .copied()
-            .unwrap_or_default();
+        let defaults = self.catalog.ssh_roster_defaults(name);
         if let Some(page) = self.host_group_mut(id) {
             if page.roster.is_some() {
                 page.saved
@@ -618,6 +639,7 @@ impl TerminalApp {
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
+        let login_limit = catalog.ssh_roster_defaults(name).login_limit.concurrency();
         self.use_group_catalog(catalog);
         let id = id.unwrap_or_else(|| self.new_host_group_tab(Some(name)));
         if self
@@ -640,7 +662,7 @@ impl TerminalApp {
             BTreeSet::new(),
             expected.iter().cloned().map(Some).zip(members),
             PaneLaunch::Select,
-            None,
+            login_limit,
             ctx,
         );
         self.remember_group_launch(
@@ -671,13 +693,14 @@ impl TerminalApp {
                     .cloned(),
             )
             .collect();
+        let login_limit = catalog.ssh_roster_defaults(name).login_limit.concurrency();
         self.use_group_catalog(catalog);
         self.open_group_child_window(
             WindowGroup {
                 name: name.into(),
                 profiles: expected.to_vec(),
                 members,
-                login_limit: None,
+                login_limit,
             },
             ctx,
         )

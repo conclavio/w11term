@@ -20,7 +20,6 @@ function Click-Button([string]$Name) {
 function Set-LoginLimit {
     $combo = [System.Windows.Automation.ControlType]::ComboBox
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $selection = [System.Windows.Automation.SelectionPattern]::Pattern
     $option = Wait-Until 'the one-at-a-time login choice' {
         $field = Find-Element 'Parallel SSH logins' $combo
         if (!$field) { return }
@@ -29,15 +28,20 @@ function Set-LoginLimit {
         Find-Element '1 at a time' ([System.Windows.Automation.ControlType]::ListItem) -Visible
     }
     $option.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Expect-LoginLimit '1 at a time'
+    $field = Find-Element 'Parallel SSH logins' $combo
+    $popup = $field.GetCurrentPattern($expand)
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+function Expect-LoginLimit([string]$Choice) {
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $selection = [System.Windows.Automation.SelectionPattern]::Pattern
     $null = Wait-Until 'the selected login limit' {
         $field = Find-Element 'Parallel SSH logins' $combo
         if (!$field) { return }
         $items = $field.GetCurrentPattern($selection).Current.GetSelection()
-        $items.Count -eq 1 -and $items[0].Current.Name -ceq '1 at a time'
+        $items.Count -eq 1 -and $items[0].Current.Name -ceq $Choice
     }
-    $field = Find-Element 'Parallel SSH logins' $combo
-    $popup = $field.GetCurrentPattern($expand)
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 function Stop-HostLogin($Pane, $OtherPane) {
     $field = Wait-Until 'the host filter' { Find-Element 'Host filter' $edit }
@@ -53,20 +57,7 @@ function Stop-HostLogin($Pane, $OtherPane) {
     }
 }
 
-$launch = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
-$app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
-try {
-    $window = Wait-InputWindow
-    $origin = $window
-    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
-    Run-Palette "Review SSH group${dot}Limited" -Enter
-    Set-LoginLimit
-    Click-Button 'Open reviewed group in new window'
-    $window = Wait-Until 'the group window' {
-        [FixtureDialog]::Windows($app.Id) | Where-Object {
-            $_ -ne $origin -and [FixtureDialog]::GetWindow($_, 4) -eq [IntPtr]::Zero
-        } | Select-Object -First 1
-    }
+function Check-QueuedLogins {
     $limits = Wait-Until 'one login awaits a password and the other remains queued' {
         $logins = @((Control @('list')).sessions | Where-Object label -like 'Login *')
         $queued = $logins | Where-Object { $_.ssh_connection.phase -eq 'queued' }
@@ -89,6 +80,41 @@ try {
     Stop-HostLogin $limits.queued $limits.auth
     $ready = (Control @('list')).sessions | Where-Object label -ceq 'Ready'
     $null = Control @('wait-for-text','--pane',"$($ready.id)",'--timeout','15','ready')
+}
+
+$launch = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
+$app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+try {
+    $window = Wait-InputWindow
+    $origin = $window
+    $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
+    Run-Palette "Review SSH group${dot}Limited" -Enter
+    Expect-LoginLimit 'Unlimited'
+    Set-LoginLimit
+    Click-Button 'Save login limit'
+    $null = Wait-Until 'login limit was saved' { Find-Element 'Saved the parallel SSH login limit' }
+    $saved = [IO.File]::ReadAllText($profiles) | ConvertFrom-Json
+    if ($saved.ssh_host_group_defaults.Limited.login_limit -cne 'one') {
+        throw 'The profile file does not contain the selected login limit'
+    }
+    Click-Button 'Cancel'
+    Run-Palette "Review SSH group${dot}Limited" -Enter
+    Expect-LoginLimit '1 at a time'
+    Click-Button 'Open reviewed group in new window'
+    $window = Wait-Until 'the group window' {
+        [FixtureDialog]::Windows($app.Id) | Where-Object {
+            $_ -ne $origin -and [FixtureDialog]::GetWindow($_, 4) -eq [IntPtr]::Zero
+        } | Select-Object -First 1
+    }
+    Check-QueuedLogins
+    $groupWindow = $window
+    $null = [FixtureMessages]::PostMessage($groupWindow, 0x10, [UIntPtr]::Zero, [IntPtr]::Zero)
+    $window = $origin
+    $null = Wait-Until 'the dedicated group is closed' {
+        [FixtureDialog]::Windows($app.Id) -notcontains $groupWindow
+    }
+    Run-Palette "Open SSH group${dot}Limited" -Enter
+    Check-QueuedLogins
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

@@ -1,16 +1,16 @@
 use super::{filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Context, Result, ensure};
-use w11term::options::SshRecipientSets;
+use w11term::options::{SshGroupLoginLimit, SshRecipientSets};
 
 pub(super) const LABEL: &str = "Review group launch…";
 const FRESH: &str = "Open a new SSH pane";
-const LOGIN_LIMITS: [(&str, Option<usize>); 6] = [
-    ("Unlimited", None),
-    ("1 at a time", Some(1)),
-    ("2 at a time", Some(2)),
-    ("4 at a time", Some(4)),
-    ("8 at a time", Some(8)),
-    ("16 at a time", Some(16)),
+const LOGIN_LIMITS: [(&str, SshGroupLoginLimit); 6] = [
+    ("Unlimited", SshGroupLoginLimit::Unlimited),
+    ("1 at a time", SshGroupLoginLimit::One),
+    ("2 at a time", SshGroupLoginLimit::Two),
+    ("4 at a time", SshGroupLoginLimit::Four),
+    ("8 at a time", SshGroupLoginLimit::Eight),
+    ("16 at a time", SshGroupLoginLimit::Sixteen),
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -125,6 +125,7 @@ struct Review {
     name: String,
     members: Vec<Member>,
     sets: SshRecipientSets,
+    roster_defaults: SshRosterDefaults,
     selected_set: Option<String>,
     feedback: String,
 }
@@ -260,7 +261,7 @@ pub(super) struct State {
     filter: filter::Filter,
     page: usize,
     set_editor: Option<SetEditor>,
-    login_limit: Option<usize>,
+    login_limit: SshGroupLoginLimit,
 }
 
 enum SetEditor {
@@ -323,7 +324,13 @@ pub enum Change {
     ChooseMatches(Vec<usize>, ConnectionSelection),
     RecipientSet(String),
     LoginLimit(usize),
-    Approve(Vec<Launch>, Option<String>, LaunchLocation, Option<usize>),
+    SaveLoginLimit(SshGroupLoginLimit),
+    Approve(
+        Vec<Launch>,
+        Option<String>,
+        LaunchLocation,
+        SshGroupLoginLimit,
+    ),
     Export(Vec<Launch>, Option<String>),
     BeginSaveSet,
     BeginUpdateSet,
@@ -331,7 +338,10 @@ pub enum Change {
     SetName(String),
     SetTarget(String),
     SaveSet(String),
-    RenameSet { from: String, to: String },
+    RenameSet {
+        from: String,
+        to: String,
+    },
     ConfirmDeleteSet(String),
     DeleteSet(String),
     BackFromSet,
@@ -380,6 +390,13 @@ impl State {
     }
 
     fn replace(&mut self, review: Review) {
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|previous| self.login_limit == previous.roster_defaults.login_limit)
+        {
+            self.login_limit = review.roster_defaults.login_limit;
+        }
         self.revision += 1;
         self.review = Some(Box::new(review));
     }
@@ -388,7 +405,7 @@ impl State {
         self.filter.clear();
         self.page = 0;
         self.set_editor = None;
-        self.login_limit = None;
+        self.login_limit = review.roster_defaults.login_limit;
         self.replace(review);
     }
 
@@ -580,24 +597,24 @@ impl State {
                         TextBlock::new()
                             .font_size(24.0)
                             .text(format!("Review SSH group · {}", review.name)),
+                        TextBlock::new().text(counts),
                         StackPanel::new()
                             .spacing(8.0)
                             .orientation(Orientation::Horizontal)
                             .children((
-                                TextBlock::new()
-                                    .vertical_alignment(VerticalAlignment::Center)
-                                    .text(counts),
-                                TextBlock::new()
-                                    .vertical_alignment(VerticalAlignment::Center)
-                                    .text("Parallel SSH logins"),
+                                TextBlock::new().vertical_alignment(VerticalAlignment::Center).text("Parallel SSH logins"),
                                 ComboBox::new()
                                     .automation_name("Parallel SSH logins")
-                                    .is_enabled(new > 0)
                                     .items_source(LOGIN_LIMITS.map(|(label, _)| label))
                                     .selected_index(LOGIN_LIMITS.iter().position(|(_, limit)| *limit == login_limit))
                                     .on_selection_changed(ctx.callback(move |index: Option<usize>| {
                                         index.map_or(Message::ControlIdle, |index| action(Change::LoginLimit(index)))
                                     })),
+                                Button::new()
+                                    .automation_name("Save login limit")
+                                    .is_enabled(login_limit != review.roster_defaults.login_limit)
+                                    .on_click(ctx.callback(move |_| action(Change::SaveLoginLimit(login_limit))))
+                                    .content("Save as default"),
                             )),
                         TextBox::new()
                             .automation_name("Find launch profiles")
@@ -1225,6 +1242,28 @@ impl TerminalApp {
                     page.saved.reuse.login_limit = *limit;
                 }
             }
+            Change::SaveLoginLimit(limit)
+                if state.login_limit == limit && review.roster_defaults.login_limit != limit =>
+            {
+                let name = review.name.clone();
+                let members = review.profiles();
+                let expected = review.roster_defaults;
+                let result =
+                    self.save_saved_group_login_limit(id, &name, &members, expected, limit);
+                if let Some(page) = self.host_group_mut(id)
+                    && let Some(review) = page.saved.reuse.review.as_mut()
+                {
+                    review.feedback = match result {
+                        Ok(()) => {
+                            review.roster_defaults.login_limit = limit;
+                            "Saved the parallel SSH login limit".into()
+                        }
+                        Err(error) => {
+                            format!("{error:#} Refresh the launch review before saving again.")
+                        }
+                    };
+                }
+            }
             Change::Refresh => {
                 let updated = self.saved_group_reuse_review(
                     review.name.clone(),
@@ -1248,8 +1287,12 @@ impl TerminalApp {
                     && state.login_limit == limit =>
             {
                 let result = match location {
-                    LaunchLocation::Tab => self.open_group_reusing_connections(id, limit, ctx),
-                    LaunchLocation::Window => self.open_reviewed_group_window(id, limit, ctx),
+                    LaunchLocation::Tab => {
+                        self.open_group_reusing_connections(id, limit.concurrency(), ctx)
+                    }
+                    LaunchLocation::Window => {
+                        self.open_reviewed_group_window(id, limit.concurrency(), ctx)
+                    }
                 };
                 if let Err(error) = result
                     && let Some(page) = self.host_group_mut(id)
@@ -1460,6 +1503,7 @@ impl TerminalApp {
     ) -> Result<Review> {
         let catalog = self.load_expected_host_group(&name, &profiles)?;
         let targets = self.host_group_targets();
+        let roster_defaults = catalog.ssh_roster_defaults(&name);
         let sets = catalog
             .ssh_recipient_sets
             .get(&name)
@@ -1487,6 +1531,7 @@ impl TerminalApp {
             name,
             members,
             sets,
+            roster_defaults,
             selected_set: None,
             feedback: String::new(),
         };
@@ -1668,6 +1713,7 @@ mod tests {
                 Member::new("East retired".into(), None, Vec::new()),
             ],
             sets: SshRecipientSets::new(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: Some("Fleet".into()),
             feedback: String::new(),
         });
@@ -1737,6 +1783,7 @@ mod tests {
                 skipped,
             ],
             sets: SshRecipientSets::new(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: Some("Fleet".into()),
             feedback: String::new(),
         });
@@ -1766,6 +1813,7 @@ mod tests {
                 Member::new("West".into(), Some(options("west")), Vec::new()),
             ],
             sets: SshRecipientSets::new(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: None,
             feedback: String::new(),
         };
@@ -1812,6 +1860,7 @@ mod tests {
                 Member::new("Offline".into(), None, Vec::new()),
             ],
             sets: sets.clone(),
+            roster_defaults: SshRosterDefaults::default(),
             selected_set: None,
             feedback: String::new(),
         };
