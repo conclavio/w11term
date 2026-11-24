@@ -328,18 +328,20 @@ mod tests {
                 serde_json::json!({"verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,"action":action})
             );
         }
-        let (_, approval) = parse_queue(&["approve-canary", "--pane", "5"]).unwrap();
-        assert_eq!(
-            serde_json::to_value(approval).unwrap(),
-            serde_json::json!({
-                "verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,
-                "action":{"approve_canary":{"pane_id":5}}
-            })
-        );
+        for (command, wire) in [("approve-canary", "approve_canary"), ("skip", "skip")] {
+            let (_, targeted) = parse_queue(&[command, "--pane", "5"]).unwrap();
+            assert_eq!(
+                serde_json::to_value(targeted).unwrap(),
+                serde_json::json!({
+                    "verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,
+                    "action":{(wire):{"pane_id":5}}
+                })
+            );
+            assert!(parse_queue(&[command]).is_err());
+            assert!(parse_queue(&[command, "--pane", "0"]).is_err());
+            assert!(parse_queue(&[command, "--pane", "5", "--pane", "6"]).is_err());
+        }
         assert!(parse_queue(&["cancel"]).is_err());
-        assert!(parse_queue(&["approve-canary"]).is_err());
-        assert!(parse_queue(&["approve-canary", "--pane", "0"]).is_err());
-        assert!(parse_queue(&["approve-canary", "--pane", "5", "--pane", "6"]).is_err());
         assert!(parse_queue(&["pause", "--pane", "5"]).is_err());
         assert!(
             parse(["ssh-group-queue", "--window", "2", "--tab", "3", "pause"].map(str::to_owned))

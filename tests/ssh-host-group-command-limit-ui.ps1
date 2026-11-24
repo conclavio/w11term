@@ -325,6 +325,10 @@ try {
         $running.state -cne 'canary_running' -or $running.canary_pane_id -ne $panes.East) {
         throw 'The CLI could not identify the running canary or accepted approval before its exit'
     }
+    $cannotSkip = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 skip --pane $panes.East | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $cannotSkip.ok -or $cannotSkip.error -notlike '*active canary cannot be skipped*') {
+        throw 'The CLI let the running canary be skipped'
+    }
     $null = Wait-Until 'only East runs before a canary result' {
         (Find-Element "$($labels.West)${dot}Queued") -and
             (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
@@ -466,7 +470,25 @@ try {
             (Find-Element "Skip queued pane $($panes.North)" $button) -and
             !(Find-Element "Skip queued pane $($panes.West)" $button)
     }
-    Click "Skip queued pane $($panes.East)"
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the skip is issued with the group in the background' { Find-Element "Read${dot}$canaryNotice" $button }
+    $skipFocus = [FixtureMessages]::GetForegroundWindow()
+    $runningSkip = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 10 skip --pane $panes.West | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $runningSkip.ok -or $runningSkip.error -notlike '*no queued command to skip*') {
+        throw 'The CLI let an already running host be skipped'
+    }
+    $skipped = (Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run','10',
+            'skip','--pane',"$($panes.East)")).run
+    $east = $skipped.recipients | Where-Object pane_id -eq $panes.East
+    $north = $skipped.recipients | Where-Object pane_id -eq $panes.North
+    $west = $skipped.recipients | Where-Object pane_id -eq $panes.West
+    if ($skipped.queue.unsent -ne 1 -or $east.delivery.state -cne 'skipped' -or
+        $north.delivery.state -cne 'queued' -or $west.execution.state -cne 'running' -or
+        [FixtureMessages]::GetForegroundWindow() -ne $skipFocus -or !(Find-Element "Read${dot}$canaryNotice" $button)) {
+        throw 'The CLI skip changed focus or modified a host other than East'
+    }
+    $tab = Wait-Until 'the group tab after skipping' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'East is skipped while North remains queued' {
         (Find-Element "$($labels.East)${dot}Skipped before sending") -and
             (Find-Element "$($labels.North)${dot}Queued") -and

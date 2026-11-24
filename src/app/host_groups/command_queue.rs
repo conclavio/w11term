@@ -342,18 +342,23 @@ impl Submission {
                 self.reject_queued_commands("Cancelled before sending.");
             }
             Action::CancelCanaryNotice => queue.notify_canary = false,
-            Action::SkipHost(pane) if !queue.is_canary(pane) => {
-                if let Some(delivery) = self
+            Action::SkipHost(pane) => {
+                if queue.is_canary(pane) {
+                    return Err("The active canary cannot be skipped");
+                }
+                let delivery = self
                     .results
                     .iter_mut()
                     .find(|delivery| delivery.target.pane == pane)
-                    && let DeliveryStatus::Queued(waiting) = &mut delivery.status
+                    .ok_or("The specified pane is not a recipient in this run")?;
+                if let DeliveryStatus::Queued(waiting) = &mut delivery.status
                     && let Some(host) = waiting.0.take()
                 {
                     host.skip_queued();
                     delivery.status = DeliveryStatus::Skipped;
                     return Ok(true);
                 }
+                return Err("The specified pane has no queued command to skip");
             }
             Action::SetPaused(_) if queue.canary.is_some() => {
                 return Err("Pause and resume are unavailable while the canary is pending");
@@ -579,6 +584,7 @@ impl TerminalApp {
             SshGroupQueueAction::Resume => Action::SetPaused(false),
             SshGroupQueueAction::Stop => Action::Cancel,
             SshGroupQueueAction::ApproveCanary { pane_id } => Action::ApproveCanary(pane_id),
+            SshGroupQueueAction::Skip { pane_id } => Action::SkipHost(pane_id),
         };
         if self
             .command_queue_run(id, run)?
