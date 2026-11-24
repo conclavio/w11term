@@ -121,8 +121,7 @@ struct Submission {
     transcript: GroupTranscript,
     recording: output_recording::State,
     saved_recordings: output_recording::saved::State,
-    command_slots: Option<Arc<Semaphore>>,
-    stop_queue_on_failure: bool,
+    command_queue: Option<command_queue::Queue>,
 }
 
 #[derive(Clone)]
@@ -579,8 +578,7 @@ impl HostGroup {
             transcript,
             recording: Default::default(),
             saved_recordings: Default::default(),
-            command_slots: None,
-            stop_queue_on_failure: false,
+            command_queue: None,
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -707,7 +705,7 @@ pub enum Action {
     Send(TabId, CommandOffer),
     CommandLimit(TabId, SshGroupParallelLimit),
     StopCommandQueueOnFailure(TabId, bool),
-    CancelQueuedCommands(TabId, u64),
+    CommandQueue(TabId, u64, command_queue::Action),
 }
 
 impl TerminalApp {
@@ -1066,8 +1064,8 @@ impl TerminalApp {
         if let Some(page) = self.host_group_mut(id) {
             let submission = page.submit(SubmissionContent::Command(text), results, transcript);
             submission.recording = recording;
-            submission.command_slots = limit.map(|limit| Arc::new(Semaphore::new(limit)));
-            submission.stop_queue_on_failure = stop_queue_on_failure;
+            submission.command_queue =
+                limit.map(|limit| command_queue::Queue::new(limit, stop_queue_on_failure));
         }
         self.poll_command_queues();
     }
@@ -1491,7 +1489,7 @@ impl TerminalApp {
                     page.roster_preferences.command_limit = limit;
                 }
             }
-            Action::CancelQueuedCommands(id, run) => self.cancel_queued_commands(id, run),
+            Action::CommandQueue(id, run, action) => self.handle_command_queue(id, run, action),
             Action::StopCommandQueueOnFailure(id, stop) => {
                 if let Some(page) = self.host_group_mut(id).filter(|page| {
                     !page.recorded_send.pending()
@@ -2373,8 +2371,8 @@ impl TerminalApp {
                             }))
                             .content(text_export::GROUP_JSON_LABEL),
                         completion::button(id, submission, ctx),
-                        command_queue::cancel_button(id, submission, ctx),
                     )),
+                command_queue::controls(id, submission, ctx),
                 retry::button(
                     id,
                     page,

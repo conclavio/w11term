@@ -3,6 +3,27 @@ use w11term::events::GroupTranscriptHost;
 
 const FAILED_RESULT: &str = "Queue stopped after an unsuccessful host.";
 
+pub enum Action {
+    SetPaused(bool),
+    Cancel,
+}
+
+pub(super) struct Queue {
+    slots: Arc<Semaphore>,
+    stop_on_failure: bool,
+    paused: bool,
+}
+
+impl Queue {
+    pub(super) fn new(limit: usize, stop_on_failure: bool) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(limit)),
+            stop_on_failure,
+            paused: false,
+        }
+    }
+}
+
 pub(super) struct Waiting(Option<GroupTranscriptHost>);
 
 impl Waiting {
@@ -59,21 +80,24 @@ impl TerminalApp {
             };
             let mut jobs = Vec::new();
             for run in &mut page.submissions {
-                let (Some(slots), SubmissionContent::Command(text)) =
-                    (&run.command_slots, &run.content)
+                let (Some(queue), SubmissionContent::Command(text)) =
+                    (&run.command_queue, &run.content)
                 else {
                     continue;
                 };
-                if run.stop_queue_on_failure && run.transcript.has_unsuccessful_result() {
+                if queue.stop_on_failure && run.transcript.has_unsuccessful_result() {
                     run.reject_queued_commands(FAILED_RESULT);
                     continue;
                 }
-                let stop_after_failure = run.stop_queue_on_failure.then(|| run.transcript.clone());
+                if queue.paused {
+                    continue;
+                }
+                let stop_after_failure = queue.stop_on_failure.then(|| run.transcript.clone());
                 for (index, delivery) in run.results.iter_mut().enumerate() {
                     let DeliveryStatus::Queued(waiting) = &mut delivery.status else {
                         continue;
                     };
-                    let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    let Ok(permit) = queue.slots.clone().try_acquire_owned() else {
                         break;
                     };
                     let mut host = waiting
@@ -117,7 +141,7 @@ impl TerminalApp {
         }
     }
 
-    pub(super) fn cancel_queued_commands(&mut self, id: TabId, run: u64) {
+    pub(super) fn handle_command_queue(&mut self, id: TabId, run: u64, action: Action) {
         if self.host_group_command_target() != Some(id) {
             return;
         }
@@ -127,25 +151,58 @@ impl TerminalApp {
             .and_then(|page| {
                 page.submissions
                     .iter_mut()
-                    .find(|submission| submission.id == run)
+                    .find(|submission| submission.id == run && submission.has_queue())
             })
         else {
             return;
         };
-        submission.reject_queued_commands("Cancelled before sending.");
+        match action {
+            Action::Cancel => submission.reject_queued_commands("Cancelled before sending."),
+            Action::SetPaused(paused) => {
+                let Some(queue) = &mut submission.command_queue else {
+                    return;
+                };
+                queue.paused = paused;
+                if !paused {
+                    self.poll_command_queues();
+                }
+            }
+        }
     }
 }
 
-pub(super) fn cancel_button(
-    id: TabId,
-    submission: &Submission,
-    ctx: &ViewContext<TerminalApp>,
-) -> View {
-    if !submission.has_queue() {
+pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<TerminalApp>) -> View {
+    let Some(queue) = submission
+        .command_queue
+        .as_ref()
+        .filter(|_| submission.has_queue())
+    else {
         return View::empty();
-    }
+    };
     let run = submission.id;
-    Button::new()
-        .on_click(ctx.callback(move |_| Message::HostGroup(Action::CancelQueuedCommands(id, run))))
-        .content("Cancel queued commands")
+    let paused = queue.paused;
+    let event = move |action| Message::HostGroup(super::Action::CommandQueue(id, run, action));
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(8.0)
+        .children((
+            Button::new()
+                .on_click(ctx.callback(move |_| event(Action::SetPaused(!paused))))
+                .content(if paused {
+                    "Resume queue"
+                } else {
+                    "Pause queue"
+                }),
+            Button::new()
+                .on_click(ctx.callback(move |_| event(Action::Cancel)))
+                .content("Cancel queued commands"),
+            if paused {
+                TextBlock::new()
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text("Command queue paused")
+                    .into()
+            } else {
+                View::empty()
+            },
+        ))
 }

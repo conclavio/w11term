@@ -97,6 +97,8 @@ Set **Parallel SSH commands** to run a submission in batches. The default is **U
 
 With a finite limit, turn on **Stop queue on failure** to withhold the remaining commands as soon as a host settles without a confirmed zero exit status. Active commands continue. **Save roster defaults** remembers this choice for a named group.
 
+Use **Pause queue** to hold unsent commands while you inspect results. Active commands continue, and stop-on-failure still applies. **Resume queue** rechecks the original prompts before sending again.
+
 Use the host-state dropdown to show ready shells, disconnected panes, or another current state. The state filter combines with the name or wildcard filter and keeps checks on hidden hosts. Sending and other actions on checked hosts use the visible selection.
 
 The live state count summarizes every host matching the name or wildcard filter. When a state filter hides hosts, the summary shows how many are visible out of the matching total.

@@ -273,8 +273,7 @@ mod tests {
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
             saved_recordings: Default::default(),
-            command_slots: None,
-            stop_queue_on_failure: false,
+            command_queue: None,
             transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
@@ -334,8 +333,7 @@ mod tests {
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
             saved_recordings: Default::default(),
-            command_slots: None,
-            stop_queue_on_failure: false,
+            command_queue: None,
             transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),
@@ -390,8 +388,7 @@ mod tests {
             ])),
             recording: Default::default(),
             saved_recordings: Default::default(),
-            command_slots: None,
-            stop_queue_on_failure: false,
+            command_queue: None,
             transcript: Default::default(),
             results: vec![captured(7, String::new(), false), running, pending],
         };

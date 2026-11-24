@@ -1525,7 +1525,7 @@ async fn native_ssh_group_notifies_when_watched_logins_settle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "bounds group execution and stops queued commands on cancellation or failure"]
+#[ignore = "bounds SSH group execution and verifies pause, resume, cancellation, and stop-on-failure"]
 async fn native_ssh_group_bounds_parallel_commands() {
     use in_band_resize::Wire;
 
@@ -1557,11 +1557,18 @@ async fn native_ssh_group_bounds_parallel_commands() {
                         let Some(line) = input.strip_suffix('\r') else {
                             continue;
                         };
+                        if name == "East" && line == "inspect" {
+                            assert!(
+                                fixtures.join("resume-inspect").is_file(),
+                                "East received the command while paused"
+                            );
+                        }
                         let handle = peer.as_ref().unwrap();
                         handle
                             .data(
                                 id,
-                                format!("\x1b]133;C\x07{name} started {line}\r\n").into_bytes(),
+                                format!("{line}\r\n\x1b]133;C\x07{name} started {line}\r\n")
+                                    .into_bytes(),
                             )
                             .await
                             .unwrap();
@@ -1597,8 +1604,8 @@ async fn native_ssh_group_bounds_parallel_commands() {
     drive_gui("ssh-host-group-command-limit-ui.ps1", state.path());
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
-            "West" => b"roll\rkeep-first\rhalt-on-failure\r".as_slice(),
-            "East" => b"roll\r",
+            "West" => b"roll\rkeep-first\rhalt-on-failure\rinspect\r".as_slice(),
+            "East" => b"roll\rinspect\r",
             _ => b"x",
         };
         assert_eq!(inputs.lock().unwrap().as_slice(), expected, "{name}");

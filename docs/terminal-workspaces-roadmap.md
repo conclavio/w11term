@@ -205,6 +205,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 89. **Limit parallel commands within a submission.** Queue checked, ready hosts in roster order, recheck each prompt when its slot becomes available, and allow cancellation before sending. The same limit applies to recorded runs.
 90. **Save a group command limit.** Store the chosen command concurrency with the roster defaults so it follows group launches, copies, and portable definitions.
 91. **Stop queued commands on failure.** Optionally withhold the remaining commands when a host settles without confirmed success. Preserve the results of commands already sent.
+92. **Pause and resume a rolling run.** Hold unsent commands while inspecting results, and resume against the reviewed prompts. Continue to apply the submission's stop-on-failure setting.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

@@ -90,7 +90,13 @@ try {
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished keep-first')
     $log = Join-Path $State 'ssh-group-output-2.txt'
     $null = Wait-Until 'the recording includes the cancelled delivery' {
-        [IO.File]::Exists($log) -and [IO.File]::ReadAllText($log).Contains('Cancelled before sending.')
+        try {
+            $stream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        } catch [IO.FileNotFoundException] {
+            return
+        }
+        $reader = [IO.StreamReader]::new($stream)
+        try { $reader.ReadToEnd().Contains('Cancelled before sending.') } finally { $reader.Dispose() }
     }
     (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
     $null = Wait-CheckBox 'Stop queue on failure' On
@@ -100,10 +106,37 @@ try {
     $null = Wait-Until 'East is queued until West settles' {
         Find-Element "$($labels.East)${dot}Queued"
     }
+    Click 'Pause queue'
+    $null = Wait-Until 'queue is paused before West fails' { Find-Element 'Command queue paused' }
     New-Item -ItemType File -Path (Join-Path $State 'release-halt-on-failure') | Out-Null
     $null = Wait-Until 'the failure withholds the remaining command' {
-        Find-Element "$($labels.East)${dot}Not sent${dot}Queue stopped after an unsuccessful host."
+        (Find-Element "$($labels.West)${dot}Exit 17") -and
+            (Find-Element "$($labels.East)${dot}Not sent${dot}Queue stopped after an unsuccessful host.") -and
+            !(Find-Element 'Resume queue' $button)
     }
+
+    Set-Command 'inspect'
+    Click 'Send to 2 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started inspect')
+    Click 'Pause queue'
+    $null = Wait-Until 'the next run is paused' { Find-Element 'Command queue paused' }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the paused group is in the background' { Find-Element 'No bells or notifications' }
+    New-Item -ItemType File -Path (Join-Path $State 'release-inspect') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished inspect')
+    $tab = Wait-Until 'the group tab after pausing' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
+    $null = Wait-Until 'the queue remains paused with a free slot' {
+        (Find-Element 'Command queue paused') -and (Find-Element "$($labels.West)${dot}Exit 0") -and
+            (Find-Element "$($labels.East)${dot}Queued")
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'resume-inspect') | Out-Null
+    Click 'Resume queue'
+    $null = Wait-Until 'the queue resumed' { !(Find-Element 'Command queue paused') }
+    $null = Wait-Until 'East was sent the resumed command' {
+        Find-Element "$($labels.East)${dot}Sent to SSH channel"
+    }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {
