@@ -45,6 +45,7 @@ pub struct CommandLink {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SshConnectionPhase {
+    Queued,
     Connecting,
     Reconnecting { attempt: Option<u32> },
     Connected,
@@ -58,6 +59,7 @@ impl SshConnectionPhase {
         use serde_json::json;
 
         match self {
+            Self::Queued => json!({"phase": "queued"}),
             Self::Connecting => json!({"phase": "connecting"}),
             Self::Reconnecting { attempt } => json!({"phase": "reconnecting", "attempt": attempt}),
             Self::Connected => json!({"phase": "connected"}),

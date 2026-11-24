@@ -371,6 +371,24 @@ impl Session {
             connection,
             None,
             None,
+            None,
+        )
+    }
+
+    pub fn start_group_ssh(
+        options: crate::options::SshOptions,
+        size: TerminalSize,
+        clipboard_policy: impl Into<RemoteClipboardPolicy>,
+        launch_gate: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        Self::start_worker(
+            Source::Ssh(options),
+            Some(size),
+            clipboard_policy.into(),
+            None,
+            None,
+            None,
+            Some(launch_gate),
         )
     }
 
@@ -380,6 +398,7 @@ impl Session {
             Source::ViewRecording(path),
             has_cell_pixels(size).then_some(size),
             RemoteClipboardPolicy::Disabled,
+            None,
             None,
             None,
             None,
@@ -395,6 +414,7 @@ impl Session {
             Source::Replay(path),
             has_cell_pixels(size).then_some(size),
             clipboard_policy.into(),
+            None,
             None,
             None,
             None,
@@ -424,6 +444,7 @@ impl Session {
             connection,
             None,
             Some(startup),
+            None,
         )
     }
 
@@ -440,6 +461,7 @@ impl Session {
             clipboard_policy.into(),
             connection,
             Some(ssh::DurableStart::Attach(saved)),
+            None,
             None,
         )
     }
@@ -458,6 +480,7 @@ impl Session {
             None,
             Some(ssh::DurableStart::Discover),
             None,
+            None,
         )
     }
 
@@ -474,6 +497,7 @@ impl Session {
             clipboard_policy.into(),
             None,
             Some(ssh::DurableStart::DiscoverHerdr),
+            None,
             None,
         )
     }
@@ -507,6 +531,7 @@ impl Session {
         connection: Option<ssh::ConnectionShare>,
         saved: Option<ssh::DurableStart>,
         startup: Option<crate::workspace::SshStartup>,
+        launch_gate: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Self {
         static NEXT_PANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (commands, input) = mpsc::unbounded_channel();
@@ -518,7 +543,12 @@ impl Session {
         };
         let events = crate::events::Events::with_group_prompt_pattern(group_prompt_pattern);
         if matches!(source, Source::Ssh(_)) {
-            events.set_ssh_connection_phase(crate::events::SshConnectionPhase::Connecting);
+            let phase = if launch_gate.is_some() {
+                crate::events::SshConnectionPhase::Queued
+            } else {
+                crate::events::SshConnectionPhase::Connecting
+            };
+            events.set_ssh_connection_phase(phase);
         }
         let player = Arc::new(std::sync::RwLock::new(match &source {
             Source::Ssh(ssh) => ssh.player.clone(),
@@ -586,12 +616,13 @@ impl Session {
             .unzip();
         let durable = durable.map(Arc::new);
         let worker_durable = durable.clone();
-        let sharing = ssh::Sharing::new(
+        let mut sharing = ssh::Sharing::new(
             ssh_connection.clone(),
             connection.filter(|_| matches!(source, Source::Ssh(_))),
             lifecycle,
             startup,
         );
+        sharing.launch_gate = launch_gate;
         let worker = thread::Builder::new()
             .name("terminal-session".into())
             .spawn(move || {

@@ -640,6 +640,7 @@ impl TerminalApp {
             BTreeSet::new(),
             expected.iter().cloned().map(Some).zip(members),
             PaneLaunch::Select,
+            None,
             ctx,
         );
         self.remember_group_launch(
@@ -676,6 +677,7 @@ impl TerminalApp {
                 name: name.into(),
                 profiles: expected.to_vec(),
                 members,
+                login_limit: None,
             },
             ctx,
         )
@@ -696,6 +698,7 @@ impl TerminalApp {
                 .cloned()
                 .map(|(name, ssh)| (Some(name), ssh)),
             PaneLaunch::Select,
+            group.login_limit,
             ctx,
         );
         self.remember_group_launch(

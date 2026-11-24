@@ -1384,6 +1384,75 @@ async fn disconnecting_one_shell_keeps_its_shared_ssh_transport_available() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_group_connection_can_be_stopped_before_using_a_launch_slot() {
+    use w11term::events::SshConnectionPhase;
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), _root, opens, server) =
+        fixture_counting_accepts(false, 1, accepted.clone()).await
+    else {
+        unreachable!()
+    };
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let slot = gate.clone().try_acquire_owned().unwrap();
+    let start = || {
+        Session::start_group_ssh(
+            ssh.clone(),
+            wezterm_term::TerminalSize::default(),
+            false,
+            gate.clone(),
+        )
+    };
+    let stopped = start();
+    let waiting = start();
+    let attempt = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(attempt) = stopped.events.pending_ssh_attempt()
+                && waiting.events.pending_ssh_attempt().is_some()
+            {
+                break attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        stopped.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Queued)
+    );
+    assert_eq!(
+        waiting.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Queued)
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 0);
+    assert!(stopped.events.cancel_ssh_attempt(attempt));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stopped.events.restart_token().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        stopped.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Stopped)
+    );
+    drop(slot);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while waiting.events.ssh_connection_phase() != Some(SshConnectionPhase::Connected) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(opens.load(Ordering::Relaxed), 1);
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(gate.available_permits(), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stopping_an_ssh_retry_keeps_the_pane_available_for_manual_reconnect() {
     use in_band_resize::Wire;
     use w11term::events::SshConnectionPhase;

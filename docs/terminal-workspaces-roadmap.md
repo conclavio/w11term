@@ -193,6 +193,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 77. **Map imported members to local profiles.** Let the operator choose a distinct local profile for each file entry, preserve the member and recipient-set order, and recheck the chosen profile settings when saving.
 78. **Open a saved SSH group in its own window.** Start the saved roster and its own fresh SSH panes together using the normal profile verification and authentication paths.
 79. **Open a reviewed group subset in its own window.** Launch only the included profiles or selected recipient set with fresh panes. Recheck the review and keep the partial roster from replacing the saved membership.
+80. **Limit simultaneous logins for a reviewed SSH group.** Let the operator choose a limit for fresh connections, show queued panes in the roster, and allow a queued attempt to be stopped.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

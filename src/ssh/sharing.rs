@@ -260,6 +260,7 @@ pub(crate) struct Sharing {
     pub published: ShareSlot,
     pub offered: Option<ConnectionShare>,
     pub durable: Option<super::durability::Worker>,
+    pub launch_gate: Option<Arc<tokio::sync::Semaphore>>,
     generations: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -286,6 +287,7 @@ impl Sharing {
             offered: self.offered.take(),
             durable: self.durable.take(),
             startup: self.startup.clone(),
+            launch_gate: self.launch_gate.take(),
             generations: self.generations.clone(),
         }
     }

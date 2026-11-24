@@ -366,6 +366,7 @@ impl TerminalApp {
             } else {
                 PaneLaunch::Select
             },
+            None,
             ctx,
         );
         if let Some(page) = self.host_group_mut(id) {

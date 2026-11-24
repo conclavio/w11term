@@ -734,7 +734,9 @@ impl Driver {
         loop {
             let deadline = dropped_at.map(|since| since + Duration::from_secs(300));
             let connected = {
-                let future = connect_shell(
+                let launch_gate = self.sharing.launch_gate.take();
+                let events = &self.events;
+                let connect = connect_shell(
                     self.options.clone(),
                     self.prompts.clone(),
                     &mut self.passwords,
@@ -742,6 +744,23 @@ impl Driver {
                     self.sharing.published.clone(),
                     program.peer_fingerprint(),
                 );
+                let future = async {
+                    // The slot covers login and opening the SSH channel. Active
+                    // shells and future reconnects do not occupy a launch slot.
+                    let _permit = if let Some(gate) = launch_gate {
+                        let permit = gate
+                            .acquire_owned()
+                            .await
+                            .context("The SSH group launch ended")?;
+                        events.set_ssh_connection_phase(
+                            crate::events::SshConnectionPhase::Connecting,
+                        );
+                        Some(permit)
+                    } else {
+                        None
+                    };
+                    connect.await
+                };
                 tokio::pin!(future);
                 loop {
                     tokio::select! {

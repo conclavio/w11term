@@ -95,6 +95,7 @@ pub(super) struct WindowGroup {
     pub(super) name: String,
     pub(super) profiles: Vec<String>,
     pub(super) members: Vec<(String, SshOptions)>,
+    pub(super) login_limit: Option<usize>,
 }
 
 struct DraftBackup {
@@ -181,6 +182,7 @@ enum TargetState {
     Offline,
     Failed(Option<ExitedPane>),
     Stopped(Option<ExitedPane>),
+    Queued,
     Connecting,
     Reconnecting(Option<u32>),
     Restartable(ExitedPane),
@@ -201,6 +203,7 @@ pub enum RosterStatus {
     Ready,
     Waiting,
     Unverified,
+    Queued,
     Connecting,
     Reconnecting,
     Disconnected,
@@ -213,11 +216,12 @@ pub enum RosterStatus {
 }
 
 impl RosterStatus {
-    const OPTIONS: [Self; 13] = [
+    const OPTIONS: [Self; 14] = [
         Self::All,
         Self::Ready,
         Self::Waiting,
         Self::Unverified,
+        Self::Queued,
         Self::Connecting,
         Self::Reconnecting,
         Self::Disconnected,
@@ -235,6 +239,7 @@ impl RosterStatus {
             Self::Ready => "Ready",
             Self::Waiting => "Waiting for a fresh prompt",
             Self::Unverified => "Prompt unverified",
+            Self::Queued => "Waiting to connect",
             Self::Connecting => "Connecting",
             Self::Reconnecting => "Reconnecting",
             Self::Disconnected => "Disconnected",
@@ -298,6 +303,7 @@ impl TargetState {
             Self::Offline | Self::Restartable(_) => RosterStatus::Disconnected,
             Self::Failed(_) => RosterStatus::Failed,
             Self::Stopped(_) => RosterStatus::Stopped,
+            Self::Queued => RosterStatus::Queued,
             Self::Connecting => RosterStatus::Connecting,
             Self::Reconnecting(_) => RosterStatus::Reconnecting,
             Self::HostKey(_) => RosterStatus::HostKey,
@@ -747,12 +753,29 @@ impl TerminalApp {
         mut opened: BTreeSet<u64>,
         targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
         mode: PaneLaunch,
+        login_limit: Option<usize>,
         ctx: &ComponentContext<Self>,
     ) {
+        let launch_gate = login_limit.map(|limit| Arc::new(tokio::sync::Semaphore::new(limit)));
         for (profile, ssh) in targets {
+            let session = launch_gate.as_ref().map(|gate| {
+                Session::start_group_ssh(
+                    ssh.clone(),
+                    TerminalSize::default(),
+                    self.appearance
+                        .read()
+                        .unwrap()
+                        .interaction
+                        .remote_clipboard_policy(),
+                    gate.clone(),
+                )
+            });
             let source = Source::Ssh(ssh);
             let label = profile.clone().unwrap_or_else(|| source_label(&source));
-            let tab = self.make_live_tab(label, source, profile);
+            let tab = match session {
+                Some(session) => live_tab_for_session(label, source, session).with_profile(profile),
+                None => self.make_live_tab(label, source, profile),
+            };
             if let Some(pane) = tab.pane_id() {
                 opened.insert(pane);
             }
@@ -837,6 +860,7 @@ impl TerminalApp {
                     TargetState::Authentication(None)
                 } else if !connected {
                     match live.session.events.ssh_connection_phase() {
+                        Some(SshConnectionPhase::Queued) => TargetState::Queued,
                         Some(SshConnectionPhase::Connecting) => TargetState::Connecting,
                         Some(SshConnectionPhase::Reconnecting { attempt }) => {
                             TargetState::Reconnecting(attempt)

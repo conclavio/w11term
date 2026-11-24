@@ -4,6 +4,14 @@ use w11term::options::SshRecipientSets;
 
 pub(super) const LABEL: &str = "Review group launch…";
 const FRESH: &str = "Open a new SSH pane";
+const LOGIN_LIMITS: [(&str, Option<usize>); 6] = [
+    ("Unlimited", None),
+    ("1 at a time", Some(1)),
+    ("2 at a time", Some(2)),
+    ("4 at a time", Some(4)),
+    ("8 at a time", Some(8)),
+    ("16 at a time", Some(16)),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Offer {
@@ -252,6 +260,7 @@ pub(super) struct State {
     filter: filter::Filter,
     page: usize,
     set_editor: Option<SetEditor>,
+    login_limit: Option<usize>,
 }
 
 enum SetEditor {
@@ -313,7 +322,8 @@ pub enum Change {
     IncludeMatches(Vec<usize>, MatchSelection),
     ChooseMatches(Vec<usize>, ConnectionSelection),
     RecipientSet(String),
-    Approve(Vec<Launch>, Option<String>, LaunchLocation),
+    LoginLimit(usize),
+    Approve(Vec<Launch>, Option<String>, LaunchLocation, Option<usize>),
     Export(Vec<Launch>, Option<String>),
     BeginSaveSet,
     BeginUpdateSet,
@@ -378,6 +388,7 @@ impl State {
         self.filter.clear();
         self.page = 0;
         self.set_editor = None;
+        self.login_limit = None;
         self.replace(review);
     }
 
@@ -472,6 +483,7 @@ impl State {
         let export_set = selected_set.clone();
         let window_offer = offered.clone();
         let window_set = selected_set.clone();
+        let login_limit = self.login_limit;
         let set_names: Vec<_> = review
             .sets
             .iter()
@@ -568,7 +580,25 @@ impl State {
                         TextBlock::new()
                             .font_size(24.0)
                             .text(format!("Review SSH group · {}", review.name)),
-                        TextBlock::new().text(counts),
+                        StackPanel::new()
+                            .spacing(8.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                TextBlock::new()
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .text(counts),
+                                TextBlock::new()
+                                    .vertical_alignment(VerticalAlignment::Center)
+                                    .text("Parallel SSH logins"),
+                                ComboBox::new()
+                                    .automation_name("Parallel SSH logins")
+                                    .is_enabled(new > 0)
+                                    .items_source(LOGIN_LIMITS.map(|(label, _)| label))
+                                    .selected_index(LOGIN_LIMITS.iter().position(|(_, limit)| *limit == login_limit))
+                                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                                        index.map_or(Message::ControlIdle, |index| action(Change::LoginLimit(index)))
+                                    })),
+                            )),
                         TextBox::new()
                             .automation_name("Find launch profiles")
                             .placeholder_text("Filter by profile name or SSH address")
@@ -662,6 +692,7 @@ impl State {
                                             offered.clone(),
                                             selected_set.clone(),
                                             LaunchLocation::Tab,
+                                            login_limit,
                                         ))
                                     }))
                                     .content("Open reviewed group"),
@@ -692,6 +723,7 @@ impl State {
                                             window_offer.clone(),
                                             window_set.clone(),
                                             LaunchLocation::Window,
+                                            login_limit,
                                         ))
                                     }))
                                     .content("Open reviewed group in new window"),
@@ -1186,6 +1218,13 @@ impl TerminalApp {
                     review.feedback = format!("{error:#}");
                 }
             }
+            Change::LoginLimit(index) => {
+                if let Some((_, limit)) = LOGIN_LIMITS.get(index)
+                    && let Some(page) = self.host_group_mut(id)
+                {
+                    page.saved.reuse.login_limit = *limit;
+                }
+            }
             Change::Refresh => {
                 let updated = self.saved_group_reuse_review(
                     review.name.clone(),
@@ -1203,12 +1242,14 @@ impl TerminalApp {
                     }
                 }
             }
-            Change::Approve(offered, set, location)
-                if review.choices() == offered && review.selected_set == set =>
+            Change::Approve(offered, set, location, limit)
+                if review.choices() == offered
+                    && review.selected_set == set
+                    && state.login_limit == limit =>
             {
                 let result = match location {
-                    LaunchLocation::Tab => self.open_group_reusing_connections(id, ctx),
-                    LaunchLocation::Window => self.open_reviewed_group_window(id, ctx),
+                    LaunchLocation::Tab => self.open_group_reusing_connections(id, limit, ctx),
+                    LaunchLocation::Window => self.open_reviewed_group_window(id, limit, ctx),
                 };
                 if let Err(error) = result
                     && let Some(page) = self.host_group_mut(id)
@@ -1504,6 +1545,7 @@ impl TerminalApp {
     fn open_group_reusing_connections(
         &mut self,
         source_tab: TabId,
+        login_limit: Option<usize>,
         ctx: &ComponentContext<Self>,
     ) -> Result<()> {
         let Some(Page::HostGroup(page)) = self.tabs.get(source_tab).map(|tab| &tab.page) else {
@@ -1557,7 +1599,7 @@ impl TerminalApp {
         } else {
             self.new_host_group_tab(Some(&name))
         };
-        self.start_host_group_panes(id, reused, fresh, PaneLaunch::Select, ctx);
+        self.start_host_group_panes(id, reused, fresh, PaneLaunch::Select, login_limit, ctx);
         self.remember_group_launch(id, &name, &profiles, skipped == 0, feedback);
         Ok(())
     }
@@ -1565,6 +1607,7 @@ impl TerminalApp {
     fn open_reviewed_group_window(
         &mut self,
         source_tab: TabId,
+        login_limit: Option<usize>,
         ctx: &ComponentContext<Self>,
     ) -> Result<()> {
         let Some(Page::HostGroup(page)) = self.tabs.get(source_tab).map(|tab| &tab.page) else {
@@ -1583,6 +1626,7 @@ impl TerminalApp {
                 name,
                 profiles,
                 members,
+                login_limit,
             },
             ctx,
         )?;

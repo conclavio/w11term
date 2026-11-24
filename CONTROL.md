@@ -225,9 +225,10 @@ audible playback; inspect the `sound` outcome. See [the game protocol](docs/game
 The CLI allows the requested wait timeout plus 15 seconds for these replies.
 
 For SSH panes the reply also includes `ssh_connection`, an object with a
-`phase` of `connecting`, `connected`, `reconnecting`, `disconnected`,
+`phase` of `queued`, `connecting`, `connected`, `reconnecting`, `disconnected`,
 `stopped`, or `failed`. Reconnecting includes an `attempt` number for an
-automatic retry and `null` for an explicit restart. Failed includes a short
+automatic retry and `null` for an explicit restart. A queued pane is waiting for
+a slot in a group launch. Failed includes a short
 `reason`. The journal adds an `ssh-connection` event on each phase change
 with the same data shape. The connection snapshot and restart token describe
 the pane at reply time, including when recorded transitions have aged out.
