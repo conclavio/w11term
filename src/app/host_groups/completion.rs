@@ -24,6 +24,7 @@ impl TerminalApp {
     pub(in crate::app) fn show_group_run(&mut self, id: TabId, run: u64) {
         if let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) {
             page.viewing = run;
+            page.preview_command_order = false;
             page.result_filter = progress::Filter::All;
             page.copy_feedback.clear();
             page.live_output = None;

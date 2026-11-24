@@ -208,6 +208,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 92. **Pause and resume a rolling run.** Hold unsent commands while inspecting results, and resume against the reviewed prompts. Continue to apply the submission's stop-on-failure setting.
 93. **Require canary approval.** Run a command on one selected host and withhold the rest until the canary reports exit 0 and the operator approves. Respect the original prompt checks, parallel limit, and recording.
 94. **Notify when a canary finishes.** Offer an opt-in Attention Inbox entry that opens the run for approval or failure review, with a separate alert for full run completion.
+95. **Preview command dispatch order.** Show the checked, visible recipients in the actual queue order, including the canary, unavailable hosts, and the parallel limit. Freeze the order on submission.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

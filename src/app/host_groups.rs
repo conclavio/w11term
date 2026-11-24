@@ -9,6 +9,7 @@ use w11term::options::{SshGroupParallelLimit, SshRosterDefaults, SshRosterOrder 
 use w11term::prompts::Question;
 mod address;
 mod close_ended;
+mod command_order;
 mod command_queue;
 mod compare;
 mod completion;
@@ -61,6 +62,7 @@ pub(super) struct HostGroup {
     draft: String,
     canary: Option<u64>,
     notify_canary: bool,
+    preview_command_order: bool,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -566,6 +568,7 @@ impl HostGroup {
         transcript: GroupTranscript,
     ) -> &mut Submission {
         transcript.finish_dispatch();
+        self.preview_command_order = false;
         self.next_submission += 1;
         self.viewing = self.next_submission;
         self.result_filter = progress::Filter::All;
@@ -710,6 +713,7 @@ pub enum Action {
     CommandLimit(TabId, SshGroupParallelLimit),
     CommandCanary(TabId, Option<u64>),
     NotifyCanary(TabId, bool),
+    PreviewCommandOrder(TabId, bool),
     StopCommandQueueOnFailure(TabId, bool),
     CommandQueue(TabId, u64, command_queue::Action),
 }
@@ -1017,14 +1021,17 @@ impl TerminalApp {
             notify_canary,
         } = offer;
         let roster = self.host_group_targets();
-        let selection = targets.iter().map(|target| target.pane).collect();
+        let current = command_order::recipients(page, page.shown(&roster));
         let ready = targets
             .iter()
             .filter(|target| target.state.is_ready())
             .count();
         !page.sending()
             && page.readiness_allows_send(ready, targets.len())
-            && page.selected_shown(&roster) == selection
+            && current
+                .iter()
+                .map(|target| target.pane)
+                .eq(targets.iter().map(|target| target.pane))
             && page.roster_preferences.command_limit == *limit
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
@@ -1032,13 +1039,13 @@ impl TerminalApp {
             && (page.canary.is_some() && page.notify_canary) == *notify_canary
             && command_queue::canary_readiness(targets, *canary).is_ok()
             && w11term::saved_commands::valid_command_text(text)
-            && ((!verify_prompts && canary.is_none() && !page.roster_preferences.require_all_ready)
-                || targets.iter().all(|reviewed| {
-                    roster.iter().any(|current| {
-                        current.pane == reviewed.pane
-                            && current.state.prompt() == reviewed.state.prompt()
-                            && current.name == reviewed.name
-                    })
+            && ((!verify_prompts
+                && !page.preview_command_order
+                && canary.is_none()
+                && !page.roster_preferences.require_all_ready)
+                || current.iter().zip(targets).all(|(current, reviewed)| {
+                    current.state.prompt() == reviewed.state.prompt()
+                        && current.name == reviewed.name
                 }))
     }
 
@@ -1525,6 +1532,13 @@ impl TerminalApp {
                         .filter(|page| page.canary.is_some() && !page.recorded_send.pending())
                 {
                     page.notify_canary = enabled;
+                }
+            }
+            Action::PreviewCommandOrder(id, show) => {
+                if self.host_group_command_target() == Some(id)
+                    && let Some(page) = self.host_group_mut(id)
+                {
+                    page.preview_command_order = show;
                 }
             }
             Action::CommandQueue(id, run, action) => self.handle_command_queue(id, run, action),
@@ -2095,12 +2109,32 @@ impl TerminalApp {
             .on_text_changed(ctx.callback(move |text| Message::HostGroup(Action::Edit(id, text))));
         let offer = CommandOffer {
             text,
-            targets: selected.clone(),
+            targets: command_order::recipients(page, shown.iter().copied())
+                .into_iter()
+                .cloned()
+                .collect(),
             limit: page.roster_preferences.command_limit,
             stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
             canary: page.canary,
             notify_canary: page.canary.is_some() && page.notify_canary,
         };
+        let (body_key, body) = if page.preview_command_order {
+            (
+                "command-order",
+                command_order::preview(&offer, page.roster_preferences.require_all_ready),
+            )
+        } else {
+            (
+                "roster",
+                StackPanel::new().spacing(10.0).keyed_children(details),
+            )
+        };
+        let preview = command_order::button(
+            id,
+            page.preview_command_order,
+            !offer.targets.is_empty(),
+            ctx,
+        );
         let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
             .style(ButtonStyle::Accent)
@@ -2186,6 +2220,7 @@ impl TerminalApp {
                                     Message::HostGroup(Action::StopCommandQueueOnFailure(id, stop))
                                 }))
                                 .content("Stop queue on failure"),
+                            preview,
                         )),
                     command_queue::canary_picker(id, page, &selected, ctx),
                     StackPanel::new()
@@ -2222,9 +2257,9 @@ impl TerminalApp {
                                 .text_wrapping(TextWrapping::Wrap),
                         )),
                 )),
-                ScrollViewer::new()
+                Grid::new()
                     .grid_row(4)
-                    .content(StackPanel::new().spacing(10.0).keyed_children(details)),
+                    .keyed_children([KeyedView::new(body_key, ScrollViewer::new().content(body))]),
             ))
     }
 
@@ -2591,7 +2626,7 @@ mod tests {
             state,
         })
         .collect::<Vec<_>>();
-        let group = HostGroup {
+        let mut group = HostGroup {
             selected: BTreeSet::from([1, 4]),
             ..Default::default()
         };
@@ -2611,7 +2646,24 @@ mod tests {
                     .map(|target| target.pane)
                     .eq([1, 4])
             );
+            group.roster_preferences.order = order;
+            assert!(
+                command_order::recipients(&group, group.shown(&targets))
+                    .iter()
+                    .map(|target| target.pane)
+                    .eq(expected
+                        .into_iter()
+                        .filter(|pane| group.selected.contains(pane)))
+            );
         }
+        group.roster_preferences.order = RosterOrder::Tabs;
+        group.canary = Some(4);
+        assert!(
+            command_order::recipients(&group, group.shown(&targets))
+                .iter()
+                .map(|target| target.pane)
+                .eq([4, 1])
+        );
     }
 
     #[test]

@@ -97,6 +97,8 @@ Set **Parallel SSH commands** to run a submission in batches. The default is **U
 
 With a finite limit, turn on **Stop queue on failure** to withhold the remaining commands as soon as a host settles without a confirmed zero exit status. Active commands continue. **Save roster defaults** remembers this choice for a named group.
 
+Use **Preview send order** to see how the checked, visible hosts will be dispatched. Finite queues follow the current roster sort, with a chosen canary promoted to the first send. The preview shows unavailable hosts and the concurrency that applies after canary approval.
+
 Use **Pause queue** to hold unsent commands while you inspect results. Active commands continue, and stop-on-failure still applies. **Resume queue** rechecks the original prompts before sending again.
 
 Choose a **Canary host** from the checked recipients to run on that shell first. It needs a fresh OSC 133 prompt and at least one other ready recipient. After a confirmed exit 0, inspect the result and select **Approve remaining hosts** to continue at the chosen concurrency. If the canary fails or its exit status is unavailable, the remaining commands are withheld. Check **Notify when canary finishes** before sending to get an Attention Inbox entry that opens the exact run when the canary succeeds or needs attention.

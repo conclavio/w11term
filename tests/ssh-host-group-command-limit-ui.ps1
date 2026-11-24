@@ -59,21 +59,33 @@ try {
     }
     Select-GroupOption 'Parallel SSH commands' '1 at a time'
     Set-Command 'roll'
-    Click 'Send to 3 hosts'
-    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started roll')
-    $null = Wait-Until 'East and North are queued' {
-        (Find-Element "$($labels.East)${dot}Queued") -and (Find-Element "$($labels.North)${dot}Queued")
+    Click 'Preview send order'
+    $null = Wait-Until 'tab order starts the preview with West' {
+        (Find-Element 'Send to one host at a time.') -and (Find-Element "1. $($labels.West)")
     }
+    Select-GroupOption 'Sort SSH roster' 'Host label'
+    $null = Wait-Until 'the preview follows the new roster sort' {
+        (Find-Element "1. $($labels.East)") -and (Find-Element "2. $($labels.North)") -and
+            (Find-Element "3. $($labels.West)") -and !(Find-Element "1. $($labels.West)")
+    }
+    Click 'Send to 3 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started roll')
+    $null = Wait-Until 'West and North are queued in the results' {
+        (Find-Element "$($labels.West)${dot}Queued") -and (Find-Element "$($labels.North)${dot}Queued")
+    }
+    Select-GroupOption 'Sort SSH roster' 'Tab order'
     $null = Control @('send-text','--pane',"$($panes.North)",'--no-paste','x')
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the group is in the background' { Find-Element 'No bells or notifications' }
-    New-Item -ItemType File -Path (Join-Path $State 'release-roll') | Out-Null
-    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished roll')
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-roll') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started roll')
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
     $tab.GetCurrentPattern($item).Select()
-    $null = Wait-Until 'the stale queued prompt was withheld' {
+    $null = Wait-Until 'North was tried before West even after the roster was sorted again' {
         Find-Element "$($labels.North)${dot}Not sent${dot}The verified prompt changed before the command was sent."
     }
+    New-Item -ItemType File -Path (Join-Path $State 'release-roll') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished roll')
 
     (Wait-CheckBox $labels.North On).Toggle()
     $null = Wait-CheckBox $labels.North Off
@@ -150,6 +162,11 @@ try {
     (Wait-CheckBox $labels.East Off).Toggle()
     (Wait-CheckBox 'Notify when canary finishes' Off).Toggle()
     $null = Wait-CheckBox 'Notify when canary finishes' On
+    Click 'Preview send order'
+    $null = Wait-Until 'the preview puts the chosen canary ahead of the other ready host' {
+        (Find-Element "Canary first${dot}$($labels.East)") -and (Find-Element "Ready${dot}$($labels.West)") -and
+            (Find-Element 'After approval, send to all remaining ready hosts.')
+    }
     Click ('Run canary and record' + [char]0x2026)
     $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
@@ -163,6 +180,8 @@ try {
     $null = Wait-Until 'both notifications are armed' {
         (Find-Element 'Cancel run notification' $button) -and (Find-Element 'Cancel canary notification' $button)
     }
+    Click 'Preview send order'
+    $null = Wait-Until 'the preview is open before leaving the group' { Find-Element 'Back to roster and results' $button }
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the canary group is in the background' { Find-Element 'No bells or notifications' }
     New-Item -ItemType File -Path (Join-Path $State 'release-east-canary-ok') | Out-Null
