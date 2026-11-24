@@ -143,6 +143,8 @@ Choose **View differences** on a result to see added and removed lines against t
 
 Choose **Use as reference** on a result group when a particular host is the expected baseline. Refresh keeps that choice while the host still belongs to a comparable group. **Use largest group** restores automatic selection.
 
+In the diff view, choose **Save full differences…** to write a UTF-8 report of the current comparison. It includes the command, both hosts and exit codes, and changed lines at full length. If the changed sections are too large to align, the report includes both full unmatched sections in source order.
+
 Choose **Prepare follow-up** on a result group to return to the roster with the original command in the editor and that group’s visible, matching panes checked. The button shows how many hosts are in scope when the roster excludes some members. Edit the draft if needed, then use **Send to _n_ hosts** when the intended shells are ready. **Restore draft** brings back the previous draft, roster filter, and checked hosts.
 
 While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its selected hosts that still report the matching command as running. The result shows Ctrl+C delivery and the command’s eventual exit status separately. w11term uses each pane’s current keyboard mode.

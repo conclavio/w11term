@@ -154,6 +154,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 40. **Notify when a run finishes.** Arm a submission for one Attention inbox entry after all recipients settle. Include final success and attention counts and link to the retained run.
 41. **Inspect changed output lines.** Compare a distinct result with the reference group and show added and removed lines with their original line numbers and exit codes. Bound the work and display for large results.
 42. **Choose a comparison reference.** Use any complete result group as the baseline for line summaries and diffs. Keep the chosen host across refreshes when its output is available, and offer a return to automatic selection.
+43. **Save a full comparison.** Export the selected reference and result as a text diff with both exit codes and their original line numbers. Include all changed lines beyond the on-screen excerpt and identify large sections that could not be aligned.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
