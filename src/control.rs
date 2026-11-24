@@ -35,6 +35,7 @@ use security::PipeSecurity;
 
 pub const VERSION: u32 = 1;
 pub const MAX_BYTES: usize = 1024 * 1024;
+pub const MAX_SSH_GROUP_OUTPUT_LINES: usize = 128;
 const MAX_LINE: usize = MAX_BYTES * 2;
 const TIMEOUT: Duration = Duration::from_secs(10);
 pub type CapturePng =
@@ -110,6 +111,41 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    WaitSshGroupOutput {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_line: Option<u64>,
+        pattern: String,
+        #[serde(default)]
+        regex: bool,
+        #[serde(default)]
+        match_case: bool,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
+    GetSshGroupOutput {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_line: Option<u64>,
+        #[serde(default = "default_group_output_limit")]
+        limit: usize,
+    },
+    FollowSshGroupOutput {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_line: Option<u64>,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     WorkspaceIdentity,
     WorkspaceWindows {
         key: String,
@@ -164,6 +200,9 @@ pub enum Request {
 fn default_wait_timeout() -> u64 {
     30
 }
+fn default_group_output_limit() -> usize {
+    MAX_SSH_GROUP_OUTPUT_LINES
+}
 #[derive(Debug)]
 pub enum UiRequest {
     ListSshGroups {
@@ -179,6 +218,13 @@ pub enum UiRequest {
         run_id: u64,
         wait_for_settlement: bool,
         reply: oneshot::Sender<Result<Value, String>>,
+    },
+    ReadSshGroupOutput {
+        tab_id: u64,
+        run_id: u64,
+        pane: Option<u64>,
+        follow: bool,
+        reply: oneshot::Sender<Result<SshGroupOutput, String>>,
     },
     Open {
         profile: String,
@@ -202,10 +248,16 @@ impl UiRequest {
             | Self::ListSshGroups { reply }
             | Self::GetSshGroupRoster { reply, .. }
             | Self::GetSshGroupRun { reply, .. } => reply,
+            Self::ReadSshGroupOutput { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
         };
         let _ = reply.send(Err(message.into()));
     }
 }
+
+pub use ssh_groups::SshGroupOutput;
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -504,6 +556,53 @@ impl Registry {
                     Some(Duration::from_secs(timeout_seconds)),
                 )
                 .await
+            }
+            Request::WaitSshGroupOutput {
+                window_id,
+                tab_id,
+                run_id,
+                pane,
+                after_line,
+                pattern,
+                regex,
+                match_case,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "SSH group wait timeout must be 1..=3600 seconds"
+                );
+                let pattern = ssh_groups::output_pattern(&pattern, regex, match_case)?;
+                self.wait_ssh_group_output(
+                    window_id,
+                    tab_id,
+                    run_id,
+                    ssh_groups::GroupOutputQuery {
+                        pane,
+                        after_line,
+                        pattern,
+                        timeout: Duration::from_secs(timeout_seconds),
+                    },
+                )
+                .await
+            }
+            Request::GetSshGroupOutput {
+                window_id,
+                tab_id,
+                run_id,
+                pane,
+                after_line,
+                limit,
+            } => {
+                ensure!(
+                    (1..=MAX_SSH_GROUP_OUTPUT_LINES).contains(&limit),
+                    "SSH group output limit must be 1..={MAX_SSH_GROUP_OUTPUT_LINES} lines"
+                );
+                self.query_ssh_group_output(window_id, tab_id, run_id, pane, after_line, limit)
+                    .await
+            }
+            Request::FollowSshGroupOutput { .. } => {
+                anyhow::bail!("follow-ssh-group-output requires a streaming reply")
             }
             Request::List => {
                 let mut sessions = Vec::new();
@@ -846,6 +945,8 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitSshGroupRun { .. }
+                        | Request::WaitSshGroupOutput { .. }
+                        | Request::FollowSshGroupOutput { .. }
                         | Request::WaitSshGroupReady { .. }
                         | Request::Events {
                             timeout_seconds: 1..,
@@ -857,7 +958,31 @@ async fn serve(
                     commands
                 };
                 match pool.try_acquire_owned() {
-                    Ok(_permit) => registry.execute(r, capture_png).await,
+                    Ok(_permit) => match r {
+                        Request::FollowSshGroupOutput {
+                            window_id,
+                            tab_id,
+                            run_id,
+                            pane,
+                            after_line,
+                            timeout_seconds,
+                        } => {
+                            return registry
+                                .follow_ssh_group_output(
+                                    &mut pipe,
+                                    ssh_groups::GroupOutputFollow {
+                                        window: window_id,
+                                        tab: tab_id,
+                                        run: run_id,
+                                        pane,
+                                        after_line,
+                                        timeout_seconds,
+                                    },
+                                )
+                                .await;
+                        }
+                        request => registry.execute(request, capture_png).await,
+                    },
                     Err(_) => Err(anyhow::anyhow!(
                         "busy: control request capacity reached; request was not executed"
                     )),
@@ -1065,8 +1190,8 @@ fn discovery_records(directory: &Path) -> Result<Vec<Instance>> {
     instances.sort_by_key(|i| i.pid);
     Ok(instances)
 }
-pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
-    let pid = match pid {
+async fn resolve_pid(pid: Option<u32>) -> Result<u32> {
+    Ok(match pid {
         Some(p) => p,
         None => {
             let instances = discover().await?;
@@ -1085,15 +1210,76 @@ pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
             );
             instances[0].pid
         }
-    };
-    call_on(connect(pid).await?, request).await
+    })
 }
 
-async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> {
+pub async fn call(pid: Option<u32>, request: &Request) -> Result<Reply> {
+    call_on(connect(resolve_pid(pid).await?).await?, request).await
+}
+
+async fn write_request(pipe: &mut NamedPipeClient, request: &Request) -> Result<()> {
     let mut bytes = serde_json::to_vec(request)?;
     bytes.push(b'\n');
     ensure!(bytes.len() <= MAX_LINE, "request exceeds 2 MiB");
     tokio::time::timeout(TIMEOUT, pipe.write_all(&bytes)).await??;
+    Ok(())
+}
+
+pub async fn follow(
+    pid: Option<u32>,
+    request: &Request,
+    mut on_reply: impl FnMut(&Reply) -> Result<()>,
+) -> Result<bool> {
+    let Request::FollowSshGroupOutput {
+        timeout_seconds, ..
+    } = request
+    else {
+        anyhow::bail!("request does not use streaming replies");
+    };
+    let mut pipe = connect(resolve_pid(pid).await?).await?;
+    write_request(&mut pipe, request).await?;
+    let mut read = BufReader::new(pipe);
+    let mut response = Vec::new();
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs((*timeout_seconds).clamp(1, 3600) + 15);
+    loop {
+        response.clear();
+        tokio::time::timeout_at(
+            deadline,
+            (&mut read)
+                .take((MAX_LINE + 1) as u64)
+                .read_until(b'\n', &mut response),
+        )
+        .await
+        .context("control output stream timed out")??;
+        ensure!(
+            !response.is_empty(),
+            "control output stream ended without a final reply"
+        );
+        ensure!(
+            response.len() <= MAX_LINE,
+            "control output reply exceeds 2 MiB"
+        );
+        let reply = decode_reply(&response)?;
+        on_reply(&reply)?;
+        if !reply.ok {
+            return Ok(false);
+        }
+        match reply
+            .result
+            .as_ref()
+            .and_then(|result| result.get("kind"))
+            .and_then(Value::as_str)
+        {
+            Some("settled") => return Ok(true),
+            Some("gap" | "line") => {}
+            _ => anyhow::bail!("unrecognized control output record"),
+        }
+    }
+}
+
+async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> {
+    write_request(&mut pipe, request).await?;
     let mut read = BufReader::new(pipe).take(32 * 1024 * 1024);
     let mut response = Vec::new();
     tokio::time::timeout(
@@ -1105,6 +1291,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupRun {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshGroupOutput {
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupReady {
@@ -1119,8 +1308,12 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
     )
     .await
     .context("control reply timed out; command may have completed")??;
+    decode_reply(&response)
+}
+
+fn decode_reply(response: &[u8]) -> Result<Reply> {
     ensure!(response.ends_with(b"\n"), "incomplete control reply");
-    let reply: Reply = serde_json::from_slice(&response)?;
+    let reply: Reply = serde_json::from_slice(response)?;
     ensure!(
         reply.version == VERSION,
         "unsupported control protocol version"

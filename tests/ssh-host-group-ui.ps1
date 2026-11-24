@@ -175,6 +175,9 @@ $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $readyJob = $null
+$outputJob = $null
+$followJob = $null
+$followReader = $null
 $logReader = $null
 $explorer = $null
 $priorExplorerWindows = @()
@@ -355,7 +358,18 @@ try {
     $null = Wait-Until 'the text search also respects the selected output host' {
         $copy = Find-Element 'Copy shown output' $button
         $copy -and !$copy.Current.IsEnabled -and
-            (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'east-accepted both')
+            (Find-Element "Newest first${dot}0 of 1 retained lines") -and !(Find-Element 'east-accepted both')
+    }
+    $outputRegex = 'Regular expression in live output'
+    $outputCase = 'Match case in live output'
+    (Wait-CheckBox $outputRegex Off).Toggle()
+    $null = Wait-CheckBox $outputRegex On
+    (Command-Editor $outputSearch).SetValue('(')
+    $null = Wait-Until 'an invalid pattern shows a diagnostic and disables both exports' {
+        $copy = Find-Element 'Copy shown output' $button
+        $save = Find-Element ('Save shown output' + [char]0x2026) $button
+        $copy -and !$copy.Current.IsEnabled -and $save -and !$save.Current.IsEnabled -and
+            (Find-Element "Live output search${dot}unclosed group")
     }
     Click 'Pause output'
     $null = Wait-Until 'output is paused' { Find-Element 'Resume output' $button }
@@ -364,23 +378,78 @@ try {
     $null = Wait-Until 'the recorder keeps writing while the display is paused' {
         [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains("$westName$($dot)west while paused")
     }
-    (Command-Editor $outputSearch).SetValue('WHILE')
+    (Command-Editor $outputSearch).SetValue('^WEST WHILE (PAUSED|AWAY)$')
     $until = [DateTime]::UtcNow.AddMilliseconds(650)
     do {
         if ((Find-Element 'west while paused') -or
-            !(Find-Element "Paused${dot}newest first${dot}0 of 2 retained lines")) {
+            !(Find-Element "Paused${dot}newest first${dot}0 of 1 retained lines")) {
             throw 'Filtered output changed while paused'
         }
         Start-Sleep -Milliseconds 120
     } while ([DateTime]::UtcNow -lt $until)
     Click 'Resume output'
     $null = Wait-Until 'matching output received while paused is available on resume' {
-        (Find-Element "Newest first${dot}1 of 3 retained lines") -and
+        (Find-Element "Newest first${dot}1 of 2 retained lines") -and
             (Find-Element 'west while paused') -and !(Find-Element 'west live first')
+    }
+    (Wait-CheckBox $outputCase Off).Toggle()
+    $null = Wait-Until 'matching case excludes the lowercase live output' {
+        (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'west while paused')
+    }
+    (Wait-CheckBox $outputCase On).Toggle()
+    $null = Wait-Until 'disabling match case restores the live output match' {
+        (Find-Element "Newest first${dot}1 of 2 retained lines") -and (Find-Element 'west while paused')
     }
     Click "Focus output pane $west"
     Wait-Focus $west
+    $outputWait = @('wait-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run','2','--pane',"$west")
+    $timedOut = & $Cli --pid $app.Id @outputWait --timeout 1 'east-accepted both' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before a match*') {
+        throw 'The output wait did not respect its pane scope or timeout'
+    }
+    $earlierMatch = Control @('wait-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run','2','EAST-ACCEPTED')
+    if ($earlierMatch.line.pane_id -ne $east -or $earlierMatch.line.text -cne 'east-accepted both') {
+        throw 'The output wait missed an existing match in retained output'
+    }
+    $westPrior = Control ($outputWait + @('--regex','^west while (paused|away)$'))
+    if ($westPrior.line.text -cne 'west while paused') { throw 'The first West output marker was missing' }
+    $westReading = Control @('get-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run','2','--pane',"$west",'--after-line',"$($westPrior.line.line_id)")
+    if ($westReading.settled -or $westReading.gap -or $westReading.has_more -or
+        $westReading.next_after_line -lt $westPrior.line.line_id) {
+        throw 'Reading the live feed did not provide a cursor for the next line'
+    }
+    $quietFollow = & $Cli --pid $app.Id follow-ssh-group-output --window $groupWindow --tab $groupTab --run 2 --pane $west --after-line $westReading.next_after_line --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $quietFollow.ok -or $quietFollow.error -notlike '*timed out before settlement*') {
+        throw 'A quiet output stream did not return a terminal timeout record'
+    }
+    $future = & $Cli --pid $app.Id @outputWait --after-line 999999 'west while' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $future.ok -or $future.error -notlike '*ahead of the latest line*') {
+        throw 'An output cursor ahead of the run did not return an explicit error'
+    }
+    $settledMiss = & $Cli --pid $app.Id wait-ssh-group-output --window $groupWindow --tab $groupTab --run 1 unreachable-match | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $settledMiss.ok -or $settledMiss.error -notlike '*settled without a matching output line*') {
+        throw 'A settled run with no match did not return a distinct error'
+    }
+    $foregroundBeforeOutputWait = [FixtureMessages]::GetForegroundWindow()
+    $waitPath = Join-Path $State 'wait-group-output.json'
+    $outputJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $outputWait +
+        @('--after-line',"$($westReading.next_after_line)",'--regex','--match-case','--timeout','15','^west\x20while\x20(?:paused|away)$')) -NoNewWindow -PassThru -RedirectStandardOutput $waitPath
+    if ($outputJob.WaitForExit(250)) { throw 'The output wait ended before West produced its matching line' }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-away'), '')
+    if (!$outputJob.WaitForExit(10000)) { throw 'The output wait did not receive the new line' }
+    $outputReply = [IO.File]::ReadAllText($waitPath) | ConvertFrom-Json
+    $match = $outputReply.result.line
+    if (!$outputReply.ok -or $outputReply.result.window_id -ne $groupWindow -or
+        $outputReply.result.tab_id -ne $groupTab -or $outputReply.result.run_id -ne 2 -or
+        $match.pane_id -ne $west -or $match.label -cne 'West' -or
+        $match.address -cne "test@127.0.0.1:$($profileData.West.port)" -or
+        $match.text -cne 'west while away' -or $match.shortened -ne $false -or
+        $match.line_id -le $westReading.next_after_line -or $match.elapsed_ms -lt $westPrior.line.elapsed_ms -or
+        [FixtureMessages]::GetForegroundWindow() -ne $foregroundBeforeOutputWait) {
+        throw "The output wait returned the wrong match or changed focus: $($outputReply.error)"
+    }
+    Wait-Focus $west
     $null = Wait-Until 'the recorder keeps writing while the terminal tab is focused' {
         [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains("$westName$($dot)west while away")
     }
@@ -403,11 +472,85 @@ try {
         [IO.File]::Exists($excerptPath) -and
             [IO.File]::ReadAllText($excerptPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $excerpt
     }
+    $outputOldest = 'Oldest first in live output'
+    $outputElapsed = 'Show elapsed time in live output'
+    (Wait-CheckBox $outputOldest Off).Toggle()
+    (Wait-CheckBox $outputElapsed Off).Toggle()
+    $null = Wait-Until 'oldest-first view places the earlier row above the later row' {
+        $earlier = Find-Element 'west while paused'
+        $later = Find-Element 'west while away'
+        $earlier -and $later -and
+            $earlier.Current.BoundingRectangle.Top -lt $later.Current.BoundingRectangle.Top
+    }
+    $null = Wait-CheckBox $outputElapsed On
+    Click 'Copy shown output'
+    $stamp = '\+\d+\.\d{3} s'
+    $timedPattern = '^' + [regex]::Escape("Submitted${dot}both`r`n") +
+        $stamp + [regex]::Escape("${dot}$westName${dot}west while paused`r`n") +
+        $stamp + [regex]::Escape("${dot}$westName${dot}west while away`r`n") + '$'
+    $timedExcerpt = Wait-Until 'copy includes the elapsed times in oldest-first order' {
+        $text = Read-ClipboardFixture
+        if ($text -cmatch $timedPattern) { $text }
+    }
+    $timelinePath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'timeline.txt'
+    Click ('Save shown output' + [char]0x2026)
+    $dialog = Wait-Until 'owned timeline save dialog' { Find-OwnedDialog 'Save shown SSH group output' }
+    $null = Wait-Until 'enter the timeline file name' {
+        [FixtureDialog]::SetFilename($dialog, $timelinePath, 'ssh-group-output-excerpt-2.txt')
+    }
+    $null = Wait-Until 'save the timeline' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved timeline matches the clipboard' {
+        [IO.File]::Exists($timelinePath) -and [IO.File]::ReadAllText($timelinePath) -ceq $timedExcerpt
+    }
+    $outputContext = 'Show surrounding lines'
+    Select-ComboValue $outputHosts 'All output hosts'
+    (Wait-CheckBox $outputContext Off).Toggle()
+    $null = Wait-Until 'context includes West neighbors while the combined feed excludes unrelated East lines' {
+        (Find-Element 'west live first') -and (Find-Element 'Context') -and
+            (Find-Element 'west while paused') -and !(Find-Element 'east-accepted both')
+    }
+    Click 'Copy shown output'
+    $null = Wait-Until 'copy includes the surrounding West lines' {
+        $text = Read-ClipboardFixture
+        $text -and $text.Contains("$westName${dot}west live first") -and
+            $text.Contains("$westName${dot}west while away") -and !$text.Contains('east-accepted both')
+    }
+    Select-ComboValue $outputHosts $westName
+    $outputRun = 'Live output run'
+    $outputPattern = '^WEST WHILE (PAUSED|AWAY)$'
+    Click 'Pause output'
+    $null = Wait-Until 'the current run is paused before switching' { Find-Element 'Resume output' $button }
+    Select-ComboValue $outputRun "Run 1${dot}one"
+    $null = Wait-Until 'the earlier run keeps the absent host scoped and starts live' {
+        $copy = Find-Element 'Copy shown output' $button
+        $copy -and !$copy.Current.IsEnabled -and (Find-Element 'Pause output' $button) -and
+            (Find-Element 'The selected host did not receive this run.') -and
+            (Command-Editor $outputSearch).Current.Value -ceq $outputPattern -and
+            !(Find-Element 'west while paused')
+    }
+    Select-ComboValue $outputRun "Run 2${dot}both"
+    $null = Wait-CheckBox $outputRegex On
+    $null = Wait-CheckBox $outputContext On
+    $null = Wait-CheckBox $outputOldest On
+    $null = Wait-CheckBox $outputElapsed On
+    $null = Wait-Until 'returning restores the same scoped lines without the prior pause' {
+        (Find-Element 'Pause output' $button) -and (Find-Element 'west while paused') -and
+            (Find-Element 'west while away') -and (Find-Element 'west live first') -and
+            (Command-Editor $outputSearch).Current.Value -ceq $outputPattern
+    }
+    Wait-RecordingStatus 'Recording live output to ' $logFile
     Click 'Clear output filters'
     $null = Wait-Until 'clearing the filters restores all retained output' {
         (Find-Element 'east-accepted both') -and (Find-Element 'west live first') -and
-            (Find-Element 'Newest first')
+            (Find-Element 'Oldest first')
     }
+    $null = Wait-CheckBox $outputRegex Off
+    $null = Wait-CheckBox $outputCase Off
+    $null = Wait-CheckBox $outputContext Off
+    (Wait-CheckBox $outputOldest On).Toggle()
+    (Wait-CheckBox $outputElapsed On).Toggle()
+    $null = Wait-CheckBox $outputOldest Off
+    $null = Wait-CheckBox $outputElapsed Off
     Click 'Stop recording'
     $firstRecordedPath = Wait-RecordingStatus 'Saved live output to ' $logFile -PassThru
     $logReader.Dispose()
@@ -427,7 +570,13 @@ try {
     if ($withNoGaps -cne (($expectedLines -join "`r`n") + "`r`n")) {
         throw "The output log lost, repeated, or reordered a line: $recorded"
     }
+    Select-ComboValue $outputRun "Run 1${dot}one"
     Click 'Back to results'
+    $null = Wait-Until 'Back opens the selected run results' {
+        (Find-Element "Submitted${dot}one") -and !(Find-Element 'SSH group live output') -and
+            !(Find-Element "Focus result pane $west" $button)
+    }
+    Click 'Next submission'
     Outcome $westName 'Running'
     Set-ResultFilter 'Running'
     $null = Wait-Until 'show the running result only' {
@@ -557,6 +706,15 @@ try {
             (Find-Element "$westName${dot}Comparison unavailable") -and
             !(Find-Element "View run differences for pane $west" $button)
     }
+    $comparisonField = 'Find compared hosts'
+    $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
+    $westSearch = "WEST $($profileData.West.port)"
+    (Find-Element $comparisonField $edit).GetCurrentPattern($valuePattern).SetValue($westSearch)
+    $null = Wait-Until 'the comparison search matches the host label and endpoint' {
+        (Find-Element 'Showing 1 of 2 hosts') -and (Find-Element $overviewSummary) -and
+            (Find-Element "$westName${dot}Comparison unavailable") -and
+            !(Find-Element "$eastName${dot}Output changed")
+    }
     Click 'Copy comparison'
     $null = Wait-Until 'the clipboard includes both run labels and all host classifications' {
         $report = Read-ClipboardFixture
@@ -590,6 +748,15 @@ try {
         $comparisonText.Contains('east-report-tail')) {
         throw 'The JSON comparison did not preserve the run and host classifications'
     }
+    Select-ComboValue 'Filter compared hosts' 'Output changed'
+    $null = Wait-Until 'classification and text filters are combined' {
+        (Find-Element 'Showing 0 of 2 hosts') -and (Find-Element 'No hosts match these filters')
+    }
+    (Find-Element $comparisonField $edit).GetCurrentPattern($valuePattern).SetValue('EAST')
+    $null = Wait-Until 'the filtered comparison offers only the matching host diff' {
+        (Find-Element "View run differences for pane $east" $button) -and (Find-Element 'Showing 1 of 2 hosts') -and
+            !(Find-Element "$westName${dot}Comparison unavailable")
+    }
     Click "View run differences for pane $east"
     $null = Wait-Until 'the group overview opens the same pane diff' {
         (Find-Element 'SSH output across runs') -and (Find-Element 'Back to run overview' $button) -and
@@ -606,8 +773,11 @@ try {
             $diff.Contains('east-report-tail') -and ([regex]::Matches($diff, 'east-report-line')).Count -eq 35
     }
     Click 'Back to run overview'
-    $null = Wait-Until 'the overview preserves the baseline and classifications' {
-        (Find-Element 'SSH group run comparison') -and (Find-Element $overviewSummary)
+    $null = Wait-Until 'the overview preserves its baseline and host filters' {
+        $search = Find-Element $comparisonField $edit
+        $search -and $search.GetCurrentPattern($valuePattern).Current.Value -ceq 'EAST' -and
+            (Find-Element 'SSH group run comparison') -and (Find-Element $overviewSummary) -and
+            (Find-Element 'Showing 1 of 2 hosts') -and !(Find-Element "$westName${dot}Comparison unavailable")
     }
     Click 'Back to results'
     $null = Wait-Until 'the cross-run comparison returns to the current submission' {
@@ -1396,7 +1566,8 @@ try {
     if ($newLogs.Count -ne 1 -or $newLogs[0].Name -notmatch '^ssh-group-output-(\d+)\.txt$') {
         throw 'Expected one new file for the recorded run'
     }
-    $nextName = "ssh-group-output-$([int]$Matches[1] + 1).txt"
+    $burstRunId = [int]$Matches[1]
+    $nextName = "ssh-group-output-$($burstRunId + 1).txt"
     $burstPath = $newLogs[0].FullName
     $logReader = Open-PeerTraceReader $burstPath
     $null = Wait-Until 'the recorder is still open with West awaiting its result' {
@@ -1405,7 +1576,37 @@ try {
     }
     Click "Focus pane $west"
     Wait-Focus $west
+    $followPath = Join-Path $State 'follow-burst.jsonl'
+    $followArgs = @('--pid',"$($app.Id)",'follow-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run',"$burstRunId",'--after-line','0','--timeout','30')
+    $followJob = Start-Process -FilePath $Cli -ArgumentList $followArgs -NoNewWindow -PassThru -RedirectStandardOutput $followPath
+    $followReader = Open-PeerTraceReader $followPath
+    $null = Wait-Until 'the follower flushes retained East lines while West is held' {
+        $text = [Text.Encoding]::UTF8.GetString((Read-PeerTrace $followReader))
+        $text.Contains('"text":"east record row 79"') -and !$followJob.HasExited
+    }
+    $followForeground = [FixtureMessages]::GetForegroundWindow()
     [IO.File]::WriteAllText((Join-Path $State 'release-record-fast'), '')
+    if (!$followJob.WaitForExit(10000)) { throw 'The output follower did not finish after settlement' }
+    $followReader.Dispose()
+    $followReader = $null
+    $stream = @([IO.File]::ReadAllLines($followPath) | ForEach-Object { $_ | ConvertFrom-Json })
+    if ($stream.Count -lt 162 -or $stream[-1].result.kind -cne 'settled' -or
+        @($stream | Where-Object { !$_.ok -or $_.result.run_id -ne $burstRunId }).Count -or
+        [FixtureMessages]::GetForegroundWindow() -ne $followForeground) {
+        throw 'The output follower lost records, changed focus, or missed settlement'
+    }
+    $streamedLines = @($stream | Where-Object { $_.result.kind -ceq 'line' } | ForEach-Object { $_.result.line })
+    $cursor = 0
+    foreach ($line in $streamedLines) {
+        if ($line.line_id -ne ($cursor + 1)) { throw 'The output follower repeated or skipped a line ID' }
+        $cursor = $line.line_id
+    }
+    if ($stream[-1].result.next_after_line -ne $cursor -or
+        $streamedLines[-1].text -cne 'west record tail' -or $streamedLines[-1].pane_id -ne $west) {
+        throw 'The output follower omitted the last live line or its cursor'
+    }
+    Wait-Focus $west
     $null = Wait-Until 'the recording ends automatically with the terminal tab focused' {
         [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains('[Group run settled]')
     }
@@ -1432,6 +1633,77 @@ try {
             throw "Unexpected burst from $side ($($actual.Count) of 80 rows): $($actual -join ', ')"
         }
     }
+    $burstWait = @('wait-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$burstRunId",'--after-line','0')
+    $lost = & $Cli --pid $app.Id @burstWait 'east record row 79' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $lost.ok -or $lost.error -notlike '*history after cursor 0 is incomplete through line*') {
+        throw 'A cursor preceding trimmed combined history did not report a gap'
+    }
+    $kept = Control ($burstWait + @('--pane',"$east",'east record row 00'))
+    if ($kept.line.pane_id -ne $east -or $kept.line.text -cne 'east record row 00') {
+        throw 'A gap in the combined feed incorrectly affected the East cursor'
+    }
+    $burstRead = @('get-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$burstRunId")
+    $page = Control ($burstRead + @('--after-line','0','--limit','2'))
+    if ($page.run_id -ne $burstRunId -or !$page.settled -or !$page.gap -or
+        !$page.has_more -or $page.lines.Count -ne 2 -or
+        $page.lines[0].line_id -ne ($page.evicted_through + 1) -or
+        $page.next_after_line -ne $page.lines[1].line_id -or
+        $page.next_after_line -ge $page.latest_line) {
+        throw 'Reading the combined output did not report its gap and first page'
+    }
+    $replay = @(& $Cli --pid $app.Id follow-ssh-group-output --window $groupWindow --tab $groupTab --run $burstRunId |
+        ForEach-Object { $_ | ConvertFrom-Json })
+    if ($LASTEXITCODE -ne 0 -or $replay[0].result.kind -cne 'gap' -or
+        $replay[0].result.evicted_through -ne $page.evicted_through -or
+        $replay[1].result.line.line_id -ne $page.lines[0].line_id -or
+        $replay[-1].result.kind -cne 'settled' -or $replay[-1].result.next_after_line -ne $page.latest_line) {
+        throw 'Following a settled run did not report the history gap and replay the retained lines'
+    }
+    $strictFollow = & $Cli --pid $app.Id follow-ssh-group-output --window $groupWindow --tab $groupTab --run $burstRunId --after-line 0 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $strictFollow.ok -or $strictFollow.error -notlike '*incomplete through line*') {
+        throw 'Following from a missing cursor did not fail before sending history'
+    }
+    $nextPage = Control ($burstRead + @('--after-line',"$($page.next_after_line)",'--limit','2'))
+    if ($nextPage.gap -or !$nextPage.has_more -or $nextPage.lines.Count -ne 2 -or
+        $nextPage.lines[0].line_id -ne ($page.next_after_line + 1)) {
+        throw 'The second output page did not resume immediately after the first'
+    }
+    $eastRead = $burstRead + @('--pane',"$east")
+    $eastPage = Control ($eastRead + @('--after-line','0'))
+    $firstEast = $eastPage.lines | Where-Object text -CEQ 'east record row 00'
+    if ($eastPage.pane_id -ne $east -or $eastPage.gap -or $eastPage.has_more -or
+        $eastPage.evicted_through -ne 0 -or $firstEast.line_id -ne $kept.line.line_id -or
+        $firstEast.label -cne 'East' -or @($eastPage.lines | Where-Object pane_id -NE $east).Count -or
+        $eastPage.next_after_line -ne $eastPage.latest_line -or $eastPage.latest_line -ne $page.latest_line) {
+        throw 'Reading East output did not preserve its own history and the run cursor'
+    }
+    $drained = Control ($eastRead + @('--after-line',"$($eastPage.next_after_line)"))
+    if (!$drained.settled -or $drained.lines.Count -ne 0 -or $drained.has_more -or
+        $drained.next_after_line -ne $eastPage.next_after_line) {
+        throw 'Reading from the final cursor did not return an empty settled page'
+    }
+    Click $liveButton
+    $null = Wait-Until 'open live output for the recorded burst' { Find-Element 'SSH group live output' }
+    (Wait-CheckBox $outputRegex Off).Toggle()
+    $null = Wait-CheckBox $outputRegex On
+    (Command-Editor $outputSearch).SetValue('^east record row (00|79)$')
+    $null = Wait-Until 'the shared tail lost the first East line after the West burst' {
+        (Find-Element 'east record row 79') -and !(Find-Element 'east record row 00')
+    }
+    Click 'Pause output'
+    $null = Wait-Until 'the combined view is paused' { Find-Element 'Resume output' $button }
+    Select-ComboValue $outputHosts $eastName
+    $null = Wait-Until 'selecting East recovers the older line from the same frozen output' {
+        (Find-Element 'east record row 00') -and (Find-Element 'east record row 79') -and
+            (Find-Element 'Resume output' $button)
+    }
+    Click 'Copy shown output'
+    $null = Wait-Until 'the recovered lines are available to clipboard exports' {
+        (Read-ClipboardFixture) -ceq "Submitted${dot}record-fast`r`n$eastName${dot}east record row 79`r`n$eastName${dot}east record row 00`r`n"
+    }
+    Click 'Back to results'
+    $null = Wait-Until 'return to the recorded burst results' { Find-Element "Submitted${dot}record-fast" }
+
     $beforeCollision = [IO.File]::ReadAllText($burstPath)
     (Command-Editor).SetValue('never-send-on-collision')
     Click $sendRecorded
@@ -1500,6 +1772,15 @@ try {
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
+    if ($followReader) { $followReader.Dispose() }
+    if ($followJob) {
+        if (!$followJob.HasExited) { $followJob.Kill(); $followJob.WaitForExit() }
+        $followJob.Dispose()
+    }
+    if ($outputJob) {
+        if (!$outputJob.HasExited) { $outputJob.Kill(); $outputJob.WaitForExit() }
+        $outputJob.Dispose()
+    }
     if ($readyJob) {
         if (!$readyJob.HasExited) { $readyJob.Kill(); $readyJob.WaitForExit() }
         $readyJob.Dispose()

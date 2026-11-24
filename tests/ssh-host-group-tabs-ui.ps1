@@ -359,6 +359,36 @@ try {
     $null = Wait-Until 'only the West submission result is shown' {
         (Find-Element "$westName${dot}Exit 0") -and !(Find-Element "Submitted${dot}east-probe")
     }
+
+    $runSearch = 'Find group runs across tabs' + [char]0x2026
+    $runField = 'Search group runs across tabs'
+    $eastRun = "$eastTab${dot}Run 1${dot}east-probe    Running${dot}0 of 1 settled"
+    $westRun = "$westTab${dot}Run 1${dot}west-probe    Finished${dot}1 of 1 settled"
+    Choose-GroupCommand $runSearch
+    $null = Wait-Until 'the run picker distinguishes identical run numbers across tabs' {
+        (Find-Element $eastRun $button) -and (Find-Element $westRun $button)
+    }
+    (Field $runField).SetValue('EAST probe #10')
+    $null = Wait-Until 'a run number is matched exactly' { Find-Element 'No matching group runs' }
+    (Field $runField).SetValue('FLEET EAST probe #1')
+    $null = Wait-Until 'search matches group title and command' {
+        (Find-Element $eastRun $button) -and !(Find-Element $westRun $button)
+    }
+    Press-Key 27
+    $null = Wait-Until 'Escape closes the cross-tab run picker' { !(Find-Element $runField $edit) }
+    Wait-Tab $westTab
+    Choose-GroupCommand $runSearch
+    (Field $runField).SetValue('east-probe')
+    $null = Wait-Until 'the background running command can be selected' { Find-Element $eastRun $button }
+    Press-Key 13
+    Wait-Tab $eastTab
+    $null = Wait-Until 'Enter opens the original background run' {
+        (Find-Element "Submitted${dot}east-probe") -and (Find-Element "$eastName${dot}Running")
+    }
+    Expect-Field 'Group command' 'east-only draft'
+    Expect-Field 'Host filter' 'east'
+    Select-Tab $westTab
+
     Click ('Recent commands' + [char]0x2026)
     $null = Wait-Until 'West recent commands excludes the East submission' {
         (Find-Element 'west-probe' $button) -and !(Find-Element 'east-probe' $button)
@@ -411,7 +441,10 @@ try {
 
     Click "Focus result pane $west"
     Wait-Focus $west
-    Choose-GroupCommand 'SSH host group'
+    Choose-GroupCommand $runSearch
+    (Field $runField).SetValue('west #1')
+    $null = Wait-Until 'the run picker is also available from a terminal tab' { Find-Element $westRun $button }
+    Press-Key 13
     Wait-Tab $westTab
     (Wait-CheckBox 'Show all window SSH panes' Off).Toggle()
     (Wait-CheckBox $eastName Off).Toggle()
@@ -475,6 +508,22 @@ try {
     (Wait-CheckBox $westName Off).Toggle()
     $null = Wait-CheckBox $westName On
     Submit 'shared-probe'
+    $null = Wait-Until 'the shared command is running' { Find-Element "$westName${dot}Running" }
+    Click "Focus result pane $west"
+    Wait-Focus $west
+    Choose-GroupCommand $runSearch
+    (Field $runField).SetValue('shared-probe')
+    $sharedRun = "$eastTab${dot}Run 2${dot}shared-probe"
+    $null = Wait-Until 'the picker follows the active run from its terminal tab' {
+        Find-Element "$sharedRun    Running${dot}0 of 1 settled" $button
+    }
+    [IO.File]::WriteAllText((Join-Path $State 'release-shared'), '')
+    $null = Wait-Until 'the open picker updates in place after a background run settles' {
+        (Find-Element "$sharedRun    Finished${dot}1 of 1 settled" $button) -and
+            !(Find-Element "$sharedRun    Running${dot}0 of 1 settled" $button)
+    }
+    Press-Key 13
+    Wait-Tab $eastTab
     $null = Wait-Until 'West receives the intentionally selected command' { Find-Element "$westName${dot}Exit 0" }
 
     Click $manage

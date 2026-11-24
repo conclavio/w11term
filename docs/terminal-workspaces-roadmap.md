@@ -226,6 +226,17 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 110. **Compare a host across group runs.** Pick an earlier capture for the same pane and SSH address, show output changes with original line numbers and exit codes, and export the full diff.
 111. **Compare two group runs across hosts.** Summarize changes to output, exit status, and participation. Open a specific host's diff and return to the same comparison.
 112. **Share a group run comparison.** Copy the summary or export versioned JSON with both runs, counts and every host classification.
+113. **Find group runs across tabs.** Show live progress for retained runs in the window. Search by tab title, command and run number, and open the original run without changing its draft or checked hosts.
+114. **Find hosts in a run comparison.** Search by label or SSH address and narrow the view by classification. Keep the filters when returning from a host diff and preserve full comparison exports.
+115. **Search group output with a pattern.** Offer regular-expression and case-sensitive matching alongside the host filter. Report invalid patterns and export the same retained lines shown in the view.
+116. **Switch runs within live output.** Carry the query and host scope across retained submissions. Show when the selected host is absent, and keep each recording attached to its original run.
+117. **Retain output per host on busy runs.** Reserve bounded history for each emitting pane. Use it for the selected host's live, paused, and exported output while keeping the combined feed in arrival order.
+118. **Show search context from the matching host.** Include nearby retained lines, label context separately, and copy or save the resulting excerpt in the same order.
+119. **Read group output chronologically.** Offer oldest-first order and elapsed capture times in the retained view, clipboard, and file exports.
+120. **Wait for SSH group output from the CLI.** Search retained lines and subscribe to new marked output from a scoped run. Report the host, line, and capture time to automation.
+121. **Resume group output waits from a line ID.** Wait for the next marker in the same run and report gaps in the combined or pane-specific retained feed.
+122. **Read retained group output in batches.** Return ordered host-labeled lines, retention gaps, and a cursor the next read or wait can use.
+123. **Follow group output from the CLI.** Stream retained and incoming lines in order over one connection, with a final settlement cursor and explicit history gaps or errors.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
