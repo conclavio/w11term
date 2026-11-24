@@ -1,4 +1,5 @@
 use super::{Delivery, DeliveryStatus, GroupExecution};
+use std::{cmp::Reverse, time::Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -10,10 +11,17 @@ pub enum Outcome {
 
 impl Outcome {
     pub(super) fn of(delivery: &Delivery) -> Self {
-        match &delivery.status {
+        Self::with_execution(&delivery.status, delivery.execution().as_ref())
+    }
+
+    pub(super) fn with_execution(
+        status: &DeliveryStatus,
+        execution: Option<&GroupExecution>,
+    ) -> Self {
+        match status {
             DeliveryStatus::Pending(..) => Self::Waiting,
             DeliveryStatus::Rejected(_) | DeliveryStatus::Unconfirmed => Self::Attention,
-            DeliveryStatus::Sent => match delivery.execution() {
+            DeliveryStatus::Sent => match execution {
                 Some(GroupExecution::AwaitingMarkers | GroupExecution::AwaitingPrompt) => {
                     Self::Waiting
                 }
@@ -23,6 +31,38 @@ impl Outcome {
                 }
                 _ => Self::Attention,
             },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResultOrder {
+    #[default]
+    Submission,
+    Longest,
+    Shortest,
+}
+
+pub(super) const RESULT_ORDERS: [(ResultOrder, &str); 3] = [
+    (ResultOrder::Submission, "Submission order"),
+    (ResultOrder::Longest, "Longest shell time"),
+    (ResultOrder::Shortest, "Shortest shell time"),
+];
+
+impl ResultOrder {
+    pub(super) fn apply(self, rows: &mut [(&Delivery, Option<GroupExecution>)], now: Instant) {
+        let time = |(_, execution): &(&Delivery, Option<GroupExecution>)| {
+            execution
+                .as_ref()
+                .and_then(|execution| execution.shell_time(now))
+        };
+        match self {
+            Self::Submission => {}
+            Self::Longest => rows.sort_by_cached_key(|row| Reverse(time(row))),
+            Self::Shortest => rows.sort_by_cached_key(|row| {
+                let duration = time(row);
+                (duration.is_none(), duration)
+            }),
         }
     }
 }
@@ -126,9 +166,53 @@ mod tests {
                 id: 2,
             },
             exit_code,
-            duration: Duration::ZERO,
+            duration: Duration::from_secs(3),
             output: GroupOutput::Unavailable("Output expired"),
         }))
+    }
+
+    #[test]
+    fn sorts_running_and_finished_times_with_stable_ties_and_unknowns_last() {
+        let now = Instant::now();
+        let states = [
+            None,
+            Some(finished(Some(0))),
+            Some(GroupExecution::Running {
+                target: GroupInterruptTarget {
+                    generation: 1,
+                    serial: 4,
+                },
+                started_at: now - Duration::from_secs(2),
+            }),
+            Some(finished(Some(17))),
+            Some(GroupExecution::AwaitingMarkers),
+        ];
+        let recipients: Vec<_> = states
+            .into_iter()
+            .enumerate()
+            .map(|(index, execution)| {
+                let mut recipient = delivery(DeliveryStatus::Sent, execution);
+                recipient.target.pane = index as u64 + 1;
+                recipient
+            })
+            .collect();
+        let ordered = |order: ResultOrder, now| {
+            let mut rows: Vec<_> = recipients
+                .iter()
+                .map(|recipient| (recipient, recipient.execution()))
+                .collect();
+            order.apply(&mut rows, now);
+            rows.iter()
+                .map(|(delivery, _)| delivery.target.pane)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordered(ResultOrder::Submission, now), [1, 2, 3, 4, 5]);
+        assert_eq!(ordered(ResultOrder::Longest, now), [2, 4, 3, 1, 5]);
+        assert_eq!(ordered(ResultOrder::Shortest, now), [3, 2, 4, 1, 5]);
+        assert_eq!(
+            ordered(ResultOrder::Longest, now + Duration::from_secs(3)),
+            [3, 2, 4, 1, 5],
+        );
     }
 
     #[test]

@@ -107,6 +107,8 @@ Choose **Send and record…** beside the group command to attach a recorder befo
 
 The submission progress bar and counts cover every recipient in the viewed run. Use **Filter submission results** to see waiting, running, successful, or attention-needed results. **Needs attention** includes nonzero exits, commands withheld or unconfirmed, and outcomes without a verified exit status. Result filters apply to **Interrupt selected**. **Copy results** includes the full submission.
 
+Use **Sort submission results** to show the longest or shortest shell times first. The sort compares live elapsed time with completed durations. Ties keep their submission order and untimed results appear last. The sort stays with the group tab as you move between submissions. Exports keep the original submission order.
+
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.
 
 Choose **Recent commands…** or find **Recent group commands…** in the command palette to search the last 50 distinct commands submitted from this tab, newest first. Search matches the full command without regard to case. Press Enter to load the selected command as a draft or Esc to return to your current draft. The host filter and checked hosts stay as they are. Recent commands are kept in memory for the life of the group tab.
