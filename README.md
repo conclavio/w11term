@@ -151,6 +151,8 @@ After delivery, the group follows each host separately. Matching shell markers s
 
 Choose **Find run…** in the results or **Find group run…** in the command palette to jump to a retained submission. Search its command text or enter a run number such as `#3`. Runs appear newest first, with repeated commands listed separately. Enter opens the selected result and Escape returns to the current submission. The command draft and checked hosts stay in place.
 
+Use **Find group runs across tabs…** in the command palette from any tab to see retained runs in the current window. Search by group tab title, command or exact run number. Active runs appear first, with their host progress updated while the picker is open. Enter opens the result in its original group tab. Escape leaves your current tab in place.
+
 While a verified command runs, its result shows elapsed time. On completion it shows **Shell time**, the interval between the shell markers as received by w11term. Network and output buffering can affect that interval. Timing is available when the shell reports the start of command output and the command can be matched to the submission.
 
 Choose **Live output…** on a submission to follow recent output from all its hosts, newest first. Each line identifies its source and lets you focus that pane. **Pause output** freezes the view while the shells continue, and **Resume output** catches up to the newest retained lines. The feed keeps 128 lines per submission and marks skipped or shortened output. It shows completed text lines from verified shell markers and the final line when the command ends. For prompt-only appliances or a full transcript, open the source pane or its command history.

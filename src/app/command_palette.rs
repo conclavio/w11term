@@ -10,6 +10,7 @@ pub(super) enum Search {
     GroupLibrary(TabId),
     GroupRecent(TabId),
     GroupRuns(TabId),
+    WindowGroupRuns,
 }
 
 impl Search {
@@ -20,6 +21,7 @@ impl Search {
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
             Self::GroupRuns(_) => "Search group runs",
+            Self::WindowGroupRuns => "Search group runs across tabs",
         }
     }
 
@@ -30,7 +32,7 @@ impl Search {
                 "Commands submitted in this tab will appear here."
             }
             Self::GroupRecent(_) => "No matching recent commands",
-            Self::GroupRuns(_) => "No matching group runs",
+            Self::GroupRuns(_) | Self::WindowGroupRuns => "No matching group runs",
             Self::Tabs => "No matching tabs",
             _ => "No matching commands",
         }
@@ -67,6 +69,8 @@ pub enum CommandId {
     GroupRecentCommand(TabId, u64),
     SearchGroupRuns(TabId),
     GroupRun(TabId, u64),
+    SearchWindowGroupRuns,
+    WindowGroupRun(TabId, u64),
     FocusTab(TabId),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
@@ -94,8 +98,8 @@ pub enum CommandId {
 
 pub(super) struct Row {
     pub id: CommandId,
-    label: String,
-    chord: String,
+    pub(super) label: String,
+    pub(super) chord: String,
     pub enabled: bool,
 }
 
@@ -560,6 +564,14 @@ impl TerminalApp {
                 enabled,
             });
         }
+        if self.has_window_group_runs() {
+            rows.push(Row {
+                id: CommandId::SearchWindowGroupRuns,
+                label: host_groups::WINDOW_RUN_SEARCH_LABEL.into(),
+                chord: String::new(),
+                enabled: true,
+            });
+        }
         if let Some(group) = self.host_group_command_target() {
             rows.extend(self.group_saved_rows(group));
             rows.extend(self.roster_commands(group).into_iter().map(|command| Row {
@@ -691,6 +703,14 @@ impl TerminalApp {
             CommandId::GroupRun(group, run) => {
                 Message::HostGroup(host_groups::Action::ViewSubmission(group, run))
             }
+            CommandId::SearchWindowGroupRuns => {
+                self.open_window_group_run_picker(ctx);
+                return;
+            }
+            CommandId::WindowGroupRun(group, run) => {
+                self.open_window_group_run(group, run, ctx);
+                return;
+            }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
             CommandId::OpenSavedHostGroup(name, members) => {
                 Message::HostGroup(host_groups::Action::OpenNamedGroup { name, members })
@@ -778,7 +798,7 @@ pub(super) fn view(
     let search_label = mode.placeholder();
     let trimming = if matches!(
         mode,
-        Search::Tabs | Search::GroupRecent(_) | Search::GroupRuns(_)
+        Search::Tabs | Search::GroupRecent(_) | Search::GroupRuns(_) | Search::WindowGroupRuns
     ) {
         TextTrimming::CharacterEllipsis
     } else {

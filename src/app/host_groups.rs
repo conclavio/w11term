@@ -40,6 +40,7 @@ mod retry;
 mod reuse;
 mod roster_commands;
 mod roster_report;
+mod run_search;
 mod save_command;
 mod saved;
 mod transfer;
@@ -53,6 +54,7 @@ pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
 pub(super) const RECENT_COMMANDS_LABEL: &str = "Recent group commands…";
 pub(super) const FIND_RUN_LABEL: &str = "Find group run…";
+pub(super) use run_search::WINDOW_RUN_SEARCH_LABEL;
 const REQUIRE_READY: &str = "Require all recipients ready";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;
@@ -837,22 +839,7 @@ impl TerminalApp {
     pub(super) fn host_group_command_target(&self) -> Option<TabId> {
         let id = self.tabs.active_id()?;
         match &self.tabs.get(id)?.page {
-            Page::HostGroup(page)
-                if !page.saved.is_editing()
-                    && page.live_output.is_none()
-                    && !page.comparison.is_open()
-                    && !page.import.is_open()
-                    && !page.host_list_export.is_open()
-                    && !page.close_ended.is_reviewing()
-                    && !page.disconnect.is_reviewing()
-                    && !page.edit_membership_open()
-                    && !page.saved.reuse.is_open()
-                    && !page.prompt_setup.is_open()
-                    && !page.transfer.is_open()
-                    && !page.environment.is_open() =>
-            {
-                Some(id)
-            }
+            Page::HostGroup(page) if page.can_view_run() => Some(id),
             _ => None,
         }
     }
@@ -914,13 +901,15 @@ impl TerminalApp {
         if matches!(
             self.tabs.active().map(|tab| &tab.page),
             Some(Page::HostGroup(_))
-        ) || self.tabs.entries().iter().any(|entry| {
-            matches!(&entry.value.page, Page::HostGroup(page)
-            if page.connection_notice.is_armed() || !page.ready_waiters.is_empty()
-                || page.submissions.iter().any(|run| {
-                    run.has_queue() || !run.control_waiters.is_empty()
-                }))
-        }) {
+        ) || self.window_group_run_picker_open()
+            || self.tabs.entries().iter().any(|entry| {
+                matches!(&entry.value.page, Page::HostGroup(page)
+                if page.connection_notice.is_armed() || !page.ready_waiters.is_empty()
+                    || page.submissions.iter().any(|run| {
+                        run.has_queue() || !run.control_waiters.is_empty()
+                    }))
+            })
+        {
             if self.host_group_timer.is_none() {
                 let sender = ctx.sender();
                 self.host_group_timer =
@@ -1318,10 +1307,12 @@ impl TerminalApp {
                 self.poll_command_queues();
                 self.poll_ssh_group_waiters();
                 self.poll_ssh_group_ready_waiters();
+                let watching_runs = self.window_group_run_picker_open();
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
                     Some(Page::HostGroup(_))
-                ) {
+                ) && !watching_runs
+                {
                     self.update_host_group_timer(ctx);
                     return;
                 }
@@ -1351,6 +1342,9 @@ impl TerminalApp {
                             submission.refresh_deliveries();
                         }
                     }
+                }
+                if watching_runs {
+                    self.refresh_open_commands();
                 }
                 self.refresh_roster_picker(ctx);
                 self.update_host_group_timer(ctx);

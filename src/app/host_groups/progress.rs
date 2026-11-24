@@ -129,6 +129,33 @@ pub(super) struct Summary {
 }
 
 impl Summary {
+    pub(super) fn capture(deliveries: &[Delivery]) -> Self {
+        let mut summary = Self::default();
+        for delivery in deliveries {
+            summary.add(Outcome::of(delivery));
+        }
+        summary
+    }
+
+    pub(super) fn in_progress(&self) -> bool {
+        self.waiting + self.running != 0
+    }
+
+    pub(super) fn picker_caption(&self) -> String {
+        let summary = if self.running > 0 {
+            "Running"
+        } else if self.waiting > 0 {
+            "Waiting"
+        } else if self.attention > 0 {
+            "Needs attention"
+        } else if self.skipped > 0 {
+            "Hosts skipped"
+        } else {
+            "Finished"
+        };
+        format!("{summary} · {} of {} settled", self.settled(), self.total())
+    }
+
     pub(super) fn add(&mut self, outcome: Outcome) {
         match outcome {
             Outcome::Waiting => self.waiting += 1,

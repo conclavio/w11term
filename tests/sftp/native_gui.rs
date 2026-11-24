@@ -1273,6 +1273,7 @@ async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
         let input = Arc::new(std::sync::Mutex::new(Vec::new()));
         let trace = input.clone();
         let release = state.path().join("release-east");
+        let release_shared = state.path().join("release-shared");
         let responder = tokio::spawn(async move {
             let prompt = b"\x1b]133;A\x07fixture$ \x1b]133;B\x07";
             let mut peer = None;
@@ -1294,7 +1295,12 @@ async fn native_ssh_host_group_tabs_keep_live_scopes_independent() {
                             .data(id, format!("{line}\r\n\x1b]133;C\x07").into_bytes())
                             .await
                             .unwrap();
-                        if name == "East" {
+                        let gate = match (name, line) {
+                            ("East", _) => Some(&release),
+                            ("West", "shared-probe") => Some(&release_shared),
+                            _ => None,
+                        };
+                        if let Some(release) = gate {
                             while !release.is_file() {
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
