@@ -13,6 +13,7 @@ pub(super) struct State {
 struct Origin {
     name: String,
     members: Vec<String>,
+    full_roster: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,16 +58,19 @@ pub enum Action {
 }
 
 impl State {
-    pub(super) fn remember(&mut self, name: &str, members: &[String]) {
+    pub(super) fn remember(&mut self, name: &str, members: &[String], full_roster: bool) {
         self.origin = Some(Origin {
             name: name.into(),
             members: members.to_vec(),
+            full_roster,
         });
         self.review = None;
     }
 
-    pub(super) fn has_origin(&self) -> bool {
-        self.origin.is_some()
+    pub(super) fn can_update(&self) -> bool {
+        self.origin
+            .as_ref()
+            .is_some_and(|origin| origin.full_roster)
     }
 
     pub(in crate::app::host_groups) fn origin(&self) -> Option<(&str, &[String])> {
@@ -196,6 +200,9 @@ impl TerminalApp {
             return;
         };
         let state = &mut page.saved.roster_update;
+        if !state.can_update() {
+            return;
+        }
         match action {
             Action::Cancel(revision) => {
                 if state.revision == revision {
@@ -262,7 +269,9 @@ impl TerminalApp {
         )?;
         self.use_group_catalog(catalog);
         if let Some(page) = self.host_group_mut(id) {
-            page.saved.roster_update.remember(&name, &proposal.members);
+            page.saved
+                .roster_update
+                .remember(&name, &proposal.members, true);
             page.saved.feedback = format!("Saved live membership for {name}");
         }
         Ok(())

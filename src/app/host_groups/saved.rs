@@ -66,7 +66,7 @@ impl SavedUi {
     }
 
     pub(super) fn can_update_roster(&self) -> bool {
-        self.roster_update.has_origin()
+        self.roster_update.can_update()
     }
 
     pub(super) fn origin(&self) -> Option<(&str, &[String])> {
@@ -305,22 +305,25 @@ impl TerminalApp {
         self.bind_folder_shares();
     }
 
-    pub(super) fn resolve_saved_host_group(
+    pub(super) fn load_expected_host_group(
         &self,
         name: &str,
         expected: &[String],
-    ) -> Result<(Profiles, Vec<SshOptions>)> {
+    ) -> Result<Profiles> {
         let catalog = self.store.catalog()?;
         ensure!(
             catalog.ssh_host_groups.get(name).map(Vec::as_slice) == Some(expected),
             "The SSH group changed on disk. Select it again."
         );
-        let members = catalog
-            .resolve_ssh_host_group_members(expected)?
-            .into_iter()
-            .cloned()
-            .collect();
-        Ok((catalog, members))
+        ensure!(!expected.is_empty(), "Choose at least one SSH profile");
+        let mut seen = BTreeSet::new();
+        for profile in expected {
+            ensure!(
+                seen.insert(profile),
+                "SSH profile {profile} appears more than once"
+            );
+        }
+        Ok(catalog)
     }
 
     pub(super) fn remember_group_launch(
@@ -328,11 +331,14 @@ impl TerminalApp {
         id: TabId,
         name: &str,
         members: &[String],
+        full_roster: bool,
         feedback: String,
     ) {
         if let Some(page) = self.host_group_mut(id) {
             if page.roster.is_some() {
-                page.saved.roster_update.remember(name, members);
+                page.saved
+                    .roster_update
+                    .remember(name, members, full_roster);
             }
             page.saved.selected = Some(name.into());
             page.saved.feedback = feedback;
@@ -380,7 +386,12 @@ impl TerminalApp {
                 "Return from the comparison before opening another group."
             );
         }
-        let (catalog, members) = self.resolve_saved_host_group(name, expected)?;
+        let catalog = self.load_expected_host_group(name, expected)?;
+        let members = catalog
+            .resolve_ssh_host_group_members(expected)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         self.use_group_catalog(catalog);
         let id = id.unwrap_or_else(|| self.new_host_group_tab(Some(name)));
         if self
@@ -408,6 +419,7 @@ impl TerminalApp {
             id,
             name,
             expected,
+            true,
             format!("Opened {} SSH panes for {name}", expected.len()),
         );
         Ok(())

@@ -71,6 +71,18 @@ function Expect-Choice([string]$FieldName, [string]$Choice) {
         }
     }
 }
+function Choose-Option([string]$FieldName, [string]$Choice) {
+    $combo = Wait-Until $FieldName { Find-Element $FieldName $comboBox }
+    $popup = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $popup.Expand()
+    $item = Wait-Until "visible option '$Choice'" {
+        $entry = Find-Element $Choice $listItem
+        if ($entry -and !$entry.Current.IsOffscreen) { $entry }
+    }
+    $item.GetCurrentPattern($selectionItem).Select()
+    Expect-Choice $FieldName $Choice
+    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
 function Session([string]$Name) {
     Wait-Until "SSH pane '$Name'" { (Control @('list')).sessions | Where-Object label -ceq $Name }
 }
@@ -243,7 +255,7 @@ try {
     }
 
     Choose-SavedGroup 'Fleet Mixed'
-    $reuse = 'Review connection reuse' + [char]0x2026
+    $reuse = 'Review group launch' + [char]0x2026
     Click $reuse
     $null = Wait-Until 'review offers to reuse East and open North' {
         (Find-Element "Review SSH group${dot}Fleet Mixed") -and
@@ -251,6 +263,22 @@ try {
     }
     Expect-Choice 'Connection for East' "Reuse${dot}$eastName"
     Expect-Choice 'Connection for North' 'Open a new SSH pane'
+    Click 'Clear included hosts'
+    $null = Wait-CheckBox 'Include profile East' Off
+    (Wait-CheckBox 'Include profile North' Off).Toggle()
+    $null = Wait-Until 'the launch can include North alone' {
+        Find-Element "0 to reuse${dot}1 to open${dot}1 skipped"
+    }
+    Click 'Refresh review'
+    $null = Wait-CheckBox 'Include profile East' Off
+    $null = Wait-CheckBox 'Include profile North' On
+    Click 'Clear included hosts'
+    $null = Wait-Until 'an empty launch is disabled' {
+        $open = Find-Element 'Open reviewed group' $button
+        $open -and !$open.Current.IsEnabled
+    }
+    Click 'Include all available'
+    $null = Wait-Until 'both available hosts are included again' { Find-Element "1 to reuse${dot}1 to open" }
     Click 'Cancel'
     $null = Wait-Until 'cancelling the launch review returns to the group' { Find-Element $reuse $button }
     if (@((Control @('list')).sessions).Count -ne 3) { throw 'Cancelling the review opened a session' }
@@ -414,6 +442,45 @@ try {
     Accept-GroupCommandWithEnter "Apply recipient set${dot}Fleet"
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
+
+    Select-Tab $westTab
+    Choose-SavedGroup 'Fleet East'
+    Click $reuse
+    Choose-Option 'Connection for West' 'Open a new SSH pane'
+    Choose-Option 'Launch recipient set' 'Canaries'
+    $null = Wait-CheckBox 'Include profile East' On
+    $null = Wait-CheckBox 'Include profile West' Off
+    $null = Wait-Until 'only the canary connection is offered' {
+        Find-Element "1 to reuse${dot}0 to open${dot}1 skipped"
+    }
+    $beforePresetLaunch = [IO.File]::ReadAllBytes($profiles)
+    $changed = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    $changed.ssh_recipient_sets.'Fleet East'.Canaries = @('West')
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Open reviewed group'
+    $null = Wait-Until 'stale launch preset requires another review' {
+        Find-Element 'Recipient set Canaries changed. Refresh the review before opening this group.'
+    }
+    if (@((Control @('list')).sessions).Count -ne 4) { throw 'A stale recipient set opened a new SSH pane' }
+    [IO.File]::WriteAllBytes($profiles, $beforePresetLaunch)
+    Click 'Refresh review'
+    $null = Wait-Until 'refreshed preset is ready' {
+        !(Find-Element 'Recipient set Canaries changed. Refresh the review before opening this group.')
+    }
+    Expect-Choice 'Launch recipient set' 'Canaries'
+    Click 'Open reviewed group'
+    Wait-Tab "SSH group${dot}Fleet East (2)"
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-Until 'only the canary is in the new roster' {
+        (Find-Element "Reused 1${dot}Opened 0 for Fleet East${dot}Skipped 1") -and
+            !(Find-Element "Focus pane $west" $button) -and !(Find-Element $update $button)
+    }
+    if (@((Control @('list')).sessions).Count -ne 4 -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($profiles)) -cne
+            [Convert]::ToBase64String($beforePresetLaunch)) {
+        throw 'The canary launch created another connection or edited the saved group'
+    }
+    Select-Tab $eastTab
     Click $manage
     (Wait-CheckBox "Include $westName" On).Toggle()
     $null = Wait-CheckBox "Include $westName" Off
