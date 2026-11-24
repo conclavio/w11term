@@ -1,8 +1,58 @@
 use super::*;
 use w11term::events::{GroupQueueEventKind, GroupTranscriptHost};
 
-const FAILED_RESULT: &str = "Queue stopped after an unsuccessful host.";
-const CANARY_FAILED: &str = "Canary did not report a successful exit.";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopReason {
+    Failure,
+    CanaryFailure,
+    Expired,
+}
+
+impl StopReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Failure => "Queue stopped after an unsuccessful host.",
+            Self::CanaryFailure => "Canary did not report a successful exit.",
+            Self::Expired => "Queue expired before sending.",
+        }
+    }
+
+    fn event(self) -> GroupQueueEventKind {
+        match self {
+            Self::Failure => GroupQueueEventKind::StoppedOnFailure,
+            Self::CanaryFailure => GroupQueueEventKind::CanaryFailed,
+            Self::Expired => GroupQueueEventKind::Expired,
+        }
+    }
+}
+
+fn deadline_reached(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
+}
+
+struct DispatchJob {
+    run: u64,
+    index: usize,
+    target: Target,
+    text: Arc<str>,
+    host: GroupTranscriptHost,
+    transcript: GroupTranscript,
+    stop_on_failure: bool,
+    deadline: Option<Instant>,
+}
+
+impl DispatchJob {
+    fn stop_reason(&self, now: Instant) -> Option<StopReason> {
+        if deadline_reached(self.deadline, now) {
+            Some(StopReason::Expired)
+        } else if self.stop_on_failure && self.transcript.has_unsuccessful_result() {
+            Some(StopReason::Failure)
+        } else {
+            None
+        }
+    }
+}
+
 const SEND_INTERVALS: [(&str, SshGroupCommandInterval); 6] = [
     ("No delay", SshGroupCommandInterval::None),
     ("500 milliseconds", SshGroupCommandInterval::HalfSecond),
@@ -10,6 +60,14 @@ const SEND_INTERVALS: [(&str, SshGroupCommandInterval); 6] = [
     ("2 seconds", SshGroupCommandInterval::TwoSeconds),
     ("5 seconds", SshGroupCommandInterval::FiveSeconds),
     ("10 seconds", SshGroupCommandInterval::TenSeconds),
+];
+const QUEUE_EXPIRIES: [(&str, SshGroupQueueExpiry); 6] = [
+    ("Never", SshGroupQueueExpiry::Never),
+    ("5 seconds", SshGroupQueueExpiry::FiveSeconds),
+    ("15 seconds", SshGroupQueueExpiry::FifteenSeconds),
+    ("30 seconds", SshGroupQueueExpiry::ThirtySeconds),
+    ("1 minute", SshGroupQueueExpiry::OneMinute),
+    ("5 minutes", SshGroupQueueExpiry::FiveMinutes),
 ];
 
 pub enum Action {
@@ -34,6 +92,7 @@ pub(super) struct Queue {
     notify_canary: bool,
     interval: Duration,
     last_dispatch: Option<Instant>,
+    deadline: Option<Instant>,
 }
 
 impl Queue {
@@ -43,6 +102,7 @@ impl Queue {
         canary: Option<u64>,
         notify_canary: bool,
         interval: Duration,
+        deadline: Option<Instant>,
     ) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(limit)),
@@ -52,6 +112,7 @@ impl Queue {
             notify_canary,
             interval,
             last_dispatch: None,
+            deadline,
         }
     }
 
@@ -69,27 +130,51 @@ impl Queue {
 }
 
 pub(super) fn interval_picker(id: TabId, page: &HostGroup, ctx: &ViewContext<TerminalApp>) -> View {
+    time_picker(
+        "Time between sends",
+        page.roster_preferences.command_interval,
+        &SEND_INTERVALS,
+        !page.recorded_send.pending(),
+        move |interval| Message::HostGroup(super::Action::CommandInterval(id, interval)),
+        ctx,
+    )
+}
+
+pub(super) fn expiry_picker(id: TabId, page: &HostGroup, ctx: &ViewContext<TerminalApp>) -> View {
+    time_picker(
+        "Expire unsent commands",
+        page.roster_preferences.command_queue_expiry,
+        &QUEUE_EXPIRIES,
+        !page.recorded_send.pending(),
+        move |expiry| Message::HostGroup(super::Action::CommandQueueExpiry(id, expiry)),
+        ctx,
+    )
+}
+
+fn time_picker<T: Copy + PartialEq + 'static>(
+    label: &'static str,
+    current: T,
+    choices: &'static [(&'static str, T)],
+    enabled: bool,
+    select: impl Fn(T) -> Message + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(8.0)
         .children((
             TextBlock::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .text("Time between sends"),
+                .text(label),
             ComboBox::new()
-                .automation_name("Time between sends")
-                .is_enabled(!page.recorded_send.pending())
-                .items_source(SEND_INTERVALS.map(|(label, _)| label))
-                .selected_index(SEND_INTERVALS.iter().position(|(_, interval)| {
-                    *interval == page.roster_preferences.command_interval
-                }))
+                .automation_name(label)
+                .is_enabled(enabled)
+                .items_source(choices.iter().map(|&(name, _)| name))
+                .selected_index(choices.iter().position(|&(_, value)| value == current))
                 .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                    index.and_then(|index| SEND_INTERVALS.get(index)).map_or(
-                        Message::ControlIdle,
-                        |&(_, interval)| {
-                            Message::HostGroup(super::Action::CommandInterval(id, interval))
-                        },
-                    )
+                    index
+                        .and_then(|index| choices.get(index))
+                        .map_or(Message::ControlIdle, |&(_, value)| select(value))
                 })),
         ))
 }
@@ -201,6 +286,11 @@ impl Submission {
             .map_or("Canary host", |delivery| delivery.target.name.as_str())
     }
 
+    fn stop_queue(&mut self, reason: StopReason) {
+        self.transcript.note_queue_activity(reason.event());
+        self.reject_queued_commands(reason.message());
+    }
+
     fn reject_queued_commands(&mut self, reason: &str) {
         for delivery in &mut self.results {
             if let DeliveryStatus::Queued(waiting) = &mut delivery.status {
@@ -239,6 +329,12 @@ impl TerminalApp {
                 else {
                     continue;
                 };
+                let now = Instant::now();
+                if deadline_reached(queue.deadline, now) {
+                    queue.notify_canary = false;
+                    run.stop_queue(StopReason::Expired);
+                    continue;
+                }
                 let stopped = queue.stop_on_failure && run.transcript.has_unsuccessful_result();
                 let only_canary = match queue.canary {
                     Some(CanaryGate::Pending(pane)) => {
@@ -250,13 +346,11 @@ impl TerminalApp {
                                 run.transcript
                                     .note_queue_activity(GroupQueueEventKind::CanaryReady);
                             } else {
-                                let (reason, event) = if result.is_some() {
-                                    (CANARY_FAILED, GroupQueueEventKind::CanaryFailed)
+                                run.stop_queue(if result.is_some() {
+                                    StopReason::CanaryFailure
                                 } else {
-                                    (FAILED_RESULT, GroupQueueEventKind::StoppedOnFailure)
-                                };
-                                run.transcript.note_queue_activity(event);
-                                run.reject_queued_commands(reason);
+                                    StopReason::Failure
+                                });
                             }
                             if notify {
                                 self.inbox.group_canary_finished(
@@ -275,15 +369,12 @@ impl TerminalApp {
                     None => None,
                 };
                 if stopped {
-                    run.transcript
-                        .note_queue_activity(GroupQueueEventKind::StoppedOnFailure);
-                    run.reject_queued_commands(FAILED_RESULT);
+                    run.stop_queue(StopReason::Failure);
                     continue;
                 }
-                if queue.paused || queue.waiting_for_interval(Instant::now()) {
+                if queue.paused || queue.waiting_for_interval(now) {
                     continue;
                 }
-                let stop_after_failure = queue.stop_on_failure.then(|| run.transcript.clone());
                 for (index, delivery) in run.results.iter_mut().enumerate() {
                     if only_canary.is_some_and(|pane| delivery.target.pane != pane) {
                         continue;
@@ -299,32 +390,44 @@ impl TerminalApp {
                         .take()
                         .expect("queued command owns its delivery receipt");
                     host.hold_execution_slot(permit);
-                    jobs.push((
-                        run.id,
+                    jobs.push(DispatchJob {
+                        run: run.id,
                         index,
-                        delivery.target.clone(),
-                        text.clone(),
+                        target: delivery.target.clone(),
+                        text: text.clone(),
                         host,
-                        stop_after_failure.clone(),
-                    ));
+                        transcript: run.transcript.clone(),
+                        stop_on_failure: queue.stop_on_failure,
+                        deadline: queue.deadline,
+                    });
                     if !queue.interval.is_zero() {
                         break;
                     }
                 }
             }
-            let mut stopped_runs = BTreeSet::new();
-            for (run, index, target, text, host, stop_after_failure) in jobs {
-                let delivery = if let Some(transcript) =
-                    stop_after_failure.as_ref().filter(|transcript| {
-                        stopped_runs.contains(&run) || transcript.has_unsuccessful_result()
-                    }) {
-                    if stopped_runs.insert(run) {
-                        transcript.note_queue_activity(GroupQueueEventKind::StoppedOnFailure);
+            let mut stopped_runs = BTreeMap::new();
+            for job in jobs {
+                let reason = stopped_runs
+                    .get(&job.run)
+                    .copied()
+                    .or_else(|| job.stop_reason(Instant::now()));
+                let DispatchJob {
+                    run,
+                    index,
+                    target,
+                    text,
+                    host,
+                    transcript,
+                    ..
+                } = job;
+                let delivery = if let Some(reason) = reason {
+                    if stopped_runs.insert(run, reason).is_none() {
+                        transcript.note_queue_activity(reason.event());
                     }
-                    host.delivery_receipt().reject(FAILED_RESULT);
+                    host.delivery_receipt().reject(reason.message());
                     Delivery {
                         target,
-                        status: DeliveryStatus::Rejected(FAILED_RESULT.into()),
+                        status: DeliveryStatus::Rejected(reason.message().into()),
                         execution: None,
                         interrupt: None,
                     }
@@ -349,12 +452,10 @@ impl TerminalApp {
             if !stopped_runs.is_empty()
                 && let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
             {
-                for run in page
-                    .submissions
-                    .iter_mut()
-                    .filter(|run| stopped_runs.contains(&run.id))
-                {
-                    run.reject_queued_commands(FAILED_RESULT);
+                for run in &mut page.submissions {
+                    if let Some(reason) = stopped_runs.get(&run.id) {
+                        run.reject_queued_commands(reason.message());
+                    }
                 }
             }
         }
@@ -378,6 +479,11 @@ impl TerminalApp {
         let Some(queue) = &mut submission.command_queue else {
             return;
         };
+        if deadline_reached(queue.deadline, Instant::now()) {
+            queue.notify_canary = false;
+            submission.stop_queue(StopReason::Expired);
+            return;
+        }
         match action {
             Action::Cancel => {
                 queue.notify_canary = false;
@@ -495,6 +601,17 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
                 .text(status)
                 .into()
         }),
+        queue.deadline.map_or_else(View::empty, |deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+            TextBlock::new()
+                .text(if remaining.is_zero() {
+                    "Unsent command deadline reached".into()
+                } else {
+                    format!("Unsent commands expire in {seconds} s")
+                })
+                .into()
+        }),
         buttons,
     ))
 }
@@ -504,10 +621,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_staged_host_is_withheld_at_the_deadline_even_without_stop_on_failure() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(5);
+        let transcript = GroupTranscript::default();
+        let job = DispatchJob {
+            run: 1,
+            index: 0,
+            target: Target {
+                pane: 1,
+                name: "host".into(),
+                names: Default::default(),
+                profile: None,
+                connected: true,
+                state: TargetState::Unverified,
+            },
+            text: "show".into(),
+            host: transcript.host(1),
+            transcript,
+            stop_on_failure: false,
+            deadline: Some(deadline),
+        };
+        assert_eq!(job.stop_reason(deadline - Duration::from_millis(1)), None);
+        assert_eq!(job.stop_reason(deadline), Some(StopReason::Expired));
+        assert!(!deadline_reached(None, deadline));
+    }
+
+    #[test]
     fn a_dispatch_interval_holds_until_its_exact_deadline() {
         let start = Instant::now();
         let interval = Duration::from_secs(2);
-        let mut queue = Queue::new(4, false, None, false, interval);
+        let mut queue = Queue::new(4, false, None, false, interval, None);
         assert!(!queue.waiting_for_interval(start));
 
         queue.last_dispatch = Some(start);

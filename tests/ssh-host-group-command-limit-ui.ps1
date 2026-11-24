@@ -358,6 +358,50 @@ try {
         $recorded -and $recorded.Contains("Skipped queued host${dot}Pane $($panes.East)") -and
             $recorded.Contains("$($labels.East)${dot}Skipped before sending") -and $recorded.Contains('[Group run settled]')
     }
+
+    Select-GroupOption 'Filter submission results' 'All results'
+    Select-GroupOption 'Expire unsent commands' '5 seconds'
+    Set-Command 'deadline'
+    Click 'Preview send order'
+    $null = Wait-Until 'the queue deadline is visible in preview' { Find-Element 'Unsent commands expire after 5s' }
+    Click ('Send and record' + [char]0x2026)
+    $dialog = Wait-Until 'deadline recording dialog' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'start the deadline run' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started deadline')
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    Click 'Pause queue'
+    Click 'Notify when run finishes'
+    $null = Wait-Until 'the queue is paused and waiting for the run notice' {
+        (Find-Element 'Command queue paused') -and (Find-Element 'Cancel run notification' $button)
+    }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the deadline passes with the paused group in the background' { $elapsed.ElapsedMilliseconds -ge 5200 }
+    New-Item -ItemType File -Path (Join-Path $State 'release-deadline') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished deadline')
+    Click "Unread${dot}$group${dot}Run 11${dot}Group run finished${dot}1 succeeded${dot}2 need attention"
+    $null = Wait-Until 'background expiry withheld the queued hosts but kept the active command' {
+        (Find-Element "$($labels.East)${dot}Not sent${dot}Queue expired before sending.") -and
+            (Find-Element "$($labels.North)${dot}Not sent${dot}Queue expired before sending.") -and
+            (Find-Element "$($labels.West)${dot}Exit 0") -and !(Find-Element 'Resume queue' $button)
+    }
+    $log = Join-Path $State 'ssh-group-output-11.txt'
+    $null = Wait-Until 'the recording keeps the deadline, expiry, and final outcomes' {
+        $recorded = Read-GroupRecording $log
+        $recorded -and $recorded.Contains('queue expires after 5s') -and $recorded.Contains('Expired unsent commands') -and
+            $recorded.Contains('Queue expired before sending.') -and $recorded.Contains('[Group run settled]')
+    }
+
+    Select-GroupOption 'Canary host' $labels.East
+    Set-Command 'deadline-approval'
+    Click 'Run canary first'
+    $null = Wait-Until 'a successful canary waits for approval before the deadline' {
+        (Find-Element "$($labels.East)${dot}Exit 0") -and (Find-Element 'Approve remaining hosts' $button)
+    }
+    $null = Wait-Until 'expiry closes the canary approval gate and withholds the remaining hosts' {
+        (Find-Element "$($labels.West)${dot}Not sent${dot}Queue expired before sending.") -and
+            (Find-Element "$($labels.North)${dot}Not sent${dot}Queue expired before sending.") -and
+            !(Find-Element 'Approve remaining hosts' $button)
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

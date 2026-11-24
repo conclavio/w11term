@@ -1499,7 +1499,9 @@ mod tests {
 
     #[test]
     fn roster_defaults_follow_group_rename_and_reject_stale_writes() {
-        use crate::options::{SshGroupCommandInterval, SshGroupParallelLimit, SshRosterOrder};
+        use crate::options::{
+            SshGroupCommandInterval, SshGroupParallelLimit, SshGroupQueueExpiry, SshRosterOrder,
+        };
         use serde_json::Value;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1526,6 +1528,7 @@ mod tests {
             login_limit: SshGroupParallelLimit::Four,
             command_limit: SshGroupParallelLimit::Two,
             command_interval: SshGroupCommandInterval::HalfSecond,
+            command_queue_expiry: SshGroupQueueExpiry::ThirtySeconds,
             stop_command_queue_on_failure: true,
         };
         assert!(
@@ -1551,6 +1554,10 @@ mod tests {
         assert_eq!(
             raw["ssh_host_group_defaults"]["Renamed"]["command_interval"],
             "500ms"
+        );
+        assert_eq!(
+            raw["ssh_host_group_defaults"]["Renamed"]["command_queue_expiry"],
+            "30s"
         );
         let remaining = other.delete_ssh_host_group("Renamed", &members).unwrap();
         assert_eq!(remaining.ssh_host_group_defaults.len(), 1);

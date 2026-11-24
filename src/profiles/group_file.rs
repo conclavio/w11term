@@ -124,7 +124,9 @@ pub(super) fn validate(group: &SavedSshGroup) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{SshGroupCommandInterval, SshGroupParallelLimit, SshRosterDefaults};
+    use crate::options::{
+        SshGroupCommandInterval, SshGroupParallelLimit, SshGroupQueueExpiry, SshRosterDefaults,
+    };
     use crate::profiles::ProfileStore;
     use serde_json::json;
 
@@ -138,6 +140,7 @@ mod tests {
                 show_terminal_line: true,
                 command_limit: SshGroupParallelLimit::Eight,
                 command_interval: SshGroupCommandInterval::FiveSeconds,
+                command_queue_expiry: SshGroupQueueExpiry::OneMinute,
                 ..Default::default()
             }),
         };
@@ -154,15 +157,21 @@ mod tests {
         let defaults = &parsed["group"]["roster_defaults"];
         assert_eq!(defaults["command_limit"], "eight");
         assert_eq!(defaults["command_interval"], "5s");
+        assert_eq!(defaults["command_queue_expiry"], "1m");
         assert!(parsed.get("profiles").is_none());
 
         parsed["group"]["roster_defaults"]
             .as_object_mut()
             .unwrap()
             .remove("command_interval");
+        parsed["group"]["roster_defaults"]
+            .as_object_mut()
+            .unwrap()
+            .remove("command_queue_expiry");
         let older_definition = decode_group_file(&serde_json::to_vec(&parsed).unwrap()).unwrap();
         let defaults = older_definition.roster_defaults.unwrap();
         assert_eq!(defaults.command_interval, SshGroupCommandInterval::None);
+        assert_eq!(defaults.command_queue_expiry, SshGroupQueueExpiry::Never);
         assert_eq!(defaults.command_limit, SshGroupParallelLimit::Eight);
     }
 

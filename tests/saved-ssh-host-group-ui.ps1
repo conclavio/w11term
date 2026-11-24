@@ -233,6 +233,8 @@ try {
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands' -Choose
     Roster-Choice 'No delay' -ControlName 'Time between sends'
     Roster-Choice '2 seconds' -ControlName 'Time between sends' -Choose
+    Roster-Choice 'Never' -ControlName 'Expire unsent commands'
+    Roster-Choice '15 seconds' -ControlName 'Expire unsent commands' -Choose
     (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
     $null = Wait-CheckBox 'Stop queue on failure' On
     (Wait-CheckBox $allReady Off).Toggle()
@@ -244,7 +246,8 @@ try {
         if (!(Find-Element 'Saved roster defaults')) { return }
         $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
         $savedDefaults.order -ceq 'label' -and $savedDefaults.command_limit -ceq 'two' -and
-            $savedDefaults.command_interval -ceq '2s' -and $savedDefaults.show_last_output -and $savedDefaults.require_all_ready -and
+            $savedDefaults.command_interval -ceq '2s' -and $savedDefaults.command_queue_expiry -ceq '15s' -and
+            $savedDefaults.show_last_output -and $savedDefaults.require_all_ready -and
             $savedDefaults.stop_command_queue_on_failure
     }
     (Wait-CheckBox $showOutput On).Toggle()
@@ -258,6 +261,7 @@ try {
     Roster-Choice 'Host label'
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands'
     Roster-Choice '2 seconds' -ControlName 'Time between sends'
+    Roster-Choice '15 seconds' -ControlName 'Expire unsent commands'
     $null = Wait-CheckBox 'Stop queue on failure' On
     $null = Wait-CheckBox $allReady On
     $null = Wait-CheckBox $showOutput On

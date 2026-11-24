@@ -78,6 +78,7 @@ pub enum GroupQueueEventKind {
     CanaryApproved,
     CanaryFailed,
     StoppedOnFailure,
+    Expired,
     Cancelled,
     HostSkipped { pane_id: u64 },
 }

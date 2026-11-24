@@ -12,6 +12,7 @@ fn label(kind: GroupQueueEventKind) -> Cow<'static, str> {
             "Stopped after the canary did not confirm success".into()
         }
         GroupQueueEventKind::StoppedOnFailure => "Stopped after an unsuccessful host".into(),
+        GroupQueueEventKind::Expired => "Expired unsent commands".into(),
         GroupQueueEventKind::Cancelled => "Cancelled queued commands".into(),
         GroupQueueEventKind::HostSkipped { pane_id } => {
             format!("Skipped queued host · Pane {pane_id}").into()

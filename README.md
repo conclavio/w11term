@@ -95,11 +95,13 @@ Turn on **Require all recipients ready** to wait for every visible, checked host
 
 Set **Parallel SSH commands** to run a submission in batches. The default is **Unlimited**. With a limit, the results show queued hosts and the next host gets a slot when an earlier command settles. A queued command still needs the original verified prompt. **Cancel queued commands** withholds the remaining sends while active commands continue.
 
-With a finite limit or a send interval, turn on **Stop queue on failure** to withhold the remaining commands as soon as a host settles without a confirmed zero exit status. Active commands continue. **Save roster defaults** remembers this choice for a named group.
+With a parallel limit, send interval, or expiry, turn on **Stop queue on failure** to withhold the remaining commands as soon as a host settles without a confirmed zero exit status. Active commands continue. **Save roster defaults** remembers this choice for a named group.
 
-Use **Preview send order** to see how the checked, visible hosts will be dispatched. Finite or paced queues follow the current roster sort, with a chosen canary promoted to the first send. Unlimited sends with no delay use tab order. The preview shows unavailable hosts and the concurrency that applies after canary approval. With a finite limit or a send interval, select **Earlier** or **Later** to move a ready host in the next run. **Use roster order** clears the draft order. Sending uses that order for the submitted queue and starts the next draft in roster order.
+Use **Preview send order** to see how the checked, visible hosts will be dispatched. Queues with a parallel limit, pacing, or expiry follow the current roster sort, with a chosen canary promoted to the first send. Immediate unlimited sends use tab order. The preview shows unavailable hosts and the concurrency that applies after canary approval. For these queues, select **Earlier** or **Later** to move a ready host in the next run. **Use roster order** clears the draft order. Sending uses that order for the submitted queue and starts the next draft in roster order.
 
 Set **Time between sends** to leave a minimum gap between dispatches within each run. The first host can start immediately. Later hosts still need a free parallel slot and any required canary approval. **No delay** is the default.
+
+Set **Expire unsent commands** to cap how long the current run can wait to dispatch. The timer starts on submission and keeps running during pauses and canary approval. When it expires, queued hosts are withheld and active commands can finish. **Never** is the default.
 
 Use **Pause queue** to hold unsent commands while you inspect results. Active commands continue, and stop-on-failure still applies. **Resume queue** rechecks the original prompts before sending again. Use **Skip host** on a queued result to remove just that recipient. The remaining queue keeps its limits and canary approval requirement. Skips are counted separately from failures.
 
@@ -135,7 +137,7 @@ Choose **Copy shown roster** to copy a plain-text status report. It includes eve
 
 Use **Sort SSH roster** to display hosts in tab order, alphabetically by label, checked first, or with hosts needing attention first. The copied roster follows the display order. Command dispatch and `POLYSH_RANK` use tab order.
 
-In a named SSH group tab, choose **Save roster defaults** to remember its sort order, output previews, readiness requirement, parallel command limit, and send interval. These defaults apply when you open the group again and travel with exported group definitions.
+In a named SSH group tab, choose **Save roster defaults** to remember its sort order, output previews, readiness requirement, parallel command limit, send interval, and queue expiry. These defaults apply when you open the group again and travel with exported group definitions.
 
 When an SSH shell has exited or its connection attempts have ended, use **Reconnect** on its roster row or **Reconnect selected** for checked hosts shown by the filter. Each attempt starts a fresh SSH login in the same pane with its scrollback and selection intact. Previous submissions stay available, and the replacement shell needs a fresh prompt before it can receive another group command.
 
@@ -189,7 +191,7 @@ Text and JSON reports include the known per-host times when you open the Save di
 
 **Save results as JSON…** exports the same snapshot for scripts. The document has `schema_version: 1`, a `submission_id` scoped to its group tab, `kind` (`command` or `environment`), `label`, `command`, and an ordered `recipients` array. Each recipient has `pane_id`, `name`, `profile`, `address`, and `command`. A command submission puts the shared command at the top level. An environment export puts the commands on the recipients.
 
-- Command submissions include `dispatch_policy` with the numeric `parallel_limit` (null means unlimited), `interval_ms`, effective `stop_on_failure`, and a `canary` with its `pane_id` and `label` when selected. The canary field is null for a run without one.
+- Command submissions include `dispatch_policy` with the numeric `parallel_limit` (null means unlimited), `interval_ms`, effective `stop_on_failure`, and a `canary` with its `pane_id` and `label` when selected. The canary field is null for a run without one. With an expiry configured, `queue_expiry_ms` gives the time allowed for unsent commands.
 - When queue events exist, `queue_activity` contains an `omitted` count and an ordered `events` array with `elapsed_ms` and `kind` for each event.
 - `delivery.state` and `interrupt.state` use `pending`, `sent`, `rejected`, or `unconfirmed`. A queued command uses `queued` until dispatch and `skipped` if removed before sending. A host skip in `queue_activity` carries its `pane_id`. A rejection includes `reason`. The `interrupt` field is `null` until an interrupt is requested.
 - `execution.state` uses `awaiting_markers`, `awaiting_prompt`, `running`, `prompt_returned`, `completed`, or `unavailable`. A completed execution includes `connection_generation`, `command_id`, and `exit_code`. The exit code is `null` when the shell supplied none.

@@ -6,7 +6,7 @@ use w11term::events::{
     ShellPrompt, SshConnectionPhase,
 };
 use w11term::options::{
-    SshGroupCommandInterval, SshGroupParallelLimit, SshRosterDefaults,
+    SshGroupCommandInterval, SshGroupParallelLimit, SshGroupQueueExpiry, SshRosterDefaults,
     SshRosterOrder as RosterOrder,
 };
 use w11term::prompts::Question;
@@ -142,6 +142,7 @@ pub struct CommandOffer {
     targets: Vec<Target>,
     limit: SshGroupParallelLimit,
     interval: SshGroupCommandInterval,
+    queue_expiry: SshGroupQueueExpiry,
     stop_queue_on_failure: bool,
     canary: Option<u64>,
     notify_canary: bool,
@@ -563,6 +564,7 @@ impl HostGroup {
             .concurrency()
             .is_some()
             || self.roster_preferences.command_interval != SshGroupCommandInterval::None
+            || self.roster_preferences.command_queue_expiry != SshGroupQueueExpiry::Never
     }
 
     fn readiness_allows_send(&self, ready: usize, total: usize) -> bool {
@@ -733,6 +735,7 @@ pub enum Action {
     Send(TabId, CommandOffer),
     CommandLimit(TabId, SshGroupParallelLimit),
     CommandInterval(TabId, SshGroupCommandInterval),
+    CommandQueueExpiry(TabId, SshGroupQueueExpiry),
     CommandCanary(TabId, Option<u64>),
     NotifyCanary(TabId, bool),
     PreviewCommandOrder(TabId, bool),
@@ -1041,6 +1044,7 @@ impl TerminalApp {
             targets,
             limit,
             interval,
+            queue_expiry,
             stop_queue_on_failure,
             canary,
             notify_canary,
@@ -1059,6 +1063,7 @@ impl TerminalApp {
                 .eq(targets.iter().map(|target| target.pane))
             && page.roster_preferences.command_limit == *limit
             && page.roster_preferences.command_interval == *interval
+            && page.roster_preferences.command_queue_expiry == *queue_expiry
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
             && page.canary == *canary
@@ -1091,9 +1096,12 @@ impl TerminalApp {
             ..
         } = offer;
         let interval = Duration::from_millis(policy.interval_ms);
-        let slots = policy
-            .parallel_limit
-            .or_else(|| (canary.is_some() || !interval.is_zero()).then_some(targets.len()));
+        let deadline = policy
+            .queue_expiry_ms
+            .map(|ms| Instant::now() + Duration::from_millis(ms));
+        let slots = policy.parallel_limit.or_else(|| {
+            (canary.is_some() || !interval.is_zero() || deadline.is_some()).then_some(targets.len())
+        });
         let results = targets
             .into_iter()
             .map(|target| {
@@ -1121,6 +1129,7 @@ impl TerminalApp {
                     canary,
                     notify_canary,
                     interval,
+                    deadline,
                 )
             });
             submission.dispatch_policy = Some(policy);
@@ -1553,6 +1562,14 @@ impl TerminalApp {
                     .filter(|page| !page.recorded_send.pending())
                 {
                     page.roster_preferences.command_interval = interval;
+                }
+            }
+            Action::CommandQueueExpiry(id, expiry) => {
+                if let Some(page) = self
+                    .host_group_mut(id)
+                    .filter(|page| !page.recorded_send.pending())
+                {
+                    page.roster_preferences.command_queue_expiry = expiry;
                 }
             }
             Action::CommandCanary(id, pane) => {
@@ -2159,6 +2176,7 @@ impl TerminalApp {
                 .collect(),
             limit: page.roster_preferences.command_limit,
             interval: page.roster_preferences.command_interval,
+            queue_expiry: page.roster_preferences.command_queue_expiry,
             stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
             canary: page.canary,
             notify_canary: page.canary.is_some() && page.notify_canary,
@@ -2260,7 +2278,13 @@ impl TerminalApp {
                                 .content("Stop queue on failure"),
                             preview,
                         )),
-                    command_queue::interval_picker(id, page, ctx),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(12.0)
+                        .children((
+                            command_queue::interval_picker(id, page, ctx),
+                            command_queue::expiry_picker(id, page, ctx),
+                        )),
                     command_queue::canary_picker(id, page, &selected, ctx),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)

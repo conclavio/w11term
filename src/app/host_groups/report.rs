@@ -237,7 +237,8 @@ mod tests {
     use super::*;
     use crate::app::host_groups::{
         CommandOffer, Delivery, DeliveryStatus, GroupInterruptTarget, SshGroupCommandInterval,
-        SshGroupParallelLimit, SubmissionContent, Target, TargetState, filter::Names,
+        SshGroupParallelLimit, SshGroupQueueExpiry, SubmissionContent, Target, TargetState,
+        filter::Names,
     };
     use std::{collections::BTreeMap, time::Duration};
     use tokio::sync::{oneshot, watch};
@@ -304,6 +305,7 @@ mod tests {
                     .collect(),
                 limit: SshGroupParallelLimit::Two,
                 interval: SshGroupCommandInterval::HalfSecond,
+                queue_expiry: SshGroupQueueExpiry::FiveSeconds,
                 stop_queue_on_failure: true,
                 canary: Some(7),
                 notify_canary: false,
@@ -347,7 +349,7 @@ mod tests {
         );
         assert!(!report.contains("Cancelled queued commands"));
         assert!(report.starts_with(
-            "Submitted · show\r\nDispatch · parallel limit 2 · 500ms between sends · stop on failure · canary Host 7\r\n"
+            "Submitted · show\r\nDispatch · parallel limit 2 · 500ms between sends · queue expires after 5s · stop on failure · canary Host 7\r\n"
         ));
         assert!(report.contains(
             "Host 7 · Sent to SSH channel\r\n  Exit 17\r\n  Shell time · 1.25 s\r\n  Output\r\nfull output\r\nsecond line"
@@ -367,6 +369,7 @@ mod tests {
             serde_json::json!({
                 "parallel_limit": 2,
                 "interval_ms": 500,
+                "queue_expiry_ms": 5000,
                 "stop_on_failure": true,
                 "canary": {"pane_id": 7, "label": "Host 7"}
             })

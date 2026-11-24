@@ -487,6 +487,37 @@ impl SshGroupCommandInterval {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SshGroupQueueExpiry {
+    #[default]
+    #[serde(rename = "never")]
+    Never,
+    #[serde(rename = "5s")]
+    FiveSeconds,
+    #[serde(rename = "15s")]
+    FifteenSeconds,
+    #[serde(rename = "30s")]
+    ThirtySeconds,
+    #[serde(rename = "1m")]
+    OneMinute,
+    #[serde(rename = "5m")]
+    FiveMinutes,
+}
+
+impl SshGroupQueueExpiry {
+    pub fn duration(self) -> Option<Duration> {
+        let seconds = match self {
+            Self::Never => return None,
+            Self::FiveSeconds => 5,
+            Self::FifteenSeconds => 15,
+            Self::ThirtySeconds => 30,
+            Self::OneMinute => 60,
+            Self::FiveMinutes => 300,
+        };
+        Some(Duration::from_secs(seconds))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SshRosterDefaults {
     pub order: SshRosterOrder,
@@ -496,6 +527,7 @@ pub struct SshRosterDefaults {
     pub login_limit: SshGroupParallelLimit,
     pub command_limit: SshGroupParallelLimit,
     pub command_interval: SshGroupCommandInterval,
+    pub command_queue_expiry: SshGroupQueueExpiry,
     pub stop_command_queue_on_failure: bool,
 }
 

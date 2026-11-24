@@ -215,6 +215,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 99. **Keep dispatch settings with command results.** Show the run's effective parallel limit, pacing, stop-on-failure, and selected canary in results, reports, and recordings.
 100. **Record queue decisions.** Keep an elapsed-time timeline of pauses, resumes, canary decisions, and stops. Include the bounded timeline in results, reports, and recording summaries.
 101. **Skip an individual queued host.** Withhold a reviewed command from one unsent recipient. Keep the remaining queue and separately report the skipped host.
+102. **Expire unsent commands.** Set a deadline from submission that applies while a queue is paused or awaiting canary approval. Report the expiry and let already dispatched commands finish.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

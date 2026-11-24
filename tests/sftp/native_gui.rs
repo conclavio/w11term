@@ -1651,11 +1651,11 @@ async fn native_ssh_group_bounds_parallel_commands() {
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
             "West" => {
-                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\r"
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\r"
                     .as_slice()
             }
             "East" => {
-                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\r"
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\r"
             }
             _ => b"xrestore-promptskip-middle\r",
         };
