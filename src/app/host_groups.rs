@@ -9,6 +9,7 @@ use w11term::options::{SshGroupLoginLimit, SshRosterDefaults, SshRosterOrder as 
 use w11term::prompts::Question;
 mod address;
 mod close_ended;
+mod command_queue;
 mod compare;
 mod completion;
 mod connection_notice;
@@ -58,6 +59,7 @@ pub(super) struct HostGroup {
     login_queue: Option<(usize, Arc<Semaphore>)>,
     roster_copy_feedback: String,
     draft: String,
+    command_limit: Option<usize>,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -120,6 +122,14 @@ struct Submission {
     transcript: GroupTranscript,
     recording: output_recording::State,
     saved_recordings: output_recording::saved::State,
+    command_slots: Option<Arc<Semaphore>>,
+}
+
+#[derive(Clone)]
+pub struct CommandOffer {
+    text: Arc<str>,
+    targets: Vec<Target>,
+    limit: Option<usize>,
 }
 
 enum SubmissionContent {
@@ -359,6 +369,7 @@ struct Delivery {
 }
 
 enum DeliveryStatus {
+    Queued(command_queue::Waiting),
     Pending(Instant, oneshot::Receiver<Result<(), String>>),
     Sent,
     Rejected(String),
@@ -407,6 +418,7 @@ impl Delivery {
 
     fn description(&self) -> String {
         let state = match &self.status {
+            DeliveryStatus::Queued(_) => "Queued".into(),
             DeliveryStatus::Pending(..) => "Sending".to_owned(),
             DeliveryStatus::Sent => "Sent to SSH channel".to_owned(),
             DeliveryStatus::Rejected(reason) => format!("Not sent · {reason}"),
@@ -424,6 +436,7 @@ impl Delivery {
 
     fn interrupt_caption(&self) -> Option<Cow<'_, str>> {
         Some(match self.interrupt.as_ref()? {
+            DeliveryStatus::Queued(_) => return None,
             DeliveryStatus::Pending(..) => "Sending Ctrl+C".into(),
             DeliveryStatus::Sent => "Ctrl+C sent".into(),
             DeliveryStatus::Rejected(reason) => format!("Ctrl+C withheld · {reason}").into(),
@@ -533,10 +546,12 @@ impl HostGroup {
 
     fn sending(&self) -> bool {
         self.submissions.back().is_some_and(|submission| {
-            submission
-                .results
-                .iter()
-                .any(|item| matches!(item.status, DeliveryStatus::Pending(..)))
+            submission.results.iter().any(|item| {
+                matches!(
+                    item.status,
+                    DeliveryStatus::Queued(_) | DeliveryStatus::Pending(..)
+                )
+            })
         })
     }
 
@@ -563,6 +578,7 @@ impl HostGroup {
             transcript,
             recording: Default::default(),
             saved_recordings: Default::default(),
+            command_slots: None,
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -686,7 +702,9 @@ pub enum Action {
     SaveResults(TabId, u64, text_export::GroupReportFormat),
     ViewOutput(TabId, u64, CommandLink),
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
-    Send(TabId, Arc<str>, Vec<Target>),
+    Send(TabId, CommandOffer),
+    CommandLimit(TabId, Option<usize>),
+    CancelQueuedCommands(TabId, u64),
 }
 
 impl TerminalApp {
@@ -811,7 +829,8 @@ impl TerminalApp {
             self.tabs.active().map(|tab| &tab.page),
             Some(Page::HostGroup(_))
         ) || self.tabs.entries().iter().any(|entry| {
-            matches!(&entry.value.page, Page::HostGroup(page) if page.connection_notice.is_armed())
+            matches!(&entry.value.page, Page::HostGroup(page)
+                if page.connection_notice.is_armed() || page.submissions.iter().any(Submission::has_queue))
         }) {
             if self.host_group_timer.is_none() {
                 let sender = ctx.sender();
@@ -919,9 +938,8 @@ impl TerminalApp {
         &self,
         target: Target,
         text: Arc<str>,
-        transcript: &GroupTranscript,
+        host: w11term::events::GroupTranscriptHost,
     ) -> Delivery {
-        let host = transcript.host(target.pane);
         let receipt = host.delivery_receipt();
         let mut execution = None;
         let status = match target.state {
@@ -941,21 +959,18 @@ impl TerminalApp {
                             } else {
                                 GroupExecution::AwaitingMarkers
                             });
-                        if live
-                            .session
-                            .input
-                            .send(Command::SendGroupCommand {
-                                prompt,
-                                text,
-                                reply,
-                                execution: observe,
-                                transcript: host,
-                            })
-                            .is_ok()
-                        {
+                        let queued = live.session.input.send(Command::SendGroupCommand {
+                            prompt,
+                            text,
+                            reply,
+                            execution: observe,
+                            transcript: host,
+                        });
+                        if queued.is_ok() {
                             execution = Some(observed);
                             DeliveryStatus::Pending(Instant::now(), received)
                         } else {
+                            receipt.reject("The pane closed.");
                             DeliveryStatus::Rejected("The pane closed.".into())
                         }
                     }
@@ -975,13 +990,7 @@ impl TerminalApp {
         }
     }
 
-    fn group_send_matches(
-        &self,
-        id: TabId,
-        text: &str,
-        targets: &[Target],
-        verify_prompts: bool,
-    ) -> bool {
+    fn group_send_matches(&self, id: TabId, offer: &CommandOffer, verify_prompts: bool) -> bool {
         if self.host_group_command_target() != Some(id) {
             return false;
         }
@@ -992,6 +1001,11 @@ impl TerminalApp {
         else {
             return false;
         };
+        let CommandOffer {
+            text,
+            targets,
+            limit,
+        } = offer;
         let roster = self.host_group_targets();
         let selection = targets.iter().map(|target| target.pane).collect();
         let ready = targets
@@ -1001,7 +1015,8 @@ impl TerminalApp {
         !page.sending()
             && page.readiness_allows_send(ready, targets.len())
             && page.selected_shown(&roster) == selection
-            && page.draft == text
+            && page.command_limit == *limit
+            && page.draft == text.as_ref()
             && w11term::saved_commands::valid_command_text(text)
             && ((!verify_prompts && !page.roster_preferences.require_all_ready)
                 || targets.iter().all(|reviewed| {
@@ -1016,19 +1031,37 @@ impl TerminalApp {
     fn submit_group_command(
         &mut self,
         id: TabId,
-        text: Arc<str>,
-        targets: Vec<Target>,
+        offer: CommandOffer,
         transcript: GroupTranscript,
         recording: output_recording::State,
     ) {
+        let CommandOffer {
+            text,
+            targets,
+            limit,
+        } = offer;
         let results = targets
             .into_iter()
-            .map(|target| self.dispatch_to_host(target, text.clone(), &transcript))
+            .map(|target| {
+                let host = transcript.host(target.pane);
+                if limit.is_some() && target.state.is_ready() {
+                    Delivery {
+                        target,
+                        status: DeliveryStatus::Queued(command_queue::Waiting::new(host)),
+                        execution: None,
+                        interrupt: None,
+                    }
+                } else {
+                    self.dispatch_to_host(target, text.clone(), host)
+                }
+            })
             .collect();
         if let Some(page) = self.host_group_mut(id) {
-            page.submit(SubmissionContent::Command(text), results, transcript)
-                .recording = recording;
+            let submission = page.submit(SubmissionContent::Command(text), results, transcript);
+            submission.recording = recording;
+            submission.command_slots = limit.map(|limit| Arc::new(Semaphore::new(limit)));
         }
+        self.poll_command_queues();
     }
 
     fn interrupt_hosts(
@@ -1158,6 +1191,7 @@ impl TerminalApp {
             Action::RecordedSend(id, action) => self.handle_recorded_send(id, action, ctx),
             Action::Tick => {
                 self.poll_connection_notices();
+                self.poll_command_queues();
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
                     Some(Page::HostGroup(_))
@@ -1441,8 +1475,17 @@ impl TerminalApp {
             Action::Interrupt(id, submission, targets) => {
                 self.interrupt_hosts(id, submission, targets)
             }
-            Action::Send(id, text, targets) => {
-                if !self.group_send_matches(id, &text, &targets, false)
+            Action::CommandLimit(id, limit) => {
+                if let Some(page) = self
+                    .host_group_mut(id)
+                    .filter(|page| !page.recorded_send.pending())
+                {
+                    page.command_limit = limit;
+                }
+            }
+            Action::CancelQueuedCommands(id, run) => self.cancel_queued_commands(id, run),
+            Action::Send(id, offer) => {
+                if !self.group_send_matches(id, &offer, false)
                     || self
                         .host_group_mut(id)
                         .is_none_or(|page| page.recorded_send.pending())
@@ -1454,8 +1497,7 @@ impl TerminalApp {
                 }
                 self.submit_group_command(
                     id,
-                    text,
-                    targets,
+                    offer,
                     GroupTranscript::default(),
                     Default::default(),
                 );
@@ -1987,13 +2029,16 @@ impl TerminalApp {
             .placeholder_text("Enter one shell command")
             .text(&page.draft)
             .on_text_changed(ctx.callback(move |text| Message::HostGroup(Action::Edit(id, text))));
-        let send_recorded = recorded_send::button(id, text.clone(), selected.clone(), enabled, ctx);
+        let offer = CommandOffer {
+            text,
+            targets: selected.clone(),
+            limit: page.command_limit,
+        };
+        let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
             .style(ButtonStyle::Accent)
             .is_enabled(enabled)
-            .on_click(ctx.callback(move |_| {
-                Message::HostGroup(Action::Send(id, text.clone(), selected.clone()))
-            }))
+            .on_click(ctx.callback(move |_| Message::HostGroup(Action::Send(id, offer.clone()))))
             .content(send_label);
         let saved_commands = Button::new()
             .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenSavedCommands(id))))
@@ -2048,6 +2093,12 @@ impl TerminalApp {
                 filter,
                 StackPanel::new().grid_row(3).spacing(7.0).children((
                     entry,
+                    login_limit::command_picker(
+                        page.command_limit,
+                        !page.recorded_send.pending(),
+                        move |limit| Message::HostGroup(Action::CommandLimit(id, limit)),
+                        ctx,
+                    ),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
@@ -2280,6 +2331,7 @@ impl TerminalApp {
                             }))
                             .content(text_export::GROUP_JSON_LABEL),
                         completion::button(id, submission, ctx),
+                        command_queue::cancel_button(id, submission, ctx),
                     )),
                 retry::button(
                     id,

@@ -15,18 +15,51 @@ pub(super) fn picker(
     select: impl Fn(SshGroupLoginLimit) -> Message + 'static,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
+    limit_picker(
+        "Parallel SSH logins",
+        CHOICES.iter().position(|(_, limit)| *limit == current),
+        enabled,
+        select,
+        ctx,
+    )
+}
+
+pub(super) fn command_picker(
+    current: Option<usize>,
+    enabled: bool,
+    select: impl Fn(Option<usize>) -> Message + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    limit_picker(
+        "Parallel SSH commands",
+        CHOICES
+            .iter()
+            .position(|(_, limit)| limit.concurrency() == current),
+        enabled,
+        move |limit| select(limit.concurrency()),
+        ctx,
+    )
+}
+
+fn limit_picker(
+    label: &'static str,
+    selected: Option<usize>,
+    enabled: bool,
+    select: impl Fn(SshGroupLoginLimit) -> Message + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(8.0)
         .children((
             TextBlock::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .text("Parallel SSH logins"),
+                .text(label),
             ComboBox::new()
-                .automation_name("Parallel SSH logins")
+                .automation_name(label)
                 .is_enabled(enabled)
                 .items_source(CHOICES.map(|(label, _)| label))
-                .selected_index(CHOICES.iter().position(|(_, limit)| *limit == current))
+                .selected_index(selected)
                 .on_selection_changed(ctx.callback(move |index: Option<usize>| {
                     index
                         .and_then(|index| CHOICES.get(index))

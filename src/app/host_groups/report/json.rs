@@ -16,6 +16,7 @@ pub(super) enum Kind {
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum DeliveryState {
+    Queued,
     Pending,
     Sent,
     Rejected { reason: String },
@@ -25,6 +26,7 @@ enum DeliveryState {
 impl From<&DeliveryStatus> for DeliveryState {
     fn from(status: &DeliveryStatus) -> Self {
         match status {
+            DeliveryStatus::Queued(_) => Self::Queued,
             DeliveryStatus::Pending(..) => Self::Pending,
             DeliveryStatus::Sent => Self::Sent,
             DeliveryStatus::Rejected(reason) => Self::Rejected {

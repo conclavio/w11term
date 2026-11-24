@@ -123,6 +123,7 @@ pub struct GroupTranscriptHost {
     index: usize,
     verify_delivery: bool,
     receipt: GroupWriteReceipt,
+    _execution_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -186,6 +187,7 @@ impl GroupTranscript {
             index,
             verify_delivery: false,
             receipt,
+            _execution_slot: None,
         }
     }
 
@@ -310,6 +312,10 @@ impl Drop for GroupTranscriptHost {
 }
 
 impl GroupTranscriptHost {
+    pub fn hold_execution_slot(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self._execution_slot = Some(permit);
+    }
+
     pub fn delivery_receipt(&self) -> GroupWriteReceipt {
         self.receipt.clone()
     }

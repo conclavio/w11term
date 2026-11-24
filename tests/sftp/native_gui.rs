@@ -1525,6 +1525,88 @@ async fn native_ssh_group_notifies_when_watched_logins_settle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "bounds group execution in the background, rejects stale prompts, and cancels queued recorded commands"]
+async fn native_ssh_group_bounds_parallel_commands() {
+    use in_band_resize::Wire;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["West", "East", "North"] {
+        let (wire, mut messages) = tokio::sync::mpsc::unbounded_channel();
+        let (Source::Ssh(ssh), root, _, server) =
+            fixture_with_wire(false, 1, Arc::default(), Some(wire)).await
+        else {
+            unreachable!()
+        };
+        let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trace = inputs.clone();
+        let fixtures = state.path().to_owned();
+        let responder = tokio::spawn(async move {
+            let prompt = b"\x1b]133;A\x07fixture$ \x1b]133;B\x07";
+            let mut peer = None;
+            while let Some(wire) = messages.recv().await {
+                match wire {
+                    Wire::Shell(id, handle) => {
+                        handle.data(id, prompt.as_slice()).await.unwrap();
+                        peer = Some(handle);
+                    }
+                    Wire::Input(id, bytes) => {
+                        trace.lock().unwrap().extend_from_slice(&bytes);
+                        let input = std::str::from_utf8(&bytes).unwrap();
+                        let Some(line) = input.strip_suffix('\r') else {
+                            continue;
+                        };
+                        let handle = peer.as_ref().unwrap();
+                        handle
+                            .data(
+                                id,
+                                format!("\x1b]133;C\x07{name} started {line}\r\n").into_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        if name == "West" {
+                            let gate = fixtures.join(format!("release-{line}"));
+                            while !gate.is_file() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        let end = format!("{name} finished {line}\r\n\x1b]133;D;0\x07");
+                        handle
+                            .data(id, [end.as_bytes(), prompt.as_slice()].concat())
+                            .await
+                            .unwrap();
+                    }
+                    Wire::Window(..) => {}
+                }
+            }
+        });
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, root, server, responder, inputs));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Fleet":["West","East","North"]}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-command-limit-ui.ps1", state.path());
+    for (name, _root, server, responder, inputs) in peers {
+        let expected = match name {
+            "West" => b"roll\rkeep-first\r".as_slice(),
+            "East" => b"roll\r",
+            _ => b"x",
+        };
+        assert_eq!(inputs.lock().unwrap().as_slice(), expected, "{name}");
+        responder.abort();
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "queues limited launches, bulk reconnects and imported SSH hosts"]
 async fn native_reviewed_ssh_group_limits_parallel_logins() {
     let state = tempfile::tempdir().unwrap();

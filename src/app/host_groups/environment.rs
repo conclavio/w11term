@@ -288,7 +288,8 @@ impl TerminalApp {
             .map(|item| {
                 let command = item.command.expect("the checked command is valid");
                 commands.insert(item.target.pane, command.clone());
-                self.dispatch_to_host(item.target, command, &transcript)
+                let host = transcript.host(item.target.pane);
+                self.dispatch_to_host(item.target, command, host)
             })
             .collect();
         if let Some(page) = self.host_group_mut(id) {

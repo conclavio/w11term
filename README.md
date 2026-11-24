@@ -93,6 +93,8 @@ The command editor shows how many selected, visible hosts are ready. **Select on
 
 Turn on **Require all recipients ready** to wait for every visible, checked host to have a verified prompt before **Send** or **Send and record** becomes available. Choose when to send once they are ready. The app checks every prompt again before dispatch, and each pane reports its own delivery outcome.
 
+Set **Parallel SSH commands** to run a submission in batches. The default is **Unlimited**. With a limit, the results show queued hosts and the next host gets a slot when an earlier command settles. A queued command still needs the original verified prompt. **Cancel queued commands** withholds the remaining sends while active commands continue.
+
 Use the host-state dropdown to show ready shells, disconnected panes, or another current state. The state filter combines with the name or wildcard filter and keeps checks on hidden hosts. Sending and other actions on checked hosts use the visible selection.
 
 The live state count summarizes every host matching the name or wildcard filter. When a state filter hides hosts, the summary shows how many are visible out of the matching total.

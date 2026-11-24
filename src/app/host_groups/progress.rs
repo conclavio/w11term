@@ -19,7 +19,7 @@ impl Outcome {
         execution: Option<&GroupExecution>,
     ) -> Self {
         match status {
-            DeliveryStatus::Pending(..) => Self::Waiting,
+            DeliveryStatus::Queued(_) | DeliveryStatus::Pending(..) => Self::Waiting,
             DeliveryStatus::Rejected(_) | DeliveryStatus::Unconfirmed => Self::Attention,
             DeliveryStatus::Sent => match execution {
                 Some(GroupExecution::AwaitingMarkers | GroupExecution::AwaitingPrompt) => {

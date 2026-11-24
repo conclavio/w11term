@@ -174,10 +174,12 @@ fn ready(submission: &Submission) -> bool {
         .results
         .iter()
         .any(|delivery| matches!(delivery.status, DeliveryStatus::Sent))
-        && submission
-            .results
-            .iter()
-            .all(|delivery| !matches!(delivery.status, DeliveryStatus::Pending(..)))
+        && submission.results.iter().all(|delivery| {
+            !matches!(
+                delivery.status,
+                DeliveryStatus::Queued(_) | DeliveryStatus::Pending(..)
+            )
+        })
 }
 
 pub(super) fn names<'a>(targets: impl Iterator<Item = &'a Target>) -> BTreeMap<u64, String> {

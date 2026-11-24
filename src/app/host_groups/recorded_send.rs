@@ -3,17 +3,12 @@ use output_recording::PreparedFile;
 
 #[derive(Default)]
 pub(super) struct State {
-    plan: Option<Box<Plan>>,
+    plan: Option<Box<CommandOffer>>,
     feedback: Option<String>,
 }
 
-struct Plan {
-    text: Arc<str>,
-    targets: Vec<Target>,
-}
-
 pub enum Action {
-    Pick(Arc<str>, Vec<Target>),
+    Pick(CommandOffer),
     Picked(Result<Option<PreparedFile>, String>),
 }
 
@@ -43,18 +38,14 @@ impl State {
 
 pub(super) fn button(
     id: TabId,
-    text: Arc<str>,
-    targets: Vec<Target>,
+    offer: CommandOffer,
     enabled: bool,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     Button::new()
         .is_enabled(enabled)
         .on_click(ctx.callback(move |_| {
-            Message::HostGroup(super::Action::RecordedSend(
-                id,
-                Action::Pick(text.clone(), targets.clone()),
-            ))
+            Message::HostGroup(super::Action::RecordedSend(id, Action::Pick(offer.clone())))
         }))
         .content("Send and record…")
 }
@@ -74,19 +65,13 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         match action {
-            Action::Pick(text, targets) => self.pick_recorded_send(id, text, targets, ctx),
+            Action::Pick(offer) => self.pick_recorded_send(id, offer, ctx),
             Action::Picked(result) => self.finish_recorded_send(id, result),
         }
     }
 
-    fn pick_recorded_send(
-        &mut self,
-        id: TabId,
-        text: Arc<str>,
-        targets: Vec<Target>,
-        ctx: &ComponentContext<Self>,
-    ) {
-        if !self.group_send_matches(id, &text, &targets, true) {
+    fn pick_recorded_send(&mut self, id: TabId, offer: CommandOffer, ctx: &ComponentContext<Self>) {
+        if !self.group_send_matches(id, &offer, true) {
             return;
         }
         let owner = self.keyboard.hwnd().map(|owner| owner.0 as usize);
@@ -104,7 +89,7 @@ impl TerminalApp {
             return;
         };
         let run = page.next_submission + 1;
-        state.plan = Some(Box::new(Plan { text, targets }));
+        state.plan = Some(Box::new(offer));
         let reply = move |result| {
             Message::HostGroup(super::Action::RecordedSend(id, Action::Picked(result)))
         };
@@ -138,16 +123,16 @@ impl TerminalApp {
         else {
             return;
         };
-        let Plan { text, targets } = *plan;
-        let send = || self.group_send_matches(id, &text, &targets, true);
+        let offer = *plan;
+        let send = || self.group_send_matches(id, &offer, true);
         let transcript = GroupTranscript::default();
         let recording = match result {
             Ok(None) => return,
             Ok(Some(file)) if send() => file
                 .start(
                     &transcript,
-                    text.clone(),
-                    output_recording::names(targets.iter()),
+                    offer.text.clone(),
+                    output_recording::names(offer.targets.iter()),
                 )
                 .map_err(|error| format!("Could not start the recording · {error}")),
             Ok(Some(_)) => Err(
@@ -156,7 +141,7 @@ impl TerminalApp {
             Err(error) => Err(format!("Could not prepare the recording · {error}")),
         };
         match recording {
-            Ok(recording) => self.submit_group_command(id, text, targets, transcript, recording),
+            Ok(recording) => self.submit_group_command(id, offer, transcript, recording),
             Err(error) => {
                 if let Some(state) = self.recorded_send_state(id) {
                     state.feedback = Some(error);
