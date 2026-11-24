@@ -1,5 +1,6 @@
 use super::{
-    CommandLink, GroupExecution, GroupOutput, Submission, execution_caption, execution_time_caption,
+    CommandLink, GroupExecution, GroupOutput, Submission, dispatch_policy, execution_caption,
+    execution_time_caption,
 };
 use anyhow::{Context, Result};
 use std::{fmt::Write as _, io, sync::Arc, time::Instant};
@@ -16,6 +17,7 @@ pub(super) struct Report {
     id: u64,
     label: String,
     kind: json::Kind,
+    dispatch_policy: Option<dispatch_policy::Policy>,
     sections: Vec<Section>,
 }
 
@@ -160,12 +162,13 @@ impl Report {
             } else {
                 json::Kind::Environment
             },
+            dispatch_policy: submission.dispatch_policy.clone(),
             sections,
         }
     }
 
     fn text_title(&self) -> String {
-        format!("Submitted · {}\r\n", self.label)
+        dispatch_policy::report_heading(&self.label, self.dispatch_policy.as_ref())
     }
 
     pub(super) fn clipboard(&self, limit: usize) -> Result<String> {
@@ -228,8 +231,8 @@ impl Report {
 mod tests {
     use super::*;
     use crate::app::host_groups::{
-        Delivery, DeliveryStatus, GroupInterruptTarget, SubmissionContent, Target, TargetState,
-        filter::Names,
+        CommandOffer, Delivery, DeliveryStatus, GroupInterruptTarget, SshGroupCommandInterval,
+        SshGroupParallelLimit, SubmissionContent, Target, TargetState, filter::Names,
     };
     use std::{collections::BTreeMap, time::Duration};
     use tokio::sync::{oneshot, watch};
@@ -268,18 +271,35 @@ mod tests {
 
     #[test]
     fn report_uses_exact_history_or_labels_the_retained_preview() {
-        let submission = Submission {
+        let mut submission = Submission {
             id: 1,
             content: SubmissionContent::Command("show".into()),
             recording: Default::default(),
             saved_recordings: Default::default(),
             command_queue: None,
+            dispatch_policy: None,
             transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
                 captured(8, "missing tail".into(), true),
             ],
         };
+        submission.dispatch_policy = Some(
+            CommandOffer {
+                text: "show".into(),
+                targets: submission
+                    .results
+                    .iter()
+                    .map(|delivery| delivery.target.clone())
+                    .collect(),
+                limit: SshGroupParallelLimit::Two,
+                interval: SshGroupCommandInterval::HalfSecond,
+                stop_queue_on_failure: true,
+                canary: Some(7),
+                notify_canary: false,
+            }
+            .dispatch_policy(),
+        );
         let snapshot = Report::capture(&submission, |pane, link| {
             assert_eq!(
                 link,
@@ -298,6 +318,9 @@ mod tests {
             })
         });
         let report = snapshot.clipboard(1024).unwrap();
+        assert!(report.starts_with(
+            "Submitted · show\r\nDispatch · parallel limit 2 · 500ms between sends · stop on failure · canary Host 7\r\n"
+        ));
         assert!(report.contains(
             "Host 7 · Sent to SSH channel\r\n  Exit 17\r\n  Shell time · 1.25 s\r\n  Output\r\nfull output\r\nsecond line"
         ));
@@ -311,6 +334,15 @@ mod tests {
         assert_eq!(document["submission_id"], 1);
         assert_eq!(document["kind"], "command");
         assert_eq!(document["command"], "show");
+        assert_eq!(
+            document["dispatch_policy"],
+            serde_json::json!({
+                "parallel_limit": 2,
+                "interval_ms": 500,
+                "stop_on_failure": true,
+                "canary": {"pane_id": 7, "label": "Host 7"}
+            })
+        );
         let hosts = document["recipients"].as_array().unwrap();
         assert_eq!(hosts[0]["name"], "Host 7");
         assert_eq!(hosts[0]["address"], "ops@lab.example:2222");
@@ -334,6 +366,7 @@ mod tests {
             recording: Default::default(),
             saved_recordings: Default::default(),
             command_queue: None,
+            dispatch_policy: None,
             transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),
@@ -389,6 +422,7 @@ mod tests {
             recording: Default::default(),
             saved_recordings: Default::default(),
             command_queue: None,
+            dispatch_policy: None,
             transcript: Default::default(),
             results: vec![captured(7, String::new(), false), running, pending],
         };
@@ -396,6 +430,7 @@ mod tests {
         let document = json(&snapshot);
         assert_eq!(document["kind"], "environment");
         assert!(document["command"].is_null());
+        assert!(document.get("dispatch_policy").is_none());
         let hosts = document["recipients"].as_array().unwrap();
         assert_eq!(hosts[0]["pane_id"], 7);
         assert_eq!(hosts[0]["command"], "export POLYSH_RANK=0");

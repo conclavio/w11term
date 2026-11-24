@@ -378,7 +378,8 @@ try {
     $logReader = $null
     $recorded = [IO.File]::ReadAllText($logFile)
     $expectedLines = @(
-        "Submitted$($dot)both", "$eastName$($dot)east-accepted both",
+        "Submitted$($dot)both", "Dispatch$($dot)unlimited parallel$($dot)no delay",
+        "$eastName$($dot)east-accepted both",
         "$westName$($dot)west live first", "$westName$($dot)west while paused",
         "$westName$($dot)west while away", '[Host outcomes]',
         "$eastName$($dot)Sent to SSH channel$($dot)Exit 0",
@@ -456,6 +457,7 @@ try {
     $null = Wait-Until 'the current report contains full output and both host outcomes' {
         $report = Read-ClipboardFixture
         $report -and $report.StartsWith("Submitted${dot}while-slow") -and
+            $report.Contains("Dispatch${dot}unlimited parallel${dot}no delay") -and
             $report.Contains("$eastName${dot}Sent to SSH channel") -and
             $report.Contains("  Exit 0") -and $report.Contains("east-report-tail") -and
             $report.Contains("$westName${dot}Not sent${dot}Waiting for a fresh prompt")
@@ -505,6 +507,11 @@ try {
     if ($json.schema_version -ne 1 -or $json.submission_id -ne 3 -or $json.kind -cne 'command' -or
         $json.command -cne 'while-slow' -or $json.recipients.Count -ne 2) {
         throw 'The JSON report did not identify the entire viewed submission'
+    }
+    $policy = $json.dispatch_policy
+    if (!$policy -or $null -ne $policy.parallel_limit -or $policy.interval_ms -ne 0 -or
+        $false -ne $policy.stop_on_failure -or $null -ne $policy.canary) {
+        throw 'The JSON report did not preserve the effective dispatch policy'
     }
     $eastJson, $westJson = $json.recipients
     if ($eastJson.pane_id -ne $east -or $eastJson.profile -cne 'East' -or

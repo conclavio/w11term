@@ -136,7 +136,7 @@ impl TerminalApp {
             Ok(Some(file)) if send() => file
                 .start(
                     &transcript,
-                    offer.text.clone(),
+                    dispatch_policy::report_heading(&offer.text, Some(&offer.dispatch_policy())),
                     output_recording::names(offer.targets.iter()),
                 )
                 .map_err(|error| format!("Could not start the recording · {error}")),

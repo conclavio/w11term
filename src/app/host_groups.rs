@@ -18,6 +18,7 @@ mod compare;
 mod completion;
 mod connection_notice;
 mod disconnect;
+mod dispatch_policy;
 mod environment;
 mod filter;
 mod host_list_export;
@@ -130,6 +131,7 @@ struct Submission {
     recording: output_recording::State,
     saved_recordings: output_recording::saved::State,
     command_queue: Option<command_queue::Queue>,
+    dispatch_policy: Option<dispatch_policy::Policy>,
 }
 
 #[derive(Clone)]
@@ -599,6 +601,7 @@ impl HostGroup {
             recording: Default::default(),
             saved_recordings: Default::default(),
             command_queue: None,
+            dispatch_policy: None,
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -1073,19 +1076,18 @@ impl TerminalApp {
         transcript: GroupTranscript,
         recording: output_recording::State,
     ) {
+        let policy = offer.dispatch_policy();
         let CommandOffer {
             text,
             targets,
-            limit,
-            interval,
-            stop_queue_on_failure,
             canary,
             notify_canary,
+            ..
         } = offer;
-        let limit = limit.concurrency();
-        let interval = interval.duration();
-        let paced = !interval.is_zero();
-        let slots = limit.or_else(|| (canary.is_some() || paced).then_some(targets.len()));
+        let interval = Duration::from_millis(policy.interval_ms);
+        let slots = policy
+            .parallel_limit
+            .or_else(|| (canary.is_some() || !interval.is_zero()).then_some(targets.len()));
         let results = targets
             .into_iter()
             .map(|target| {
@@ -1109,12 +1111,13 @@ impl TerminalApp {
             submission.command_queue = slots.map(|slots| {
                 command_queue::Queue::new(
                     slots,
-                    (limit.is_some() || paced) && stop_queue_on_failure,
+                    policy.stop_on_failure,
                     canary,
                     notify_canary,
                     interval,
                 )
             });
+            submission.dispatch_policy = Some(policy);
         }
         self.poll_command_queues();
     }
@@ -2387,6 +2390,15 @@ impl TerminalApp {
                     .font_size(18.0)
                     .text(format!("Submitted · {}", submission.content.label()))
                     .text_trimming(TextTrimming::CharacterEllipsis),
+                submission
+                    .dispatch_policy
+                    .as_ref()
+                    .map_or_else(View::empty, |policy| {
+                        TextBlock::new()
+                            .text(policy.caption())
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into()
+                    }),
                 TextBlock::new()
                     .text(summary.caption())
                     .text_wrapping(TextWrapping::Wrap),

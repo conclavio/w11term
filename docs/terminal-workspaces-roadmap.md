@@ -212,6 +212,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 96. **Reorder a rollout.** Move ready recipients earlier or later in a finite queue preview. Keep the canary first, preserve roster sorting, and use the custom order for one submission.
 97. **Pace command dispatch.** Give each run an optional minimum gap between SSH sends. Enforce it alongside the parallel limit and canary gate, with a visible waiting state while the queue is running.
 98. **Save dispatch pacing for a named group.** Remember its interval across launches, copies, renames, and portable definitions. Read existing definitions without an interval as no delay.
+99. **Keep dispatch settings with command results.** Show the run's effective parallel limit, pacing, stop-on-failure, and selected canary in results, reports, and recordings.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

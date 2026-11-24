@@ -1,5 +1,7 @@
 use super::{CapturedOutput, Report};
-use crate::app::host_groups::{Delivery, DeliveryStatus, GroupExecution, SubmissionContent};
+use crate::app::host_groups::{
+    Delivery, DeliveryStatus, GroupExecution, SubmissionContent, dispatch_policy::Policy,
+};
 use serde::Serialize;
 use std::{
     io::{self, Write},
@@ -151,6 +153,8 @@ struct Document<'a> {
     kind: Kind,
     label: &'a str,
     command: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_policy: Option<&'a Policy>,
     recipients: Vec<DocumentRecipient<'a>>,
 }
 
@@ -165,6 +169,7 @@ impl Report {
             kind: self.kind,
             label: &self.label,
             command: matches!(self.kind, Kind::Command).then_some(self.label.as_str()),
+            dispatch_policy: self.dispatch_policy.as_ref(),
             recipients: self
                 .sections
                 .iter()

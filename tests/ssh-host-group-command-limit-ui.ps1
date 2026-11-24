@@ -21,6 +21,15 @@ function Click([string]$Name) {
         if ($entry -and $entry.Current.IsEnabled) { $entry }
     })
 }
+function Read-GroupRecording([string]$Path) {
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    } catch [IO.FileNotFoundException] {
+        return
+    }
+    $reader = [IO.StreamReader]::new($stream)
+    try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
 function Set-Command([string]$Command) {
     $field = Wait-Until 'group command' { Find-Element 'Group command' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Command)
@@ -122,14 +131,10 @@ try {
     New-Item -ItemType File -Path (Join-Path $State 'release-keep-first') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished keep-first')
     $log = Join-Path $State 'ssh-group-output-2.txt'
-    $null = Wait-Until 'the recording includes the cancelled delivery' {
-        try {
-            $stream = [IO.File]::Open($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-        } catch [IO.FileNotFoundException] {
-            return
-        }
-        $reader = [IO.StreamReader]::new($stream)
-        try { $reader.ReadToEnd().Contains('Cancelled before sending.') } finally { $reader.Dispose() }
+    $null = Wait-Until 'the recording includes the cancelled delivery and finite limit' {
+        $recorded = Read-GroupRecording $log
+        $recorded -and $recorded.Contains('Cancelled before sending.') -and
+            $recorded.Contains("Dispatch${dot}parallel limit 1${dot}no delay")
     }
     (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
     $null = Wait-CheckBox 'Stop queue on failure' On
@@ -223,6 +228,17 @@ try {
         Find-Element "Read${dot}$canaryNotice" $button
     }
     Click "Unread${dot}$group${dot}Run 5${dot}Group run finished${dot}2 succeeded${dot}0 need attention"
+    $canaryPolicy = "Dispatch${dot}unlimited parallel${dot}no delay${dot}canary $($labels.East)"
+    Select-GroupOption 'Time between sends' '1 second'
+    $null = Wait-Until 'changing the draft interval leaves the completed canary policy intact' {
+        Find-Element $canaryPolicy
+    }
+    Select-GroupOption 'Time between sends' 'No delay'
+    $log = Join-Path $State 'ssh-group-output-5.txt'
+    $null = Wait-Until 'the recording names the original canary' {
+        $recorded = Read-GroupRecording $log
+        $recorded -and $recorded.Contains($canaryPolicy) -and $recorded.Contains('[Group run settled]')
+    }
 
     Set-Command 'canary-fails'
     Click 'Run canary first'
@@ -274,7 +290,8 @@ try {
     Click 'Send to 2 hosts'
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished pace')
     $null = Wait-Until 'East still waits after the first command finishes' {
-        (Find-Element 'Waiting for the next send interval') -and (Find-Element "$($labels.East)${dot}Queued")
+        (Find-Element 'Waiting for the next send interval') -and (Find-Element "$($labels.East)${dot}Queued") -and
+            (Find-Element "Dispatch${dot}unlimited parallel${dot}5s between sends${dot}stop on failure")
     }
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the group is in the background during the interval' { Find-Element "Read${dot}$canaryNotice" $button }
