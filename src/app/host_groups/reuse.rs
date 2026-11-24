@@ -6,13 +6,49 @@ const FRESH: &str = "Open a new SSH pane";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Connection {
-    pane: u64,
+    pub(super) pane: u64,
     generation: u64,
 }
 
-struct Candidate {
-    connection: Connection,
+pub(super) struct Candidate {
+    pub(super) connection: Connection,
     title: String,
+}
+
+pub(super) fn connection_picker(
+    label: &str,
+    candidates: &[Candidate],
+    selected: Option<Connection>,
+    enabled: bool,
+    choose: impl Fn(Option<Connection>) -> Message + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let labels = std::iter::once(FRESH.to_owned())
+        .chain(
+            candidates
+                .iter()
+                .map(|candidate| format!("Reuse · {}", candidate.title)),
+        )
+        .collect::<Vec<_>>();
+    let choices: Vec<_> = std::iter::once(None)
+        .chain(
+            candidates
+                .iter()
+                .map(|candidate| Some(candidate.connection)),
+        )
+        .collect();
+    let selected = choices.iter().position(|&choice| choice == selected);
+    ComboBox::new()
+        .automation_name(format!("Connection for {label}"))
+        .items_source(labels)
+        .selected_index(selected)
+        .is_enabled(enabled)
+        .on_selection_changed(ctx.callback(move |choice: Option<usize>| {
+            choice
+                .and_then(|choice| choices.get(choice).copied())
+                .map_or(Message::ControlIdle, &choose)
+        }))
+        .into()
 }
 
 struct Member {
@@ -127,37 +163,18 @@ impl State {
         let reuse = offered.iter().flatten().count();
         let new = offered.len() - reuse;
         let rows = review.members.iter().enumerate().map(|(index, member)| {
-            let mut labels = vec![FRESH.to_owned()];
-            labels.extend(
-                member
-                    .candidates
-                    .iter()
-                    .map(|candidate| format!("Reuse · {}", candidate.title)),
-            );
-            let options: Vec<_> = std::iter::once(None)
-                .chain(
-                    member
-                        .candidates
-                        .iter()
-                        .map(|candidate| Some(candidate.connection)),
-                )
-                .collect();
-            let selected = options.iter().position(|&choice| choice == member.choice);
             KeyedView::new(
                 member.profile.as_str(),
                 StackPanel::new().spacing(4.0).children((
                     TextBlock::new().text(&member.profile),
-                    ComboBox::new()
-                        .automation_name(format!("Connection for {}", member.profile))
-                        .items_source(labels)
-                        .selected_index(selected)
-                        .on_selection_changed(ctx.callback(move |choice: Option<usize>| {
-                            choice
-                                .and_then(|choice| options.get(choice).copied())
-                                .map_or(Message::ControlIdle, |choice| {
-                                    action(Change::Choose(index, choice))
-                                })
-                        })),
+                    connection_picker(
+                        &member.profile,
+                        &member.candidates,
+                        member.choice,
+                        true,
+                        move |choice| action(Change::Choose(index, choice)),
+                        ctx,
+                    ),
                 )),
             )
         });
@@ -326,18 +343,7 @@ impl TerminalApp {
             .zip(options)
             .enumerate()
             .map(|(index, (profile, options))| {
-                let candidates = targets
-                    .iter()
-                    .filter_map(|target| {
-                        (target.profile.as_deref() == Some(profile.as_str())).then_some(())?;
-                        let connection =
-                            self.group_reuse_connection(target.pane, &profile, &options)?;
-                        Some(Candidate {
-                            connection,
-                            title: target.name.clone(),
-                        })
-                    })
-                    .collect();
+                let candidates = self.group_reuse_candidates(&targets, Some(&profile), &options);
                 let mut member = Member::new(profile, options, candidates);
                 if let Some(previous) = previous {
                     member.choice = previous.members[index]
@@ -354,16 +360,36 @@ impl TerminalApp {
         })
     }
 
-    fn group_reuse_connection(
+    pub(super) fn group_reuse_candidates(
+        &self,
+        targets: &[Target],
+        profile: Option<&str>,
+        options: &SshOptions,
+    ) -> Vec<Candidate> {
+        targets
+            .iter()
+            .filter_map(|target| {
+                if target.profile.as_deref() != profile {
+                    return None;
+                }
+                Some(Candidate {
+                    connection: self.group_reuse_connection(target.pane, profile, options)?,
+                    title: target.name.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn group_reuse_connection(
         &self,
         pane: u64,
-        profile: &str,
+        profile: Option<&str>,
         expected: &SshOptions,
     ) -> Option<Connection> {
         let Page::Terminal(live) = &self.tabs.get(self.tab_for_pane(pane)?)?.page else {
             return None;
         };
-        if live.profile_name.as_deref() != Some(profile)
+        if live.profile_name.as_deref() != profile
             || !matches!(&live.source, Source::Ssh(options) if options == expected)
             || !live.session.is_direct_ssh_shell()
             || live.read_only.get()
@@ -392,7 +418,7 @@ impl TerminalApp {
         let profiles = review.profiles();
         let (catalog, current) = self.resolve_saved_host_group(&name, &profiles)?;
         review.validate(&current, |approved, profile, expected| {
-            self.group_reuse_connection(approved.pane, profile, expected) == Some(approved)
+            self.group_reuse_connection(approved.pane, Some(profile), expected) == Some(approved)
         })?;
         let mut reused = BTreeSet::new();
         let mut fresh = Vec::new();
