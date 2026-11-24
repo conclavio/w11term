@@ -415,6 +415,8 @@ fn default_profiles_path() -> PathBuf {
     local
 }
 
+pub type SshRecipientSets = BTreeMap<String, Vec<String>>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profiles {
     pub profiles: BTreeMap<String, SshOptions>,
@@ -423,6 +425,7 @@ pub struct Profiles {
     pub profile_order: Vec<String>,
     pub startup_profile: Option<String>,
     pub ssh_host_groups: BTreeMap<String, Vec<String>>,
+    pub ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
     pub(crate) has_explicit_order: bool,
 }
 
@@ -435,6 +438,7 @@ impl Default for Profiles {
             local,
             startup_profile: None,
             ssh_host_groups: BTreeMap::new(),
+            ssh_recipient_sets: BTreeMap::new(),
             has_explicit_order: false,
         }
     }
@@ -521,6 +525,8 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         startup_profile: Option<String>,
         #[serde(default)]
         ssh_host_groups: BTreeMap<String, Vec<String>>,
+        #[serde(default)]
+        ssh_recipient_sets: BTreeMap<String, SshRecipientSets>,
     }
     let document: Document =
         serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
@@ -533,6 +539,7 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
         has_explicit_order: explicit_order.is_some(),
         startup_profile: document.startup_profile,
         ssh_host_groups: document.ssh_host_groups,
+        ssh_recipient_sets: document.ssh_recipient_sets,
         ..Profiles::default()
     };
     for (name, value) in document.profiles {

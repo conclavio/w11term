@@ -69,6 +69,12 @@ impl State {
         self.origin.is_some()
     }
 
+    pub(in crate::app::host_groups) fn origin(&self) -> Option<(&str, &[String])> {
+        self.origin
+            .as_ref()
+            .map(|origin| (origin.name.as_str(), origin.members.as_slice()))
+    }
+
     pub(super) fn is_open(&self) -> bool {
         self.review.is_some()
     }
