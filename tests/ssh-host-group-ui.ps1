@@ -111,6 +111,9 @@ function Select-ComboValue([string]$ControlName, [string]$Name) {
 function Set-ResultFilter([string]$Name) {
     Select-ComboValue 'Filter submission results' $Name
 }
+function Roster-Snapshot {
+    (Control @('get-ssh-group-roster','--window',"$groupWindow",'--tab',"$groupTab")).roster
+}
 function Set-RecipientSearch([string]$Query) {
     $field = Wait-Until 'result recipient search' { Find-Element 'Search result recipients' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
@@ -191,11 +194,24 @@ try {
     Run-Palette 'SSH host group'
     Pane-Status $east "Connected${dot}Ready"
     Pane-Status $west 'Connecting'
+    $owner = (Control @('list-ssh-groups')).windows | Where-Object { $_.groups.label -ccontains 'SSH host group' }
+    $groupWindow = $owner.window_id
+    $groupTab = ($owner.groups | Where-Object label -ceq 'SSH host group').tab_id
+    if (!$groupWindow -or !$groupTab) { throw 'The CLI did not list the active SSH group' }
     $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Connecting'
     $null = Wait-Until 'the connecting filter isolates West during its shell request' {
         (Find-Element "Focus pane $west" $button) -and !(Find-Element "Focus pane $east" $button) -and
             !(Find-Element "Reconnect SSH pane $west" $button)
+    }
+    $roster = Roster-Snapshot
+    $eastRoster = $roster.hosts | Where-Object pane_id -eq $east
+    $westRoster = $roster.hosts | Where-Object pane_id -eq $west
+    if ($roster.scope -cne 'window' -or $roster.filter.state -cne 'connecting' -or $roster.counts.hosts -ne 2 -or
+        $roster.counts.shown -ne 1 -or $eastRoster.shown -or $eastRoster.prompt_verification -cne 'shell_markers' -or
+        !$westRoster.shown -or $westRoster.connected -or $westRoster.state -cne 'connecting' -or
+        $null -ne ($roster.hosts | Where-Object pane_id -eq $local)) {
+        throw 'The CLI roster did not preserve the live filter and SSH pane states'
     }
     Remove-Item -LiteralPath $westShellGate
     Select-ComboValue $hostStateFilter 'All host states'
@@ -762,7 +778,17 @@ try {
     Click 'Next submission'
     $null = Wait-Until 'later submission restored' { Find-Element "Submitted${dot}while-slow" }
     Click 'Attention inbox, 1 unread'
-    Click "Unread${dot}SSH host group${dot}Run 2${dot}Group run finished${dot}1 succeeded${dot}1 needs attention"
+    $runNotice = "Unread${dot}SSH host group${dot}Run 2${dot}Group run finished${dot}1 succeeded${dot}1 needs attention"
+    $null = Wait-Until 'the attention view is active before reading the background roster' {
+        Find-Element $runNotice $button
+    }
+    $beforeRosterFocus = [FixtureMessages]::GetForegroundWindow()
+    $backgroundRoster = Roster-Snapshot
+    if ($backgroundRoster.counts.hosts -ne 2 -or [FixtureMessages]::GetForegroundWindow() -ne $beforeRosterFocus -or
+        !(Find-Element $runNotice $button)) {
+        throw 'Reading the background group roster changed focus or lost its hosts'
+    }
+    Click $runNotice
     $null = Wait-Until 'the alert opens its original run and marks the inbox read' {
         (Find-Element "Submitted${dot}both") -and (Find-Element 'Attention inbox, 0 unread' $button)
     }
@@ -820,6 +846,15 @@ try {
             !(Find-Element "Focus pane $west" $button) -and
             (Find-Element '1 selected host is hidden by the filter.') -and
             (Find-Element "Showing 1 of 2 matching hosts${dot}Ready (1)${dot}Alternate screen (1)")
+    }
+    $roster = Roster-Snapshot
+    if ($roster.schema_version -ne 1 -or $roster.label -cne 'SSH host group' -or
+        $roster.filter.state -cne 'ready' -or $roster.sort -cne 'attention-first' -or $roster.counts.checked -ne 2 -or
+        $roster.counts.checked_shown -ne 1 -or $roster.counts.ready_checked_shown -ne 1 -or !$roster.selection_ready -or
+        $roster.hosts[0].pane_id -ne $west -or $roster.hosts[0].shown -or !$roster.hosts[0].checked -or
+        $roster.hosts[0].state -cne 'alternate' -or $roster.hosts[1].pane_id -ne $east -or !$roster.hosts[1].shown -or
+        $roster.hosts[1].profile -cne 'East' -or $roster.hosts[1].address -cne "test@127.0.0.1:$($profileData.East.port)") {
+        throw 'The CLI roster lost the checked hidden host, display order, or readiness'
     }
     Select-ComboValue $hostStateFilter 'Alternate screen'
     Run-Palette 'Copy shown SSH roster'

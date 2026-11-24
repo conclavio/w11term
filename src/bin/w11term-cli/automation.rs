@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use w11term::control::{CommandStatus, Request};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -77,8 +77,15 @@ pub fn parse(
                 connection_generation = Some(value(&mut args)?.parse()?)
             }
             "--window" | "--tab" | "--run"
-                if matches!(verb, "get-ssh-group-run" | "wait-ssh-group-run") =>
+                if matches!(
+                    verb,
+                    "get-ssh-group-roster" | "get-ssh-group-run" | "wait-ssh-group-run"
+                ) =>
             {
+                ensure!(
+                    verb != "get-ssh-group-roster" || arg != "--run",
+                    "{verb} does not accept --run"
+                );
                 let id: u64 = value(&mut args)?
                     .parse()
                     .with_context(|| format!("{arg} requires a positive integer"))?;
@@ -171,10 +178,13 @@ pub fn parse(
             ensure!(pane.is_none(), "list-ssh-groups does not accept --pane");
             Request::ListSshGroups
         }
-        "get-ssh-group-run" | "wait-ssh-group-run" => {
+        "get-ssh-group-roster" | "get-ssh-group-run" | "wait-ssh-group-run" => {
             ensure!(pane.is_none(), "{verb} does not accept --pane");
             let window_id = window_id.context("--window is required (from list-ssh-groups)")?;
             let tab_id = tab_id.context("--tab is required (from list-ssh-groups)")?;
+            if verb == "get-ssh-group-roster" {
+                return Ok((pid, Request::GetSshGroupRoster { window_id, tab_id }));
+            }
             let run_id = run_id.context("--run is required (from list-ssh-groups)")?;
             if verb == "wait-ssh-group-run" {
                 let timeout_seconds = timeout.unwrap_or(30);

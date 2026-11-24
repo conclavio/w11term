@@ -171,13 +171,35 @@ output. Keep the pane ID, command ID and connection generation together. A looku
 fails if its record has been evicted or its connection generation has changed.
 After a reconnect, list again to see the new session’s history.
 
-## Retained SSH group runs
+<a id="retained-ssh-group-runs"></a>
+
+## SSH group rosters and runs
 
 `list-ssh-groups` lists live SSH group tabs across the selected process. The
 reply includes `pid` and a `windows` array with `window_id` and `groups` for
 each window. A group has `tab_id`, `label`, and `runs` in submission order,
 oldest first. A tab retains the eight newest runs. A group can have an empty
 run list.
+
+`get-ssh-group-roster --window ID --tab ID` returns the current roster for
+those IDs. The reply includes `window_id`, `tab_id`, and a `roster` object
+with `schema_version: 1`, `label`, `scope` (`group` or `window`), `sort`,
+`filter`, and `hosts` in roster sort order. The filter reports its `query`,
+`wildcards`, `state`, and any pattern `error`. Each in-scope host has
+`pane_id`, `name`, `profile`, `address`, `state`, `connected`, `checked`,
+and `shown`. A checked host hidden by the current filter stays in the reply
+with `shown: false`. Ready hosts include `prompt_verification` as
+`shell_markers` or `pattern`. Reconnecting hosts can carry `reconnect_attempt`.
+Host states are `ready`, `waiting`, `unverified`, `queued`, `connecting`,
+`reconnecting`, `disconnected`, `failed`, `stopped`, `host_key`,
+`authentication`, `read_only`, and `alternate`. The state filter also
+supports `all`.
+
+The `counts` object includes `hosts`, `shown`, `checked`, `checked_shown`,
+and `ready_checked_shown`. `selection_ready` reports whether the shown
+checked hosts meet the group's `require_all_ready` prompt rule. The Send
+button also depends on the current draft and review.
+The query leaves the group's selection and window focus in place.
 
 Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `recipient_count`, `settled_count`, and `outcomes` counts for `waiting`,
@@ -208,6 +230,7 @@ leaves the original run in progress.
 
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
+w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 ```
@@ -216,6 +239,7 @@ Direct pipe clients use these JSON requests.
 
 ```json
 {"verb":"list-ssh-groups"}
+{"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 ```

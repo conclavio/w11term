@@ -5381,6 +5381,11 @@ impl Component for TerminalApp {
                     let _ = reply.send(Ok(self.control_ssh_groups()));
                 }
             }
+            Message::Control(w11term::control::UiRequest::GetSshGroupRoster { tab_id, reply }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_ssh_group_roster(tab_id));
+                }
+            }
             Message::Control(w11term::control::UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,

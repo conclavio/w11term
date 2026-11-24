@@ -88,6 +88,10 @@ pub enum Request {
     },
     List,
     ListSshGroups,
+    GetSshGroupRoster {
+        window_id: WindowId,
+        tab_id: u64,
+    },
     GetSshGroupRun {
         window_id: WindowId,
         tab_id: u64,
@@ -159,6 +163,10 @@ pub enum UiRequest {
     ListSshGroups {
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    GetSshGroupRoster {
+        tab_id: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     GetSshGroupRun {
         tab_id: u64,
         run_id: u64,
@@ -185,6 +193,7 @@ impl UiRequest {
             Self::Open { reply, .. }
             | Self::Resize { reply, .. }
             | Self::ListSshGroups { reply }
+            | Self::GetSshGroupRoster { reply, .. }
             | Self::GetSshGroupRun { reply, .. } => reply,
         };
         let _ = reply.send(Err(message.into()));
@@ -444,6 +453,9 @@ impl Registry {
             Request::WorkspaceIdentity => Ok(json!(self.legacy_workspace())),
             Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
             Request::ListSshGroups => self.list_ssh_groups().await,
+            Request::GetSshGroupRoster { window_id, tab_id } => {
+                self.get_ssh_group_roster(window_id, tab_id).await
+            }
             Request::GetSshGroupRun {
                 window_id,
                 tab_id,

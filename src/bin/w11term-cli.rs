@@ -24,9 +24,22 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
                 .with_context(|| format!("{arg} requires a value"))
         };
         match arg.as_str() {
-            "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
-            | "save-text" | "restart" | "list-commands" | "get-command" | "inspect"
-            | "playback" | "list-ssh-groups" | "get-ssh-group-run" | "wait-ssh-group-run"
+            "find-text"
+            | "wait-for-text"
+            | "events"
+            | "open"
+            | "resize"
+            | "record"
+            | "save-text"
+            | "restart"
+            | "list-commands"
+            | "get-command"
+            | "inspect"
+            | "playback"
+            | "list-ssh-groups"
+            | "get-ssh-group-roster"
+            | "get-ssh-group-run"
+            | "wait-ssh-group-run"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -169,6 +182,16 @@ mod tests {
             (Some(7), Request::ListSshGroups)
         ));
         assert!(matches!(
+            parse_line("get-ssh-group-roster --window 11 --tab 12 --pid 7").unwrap(),
+            (
+                Some(7),
+                Request::GetSshGroupRoster {
+                    window_id: 11,
+                    tab_id: 12
+                }
+            )
+        ));
+        assert!(matches!(
             parse_line("wait-ssh-group-run --window 11 --tab 12 --run 4 --timeout 7").unwrap(),
             (
                 None,
@@ -204,6 +227,9 @@ mod tests {
         for invalid in [
             "--pane 7 list-ssh-groups",
             "list-ssh-groups --window 2",
+            "get-ssh-group-roster --tab 2",
+            "get-ssh-group-roster --window 2 --tab 3 --run 1",
+            "get-ssh-group-roster --window 2 --tab 3 --pane 1",
             "get-ssh-group-run --window 2 --tab 3",
             "get-ssh-group-run --window 2 --tab 0 --run 4",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --run 5",

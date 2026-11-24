@@ -230,7 +230,8 @@ enum TargetState {
     Matched(PromptToken),
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RosterStatus {
     #[default]
     All,

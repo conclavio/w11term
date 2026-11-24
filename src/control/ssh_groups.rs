@@ -2,6 +2,14 @@ use super::*;
 use tokio::time::Instant;
 
 impl Registry {
+    pub(super) async fn get_ssh_group_roster(&self, window: WindowId, tab: u64) -> Result<Value> {
+        let deadline = Instant::now() + TIMEOUT;
+        let (reply, response) = oneshot::channel();
+        self.window_ui(window)?(UiRequest::GetSshGroupRoster { tab_id: tab, reply });
+        let roster = receive(window, response, deadline).await?;
+        Ok(json!({ "window_id": window, "tab_id": tab, "roster": roster }))
+    }
+
     pub(super) async fn list_ssh_groups(&self) -> Result<Value> {
         let deadline = Instant::now() + TIMEOUT;
         let responses: Vec<_> = self
@@ -124,6 +132,12 @@ mod tests {
                     .send(Ok(json!({ "summary": { "run_id": run_id } })))
                     .unwrap();
             }
+            UiRequest::GetSshGroupRoster { tab_id, reply } => {
+                assert_eq!(tab_id, 9);
+                reply
+                    .send(Ok(json!({ "hosts": [{ "pane_id": 7 }] })))
+                    .unwrap();
+            }
             _ => panic!("unexpected first-window request"),
         });
         second.set_ui(|request| match request {
@@ -142,6 +156,10 @@ mod tests {
         assert_eq!(
             lookup,
             json!({ "window_id": 3, "tab_id": 9, "run": { "summary": { "run_id": 2 } } })
+        );
+        assert_eq!(
+            second.get_ssh_group_roster(3, 9).await.unwrap(),
+            json!({ "window_id": 3, "tab_id": 9, "roster": { "hosts": [{ "pane_id": 7 }] } })
         );
         first.unregister().unwrap();
         assert_eq!(

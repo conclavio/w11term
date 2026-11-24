@@ -28,6 +28,21 @@ impl Submission {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn control_ssh_group_roster(&self, tab: TabId) -> Result<Value, String> {
+        let Some(AppTab {
+            label,
+            page: Page::HostGroup(page),
+        }) = self.tabs.get(tab)
+        else {
+            return Err(format!("unknown SSH group tab {tab} in this window"));
+        };
+        Ok(roster_report::roster_json(
+            label,
+            page,
+            &self.host_group_targets(),
+        ))
+    }
+
     fn ssh_group_tab_ids(&self, include: impl Fn(&HostGroup) -> bool) -> Vec<TabId> {
         self.tabs
             .entries()
