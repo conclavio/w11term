@@ -260,6 +260,25 @@ try {
     $null = Wait-Until 'approval still rechecks the queued prompt' {
         Find-Element "$($labels.West)${dot}Not sent${dot}The verified prompt changed before the command was sent."
     }
+
+    $null = Control @('send-text','--pane',"$($panes.West)",'--no-paste','restore-prompt')
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West restored prompt')
+    Select-GroupOption 'Canary host' 'No canary'
+    Select-GroupOption 'Time between sends' '5 seconds'
+    Set-Command 'pace'
+    Click 'Preview send order'
+    $null = Wait-Until 'the unlimited queue shows its dispatch interval and order' {
+        (Find-Element "Dispatch interval${dot}5s") -and
+            (Find-Element "1. $($labels.West)") -and (Find-Element "2. $($labels.East)")
+    }
+    Click 'Send to 2 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished pace')
+    $null = Wait-Until 'East still waits after the first command finishes' {
+        (Find-Element 'Waiting for the next send interval') -and (Find-Element "$($labels.East)${dot}Queued")
+    }
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the group is in the background during the interval' { Find-Element "Read${dot}$canaryNotice" $button }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','15','East finished pace')
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

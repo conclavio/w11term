@@ -64,6 +64,7 @@ pub(super) struct HostGroup {
     notify_canary: bool,
     preview_command_order: bool,
     manual_command_order: Vec<u64>,
+    command_interval: Duration,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -134,6 +135,7 @@ pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
     limit: SshGroupParallelLimit,
+    interval: Duration,
     stop_queue_on_failure: bool,
     canary: Option<u64>,
     notify_canary: bool,
@@ -547,6 +549,14 @@ impl HostGroup {
             .collect()
     }
 
+    fn orders_commands(&self) -> bool {
+        self.roster_preferences
+            .command_limit
+            .concurrency()
+            .is_some()
+            || !self.command_interval.is_zero()
+    }
+
     fn readiness_allows_send(&self, ready: usize, total: usize) -> bool {
         ready > 0 && (!self.roster_preferences.require_all_ready || ready == total)
     }
@@ -712,6 +722,7 @@ pub enum Action {
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, CommandOffer),
     CommandLimit(TabId, SshGroupParallelLimit),
+    CommandInterval(TabId, Duration),
     CommandCanary(TabId, Option<u64>),
     NotifyCanary(TabId, bool),
     PreviewCommandOrder(TabId, bool),
@@ -1018,6 +1029,7 @@ impl TerminalApp {
             text,
             targets,
             limit,
+            interval,
             stop_queue_on_failure,
             canary,
             notify_canary,
@@ -1035,6 +1047,7 @@ impl TerminalApp {
                 .map(|target| target.pane)
                 .eq(targets.iter().map(|target| target.pane))
             && page.roster_preferences.command_limit == *limit
+            && page.command_interval == *interval
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
             && page.canary == *canary
@@ -1062,12 +1075,14 @@ impl TerminalApp {
             text,
             targets,
             limit,
+            interval,
             stop_queue_on_failure,
             canary,
             notify_canary,
         } = offer;
         let limit = limit.concurrency();
-        let slots = limit.or_else(|| canary.map(|_| targets.len()));
+        let paced = !interval.is_zero();
+        let slots = limit.or_else(|| (canary.is_some() || paced).then_some(targets.len()));
         let results = targets
             .into_iter()
             .map(|target| {
@@ -1091,9 +1106,10 @@ impl TerminalApp {
             submission.command_queue = slots.map(|slots| {
                 command_queue::Queue::new(
                     slots,
-                    limit.is_some() && stop_queue_on_failure,
+                    (limit.is_some() || paced) && stop_queue_on_failure,
                     canary,
                     notify_canary,
+                    interval,
                 )
             });
         }
@@ -1519,6 +1535,14 @@ impl TerminalApp {
                     page.roster_preferences.command_limit = limit;
                 }
             }
+            Action::CommandInterval(id, interval) => {
+                if let Some(page) = self
+                    .host_group_mut(id)
+                    .filter(|page| !page.recorded_send.pending())
+                {
+                    page.command_interval = interval;
+                }
+            }
             Action::CommandCanary(id, pane) => {
                 if self.host_group_command_target() == Some(id)
                     && let Some(page) = self
@@ -1547,14 +1571,10 @@ impl TerminalApp {
             Action::EditCommandOrder(id, edit) => self.edit_command_order(id, edit),
             Action::CommandQueue(id, run, action) => self.handle_command_queue(id, run, action),
             Action::StopCommandQueueOnFailure(id, stop) => {
-                if let Some(page) = self.host_group_mut(id).filter(|page| {
-                    !page.recorded_send.pending()
-                        && page
-                            .roster_preferences
-                            .command_limit
-                            .concurrency()
-                            .is_some()
-                }) {
+                if let Some(page) = self
+                    .host_group_mut(id)
+                    .filter(|page| !page.recorded_send.pending() && page.orders_commands())
+                {
                     page.roster_preferences.stop_command_queue_on_failure = stop;
                 }
             }
@@ -2118,6 +2138,7 @@ impl TerminalApp {
                 .cloned()
                 .collect(),
             limit: page.roster_preferences.command_limit,
+            interval: page.command_interval,
             stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
             canary: page.canary,
             notify_canary: page.canary.is_some() && page.notify_canary,
@@ -2212,20 +2233,14 @@ impl TerminalApp {
                             CheckBox::new()
                                 .automation_name("Stop queue on failure")
                                 .is_checked(page.roster_preferences.stop_command_queue_on_failure)
-                                .is_enabled(
-                                    !page.recorded_send.pending()
-                                        && page
-                                            .roster_preferences
-                                            .command_limit
-                                            .concurrency()
-                                            .is_some(),
-                                )
+                                .is_enabled(!page.recorded_send.pending() && page.orders_commands())
                                 .on_is_checked_changed(ctx.callback(move |stop| {
                                     Message::HostGroup(Action::StopCommandQueueOnFailure(id, stop))
                                 }))
                                 .content("Stop queue on failure"),
                             preview,
                         )),
+                    command_queue::interval_picker(id, page, ctx),
                     command_queue::canary_picker(id, page, &selected, ctx),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)

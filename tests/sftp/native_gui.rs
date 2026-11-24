@@ -1525,13 +1525,14 @@ async fn native_ssh_group_notifies_when_watched_logins_settle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "verifies manual SSH rollout order, queue controls, canary approval, and notices"]
+#[ignore = "verifies manual and paced SSH rollouts, queue controls, canary approval, and notices"]
 async fn native_ssh_group_bounds_parallel_commands() {
     use in_band_resize::Wire;
 
     let state = tempfile::tempdir().unwrap();
     let mut peers = Vec::new();
     let mut profiles = serde_json::Map::new();
+    let paced_arrivals = Arc::new(std::sync::Mutex::new(HashMap::new()));
     for name in ["West", "East", "North"] {
         let (wire, mut messages) = tokio::sync::mpsc::unbounded_channel();
         let (Source::Ssh(ssh), root, _, server) =
@@ -1542,6 +1543,7 @@ async fn native_ssh_group_bounds_parallel_commands() {
         let inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
         let trace = inputs.clone();
         let fixtures = state.path().to_owned();
+        let arrivals = paced_arrivals.clone();
         let responder = tokio::spawn(async move {
             let prompt = b"\x1b]133;A\x07fixture$ \x1b]133;B\x07";
             let mut peer = None;
@@ -1554,9 +1556,26 @@ async fn native_ssh_group_bounds_parallel_commands() {
                     Wire::Input(id, bytes) => {
                         trace.lock().unwrap().extend_from_slice(&bytes);
                         let input = std::str::from_utf8(&bytes).unwrap();
+                        if name == "West" && input == "restore-prompt" {
+                            peer.as_ref()
+                                .unwrap()
+                                .data(
+                                    id,
+                                    [b"\r\nWest restored prompt\r\n".as_slice(), prompt].concat(),
+                                )
+                                .await
+                                .unwrap();
+                            continue;
+                        }
                         let Some(line) = input.strip_suffix('\r') else {
                             continue;
                         };
+                        if line == "pace" {
+                            arrivals
+                                .lock()
+                                .unwrap()
+                                .insert(name, std::time::Instant::now());
+                        }
                         if name == "East" && line == "inspect" {
                             assert!(
                                 fixtures.join("resume-inspect").is_file(),
@@ -1579,7 +1598,7 @@ async fn native_ssh_group_bounds_parallel_commands() {
                             )
                             .await
                             .unwrap();
-                        if name == "West" {
+                        if name == "West" && line != "pace" {
                             let gate = fixtures.join(format!("release-{line}"));
                             while !gate.is_file() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1620,10 +1639,23 @@ async fn native_ssh_group_bounds_parallel_commands() {
     )
     .unwrap();
     drive_gui("ssh-host-group-command-limit-ui.ps1", state.path());
+    let arrivals = paced_arrivals.lock().unwrap();
+    let elapsed = arrivals["East"].saturating_duration_since(arrivals["West"]);
+    // Allow for SSH packet delivery jitter. The queue deadline itself has an exact unit test.
+    assert!(
+        elapsed >= Duration::from_millis(4750),
+        "paced sends arrived {elapsed:?} apart"
+    );
+    drop(arrivals);
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
-            "West" => b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rx".as_slice(),
-            "East" => b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\r",
+            "West" => {
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\r"
+                    .as_slice()
+            }
+            "East" => {
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\r"
+            }
             _ => b"x",
         };
         assert_eq!(inputs.lock().unwrap().as_slice(), expected, "{name}");

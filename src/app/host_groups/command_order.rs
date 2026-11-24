@@ -7,13 +7,7 @@ pub enum Edit {
 
 fn sort_targets(page: &HostGroup, targets: &mut [&Target]) {
     page.sort_shown(targets);
-    if page.manual_command_order.is_empty()
-        || page
-            .roster_preferences
-            .command_limit
-            .concurrency()
-            .is_none()
-    {
+    if page.manual_command_order.is_empty() || !page.orders_commands() {
         return;
     }
     let ranks: BTreeMap<_, _> = page
@@ -44,12 +38,7 @@ pub(super) fn recipients<'a>(
 }
 
 fn swap_recipients(page: &mut HostGroup, roster: &[Target], earlier: u64, later: u64) {
-    if page
-        .roster_preferences
-        .command_limit
-        .concurrency()
-        .is_none()
-    {
+    if !page.orders_commands() {
         return;
     }
     let visible: Vec<_> = recipients(page, page.shown(roster))
@@ -121,6 +110,7 @@ pub(super) fn preview(
 ) -> View {
     let limit = offer.limit.concurrency();
     let canary = offer.canary.is_some();
+    let ordered = page.orders_commands();
     let summary = match (canary, limit) {
         (true, Some(1)) => "After approval, send to one host at a time.".into(),
         (true, Some(limit)) => format!("After approval, send to up to {limit} hosts at a time."),
@@ -134,7 +124,7 @@ pub(super) fn preview(
         Some("Check the hosts to include in the send order.")
     } else if unavailable && page.roster_preferences.require_all_ready {
         Some("Waiting for all checked hosts to be ready.")
-    } else if unavailable && limit.is_some() && offer.stop_queue_on_failure {
+    } else if unavailable && ordered && offer.stop_queue_on_failure {
         Some("An unavailable host would stop this queue before it starts.")
     } else {
         None
@@ -153,7 +143,7 @@ pub(super) fn preview(
             format!("Unavailable · {name} · {}", target.state.label())
         } else if Some(target.pane) == offer.canary {
             format!("Canary first · {name}")
-        } else if limit.is_some() {
+        } else if ordered {
             position += 1;
             format!("{position}. {name}")
         } else {
@@ -163,7 +153,7 @@ pub(super) fn preview(
             .vertical_alignment(VerticalAlignment::Center)
             .text(text)
             .text_wrapping(TextWrapping::Wrap);
-        let row = if limit.is_some() && movable_panes.len() > 1 && movable(target, offer.canary) {
+        let row = if ordered && movable_panes.len() > 1 && movable(target, offer.canary) {
             let pane = target.pane;
             let previous = position
                 .checked_sub(2)
@@ -229,6 +219,13 @@ pub(super) fn preview(
         TextBlock::new()
             .text(summary)
             .text_wrapping(TextWrapping::Wrap),
+        if offer.interval.is_zero() {
+            View::empty()
+        } else {
+            TextBlock::new()
+                .text(format!("Dispatch interval · {:?}", offer.interval))
+                .into()
+        },
         hold.map_or_else(View::empty, |text| {
             TextBlock::new()
                 .text(text)

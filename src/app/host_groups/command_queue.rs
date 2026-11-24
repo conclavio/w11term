@@ -3,6 +3,14 @@ use w11term::events::GroupTranscriptHost;
 
 const FAILED_RESULT: &str = "Queue stopped after an unsuccessful host.";
 const CANARY_FAILED: &str = "Canary did not report a successful exit.";
+const SEND_INTERVALS: [(&str, Duration); 6] = [
+    ("No delay", Duration::ZERO),
+    ("500 milliseconds", Duration::from_millis(500)),
+    ("1 second", Duration::from_secs(1)),
+    ("2 seconds", Duration::from_secs(2)),
+    ("5 seconds", Duration::from_secs(5)),
+    ("10 seconds", Duration::from_secs(10)),
+];
 
 pub enum Action {
     SetPaused(bool),
@@ -23,6 +31,8 @@ pub(super) struct Queue {
     paused: bool,
     canary: Option<CanaryGate>,
     notify_canary: bool,
+    interval: Duration,
+    last_dispatch: Option<Instant>,
 }
 
 impl Queue {
@@ -31,6 +41,7 @@ impl Queue {
         stop_on_failure: bool,
         canary: Option<u64>,
         notify_canary: bool,
+        interval: Duration,
     ) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(limit)),
@@ -38,8 +49,43 @@ impl Queue {
             paused: false,
             canary: canary.map(CanaryGate::Pending),
             notify_canary,
+            interval,
+            last_dispatch: None,
         }
     }
+
+    fn waiting_for_interval(&self, now: Instant) -> bool {
+        self.last_dispatch
+            .is_some_and(|last| now.saturating_duration_since(last) < self.interval)
+    }
+}
+
+pub(super) fn interval_picker(id: TabId, page: &HostGroup, ctx: &ViewContext<TerminalApp>) -> View {
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(8.0)
+        .children((
+            TextBlock::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .text("Time between sends"),
+            ComboBox::new()
+                .automation_name("Time between sends")
+                .is_enabled(!page.recorded_send.pending())
+                .items_source(SEND_INTERVALS.map(|(label, _)| label))
+                .selected_index(
+                    SEND_INTERVALS
+                        .iter()
+                        .position(|(_, interval)| *interval == page.command_interval),
+                )
+                .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                    index.and_then(|index| SEND_INTERVALS.get(index)).map_or(
+                        Message::ControlIdle,
+                        |&(_, interval)| {
+                            Message::HostGroup(super::Action::CommandInterval(id, interval))
+                        },
+                    )
+                })),
+        ))
 }
 
 pub(super) fn canary_readiness(
@@ -223,7 +269,7 @@ impl TerminalApp {
                     run.reject_queued_commands(FAILED_RESULT);
                     continue;
                 }
-                if queue.paused {
+                if queue.paused || queue.waiting_for_interval(Instant::now()) {
                     continue;
                 }
                 let stop_after_failure = queue.stop_on_failure.then(|| run.transcript.clone());
@@ -250,6 +296,9 @@ impl TerminalApp {
                         host,
                         stop_after_failure.clone(),
                     ));
+                    if !queue.interval.is_zero() {
+                        break;
+                    }
                 }
             }
             for (run, index, target, text, host, stop_after_failure) in jobs {
@@ -272,6 +321,12 @@ impl TerminalApp {
                         .iter_mut()
                         .find(|submission| submission.id == run)
                 {
+                    if let DeliveryStatus::Pending(sent_at, _) = &delivery.status
+                        && let Some(queue) = &mut submission.command_queue
+                        && !queue.interval.is_zero()
+                    {
+                        queue.last_dispatch = Some(*sent_at);
+                    }
                     submission.results[index] = delivery;
                 }
             }
@@ -356,7 +411,13 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
                 } else {
                     "Pause queue"
                 }),
-            paused.then(|| "Command queue paused".to_owned()),
+            if paused {
+                Some("Command queue paused".to_owned())
+            } else {
+                queue
+                    .waiting_for_interval(Instant::now())
+                    .then(|| "Waiting for the next send interval".to_owned())
+            },
         ),
     };
     let buttons = StackPanel::new()
@@ -384,4 +445,24 @@ pub(super) fn controls(id: TabId, submission: &Submission, ctx: &ViewContext<Ter
         }),
         buttons,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dispatch_interval_holds_until_its_exact_deadline() {
+        let start = Instant::now();
+        let interval = Duration::from_secs(2);
+        let mut queue = Queue::new(4, false, None, false, interval);
+        assert!(!queue.waiting_for_interval(start));
+
+        queue.last_dispatch = Some(start);
+        assert!(queue.waiting_for_interval(start + interval - Duration::from_millis(1)));
+        assert!(!queue.waiting_for_interval(start + interval));
+
+        queue.interval = Duration::ZERO;
+        assert!(!queue.waiting_for_interval(start));
+    }
 }
