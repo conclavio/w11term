@@ -29,6 +29,7 @@ pub enum Subject {
     },
     SshHostList,
     SshGroupDefinition,
+    SshLoginReport(u64),
 }
 
 impl Subject {
@@ -42,6 +43,7 @@ impl Subject {
             Self::HostGroupDiff { .. } => "SSH group differences".into(),
             Self::SshHostList => "SSH host list".into(),
             Self::SshGroupDefinition => "SSH group definition".into(),
+            Self::SshLoginReport(_) => "SSH login report".into(),
         }
     }
 
@@ -71,6 +73,9 @@ impl Subject {
             )),
             Self::SshHostList => file_picker::Purpose::SshHostList,
             Self::SshGroupDefinition => file_picker::Purpose::SshGroupDefinition,
+            Self::SshLoginReport(sequence) => {
+                file_picker::Purpose::SshLoginReport(format!("ssh-login-results-{sequence}.txt"))
+            }
         }
     }
 }

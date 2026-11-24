@@ -29,6 +29,7 @@ pub(super) enum Purpose {
     Scrollback,
     CommandOutput(String),
     GroupReport(String),
+    SshLoginReport(String),
     GroupJsonReport(String),
     GroupOutputExcerpt(String),
     GroupOutputDiff(String),
@@ -305,6 +306,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
             Purpose::Scrollback
             | Purpose::CommandOutput(_)
             | Purpose::GroupReport(_)
+            | Purpose::SshLoginReport(_)
             | Purpose::GroupJsonReport(_)
             | Purpose::GroupOutputExcerpt(_)
             | Purpose::GroupOutputDiff(_)
@@ -325,6 +327,9 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                         suggestion.as_str(),
                         w!("txt"),
                     ),
+                    Purpose::SshLoginReport(suggestion) => {
+                        (w!("Save SSH login report"), suggestion.as_str(), w!("txt"))
+                    }
                     Purpose::GroupJsonReport(suggestion) => (
                         w!("Save SSH group results as JSON"),
                         suggestion.as_str(),

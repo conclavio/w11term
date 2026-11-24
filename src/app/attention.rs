@@ -1,5 +1,6 @@
 use super::*;
-use w11term::events::{NoticeTarget, SshAttemptOutcome};
+use std::{fmt::Write as _, io::Write as _};
+use w11term::events::{NoticeTarget, SshAttemptOutcome, SshLoginResult};
 
 pub(super) const LONG_COMMANDS: &str = "Notify for long commands";
 
@@ -27,8 +28,14 @@ pub enum Action {
     ViewLoginResults(NoticeTarget),
     BackFromLoginResults(NoticeTarget),
     VisitLoginPane { target: NoticeTarget, pane: u64 },
+    ExportLoginReport(NoticeTarget, LoginReportAction),
     MarkAllRead,
     Clear,
+}
+
+pub enum LoginReportAction {
+    Copy,
+    Save,
 }
 
 impl TerminalApp {
@@ -139,7 +146,7 @@ impl TerminalApp {
                 return;
             }
             Action::VisitLoginPane { target, pane } => {
-                if matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Attention(Some(open))) if *open == target)
+                if self.viewing_login_results(target)
                     && self
                         .inbox
                         .group_login_notice(target)
@@ -151,6 +158,10 @@ impl TerminalApp {
                 } else {
                     return;
                 }
+            }
+            Action::ExportLoginReport(target, action) => {
+                self.export_login_report(target, action, ctx);
+                return;
             }
             Action::MarkAllRead => {
                 self.inbox.mark_all_read();
@@ -332,8 +343,48 @@ impl TerminalApp {
             ))
     }
 
+    fn viewing_login_results(&self, target: NoticeTarget) -> bool {
+        matches!(self.tabs.active().map(|tab| &tab.page),
+            Some(Page::Attention(Some(open))) if *open == target)
+    }
+
+    fn export_login_report(
+        &mut self,
+        target: NoticeTarget,
+        action: LoginReportAction,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if !self.viewing_login_results(target) {
+            return;
+        }
+        let NoticeTarget::GroupLogins { sequence, .. } = target else {
+            return;
+        };
+        let Some(notice) = self.inbox.group_login_notice(target) else {
+            return;
+        };
+        let Some(results) = notice.login_results.as_deref() else {
+            return;
+        };
+        let text = login_report_text(&notice.source, &notice.message, results);
+        match action {
+            LoginReportAction::Copy => {
+                self.export.status = Some(match w11term::clipboard::write(&text) {
+                    Ok(()) => "Copied SSH login report".into(),
+                    Err(error) => format!("Could not copy SSH login report. {error}"),
+                });
+            }
+            LoginReportAction::Save => self.begin_text_export(
+                text_export::Subject::SshLoginReport(sequence),
+                move |file| file.write_all(text.as_bytes()),
+                ctx,
+            ),
+        }
+    }
+
     fn login_results_view(&self, target: NoticeTarget, ctx: &ViewContext<Self>) -> View {
         let notice = self.inbox.group_login_notice(target);
+        let available = notice.is_some();
         let content = notice
             .as_ref()
             .and_then(|notice| notice.login_results.as_deref())
@@ -347,22 +398,13 @@ impl TerminalApp {
                     ScrollViewer::new().content(StackPanel::new().spacing(8.0).keyed_children(
                         results.iter().map(|result| {
                             let pane = result.pane;
-                            let (status, reason) = match &result.outcome {
-                                SshAttemptOutcome::Connected => ("Connected", None),
-                                SshAttemptOutcome::Failed(reason) => {
-                                    ("Failed", Some(reason.as_ref()))
-                                }
-                                SshAttemptOutcome::Stopped => ("Stopped", None),
-                                SshAttemptOutcome::Closed => ("Closed", None),
-                            };
-                            let diagnostic = reason
-                                .filter(|reason| !reason.is_empty())
-                                .map_or_else(View::empty, |reason| {
-                                    TextBlock::new()
-                                        .text(reason)
-                                        .text_wrapping(TextWrapping::Wrap)
-                                        .into()
-                                });
+                            let (status, reason) = login_outcome(&result.outcome);
+                            let diagnostic = reason.map_or_else(View::empty, |reason| {
+                                TextBlock::new()
+                                    .text(reason)
+                                    .text_wrapping(TextWrapping::Wrap)
+                                    .into()
+                            });
                             KeyedView::new(
                                 pane,
                                 Grid::new()
@@ -403,15 +445,62 @@ impl TerminalApp {
                     notice.as_ref().map_or_else(View::empty, |notice| {
                         TextBlock::new().text(notice.source.as_ref()).into()
                     }),
-                    Button::new()
-                        .on_click(ctx.callback(move |_| {
-                            Message::Attention(Action::BackFromLoginResults(target))
-                        }))
-                        .content("Back to inbox"),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .is_enabled(available)
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::ExportLoginReport(
+                                        target,
+                                        LoginReportAction::Copy,
+                                    ))
+                                }))
+                                .content("Copy login report"),
+                            Button::new()
+                                .is_enabled(available && self.export.pending.is_none())
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::ExportLoginReport(
+                                        target,
+                                        LoginReportAction::Save,
+                                    ))
+                                }))
+                                .content("Save login report…"),
+                            Button::new()
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::BackFromLoginResults(target))
+                                }))
+                                .content("Back to inbox"),
+                        )),
                 )),
                 Border::new().grid_row(1).content(content),
             ))
     }
+}
+
+fn login_outcome(outcome: &SshAttemptOutcome) -> (&'static str, Option<&str>) {
+    match outcome {
+        SshAttemptOutcome::Connected => ("Connected", None),
+        SshAttemptOutcome::Failed(reason) => (
+            "Failed",
+            Some(reason.as_ref()).filter(|reason| !reason.is_empty()),
+        ),
+        SshAttemptOutcome::Stopped => ("Stopped", None),
+        SshAttemptOutcome::Closed => ("Closed", None),
+    }
+}
+
+fn login_report_text(source: &str, summary: &str, results: &[SshLoginResult]) -> String {
+    let mut text = format!("SSH login results\n{source}\n{summary}\n\n");
+    for result in results {
+        let (status, reason) = login_outcome(&result.outcome);
+        writeln!(text, "{} · {status}", result.host).expect("String writes cannot fail");
+        if let Some(reason) = reason {
+            writeln!(text, "  {reason}").expect("String writes cannot fail");
+        }
+    }
+    text
 }
 
 pub(super) fn flash_background_window(hwnd: windows::Win32::Foundation::HWND) {

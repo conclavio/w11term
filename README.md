@@ -107,6 +107,8 @@ Choose **Notify when logins finish** to watch the currently checked, shown SSH a
 
 Choose **View login results** beside a login alert for each watched host's address, original outcome, and any failure message. A later reconnect leaves the original report intact. Open a pane from the report while that pane is still available.
 
+Use **Copy login report** or **Save login report…** to share the captured results as plain text. Saved reports use UTF-8.
+
 Choose **Close ended SSH panes…** to review and close checked, visible panes whose connection has ended. Closing discards their scrollback. Panes in pinned tabs stay open, and a pane that reconnects before confirmation is kept. The command palette offers **Review close for ended SSH panes**.
 
 Choose **Open next SSH prompt** to open the first pending host-key or sign-in prompt in the displayed roster. The button shows how many visible hosts are waiting and follows the roster filters and sort order. Select the group tab to return to the roster.

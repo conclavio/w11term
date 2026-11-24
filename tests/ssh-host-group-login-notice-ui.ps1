@@ -3,8 +3,11 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
+$env:W11TERM_EXPORT_SMOKE_DIR = $State
+$env:W11TERM_TEST_COPY_FILE = Join-Path $State 'login-report-clipboard.txt'
 $profiles = Join-Path $State 'profiles.json'
 $config = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles
 $gates = [IO.File]::ReadAllText((Join-Path $State 'shell-gates.json')) | ConvertFrom-Json
@@ -16,6 +19,32 @@ function Click-Button([string]$Name) {
         $item = Find-Element $Name $button
         if ($item -and $item.Current.IsEnabled) { $item }
     })
+}
+
+function Check-LoginReportExport([string]$Expected) {
+    Click-Button 'Copy login report'
+    $null = Wait-Until 'copy includes the original host results and diagnostic' {
+        (Read-ClipboardFixture) -ceq $Expected
+    }
+    $save = 'Save login report' + [char]0x2026
+    $title = 'Save SSH login report'
+    $destination = Join-Path $State 'verified-logins.txt'
+    Click-Button $save
+    $dialog = Wait-Until 'owned login report dialog' { Find-OwnedDialog $title }
+    $null = Wait-Until 'cancel login report export' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'the canceled dialog has closed' { !(Find-OwnedDialog $title) }
+    if ([IO.File]::Exists((Join-Path $State 'ssh-login-results-2.txt'))) { throw 'Cancel saved a login report' }
+
+    Click-Button $save
+    $dialog = Wait-Until 'reopened login report dialog' { Find-OwnedDialog $title }
+    $null = Wait-Until 'enter the login report destination' {
+        [FixtureDialog]::SetFilename($dialog, $destination, 'ssh-login-results-2.txt')
+    }
+    $null = Wait-Until 'accept the login report destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $utf8 = [Text.UTF8Encoding]::new($false, $true)
+    $null = Wait-Until 'the saved UTF-8 report matches the copy' {
+        [IO.File]::Exists($destination) -and [IO.File]::ReadAllText($destination, $utf8) -ceq $Expected
+    }
 }
 
 $launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '--rows', '35')
@@ -58,10 +87,13 @@ try {
     Click-Button $viewResults
     $success = "West${dot}test@127.0.0.1:$($config.West.port)${dot}Pane $west${dot}Connected"
     $failure = "East${dot}test@127.0.0.1:$($config.East.port)${dot}Pane $east${dot}Failed"
+    $reason = 'remote server rejected a PTY or shell request (1 outstanding)'
     $null = Wait-Until 'the report retains the original failure after East reconnects' {
         (Find-Element $success) -and (Find-Element $failure) -and
-            (Find-Element 'remote server rejected a PTY or shell request (1 outstanding)')
+            (Find-Element $reason)
     }
+    $report = @('SSH login results', "SSH group${dot}Notices", $message, '', $success, $failure, "  $reason", '') -join "`n"
+    Check-LoginReportExport $report
     Click-Button "Open SSH login pane $east"
     Wait-Focus $east
     Click-Button 'Attention inbox, 0 unread'
