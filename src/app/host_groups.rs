@@ -27,7 +27,7 @@ const SUBMISSION_LIMIT: usize = 8;
 
 #[derive(Default)]
 pub(super) struct HostGroup {
-    saved: saved::SavedUi,
+    saved: Box<saved::SavedUi>,
     roster: Option<Box<MemberRoster>>,
     selected: BTreeSet<u64>,
     filter: filter::Filter,
