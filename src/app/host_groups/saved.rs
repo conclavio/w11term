@@ -201,6 +201,10 @@ pub enum Action {
         members: Vec<String>,
         new_tab: bool,
     },
+    OpenWindow {
+        name: String,
+        members: Vec<String>,
+    },
     Draft(u64, DraftAction),
     Duplicate(duplicate::Action),
     Definition(definition::Action),
@@ -304,6 +308,17 @@ impl TerminalApp {
                     && let Err(error) =
                         self.open_saved_host_group((!new_tab).then_some(id), &name, &members, ctx)
                 {
+                    self.refresh_profiles();
+                    if let Some(page) = self.host_group_mut(id) {
+                        page.saved.feedback = format!("{error:#}");
+                    }
+                }
+            }
+            Action::OpenWindow { name, members } => {
+                if self.host_group_command_target() != Some(id) {
+                    return;
+                }
+                if let Err(error) = self.launch_saved_group_window(&name, &members, ctx) {
                     self.refresh_profiles();
                     if let Some(page) = self.host_group_mut(id) {
                         page.saved.feedback = format!("{error:#}");
@@ -637,6 +652,61 @@ impl TerminalApp {
         Ok(())
     }
 
+    fn launch_saved_group_window(
+        &mut self,
+        name: &str,
+        expected: &[String],
+        ctx: &ComponentContext<Self>,
+    ) -> Result<()> {
+        self.check_saved_group_launch()?;
+        let catalog = self.load_expected_host_group(name, expected)?;
+        let members = expected
+            .iter()
+            .cloned()
+            .zip(
+                catalog
+                    .resolve_ssh_host_group_members(expected)?
+                    .into_iter()
+                    .cloned(),
+            )
+            .collect();
+        self.use_group_catalog(catalog);
+        self.open_group_child_window(
+            WindowGroup {
+                name: name.into(),
+                members,
+            },
+            ctx,
+        )
+    }
+
+    pub(in crate::app) fn start_group_window(
+        &mut self,
+        group: &WindowGroup,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let id = self.new_host_group_tab(Some(&group.name));
+        let members: Vec<_> = group.members.iter().map(|(name, _)| name.clone()).collect();
+        self.start_host_group_panes(
+            id,
+            BTreeSet::new(),
+            group
+                .members
+                .iter()
+                .cloned()
+                .map(|(name, ssh)| (Some(name), ssh)),
+            PaneLaunch::Select,
+            ctx,
+        );
+        self.remember_group_launch(
+            id,
+            &group.name,
+            &members,
+            true,
+            format!("Opened {} SSH panes for {}", members.len(), group.name),
+        );
+    }
+
     pub(super) fn open_host_group_from_palette(
         &mut self,
         name: &str,
@@ -665,6 +735,8 @@ impl TerminalApp {
             .map_or_else(View::empty, |(name, members)| {
                 let launch = reuse::button(id, name, members, ctx);
                 let duplicate = duplicate::button(id, name, ctx);
+                let group_window = name.to_owned();
+                let group_window_members = members.clone();
                 let name = name.to_owned();
                 let members = members.clone();
                 StackPanel::new()
@@ -685,6 +757,18 @@ impl TerminalApp {
                             }))
                             .content("Export saved group hosts…"),
                         duplicate,
+                        Button::new()
+                            .is_enabled(!group_window_members.is_empty())
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(HostAction::Saved(
+                                    id,
+                                    Action::OpenWindow {
+                                        name: group_window.clone(),
+                                        members: group_window_members.clone(),
+                                    },
+                                ))
+                            }))
+                            .content("Open group in new window"),
                     ))
             });
         let action = move |action| Message::HostGroup(HostAction::Saved(id, action));

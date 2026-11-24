@@ -4527,6 +4527,8 @@ impl Component for TerminalApp {
         let options = &input.options;
         let opening = &input.opening;
         let moving = input.transfer.is_some();
+        let group_window = input.group.as_ref();
+        let child_window = moving || group_window.is_some();
         let sender = context.sender();
         let clipboard = clipboard_paste::State::default();
         let paste_origin = clipboard.input_origin.clone();
@@ -4631,7 +4633,7 @@ impl Component for TerminalApp {
                 .expect("validated keyboard settings"),
         );
         let appearance = Arc::new(RwLock::new(appearance));
-        let grid = if !moving && (options.cols.is_some() || options.rows.is_some()) {
+        let grid = if !child_window && (options.cols.is_some() || options.rows.is_some()) {
             Some((options.cols.unwrap_or(120), options.rows.unwrap_or(32)))
         } else {
             None
@@ -4668,7 +4670,7 @@ impl Component for TerminalApp {
                 workspace.sources.clone(),
                 osc52,
             );
-        } else if !moving {
+        } else if !child_window {
             tabs.insert(
                 live_tab_sized(
                     label.clone(),
@@ -4700,7 +4702,8 @@ impl Component for TerminalApp {
         let new_window = input
             .transfer
             .as_ref()
-            .and_then(|transfer| transfer.new_window.as_ref());
+            .and_then(|transfer| transfer.new_window.as_ref())
+            .or_else(|| group_window.map(|group| group.claim()));
         let registry = new_window.map_or_else(
             || Registry::window(1, opening.as_ref().map(|window| window.key.clone())),
             |window| window.registry.clone(),
@@ -4758,7 +4761,7 @@ impl Component for TerminalApp {
             active_group,
             windows: Rc::new(RefCell::new(crate::window_state::Windows::load())),
             window_profile: None,
-            window_restored: moving || options.cols.is_some() || options.rows.is_some(),
+            window_restored: child_window || options.cols.is_some() || options.rows.is_some(),
             keyboard,
             broadcast_typing: None,
             _control: control,
@@ -4829,11 +4832,17 @@ impl Component for TerminalApp {
         }
         app.arm_window_tick(context);
         context.sender().send(Message::WindowTick);
-        app.activate(context);
+        if let Some(group_window) = group_window {
+            app.start_group_window(&group_window.launch, context);
+        } else {
+            app.activate(context);
+        }
         app.watch_control(context);
-        app.sync_selection(context);
+        if group_window.is_none() {
+            app.sync_selection(context);
+        }
         #[cfg(feature = "ui-smoke")]
-        if !moving && std::env::var_os("W11TERM_UI_SMOKE").is_some() {
+        if !child_window && std::env::var_os("W11TERM_UI_SMOKE").is_some() {
             if let Some(fixture) = std::env::var_os("W11TERM_IMPORT_SMOKE") {
                 let expected = std::path::PathBuf::from(fixture).with_file_name("profiles.json");
                 assert_eq!(

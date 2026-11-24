@@ -1450,6 +1450,36 @@ async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a saved group in a second native window and closes just its sessions"]
+async fn native_saved_ssh_group_opens_in_an_independent_window() {
+    let state = tempfile::tempdir().unwrap();
+    let mut peers = Vec::new();
+    let mut profiles = serde_json::Map::new();
+    for name in ["East", "West"] {
+        let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, 2).await else {
+            unreachable!()
+        };
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((root, opens, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Fleet":["West","East"]},
+            "ssh_host_group_defaults": {"Fleet":{"require_all_ready":true}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-window-ui.ps1", state.path());
+    for (_, opens, server) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "previews an SSH range and opens only reviewed saved and one-time sessions through WinUI"]
 async fn native_ssh_host_list_import_checks_profiles_and_opens_only_reviewed_hosts() {
     let state = tempfile::tempdir().unwrap();

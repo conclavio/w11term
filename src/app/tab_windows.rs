@@ -13,6 +13,7 @@ use windows::Win32::{
 };
 
 const WINDOW_LABEL: &str = "Window ";
+static NEXT_WINDOW: AtomicU64 = AtomicU64::new(2);
 
 pub(super) fn menu_window(label: &str) -> Option<u64> {
     let (id, _) = label.strip_prefix(WINDOW_LABEL)?.split_once(" · ")?;
@@ -46,6 +47,7 @@ pub struct WindowLaunch {
     pub(super) options: Options,
     pub(super) opening: Option<Rc<crate::workspace_window::Opening>>,
     pub(super) transfer: Option<Rc<Transfer>>,
+    pub(super) group: Option<Rc<GroupWindow>>,
 }
 
 impl WindowLaunch {
@@ -54,6 +56,7 @@ impl WindowLaunch {
             options,
             opening,
             transfer: None,
+            group: None,
         }
     }
 }
@@ -63,6 +66,8 @@ impl PartialEq for WindowLaunch {
         self.options == other.options
             && self.opening == other.opening
             && self.transfer.as_ref().map(|t| t.id()) == other.transfer.as_ref().map(|t| t.id())
+            && self.group.as_ref().map(|g| g.window.registry.window_id())
+                == other.group.as_ref().map(|g| g.window.registry.window_id())
     }
 }
 
@@ -85,6 +90,60 @@ pub(super) struct Transfer {
 pub(super) struct NewWindow {
     pub(super) registry: Registry,
     pub(super) server: Arc<Server>,
+}
+
+pub(super) struct GroupWindow {
+    window: NewWindow,
+    pub(super) launch: host_groups::WindowGroup,
+    claimed: Cell<bool>,
+}
+
+impl GroupWindow {
+    pub(super) fn claim(&self) -> &NewWindow {
+        self.claimed.set(true);
+        &self.window
+    }
+}
+
+impl Drop for GroupWindow {
+    fn drop(&mut self) {
+        if !self.claimed.get() {
+            let _ = self.window.registry.unregister();
+        }
+    }
+}
+
+impl TerminalApp {
+    fn reserve_child_window(&self) -> anyhow::Result<NewWindow> {
+        let id = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
+        Ok(NewWindow {
+            registry: self.registry.register_window(id, None)?,
+            server: self._control.clone(),
+        })
+    }
+
+    pub(super) fn open_group_child_window(
+        &self,
+        group: host_groups::WindowGroup,
+        ctx: &ComponentContext<Self>,
+    ) -> anyhow::Result<()> {
+        let window = self.reserve_child_window()?;
+        let launch = WindowLaunch {
+            options: self.window_launch.clone(),
+            opening: None,
+            transfer: None,
+            group: Some(Rc::new(GroupWindow {
+                window,
+                launch: group,
+                claimed: Cell::new(false),
+            })),
+        };
+        anyhow::ensure!(
+            ctx.open_window(View::component::<Self>(launch)),
+            "The SSH group window could not be opened."
+        );
+        Ok(())
+    }
 }
 
 struct OfferedTab<T> {
@@ -329,20 +388,14 @@ impl TerminalApp {
             };
             (destination, None, Some(target))
         } else {
-            static NEXT_WINDOW: AtomicU64 = AtomicU64::new(2);
-            let destination = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
-            let registry = match self.registry.register_window(destination, None) {
-                Ok(registry) => registry,
+            let new_window = match self.reserve_child_window() {
+                Ok(window) => window,
                 Err(error) => {
                     self.window_error = Some(format!("Opening another window: {error}"));
                     return;
                 }
             };
-            let new_window = NewWindow {
-                registry,
-                server: self._control.clone(),
-            };
-            (destination, Some(new_window), None)
+            (new_window.registry.window_id(), Some(new_window), None)
         };
         static NEXT_TRANSFER: AtomicU64 = AtomicU64::new(1);
         let transfer = Rc::new(Transfer {
@@ -365,6 +418,7 @@ impl TerminalApp {
                 options: self.window_launch.clone(),
                 opening: None,
                 transfer: Some(transfer.clone()),
+                group: None,
             };
             ctx.open_window(View::component::<Self>(launch))
         } else {

@@ -91,6 +91,11 @@ enum PaneLaunch {
     Add,
 }
 
+pub(super) struct WindowGroup {
+    pub(super) name: String,
+    pub(super) members: Vec<(String, SshOptions)>,
+}
+
 struct DraftBackup {
     text: String,
     scope: Option<DraftScope>,

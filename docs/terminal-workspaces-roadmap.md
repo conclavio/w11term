@@ -191,6 +191,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 75. **Duplicate a saved SSH group.** Copy its ordered profiles, recipient sets, and roster defaults to a new name. Recheck the reviewed source and save the copy atomically.
 76. **Share a saved SSH group definition.** Export the group name, ordered profile names, recipient sets, and roster defaults as versioned JSON. Review its local profile matches and recheck their settings when saving the imported group.
 77. **Map imported members to local profiles.** Let the operator choose a distinct local profile for each file entry, preserve the member and recipient-set order, and recheck the chosen profile settings when saving.
+78. **Open a saved SSH group in its own window.** Start the saved roster and its own fresh SSH panes together using the normal profile verification and authentication paths.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
