@@ -3,6 +3,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:USERPROFILE = Join-Path $State 'ssh-home'
@@ -15,7 +16,13 @@ $west = "test@127.0.0.1:$($catalog.profiles.West.port)"
 $port = [IO.File]::ReadAllText((Join-Path $State 'one-time-port'))
 $direct = "test@127.0.0.1:$port"
 $other = "test@127.0.0.2:$port"
+$env:W11TERM_HOST_LIST_SMOKE_DIR = Join-Path $State 'host-lists'
+$null = [IO.Directory]::CreateDirectory($env:W11TERM_HOST_LIST_SMOKE_DIR)
+$fleetText = @('# fleet', 'West', "ssh://$west", $east, 'East', "127.0.0.<1-2>:$port") -join "`n"
+[IO.File]::WriteAllText((Join-Path $env:W11TERM_HOST_LIST_SMOKE_DIR 'fleet-hosts'), $fleetText, [Text.UTF8Encoding]::new($true))
+[IO.File]::WriteAllBytes((Join-Path $env:W11TERM_HOST_LIST_SMOKE_DIR 'bad-hosts'), [byte[]]@(0x61, 0, 0x62))
 $label = 'Import host list' + [char]0x2026
+$openFile = 'Open host list file' + [char]0x2026
 $dot = ' ' + [char]0xb7 + ' '
 $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
@@ -65,6 +72,20 @@ function Assert-PreviewOnly {
         throw 'SSH sessions opened before confirmation'
     }
 }
+function Open-HostListFile([string]$Name) {
+    Click $openFile
+    $dialog = Wait-Until 'owned host list file picker' { Find-OwnedDialog 'Open SSH host list' }
+    if ($Name) { Select-DialogItem $dialog $Name }
+    $buttonId = if ($Name) { 1 } else { 2 }
+    $null = Wait-Until 'close the host list file picker' { [FixtureDialog]::ClickButton($dialog, $buttonId) }
+    $null = Wait-Until 'host list picker dismissed' { !(Find-OwnedDialog 'Open SSH host list') }
+}
+function Expect-HostList([string]$Expected) {
+    $null = Wait-Until 'host list editor contains the expected text' {
+        $text = (Text-Field 'SSH host list').Current.Value
+        $text.Replace("`r`n", "`n").Replace("`r", "`n") -ceq $Expected
+    }
+}
 
 $launch = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -75,8 +96,19 @@ try {
     Click 'SSH host group' $menu
     Click $label
     (Text-Field 'Default SSH user').SetValue('test')
-    $input = @('# fleet', 'West', "ssh://$west", $east, 'East', "127.0.0.<1-2>:$port") -join [Environment]::NewLine
-    (Text-Field 'SSH host list').SetValue($input)
+    $typed = 'test@keep.example:22'
+    (Text-Field 'SSH host list').SetValue($typed)
+    Open-HostListFile
+    Expect-HostList $typed
+    Open-HostListFile 'bad-hosts'
+    $errorText = 'Could not open the host list. Choose a UTF-8 or BOM-marked UTF-16 text file.'
+    $null = Wait-Until 'invalid host list is reported' { Find-Element $errorText }
+    Expect-HostList $typed
+    Open-HostListFile 'fleet-hosts'
+    Expect-HostList $fleetText
+    $null = Wait-Until 'loading clears the file error' { !(Find-Element $errorText) }
+    if ((Text-Field 'Default SSH user').Current.Value -cne 'test') { throw 'Loading changed the default SSH user' }
+    Assert-PreviewOnly
     Keyless
     Press-Key 0x77 # The first tab is the original demo session.
     $null = Wait-Until 'host list editor is hidden on the other tab' { !(Find-Element 'SSH host list') }

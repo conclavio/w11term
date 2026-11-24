@@ -2,6 +2,7 @@ use super::*;
 use anyhow::{Result, ensure};
 use std::{cell::OnceCell, path::Path};
 
+mod file;
 mod list;
 
 const LABEL: &str = "Import host list…";
@@ -18,6 +19,7 @@ struct Draft {
     text: String,
     editor_ready: bool,
     editor: OnceCell<View>,
+    loading_file: bool,
     default_user: String,
     authentication: usize,
     identity: String,
@@ -33,11 +35,13 @@ struct Review {
 pub enum Action {
     Begin,
     Form(u64, Change),
+    FileLoaded(u64, Result<Option<String>, String>),
 }
 
 pub enum Change {
     Mounted,
     Text(String),
+    LoadFile,
     DefaultUser(String),
     Authentication(usize),
     Identity(String),
@@ -75,6 +79,27 @@ impl State {
     pub(super) fn editor_unmounted(&mut self) {
         if let Some(draft) = &mut self.draft {
             draft.editor_unmounted();
+        }
+    }
+
+    fn finish_file(&mut self, revision: u64, result: Result<Option<String>, String>) {
+        let Some(draft) = self
+            .draft
+            .as_mut()
+            .filter(|draft| revision == self.revision && draft.loading_file)
+        else {
+            return;
+        };
+        draft.loading_file = false;
+        draft.editor.take();
+        self.revision += 1;
+        match result {
+            Ok(Some(text)) => {
+                draft.text = text;
+                draft.error = None;
+            }
+            Ok(None) => {}
+            Err(error) => draft.error = Some(format!("Could not open the host list. {error}")),
         }
     }
 
@@ -174,7 +199,7 @@ impl State {
                 .height(134.0)
                 .accepts_return(true)
                 .text_wrapping(TextWrapping::Wrap)
-                .is_enabled(draft.editor_ready)
+                .is_enabled(draft.editor_ready && !draft.loading_file)
                 .text_optional(draft.editor_ready.then_some(&draft.text))
                 .on_text_changed(ctx.callback(move |text| action(Change::Text(text))))
                 .into()
@@ -202,8 +227,12 @@ impl State {
             )),
             key,
             StackPanel::new().orientation(Orientation::Horizontal).spacing(8.0).children((
+                Button::new()
+                    .is_enabled(draft.editor_ready && !draft.loading_file)
+                    .on_click(ctx.callback(move |_| action(Change::LoadFile)))
+                    .content("Open host list file…"),
                 Button::new().style(ButtonStyle::Accent)
-                    .is_enabled(!draft.text.trim().is_empty())
+                    .is_enabled(!draft.loading_file && !draft.text.trim().is_empty())
                     .on_click(ctx.callback(move |_| action(Change::Preview))).content("Preview hosts"),
                 cancel,
             )),
@@ -229,7 +258,7 @@ impl TerminalApp {
         action: Action,
         ctx: &ComponentContext<Self>,
     ) {
-        let revision = match action {
+        let (revision, change) = match action {
             Action::Begin => {
                 if self.host_group_command_target() == Some(id)
                     && let Some(page) = self.host_group_mut(id)
@@ -240,10 +269,13 @@ impl TerminalApp {
                 }
                 return;
             }
-            Action::Form(revision, _) => revision,
-        };
-        let Action::Form(_, change) = action else {
-            return;
+            Action::Form(revision, change) => (revision, change),
+            Action::FileLoaded(revision, result) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.import.finish_file(revision, result);
+                }
+                return;
+            }
         };
         if self.tabs.active_id() != Some(id) {
             return;
@@ -269,11 +301,51 @@ impl TerminalApp {
                 draft.editor.take();
             }
             Change::Text(text)
-                if draft.review.is_none() && draft.editor_ready && draft.text != text =>
+                if draft.review.is_none()
+                    && draft.editor_ready
+                    && !draft.loading_file
+                    && draft.text != text =>
             {
                 draft.text = text;
                 draft.editor.take();
                 draft.error = None;
+            }
+            Change::LoadFile
+                if draft.review.is_none() && draft.editor_ready && !draft.loading_file =>
+            {
+                let Some(owner) = self.keyboard.hwnd() else {
+                    draft.error = Some("The window is unavailable.".into());
+                    return;
+                };
+                draft.loading_file = true;
+                draft.editor.take();
+                let owner = owner.0 as usize;
+                let loaded = move |result| {
+                    Message::HostGroup(super::Action::Import(
+                        id,
+                        Action::FileLoaded(revision, result),
+                    ))
+                };
+                ctx.spawn_background_with_rejection(
+                    move |cancel| {
+                        let read = || -> Result<Option<String>> {
+                            if cancel.is_cancelled() {
+                                return Ok(None);
+                            }
+                            let Some(selected) =
+                                file_picker::pick(owner, file_picker::Purpose::OpenSshHostList)?
+                            else {
+                                return Ok(None);
+                            };
+                            if cancel.is_cancelled() {
+                                return Ok(None);
+                            }
+                            file::read(&selected.path).map(Some)
+                        };
+                        loaded(read().map_err(|error| format!("{error:#}")))
+                    },
+                    loaded(Err("File picker unavailable.".into())),
+                );
             }
             Change::DefaultUser(user) if draft.review.is_none() && draft.default_user != user => {
                 draft.default_user = user;
@@ -289,7 +361,7 @@ impl TerminalApp {
                 draft.identity = identity;
                 draft.error = None;
             }
-            Change::Preview if draft.review.is_none() => {
+            Change::Preview if draft.review.is_none() && !draft.loading_file => {
                 let rows = catalog_store
                     .catalog()
                     .and_then(|catalog| draft.rows(&catalog, catalog_store.path()));
@@ -375,5 +447,42 @@ impl TerminalApp {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_results_belong_to_the_pending_editor_and_only_replace_its_text() {
+        let mut state = State {
+            draft: Some(Draft {
+                text: "ops@typed".into(),
+                default_user: "ops".into(),
+                authentication: 1,
+                loading_file: true,
+                ..Default::default()
+            }),
+            revision: 9,
+            ..Default::default()
+        };
+        state.finish_file(8, Ok(Some("wrong".into())));
+        assert!(state.draft.as_ref().unwrap().loading_file);
+        state.finish_file(9, Ok(None));
+        assert_eq!(state.draft.as_ref().unwrap().text, "ops@typed");
+        assert!(!state.draft.as_ref().unwrap().loading_file);
+        state.draft.as_mut().unwrap().loading_file = true;
+        state.finish_file(10, Err("read failed".into()));
+        assert_eq!(state.draft.as_ref().unwrap().text, "ops@typed");
+        assert!(state.draft.as_ref().unwrap().error.is_some());
+        state.draft.as_mut().unwrap().loading_file = true;
+        state.finish_file(11, Ok(Some("ops@loaded\n".into())));
+        let draft = state.draft.unwrap();
+        assert_eq!(draft.text, "ops@loaded\n");
+        assert_eq!(draft.default_user, "ops");
+        assert_eq!(draft.authentication, 1);
+        assert!(draft.error.is_none());
+        assert!(draft.review.is_none());
     }
 }
