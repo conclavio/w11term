@@ -68,24 +68,45 @@ try {
         (Find-Element "1. $($labels.East)") -and (Find-Element "2. $($labels.North)") -and
             (Find-Element "3. $($labels.West)") -and !(Find-Element "1. $($labels.West)")
     }
+    Click "Move $($labels.East) later"
+    $null = Wait-Until 'moving East later puts North first' { Find-Element "1. $($labels.North)" }
+    Click 'Use roster order'
+    $null = Wait-Until 'discarding the manual order restores the current sort' {
+        (Find-Element "1. $($labels.East)") -and !(Find-Element 'Use roster order' $button)
+    }
+
+    Click "Move $($labels.West) earlier"
+    $null = Wait-Until 'West moves one position earlier' { Find-Element "2. $($labels.West)" }
+    Click "Move $($labels.West) earlier"
+    $null = Wait-Until 'West becomes the first planned recipient' { Find-Element "1. $($labels.West)" }
+    Click "Move $($labels.North) earlier"
+    $null = Wait-Until 'the exact manual order is visible before sending' {
+        (Find-Element "1. $($labels.West)") -and (Find-Element "2. $($labels.North)") -and (Find-Element "3. $($labels.East)")
+    }
     Click 'Send to 3 hosts'
-    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started roll')
-    $null = Wait-Until 'West and North are queued in the results' {
-        (Find-Element "$($labels.West)${dot}Queued") -and (Find-Element "$($labels.North)${dot}Queued")
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started roll')
+    $null = Wait-Until 'North and East are queued in the results' {
+        (Find-Element "$($labels.North)${dot}Queued") -and (Find-Element "$($labels.East)${dot}Queued")
     }
     Select-GroupOption 'Sort SSH roster' 'Tab order'
     $null = Control @('send-text','--pane',"$($panes.North)",'--no-paste','x')
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the group is in the background' { Find-Element 'No bells or notifications' }
-    New-Item -ItemType File -Path (Join-Path $State 'release-east-roll') | Out-Null
-    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started roll')
+    New-Item -ItemType File -Path (Join-Path $State 'release-roll') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started roll')
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
     $tab.GetCurrentPattern($item).Select()
-    $null = Wait-Until 'North was tried before West even after the roster was sorted again' {
+    $null = Wait-Until 'North was tried before East despite the new roster sort' {
         Find-Element "$($labels.North)${dot}Not sent${dot}The verified prompt changed before the command was sent."
     }
-    New-Item -ItemType File -Path (Join-Path $State 'release-roll') | Out-Null
-    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished roll')
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-roll') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished roll')
+    Click 'Preview send order'
+    $null = Wait-Until 'the next draft goes back to the roster order' {
+        (Find-Element "1. $($labels.West)") -and (Find-Element "2. $($labels.East)") -and
+            !(Find-Element 'Use roster order' $button)
+    }
+    Click 'Back to roster and results'
 
     (Wait-CheckBox $labels.North On).Toggle()
     $null = Wait-CheckBox $labels.North Off

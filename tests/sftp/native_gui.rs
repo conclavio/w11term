@@ -1525,7 +1525,7 @@ async fn native_ssh_group_notifies_when_watched_logins_settle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "verifies rolling SSH order, queue controls, canary approval, and notices"]
+#[ignore = "verifies manual SSH rollout order, queue controls, canary approval, and notices"]
 async fn native_ssh_group_bounds_parallel_commands() {
     use in_band_resize::Wire;
 

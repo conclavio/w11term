@@ -63,6 +63,7 @@ pub(super) struct HostGroup {
     canary: Option<u64>,
     notify_canary: bool,
     preview_command_order: bool,
+    manual_command_order: Vec<u64>,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -714,6 +715,7 @@ pub enum Action {
     CommandCanary(TabId, Option<u64>),
     NotifyCanary(TabId, bool),
     PreviewCommandOrder(TabId, bool),
+    EditCommandOrder(TabId, command_order::Edit),
     StopCommandQueueOnFailure(TabId, bool),
     CommandQueue(TabId, u64, command_queue::Action),
 }
@@ -1083,6 +1085,7 @@ impl TerminalApp {
             })
             .collect();
         if let Some(page) = self.host_group_mut(id) {
+            page.manual_command_order.clear();
             let submission = page.submit(SubmissionContent::Command(text), results, transcript);
             submission.recording = recording;
             submission.command_queue = slots.map(|slots| {
@@ -1541,6 +1544,7 @@ impl TerminalApp {
                     page.preview_command_order = show;
                 }
             }
+            Action::EditCommandOrder(id, edit) => self.edit_command_order(id, edit),
             Action::CommandQueue(id, run, action) => self.handle_command_queue(id, run, action),
             Action::StopCommandQueueOnFailure(id, stop) => {
                 if let Some(page) = self.host_group_mut(id).filter(|page| {
@@ -2121,7 +2125,7 @@ impl TerminalApp {
         let (body_key, body) = if page.preview_command_order {
             (
                 "command-order",
-                command_order::preview(&offer, page.roster_preferences.require_all_ready),
+                command_order::preview(id, page, &offer, ctx),
             )
         } else {
             (
