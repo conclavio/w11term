@@ -185,6 +185,8 @@ While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its 
 
 In **SSH host group**, choose **New group**, name it, and check the saved SSH profiles to include. **Open group** uses the current group tab. **Open in new tab** and the palette command **Open SSH group** create a named group tab. Each launch starts a fresh SSH tab for every member. Unavailable profiles are reported before any member tabs open. Uncheck a pane to pause delivery to it. **Edit group** changes the saved name or members, and **Delete group** removes the saved group. Group definitions live with their profiles in `profiles.json`. Renaming a profile updates its group memberships, and deleting a profile removes it from those groups.
 
+Choose **Duplicate group…** to save the selected group under a new name. The copy keeps its profile order, recipient sets, and roster defaults. It appears in the saved groups list and can be opened separately.
+
 When creating or editing a group, filter by profile name or SSH address. **Check matches** and **Uncheck matches** apply to every matching profile across pages. **Move up** and **Move down** change a checked profile’s position in the full group. Fresh tabs open in the saved order.
 
 Group tabs keep their own drafts, filters, host selections, and results. A named tab shows the panes opened for that group and panes added with **Import host list…**. Turn on **Show all window SSH panes** to include other connections in the roster. Turning it off clears checks on those other panes. **New SSH group tab** opens an independent window-wide roster with an empty selection. **SSH host group** returns to the most recently used group tab.

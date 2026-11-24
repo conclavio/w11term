@@ -258,6 +258,36 @@ try {
         if ($current.Count -eq 3) { ,$current }
     }
 
+    $duplicate = 'Duplicate group' + [char]0x2026
+    Click $duplicate
+    $null = Wait-Until 'the copy review names the source' { Find-Element 'Copy from Fleet' }
+    Click 'Cancel'
+    $null = Wait-Until 'the copy review closes on cancel' { Find-Element $duplicate $button }
+    if ((Catalog).ssh_host_groups.PSObject.Properties.Name.Count -ne 1) { throw 'Cancel changed the groups' }
+    Click $duplicate
+    $nameField = Wait-Until 'new group name field' { Find-Element 'New SSH group name' $edit }
+    $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Fleet')
+    Click 'Save copy'
+    $null = Wait-Until 'the existing group name is refused' { Find-Element 'An SSH group named Fleet already exists' }
+    $nameField = Wait-Until 'the copy name can be corrected' { Find-Element 'New SSH group name' $edit }
+    $nameField.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Fleet copy')
+    Click 'Save copy'
+    $null = Wait-Until 'the group copy is saved' {
+        $saved = Catalog
+        (Find-Element 'SSH group copied') -and
+            ($saved.ssh_host_groups.'Fleet copy' -join ',') -ceq 'West,East' -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.order -ceq 'label' -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.show_last_output
+    }
+    if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Copying the group opened SSH panes' }
+    Click 'Edit group'
+    Click 'Delete group'
+    Click 'Confirm delete group'
+    $null = Wait-Until 'the copy is deleted and the original remains' {
+        (Find-Element 'Edit group' $button) -and ((Catalog).ssh_host_groups.Fleet -join ',') -ceq 'West,East' -and
+            -not ((Catalog).ssh_host_groups.'Fleet copy')
+    }
+
     Click 'Edit group'
     $null = Wait-CheckBox 'Group member East' On
     Filter-GroupProfiles 'west'

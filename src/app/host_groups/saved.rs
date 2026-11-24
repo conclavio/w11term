@@ -1,6 +1,7 @@
 use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Result, ensure};
 
+mod duplicate;
 mod roster_update;
 pub use roster_update::Action as RosterUpdateAction;
 pub(super) use roster_update::update_button;
@@ -9,6 +10,7 @@ pub(super) use roster_update::update_button;
 pub(super) struct SavedUi {
     selected: Option<String>,
     editor: Option<Editor>,
+    duplicate: Option<Box<duplicate::Draft>>,
     next_editor: u64,
     pub(super) feedback: String,
     pub(super) reuse: reuse::State,
@@ -141,7 +143,10 @@ impl SavedUi {
     }
 
     pub(super) fn is_editing(&self) -> bool {
-        self.editor.is_some() || self.roster_update.is_open() || self.recipient_sets.is_open()
+        self.editor.is_some()
+            || self.duplicate.is_some()
+            || self.roster_update.is_open()
+            || self.recipient_sets.is_open()
     }
 
     pub(super) fn can_update_roster(&self) -> bool {
@@ -194,6 +199,7 @@ pub enum Action {
         new_tab: bool,
     },
     Draft(u64, DraftAction),
+    Duplicate(duplicate::Action),
     UpdateRoster(RosterUpdateAction),
     SaveRosterDefaults {
         group: String,
@@ -301,6 +307,7 @@ impl TerminalApp {
                 }
             }
             Action::Draft(editor, action) => self.edit_saved_host_group(id, editor, action),
+            Action::Duplicate(action) => self.handle_duplicate_group(id, action),
             Action::UpdateRoster(action) => self.handle_roster_update(id, action),
         }
     }
@@ -652,6 +659,7 @@ impl TerminalApp {
             .zip(members)
             .map_or_else(View::empty, |(name, members)| {
                 let launch = reuse::button(id, name, members, ctx);
+                let duplicate = duplicate::button(id, name, ctx);
                 let name = name.to_owned();
                 let members = members.clone();
                 StackPanel::new()
@@ -671,6 +679,7 @@ impl TerminalApp {
                                 ))
                             }))
                             .content("Export saved group hosts…"),
+                        duplicate,
                     ))
             });
         let action = move |action| Message::HostGroup(HostAction::Saved(id, action));
@@ -786,6 +795,9 @@ impl TerminalApp {
         saved: &SavedUi,
         ctx: &ViewContext<Self>,
     ) -> Option<View> {
+        if let Some(draft) = &saved.duplicate {
+            return Some(draft.view(id, &saved.feedback, ctx));
+        }
         if let Some(review) = saved.roster_update.view(id, ctx) {
             return Some(review);
         }

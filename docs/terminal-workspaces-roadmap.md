@@ -188,6 +188,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 72. **Close ended SSH panes.** Review the checked, shown panes whose attempts have ended. Claim the reviewed exit before closing each pane, so a concurrent restart keeps it open. Respect pinned tabs and retain neighboring splits.
 73. **Recall recent group commands with Ctrl+R.** Open the current tab’s searchable command history from the keyboard. Enter recalls the selected command into the draft for review.
 74. **Preview the current terminal line in the roster.** Use each shown host’s live primary screen even when a pane is scrolled back. Mask concealed cells and keep the preview opt-in.
+75. **Duplicate a saved SSH group.** Copy its ordered profiles, recipient sets, and roster defaults to a new name. Recheck the reviewed source and save the copy atomically.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 
