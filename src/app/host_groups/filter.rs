@@ -27,8 +27,8 @@ struct Wildcards {
 
 #[derive(Clone, Default)]
 pub(super) struct Names {
-    label: String,
-    host: String,
+    pub(super) label: String,
+    pub(super) host: String,
     address: String,
 }
 

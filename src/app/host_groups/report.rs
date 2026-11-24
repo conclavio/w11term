@@ -75,6 +75,9 @@ impl Report {
             .iter()
             .map(|delivery| {
                 let mut heading = format!("\r\n{}\r\n", delivery.description());
+                if let Some(command) = submission.content.host_command(delivery.target.pane) {
+                    let _ = writeln!(heading, "  {command}\r");
+                }
                 let execution = delivery.execution();
                 if let Some(execution) = &execution {
                     let _ = writeln!(heading, "  {}\r", execution_caption(execution));
@@ -110,7 +113,7 @@ impl Report {
             .collect();
 
         Self {
-            title: format!("Submitted · {}\r\n", submission.text),
+            title: format!("Submitted · {}\r\n", submission.content.label()),
             sections,
         }
     }
@@ -177,7 +180,9 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::host_groups::{Delivery, DeliveryStatus, Target, TargetState};
+    use crate::app::host_groups::{
+        Delivery, DeliveryStatus, SubmissionContent, Target, TargetState,
+    };
     use tokio::sync::watch;
 
     fn captured(pane: u64, text: String, truncated: bool) -> Delivery {
@@ -209,7 +214,7 @@ mod tests {
     fn report_uses_exact_history_or_labels_the_retained_preview() {
         let submission = Submission {
             id: 1,
-            text: "show".into(),
+            content: SubmissionContent::Command("show".into()),
             transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
@@ -250,7 +255,7 @@ mod tests {
         other.status = DeliveryStatus::Rejected("SSH connection closed".into());
         let submission = Submission {
             id: 1,
-            text: "show".into(),
+            content: SubmissionContent::Command("show".into()),
             transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),

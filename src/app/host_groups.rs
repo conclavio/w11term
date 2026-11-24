@@ -7,6 +7,7 @@ use w11term::events::{
 };
 mod address;
 mod compare;
+mod environment;
 mod filter;
 mod host_list_export;
 mod import;
@@ -53,6 +54,7 @@ pub(super) struct HostGroup {
     retry_feedback: String,
     prompt_setup: prompt_setup::State,
     transfer: transfer::State,
+    environment: environment::State,
 }
 
 #[derive(Default)]
@@ -69,9 +71,37 @@ struct DraftBackup {
 
 struct Submission {
     id: u64,
-    text: Arc<str>,
+    content: SubmissionContent,
     results: Vec<Delivery>,
     transcript: GroupTranscript,
+}
+
+enum SubmissionContent {
+    Command(Arc<str>),
+    Environment(BTreeMap<u64, Arc<str>>),
+}
+
+impl SubmissionContent {
+    fn label(&self) -> &str {
+        match self {
+            Self::Command(text) => text,
+            Self::Environment(_) => environment::LABEL,
+        }
+    }
+
+    fn command(&self) -> Option<&str> {
+        match self {
+            Self::Command(text) => Some(text),
+            Self::Environment(_) => None,
+        }
+    }
+
+    fn host_command(&self, pane: u64) -> Option<&str> {
+        match self {
+            Self::Command(_) => None,
+            Self::Environment(commands) => commands.get(&pane).map(AsRef::as_ref),
+        }
+    }
 }
 
 impl HostGroup {
@@ -105,7 +135,14 @@ enum TargetState {
 
 impl TargetState {
     fn is_ready(self) -> bool {
-        matches!(self, Self::Ready(_) | Self::Matched(_))
+        self.prompt().is_some()
+    }
+
+    fn prompt(self) -> Option<PromptToken> {
+        match self {
+            Self::Ready(prompt) | Self::Matched(prompt) => Some(prompt),
+            _ => None,
+        }
     }
 
     fn label(self) -> &'static str {
@@ -275,16 +312,23 @@ impl HostGroup {
         })
     }
 
-    fn submit(&mut self, text: Arc<str>, results: Vec<Delivery>, transcript: GroupTranscript) {
+    fn submit(
+        &mut self,
+        content: SubmissionContent,
+        results: Vec<Delivery>,
+        transcript: GroupTranscript,
+    ) {
         self.next_submission += 1;
         self.viewing = self.next_submission;
         self.result_filter = progress::Filter::All;
-        self.previous_draft = None;
+        if content.command().is_some() {
+            self.previous_draft = None;
+        }
         self.copy_feedback.clear();
         self.retry_feedback.clear();
         self.submissions.push_back(Submission {
             id: self.viewing,
-            text,
+            content,
             results,
             transcript,
         });
@@ -303,10 +347,13 @@ impl HostGroup {
     }
 
     fn load_command(&mut self, id: u64) -> bool {
-        let Some(command) = self.viewed_submission(id).map(|item| item.text.to_string()) else {
+        let Some(command) = self
+            .viewed_submission(id)
+            .and_then(|item| item.content.command())
+        else {
             return false;
         };
-        self.load_draft(command);
+        self.load_draft(command.to_owned());
         true
     }
 
@@ -361,6 +408,7 @@ pub enum Action {
     PrepareRetry(TabId, u64, BTreeSet<u64>),
     PromptSetup(TabId, prompt_setup::Action),
     Transfer(TabId, transfer::Action),
+    Environment(TabId, environment::Action),
     OpenSavedCommands(TabId),
     LoadSavedCommand(TabId, w11term::saved_commands::Entry),
     SaveCommand(TabId, save_command::Action),
@@ -425,7 +473,8 @@ impl TerminalApp {
                     && !page.edit_membership_open()
                     && !page.saved.reuse.is_open()
                     && !page.prompt_setup.is_open()
-                    && !page.transfer.is_open() =>
+                    && !page.transfer.is_open()
+                    && !page.environment.is_open() =>
             {
                 Some(id)
             }
@@ -698,6 +747,7 @@ impl TerminalApp {
             Action::HostListExport(id, action) => self.handle_host_list_export(id, action, ctx),
             Action::RecipientSets(id, action) => self.handle_recipient_sets(id, action),
             Action::Transfer(id, action) => self.handle_host_group_transfer(id, action, ctx),
+            Action::Environment(id, action) => self.handle_host_group_environment(id, action),
             Action::Tick => {
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
@@ -914,7 +964,7 @@ impl TerminalApp {
                     .map(|target| self.dispatch_to_host(target, text.clone(), &transcript))
                     .collect();
                 if let Some(page) = self.host_group_mut(id) {
-                    page.submit(text, results, transcript);
+                    page.submit(SubmissionContent::Command(text), results, transcript);
                 }
             }
         }
@@ -954,6 +1004,11 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &ViewContext<Self>,
     ) -> View {
+        if page.environment.is_open() {
+            return page
+                .environment
+                .view(id, page, &self.host_group_targets(), ctx);
+        }
         if let Some(view) = page.transfer.view(id, ctx) {
             return view;
         }
@@ -1177,6 +1232,7 @@ impl TerminalApp {
                     },
                     host_list_export::button(id, &selected, ctx),
                 )),
+            environment::button(id, page, &selected, ctx),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
             "Enter one command line of up to 4096 bytes.".into()
@@ -1327,7 +1383,7 @@ impl TerminalApp {
             StackPanel::new().spacing(4.0).children((
                 TextBlock::new()
                     .font_size(18.0)
-                    .text(format!("Submitted · {}", submission.text))
+                    .text(format!("Submitted · {}", submission.content.label()))
                     .text_trimming(TextTrimming::CharacterEllipsis),
                 TextBlock::new()
                     .text(summary.caption())
@@ -1355,11 +1411,15 @@ impl TerminalApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
                     .children((
-                        Button::new()
-                            .on_click(ctx.callback(move |_| {
-                                Message::HostGroup(Action::LoadCommand(id, submission_id))
-                            }))
-                            .content("Load command"),
+                        if submission.content.command().is_some() {
+                            Button::new()
+                                .on_click(ctx.callback(move |_| {
+                                    Message::HostGroup(Action::LoadCommand(id, submission_id))
+                                }))
+                                .content("Load command")
+                        } else {
+                            View::empty()
+                        },
                         Button::new()
                             .on_click(ctx.callback(move |_| {
                                 Message::HostGroup(Action::CopyResults(id, submission_id))
@@ -1433,7 +1493,7 @@ impl TerminalApp {
         details.extend(shown.into_iter().map(|delivery| {
             KeyedView::new(
                 format!("delivery-{}-{}", submission.id, delivery.target.pane),
-                self.host_group_result_row(id, delivery, ctx),
+                self.host_group_result_row(id, delivery, &submission.content, ctx),
             )
         }));
     }
@@ -1442,6 +1502,7 @@ impl TerminalApp {
         &self,
         id: TabId,
         delivery: &Delivery,
+        content: &SubmissionContent,
         ctx: &ViewContext<Self>,
     ) -> View {
         let pane = delivery.target.pane;
@@ -1451,6 +1512,14 @@ impl TerminalApp {
                 .text(delivery.description())
                 .text_wrapping(TextWrapping::Wrap),
         )];
+        if let Some(command) = content.host_command(pane) {
+            rows.push(KeyedView::new(
+                "command",
+                TextBlock::new()
+                    .text(command)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         if let Some(result) = delivery.execution() {
             let name = &delivery.target.name;
             let caption = execution_caption(&result);
@@ -1604,7 +1673,7 @@ mod tests {
         let mut group = HostGroup::default();
         for id in 1..=10 {
             group.submit(
-                format!("command {id}").into(),
+                SubmissionContent::Command(format!("command {id}").into()),
                 Vec::new(),
                 GroupTranscript::default(),
             );
@@ -1623,12 +1692,12 @@ mod tests {
         };
         group.filter.set_query("east".into());
         group.submit(
-            "show  inventory".into(),
+            SubmissionContent::Command("show  inventory".into()),
             Vec::new(),
             GroupTranscript::default(),
         );
         group.submit(
-            "show revision".into(),
+            SubmissionContent::Command("show revision".into()),
             Vec::new(),
             GroupTranscript::default(),
         );
@@ -1650,7 +1719,7 @@ mod tests {
         assert!(!group.restore_draft());
         assert!(group.load_command(2));
         group.submit(
-            "show revision".into(),
+            SubmissionContent::Command("show revision".into()),
             Vec::new(),
             GroupTranscript::default(),
         );
