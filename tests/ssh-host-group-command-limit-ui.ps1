@@ -39,21 +39,34 @@ function Run-Snapshot([uint64]$Run) {
 }
 function Select-GroupOption([string]$Name, [string]$Label) {
     $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $listItem = [System.Windows.Automation.ControlType]::ListItem
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $field = Wait-Until "enabled '$Name'" { $entry = Find-Element $Name $combo; if ($entry -and $entry.Current.IsEnabled) { $entry } }
-    $popup = $field.GetCurrentPattern($expand)
-    $popup.Expand()
-    $option = Wait-Until "visible option '$Label'" {
-        Find-Element $Label ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $option.GetCurrentPattern($item).Select()
+    $selection = [System.Windows.Automation.SelectionPattern]::Pattern
     $null = Wait-Until "'$Name' selected '$Label'" {
-        $entry = Find-Element $Name $combo
-        $selected = $entry.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
-        $selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Label
+        try {
+            $field = Find-Element $Name $combo -Visible
+            $selected = $null
+            if (!$field -or !$field.Current.IsEnabled -or
+                !$field.TryGetCurrentPattern($selection, [ref]$selected)) { return }
+            $current = $selected.Current.GetSelection()
+            if ($current.Count -eq 1 -and $current[0].Current.Name -ceq $Label) { return $true }
+
+            # A deferred focus or roster update can dismiss the first popup.
+            $popup = $null
+            if (!$field.TryGetCurrentPattern($expand, [ref]$popup)) { return }
+            if ($popup.Current.ExpandCollapseState -eq 'Collapsed') { $popup.Expand() }
+            $option = Find-Element $Label $listItem -Visible
+            $choice = $null
+            if ($option -and $option.Current.IsEnabled -and
+                $option.TryGetCurrentPattern($item, [ref]$choice)) { $choice.Select() }
+        } catch {
+            if ($_.Exception.GetBaseException() -isnot [System.Windows.Automation.ElementNotAvailableException]) { throw }
+        }
     }
-    $popup = (Find-Element $Name $combo).GetCurrentPattern($expand)
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    $field = Find-Element $Name $combo -Visible
+    $popup = $null
+    if ($field -and $field.TryGetCurrentPattern($expand, [ref]$popup) -and
+        $popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
 }
 
 $launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '--rows', '36')
@@ -314,6 +327,9 @@ try {
     }
     Click "Unread${dot}$group${dot}Run 5${dot}Group run finished${dot}2 succeeded${dot}0 need attention"
     $canaryPolicy = "Dispatch${dot}unlimited parallel${dot}no delay${dot}canary $($labels.East)"
+    $null = Wait-Until 'the completion alert returns to the canary run' {
+        (Find-Element "Submitted${dot}canary-ok") -and (Find-Element $canaryPolicy)
+    }
     Select-GroupOption 'Time between sends' '1 second'
     $null = Wait-Until 'changing the draft interval leaves the completed canary policy intact' {
         Find-Element $canaryPolicy
