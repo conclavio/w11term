@@ -182,6 +182,7 @@ $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $readyJob = $null
+$explicitReadyJob = $null
 $outputJob = $null
 $followJob = $null
 $followReader = $null
@@ -2004,8 +2005,33 @@ try {
     if ($LASTEXITCODE -eq 0 -or $notReady.ok -or $notReady.error -notlike "*SSH pane $west*not ready*") {
         throw 'The CLI accepted a submission while one of its explicitly named SSH panes was unready'
     }
+    $outsideReady = & $Cli --pid $app.Id @readyArgs --pane $local --timeout 15 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $outsideReady.ok -or $outsideReady.error -notlike "*Requested SSH pane $local*outside*") {
+        throw 'The explicit readiness wait accepted a pane outside the SSH roster'
+    }
+    $explicitOutput = Join-Path $State 'wait-explicit-group-ready.json'
+    $explicitArgs = $readyArgs + @('--pane',"$west",'--pane',"$east",'--timeout','15')
+    $explicitReadyJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $explicitArgs) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $explicitOutput
+    (Wait-CheckBox $westName On).Toggle()
+    Set-HostFilter 'east'
+    $null = Wait-Until 'the roster hides and unchecks West while a CLI wait is pending' {
+        $hidden = (Roster-Snapshot).hosts | Where-Object pane_id -eq $west
+        $hidden -and !$hidden.shown -and !$hidden.checked -and $hidden.state -ceq 'alternate'
+    }
+    if ($explicitReadyJob.HasExited) { throw 'The explicit wait ended while a requested pane was unready' }
     Send-Raw $west 'prompt'
+    if (!$explicitReadyJob.WaitForExit(10000)) { throw 'The explicit readiness wait did not finish' }
+    $explicit = [IO.File]::ReadAllText($explicitOutput) | ConvertFrom-Json
+    $hiddenReady = $explicit.result.roster.hosts | Where-Object pane_id -eq $west
+    if (!$explicit.ok -or ($explicit.result.ready_pane_ids -join ',') -cne "$west,$east" -or
+        $hiddenReady.shown -or $hiddenReady.checked -or $hiddenReady.state -cne 'ready') {
+        throw 'The explicit readiness wait followed the UI selection or lost its requested pane order'
+    }
+    Set-HostFilter ''
     Pane-Status $west "Connected${dot}Ready"
+    (Wait-CheckBox $westName Off).Toggle()
+    $null = Wait-CheckBox $westName On
     (Command-Editor).SetValue('untouched command draft')
     Set-HostFilter 'east'
     $beforeSubmit = Wait-Until 'the East filter is committed before leaving the group' {
@@ -2176,6 +2202,10 @@ try {
     if ($readyJob) {
         if (!$readyJob.HasExited) { $readyJob.Kill(); $readyJob.WaitForExit() }
         $readyJob.Dispose()
+    }
+    if ($explicitReadyJob) {
+        if (!$explicitReadyJob.HasExited) { $explicitReadyJob.Kill(); $explicitReadyJob.WaitForExit() }
+        $explicitReadyJob.Dispose()
     }
     if ($logReader) { $logReader.Dispose() }
     if ($explorer) {

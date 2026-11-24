@@ -224,13 +224,19 @@ checked hosts meet the group's `require_all_ready` prompt rule. The Send
 button also depends on the current draft and review.
 The query leaves the group's selection and window focus in place.
 
-`wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]` returns the
-same roster snapshot when every initially checked, shown host has a verified
-prompt. It always requires all of those hosts, including when partial sends
-are enabled for the group. Use a roster filter that keeps the intended hosts
-shown as their state changes. A changed checked-and-shown set, empty scope,
-closed tab, or timeout returns an error. The wait defaults to 30 seconds and
-accepts 1 through 3600. It can complete with the roster in the background.
+`wait-ssh-group-ready --window ID --tab ID [--pane ID ...] [--timeout SECONDS]`
+returns the roster once every selected recipient has a verified prompt.
+With repeated `--pane` flags, it waits for those distinct panes in the
+group's roster scope even if the UI hides or unchecks them. A pane outside
+the scope, including one that leaves during the wait, returns an error.
+The explicit reply adds `ready_pane_ids` in request order. The roster's
+selection fields still describe its current UI state.
+
+Omit `--pane` to wait for the initially checked, shown hosts. An empty or
+changed checked-and-shown set returns an error in this mode. Both modes
+require every requested prompt, including when the group allows partial
+sends. A closed tab or timeout returns an error. The wait defaults to
+30 seconds, accepts 1 through 3600, and works in the background.
 
 Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `recipient_count`, `settled_count`, and `outcomes` counts for `waiting`,
@@ -387,6 +393,7 @@ w11term-cli --pid 12345 list-saved-ssh-groups --window 1
 w11term-cli --pid 12345 open-ssh-group --window 1 --name "Fleet Ops"
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
+w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --pane 17 --pane 19 --timeout 60
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 -- "uname -a"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --expect-output '^READY$' --regex --match-case -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
@@ -407,6 +414,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"open-ssh-group","window_id":1,"name":"Fleet Ops"}
 {"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
+{"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"pane_ids":[17,19],"timeout_seconds":60}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"uname -a"}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","expect_output":{"query":"^READY$","regex":true,"match_case":true}}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}

@@ -1,7 +1,8 @@
 use super::*;
 use serde_json::{Value, json};
 use w11term::control::{
-    SshGroupCommandOptions, SshGroupOutput, SshGroupReportFormat, SshGroupReportWriter,
+    SshGroupCommandOptions, SshGroupOutput, SshGroupReadiness, SshGroupReportFormat,
+    SshGroupReportWriter,
 };
 use w11term::events::GroupCompletionState;
 
@@ -16,53 +17,80 @@ pub struct PreparedControlRecording {
 }
 
 pub(super) struct ReadinessWait {
-    checked: BTreeSet<u64>,
+    panes: BTreeSet<u64>,
+    explicit: bool,
     reply: ControlReply,
 }
 
-fn all_checked_ready(checked: &BTreeSet<u64>, targets: &[Target]) -> bool {
-    !checked.is_empty()
-        && targets
+impl ReadinessWait {
+    fn outcome(
+        &self,
+        checked: &BTreeSet<u64>,
+        scoped: &BTreeMap<u64, bool>,
+    ) -> Option<Result<(), String>> {
+        if self.explicit {
+            if let Some(pane) = self.panes.iter().find(|pane| !scoped.contains_key(pane)) {
+                return Some(Err(format!(
+                    "Requested SSH pane {pane} is outside this group's roster"
+                )));
+            }
+        } else if self.panes != *checked {
+            return Some(Err(
+                "The checked, shown SSH hosts changed during the readiness wait".into(),
+            ));
+        }
+        self.panes
             .iter()
-            .filter(|target| target.state.is_ready() && checked.contains(&target.pane))
-            .count()
-            == checked.len()
+            .all(|pane| scoped.get(pane) == Some(&true))
+            .then_some(Ok(()))
+    }
 }
 
 impl HostGroup {
-    fn wait_for_readiness(&mut self, label: &str, targets: &[Target], reply: ControlReply) {
-        let checked = self.selected_shown(targets);
-        if checked.is_empty() {
+    fn wait_for_readiness(
+        &mut self,
+        label: &str,
+        targets: &[Target],
+        scope: SshGroupReadiness,
+        reply: ControlReply,
+    ) {
+        let (panes, explicit) = match scope {
+            SshGroupReadiness::CheckedShown => (self.selected_shown(targets), false),
+            SshGroupReadiness::Panes(panes) => (panes.into_iter().collect(), true),
+        };
+        if panes.is_empty() {
             let _ = reply.send(Err("No checked, shown SSH hosts in this group".into()));
-        } else if all_checked_ready(&checked, targets) {
-            let _ = reply.send(Ok(roster_report::roster_json(label, self, targets)));
         } else {
-            self.ready_waiters.push(ReadinessWait { checked, reply });
+            self.ready_waiters.push(ReadinessWait {
+                panes,
+                explicit,
+                reply,
+            });
+            self.poll_readiness_waiters(label, targets);
         }
     }
 
     fn poll_readiness_waiters(&mut self, label: &str, targets: &[Target]) {
         let checked = self.selected_shown(targets);
-        let ready = all_checked_ready(&checked, targets);
-        let finished: Vec<_> = self
-            .ready_waiters
-            .extract_if(.., |wait| {
-                wait.reply.is_closed() || wait.checked != checked || ready
-            })
+        let scoped = self
+            .scoped_targets(targets)
+            .map(|target| (target.pane, target.state.is_ready()))
             .collect();
         let mut snapshot = None;
-        for wait in finished {
+        for wait in std::mem::take(&mut self.ready_waiters) {
             if wait.reply.is_closed() {
                 continue;
             }
-            let result = if wait.checked != checked {
-                Err("The checked, shown SSH hosts changed during the readiness wait".into())
+            if let Some(result) = wait.outcome(&checked, &scoped) {
+                let result = result.map(|()| {
+                    snapshot
+                        .get_or_insert_with(|| roster_report::roster_json(label, self, targets))
+                        .clone()
+                });
+                let _ = wait.reply.send(result);
             } else {
-                Ok(snapshot
-                    .get_or_insert_with(|| roster_report::roster_json(label, self, targets))
-                    .clone())
-            };
-            let _ = wait.reply.send(result);
+                self.ready_waiters.push(wait);
+            }
         }
     }
 }
@@ -268,7 +296,7 @@ impl TerminalApp {
     pub(in crate::app) fn control_ssh_group_roster(
         &mut self,
         tab: TabId,
-        wait_for_readiness: bool,
+        readiness: Option<SshGroupReadiness>,
         reply: ControlReply,
     ) {
         let targets = self.host_group_targets();
@@ -280,8 +308,8 @@ impl TerminalApp {
             let _ = reply.send(Err(format!("unknown SSH group tab {tab} in this window")));
             return;
         };
-        if wait_for_readiness {
-            page.wait_for_readiness(label, &targets, reply);
+        if let Some(readiness) = readiness {
+            page.wait_for_readiness(label, &targets, readiness, reply);
         } else {
             let _ = reply.send(Ok(roster_report::roster_json(label, page, &targets)));
         }
@@ -460,7 +488,7 @@ mod tests {
         let targets = [target(1, "East"), target(2, "West")];
         let mut group = HostGroup::default();
         let (empty, mut empty_reply) = oneshot::channel();
-        group.wait_for_readiness("Fleet", &targets, empty);
+        group.wait_for_readiness("Fleet", &targets, SshGroupReadiness::CheckedShown, empty);
         assert!(
             empty_reply
                 .try_recv()
@@ -472,8 +500,13 @@ mod tests {
         group.selected = BTreeSet::from([1, 2]);
         let (reply, mut result) = oneshot::channel();
         let (cancelled, dropped_reply) = oneshot::channel();
-        group.wait_for_readiness("Fleet", &targets, reply);
-        group.wait_for_readiness("Fleet", &targets, cancelled);
+        group.wait_for_readiness("Fleet", &targets, SshGroupReadiness::CheckedShown, reply);
+        group.wait_for_readiness(
+            "Fleet",
+            &targets,
+            SshGroupReadiness::CheckedShown,
+            cancelled,
+        );
         drop(dropped_reply);
         group.poll_readiness_waiters("Fleet", &targets);
         assert!(matches!(result.try_recv(), Err(TryRecvError::Empty)));
@@ -490,6 +523,42 @@ mod tests {
         );
         assert_eq!(group.selected, BTreeSet::from([1, 2]));
         assert!(group.ready_waiters.is_empty());
+    }
+
+    #[test]
+    fn explicit_readiness_survives_selection_changes_until_a_pane_leaves_the_roster() {
+        let west = Target {
+            pane: 7,
+            name: "West".into(),
+            names: filter::Names::default(),
+            profile: Some("West".into()),
+            connected: true,
+            state: TargetState::Unverified,
+        };
+        let mut group = HostGroup::default();
+        group.roster = Some(Box::new(MemberRoster {
+            panes: BTreeSet::from([7]),
+            ..Default::default()
+        }));
+        group.selected.insert(7);
+        let (reply, mut result) = oneshot::channel();
+        group.wait_for_readiness(
+            "Fleet",
+            std::slice::from_ref(&west),
+            SshGroupReadiness::Panes(vec![7]),
+            reply,
+        );
+        group.selected.clear();
+        group.filter.set_query("East".into());
+        group.poll_readiness_waiters("Fleet", std::slice::from_ref(&west));
+        assert!(matches!(result.try_recv(), Err(TryRecvError::Empty)));
+
+        group.roster.as_mut().unwrap().panes.clear();
+        group.poll_readiness_waiters("Fleet", &[west]);
+        assert_eq!(
+            result.try_recv().unwrap().unwrap_err(),
+            "Requested SSH pane 7 is outside this group's roster"
+        );
     }
 
     #[test]

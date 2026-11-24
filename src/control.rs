@@ -103,6 +103,8 @@ pub enum Request {
     WaitSshGroupReady {
         window_id: WindowId,
         tab_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_ids: Option<Vec<u64>>,
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
@@ -244,7 +246,7 @@ pub enum UiRequest {
     },
     GetSshGroupRoster {
         tab_id: u64,
-        wait_for_readiness: bool,
+        readiness: Option<SshGroupReadiness>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     SubmitSshGroupCommand {
@@ -311,11 +313,11 @@ impl UiRequest {
     }
 }
 
-pub use ssh_groups::validate_group_submission;
 pub use ssh_groups::{
-    SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput, SshGroupReportFormat,
-    SshGroupReportWriter,
+    SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput, SshGroupReadiness,
+    SshGroupReportFormat, SshGroupReportWriter,
 };
+pub use ssh_groups::{validate_group_panes, validate_group_submission};
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -580,16 +582,24 @@ impl Registry {
             Request::WaitSshGroupReady {
                 window_id,
                 tab_id,
+                pane_ids,
                 timeout_seconds,
             } => {
                 ensure!(
                     (1..=3600).contains(&timeout_seconds),
                     "SSH group wait timeout must be 1..=3600 seconds"
                 );
+                let readiness = match pane_ids {
+                    Some(panes) => {
+                        validate_group_panes(&panes)?;
+                        SshGroupReadiness::Panes(panes)
+                    }
+                    None => SshGroupReadiness::CheckedShown,
+                };
                 self.query_ssh_group_roster(
                     window_id,
                     tab_id,
-                    Some(Duration::from_secs(timeout_seconds)),
+                    Some((Duration::from_secs(timeout_seconds), readiness)),
                 )
                 .await
             }

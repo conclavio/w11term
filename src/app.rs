@@ -5395,12 +5395,13 @@ impl Component for TerminalApp {
             }
             Message::Control(w11term::control::UiRequest::GetSshGroupRoster {
                 tab_id,
-                wait_for_readiness,
+                readiness,
                 reply,
             }) => {
                 if !reply.is_closed() {
-                    self.control_ssh_group_roster(tab_id, wait_for_readiness, reply);
-                    if wait_for_readiness {
+                    let waiting = readiness.is_some();
+                    self.control_ssh_group_roster(tab_id, readiness, reply);
+                    if waiting {
                         self.update_host_group_timer(context);
                     }
                 }

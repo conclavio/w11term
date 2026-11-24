@@ -34,6 +34,12 @@ pub struct SshGroupCommandOptions {
     pub record_output: Option<PathBuf>,
 }
 
+#[derive(Debug)]
+pub enum SshGroupReadiness {
+    CheckedShown,
+    Panes(Vec<u64>),
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SshGroupReportFormat {
@@ -119,6 +125,10 @@ pub fn validate_group_submission(pane_ids: &[u64], command: &str) -> Result<()> 
         crate::saved_commands::valid_command_text(command),
         "provide one nonempty shell command line of up to 4096 UTF-8 bytes"
     );
+    validate_group_panes(pane_ids)
+}
+
+pub fn validate_group_panes(pane_ids: &[u64]) -> Result<()> {
     ensure!(
         !pane_ids.is_empty(),
         "provide at least one explicit SSH pane ID"
@@ -228,21 +238,31 @@ impl Registry {
         &self,
         window: WindowId,
         tab: u64,
-        wait_for: Option<Duration>,
+        wait_for: Option<(Duration, SshGroupReadiness)>,
     ) -> Result<Value> {
-        let deadline = Instant::now() + wait_for.unwrap_or(TIMEOUT);
+        let (timeout, readiness) =
+            wait_for.map_or((TIMEOUT, None), |(timeout, scope)| (timeout, Some(scope)));
+        let deadline = Instant::now() + timeout;
+        let waiting = readiness.is_some();
+        let panes = match &readiness {
+            Some(SshGroupReadiness::Panes(panes)) => Some(panes.clone()),
+            _ => None,
+        };
         let (reply, response) = oneshot::channel();
         self.window_ui(window)?(UiRequest::GetSshGroupRoster {
             tab_id: tab,
-            wait_for_readiness: wait_for.is_some(),
+            readiness,
             reply,
         });
-        let roster = if wait_for.is_some() {
+        let roster = if waiting {
+            let timeout_error = if panes.is_some() {
+                "wait-ssh-group-ready timed out before all requested SSH panes were ready"
+            } else {
+                "wait-ssh-group-ready timed out before all checked, shown hosts were ready"
+            };
             tokio::time::timeout_at(deadline, response)
                 .await
-                .context(
-                    "wait-ssh-group-ready timed out before all checked, shown hosts were ready",
-                )?
+                .context(timeout_error)?
                 .with_context(|| {
                     format!(
                         "SSH group tab {tab} in window {window} closed during the readiness wait"
@@ -252,7 +272,11 @@ impl Registry {
         } else {
             receive(window, response, deadline).await?
         };
-        Ok(json!({ "window_id": window, "tab_id": tab, "roster": roster }))
+        let mut result = json!({ "window_id": window, "tab_id": tab, "roster": roster });
+        if let Some(panes) = panes {
+            result["ready_pane_ids"] = json!(panes);
+        }
+        Ok(result)
     }
 
     pub(super) async fn list_ssh_groups(&self) -> Result<Value> {
@@ -771,11 +795,13 @@ mod tests {
             }
             UiRequest::GetSshGroupRoster {
                 tab_id,
-                wait_for_readiness,
+                readiness,
                 reply,
             } => {
                 assert_eq!(tab_id, 9);
-                assert!(!wait_for_readiness);
+                if let Some(scope) = readiness {
+                    assert!(matches!(scope, SshGroupReadiness::Panes(panes) if panes == [8, 7]));
+                }
                 reply
                     .send(Ok(json!({ "hosts": [{ "pane_id": 7 }] })))
                     .unwrap();
@@ -879,6 +905,15 @@ mod tests {
             second.query_ssh_group_roster(3, 9, None).await.unwrap(),
             json!({ "window_id": 3, "tab_id": 9, "roster": { "hosts": [{ "pane_id": 7 }] } })
         );
+        let explicit = second
+            .query_ssh_group_roster(
+                3,
+                9,
+                Some((Duration::from_secs(1), SshGroupReadiness::Panes(vec![8, 7]))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(explicit["ready_pane_ids"], json!([8, 7]));
         first.unregister().unwrap();
         assert_eq!(
             second

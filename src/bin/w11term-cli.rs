@@ -414,6 +414,7 @@ mod tests {
                 Request::WaitSshGroupReady {
                     window_id: 11,
                     tab_id: 12,
+                    pane_ids: None,
                     timeout_seconds: 4
                 }
             )
@@ -427,6 +428,11 @@ mod tests {
                     ..
                 }
             )
+        ));
+        assert!(matches!(
+            parse_line("wait-ssh-group-ready --window 11 --tab 12 --pane 8 --pane 3 --timeout 4").unwrap(),
+            (None, Request::WaitSshGroupReady { window_id: 11, tab_id: 12, pane_ids: Some(panes), timeout_seconds: 4 })
+                if panes == [8, 3]
         ));
         assert!(matches!(
             parse_line("wait-ssh-group-run --window 11 --tab 12 --run 4 --timeout 7").unwrap(),
@@ -485,6 +491,8 @@ mod tests {
             "get-ssh-group-roster --window 2 --tab 3 --run 1",
             "get-ssh-group-roster --window 2 --tab 3 --pane 1",
             "wait-ssh-group-ready --window 2 --tab 3 --run 1",
+            "wait-ssh-group-ready --window 2 --tab 3 --pane 0",
+            "wait-ssh-group-ready --window 2 --tab 3 --pane 8 --pane 8",
             "wait-ssh-group-ready --window 2 --tab 3 --timeout 0",
             "wait-ssh-group-ready --window 2 --tab 3 --timeout 3601",
             "get-ssh-group-run --window 2 --tab 3",
