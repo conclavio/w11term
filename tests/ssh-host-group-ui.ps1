@@ -2008,6 +2008,13 @@ try {
     Pane-Status $west "Connected${dot}Ready"
     (Command-Editor).SetValue('untouched command draft')
     Set-HostFilter 'east'
+    $beforeSubmit = Wait-Until 'the East filter is committed before leaving the group' {
+        $roster = Roster-Snapshot
+        if (($roster.hosts | Where-Object shown).pane_id -eq $east -and $roster.counts.shown -eq 1) { $roster }
+    }
+    $null = Wait-Until 'the command draft is committed before leaving the group' {
+        (Command-Editor).Current.Value -ceq 'untouched command draft'
+    }
     Press-Key 0x77
     Wait-Focus $east
     $submitForeground = [FixtureMessages]::GetForegroundWindow()
@@ -2025,10 +2032,15 @@ try {
     }
     Wait-Focus $east
     Run-Palette 'SSH host group'
-    $null = Wait-Until 'background submission preserved the displayed results and draft' {
-        (Find-Element "Submitted${dot}check-each-host") -and
-            (Command-Editor).Current.Value -ceq 'untouched command draft' -and
-            (Find-Element "Focus pane $east" $button) -and !(Find-Element "Focus pane $west" $button)
+    $null = Wait-Until 'background submission preserved the displayed results' {
+        Find-Element "Submitted${dot}check-each-host"
+    }
+    $draft = (Command-Editor).Current.Value
+    if ($draft -cne 'untouched command draft') { throw "The background send changed the draft to '$draft'" }
+    $afterSubmit = Roster-Snapshot
+    if (($afterSubmit.hosts | Where-Object shown).pane_id -ne $east -or $afterSubmit.counts.shown -ne 1 -or
+        $afterSubmit.counts.checked -ne $beforeSubmit.counts.checked) {
+        throw 'The background send changed the roster filter or checked hosts'
     }
     Set-HostFilter ''
     Click 'Previous submission'
