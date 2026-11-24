@@ -357,6 +357,17 @@ try {
         $copy -and !$copy.Current.IsEnabled -and
             (Find-Element "Newest first${dot}0 of 2 retained lines") -and !(Find-Element 'east-accepted both')
     }
+    $outputRegex = 'Regular expression in live output'
+    $outputCase = 'Match case in live output'
+    (Wait-CheckBox $outputRegex Off).Toggle()
+    $null = Wait-CheckBox $outputRegex On
+    (Command-Editor $outputSearch).SetValue('(')
+    $null = Wait-Until 'an invalid pattern shows a diagnostic and disables both exports' {
+        $copy = Find-Element 'Copy shown output' $button
+        $save = Find-Element ('Save shown output' + [char]0x2026) $button
+        $copy -and !$copy.Current.IsEnabled -and $save -and !$save.Current.IsEnabled -and
+            (Find-Element "Live output search${dot}unclosed group")
+    }
     Click 'Pause output'
     $null = Wait-Until 'output is paused' { Find-Element 'Resume output' $button }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-paused'), '')
@@ -364,7 +375,7 @@ try {
     $null = Wait-Until 'the recorder keeps writing while the display is paused' {
         [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains("$westName$($dot)west while paused")
     }
-    (Command-Editor $outputSearch).SetValue('WHILE')
+    (Command-Editor $outputSearch).SetValue('^WEST WHILE (PAUSED|AWAY)$')
     $until = [DateTime]::UtcNow.AddMilliseconds(650)
     do {
         if ((Find-Element 'west while paused') -or
@@ -377,6 +388,14 @@ try {
     $null = Wait-Until 'matching output received while paused is available on resume' {
         (Find-Element "Newest first${dot}1 of 3 retained lines") -and
             (Find-Element 'west while paused') -and !(Find-Element 'west live first')
+    }
+    (Wait-CheckBox $outputCase Off).Toggle()
+    $null = Wait-Until 'matching case excludes the lowercase live output' {
+        (Find-Element "Newest first${dot}0 of 3 retained lines") -and !(Find-Element 'west while paused')
+    }
+    (Wait-CheckBox $outputCase On).Toggle()
+    $null = Wait-Until 'disabling match case restores the live output match' {
+        (Find-Element "Newest first${dot}1 of 3 retained lines") -and (Find-Element 'west while paused')
     }
     Click "Focus output pane $west"
     Wait-Focus $west
@@ -408,6 +427,8 @@ try {
         (Find-Element 'east-accepted both') -and (Find-Element 'west live first') -and
             (Find-Element 'Newest first')
     }
+    $null = Wait-CheckBox $outputRegex Off
+    $null = Wait-CheckBox $outputCase Off
     Click 'Stop recording'
     $firstRecordedPath = Wait-RecordingStatus 'Saved live output to ' $logFile -PassThru
     $logReader.Dispose()

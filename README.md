@@ -157,7 +157,7 @@ While a verified command runs, its result shows elapsed time. On completion it s
 
 Choose **Live output…** on a submission to follow recent output from all its hosts, newest first. Each line identifies its source and lets you focus that pane. **Pause output** freezes the view while the shells continue, and **Resume output** catches up to the newest retained lines. The feed keeps 128 lines per submission and marks skipped or shortened output. It shows completed text lines from verified shell markers and the final line when the command ends. For prompt-only appliances or a full transcript, open the source pane or its command history.
 
-Use **Find in live output** for a literal, case-insensitive text search and the host dropdown to narrow the retained lines to one SSH pane. The view shows the number of matching lines and keeps the filters when you pause, resume, or visit an originating pane. **Clear output filters** restores all retained lines.
+**Find in live output** starts with case-insensitive literal search. Turn on **Regular expression** to match a pattern against each retained line or **Match case** to distinguish uppercase from lowercase. Use the host dropdown to narrow the results to one SSH pane. The view keeps the filters when you pause, resume, or visit an originating pane. An invalid pattern shows a diagnostic and disables export until corrected. **Clear output filters** restores all retained lines and the default search options.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.
 

@@ -1,9 +1,9 @@
 use super::*;
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
 use std::{collections::BTreeMap, fmt::Write as _, io::Write as _};
 use w11term::{
     events::{GroupTranscriptLine, GroupTranscriptSnapshot},
-    search::MAX_QUERY_BYTES,
+    search::{MAX_QUERY_BYTES, compile_regex},
 };
 
 #[derive(Clone)]
@@ -13,6 +13,8 @@ pub enum Action {
     Pause,
     Resume,
     Search(String),
+    UseRegex(bool),
+    MatchCase(bool),
     FilterHost(Option<u64>),
     ClearFilters,
     CopyShown,
@@ -29,38 +31,59 @@ pub(super) struct State {
 #[derive(Default)]
 struct Filter {
     query: String,
-    matcher: Option<Regex>,
+    matcher: Option<Result<Regex, String>>,
+    regex: bool,
+    sensitive: bool,
     pane: Option<u64>,
 }
 
 impl Filter {
-    fn set_query(&mut self, mut query: String) {
-        query.truncate(query.floor_char_boundary(query.len().min(MAX_QUERY_BYTES)));
-        if self.query == query {
+    fn configure(&mut self, query: String, regex: bool, sensitive: bool) {
+        if (self.query.as_str(), self.regex, self.sensitive) == (query.as_str(), regex, sensitive) {
             return;
         }
         self.matcher = if query.is_empty() {
             None
+        } else if query.len() > MAX_QUERY_BYTES {
+            Some(Err(format!(
+                "Search text exceeds {MAX_QUERY_BYTES} UTF-8 bytes"
+            )))
         } else {
-            RegexBuilder::new(&regex::escape(&query))
-                .case_insensitive(true)
-                .build()
-                .ok()
+            let pattern = if regex {
+                Cow::Borrowed(query.as_str())
+            } else {
+                Cow::Owned(regex::escape(&query))
+            };
+            Some(compile_regex(&pattern, sensitive))
         };
         self.query = query;
+        self.regex = regex;
+        self.sensitive = sensitive;
+    }
+
+    fn set_query(&mut self, query: String) {
+        self.configure(query, self.regex, self.sensitive);
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.matcher.as_ref()?.as_ref().err().map(String::as_str)
+    }
+
+    fn filters_lines(&self) -> bool {
+        self.pane.is_some() || self.matcher.is_some()
     }
 
     fn active(&self) -> bool {
-        self.pane.is_some() || !self.query.is_empty()
+        self.filters_lines() || self.regex || self.sensitive
     }
 
     fn includes(&self, line: &GroupTranscriptLine) -> bool {
         self.pane.is_none_or(|pane| pane == line.pane)
-            && (self.query.is_empty()
-                || self
-                    .matcher
+            && self.matcher.as_ref().is_none_or(|result| {
+                result
                     .as_ref()
-                    .is_some_and(|query| query.is_match(&line.text)))
+                    .is_ok_and(|pattern| pattern.is_match(&line.text))
+            })
     }
 }
 
@@ -178,6 +201,16 @@ impl HostGroup {
             }
             Action::Resume => output.paused = None,
             Action::Search(query) => output.filter.set_query(query),
+            Action::UseRegex(regex) => {
+                output
+                    .filter
+                    .configure(output.filter.query.clone(), regex, output.filter.sensitive)
+            }
+            Action::MatchCase(sensitive) => {
+                output
+                    .filter
+                    .configure(output.filter.query.clone(), output.filter.regex, sensitive)
+            }
             Action::FilterHost(pane) => output.filter.pane = pane,
             Action::ClearFilters => output.filter = Filter::default(),
             _ => {}
@@ -309,7 +342,26 @@ impl TerminalApp {
                     .on_click(ctx.callback(move |_| send(Action::ClearFilters)))
                     .content("Clear output filters"),
             ));
-        let status = if output.filter.active() {
+        let search_options = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((
+                CheckBox::new()
+                    .automation_name("Regular expression in live output")
+                    .is_checked(output.filter.regex)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::UseRegex(enabled))),
+                    )
+                    .content("Regular expression"),
+                CheckBox::new()
+                    .automation_name("Match case in live output")
+                    .is_checked(output.filter.sensitive)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::MatchCase(enabled))),
+                    )
+                    .content("Match case"),
+            ));
+        let status = if output.filter.filters_lines() {
             Cow::Owned(format!(
                 "{status} · {} of {} retained lines",
                 lines.len(),
@@ -357,6 +409,13 @@ impl TerminalApp {
                             output_recording::button(id, submission, ctx),
                         )),
                     search,
+                    search_options,
+                    output.filter.error().map_or_else(View::empty, |error| {
+                        TextBlock::new()
+                            .text(format!("Live output search · {error}"))
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into()
+                    }),
                     Grid::new()
                         .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
                         .column_spacing(8.0)
@@ -419,6 +478,33 @@ mod tests {
         assert!(!filter.includes(&east));
         assert!(filter.includes(&west));
         assert!(filter.active());
+    }
+
+    #[test]
+    fn regex_search_matches_case_on_request_and_rejects_invalid_and_oversized_patterns() {
+        let line = GroupTranscriptLine {
+            id: 1,
+            pane: 2,
+            text: "Error 503".into(),
+            shortened: false,
+        };
+        let pattern = "^ERROR [0-9]{3}$";
+        let mut filter = Filter::default();
+        filter.configure(pattern.into(), true, false);
+        assert!(filter.includes(&line));
+        filter.configure(pattern.into(), true, true);
+        assert!(!filter.includes(&line));
+        assert!(filter.error().is_none());
+        filter.set_query("(".into());
+        assert!(filter.error().is_some());
+        assert!(!filter.includes(&line));
+        filter.set_query("界".repeat(MAX_QUERY_BYTES));
+        assert!(filter.error().unwrap().contains("UTF-8 bytes"));
+        assert!(!filter.includes(&line));
+        filter.set_query(String::new());
+        assert!(filter.error().is_none());
+        assert!(filter.active());
+        assert!(filter.includes(&line));
     }
 
     #[test]

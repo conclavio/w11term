@@ -258,7 +258,8 @@ impl Search {
     }
 }
 
-fn compile_regex(query: &str, sensitive: bool) -> Result<Regex, String> {
+/// Compile a bounded search pattern and return a one-line diagnostic on failure.
+pub fn compile_regex(query: &str, sensitive: bool) -> Result<Regex, String> {
     RegexBuilder::new(query)
         .case_insensitive(!sensitive)
         .size_limit(1024 * 1024)
