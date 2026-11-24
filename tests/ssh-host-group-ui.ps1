@@ -411,6 +411,12 @@ try {
     }
     $westPrior = Control ($outputWait + @('--regex','^west while (paused|away)$'))
     if ($westPrior.line.text -cne 'west while paused') { throw 'The first West output marker was missing' }
+    $westReading = Control @('get-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",
+        '--run','2','--pane',"$west",'--after-line',"$($westPrior.line.line_id)")
+    if ($westReading.settled -or $westReading.gap -or $westReading.has_more -or
+        $westReading.next_after_line -lt $westPrior.line.line_id) {
+        throw 'Reading the live feed did not provide a cursor for the next line'
+    }
     $future = & $Cli --pid $app.Id @outputWait --after-line 999999 'west while' | ConvertFrom-Json
     if ($LASTEXITCODE -eq 0 -or $future.ok -or $future.error -notlike '*ahead of the latest line*') {
         throw 'An output cursor ahead of the run did not return an explicit error'
@@ -422,7 +428,7 @@ try {
     $foregroundBeforeOutputWait = [FixtureMessages]::GetForegroundWindow()
     $waitPath = Join-Path $State 'wait-group-output.json'
     $outputJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $outputWait +
-        @('--after-line',"$($westPrior.line.line_id)",'--regex','--match-case','--timeout','15','^west\x20while\x20(?:paused|away)$')) -NoNewWindow -PassThru -RedirectStandardOutput $waitPath
+        @('--after-line',"$($westReading.next_after_line)",'--regex','--match-case','--timeout','15','^west\x20while\x20(?:paused|away)$')) -NoNewWindow -PassThru -RedirectStandardOutput $waitPath
     if ($outputJob.WaitForExit(250)) { throw 'The output wait ended before West produced its matching line' }
     [IO.File]::WriteAllText((Join-Path $State 'release-west-away'), '')
     if (!$outputJob.WaitForExit(10000)) { throw 'The output wait did not receive the new line' }
@@ -433,7 +439,7 @@ try {
         $match.pane_id -ne $west -or $match.label -cne 'West' -or
         $match.address -cne "test@127.0.0.1:$($profileData.West.port)" -or
         $match.text -cne 'west while away' -or $match.shortened -ne $false -or
-        $match.line_id -le $westPrior.line.line_id -or $match.elapsed_ms -lt $westPrior.line.elapsed_ms -or
+        $match.line_id -le $westReading.next_after_line -or $match.elapsed_ms -lt $westPrior.line.elapsed_ms -or
         [FixtureMessages]::GetForegroundWindow() -ne $foregroundBeforeOutputWait) {
         throw "The output wait returned the wrong match or changed focus: $($outputReply.error)"
     }
@@ -1599,6 +1605,34 @@ try {
     $kept = Control ($burstWait + @('--pane',"$east",'east record row 00'))
     if ($kept.line.pane_id -ne $east -or $kept.line.text -cne 'east record row 00') {
         throw 'A gap in the combined feed incorrectly affected the East cursor'
+    }
+    $burstRead = @('get-ssh-group-output','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$burstRunId")
+    $page = Control ($burstRead + @('--after-line','0','--limit','2'))
+    if ($page.run_id -ne $burstRunId -or !$page.settled -or !$page.gap -or
+        !$page.has_more -or $page.lines.Count -ne 2 -or
+        $page.lines[0].line_id -ne ($page.evicted_through + 1) -or
+        $page.next_after_line -ne $page.lines[1].line_id -or
+        $page.next_after_line -ge $page.latest_line) {
+        throw 'Reading the combined output did not report its gap and first page'
+    }
+    $nextPage = Control ($burstRead + @('--after-line',"$($page.next_after_line)",'--limit','2'))
+    if ($nextPage.gap -or !$nextPage.has_more -or $nextPage.lines.Count -ne 2 -or
+        $nextPage.lines[0].line_id -ne ($page.next_after_line + 1)) {
+        throw 'The second output page did not resume immediately after the first'
+    }
+    $eastRead = $burstRead + @('--pane',"$east")
+    $eastPage = Control ($eastRead + @('--after-line','0'))
+    $firstEast = $eastPage.lines | Where-Object text -CEQ 'east record row 00'
+    if ($eastPage.pane_id -ne $east -or $eastPage.gap -or $eastPage.has_more -or
+        $eastPage.evicted_through -ne 0 -or $firstEast.line_id -ne $kept.line.line_id -or
+        $firstEast.label -cne 'East' -or @($eastPage.lines | Where-Object pane_id -NE $east).Count -or
+        $eastPage.next_after_line -ne $eastPage.latest_line -or $eastPage.latest_line -ne $page.latest_line) {
+        throw 'Reading East output did not preserve its own history and the run cursor'
+    }
+    $drained = Control ($eastRead + @('--after-line',"$($eastPage.next_after_line)"))
+    if (!$drained.settled -or $drained.lines.Count -ne 0 -or $drained.has_more -or
+        $drained.next_after_line -ne $eastPage.next_after_line) {
+        throw 'Reading from the final cursor did not return an empty settled page'
     }
     Click $liveButton
     $null = Wait-Until 'open live output for the recorded burst' { Find-Element 'SSH group live output' }

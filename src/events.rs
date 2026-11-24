@@ -19,7 +19,7 @@ pub use group_transcript::{
     GroupCompletionState, GroupQueueActivity, GroupQueueEvent, GroupQueueEventKind,
     GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
     GroupTranscript, GroupTranscriptHistory, GroupTranscriptHost, GroupTranscriptLine,
-    GroupTranscriptOutputWatch, GroupTranscriptRecording, GroupTranscriptSnapshot,
+    GroupTranscriptOutput, GroupTranscriptRecording, GroupTranscriptSnapshot,
     GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;

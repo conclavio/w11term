@@ -35,6 +35,7 @@ use security::PipeSecurity;
 
 pub const VERSION: u32 = 1;
 pub const MAX_BYTES: usize = 1024 * 1024;
+pub const MAX_SSH_GROUP_OUTPUT_LINES: usize = 128;
 const MAX_LINE: usize = MAX_BYTES * 2;
 const TIMEOUT: Duration = Duration::from_secs(10);
 pub type CapturePng =
@@ -125,6 +126,16 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    GetSshGroupOutput {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        pane: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_line: Option<u64>,
+        #[serde(default = "default_group_output_limit")]
+        limit: usize,
+    },
     WorkspaceIdentity,
     WorkspaceWindows {
         key: String,
@@ -179,6 +190,9 @@ pub enum Request {
 fn default_wait_timeout() -> u64 {
     30
 }
+fn default_group_output_limit() -> usize {
+    MAX_SSH_GROUP_OUTPUT_LINES
+}
 #[derive(Debug)]
 pub enum UiRequest {
     ListSshGroups {
@@ -195,11 +209,12 @@ pub enum UiRequest {
         wait_for_settlement: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
-    WatchSshGroupOutput {
+    ReadSshGroupOutput {
         tab_id: u64,
         run_id: u64,
         pane: Option<u64>,
-        reply: oneshot::Sender<Result<SshGroupOutputWatch, String>>,
+        follow: bool,
+        reply: oneshot::Sender<Result<SshGroupOutput, String>>,
     },
     Open {
         profile: String,
@@ -223,7 +238,7 @@ impl UiRequest {
             | Self::ListSshGroups { reply }
             | Self::GetSshGroupRoster { reply, .. }
             | Self::GetSshGroupRun { reply, .. } => reply,
-            Self::WatchSshGroupOutput { reply, .. } => {
+            Self::ReadSshGroupOutput { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
                 return;
             }
@@ -232,7 +247,7 @@ impl UiRequest {
     }
 }
 
-pub use ssh_groups::SshGroupOutputWatch;
+pub use ssh_groups::SshGroupOutput;
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -560,6 +575,21 @@ impl Registry {
                     },
                 )
                 .await
+            }
+            Request::GetSshGroupOutput {
+                window_id,
+                tab_id,
+                run_id,
+                pane,
+                after_line,
+                limit,
+            } => {
+                ensure!(
+                    (1..=MAX_SSH_GROUP_OUTPUT_LINES).contains(&limit),
+                    "SSH group output limit must be 1..={MAX_SSH_GROUP_OUTPUT_LINES} lines"
+                );
+                self.query_ssh_group_output(window_id, tab_id, run_id, pane, after_line, limit)
+                    .await
             }
             Request::List => {
                 let mut sessions = Vec::new();

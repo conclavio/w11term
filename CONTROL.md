@@ -260,6 +260,25 @@ selected feed have already left retention, the wait reports the last
 missing line ID as a history gap. Omit the cursor to search the available
 retained feed from its oldest line.
 
+`get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]`
+returns a snapshot of retained lines in arrival order. The pane selector and
+cursor use the same run scope as the wait command. The limit defaults to 128
+and accepts 1 through 128. A page can be empty.
+
+The result contains the window, tab, and run IDs, `pane_id` (null for the
+combined feed), and a `lines` array with the same line fields as the wait
+command. It also includes these fields.
+
+- `settled` indicates that the run has finished tracking all recipients.
+- `latest_line` is the newest line ID captured in the run, or 0 before any output.
+- `evicted_through` is the last line ID lost from the selected feed, or 0.
+- `gap` is true when lines after the supplied cursor have been evicted. With no cursor, it reports whether the beginning of the selected feed was lost. The page still contains the available lines.
+- `has_more` means the snapshot has more retained lines after this page.
+- `next_after_line` is the last returned line ID when more retained lines are available. Once the page drains the feed, it advances to `latest_line`, including when the selected pane was quiet.
+
+Pass `next_after_line` to the same read command until `has_more` is false.
+You can then use that cursor in a wait command for the next marker.
+
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
@@ -268,6 +287,7 @@ w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --regex '^ready for traffic$'
+w11term-cli --pid 12345 get-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --limit 20
 ```
 
 Direct pipe clients use these JSON requests.
@@ -280,6 +300,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"pattern":"^ready for traffic$","regex":true}
+{"verb":"get-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"limit":20}
 ```
 
 ## Waiting, geometry, tabs, and events

@@ -41,6 +41,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "get-ssh-group-run"
             | "wait-ssh-group-run"
             | "wait-ssh-group-output"
+            | "get-ssh-group-output"
             | "wait-ssh-group-ready"
                 if verb.is_none() =>
             {
@@ -285,9 +286,19 @@ mod tests {
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --timeout 3601 ready",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --after-line -1 ready",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --after-line 0 --after-line 3 ready",
+            "get-ssh-group-output --window 2 --tab 3 --run 4 --limit 0",
+            "get-ssh-group-output --window 2 --tab 3 --run 4 --limit 129",
+            "get-ssh-group-output --window 2 --tab 3 --run 4 --limit 1 --limit 2",
+            "get-ssh-group-output --window 2 --tab 3 --run 4 unexpected",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }
+        assert!(matches!(
+            parse_line("get-ssh-group-output --window 11 --tab 12 --run 4 --pane 8 --after-line 5 --limit 16").unwrap(),
+            (None, Request::GetSshGroupOutput {
+                window_id: 11, tab_id: 12, run_id: 4, pane: Some(8), after_line: Some(5), limit: 16
+            })
+        ));
     }
 
     #[test]

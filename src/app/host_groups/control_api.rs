@@ -1,6 +1,6 @@
 use super::*;
 use serde_json::{Value, json};
-use w11term::control::SshGroupOutputWatch;
+use w11term::control::SshGroupOutput;
 use w11term::events::GroupCompletionState;
 
 pub(in crate::app) type ControlReply = oneshot::Sender<Result<Value, String>>;
@@ -192,7 +192,8 @@ impl TerminalApp {
         tab: TabId,
         run: u64,
         pane: Option<u64>,
-    ) -> Result<SshGroupOutputWatch, String> {
+        follow: bool,
+    ) -> Result<SshGroupOutput, String> {
         let Some(AppTab {
             page: Page::HostGroup(page),
             ..
@@ -226,13 +227,17 @@ impl TerminalApp {
                 "pane {pane} was not a recipient of SSH group run {run}"
             ));
         }
-        Ok(SshGroupOutputWatch {
-            stream: submission.transcript.watch_output(pane),
-            hosts,
-            retained: submission
+        let output = submission.transcript.read_output(pane, follow);
+        let retained = output.incoming.is_some().then(|| {
+            submission
                 .output_lifetime
                 .get_or_insert_with(|| watch::channel(()).0)
-                .subscribe(),
+                .subscribe()
+        });
+        Ok(SshGroupOutput {
+            output,
+            hosts,
+            retained,
         })
     }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::events::{GroupTranscriptLine, GroupTranscriptOutputWatch};
+use crate::events::{GroupTranscriptLine, GroupTranscriptOutput};
 use anyhow::bail;
 use regex::Regex;
 use std::{borrow::Cow, collections::BTreeMap};
@@ -9,10 +9,10 @@ use tokio::{
 };
 
 #[derive(Debug)]
-pub struct SshGroupOutputWatch {
-    pub stream: GroupTranscriptOutputWatch,
+pub struct SshGroupOutput {
+    pub output: GroupTranscriptOutput,
     pub hosts: BTreeMap<u64, (String, String)>,
-    pub retained: watch::Receiver<()>,
+    pub retained: Option<watch::Receiver<()>>,
 }
 
 pub(super) struct GroupOutputQuery {
@@ -35,6 +35,28 @@ pub(super) fn output_pattern(query: &str, regex: bool, match_case: bool) -> Resu
         Cow::Owned(regex::escape(query))
     };
     crate::search::compile_regex(&pattern, match_case).map_err(anyhow::Error::msg)
+}
+
+fn check_cursor(after_line: Option<u64>, latest_line: u64) -> Result<()> {
+    if let Some(cursor) = after_line {
+        ensure!(
+            cursor <= latest_line,
+            "output cursor {cursor} is ahead of the latest line {latest_line}"
+        );
+    }
+    Ok(())
+}
+
+fn describe_output_line(line: &GroupTranscriptLine, label: &str, address: &str) -> Value {
+    json!({
+        "line_id": line.id,
+        "pane_id": line.pane,
+        "label": label,
+        "address": address,
+        "text": &*line.text,
+        "shortened": line.shortened,
+        "elapsed_ms": line.elapsed_ms,
+    })
 }
 
 impl Registry {
@@ -119,6 +141,75 @@ impl Registry {
         Ok(json!({ "window_id": window, "tab_id": tab, "run": run }))
     }
 
+    async fn read_ssh_group_output(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        pane: Option<u64>,
+        follow: bool,
+    ) -> Result<SshGroupOutput> {
+        let (reply, response) = oneshot::channel();
+        self.window_ui(window)?(UiRequest::ReadSshGroupOutput {
+            tab_id: tab,
+            run_id: run,
+            pane,
+            follow,
+            reply,
+        });
+        response
+            .await
+            .with_context(|| format!("window {window} closed during SSH group output lookup"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(super) async fn query_ssh_group_output(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        pane: Option<u64>,
+        after_line: Option<u64>,
+        limit: usize,
+    ) -> Result<Value> {
+        let SshGroupOutput { output, hosts, .. } = tokio::time::timeout(
+            TIMEOUT,
+            self.read_ssh_group_output(window, tab, run, pane, false),
+        )
+        .await
+        .context("get-ssh-group-output timed out")??;
+        check_cursor(after_line, output.latest_line)?;
+        let cursor = after_line.unwrap_or(0);
+        let mut available = output.history.lines.iter().filter_map(|line| {
+            let (label, address) = hosts.get(&line.pane)?;
+            (line.id > cursor).then_some((line, label, address))
+        });
+        let page: Vec<_> = available.by_ref().take(limit).collect();
+        let has_more = available.next().is_some();
+        let next_after_line = if has_more {
+            page.last().map_or(cursor, |(line, _, _)| line.id)
+        } else {
+            output.latest_line
+        };
+        let lines: Vec<_> = page
+            .into_iter()
+            .map(|(line, label, address)| describe_output_line(line, label, address))
+            .collect();
+        Ok(json!({
+            "window_id": window,
+            "tab_id": tab,
+            "run_id": run,
+            "pane_id": pane,
+            "settled": output.settled,
+            "latest_line": output.latest_line,
+            "evicted_through": output.evicted_through,
+            "gap": cursor < output.evicted_through,
+            "has_more": has_more,
+            "next_after_line": next_after_line,
+            "lines": lines,
+        }))
+    }
+
     pub(super) async fn wait_ssh_group_output(
         &self,
         window: WindowId,
@@ -133,20 +224,11 @@ impl Registry {
             timeout,
         } = query;
         let deadline = Instant::now() + timeout;
-        let (reply, response) = oneshot::channel();
-        self.window_ui(window)?(UiRequest::WatchSshGroupOutput {
-            tab_id: tab,
-            run_id: run,
-            pane,
-            reply,
-        });
         tokio::time::timeout_at(deadline, async {
-            let SshGroupOutputWatch { stream, hosts, mut retained } = response.await
-                .with_context(|| format!("window {window} closed during SSH group output lookup"))?
-                .map_err(anyhow::Error::msg)?;
+            let SshGroupOutput { output, hosts, retained } = self.read_ssh_group_output(window, tab, run, pane, true).await?;
+            check_cursor(after_line, output.latest_line)?;
             if let Some(cursor) = after_line {
-                ensure!(cursor <= stream.latest_line, "output cursor {cursor} is ahead of the latest line {}", stream.latest_line);
-                ensure!(cursor >= stream.evicted_through, "SSH group output history after cursor {cursor} is incomplete through line {}", stream.evicted_through);
+                ensure!(cursor >= output.evicted_through, "SSH group output history after cursor {cursor} is incomplete through line {}", output.evicted_through);
             }
             let matched = |line: &GroupTranscriptLine| {
                 let (label, address) = hosts.get(&line.pane)?;
@@ -156,21 +238,13 @@ impl Registry {
                     "window_id": window,
                     "tab_id": tab,
                     "run_id": run,
-                    "line": {
-                        "line_id": line.id,
-                        "pane_id": line.pane,
-                        "label": label,
-                        "address": address,
-                        "text": &*line.text,
-                        "shortened": line.shortened,
-                        "elapsed_ms": line.elapsed_ms,
-                    }
+                    "line": describe_output_line(line, label, address)
                 }))
             };
-            if let Some(result) = stream.history.lines.iter().find_map(matched) {
+            if let Some(result) = output.history.lines.iter().find_map(matched) {
                 return Ok(result);
             }
-            if let Some(mut incoming) = stream.incoming {
+            if let (Some(mut incoming), Some(mut retained)) = (output.incoming, retained) {
                 loop {
                     tokio::select! {
                         _ = retained.changed() => bail!("SSH group run {run} is no longer retained in tab {tab} of window {window}"),
@@ -215,21 +289,23 @@ mod tests {
         let (lifetime, retained) = watch::channel(());
         let transcript = GroupTranscript::default();
         registry.set_ui(move |request| {
-            let UiRequest::WatchSshGroupOutput {
+            let UiRequest::ReadSshGroupOutput {
                 tab_id,
                 run_id,
                 pane,
+                follow,
                 reply,
             } = request
             else {
                 panic!("unexpected output request");
             };
             assert_eq!((tab_id, run_id, pane), (9, 2, Some(7)));
+            assert!(follow);
             reply
-                .send(Ok(SshGroupOutputWatch {
-                    stream: transcript.watch_output(pane),
+                .send(Ok(SshGroupOutput {
+                    output: transcript.read_output(pane, follow),
                     hosts: Default::default(),
-                    retained: retained.clone(),
+                    retained: Some(retained.clone()),
                 }))
                 .unwrap();
         });

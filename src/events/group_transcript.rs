@@ -315,10 +315,11 @@ pub struct GroupTranscriptLine {
 }
 
 #[derive(Debug)]
-pub struct GroupTranscriptOutputWatch {
+pub struct GroupTranscriptOutput {
     pub history: GroupTranscriptSnapshot,
     pub evicted_through: u64,
     pub latest_line: u64,
+    pub settled: bool,
     pub incoming: Option<broadcast::Receiver<GroupTranscriptLine>>,
 }
 
@@ -491,7 +492,7 @@ impl GroupTranscript {
         self.0.lock().unwrap().history.clone()
     }
 
-    pub fn watch_output(&self, pane: Option<u64>) -> GroupTranscriptOutputWatch {
+    pub fn read_output(&self, pane: Option<u64>, follow: bool) -> GroupTranscriptOutput {
         let mut transcript = self.0.lock().unwrap();
         let (history, evicted_through) = transcript.history.scoped_with_boundary(pane);
         let history = history.into_owned();
@@ -502,16 +503,18 @@ impl GroupTranscript {
             .lines
             .back()
             .map_or(0, |line| line.id);
-        let incoming = (!transcript.settled()).then(|| {
+        let settled = transcript.settled();
+        let incoming = (follow && !settled).then(|| {
             transcript
                 .output_watch
                 .get_or_insert_with(|| broadcast::channel(OUTPUT_WATCH_QUEUE).0)
                 .subscribe()
         });
-        GroupTranscriptOutputWatch {
+        GroupTranscriptOutput {
             history,
             evicted_through,
             latest_line,
+            settled,
             incoming,
         }
     }
@@ -898,7 +901,10 @@ mod tests {
         append(&east, "unselected");
         append(&west, "retained");
         transcript.finish_dispatch();
-        let watch = transcript.watch_output(Some(2));
+        let snapshot = transcript.read_output(Some(2), false);
+        assert!(!snapshot.settled);
+        assert!(snapshot.incoming.is_none());
+        let watch = transcript.read_output(Some(2), true);
         assert_eq!(watch.history.lines.len(), 1);
         assert_eq!(watch.latest_line, 2);
         assert_eq!(watch.evicted_through, 0);
@@ -910,9 +916,10 @@ mod tests {
         let line = incoming.try_recv().unwrap();
         assert_eq!((line.id, line.pane, &*line.text), (3, 2, "final"));
         assert!(matches!(incoming.try_recv(), Err(TryRecvError::Closed)));
-        let settled = transcript.watch_output(None);
+        let settled = transcript.read_output(None, true);
         assert_eq!(settled.history.lines.len(), 3);
         assert_eq!(settled.latest_line, 3);
+        assert!(settled.settled);
         assert!(settled.incoming.is_none());
     }
 
