@@ -231,6 +231,8 @@ try {
     Roster-Choice 'Host label' -Choose
     Roster-Choice 'Unlimited' -ControlName 'Parallel SSH commands'
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands' -Choose
+    Roster-Choice 'No delay' -ControlName 'Time between sends'
+    Roster-Choice '2 seconds' -ControlName 'Time between sends' -Choose
     (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
     $null = Wait-CheckBox 'Stop queue on failure' On
     (Wait-CheckBox $allReady Off).Toggle()
@@ -242,11 +244,12 @@ try {
         if (!(Find-Element 'Saved roster defaults')) { return }
         $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
         $savedDefaults.order -ceq 'label' -and $savedDefaults.command_limit -ceq 'two' -and
-            $savedDefaults.show_last_output -and $savedDefaults.require_all_ready -and
+            $savedDefaults.command_interval -ceq '2s' -and $savedDefaults.show_last_output -and $savedDefaults.require_all_ready -and
             $savedDefaults.stop_command_queue_on_failure
     }
     (Wait-CheckBox $showOutput On).Toggle()
     $null = Wait-CheckBox $showOutput Off
+    Roster-Choice '10 seconds' -ControlName 'Time between sends' -Choose
     Close-GroupWindow
     Launch-Window
     Open-FleetPalette
@@ -254,6 +257,7 @@ try {
     $null = Wait-Until 'reopened Fleet with its own roster defaults' { Find-Element 'Opened 2 SSH panes for Fleet' }
     Roster-Choice 'Host label'
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands'
+    Roster-Choice '2 seconds' -ControlName 'Time between sends'
     $null = Wait-CheckBox 'Stop queue on failure' On
     $null = Wait-CheckBox $allReady On
     $null = Wait-CheckBox $showOutput On
@@ -286,7 +290,8 @@ try {
         ($saved.ssh_host_groups.'Fleet copy' -join ',') -ceq 'West,East' -and
             $saved.ssh_host_group_defaults.'Fleet copy'.order -ceq 'label' -and
             $saved.ssh_host_group_defaults.'Fleet copy'.show_last_output -and
-            $saved.ssh_host_group_defaults.'Fleet copy'.command_limit -ceq 'two'
+            $saved.ssh_host_group_defaults.'Fleet copy'.command_limit -ceq 'two' -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.command_interval -ceq '2s'
     }
     if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Copying the group opened SSH panes' }
     Click 'Edit group'
@@ -309,7 +314,8 @@ try {
     if ($exported.format -cne 'w11term-ssh-group' -or $exported.version -ne 1 -or
         ($exported.group.members -join ',') -cne 'West,East' -or
         ($exported.group.recipient_sets.Canary -join ',') -cne 'East,West' -or
-        !$exported.group.roster_defaults.show_last_output -or $exported.profiles) {
+        !$exported.group.roster_defaults.show_last_output -or
+        $exported.group.roster_defaults.command_interval -cne '2s' -or $exported.profiles) {
         throw 'The group file did not preserve its portable definition'
     }
 
@@ -370,7 +376,8 @@ try {
         ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West Local,East' -and
             ($saved.ssh_recipient_sets.'Portable Fleet'.Canary -join ',') -ceq 'East,West Local' -and
             $saved.ssh_host_group_defaults.'Portable Fleet'.show_last_output -and
-            $saved.ssh_host_group_defaults.'Portable Fleet'.command_limit -ceq 'two'
+            $saved.ssh_host_group_defaults.'Portable Fleet'.command_limit -ceq 'two' -and
+            $saved.ssh_host_group_defaults.'Portable Fleet'.command_interval -ceq '2s'
     }
     if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Importing the definition opened SSH panes' }
     $restored = Catalog
@@ -401,7 +408,8 @@ try {
         throw 'The renamed group has the wrong saved membership'
     }
     $defaults = (Catalog).ssh_host_group_defaults
-    if ($defaults.Fleet -or $defaults.'East only'.order -cne 'label') {
+    if ($defaults.Fleet -or $defaults.'East only'.order -cne 'label' -or
+        $defaults.'East only'.command_interval -cne '2s') {
         throw 'Roster defaults did not follow the group rename'
     }
     Click 'Edit group'

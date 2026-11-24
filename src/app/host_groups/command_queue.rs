@@ -3,13 +3,13 @@ use w11term::events::GroupTranscriptHost;
 
 const FAILED_RESULT: &str = "Queue stopped after an unsuccessful host.";
 const CANARY_FAILED: &str = "Canary did not report a successful exit.";
-const SEND_INTERVALS: [(&str, Duration); 6] = [
-    ("No delay", Duration::ZERO),
-    ("500 milliseconds", Duration::from_millis(500)),
-    ("1 second", Duration::from_secs(1)),
-    ("2 seconds", Duration::from_secs(2)),
-    ("5 seconds", Duration::from_secs(5)),
-    ("10 seconds", Duration::from_secs(10)),
+const SEND_INTERVALS: [(&str, SshGroupCommandInterval); 6] = [
+    ("No delay", SshGroupCommandInterval::None),
+    ("500 milliseconds", SshGroupCommandInterval::HalfSecond),
+    ("1 second", SshGroupCommandInterval::OneSecond),
+    ("2 seconds", SshGroupCommandInterval::TwoSeconds),
+    ("5 seconds", SshGroupCommandInterval::FiveSeconds),
+    ("10 seconds", SshGroupCommandInterval::TenSeconds),
 ];
 
 pub enum Action {
@@ -72,11 +72,9 @@ pub(super) fn interval_picker(id: TabId, page: &HostGroup, ctx: &ViewContext<Ter
                 .automation_name("Time between sends")
                 .is_enabled(!page.recorded_send.pending())
                 .items_source(SEND_INTERVALS.map(|(label, _)| label))
-                .selected_index(
-                    SEND_INTERVALS
-                        .iter()
-                        .position(|(_, interval)| *interval == page.command_interval),
-                )
+                .selected_index(SEND_INTERVALS.iter().position(|(_, interval)| {
+                    *interval == page.roster_preferences.command_interval
+                }))
                 .on_selection_changed(ctx.callback(move |index: Option<usize>| {
                     index.and_then(|index| SEND_INTERVALS.get(index)).map_or(
                         Message::ControlIdle,

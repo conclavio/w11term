@@ -109,6 +109,7 @@ pub(super) fn preview(
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let limit = offer.limit.concurrency();
+    let interval = offer.interval.duration();
     let canary = offer.canary.is_some();
     let ordered = page.orders_commands();
     let summary = match (canary, limit) {
@@ -219,11 +220,11 @@ pub(super) fn preview(
         TextBlock::new()
             .text(summary)
             .text_wrapping(TextWrapping::Wrap),
-        if offer.interval.is_zero() {
+        if interval.is_zero() {
             View::empty()
         } else {
             TextBlock::new()
-                .text(format!("Dispatch interval · {:?}", offer.interval))
+                .text(format!("Dispatch interval · {interval:?}"))
                 .into()
         },
         hold.map_or_else(View::empty, |text| {

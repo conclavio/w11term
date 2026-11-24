@@ -124,7 +124,7 @@ pub(super) fn validate(group: &SavedSshGroup) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::{SshGroupParallelLimit, SshRosterDefaults};
+    use crate::options::{SshGroupCommandInterval, SshGroupParallelLimit, SshRosterDefaults};
     use crate::profiles::ProfileStore;
     use serde_json::json;
 
@@ -137,6 +137,7 @@ mod tests {
             roster_defaults: Some(SshRosterDefaults {
                 show_terminal_line: true,
                 command_limit: SshGroupParallelLimit::Eight,
+                command_interval: SshGroupCommandInterval::FiveSeconds,
                 ..Default::default()
             }),
         };
@@ -146,12 +147,23 @@ mod tests {
             decode_group_file(format!("\u{feff}{encoded}").as_bytes()).unwrap(),
             group
         );
-        let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(parsed["format"], FORMAT);
         assert_eq!(parsed["version"], VERSION);
         assert_eq!(parsed["group"]["members"], json!(["West", "East"]));
-        assert_eq!(parsed["group"]["roster_defaults"]["command_limit"], "eight");
+        let defaults = &parsed["group"]["roster_defaults"];
+        assert_eq!(defaults["command_limit"], "eight");
+        assert_eq!(defaults["command_interval"], "5s");
         assert!(parsed.get("profiles").is_none());
+
+        parsed["group"]["roster_defaults"]
+            .as_object_mut()
+            .unwrap()
+            .remove("command_interval");
+        let older_definition = decode_group_file(&serde_json::to_vec(&parsed).unwrap()).unwrap();
+        let defaults = older_definition.roster_defaults.unwrap();
+        assert_eq!(defaults.command_interval, SshGroupCommandInterval::None);
+        assert_eq!(defaults.command_limit, SshGroupParallelLimit::Eight);
     }
 
     #[test]

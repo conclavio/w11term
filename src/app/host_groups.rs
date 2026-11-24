@@ -5,7 +5,10 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt, SshConnectionPhase,
 };
-use w11term::options::{SshGroupParallelLimit, SshRosterDefaults, SshRosterOrder as RosterOrder};
+use w11term::options::{
+    SshGroupCommandInterval, SshGroupParallelLimit, SshRosterDefaults,
+    SshRosterOrder as RosterOrder,
+};
 use w11term::prompts::Question;
 mod address;
 mod close_ended;
@@ -64,7 +67,6 @@ pub(super) struct HostGroup {
     notify_canary: bool,
     preview_command_order: bool,
     manual_command_order: Vec<u64>,
-    command_interval: Duration,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -135,7 +137,7 @@ pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
     limit: SshGroupParallelLimit,
-    interval: Duration,
+    interval: SshGroupCommandInterval,
     stop_queue_on_failure: bool,
     canary: Option<u64>,
     notify_canary: bool,
@@ -554,7 +556,7 @@ impl HostGroup {
             .command_limit
             .concurrency()
             .is_some()
-            || !self.command_interval.is_zero()
+            || self.roster_preferences.command_interval != SshGroupCommandInterval::None
     }
 
     fn readiness_allows_send(&self, ready: usize, total: usize) -> bool {
@@ -722,7 +724,7 @@ pub enum Action {
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, CommandOffer),
     CommandLimit(TabId, SshGroupParallelLimit),
-    CommandInterval(TabId, Duration),
+    CommandInterval(TabId, SshGroupCommandInterval),
     CommandCanary(TabId, Option<u64>),
     NotifyCanary(TabId, bool),
     PreviewCommandOrder(TabId, bool),
@@ -1047,7 +1049,7 @@ impl TerminalApp {
                 .map(|target| target.pane)
                 .eq(targets.iter().map(|target| target.pane))
             && page.roster_preferences.command_limit == *limit
-            && page.command_interval == *interval
+            && page.roster_preferences.command_interval == *interval
             && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
             && page.canary == *canary
@@ -1081,6 +1083,7 @@ impl TerminalApp {
             notify_canary,
         } = offer;
         let limit = limit.concurrency();
+        let interval = interval.duration();
         let paced = !interval.is_zero();
         let slots = limit.or_else(|| (canary.is_some() || paced).then_some(targets.len()));
         let results = targets
@@ -1540,7 +1543,7 @@ impl TerminalApp {
                     .host_group_mut(id)
                     .filter(|page| !page.recorded_send.pending())
                 {
-                    page.command_interval = interval;
+                    page.roster_preferences.command_interval = interval;
                 }
             }
             Action::CommandCanary(id, pane) => {
@@ -2138,7 +2141,7 @@ impl TerminalApp {
                 .cloned()
                 .collect(),
             limit: page.roster_preferences.command_limit,
-            interval: page.command_interval,
+            interval: page.roster_preferences.command_interval,
             stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
             canary: page.canary,
             notify_canary: page.canary.is_some() && page.notify_canary,

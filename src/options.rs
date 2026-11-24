@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    time::Duration,
 };
 mod group_prompt;
 mod local;
@@ -456,6 +457,36 @@ impl SshGroupParallelLimit {
 pub type SshGroupLoginLimit = SshGroupParallelLimit;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum SshGroupCommandInterval {
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "500ms")]
+    HalfSecond,
+    #[serde(rename = "1s")]
+    OneSecond,
+    #[serde(rename = "2s")]
+    TwoSeconds,
+    #[serde(rename = "5s")]
+    FiveSeconds,
+    #[serde(rename = "10s")]
+    TenSeconds,
+}
+
+impl SshGroupCommandInterval {
+    pub fn duration(self) -> Duration {
+        match self {
+            Self::None => Duration::ZERO,
+            Self::HalfSecond => Duration::from_millis(500),
+            Self::OneSecond => Duration::from_secs(1),
+            Self::TwoSeconds => Duration::from_secs(2),
+            Self::FiveSeconds => Duration::from_secs(5),
+            Self::TenSeconds => Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SshRosterDefaults {
     pub order: SshRosterOrder,
@@ -464,6 +495,7 @@ pub struct SshRosterDefaults {
     pub require_all_ready: bool,
     pub login_limit: SshGroupParallelLimit,
     pub command_limit: SshGroupParallelLimit,
+    pub command_interval: SshGroupCommandInterval,
     pub stop_command_queue_on_failure: bool,
 }
 
