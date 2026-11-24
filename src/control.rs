@@ -121,6 +121,16 @@ pub enum Request {
         tab_id: u64,
         run_id: u64,
     },
+    SaveSshGroupReport {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        path: PathBuf,
+        #[serde(default)]
+        format: SshGroupReportFormat,
+        #[serde(default)]
+        overwrite: bool,
+    },
     WaitSshGroupRun {
         window_id: WindowId,
         tab_id: u64,
@@ -250,6 +260,12 @@ pub enum UiRequest {
         wait_for_settlement: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    CaptureSshGroupReport {
+        tab_id: u64,
+        run_id: u64,
+        format: SshGroupReportFormat,
+        reply: oneshot::Sender<Result<SshGroupReportWriter, String>>,
+    },
     ReadSshGroupOutput {
         tab_id: u64,
         run_id: u64,
@@ -286,13 +302,20 @@ impl UiRequest {
                 let _ = reply.send(Err(message.into()));
                 return;
             }
+            Self::CaptureSshGroupReport { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
         };
         let _ = reply.send(Err(message.into()));
     }
 }
 
 pub use ssh_groups::validate_group_submission;
-pub use ssh_groups::{SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput};
+pub use ssh_groups::{
+    SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput, SshGroupReportFormat,
+    SshGroupReportWriter,
+};
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
 fn sftp_default_timeout() -> u64 {
     crate::sftp::DEFAULT_TIMEOUT
@@ -576,6 +599,17 @@ impl Registry {
                 run_id,
             } => {
                 self.query_ssh_group_run(window_id, tab_id, run_id, None)
+                    .await
+            }
+            Request::SaveSshGroupReport {
+                window_id,
+                tab_id,
+                run_id,
+                path,
+                format,
+                overwrite,
+            } => {
+                self.save_ssh_group_report(window_id, tab_id, run_id, path, format, overwrite)
                     .await
             }
             Request::SubmitSshGroupCommand {

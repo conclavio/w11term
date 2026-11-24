@@ -2070,6 +2070,40 @@ try {
         $cliLines[-1] -cne '[Group run settled]') {
         throw 'The completed CLI transcript lost output, host outcomes, or its settlement footer'
     }
+    $reportArgs = @('save-ssh-group-report','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $cliReportPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'CLI group report.json'
+    $retiredReport = & $Cli --pid $app.Id @reportArgs 99999 $cliReportPath | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $retiredReport.ok -or $retiredReport.error -notlike '*is not retained*' -or
+        [IO.File]::Exists($cliReportPath)) {
+        throw 'Exporting an unknown run created a destination or gave an ambiguous reply'
+    }
+    $reportRun = "$($checked.run_id)"
+    $savedReport = Control ($reportArgs + @($reportRun,$cliReportPath))
+    $jsonText = [IO.File]::ReadAllText($cliReportPath)
+    $cliDoc = $jsonText | ConvertFrom-Json
+    $docWest, $docEast = $cliDoc.recipients
+    if ($savedReport.window_id -ne $groupWindow -or $savedReport.tab_id -ne $groupTab -or
+        $savedReport.run_id -ne $checked.run_id -or $savedReport.path -cne $cliReportPath -or
+        $savedReport.format -cne 'json' -or $cliDoc.schema_version -ne 1 -or $cliDoc.submission_id -ne $checked.run_id -or
+        $cliDoc.output_expectation.query -cne $cliPattern -or $docWest.pane_id -ne $west -or
+        $docWest.output_expectation -cne 'matched' -or $docWest.output.state -cne 'complete' -or
+        $docWest.output.text -notlike '*west-accepted cli-expect*' -or $docEast.pane_id -ne $east -or
+        $docEast.output_expectation -cne 'missing' -or $docEast.output.state -cne 'complete' -or
+        $docEast.output.text -notlike '*east-accepted cli-expect*') {
+        throw 'The CLI JSON report lost output, recipient order, or the output check'
+    }
+    $conflict = & $Cli --pid $app.Id @reportArgs $reportRun --format text $cliReportPath | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $conflict.ok -or [IO.File]::ReadAllText($cliReportPath) -cne $jsonText) {
+        throw 'The CLI report replaced an existing destination without permission'
+    }
+    $textReport = Control ($reportArgs + @($reportRun,'--format','text','--overwrite',$cliReportPath))
+    $reportText = [IO.File]::ReadAllText($cliReportPath)
+    if ($textReport.format -cne 'text' -or !$reportText.StartsWith("Submitted${dot}cli-expect") -or
+        !$reportText.Contains('Expected output matched') -or !$reportText.Contains('Expected output missing') -or
+        !$reportText.Contains('east-accepted cli-expect') -or !$reportText.Contains('west-accepted cli-expect') -or
+        [FixtureMessages]::GetForegroundWindow() -ne $submitForeground) {
+        throw 'The background text export lost output or moved focus'
+    }
     Wait-Focus $east
     Run-Palette 'SSH host group'
     $null = Wait-Until 'background submission preserved the displayed results' {

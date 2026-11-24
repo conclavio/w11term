@@ -299,6 +299,19 @@ output, use `get-command` with its `pane_id` and the
 `execution.command_id` and `execution.connection_generation` in the reply.
 The usual pane history retention rules apply.
 
+`save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH`
+saves the same full-run report available from the group results view. JSON
+is the default. Both formats include all recipients, their current status,
+and available captured output. Use `wait-ssh-group-run` before exporting
+if you need final outcomes. An unknown or evicted run returns an error
+before any file is created.
+
+The CLI resolves relative paths from its working directory. Raw requests
+require an absolute path. A completed report is published in one operation
+and requires `--overwrite` to replace an existing file. The reply returns
+`window_id`, `tab_id`, `run_id`, `path`, and `format`. The export works while
+the group is in the background.
+
 `wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]`
 returns the same detail reply once all recipients settle, including the result
 of any active per-recipient expected-output check. For CLI-started recordings,
@@ -378,6 +391,7 @@ w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --expect-output '^READY$' --regex --match-case -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
+w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --regex '^ready for traffic$'
@@ -397,6 +411,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","expect_output":{"query":"^READY$","regex":true,"match_case":true}}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
+{"verb":"save-ssh-group-report","window_id":1,"tab_id":9,"run_id":3,"path":"C:\\Reports\\group report.json","format":"json","overwrite":false}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"pattern":"^ready for traffic$","regex":true}

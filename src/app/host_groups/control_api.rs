@@ -1,6 +1,8 @@
 use super::*;
 use serde_json::{Value, json};
-use w11term::control::{SshGroupCommandOptions, SshGroupOutput};
+use w11term::control::{
+    SshGroupCommandOptions, SshGroupOutput, SshGroupReportFormat, SshGroupReportWriter,
+};
 use w11term::events::GroupCompletionState;
 
 pub(in crate::app) type ControlReply = oneshot::Sender<Result<Value, String>>;
@@ -93,6 +95,32 @@ impl Submission {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn control_capture_ssh_group_report(
+        &mut self,
+        tab: TabId,
+        run: u64,
+        format: SshGroupReportFormat,
+    ) -> Result<SshGroupReportWriter, String> {
+        let page = self
+            .host_group_by_id_mut(tab)
+            .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))?;
+        let index = page
+            .submissions
+            .iter()
+            .position(|item| item.id == run)
+            .ok_or_else(|| format!("SSH group run {run} is not retained in tab {tab}"))?;
+        page.submissions[index].refresh_deliveries();
+
+        let Some(Page::HostGroup(page)) = self.tabs.get(tab).map(|tab| &tab.page) else {
+            unreachable!("the validated group remains open during capture");
+        };
+        let report = self.capture_full_host_group_report(&page.submissions[index]);
+        Ok(SshGroupReportWriter::new(move |file| match format {
+            SshGroupReportFormat::Text => report.write_to(file),
+            SshGroupReportFormat::Json => report.write_json(file),
+        }))
+    }
+
     pub(in crate::app) fn control_submit_ssh_group_command(
         &mut self,
         tab: TabId,

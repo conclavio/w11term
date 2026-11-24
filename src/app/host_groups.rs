@@ -1826,6 +1826,12 @@ impl TerminalApp {
         }
     }
 
+    fn capture_full_host_group_report(&self, submission: &Submission) -> report::Report {
+        report::Report::capture(submission, |pane, link| {
+            self.history_frame(pane)?.command_for_link(link).cloned()
+        })
+    }
+
     fn capture_host_group_report(
         &mut self,
         id: TabId,
@@ -1839,10 +1845,10 @@ impl TerminalApp {
             return None;
         };
         let submission = page.viewed_submission(submission_id)?;
-        let retained = |pane, link| self.history_frame(pane)?.command_for_link(link).cloned();
         let Some(offered) = offered else {
-            return Some(report::Report::capture(submission, retained));
+            return Some(self.capture_full_host_group_report(submission));
         };
+        let retained = |pane, link| self.history_frame(pane)?.command_for_link(link).cloned();
         let now = Instant::now();
         let (summary, rows) = page.result_rows(submission, now);
         if rows.is_empty()

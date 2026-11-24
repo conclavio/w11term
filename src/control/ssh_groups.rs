@@ -34,6 +34,33 @@ pub struct SshGroupCommandOptions {
     pub record_output: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshGroupReportFormat {
+    #[default]
+    Json,
+    Text,
+}
+
+type ReportWrite = Box<dyn FnOnce(&mut std::fs::File) -> std::io::Result<()> + Send>;
+
+pub struct SshGroupReportWriter(ReportWrite);
+
+impl SshGroupReportWriter {
+    pub fn new(
+        write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()> + Send + 'static,
+    ) -> Self {
+        Self(Box::new(write))
+    }
+}
+
+impl std::fmt::Debug for SshGroupReportWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshGroupReportWriter")
+            .finish_non_exhaustive()
+    }
+}
+
 pub(super) struct GroupOutputQuery {
     pub(super) pane: Option<u64>,
     pub(super) after_line: Option<u64>,
@@ -108,6 +135,36 @@ pub fn validate_group_submission(pane_ids: &[u64], command: &str) -> Result<()> 
 }
 
 impl Registry {
+    pub(super) async fn save_ssh_group_report(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        path: PathBuf,
+        format: SshGroupReportFormat,
+        overwrite: bool,
+    ) -> Result<Value> {
+        ensure!(path.is_absolute(), "SSH group report path must be absolute");
+        let deadline = Instant::now() + TIMEOUT;
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::CaptureSshGroupReport {
+            tab_id: tab,
+            run_id: run,
+            format,
+            reply,
+        });
+        let writer = receive(window, response, deadline).await?;
+        let path = tokio::task::spawn_blocking(move || {
+            crate::transcript::save_with(&path, overwrite, writer.0)?;
+            anyhow::Ok(path)
+        })
+        .await??;
+        Ok(
+            json!({ "window_id": window, "tab_id": tab, "run_id": run, "path": path, "format": format }),
+        )
+    }
+
     pub(super) async fn list_saved_ssh_groups(&self, window: WindowId) -> Result<Value> {
         let deadline = Instant::now() + TIMEOUT;
         let ui = self.window_ui(window)?;
@@ -489,11 +546,11 @@ impl Registry {
     }
 }
 
-async fn receive(
+async fn receive<T>(
     window: WindowId,
-    response: oneshot::Receiver<Result<Value, String>>,
+    response: oneshot::Receiver<Result<T, String>>,
     deadline: Instant,
-) -> Result<Value> {
+) -> Result<T> {
     tokio::time::timeout_at(deadline, response)
         .await
         .with_context(|| format!("SSH group query timed out for window {window}"))?
@@ -504,6 +561,60 @@ async fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn report_export_captures_from_the_explicit_window_before_writing() {
+        use std::io::Write as _;
+
+        let owner = Registry::window(3, None);
+        let foreground = owner.register_window(5, None).unwrap();
+        foreground.activate();
+        owner.set_ui(|request| {
+            let UiRequest::CaptureSshGroupReport {
+                tab_id,
+                run_id,
+                format,
+                reply,
+            } = request
+            else {
+                panic!("unexpected control request");
+            };
+            assert_eq!((tab_id, run_id, format), (7, 2, SshGroupReportFormat::Text));
+            assert!(
+                reply
+                    .send(Ok(SshGroupReportWriter::new(
+                        |file| file.write_all(b"captured output")
+                    )))
+                    .is_ok()
+            );
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("group report.txt");
+        let saved = foreground
+            .save_ssh_group_report(3, 7, 2, path.clone(), SshGroupReportFormat::Text, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            saved,
+            json!({ "window_id":3, "tab_id":7, "run_id":2, "path":path, "format":"text" })
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"captured output");
+        assert!(
+            foreground
+                .save_ssh_group_report(
+                    3,
+                    7,
+                    2,
+                    "relative.txt".into(),
+                    SshGroupReportFormat::Text,
+                    false
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("must be absolute")
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn output_wait_times_out_and_reports_retirement() {

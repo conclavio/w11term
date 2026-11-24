@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, bail, ensure};
-use w11term::control::{CommandStatus, Request, SshGroupExpectedOutput, validate_group_submission};
+use w11term::control::{
+    CommandStatus, Request, SshGroupExpectedOutput, SshGroupReportFormat, validate_group_submission,
+};
 use w11term::session::ReplayAction;
-pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
+pub const HELP: &str = "w11term-cli [--pid PID] inspect --pane ID\nw11term-cli [--pid PID] playback --pane ID [--pause | --resume | --step]\nw11term-cli [--pid PID] find-text (--pane ID | --all-panes) [--regex] [--match-case] [--] TEXT\nw11term-cli [--pid PID] wait-for-text --pane ID [--regex] [--timeout SECONDS] TEXT\nw11term-cli [--pid PID] events --pane ID [--since CURSOR] [--timeout SECONDS]\nw11term-cli [--pid PID] resize --pane ID --cols N --rows N\nw11term-cli [--pid PID] open --profile NAME [--cols N --rows N] [--activate]\nw11term-cli [--pid PID] record --pane ID ([--timed] PATH | --stop)\nw11term-cli [--pid PID] save-text --pane ID PATH [--overwrite]\nw11term-cli [--pid PID] list-commands --pane ID [--status all|failed|succeeded|unknown]\nw11term-cli [--pid PID] get-command --pane ID --id ID --connection-generation N\nw11term-cli [--pid PID] list-ssh-groups\nw11term-cli [--pid PID] list-saved-ssh-groups --window ID\nw11term-cli [--pid PID] open-ssh-group --window ID --name NAME\nw11term-cli [--pid PID] get-ssh-group-roster --window ID --tab ID\nw11term-cli [--pid PID] wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]\nw11term-cli [--pid PID] submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND\nw11term-cli [--pid PID] get-ssh-group-run --window ID --tab ID --run ID\nw11term-cli [--pid PID] save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH\nw11term-cli [--pid PID] wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]\nw11term-cli [--pid PID] get-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--limit LINES]\nw11term-cli [--pid PID] wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT\nw11term-cli [--pid PID] follow-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--timeout SECONDS]\nw11term-cli [--pid PID] restart --pane ID --exit-token TOKEN";
 pub fn parse(
     verb: &str,
     args: impl Iterator<Item = String>,
@@ -36,6 +38,7 @@ pub fn parse(
     let mut expected_query = None;
     let mut record_output = None;
     let mut group_name = None;
+    let mut report_format = None;
     while let Some(arg) = args.next() {
         let value = |args: &mut dyn Iterator<Item = String>| {
             args.next()
@@ -139,7 +142,17 @@ pub fn parse(
                     _ => ReplayAction::Step,
                 });
             }
-            "--overwrite" if verb == "save-text" => overwrite = true,
+            "--overwrite" if matches!(verb, "save-text" | "save-ssh-group-report") => {
+                overwrite = true
+            }
+            "--format" if verb == "save-ssh-group-report" => {
+                ensure!(report_format.is_none(), "specify --format only once");
+                report_format = Some(match value(&mut args)?.as_str() {
+                    "json" => SshGroupReportFormat::Json,
+                    "text" => SshGroupReportFormat::Text,
+                    _ => bail!("--format expects json or text"),
+                });
+            }
             "--exit-token" if verb == "restart" => exit_token = Some(value(&mut args)?.parse()?),
             "--id" if verb == "get-command" => command_id = Some(value(&mut args)?.parse()?),
             "--status" if verb == "list-commands" => {
@@ -165,6 +178,7 @@ pub fn parse(
                             | "wait-ssh-group-ready"
                             | "wait-ssh-group-output"
                             | "submit-ssh-group-command"
+                            | "save-ssh-group-report"
                     ) =>
             {
                 ensure!(
@@ -195,6 +209,11 @@ pub fn parse(
                     "provide one quoted shell command line"
                 );
             }
+            "--" if verb == "save-ssh-group-report" => {
+                ensure!(text.is_none(), "provide one report destination");
+                text = Some(args.next().context("missing report destination after --")?);
+                ensure!(args.next().is_none(), "provide one report destination");
+            }
             "--" if matches!(
                 verb,
                 "find-text" | "wait-for-text" | "wait-ssh-group-output"
@@ -212,6 +231,7 @@ pub fn parse(
                         | "wait-ssh-group-output"
                         | "record"
                         | "save-text"
+                        | "save-ssh-group-report"
                         | "submit-ssh-group-command"
                 ) =>
             {
@@ -328,6 +348,21 @@ pub fn parse(
                     match_case,
                 }),
                 record_output,
+            }
+        }
+        "save-ssh-group-report" => {
+            ensure!(
+                pane.is_none(),
+                "save-ssh-group-report does not accept --pane"
+            );
+            let path = text.context("save-ssh-group-report requires a destination path")?;
+            Request::SaveSshGroupReport {
+                window_id: window_id.context("--window is required (from list-ssh-groups)")?,
+                tab_id: tab_id.context("--tab is required (from list-ssh-groups)")?,
+                run_id: run_id.context("--run is required (from list-ssh-groups)")?,
+                path: std::path::absolute(path)?,
+                format: report_format.unwrap_or_default(),
+                overwrite,
             }
         }
         "get-ssh-group-roster"

@@ -5418,6 +5418,17 @@ impl Component for TerminalApp {
                     }
                 }
             }
+            Message::Control(w11term::control::UiRequest::CaptureSshGroupReport {
+                tab_id,
+                run_id,
+                format,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ =
+                        reply.send(self.control_capture_ssh_group_report(tab_id, run_id, format));
+                }
+            }
             Message::Control(w11term::control::UiRequest::SubmitSshGroupCommand {
                 tab_id,
                 pane_ids,

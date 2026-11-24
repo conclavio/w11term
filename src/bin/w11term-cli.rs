@@ -44,6 +44,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "open-ssh-group"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
+            | "save-ssh-group-report"
             | "submit-ssh-group-command"
             | "wait-ssh-group-run"
             | "wait-ssh-group-output"
@@ -290,6 +291,53 @@ mod tests {
             ],
         ] {
             assert!(submit(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn parses_report_exports_and_defaults_to_json_without_overwriting() {
+        use w11term::control::SshGroupReportFormat;
+
+        let base = [
+            "save-ssh-group-report",
+            "--window",
+            "2",
+            "--tab",
+            "3",
+            "--run",
+            "4",
+        ];
+        let save = |extra: &[&str]| {
+            parse(
+                base.into_iter()
+                    .chain(extra.iter().copied())
+                    .map(str::to_owned),
+            )
+        };
+        assert!(matches!(
+            save(&["report file.json"]).unwrap().1,
+            Request::SaveSshGroupReport {
+                window_id: 2, tab_id: 3, run_id: 4, path, format: SshGroupReportFormat::Json, overwrite: false,
+            } if path == std::path::absolute("report file.json").unwrap()
+        ));
+        assert!(matches!(
+            save(&["--format", "text", "--overwrite", "--", "--report.txt"])
+                .unwrap()
+                .1,
+            Request::SaveSshGroupReport {
+                format: SshGroupReportFormat::Text,
+                overwrite: true,
+                ..
+            }
+        ));
+        for invalid in [
+            &[][..],
+            &["--format", "yaml", "report.txt"],
+            &["--format", "json", "--format", "text", "report.txt"],
+            &["--pane", "1", "report.txt"],
+            &["one.json", "two.json"],
+        ] {
+            assert!(save(invalid).is_err(), "{invalid:?}");
         }
     }
 
