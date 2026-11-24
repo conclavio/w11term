@@ -1193,6 +1193,91 @@ async fn native_ssh_host_group_uploads_to_reviewed_connections() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "drives the native SSH group download review, generation checks and cancellation"]
+async fn native_ssh_host_group_downloads_to_distinct_files() {
+    let state = tempfile::tempdir().unwrap();
+    let picker = state.path().join("picker/collected");
+    fs::create_dir_all(&picker).unwrap();
+    fs::write(picker.join("snapshot.bin"), b"existing").unwrap();
+    let east: Vec<u8> = (0..84_000).map(|offset| (offset % 251) as u8).collect();
+    let west: Vec<u8> = (0..42_000)
+        .map(|offset| (250 - offset % 251) as u8)
+        .collect();
+    let mut profiles = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for (name, bytes, channels) in [
+        ("Fetch East", Some(east.as_slice()), 2),
+        ("Fetch West", Some(west.as_slice()), 2),
+        ("Fetch Missing", None, 2),
+        ("Fetch Stale", Some(east.as_slice()), 2),
+        ("Witness", Some(west.as_slice()), 1),
+    ] {
+        let (Source::Ssh(ssh), root, opens, server) =
+            fixture_connections(false, if name == "Fetch Stale" { 2 } else { 1 }).await
+        else {
+            unreachable!()
+        };
+        let reports = root.path().join("reports");
+        fs::create_dir(&reports).unwrap();
+        if let Some(bytes) = bytes {
+            fs::write(reports.join("snapshot.bin"), bytes).unwrap();
+        }
+        if name == "Fetch East" {
+            fs::write(reports.join("cancel.bin"), &east).unwrap();
+            fs::write(root.path().join("transfer-trace"), []).unwrap();
+            fs::write(
+                state.path().join("east-root"),
+                root.path().to_str().unwrap(),
+            )
+            .unwrap();
+        }
+        if name == "Fetch Stale" {
+            fs::write(root.path().join("exit-on-eot"), []).unwrap();
+        }
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, root, opens, server, channels));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({"profiles": profiles})).unwrap(),
+    )
+    .unwrap();
+    drive_gui("ssh-host-group-download-ui.ps1", state.path());
+
+    let mut received = Vec::new();
+    let mut directories = 0;
+    for entry in fs::read_dir(&picker).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            directories += 1;
+            assert!(
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("ssh-group-download-")
+            );
+            for file in fs::read_dir(entry.path()).unwrap() {
+                let file = file.unwrap();
+                assert!(
+                    file.file_name()
+                        .to_string_lossy()
+                        .ends_with("-snapshot.bin")
+                );
+                received.push(fs::read(file.path()).unwrap());
+            }
+        }
+    }
+    received.sort_by_key(Vec::len);
+    assert_eq!(received, [west, east]);
+    assert_eq!(directories, 2);
+    assert_eq!(fs::read(picker.join("snapshot.bin")).unwrap(), b"existing");
+    for (name, _root, opens, server, channels) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), channels, "{name}");
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks actual tab and window titles while native Settings, SSH and PowerShell change the active title"]
 async fn native_application_titles_follow_the_focused_shell_and_preserve_a_manual_name() {
     let input = concat!(

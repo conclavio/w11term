@@ -292,8 +292,8 @@ impl TerminalApp {
                 "Finish prompt setup before opening another group."
             );
             ensure!(
-                !page.upload.is_open(),
-                "Return from the group upload before opening another group."
+                !page.transfer.is_open(),
+                "Return from the group transfer before opening another group."
             );
         }
         let catalog = self.store.catalog()?;
