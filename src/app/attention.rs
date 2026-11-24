@@ -1,4 +1,4 @@
-use super::*;
+use super::{host_groups::FailedLogin, *};
 use std::{fmt::Write as _, io::Write as _};
 use w11term::events::{NoticeTarget, SshAttemptOutcome, SshLoginResult};
 
@@ -22,13 +22,28 @@ pub enum Action {
     Open,
     WatchCommand(bool),
     LongCommands(clipboard_paste::Origin, bool),
-    Visit { pane: u64, sequence: u64 },
+    Visit {
+        pane: u64,
+        sequence: u64,
+    },
     VisitGroup(NoticeTarget),
-    ViewCommand { pane: u64, sequence: u64 },
+    ViewCommand {
+        pane: u64,
+        sequence: u64,
+    },
     ViewLoginResults(NoticeTarget),
     BackFromLoginResults(NoticeTarget),
-    VisitLoginPane { target: NoticeTarget, pane: u64 },
+    VisitLoginPane {
+        target: NoticeTarget,
+        pane: u64,
+    },
     ExportLoginReport(NoticeTarget, LoginReportAction),
+    ReviewLoginReconnect(NoticeTarget),
+    FinishLoginReconnect {
+        target: NoticeTarget,
+        offered: Arc<[FailedLogin]>,
+        reconnect: bool,
+    },
     MarkAllRead,
     Clear,
 }
@@ -36,6 +51,18 @@ pub enum Action {
 pub enum LoginReportAction {
     Copy,
     Save,
+}
+
+pub(super) enum AttentionPage {
+    Inbox,
+    Logins {
+        target: NoticeTarget,
+        changed: bool,
+    },
+    Reconnect {
+        target: NoticeTarget,
+        offered: Arc<[FailedLogin]>,
+    },
 }
 
 impl TerminalApp {
@@ -72,16 +99,16 @@ impl TerminalApp {
                     .find(|entry| matches!(entry.value.page, Page::Attention(_)))
                     .map(|entry| entry.id);
                 if let Some(id) = existing {
-                    if let Some(Page::Attention(target)) =
+                    if let Some(Page::Attention(page)) =
                         self.tabs.get_mut(id).map(|tab| &mut tab.page)
                     {
-                        *target = None;
+                        *page = AttentionPage::Inbox;
                     }
                     self.tabs.select(id);
                 } else {
                     self.tabs.insert(AppTab {
                         label: "Attention inbox".into(),
-                        page: Page::Attention(None),
+                        page: Page::Attention(AttentionPage::Inbox),
                     });
                 }
             }
@@ -124,24 +151,20 @@ impl TerminalApp {
                 return;
             }
             Action::ViewLoginResults(target) => {
-                if self.inbox.group_login_notice(target).is_some()
-                    && let Some(id) = self.tabs.active_id()
-                    && let Some(Page::Attention(view)) =
-                        self.tabs.get_mut(id).map(|tab| &mut tab.page)
-                    && view.is_none()
+                if matches!(self.active_attention(), Some(AttentionPage::Inbox))
+                    && self.inbox.group_login_notice(target).is_some()
                     && self.inbox.mark_target_read(target)
                 {
-                    *view = Some(target);
+                    self.set_attention(AttentionPage::Logins {
+                        target,
+                        changed: false,
+                    });
                 }
                 return;
             }
             Action::BackFromLoginResults(target) => {
-                if let Some(id) = self.tabs.active_id()
-                    && let Some(Page::Attention(view)) =
-                        self.tabs.get_mut(id).map(|tab| &mut tab.page)
-                    && *view == Some(target)
-                {
-                    *view = None;
+                if self.viewing_login_results(target) {
+                    self.set_attention(AttentionPage::Inbox);
                 }
                 return;
             }
@@ -162,6 +185,32 @@ impl TerminalApp {
             Action::ExportLoginReport(target, action) => {
                 self.export_login_report(target, action, ctx);
                 return;
+            }
+            Action::ReviewLoginReconnect(target) => {
+                if self.viewing_login_results(target) {
+                    let offered = self.eligible_login_reconnects(target);
+                    if offered.is_empty() {
+                        self.set_attention(AttentionPage::Logins {
+                            target,
+                            changed: true,
+                        });
+                    } else {
+                        self.set_attention(AttentionPage::Reconnect {
+                            target,
+                            offered: offered.into(),
+                        });
+                    }
+                }
+                return;
+            }
+            Action::FinishLoginReconnect {
+                target,
+                offered,
+                reconnect,
+            } => {
+                if !self.finish_login_reconnect(target, &offered, reconnect) {
+                    return;
+                }
             }
             Action::MarkAllRead => {
                 self.inbox.mark_all_read();
@@ -191,13 +240,15 @@ impl TerminalApp {
             .content(text)
     }
 
-    pub(super) fn attention_view(
-        &self,
-        login_results: Option<NoticeTarget>,
-        ctx: &ViewContext<Self>,
-    ) -> View {
-        if let Some(target) = login_results {
-            return self.login_results_view(target, ctx);
+    pub(super) fn attention_view(&self, page: &AttentionPage, ctx: &ViewContext<Self>) -> View {
+        match page {
+            AttentionPage::Inbox => {}
+            AttentionPage::Logins { target, changed } => {
+                return self.login_results_view(*target, *changed, ctx);
+            }
+            AttentionPage::Reconnect { target, offered } => {
+                return self.login_reconnect_view(*target, offered, ctx);
+            }
         }
         let rows = self.inbox.rows();
         let content = if rows.is_empty() {
@@ -344,8 +395,66 @@ impl TerminalApp {
     }
 
     fn viewing_login_results(&self, target: NoticeTarget) -> bool {
-        matches!(self.tabs.active().map(|tab| &tab.page),
-            Some(Page::Attention(Some(open))) if *open == target)
+        matches!(self.active_attention(), Some(AttentionPage::Logins { target: open, .. }) if *open == target)
+    }
+
+    fn active_attention(&self) -> Option<&AttentionPage> {
+        match &self.tabs.active()?.page {
+            Page::Attention(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    fn set_attention(&mut self, next: AttentionPage) {
+        if let Some(id) = self.tabs.active_id()
+            && let Some(Page::Attention(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
+        {
+            *page = next;
+        }
+    }
+
+    fn eligible_login_reconnects(&self, target: NoticeTarget) -> Vec<FailedLogin> {
+        let NoticeTarget::GroupLogins { tab, .. } = target else {
+            return Vec::new();
+        };
+        let Some(results) = self
+            .inbox
+            .group_login_notice(target)
+            .and_then(|row| row.login_results)
+        else {
+            return Vec::new();
+        };
+        self.report_failed_logins(tab, &results)
+    }
+
+    fn finish_login_reconnect(
+        &mut self,
+        target: NoticeTarget,
+        offered: &Arc<[FailedLogin]>,
+        reconnect: bool,
+    ) -> bool {
+        if !matches!(self.active_attention(), Some(AttentionPage::Reconnect { target: open, offered: visible })
+            if *open == target && Arc::ptr_eq(offered, visible))
+        {
+            return false;
+        }
+        if !reconnect {
+            self.set_attention(AttentionPage::Logins {
+                target,
+                changed: false,
+            });
+            return false;
+        }
+        let NoticeTarget::GroupLogins { tab, .. } = target else {
+            return false;
+        };
+        let changed = self.eligible_login_reconnects(target) != offered.as_ref();
+        self.set_attention(AttentionPage::Logins { target, changed });
+        if changed {
+            return false;
+        }
+        self.restart_report_failed_logins(tab, offered);
+        true
     }
 
     fn export_login_report(
@@ -382,7 +491,12 @@ impl TerminalApp {
         }
     }
 
-    fn login_results_view(&self, target: NoticeTarget, ctx: &ViewContext<Self>) -> View {
+    fn login_results_view(
+        &self,
+        target: NoticeTarget,
+        changed: bool,
+        ctx: &ViewContext<Self>,
+    ) -> View {
         let notice = self.inbox.group_login_notice(target);
         let available = notice.is_some();
         let content = notice
@@ -473,8 +587,85 @@ impl TerminalApp {
                                 }))
                                 .content("Back to inbox"),
                         )),
+                    if self.eligible_login_reconnects(target).is_empty() {
+                        View::empty()
+                    } else {
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::Attention(Action::ReviewLoginReconnect(target))
+                            }))
+                            .content("Review failed logins")
+                    },
+                    if changed {
+                        TextBlock::new()
+                            .text("The failed logins changed. Review the remaining hosts again.")
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into()
+                    } else {
+                        View::empty()
+                    },
                 )),
                 Border::new().grid_row(1).content(content),
+            ))
+    }
+
+    fn login_reconnect_view(
+        &self,
+        target: NoticeTarget,
+        offered: &Arc<[FailedLogin]>,
+        ctx: &ViewContext<Self>,
+    ) -> View {
+        let confirm = offered.clone();
+        let cancel = offered.clone();
+        let count = offered.len();
+        let hosts = if count == 1 { "host" } else { "hosts" };
+        Grid::new()
+            .margin(16.0)
+            .row_spacing(12.0)
+            .rows([GridLength::Auto, GridLength::STAR])
+            .children((
+                StackPanel::new().spacing(8.0).children((
+                    TextBlock::new()
+                        .font_size(24.0)
+                        .text("Review SSH reconnects"),
+                    TextBlock::new().text("Start a fresh SSH login in each listed pane."),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .automation_name("Reconnect reviewed logins")
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::FinishLoginReconnect {
+                                        target,
+                                        offered: confirm.clone(),
+                                        reconnect: true,
+                                    })
+                                }))
+                                .content(format!("Reconnect {count} {hosts}")),
+                            Button::new()
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Attention(Action::FinishLoginReconnect {
+                                        target,
+                                        offered: cancel.clone(),
+                                        reconnect: false,
+                                    })
+                                }))
+                                .content("Cancel reconnect review"),
+                        )),
+                )),
+                ScrollViewer::new().grid_row(1).content(
+                    StackPanel::new()
+                        .spacing(6.0)
+                        .keyed_children(offered.iter().enumerate().map(|(index, result)| {
+                            KeyedView::new(
+                                index,
+                                TextBlock::new()
+                                    .text(&result.host)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )
+                        })),
+                ),
             ))
     }
 }

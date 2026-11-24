@@ -1482,21 +1482,21 @@ async fn native_saved_ssh_group_opens_in_an_independent_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reports watched SSH logins in the background and preserves a host's result across reconnect"]
+#[ignore = "reconnects reviewed failed SSH logins and rejects a stale report review"]
 async fn native_ssh_group_notifies_when_watched_logins_settle() {
     let state = tempfile::tempdir().unwrap();
     let mut profiles = serde_json::Map::new();
     let mut gates = serde_json::Map::new();
     let mut peers = Vec::new();
-    for name in ["West", "East"] {
-        let connections = if name == "East" { 2 } else { 1 };
+    for name in ["West", "East", "North"] {
+        let connections = if name == "West" { 1 } else { 2 };
         let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, connections).await
         else {
             unreachable!()
         };
         let gate = root.path().join("hold-shell-request");
         fs::write(&gate, []).unwrap();
-        if name == "East" {
+        if name != "West" {
             fs::write(root.path().join("reject-shell-request"), []).unwrap();
         }
         profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
@@ -1507,7 +1507,7 @@ async fn native_ssh_group_notifies_when_watched_logins_settle() {
         state.path().join("profiles.json"),
         serde_json::to_vec(&json!({
             "profiles": profiles,
-            "ssh_host_groups": {"Notices":["West","East"]}
+            "ssh_host_groups": {"Notices":["West","East","North"]}
         }))
         .unwrap(),
     )

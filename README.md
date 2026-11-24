@@ -109,6 +109,8 @@ Choose **View login results** beside a login alert for each watched host's addre
 
 Use **Copy login report** or **Save login report…** to share the captured results as plain text. Saved reports use UTF-8.
 
+Use **Review failed logins** to see which failures from the report can still be retried. Confirm to reconnect the listed panes through the roster's login queue. If a pane has already reconnected or the eligible hosts change, review the remaining hosts again.
+
 Choose **Close ended SSH panes…** to review and close checked, visible panes whose connection has ended. Closing discards their scrollback. Panes in pinned tabs stay open, and a pane that reconnects before confirmation is kept. The command palette offers **Review close for ended SSH panes**.
 
 Choose **Open next SSH prompt** to open the first pending host-key or sign-in prompt in the displayed roster. The button shows how many visible hosts are waiting and follows the roster filters and sort order. Select the group tab to return to the roster.

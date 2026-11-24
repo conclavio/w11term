@@ -64,6 +64,7 @@ try {
 
     $west = ((Control @('list')).sessions | Where-Object label -ceq 'West').id
     $east = ((Control @('list')).sessions | Where-Object label -ceq 'East').id
+    $north = ((Control @('list')).sessions | Where-Object label -ceq 'North').id
     Remove-Item -LiteralPath $gates.West
     $null = Control @('wait-for-text','--pane',"$west",'--timeout','10','ready')
     if ((Control @('events','--pane',"$east")).ssh_connection.phase -ne 'connecting') {
@@ -72,27 +73,65 @@ try {
     if (!(Find-Element 'No bells or notifications')) { throw 'The partial result opened or filled the inbox' }
 
     Remove-Item -LiteralPath $gates.East
-    $message = "SSH logins finished${dot}1 connected${dot}1 failed${dot}0 stopped${dot}0 closed"
+    Remove-Item -LiteralPath $gates.North
+    $message = "SSH logins finished${dot}1 connected${dot}2 failed${dot}0 stopped${dot}0 closed"
     $null = Wait-Until 'one new unread notification while the group is in the background' {
         Find-Element 'Attention inbox, 1 unread' $button
     }
-    $exit = Wait-Until 'the failed login is restartable' {
+    $eastExit = Wait-Until 'East is restartable' {
         (Control @('events','--pane',"$east")).restart_token
     }
-    Remove-Item -LiteralPath (Join-Path (Split-Path -LiteralPath $gates.East) 'reject-shell-request')
-    $null = Control @('restart','--pane',"$east",'--exit-token',"$exit")
-    $null = Control @('wait-for-text','--pane',"$east",'--timeout','10','ready')
-
+    $northExit = Wait-Until 'North is restartable' {
+        (Control @('events','--pane',"$north")).restart_token
+    }
     $viewResults = "View SSH login results for SSH group${dot}Notices, notice 2"
+    $eastHost = "East${dot}test@127.0.0.1:$($config.East.port)${dot}Pane $east"
+    $northHost = "North${dot}test@127.0.0.1:$($config.North.port)${dot}Pane $north"
+    Click-Button $viewResults
+    Click-Button 'Review failed logins'
+    $null = Wait-Until 'both original failed attempts are in the review' {
+        (Find-Element 'Review SSH reconnects') -and (Find-Element $eastHost) -and (Find-Element $northHost)
+    }
+    Click-Button 'Cancel reconnect review'
+    Click-Button 'Review failed logins'
+    $null = Wait-Until 'the reconnect offer awaits explicit approval' {
+        (Find-Element 'Reconnect reviewed logins' $button) -and
+            (Control @('events','--pane',"$east")).restart_token -eq $eastExit -and
+            (Control @('events','--pane',"$north")).restart_token -eq $northExit
+    }
+
+    Remove-Item -LiteralPath (Join-Path (Split-Path -LiteralPath $gates.East) 'reject-shell-request')
+    $null = Control @('restart','--pane',"$east",'--exit-token',"$eastExit")
+    $null = Control @('wait-for-text','--pane',"$east",'--timeout','10','ready')
+    Click-Button 'Reconnect reviewed logins'
+    $null = Wait-Until 'the stale review returns to the report' {
+        Find-Element 'The failed logins changed. Review the remaining hosts again.'
+    }
+    if ((Control @('events','--pane',"$north")).restart_token -ne $northExit) {
+        throw 'A stale offer restarted North without a fresh review'
+    }
+    Click-Button 'Review failed logins'
+    $null = Wait-Until 'only the remaining failed login is offered' {
+        (Find-Element $northHost) -and !(Find-Element $eastHost)
+    }
+    Remove-Item -LiteralPath (Join-Path (Split-Path -LiteralPath $gates.North) 'reject-shell-request')
+    Click-Button 'Reconnect reviewed logins'
+    $null = Control @('wait-for-text','--pane',"$north",'--timeout','10','ready')
+    $null = Wait-Until 'a confirmed retry returns to the original roster' {
+        (Find-Element 'Host filter') -and (Find-Element 'Reconnect requested for 1 host.')
+    }
+
+    Click-Button 'Attention inbox, 0 unread'
     Click-Button $viewResults
     $success = "West${dot}test@127.0.0.1:$($config.West.port)${dot}Pane $west${dot}Connected"
-    $failure = "East${dot}test@127.0.0.1:$($config.East.port)${dot}Pane $east${dot}Failed"
+    $failure = "$eastHost${dot}Failed"
+    $northFailure = "$northHost${dot}Failed"
     $reason = 'remote server rejected a PTY or shell request (1 outstanding)'
-    $null = Wait-Until 'the report retains the original failure after East reconnects' {
-        (Find-Element $success) -and (Find-Element $failure) -and
-            (Find-Element $reason)
+    $null = Wait-Until 'the report retains the original failures after reconnecting' {
+        (Find-Element $success) -and (Find-Element $failure) -and (Find-Element $northFailure) -and
+            (Find-Element $reason) -and !(Find-Element 'Review failed logins' $button)
     }
-    $report = @('SSH login results', "SSH group${dot}Notices", $message, '', $success, $failure, "  $reason", '') -join "`n"
+    $report = @('SSH login results', "SSH group${dot}Notices", $message, '', $success, $failure, "  $reason", $northFailure, "  $reason", '') -join "`n"
     Check-LoginReportExport $report
     Click-Button "Open SSH login pane $east"
     Wait-Focus $east

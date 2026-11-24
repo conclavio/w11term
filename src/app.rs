@@ -381,7 +381,7 @@ enum SettingsEditor {
 enum Page {
     LocalForwards(local_forwards::Panel),
     SharedFolders(folder_shares::Panel),
-    Attention(Option<w11term::events::NoticeTarget>),
+    Attention(attention::AttentionPage),
     CommandHistory(command_history::HistoryPage),
     HostGroup(Box<host_groups::HostGroup>),
     Terminal(LiveTab),
@@ -6815,7 +6815,7 @@ impl Component for TerminalApp {
                 Page::Settings(Some(SettingsEditor::WordDelimiters(editor))) => {
                     word_delimiters::view(editor, context)
                 }
-                Page::Attention(target) => self.attention_view(*target, context),
+                Page::Attention(page) => self.attention_view(page, context),
                 Page::CommandHistory(page) => self.history_view(page, context),
                 Page::HostGroup(page) => self.host_group_view(id, page, context),
                 Page::SharedFolders(page) => self.folder_panel_view(page, context),

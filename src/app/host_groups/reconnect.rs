@@ -1,10 +1,16 @@
 use super::*;
-use w11term::events::PendingSshAttempt;
+use w11term::events::{PendingSshAttempt, SshAttemptOutcome, SshLoginResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attempt {
     pub(super) pane: u64,
     pub(super) token: PendingSshAttempt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedLogin {
+    pub host: String,
+    exit: ExitedPane,
 }
 
 pub enum Request {
@@ -121,14 +127,73 @@ impl TerminalApp {
             }
             Request::Host(_) => None,
         };
+        let exits = request.exits();
+        let confirmed = exits
+            .iter()
+            .copied()
+            .filter(|exit| eligible.get(&exit.pane) == Some(exit))
+            .collect::<Vec<_>>();
+        self.restart_group_exits(id, &confirmed, exits.len() - confirmed.len(), login_permits);
+    }
+
+    pub(in crate::app) fn report_failed_logins(
+        &self,
+        id: TabId,
+        results: &[SshLoginResult],
+    ) -> Vec<FailedLogin> {
+        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|entry| &entry.page) else {
+            return Vec::new();
+        };
+        results
+            .iter()
+            .filter_map(|result| {
+                if !page.includes_pane(result.pane)
+                    || !matches!(result.outcome, SshAttemptOutcome::Failed(_))
+                {
+                    return None;
+                }
+                let token = self
+                    .direct_ssh_session(result.pane)?
+                    .events
+                    .failed_ssh_restart_token(result.attempt)?;
+                Some(FailedLogin {
+                    host: result.host.clone(),
+                    exit: ExitedPane {
+                        pane: result.pane,
+                        token,
+                    },
+                })
+            })
+            .collect()
+    }
+
+    pub(in crate::app) fn restart_report_failed_logins(
+        &mut self,
+        id: TabId,
+        recipients: &[FailedLogin],
+    ) {
+        self.tabs.select(id);
+        let Some(page) = self.host_group_mut(id) else {
+            return;
+        };
+        let permits = page.login_permits(page.roster_preferences.login_limit.concurrency());
+        let exits = recipients
+            .iter()
+            .map(|recipient| recipient.exit)
+            .collect::<Vec<_>>();
+        self.restart_group_exits(id, &exits, 0, permits);
+    }
+
+    fn restart_group_exits(
+        &mut self,
+        id: TabId,
+        exits: &[ExitedPane],
+        mut skipped: usize,
+        login_permits: Option<Arc<Semaphore>>,
+    ) {
         let mut started = 0;
-        let mut skipped = 0;
         let mut feedback = Vec::new();
-        for &exit in request.exits() {
-            if eligible.get(&exit.pane) != Some(&exit) {
-                skipped += 1;
-                continue;
-            }
+        for &exit in exits {
             match self.restart_exited_pane(exit, login_permits.clone()) {
                 Ok(true) => started += 1,
                 Ok(false) => skipped += 1,

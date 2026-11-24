@@ -18,7 +18,7 @@ struct Watch {
 }
 
 struct WatchedHost {
-    pane: u64,
+    attempt: Attempt,
     host: String,
     completion: SshAttemptCompletion,
 }
@@ -84,7 +84,8 @@ impl State {
             .attempts
             .into_iter()
             .map(|host| SshLoginResult {
-                pane: host.pane,
+                pane: host.attempt.pane,
+                attempt: host.attempt.token,
                 host: host.host,
                 outcome: host.completion.outcome().expect("the attempt has settled"),
             })
@@ -139,7 +140,7 @@ impl TerminalApp {
                                 .watch_ssh_attempt(attempt.token)?;
                             let host = visible.get(&attempt.pane)?.names.display(attempt.pane);
                             Some(WatchedHost {
-                                pane: attempt.pane,
+                                attempt: *attempt,
                                 host,
                                 completion,
                             })

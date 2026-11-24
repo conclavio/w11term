@@ -201,6 +201,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 85. **Bound SSH shell setup waits.** Time out stalled session-channel opens and terminal setup replies so a remote host cannot hold a login slot or wait in the roster indefinitely.
 86. **Inspect the hosts behind a login alert.** Retain their original outcomes and diagnostics in the inbox and link back to the original panes.
 87. **Export a login report.** Copy or save the captured outcomes and diagnostics as text from their Attention inbox entry.
+88. **Retry failed logins from a report.** Review the original failures that still have a restartable pane in the group. Recheck the attempts at confirmation and use the roster's login queue.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

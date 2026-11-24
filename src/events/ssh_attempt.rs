@@ -1,4 +1,4 @@
-use super::Events;
+use super::{Events, SshConnectionPhase};
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
 
@@ -85,6 +85,22 @@ impl Events {
             .as_ref()
             .filter(|attempt| attempt.id == id)?;
         Some(SshAttemptCompletion(attempt.completion.subscribe()))
+    }
+
+    /// Only the exit of this attempt can be claimed for a report retry.
+    pub fn failed_ssh_restart_token(&self, id: PendingSshAttempt) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        if state.ssh_attempts.next == id.0
+            && state.ssh_attempts.current.is_none()
+            && matches!(
+                state.ssh_connection_phase,
+                Some(SshConnectionPhase::Failed(_))
+            )
+        {
+            state.restart_token
+        } else {
+            None
+        }
     }
 
     pub fn cancel_ssh_attempt(&self, id: PendingSshAttempt) -> bool {
@@ -184,5 +200,25 @@ mod tests {
             .unwrap();
         drop(closed);
         assert_eq!(watched.outcome(), Some(SshAttemptOutcome::Closed));
+    }
+
+    #[test]
+    fn a_report_can_only_reconnect_its_original_failed_attempt() {
+        let events = Events::default();
+        let (commands, _worker) = tokio::sync::mpsc::unbounded_channel();
+        let (first, _stop) = events.begin_ssh_attempt();
+        let first_id = events.pending_ssh_attempt().unwrap();
+        assert!(first.finish(SshAttemptOutcome::Failed("first failure".into())));
+        events.pane_exited(1, Some(SshConnectionPhase::Failed("first failure".into())));
+        assert_eq!(events.failed_ssh_restart_token(first_id), Some(1));
+        events.restart_exited(&commands, 1).unwrap();
+        assert_eq!(events.failed_ssh_restart_token(first_id), None);
+
+        let (second, _stop) = events.begin_ssh_attempt();
+        let second_id = events.pending_ssh_attempt().unwrap();
+        assert!(second.finish(SshAttemptOutcome::Failed("later failure".into())));
+        events.pane_exited(2, Some(SshConnectionPhase::Failed("later failure".into())));
+        assert_eq!(events.failed_ssh_restart_token(first_id), None);
+        assert_eq!(events.failed_ssh_restart_token(second_id), Some(2));
     }
 }

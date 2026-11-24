@@ -37,6 +37,7 @@ mod saved;
 mod transfer;
 
 pub use recipient_sets::{Action as RecipientSetAction, Offer as RecipientSetOffer};
+pub(super) use reconnect::FailedLogin;
 pub use reuse::Offer as LaunchReviewOffer;
 pub use roster_commands::RosterCommand;
 

@@ -1,4 +1,4 @@
-use super::{CommandLink, Event, SshAttemptOutcome};
+use super::{CommandLink, Event, PendingSshAttempt, SshAttemptOutcome};
 use std::{
     collections::VecDeque,
     fmt,
@@ -17,6 +17,7 @@ pub enum NoticeTarget {
 #[derive(Clone, Debug)]
 pub struct SshLoginResult {
     pub pane: u64,
+    pub attempt: PendingSshAttempt,
     pub host: String,
     pub outcome: SshAttemptOutcome,
 }
