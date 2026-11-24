@@ -1309,6 +1309,81 @@ async fn split_panes_have_independent_sftp_handles_on_one_tcp_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnecting_one_shell_keeps_its_shared_ssh_transport_available() {
+    async fn disconnect(pane: &Session, connection: u64) -> Result<(), String> {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        pane.input
+            .send(Command::DisconnectSshShell { connection, reply })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    let (original, source, _root, opens, server) = fixture(false).await;
+    let generation = original.frames.load().connection_generation;
+    let child = Session::start_configured_with_connection(
+        source,
+        Default::default(),
+        false,
+        original.ssh_connection(),
+    );
+    let child_generation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(generation) = child.events.shell_generation() {
+                break generation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("second shell must use the fixture's single TCP connection");
+    assert!(disconnect(&original, generation + 1).await.is_err());
+    assert_eq!(original.ssh_connection_generation(), Some(generation));
+    disconnect(&original, generation).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while original.events.restart_token().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a deliberate disconnect must make the same pane restartable");
+    assert!(original.ssh_connection().is_none());
+    assert_eq!(child.ssh_connection_generation(), Some(child_generation));
+    let (reply, response) = tokio::sync::oneshot::channel();
+    child
+        .input
+        .send(Command::Raw(b"shared-shell-still-live".to_vec(), reply))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !child
+            .frames
+            .load()
+            .rows
+            .iter()
+            .any(|line| line.as_str().contains("shared-shell-still-live"))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the sibling shell must still receive its echo");
+    assert_eq!(opens.load(Ordering::Relaxed), 2, "one channel per shell");
+    drop(original);
+    drop(child);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
     use tokio::sync::{oneshot, watch};
     use w11term::sftp::{CHUNK, Job, Operation, TransferProgress};

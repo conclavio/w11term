@@ -118,6 +118,10 @@ impl TerminalConfiguration for Config {
 pub enum TransportInput {
     Authenticate(crate::options::Authentication),
     Sftp(crate::sftp::Job),
+    DisconnectShell {
+        connection: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Data(Vec<u8>),
     /// Parser-generated reply on a viewer transport that distinguishes it from user input.
     Automatic(Vec<u8>),
@@ -135,7 +139,7 @@ pub enum TransportInput {
 impl TransportInput {
     pub(crate) fn reject_input(self, reason: &str) {
         match self {
-            Self::Raw(_, reply) => {
+            Self::Raw(_, reply) | Self::DisconnectShell { reply, .. } => {
                 let _ = reply.send(Err(reason.into()));
             }
             Self::Scoped { reply, kind, .. } => kind.reject(reply, reason),

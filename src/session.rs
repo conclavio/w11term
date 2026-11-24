@@ -109,6 +109,10 @@ pub enum Command {
         target: crate::events::GroupInterruptTarget,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    DisconnectSshShell {
+        connection: u64,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     Capture(tokio::sync::oneshot::Sender<(Snapshot, TerminalSize)>),
     /// Capture immutable UTF-8 text on this worker. The caller owns all file I/O.
     ExportText(tokio::sync::oneshot::Sender<Result<String, &'static str>>),
@@ -304,6 +308,11 @@ impl Session {
         self.ssh_connection
             .generation()
             .and_then(|(current, link)| (current == generation).then_some(link))
+    }
+    pub fn ssh_connection_generation(&self) -> Option<u64> {
+        self.ssh_connection
+            .generation()
+            .map(|(generation, _)| generation)
     }
     pub fn ssh_connection_changes(&self) -> tokio::sync::watch::Receiver<()> {
         self.ssh_connection.subscribe()
@@ -1045,6 +1054,17 @@ async fn run(
                         match bytes {
                             Ok(bytes) => { write_group_input(&writer, target.generation, bytes, reply, kind); }
                             Err(error) => { let _ = reply.send(Err(error)); }
+                        }
+                        Ok(())
+                    }
+                    Some(Command::DisconnectSshShell { connection, reply }) => {
+                        let request = TransportInput::DisconnectShell { connection, reply };
+                        if !group_shell || player.read().unwrap().rustmush {
+                            request.reject_input("Disconnect requires a direct SSH shell.");
+                        } else if phase != Phase::Running || connection_generation != connection {
+                            request.reject_input("The SSH shell changed before disconnect.");
+                        } else if let Err(error) = writer.send(request) {
+                            error.0.reject_input("The SSH shell already closed.");
                         }
                         Ok(())
                     }

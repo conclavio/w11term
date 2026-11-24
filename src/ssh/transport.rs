@@ -438,6 +438,9 @@ fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOpti
         TransportInput::Resize(new) => *size = new,
         TransportInput::Authenticate(auth) => options.authentication = auth,
         TransportInput::Data(_) | TransportInput::Automatic(_) => {}
+        message @ TransportInput::DisconnectShell { .. } => {
+            message.reject_input("The SSH shell changed before disconnect.");
+        }
         message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. }) => {
             message.reject_input("SSH is reconnecting; input was not queued or sent");
         }
@@ -906,6 +909,9 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             message = input.recv() => {
                 if process_exited {
                     match message {
+                        Some(message @ TransportInput::DisconnectShell { .. }) => {
+                            message.reject_input("The SSH shell already exited.");
+                        }
                         Some(message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. })) => {
                             message.reject_input("Remote process exited; input was not sent");
                         }
@@ -920,6 +926,19 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                 let discard_input = waiting_for_resume || queued_before_unlock > 0;
                 queued_before_unlock = queued_before_unlock.saturating_sub(1);
                 match message {
+                    Some(TransportInput::DisconnectShell { connection, reply }) => {
+                        if managed || options.player.rustmush ||
+                            sharing.startup.as_ref().is_some_and(|startup| !startup.command.is_empty())
+                        {
+                            let _ = reply.send(Err("Disconnect requires a direct SSH shell.".into()));
+                        } else if connection != generation || pending != 0 {
+                            let _ = reply.send(Err("The SSH shell changed before disconnect.".into()));
+                        } else {
+                            // The channel guard closes this shell. A sibling may still own the link.
+                            let _ = reply.send(Ok(()));
+                            return Ok(());
+                        }
+                    }
                     Some(TransportInput::Authenticate(auth)) => options.authentication = auth,
                     Some(TransportInput::Sftp(job)) => {
                         forward_sftp(&sftp_tx,&cleanup_tx,job);
@@ -1044,6 +1063,9 @@ async fn run_herdr_channel(
                 Some(TransportInput::Resize(size))=>{driver.size=size; viewer.resize(u16::try_from(size.cols)?,u16::try_from(size.rows)?).await?;}
                 Some(TransportInput::Authenticate(auth))=>driver.options.authentication=auth,
                 Some(TransportInput::Sftp(job))=>forward_sftp(&sftp_tx,&cleanup_tx,job),
+                Some(message @ TransportInput::DisconnectShell { .. }) => {
+                    message.reject_input("Disconnect requires a direct SSH shell.");
+                }
                 None=>{viewer.close().await?;return Ok(());}
             },
             data=viewer.next_data()=>match data? {

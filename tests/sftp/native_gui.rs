@@ -1089,6 +1089,44 @@ async fn native_ssh_host_group_opens_filtered_authentication_prompts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews and disconnects selected SSH shells in a Windows roster"]
+async fn native_ssh_host_group_disconnects_reviewed_shells_and_keeps_panes() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for (name, launches) in [("Fleet East", 3), ("Fleet West", 2), ("Witness", 1)] {
+        let (Source::Ssh(ssh), root, opens, server) = fixture_connections(false, launches).await
+        else {
+            unreachable!()
+        };
+        fs::write(root.path().join("exit-on-eot"), b"").unwrap();
+        if name == "Fleet East" {
+            let scrollback: String = (0..64)
+                .map(|line| format!("east history {line:02}\r\n"))
+                .collect();
+            fs::write(root.path().join("copy-history.vt"), scrollback).unwrap();
+        }
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, root, opens, launches, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Disconnect review": ["Fleet East", "Fleet West", "Witness"]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("ssh-host-group-disconnect-ui.ps1", state.path());
+    for (name, _root, opens, launches, server) in peers {
+        assert_eq!(opens.load(Ordering::Relaxed), launches, "{name}");
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks reviewed rank, shell syntax and prompt scope on the native SSH group tab"]
 async fn native_ssh_host_group_exports_ranked_variables() {
     use in_band_resize::Wire;

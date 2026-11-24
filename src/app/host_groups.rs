@@ -10,6 +10,7 @@ use w11term::prompts::Question;
 mod address;
 mod compare;
 mod completion;
+mod disconnect;
 mod environment;
 mod filter;
 mod host_list_export;
@@ -67,6 +68,7 @@ pub(super) struct HostGroup {
     import: import::State,
     host_list_export: Box<host_list_export::State>,
     reconnect_feedback: String,
+    disconnect: Box<disconnect::State>,
     retry_feedback: String,
     prompt_setup: prompt_setup::State,
     transfer: transfer::State,
@@ -588,6 +590,7 @@ pub enum Action {
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
+    Disconnect(TabId, disconnect::Action),
     FilterResults(TabId, u64, progress::Filter),
     OrderResults(TabId, u64, progress::ResultOrder),
     LoadCommand(TabId, u64),
@@ -659,6 +662,7 @@ impl TerminalApp {
                     && !page.comparison.is_open()
                     && !page.import.is_open()
                     && !page.host_list_export.is_open()
+                    && !page.disconnect.is_reviewing()
                     && !page.edit_membership_open()
                     && !page.saved.reuse.is_open()
                     && !page.prompt_setup.is_open()
@@ -1023,6 +1027,7 @@ impl TerminalApp {
             Action::Membership(id, action) => self.handle_group_membership(id, action),
             Action::Reuse(id, action) => self.handle_host_group_reuse(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
+            Action::Disconnect(id, action) => self.handle_group_disconnect(id, action),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
             Action::HostListExport(id, action) => self.handle_host_list_export(id, action, ctx),
             Action::RecipientSets(id, action) => self.handle_recipient_sets(id, action),
@@ -1054,6 +1059,7 @@ impl TerminalApp {
                     {
                         page.selected.retain(|pane| panes.contains(pane));
                         page.prompt_setup.poll();
+                        page.disconnect.poll();
                         for submission in &mut page.submissions {
                             if let Some(path) = submission.recording.poll() {
                                 submission.saved_recordings.add(path);
@@ -1419,6 +1425,9 @@ impl TerminalApp {
         page: &HostGroup,
         ctx: &mut ViewContext<Self>,
     ) -> View {
+        if let Some(view) = page.disconnect.review(id, ctx) {
+            return view;
+        }
         if page.environment.is_open() {
             return page
                 .environment
@@ -1723,6 +1732,8 @@ impl TerminalApp {
                         .content("Save selection as group…"),
                 )),
             reconnect::selection_controls(id, page, &shown, ctx),
+            page.disconnect
+                .controls(id, self.disconnect_recipients(selected.iter()), ctx),
             next_prompt,
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
