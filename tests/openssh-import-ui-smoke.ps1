@@ -33,6 +33,16 @@ function Ssh-Reference([string]$Alias) {
     }
     return $endpoint
 }
+function Click([string]$Name) {
+    Invoke-Button (Wait-Until "enabled '$Name'" {
+        $entry = Find-Element $Name $button
+        if ($entry -and $entry.Current.IsEnabled) { $entry }
+    })
+}
+function Field([string]$Name) {
+    (Wait-Until $Name { Find-Element $Name ([System.Windows.Automation.ControlType]::Edit) }).GetCurrentPattern(
+        [System.Windows.Automation.ValuePattern]::Pattern)
+}
 try {
     # Absolute local paths keep both readers inside the selected fixture even
     # when the system client's -F config lives outside the user's SSH directory.
@@ -59,6 +69,13 @@ Host gateway
 # This alias cannot be represented by a native SSH profile.
 Host blocked
     ProxyCommand never-executed %h
+'@
+    Write-Config (Join-Path $fragments '40-web.conf') @'
+Host web
+    HostName web.test
+    User pilot
+    Port 2300
+    HostKeyAlias Web.Key.Test
 '@
     [IO.File]::WriteAllText($profiles,'{"profiles":{}}',$utf8)
     $env:W11TERM_DATA_DIR = $data
@@ -112,6 +129,67 @@ Host blocked
             throw "Saved profile differs from Windows OpenSSH -G. See $profiles"
         }
         Write-Output 'Windows OpenSSH -G independently confirmed the destination and gateway.'
+    }
+
+    Remove-Item Env:W11TERM_UI_SMOKE, Env:W11TERM_IMPORT_SMOKE
+    [IO.File]::WriteAllText($env:W11TERM_SETTINGS_PATH,'{"shortcuts":{"command_palette":"F7"}}',$utf8)
+    $groupLog = Join-Path $state 'group-stderr.log'
+    $terminal = Start-Process -FilePath $gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError $groupLog
+    $app = $terminal
+    $window = Wait-InputWindow
+    Run-Palette 'Settings'
+    Click ('Import OpenSSH config' + [char]0x2026)
+    (Field 'OpenSSH config path').SetValue('')
+    $null = Wait-Until 'empty path disables Preview hosts' {
+        $entry = Find-Element 'Preview hosts' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    (Field 'OpenSSH config path').SetValue($config)
+    Click 'Preview hosts'
+    $groupAction = 'Create SSH group from aliases' + [char]0x2026
+    $null = Wait-Until 'imported aliases' { Find-Element $groupAction $button }
+    $picker = Wait-Until 'host alias picker' {
+        Find-Element 'Host alias' ([System.Windows.Automation.ControlType]::ComboBox)
+    }
+    $picker.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $gatewayEntry = Wait-Until 'gateway option' {
+        Find-Element 'gateway' ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $gatewayEntry.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'gateway destination preview' {
+        Find-Element "Destination`njump@gateway.test:2201 (SSH agent, host key alias bastion.key.test)"
+    }
+    Click 'Save profile'
+    $null = Wait-Until 'gateway saved for reuse' { Find-Element 'Saved profile gateway' }
+    Click $groupAction
+    $checkBox = [System.Windows.Automation.ControlType]::CheckBox
+    foreach ($alias in @('gateway','web','via','blocked')) {
+        $check = Wait-Until "reviewed alias $alias" { Find-Element "Include OpenSSH alias $alias" $checkBox }
+        if ($check.Current.IsEnabled -ne ($alias -in @('gateway','web'))) {
+            throw "Unexpected review availability for $alias"
+        }
+    }
+    (Field 'OpenSSH group name').SetValue('Imported fleet')
+    Click 'Check shown aliases'
+    $dot = [char]0xb7
+    $null = Wait-Until 'one existing and one new profile checked' {
+        Find-Element "2 checked $dot 1 new $dot 1 existing $dot Page 1 of 1"
+    }
+    (Field 'Filter OpenSSH aliases').SetValue('WEB')
+    $null = Wait-Until 'filter hides gateway without clearing either check' {
+        !(Find-Element 'Include OpenSSH alias gateway' $checkBox) -and
+            (Find-Element "2 checked $dot 1 new $dot 1 existing $dot Page 1 of 1")
+    }
+    Click 'Save SSH group'
+    $null = Wait-Until 'saved imported group' { Find-Element 'Saved SSH group Imported fleet' }
+    $catalog = Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json
+    if (($catalog.ssh_host_groups.'Imported fleet' -join ',') -cne 'gateway,web' -or
+        @($catalog.profiles.psobject.Properties).Count -ne 3 -or
+        $catalog.profiles.gateway.host_key_alias -cne 'bastion.key.test' -or
+        $catalog.profiles.web.host -cne 'web.test' -or $catalog.profiles.web.port -ne 2300 -or
+        $catalog.profiles.web.host_key_alias -cne 'web.key.test' -or
+        $catalog.profiles.via.terminal_type -cne 'xterm-sixel') {
+        throw "Unexpected saved group membership or profile options. See $profiles"
     }
     Write-Output "OpenSSH import native smoke passed. Artifacts in $state"
 } finally {

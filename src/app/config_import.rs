@@ -5,6 +5,8 @@ use w11term::{
     ssh_config::{ImportReport, ImportedAlias, import_file},
 };
 
+mod group;
+
 pub(super) struct ImportPage {
     path: String,
     revision: u64,
@@ -13,6 +15,7 @@ pub(super) struct ImportPage {
     report: Option<ImportReport>,
     selected: Option<usize>,
     status: String,
+    group: Option<Box<group::Editor>>,
 }
 impl Default for ImportPage {
     fn default() -> Self {
@@ -26,6 +29,7 @@ impl Default for ImportPage {
             report: None,
             selected: None,
             status: String::new(),
+            group: None,
         }
     }
 }
@@ -69,6 +73,7 @@ impl ImportPage {
         self.revision += 1;
         self.report = None;
         self.selected = None;
+        self.group = None;
         self.reading = false;
         self.status.clear();
     }
@@ -118,6 +123,8 @@ pub enum Action {
     Read(TabId, u64, Result<ImportReport, String>),
     Select(TabId, u64, Option<usize>),
     Save(TabId, u64, usize),
+    OpenGroup(TabId, u64),
+    Group(TabId, u64, group::Change),
 }
 
 fn endpoint(
@@ -252,6 +259,22 @@ impl TerminalApp {
                     page.finish(revision, result);
                 }
             }
+            Action::OpenGroup(id, revision) => {
+                if self.tabs.active_id() == Some(id)
+                    && let Some(page) = self.import_page_mut(id)
+                    && page.revision == revision
+                    && page.picking.is_none()
+                    && page.group.is_none()
+                    && page
+                        .report
+                        .as_ref()
+                        .is_some_and(|report| !report.aliases.is_empty())
+                {
+                    page.revision += 1;
+                    page.group = Some(Box::default());
+                }
+            }
+            Action::Group(id, revision, change) => self.edit_config_group(id, revision, change),
             Action::Select(id, revision, selected) => {
                 if let Some(page) = self.import_page_mut(id)
                     && page.revision == revision
@@ -301,6 +324,11 @@ impl TerminalApp {
         context: &ViewContext<Self>,
     ) -> View {
         let revision = page.revision;
+        if let Some(group) = &page.group
+            && let Some(report) = &page.report
+        {
+            return group.view(id, revision, report, &self.catalog, context);
+        }
         let mut fields = vec![
             KeyedView::new(
                 "title",
@@ -358,6 +386,15 @@ impl TerminalApp {
                 fields.push(text("config-warnings", report.warnings.join("\n")));
             }
             if !report.aliases.is_empty() {
+                fields.push(KeyedView::new(
+                    "create-group",
+                    Button::new()
+                        .is_enabled(page.picking.is_none())
+                        .on_click(context.callback(move |_| {
+                            Message::ImportConfig(Action::OpenGroup(id, revision))
+                        }))
+                        .content("Create SSH group from aliases…"),
+                ));
                 fields.push(text("host-label", "Host alias".into()));
                 fields.push(KeyedView::new(
                     "hosts",
