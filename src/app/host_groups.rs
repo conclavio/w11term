@@ -5,7 +5,7 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt, SshConnectionPhase,
 };
-use w11term::options::{SshGroupLoginLimit, SshRosterDefaults, SshRosterOrder as RosterOrder};
+use w11term::options::{SshGroupParallelLimit, SshRosterDefaults, SshRosterOrder as RosterOrder};
 use w11term::prompts::Question;
 mod address;
 mod close_ended;
@@ -19,9 +19,9 @@ mod filter;
 mod host_list_export;
 mod import;
 mod live_output;
-mod login_limit;
 mod membership;
 mod output_recording;
+mod parallel_limit;
 mod progress;
 mod prompt_setup;
 mod recent_commands;
@@ -59,7 +59,6 @@ pub(super) struct HostGroup {
     login_queue: Option<(usize, Arc<Semaphore>)>,
     roster_copy_feedback: String,
     draft: String,
-    command_limit: Option<usize>,
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     focus_loaded_command: bool,
@@ -129,7 +128,7 @@ struct Submission {
 pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
-    limit: Option<usize>,
+    limit: SshGroupParallelLimit,
 }
 
 enum SubmissionContent {
@@ -703,7 +702,7 @@ pub enum Action {
     ViewOutput(TabId, u64, CommandLink),
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, CommandOffer),
-    CommandLimit(TabId, Option<usize>),
+    CommandLimit(TabId, SshGroupParallelLimit),
     CancelQueuedCommands(TabId, u64),
 }
 
@@ -1015,7 +1014,7 @@ impl TerminalApp {
         !page.sending()
             && page.readiness_allows_send(ready, targets.len())
             && page.selected_shown(&roster) == selection
-            && page.command_limit == *limit
+            && page.roster_preferences.command_limit == *limit
             && page.draft == text.as_ref()
             && w11term::saved_commands::valid_command_text(text)
             && ((!verify_prompts && !page.roster_preferences.require_all_ready)
@@ -1040,6 +1039,7 @@ impl TerminalApp {
             targets,
             limit,
         } = offer;
+        let limit = limit.concurrency();
         let results = targets
             .into_iter()
             .map(|target| {
@@ -1480,7 +1480,7 @@ impl TerminalApp {
                     .host_group_mut(id)
                     .filter(|page| !page.recorded_send.pending())
                 {
-                    page.command_limit = limit;
+                    page.roster_preferences.command_limit = limit;
                 }
             }
             Action::CancelQueuedCommands(id, run) => self.cancel_queued_commands(id, run),
@@ -2032,7 +2032,7 @@ impl TerminalApp {
         let offer = CommandOffer {
             text,
             targets: selected.clone(),
-            limit: page.command_limit,
+            limit: page.roster_preferences.command_limit,
         };
         let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
@@ -2093,8 +2093,9 @@ impl TerminalApp {
                 filter,
                 StackPanel::new().grid_row(3).spacing(7.0).children((
                     entry,
-                    login_limit::command_picker(
-                        page.command_limit,
+                    parallel_limit::picker(
+                        "Parallel SSH commands",
+                        page.roster_preferences.command_limit,
                         !page.recorded_send.pending(),
                         move |limit| Message::HostGroup(Action::CommandLimit(id, limit)),
                         ctx,

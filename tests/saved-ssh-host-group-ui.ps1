@@ -51,14 +51,14 @@ function Filter-GroupProfiles([string]$Query) {
     $field = Wait-Until 'saved group profile search' { Find-Element 'Find group profiles' $edit }
     $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
 }
-function Roster-Order([string]$Name, [switch]$Choose) {
+function Roster-Choice([string]$Name, [switch]$Choose, [string]$ControlName = 'Sort SSH roster') {
     $comboType = [System.Windows.Automation.ControlType]::ComboBox
     $listItem = [System.Windows.Automation.ControlType]::ListItem
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
     $selection = [System.Windows.Automation.SelectionPattern]::Pattern
     if ($Choose) {
-        $option = Wait-Until "the '$Name' roster sort option" {
-            $combo = Find-Element 'Sort SSH roster' $comboType
+        $option = Wait-Until "the '$Name' option for $ControlName" {
+            $combo = Find-Element $ControlName $comboType
             if (!$combo) { return }
             $popup = $combo.GetCurrentPattern($expand)
             if ($popup.Current.ExpandCollapseState -eq 'Collapsed') { $popup.Expand() }
@@ -67,8 +67,8 @@ function Roster-Order([string]$Name, [switch]$Choose) {
         }
         $option.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     }
-    $combo = Wait-Until "roster sort is '$Name'" {
-        $item = Find-Element 'Sort SSH roster' $comboType
+    $combo = Wait-Until "$ControlName is '$Name'" {
+        $item = Find-Element $ControlName $comboType
         if (!$item) { return }
         $items = $item.GetCurrentPattern($selection).Current.GetSelection()
         if ($items.Count -eq 1 -and $items[0].Current.Name -ceq $Name) { $item }
@@ -227,8 +227,10 @@ try {
     $saveDefaults = 'Save roster defaults'
     $showOutput = 'Show last command output'
     $allReady = 'Require all recipients ready'
-    Roster-Order 'Tab order'
-    Roster-Order 'Host label' -Choose
+    Roster-Choice 'Tab order'
+    Roster-Choice 'Host label' -Choose
+    Roster-Choice 'Unlimited' -ControlName 'Parallel SSH commands'
+    Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands' -Choose
     (Wait-CheckBox $allReady Off).Toggle()
     (Wait-CheckBox $showOutput Off).Toggle()
     $null = Wait-CheckBox $allReady On
@@ -237,7 +239,7 @@ try {
     $null = Wait-Until 'the defaults are saved for Fleet' {
         if (!(Find-Element 'Saved roster defaults')) { return }
         $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
-        $savedDefaults.order -ceq 'label' -and
+        $savedDefaults.order -ceq 'label' -and $savedDefaults.command_limit -ceq 'two' -and
             $savedDefaults.show_last_output -and $savedDefaults.require_all_ready
     }
     (Wait-CheckBox $showOutput On).Toggle()
@@ -247,7 +249,8 @@ try {
     Open-FleetPalette
     Click "Open SSH group${dot}Fleet"
     $null = Wait-Until 'reopened Fleet with its own roster defaults' { Find-Element 'Opened 2 SSH panes for Fleet' }
-    Roster-Order 'Host label'
+    Roster-Choice 'Host label'
+    Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands'
     $null = Wait-CheckBox $allReady On
     $null = Wait-CheckBox $showOutput On
     $null = Wait-Until 'the loaded preferences match the saved defaults' {
@@ -278,7 +281,8 @@ try {
         $saved = Catalog
         ($saved.ssh_host_groups.'Fleet copy' -join ',') -ceq 'West,East' -and
             $saved.ssh_host_group_defaults.'Fleet copy'.order -ceq 'label' -and
-            $saved.ssh_host_group_defaults.'Fleet copy'.show_last_output
+            $saved.ssh_host_group_defaults.'Fleet copy'.show_last_output -and
+            $saved.ssh_host_group_defaults.'Fleet copy'.command_limit -ceq 'two'
     }
     if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Copying the group opened SSH panes' }
     Click 'Edit group'
@@ -361,7 +365,8 @@ try {
         $saved = Catalog
         ($saved.ssh_host_groups.'Portable Fleet' -join ',') -ceq 'West Local,East' -and
             ($saved.ssh_recipient_sets.'Portable Fleet'.Canary -join ',') -ceq 'East,West Local' -and
-            $saved.ssh_host_group_defaults.'Portable Fleet'.show_last_output
+            $saved.ssh_host_group_defaults.'Portable Fleet'.show_last_output -and
+            $saved.ssh_host_group_defaults.'Portable Fleet'.command_limit -ceq 'two'
     }
     if (@((Control @('list')).sessions).Count -ne $sessions.Count) { throw 'Importing the definition opened SSH panes' }
     $restored = Catalog

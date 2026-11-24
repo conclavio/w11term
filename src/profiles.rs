@@ -1499,7 +1499,7 @@ mod tests {
 
     #[test]
     fn roster_defaults_follow_group_rename_and_reject_stale_writes() {
-        use crate::options::{SshGroupLoginLimit, SshRosterOrder};
+        use crate::options::{SshGroupParallelLimit, SshRosterOrder};
         use serde_json::Value;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1523,7 +1523,8 @@ mod tests {
             show_last_output: true,
             show_terminal_line: true,
             require_all_ready: true,
-            login_limit: SshGroupLoginLimit::Four,
+            login_limit: SshGroupParallelLimit::Four,
+            command_limit: SshGroupParallelLimit::Two,
         };
         assert!(
             store

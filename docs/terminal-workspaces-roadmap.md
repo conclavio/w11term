@@ -203,6 +203,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 87. **Export a login report.** Copy or save the captured outcomes and diagnostics as text from their Attention inbox entry.
 88. **Retry failed logins from a report.** Review the original failures that still have a restartable pane in the group. Recheck the attempts at confirmation and use the roster's login queue.
 89. **Limit parallel commands within a submission.** Queue checked, ready hosts in roster order, recheck each prompt when its slot becomes available, and allow cancellation before sending. The same limit applies to recorded runs.
+90. **Save a group command limit.** Store the chosen command concurrency with the roster defaults so it follows group launches, copies, and portable definitions.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

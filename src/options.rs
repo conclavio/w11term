@@ -430,7 +430,7 @@ pub enum SshRosterOrder {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SshGroupLoginLimit {
+pub enum SshGroupParallelLimit {
     #[default]
     Unlimited,
     One,
@@ -440,7 +440,7 @@ pub enum SshGroupLoginLimit {
     Sixteen,
 }
 
-impl SshGroupLoginLimit {
+impl SshGroupParallelLimit {
     pub fn concurrency(self) -> Option<usize> {
         match self {
             Self::Unlimited => None,
@@ -453,6 +453,8 @@ impl SshGroupLoginLimit {
     }
 }
 
+pub type SshGroupLoginLimit = SshGroupParallelLimit;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SshRosterDefaults {
@@ -460,7 +462,8 @@ pub struct SshRosterDefaults {
     pub show_last_output: bool,
     pub show_terminal_line: bool,
     pub require_all_ready: bool,
-    pub login_limit: SshGroupLoginLimit,
+    pub login_limit: SshGroupParallelLimit,
+    pub command_limit: SshGroupParallelLimit,
 }
 
 #[derive(Clone, Debug, PartialEq)]

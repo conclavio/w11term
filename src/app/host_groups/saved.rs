@@ -484,7 +484,7 @@ impl TerminalApp {
         name: &str,
         members: &[String],
         expected: SshRosterDefaults,
-        login_limit: SshGroupLoginLimit,
+        login_limit: SshGroupParallelLimit,
     ) -> Result<()> {
         let updated = SshRosterDefaults {
             login_limit,

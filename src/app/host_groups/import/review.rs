@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Approval {
     choices: BTreeMap<usize, Option<reuse::Connection>>,
-    login_limit: SshGroupLoginLimit,
+    login_limit: SshGroupParallelLimit,
 }
 
 pub(super) struct Review {
@@ -70,7 +70,7 @@ impl Review {
         }
     }
 
-    fn approval(&self, login_limit: SshGroupLoginLimit) -> Approval {
+    fn approval(&self, login_limit: SshGroupParallelLimit) -> Approval {
         Approval {
             choices: self
                 .checked
@@ -116,7 +116,7 @@ impl Review {
         cancel: View,
         error: View,
         saved: bool,
-        login_limit: SshGroupLoginLimit,
+        login_limit: SshGroupParallelLimit,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         if let Some(editor) = &self.save {
@@ -192,7 +192,8 @@ impl Review {
                         "Review SSH hosts"
                     }),
                     TextBlock::new().text(format!("{reused} to reuse · {fresh} to open")),
-                    login_limit::picker(
+                    parallel_limit::picker(
+                        "Parallel SSH logins",
                         login_limit,
                         fresh > 0,
                         move |limit| action(Change::LoginLimit(limit)),

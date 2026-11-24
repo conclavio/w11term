@@ -253,7 +253,7 @@ pub(super) struct State {
     filter: filter::Filter,
     page: usize,
     set_editor: Option<SetEditor>,
-    login_limit: SshGroupLoginLimit,
+    login_limit: SshGroupParallelLimit,
 }
 
 enum SetEditor {
@@ -315,13 +315,13 @@ pub enum Change {
     IncludeMatches(Vec<usize>, MatchSelection),
     ChooseMatches(Vec<usize>, ConnectionSelection),
     RecipientSet(String),
-    LoginLimit(SshGroupLoginLimit),
-    SaveLoginLimit(SshGroupLoginLimit),
+    LoginLimit(SshGroupParallelLimit),
+    SaveLoginLimit(SshGroupParallelLimit),
     Approve(
         Vec<Launch>,
         Option<String>,
         LaunchLocation,
-        SshGroupLoginLimit,
+        SshGroupParallelLimit,
     ),
     Export(Vec<Launch>, Option<String>),
     BeginSaveSet,
@@ -594,7 +594,7 @@ impl State {
                             .spacing(8.0)
                             .orientation(Orientation::Horizontal)
                             .children((
-                                login_limit::picker(login_limit, true, move |limit| action(Change::LoginLimit(limit)), ctx),
+                                parallel_limit::picker("Parallel SSH logins", login_limit, true, move |limit| action(Change::LoginLimit(limit)), ctx),
                                 Button::new()
                                     .automation_name("Save login limit")
                                     .is_enabled(login_limit != review.roster_defaults.login_limit)

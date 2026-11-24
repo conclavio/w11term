@@ -124,7 +124,7 @@ pub(super) fn validate(group: &SavedSshGroup) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::options::SshRosterDefaults;
+    use crate::options::{SshGroupParallelLimit, SshRosterDefaults};
     use crate::profiles::ProfileStore;
     use serde_json::json;
 
@@ -136,6 +136,7 @@ mod tests {
             recipient_sets: Some([("Canary".into(), vec!["East".into()])].into()),
             roster_defaults: Some(SshRosterDefaults {
                 show_terminal_line: true,
+                command_limit: SshGroupParallelLimit::Eight,
                 ..Default::default()
             }),
         };
@@ -149,6 +150,7 @@ mod tests {
         assert_eq!(parsed["format"], FORMAT);
         assert_eq!(parsed["version"], VERSION);
         assert_eq!(parsed["group"]["members"], json!(["West", "East"]));
+        assert_eq!(parsed["group"]["roster_defaults"]["command_limit"], "eight");
         assert!(parsed.get("profiles").is_none());
     }
 
