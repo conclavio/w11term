@@ -1,18 +1,26 @@
 use super::*;
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
 use std::{collections::BTreeMap, fmt::Write as _, io::Write as _};
 use w11term::{
-    events::{GroupTranscriptLine, GroupTranscriptSnapshot},
-    search::MAX_QUERY_BYTES,
+    events::{GroupTranscriptHistory, GroupTranscriptLine, GroupTranscriptSnapshot},
+    search::{MAX_QUERY_BYTES, compile_regex},
 };
+
+const CONTEXT_LINES: usize = 2;
 
 #[derive(Clone)]
 pub enum Action {
     Open,
     Back,
+    ViewRun(u64),
     Pause,
     Resume,
     Search(String),
+    UseRegex(bool),
+    MatchCase(bool),
+    ShowContext(bool),
+    OldestFirst(bool),
+    ShowElapsed(bool),
     FilterHost(Option<u64>),
     ClearFilters,
     CopyShown,
@@ -21,95 +29,245 @@ pub enum Action {
 
 pub(super) struct State {
     pub(super) submission: u64,
-    paused: Option<GroupTranscriptSnapshot>,
+    paused: Option<GroupTranscriptHistory>,
     filter: Filter,
+    timeline: Timeline,
     copy_feedback: Option<String>,
+}
+
+#[derive(Default)]
+struct Timeline {
+    oldest_first: bool,
+    show_elapsed: bool,
+}
+
+impl Timeline {
+    fn status(&self, paused: bool) -> &'static str {
+        match (paused, self.oldest_first) {
+            (false, false) => "Newest first",
+            (false, true) => "Oldest first",
+            (true, false) => "Paused · newest first",
+            (true, true) => "Paused · oldest first",
+        }
+    }
 }
 
 #[derive(Default)]
 struct Filter {
     query: String,
-    matcher: Option<Regex>,
-    pane: Option<u64>,
+    matcher: Option<Result<Regex, String>>,
+    regex: bool,
+    sensitive: bool,
+    show_context: bool,
+    host: Option<HostFilter>,
+}
+
+struct HostFilter {
+    pane: u64,
+    address: String,
+    label: String,
+}
+
+impl HostFilter {
+    fn matches(&self, pane: u64, address: &str) -> bool {
+        self.pane == pane && self.address == address
+    }
+}
+
+impl From<&Target> for HostFilter {
+    fn from(target: &Target) -> Self {
+        Self {
+            pane: target.pane,
+            address: target.names.address().into(),
+            label: target.name.clone(),
+        }
+    }
 }
 
 impl Filter {
-    fn set_query(&mut self, mut query: String) {
-        query.truncate(query.floor_char_boundary(query.len().min(MAX_QUERY_BYTES)));
-        if self.query == query {
+    fn configure(&mut self, query: String, regex: bool, sensitive: bool) {
+        if (self.query.as_str(), self.regex, self.sensitive) == (query.as_str(), regex, sensitive) {
             return;
         }
         self.matcher = if query.is_empty() {
             None
+        } else if query.len() > MAX_QUERY_BYTES {
+            Some(Err(format!(
+                "Search text exceeds {MAX_QUERY_BYTES} UTF-8 bytes"
+            )))
         } else {
-            RegexBuilder::new(&regex::escape(&query))
-                .case_insensitive(true)
-                .build()
-                .ok()
+            let pattern = if regex {
+                Cow::Borrowed(query.as_str())
+            } else {
+                Cow::Owned(regex::escape(&query))
+            };
+            Some(compile_regex(&pattern, sensitive))
         };
         self.query = query;
+        self.regex = regex;
+        self.sensitive = sensitive;
+    }
+
+    fn set_query(&mut self, query: String) {
+        self.configure(query, self.regex, self.sensitive);
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.matcher.as_ref()?.as_ref().err().map(String::as_str)
+    }
+
+    fn filters_lines(&self) -> bool {
+        self.host.is_some() || self.matcher.is_some()
     }
 
     fn active(&self) -> bool {
-        self.pane.is_some() || !self.query.is_empty()
+        self.filters_lines() || self.regex || self.sensitive || self.show_context
     }
 
-    fn includes(&self, line: &GroupTranscriptLine) -> bool {
-        self.pane.is_none_or(|pane| pane == line.pane)
-            && (self.query.is_empty()
-                || self
-                    .matcher
-                    .as_ref()
-                    .is_some_and(|query| query.is_match(&line.text)))
+    fn includes_host(&self, line: &GroupTranscriptLine, address: &str) -> bool {
+        self.host
+            .as_ref()
+            .is_none_or(|host| host.matches(line.pane, address))
+    }
+
+    fn matches_text(&self, line: &GroupTranscriptLine) -> bool {
+        self.matcher.as_ref().is_none_or(|result| {
+            result
+                .as_ref()
+                .is_ok_and(|pattern| pattern.is_match(&line.text))
+        })
+    }
+
+    fn includes_context(&self) -> bool {
+        self.show_context && self.matcher.is_some()
     }
 }
 
+struct ShownLine<'a> {
+    line: &'a GroupTranscriptLine,
+    name: &'a str,
+    matched: bool,
+}
+
+fn retain_with_context(rows: Vec<ShownLine<'_>>) -> Vec<ShownLine<'_>> {
+    let mut by_host = BTreeMap::<_, Vec<_>>::new();
+    for (index, row) in rows.iter().enumerate() {
+        by_host.entry(row.line.pane).or_default().push(index);
+    }
+    let mut shown = vec![false; rows.len()];
+    for positions in by_host.values() {
+        for (offset, &index) in positions.iter().enumerate() {
+            if rows[index].matched {
+                let start = offset.saturating_sub(CONTEXT_LINES);
+                let end = (offset + CONTEXT_LINES + 1).min(positions.len());
+                for &neighbor in &positions[start..end] {
+                    shown[neighbor] = true;
+                }
+            }
+        }
+    }
+    rows.into_iter()
+        .zip(shown)
+        .filter_map(|(row, show)| show.then_some(row))
+        .collect()
+}
+
 impl Submission {
-    fn output_snapshot(&self) -> GroupTranscriptSnapshot {
-        let sent: BTreeSet<_> = self
-            .results
+    fn output_panes(&self) -> BTreeSet<u64> {
+        self.results
             .iter()
             .filter(|delivery| matches!(delivery.status, DeliveryStatus::Sent))
             .map(|delivery| delivery.target.pane)
-            .collect();
+            .collect()
+    }
+
+    fn output_snapshot(&self, pane: Option<u64>) -> GroupTranscriptSnapshot {
+        let sent = self.output_panes();
+        if let Some(pane) = pane {
+            return if sent.contains(&pane) {
+                self.transcript.snapshot_for_pane(pane)
+            } else {
+                GroupTranscriptSnapshot::default()
+            };
+        }
         let mut snapshot = self.transcript.snapshot();
         snapshot.lines.retain(|line| sent.contains(&line.pane));
         snapshot
     }
 
-    fn output_names(&self) -> BTreeMap<u64, &str> {
+    fn output_history(&self) -> GroupTranscriptHistory {
+        let sent = self.output_panes();
+        let mut history = self.transcript.history();
+        history.retain_panes(|pane| sent.contains(&pane));
+        history
+    }
+
+    fn output_hosts(&self) -> BTreeMap<u64, (&str, &str)> {
         self.results
             .iter()
-            .map(|delivery| (delivery.target.pane, delivery.target.name.as_str()))
+            .map(|delivery| {
+                let target = &delivery.target;
+                (target.pane, (target.name.as_str(), target.names.address()))
+            })
             .collect()
     }
 }
 
 impl State {
-    fn snapshot(&self, submission: &Submission) -> Cow<'_, GroupTranscriptSnapshot> {
-        self.paused
-            .as_ref()
-            .map_or_else(|| Cow::Owned(submission.output_snapshot()), Cow::Borrowed)
+    fn snapshot(
+        &self,
+        submission: &Submission,
+        hosts: &BTreeMap<u64, (&str, &str)>,
+    ) -> Cow<'_, GroupTranscriptSnapshot> {
+        let pane = match &self.filter.host {
+            None => None,
+            Some(host)
+                if hosts
+                    .get(&host.pane)
+                    .is_some_and(|&(_, address)| host.address == address) =>
+            {
+                Some(host.pane)
+            }
+            Some(_) => return Cow::Owned(GroupTranscriptSnapshot::default()),
+        };
+        self.paused.as_ref().map_or_else(
+            || Cow::Owned(submission.output_snapshot(pane)),
+            |history| history.scoped(pane),
+        )
     }
 
     fn shown<'a>(
         &'a self,
         snapshot: &'a GroupTranscriptSnapshot,
-        names: &'a BTreeMap<u64, &'a str>,
-    ) -> impl Iterator<Item = (&'a GroupTranscriptLine, &'a str)> {
-        snapshot.lines.iter().rev().filter_map(move |line| {
-            let &name = names.get(&line.pane)?;
-            self.filter.includes(line).then_some((line, name))
-        })
+        hosts: &'a BTreeMap<u64, (&'a str, &'a str)>,
+    ) -> Vec<ShownLine<'a>> {
+        let rows = snapshot.lines.iter().rev().filter_map(|line| {
+            let &(name, address) = hosts.get(&line.pane)?;
+            self.filter.includes_host(line, address).then(|| ShownLine {
+                line,
+                name,
+                matched: self.filter.matches_text(line),
+            })
+        });
+        let mut shown = if self.filter.includes_context() {
+            retain_with_context(rows.collect())
+        } else {
+            rows.filter(|row| row.matched).collect()
+        };
+        if self.timeline.oldest_first {
+            shown.reverse();
+        }
+        shown
     }
 
     fn excerpt(&self, submission: &Submission) -> Option<String> {
-        let snapshot = self.snapshot(submission);
-        let names = submission.output_names();
+        let hosts = submission.output_hosts();
+        let snapshot = self.snapshot(submission, &hosts);
         format_excerpt(
             submission.content.label(),
             snapshot.omitted,
-            self.shown(&snapshot, &names),
+            self.shown(&snapshot, &hosts),
+            self.timeline.show_elapsed,
         )
     }
 }
@@ -122,15 +280,24 @@ fn displayed_line(line: &GroupTranscriptLine) -> Cow<'_, str> {
     }
 }
 
-fn format_excerpt<'a>(
+fn elapsed_label(elapsed_ms: u64) -> String {
+    format!("+{}.{:03} s", elapsed_ms / 1000, elapsed_ms % 1000)
+}
+
+fn format_excerpt(
     label: &str,
     omitted: u64,
-    lines: impl Iterator<Item = (&'a GroupTranscriptLine, &'a str)>,
+    lines: Vec<ShownLine<'_>>,
+    show_elapsed: bool,
 ) -> Option<String> {
-    let mut lines = lines.peekable();
-    lines.peek()?;
+    if lines.is_empty() {
+        return None;
+    }
     let mut text = format!("Submitted · {label}\r\n");
-    for (line, name) in lines {
+    for ShownLine { line, name, .. } in lines {
+        if show_elapsed {
+            let _ = write!(text, "{} · ", elapsed_label(line.elapsed_ms));
+        }
         let _ = writeln!(text, "{name} · {}\r", displayed_line(line));
     }
     if omitted > 0 {
@@ -150,19 +317,43 @@ impl HostGroup {
                 submission: id,
                 paused: None,
                 filter: Filter::default(),
+                timeline: Timeline::default(),
                 copy_feedback: None,
             }));
             return;
         }
-        if let Action::FilterHost(Some(pane)) = action
-            && !submission
-                .results
-                .iter()
-                .any(|delivery| delivery.target.pane == pane)
-        {
+        if let Action::ViewRun(run) = action {
+            if run != id
+                && self.submissions.iter().any(|item| item.id == run)
+                && let Some(output) = self
+                    .live_output
+                    .as_mut()
+                    .filter(|output| output.submission == id)
+            {
+                output.submission = run;
+                output.paused = None;
+                output.copy_feedback = None;
+                self.viewing = run;
+                self.result_filter = progress::Filter::All;
+                self.recipient_search.clear();
+                self.copy_feedback.clear();
+            }
             return;
         }
-        let pause = matches!(action, Action::Pause).then(|| submission.output_snapshot());
+        let host_filter = match action {
+            Action::FilterHost(Some(pane)) => {
+                let Some(delivery) = submission
+                    .results
+                    .iter()
+                    .find(|delivery| delivery.target.pane == pane)
+                else {
+                    return;
+                };
+                Some(HostFilter::from(&delivery.target))
+            }
+            _ => None,
+        };
+        let pause = matches!(action, Action::Pause).then(|| submission.output_history());
         let Some(output) = self
             .live_output
             .as_mut()
@@ -178,7 +369,20 @@ impl HostGroup {
             }
             Action::Resume => output.paused = None,
             Action::Search(query) => output.filter.set_query(query),
-            Action::FilterHost(pane) => output.filter.pane = pane,
+            Action::UseRegex(regex) => {
+                output
+                    .filter
+                    .configure(output.filter.query.clone(), regex, output.filter.sensitive)
+            }
+            Action::MatchCase(sensitive) => {
+                output
+                    .filter
+                    .configure(output.filter.query.clone(), output.filter.regex, sensitive)
+            }
+            Action::ShowContext(show) => output.filter.show_context = show,
+            Action::OldestFirst(enabled) => output.timeline.oldest_first = enabled,
+            Action::ShowElapsed(enabled) => output.timeline.show_elapsed = enabled,
+            Action::FilterHost(_) => output.filter.host = host_filter,
             Action::ClearFilters => output.filter = Filter::default(),
             _ => {}
         }
@@ -227,32 +431,69 @@ impl TerminalApp {
     pub(super) fn host_group_live_output(
         &self,
         id: TabId,
+        page: &HostGroup,
         output: &State,
         submission: &Submission,
         ctx: &ViewContext<Self>,
     ) -> View {
-        let snapshot = output.snapshot(submission);
-        let names = submission.output_names();
-        let lines: Vec<_> = output
-            .shown(&snapshot, &names)
-            .map(|(line, name)| {
-                let pane = line.pane;
-                KeyedView::new(
-                    line.id.to_string(),
-                    StackPanel::new().spacing(2.0).children((
+        let output_hosts = submission.output_hosts();
+        let snapshot = output.snapshot(submission, &output_hosts);
+        let shown = output.shown(&snapshot, &output_hosts);
+        let matches = shown.iter().filter(|row| row.matched).count();
+        let lines: Vec<_> = shown
+            .into_iter()
+            .map(
+                |ShownLine {
+                     line,
+                     name,
+                     matched,
+                 }| {
+                    let pane = line.pane;
+                    let host =
                         Button::new()
                             .automation_name(format!("Focus output pane {pane}"))
                             .is_enabled(self.tab_for_pane(pane).is_some())
                             .on_click(ctx.callback(move |_| {
                                 Message::HostGroup(super::Action::Visit(id, pane))
                             }))
-                            .content(name),
-                        TextBlock::new()
-                            .text(displayed_line(line).as_ref())
-                            .text_wrapping(TextWrapping::Wrap),
-                    )),
-                )
-            })
+                            .content(name);
+                    let source = if matched && !output.timeline.show_elapsed {
+                        host
+                    } else {
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(8.0)
+                            .children((
+                                if output.timeline.show_elapsed {
+                                    TextBlock::new()
+                                        .text(elapsed_label(line.elapsed_ms))
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .into()
+                                } else {
+                                    View::empty()
+                                },
+                                host,
+                                if matched {
+                                    View::empty()
+                                } else {
+                                    TextBlock::new()
+                                        .text("Context")
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .into()
+                                },
+                            ))
+                    };
+                    KeyedView::new(
+                        line.id.to_string(),
+                        StackPanel::new().spacing(2.0).children((
+                            source,
+                            TextBlock::new()
+                                .text(displayed_line(line).as_ref())
+                                .text_wrapping(TextWrapping::Wrap),
+                        )),
+                    )
+                },
+            )
             .collect();
         let submission_id = submission.id;
         let send =
@@ -262,37 +503,61 @@ impl TerminalApp {
         } else {
             ("Pause output", Action::Pause)
         };
-        let status = if output.paused.is_some() {
-            "Paused · newest first"
-        } else {
-            "Newest first"
-        };
-        let panes: Vec<_> = std::iter::once(None)
-            .chain(
-                submission
-                    .results
-                    .iter()
-                    .map(|delivery| Some(delivery.target.pane)),
-            )
-            .collect();
+        let status = output.timeline.status(output.paused.is_some());
+        let mut panes = vec![None];
+        let mut host_labels = vec![Cow::Borrowed("All output hosts")];
+        let mut selected_host = 0;
+        for delivery in &submission.results {
+            let target = &delivery.target;
+            if output
+                .filter
+                .host
+                .as_ref()
+                .is_some_and(|host| host.matches(target.pane, target.names.address()))
+            {
+                selected_host = panes.len();
+            }
+            panes.push(Some(target.pane));
+            host_labels.push(Cow::Borrowed(target.name.as_str()));
+        }
+        let host_absent = selected_host == 0 && output.filter.host.is_some();
+        if let Some(host) = output.filter.host.as_ref().filter(|_| host_absent) {
+            selected_host = host_labels.len();
+            host_labels.push(Cow::Owned(format!("{} · absent from this run", host.label)));
+        }
         let hosts = ComboBox::new()
             .grid_column(1)
             .automation_name("Filter live output by host")
             .max_width(320.0)
-            .items_source(
-                std::iter::once("All output hosts").chain(
-                    submission
-                        .results
-                        .iter()
-                        .map(|delivery| delivery.target.name.as_str()),
-                ),
-            )
-            .selected_index(panes.iter().position(|&pane| pane == output.filter.pane))
+            .items_source(host_labels)
+            .selected_index(Some(selected_host))
             .on_selection_changed(ctx.callback(move |index: Option<usize>| {
                 index
                     .and_then(|index| panes.get(index))
                     .map_or(Message::ControlIdle, |&pane| send(Action::FilterHost(pane)))
             }));
+        let run_picker: View = if page.submissions.len() > 1 {
+            let runs: Vec<_> = page.submissions.iter().rev().map(|run| run.id).collect();
+            ComboBox::new()
+                .automation_name("Live output run")
+                .items_source(
+                    page.submissions
+                        .iter()
+                        .rev()
+                        .map(|run| format!("Run {} · {}", run.id, run.content.label())),
+                )
+                .selected_index(runs.iter().position(|&run| run == submission_id))
+                .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                    index
+                        .and_then(|index| runs.get(index))
+                        .map_or(Message::ControlIdle, |&run| send(Action::ViewRun(run)))
+                }))
+                .into()
+        } else {
+            TextBlock::new()
+                .text(format!("Submitted · {}", submission.content.label()))
+                .into()
+        };
         let search = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
             .column_spacing(8.0)
@@ -309,7 +574,59 @@ impl TerminalApp {
                     .on_click(ctx.callback(move |_| send(Action::ClearFilters)))
                     .content("Clear output filters"),
             ));
-        let status = if output.filter.active() {
+        let search_options = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((
+                CheckBox::new()
+                    .automation_name("Regular expression in live output")
+                    .is_checked(output.filter.regex)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::UseRegex(enabled))),
+                    )
+                    .content("Regular expression"),
+                CheckBox::new()
+                    .automation_name("Match case in live output")
+                    .is_checked(output.filter.sensitive)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::MatchCase(enabled))),
+                    )
+                    .content("Match case"),
+                CheckBox::new()
+                    .automation_name("Show surrounding lines")
+                    .is_checked(output.filter.show_context)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::ShowContext(enabled))),
+                    )
+                    .content("Show surrounding lines"),
+            ));
+        let timeline_options = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((
+                CheckBox::new()
+                    .automation_name("Oldest first in live output")
+                    .is_checked(output.timeline.oldest_first)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::OldestFirst(enabled))),
+                    )
+                    .content("Oldest first"),
+                CheckBox::new()
+                    .automation_name("Show elapsed time in live output")
+                    .is_checked(output.timeline.show_elapsed)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::ShowElapsed(enabled))),
+                    )
+                    .content("Show elapsed time"),
+            ));
+        let status = if output.filter.includes_context() {
+            Cow::Owned(format!(
+                "{status} · {matches} {} · {} of {} retained lines shown",
+                if matches == 1 { "match" } else { "matches" },
+                lines.len(),
+                snapshot.lines.len()
+            ))
+        } else if output.filter.filters_lines() {
             Cow::Owned(format!(
                 "{status} · {} of {} retained lines",
                 lines.len(),
@@ -327,7 +644,11 @@ impl TerminalApp {
                 .text_wrapping(TextWrapping::Wrap)
                 .into()
         };
-        let content = if snapshot.lines.is_empty() {
+        let content = if host_absent {
+            TextBlock::new()
+                .text("The selected host did not receive this run.")
+                .into()
+        } else if snapshot.lines.is_empty() {
             TextBlock::new()
                 .text("No marked output yet. Prompt-only shells show output in their panes.")
                 .text_wrapping(TextWrapping::Wrap)
@@ -343,7 +664,7 @@ impl TerminalApp {
                     TextBlock::new()
                         .font_size(24.0)
                         .text("SSH group live output"),
-                    TextBlock::new().text(format!("Submitted · {}", submission.content.label())),
+                    run_picker,
                     StackPanel::new()
                         .spacing(8.0)
                         .orientation(Orientation::Horizontal)
@@ -357,6 +678,14 @@ impl TerminalApp {
                             output_recording::button(id, submission, ctx),
                         )),
                     search,
+                    search_options,
+                    timeline_options,
+                    output.filter.error().map_or_else(View::empty, |error| {
+                        TextBlock::new()
+                            .text(format!("Live output search · {error}"))
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into()
+                    }),
                     Grid::new()
                         .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
                         .column_spacing(8.0)
@@ -401,6 +730,7 @@ mod tests {
         let line = |pane, text: &str| GroupTranscriptLine {
             id: pane,
             pane,
+            elapsed_ms: 0,
             text: text.into(),
             shortened: false,
         };
@@ -408,17 +738,115 @@ mod tests {
         let west = line(2, "result [état]");
         let other = line(1, "Result ÉTAT");
         let mut filter = Filter::default();
-        assert!(filter.includes(&other));
+        assert!(filter.includes_host(&other, "east"));
+        assert!(filter.matches_text(&other));
         filter.set_query("[état]".into());
-        assert!(filter.includes(&east) && filter.includes(&west));
-        assert!(!filter.includes(&other));
-        filter.pane = Some(2);
-        assert!(!filter.includes(&east));
-        assert!(filter.includes(&west));
+        assert!(filter.matches_text(&east) && filter.matches_text(&west));
+        assert!(!filter.matches_text(&other));
+        filter.host = Some(HostFilter {
+            pane: 2,
+            address: "west".into(),
+            label: "West".into(),
+        });
+        assert!(!filter.includes_host(&east, "east"));
+        assert!(filter.includes_host(&west, "west"));
+        assert!(!filter.includes_host(&west, "different destination"));
         filter.set_query(String::new());
-        assert!(!filter.includes(&east));
-        assert!(filter.includes(&west));
+        assert!(filter.matches_text(&other));
+        assert!(!filter.includes_host(&east, "east"));
         assert!(filter.active());
+    }
+
+    #[test]
+    fn regex_search_matches_case_on_request_and_rejects_invalid_and_oversized_patterns() {
+        let line = GroupTranscriptLine {
+            id: 1,
+            pane: 2,
+            elapsed_ms: 0,
+            text: "Error 503".into(),
+            shortened: false,
+        };
+        let pattern = "^ERROR [0-9]{3}$";
+        let mut filter = Filter::default();
+        filter.configure(pattern.into(), true, false);
+        assert!(filter.matches_text(&line));
+        filter.configure(pattern.into(), true, true);
+        assert!(!filter.matches_text(&line));
+        assert!(filter.error().is_none());
+        filter.set_query("(".into());
+        assert!(filter.error().is_some());
+        assert!(!filter.matches_text(&line));
+        filter.set_query("界".repeat(MAX_QUERY_BYTES));
+        assert!(filter.error().unwrap().contains("UTF-8 bytes"));
+        assert!(!filter.matches_text(&line));
+        filter.set_query(String::new());
+        assert!(filter.error().is_none());
+        assert!(filter.active());
+        assert!(filter.matches_text(&line));
+    }
+
+    #[test]
+    fn context_uses_only_neighbors_from_matching_hosts_and_deduplicates_windows() {
+        let lines = [
+            (1, "outside context"),
+            (1, "second before"),
+            (1, "first before"),
+            (2, "unrelated other host"),
+            (1, "error first"),
+            (1, "between errors"),
+            (1, "error second"),
+            (2, "unrelated later"),
+            (1, "first after"),
+            (1, "second after"),
+            (1, "also outside context"),
+        ];
+        let snapshot = GroupTranscriptSnapshot {
+            omitted: 0,
+            lines: lines
+                .into_iter()
+                .enumerate()
+                .map(|(id, (pane, text))| GroupTranscriptLine {
+                    id: id as u64,
+                    pane,
+                    elapsed_ms: 0,
+                    text: text.into(),
+                    shortened: false,
+                })
+                .collect(),
+        };
+        let mut output = State {
+            submission: 1,
+            paused: None,
+            filter: Filter {
+                show_context: true,
+                ..Default::default()
+            },
+            timeline: Timeline::default(),
+            copy_feedback: None,
+        };
+        let hosts = BTreeMap::from([(1, ("East", "east")), (2, ("West", "west"))]);
+        output.filter.set_query("error ".into());
+        let shown = output.shown(&snapshot, &hosts);
+        assert_eq!(
+            shown
+                .iter()
+                .map(|row| (row.line.id, row.matched))
+                .collect::<Vec<_>>(),
+            [
+                (9, false),
+                (8, false),
+                (6, true),
+                (5, false),
+                (4, true),
+                (2, false),
+                (1, false)
+            ]
+        );
+        let excerpt = format_excerpt("run", 0, shown, false).unwrap();
+        assert_eq!(excerpt.matches("between errors").count(), 1);
+        assert!(!excerpt.contains("unrelated"));
+        output.filter.configure("(".into(), true, false);
+        assert!(output.shown(&snapshot, &hosts).is_empty());
     }
 
     #[test]
@@ -426,6 +854,7 @@ mod tests {
         let line = |id, pane, text: &str, shortened| GroupTranscriptLine {
             id,
             pane,
+            elapsed_ms: id * 50,
             text: text.into(),
             shortened,
         };
@@ -440,23 +869,55 @@ mod tests {
         };
         let mut output = State {
             submission: 1,
-            paused: Some(snapshot),
+            paused: None,
             filter: Filter {
-                pane: Some(7),
+                host: Some(HostFilter {
+                    pane: 7,
+                    address: "east".into(),
+                    label: "East".into(),
+                }),
                 ..Filter::default()
             },
+            timeline: Timeline::default(),
             copy_feedback: None,
         };
-        let snapshot = output.paused.as_ref().unwrap();
-        let names = BTreeMap::from([(7, "East"), (9, "West")]);
+        let names = BTreeMap::from([(7, ("East", "east")), (9, ("West", "west"))]);
         output.filter.set_query("witness".into());
         assert_eq!(
-            format_excerpt("show", snapshot.omitted, output.shown(snapshot, &names)).as_deref(),
+            format_excerpt(
+                "show",
+                snapshot.omitted,
+                output.shown(&snapshot, &names),
+                false
+            )
+            .as_deref(),
             Some(
                 "Submitted · show\r\nEast · 雪 WITNESS…\r\nEast · first witness\r\n[Older lines are outside the retained output.]\r\n"
             ),
         );
+        output.timeline.oldest_first = true;
+        output.timeline.show_elapsed = true;
+        assert_eq!(
+            format_excerpt(
+                "show",
+                snapshot.omitted,
+                output.shown(&snapshot, &names),
+                output.timeline.show_elapsed
+            )
+            .as_deref(),
+            Some(
+                "Submitted · show\r\n+0.050 s · East · first witness\r\n+0.200 s · East · 雪 WITNESS…\r\n[Older lines are outside the retained output.]\r\n"
+            ),
+        );
         output.filter.set_query("missing".into());
-        assert!(format_excerpt("show", snapshot.omitted, output.shown(snapshot, &names)).is_none());
+        assert!(
+            format_excerpt(
+                "show",
+                snapshot.omitted,
+                output.shown(&snapshot, &names),
+                true
+            )
+            .is_none()
+        );
     }
 }

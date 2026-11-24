@@ -447,6 +447,7 @@ mod tests {
         let line = |id, pane, text, shortened| GroupTranscriptLine {
             id,
             pane,
+            elapsed_ms: 0,
             text: Arc::from(text),
             shortened,
         };

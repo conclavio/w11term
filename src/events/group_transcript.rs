@@ -1,7 +1,8 @@
 use super::{GroupExecution, Inbox};
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    borrow::Cow,
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Instant,
 };
@@ -9,7 +10,9 @@ use tokio::sync::{broadcast, oneshot};
 use wezterm_term::LiveOutputBatch;
 
 const TRANSCRIPT_LINES: usize = 128;
+const HOST_TRANSCRIPT_BUDGET: usize = 512;
 const RECORDING_QUEUE: usize = 1024;
+const OUTPUT_WATCH_QUEUE: usize = 1024;
 const QUEUE_EVENT_LIMIT: usize = 32;
 
 #[derive(Clone, Debug, Default)]
@@ -17,9 +20,10 @@ pub struct GroupTranscript(Arc<Mutex<Transcript>>);
 
 #[derive(Debug, Default)]
 struct Transcript {
-    snapshot: GroupTranscriptSnapshot,
+    history: GroupTranscriptHistory,
     queue_activity: QueueActivity,
     recording: Option<Recording>,
+    output_watch: Option<broadcast::Sender<GroupTranscriptLine>>,
     next_recording: u64,
     hosts: Vec<HostRecord>,
     active_hosts: usize,
@@ -118,13 +122,17 @@ impl Default for QueueActivity {
 }
 
 impl QueueActivity {
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.started_at).as_millis())
+            .unwrap_or(u64::MAX)
+    }
+
     fn push(&mut self, kind: GroupQueueEventKind, now: Instant) {
         if self.snapshot.events.len() == QUEUE_EVENT_LIMIT {
             self.snapshot.events.pop_front();
             self.snapshot.omitted = self.snapshot.omitted.saturating_add(1);
         }
-        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.started_at).as_millis())
-            .unwrap_or(u64::MAX);
+        let elapsed_ms = self.elapsed_ms(now);
         self.snapshot
             .events
             .push_back(GroupQueueEvent { elapsed_ms, kind });
@@ -186,12 +194,133 @@ pub struct GroupTranscriptSnapshot {
     pub lines: VecDeque<GroupTranscriptLine>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TranscriptFeed {
+    snapshot: GroupTranscriptSnapshot,
+    evicted_through: u64,
+}
+
+impl TranscriptFeed {
+    fn retain_recent(&mut self, capacity: usize) -> Option<GroupTranscriptLine> {
+        let dropped = self.snapshot.lines.len().saturating_sub(capacity);
+        let last = self.snapshot.lines.drain(..dropped).next_back()?;
+        self.snapshot.omitted += dropped as u64;
+        self.evicted_through = last.id;
+        Some(last)
+    }
+
+    fn push(&mut self, line: GroupTranscriptLine, capacity: usize) -> Option<GroupTranscriptLine> {
+        if capacity == 0 {
+            self.snapshot.omitted += 1;
+            self.evicted_through = line.id;
+            Some(line)
+        } else {
+            let evicted = self.retain_recent(capacity - 1);
+            self.snapshot.lines.push_back(line);
+            evicted
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HostOutputFeed {
+    reserved: TranscriptFeed,
+    combined_evicted_through: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GroupTranscriptHistory {
+    combined: TranscriptFeed,
+    hosts: BTreeMap<u64, HostOutputFeed>,
+}
+
+impl GroupTranscriptHistory {
+    pub fn scoped(&self, pane: Option<u64>) -> Cow<'_, GroupTranscriptSnapshot> {
+        self.scoped_with_boundary(pane).0
+    }
+
+    fn scoped_with_boundary(&self, pane: Option<u64>) -> (Cow<'_, GroupTranscriptSnapshot>, u64) {
+        let Some(pane) = pane else {
+            return (
+                Cow::Borrowed(&self.combined.snapshot),
+                self.combined.evicted_through,
+            );
+        };
+        let Some(host) = self.hosts.get(&pane) else {
+            return (Cow::Owned(GroupTranscriptSnapshot::default()), 0);
+        };
+        let combined = self
+            .combined
+            .snapshot
+            .lines
+            .iter()
+            .filter(|line| line.pane == pane);
+        let count = combined.clone().count();
+        let reserved = &host.reserved.snapshot;
+        if count <= reserved.lines.len() {
+            return (Cow::Borrowed(reserved), host.reserved.evicted_through);
+        }
+        // Both histories hold a suffix of this host's output. A busy host
+        // can have more lines in the shared feed than in its reserved history.
+        (
+            Cow::Owned(GroupTranscriptSnapshot {
+                omitted: reserved.omitted - (count - reserved.lines.len()) as u64,
+                lines: combined.cloned().collect(),
+            }),
+            host.combined_evicted_through,
+        )
+    }
+
+    pub fn retain_panes(&mut self, includes: impl Fn(u64) -> bool) {
+        self.combined
+            .snapshot
+            .lines
+            .retain(|line| includes(line.pane));
+        self.hosts.retain(|&pane, _| includes(pane));
+    }
+
+    fn push(&mut self, line: GroupTranscriptLine) {
+        let previous_hosts = self.hosts.len();
+        self.hosts.entry(line.pane).or_default();
+        let capacity = (HOST_TRANSCRIPT_BUDGET / self.hosts.len()).min(TRANSCRIPT_LINES);
+        if self.hosts.len() != previous_hosts
+            && capacity < (HOST_TRANSCRIPT_BUDGET / previous_hosts.max(1)).min(TRANSCRIPT_LINES)
+        {
+            for host in self.hosts.values_mut() {
+                let _ = host.reserved.retain_recent(capacity);
+            }
+        }
+        let _ = self
+            .hosts
+            .get_mut(&line.pane)
+            .unwrap()
+            .reserved
+            .push(line.clone(), capacity);
+        if let Some(evicted) = self.combined.push(line, TRANSCRIPT_LINES) {
+            self.hosts
+                .get_mut(&evicted.pane)
+                .unwrap()
+                .combined_evicted_through = evicted.id;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GroupTranscriptLine {
     pub id: u64,
     pub pane: u64,
+    pub elapsed_ms: u64,
     pub text: Arc<str>,
     pub shortened: bool,
+}
+
+#[derive(Debug)]
+pub struct GroupTranscriptOutput {
+    pub history: GroupTranscriptSnapshot,
+    pub evicted_through: u64,
+    pub latest_line: u64,
+    pub settled: bool,
+    pub incoming: Option<broadcast::Receiver<GroupTranscriptLine>>,
 }
 
 #[derive(Debug)]
@@ -347,7 +476,47 @@ impl GroupTranscript {
     }
 
     pub fn snapshot(&self) -> GroupTranscriptSnapshot {
-        self.0.lock().unwrap().snapshot.clone()
+        self.0.lock().unwrap().history.combined.snapshot.clone()
+    }
+
+    pub fn snapshot_for_pane(&self, pane: u64) -> GroupTranscriptSnapshot {
+        self.0
+            .lock()
+            .unwrap()
+            .history
+            .scoped(Some(pane))
+            .into_owned()
+    }
+
+    pub fn history(&self) -> GroupTranscriptHistory {
+        self.0.lock().unwrap().history.clone()
+    }
+
+    pub fn read_output(&self, pane: Option<u64>, follow: bool) -> GroupTranscriptOutput {
+        let mut transcript = self.0.lock().unwrap();
+        let (history, evicted_through) = transcript.history.scoped_with_boundary(pane);
+        let history = history.into_owned();
+        let latest_line = transcript
+            .history
+            .combined
+            .snapshot
+            .lines
+            .back()
+            .map_or(0, |line| line.id);
+        let settled = transcript.settled();
+        let incoming = (follow && !settled).then(|| {
+            transcript
+                .output_watch
+                .get_or_insert_with(|| broadcast::channel(OUTPUT_WATCH_QUEUE).0)
+                .subscribe()
+        });
+        GroupTranscriptOutput {
+            history,
+            evicted_through,
+            latest_line,
+            settled,
+            incoming,
+        }
     }
 
     pub fn start_recording(
@@ -371,7 +540,7 @@ impl GroupTranscript {
             ended: finish,
         });
         let stream = GroupTranscriptStream {
-            history: transcript.snapshot.clone(),
+            history: transcript.history.combined.snapshot.clone(),
             incoming,
             ended,
         };
@@ -387,6 +556,7 @@ impl GroupTranscript {
         if !transcript.settled() {
             return;
         }
+        transcript.output_watch = None;
         if transcript
             .recording
             .as_ref()
@@ -467,15 +637,17 @@ impl GroupTranscriptHost {
             return;
         }
         let mut transcript = self.transcript.0.lock().unwrap();
+        let elapsed_ms = transcript.queue_activity.elapsed_ms(Instant::now());
         if batch.gap {
             transcript.push(
                 self.pane,
+                elapsed_ms,
                 "A portion of this host’s output was skipped.",
                 false,
             );
         }
         for line in batch.lines {
-            transcript.push(self.pane, line.text, line.shortened);
+            transcript.push(self.pane, elapsed_ms, line.text, line.shortened);
         }
     }
 }
@@ -502,23 +674,32 @@ impl Transcript {
         }
     }
 
-    fn push(&mut self, pane: u64, text: impl Into<Arc<str>>, shortened: bool) {
-        let snapshot = &mut self.snapshot;
-        let id = snapshot.lines.back().map_or(1, |line| line.id + 1);
-        if snapshot.lines.len() == TRANSCRIPT_LINES {
-            snapshot.lines.pop_front();
-            snapshot.omitted += 1;
-        }
+    fn push(&mut self, pane: u64, elapsed_ms: u64, text: impl Into<Arc<str>>, shortened: bool) {
+        let id = self
+            .history
+            .combined
+            .snapshot
+            .lines
+            .back()
+            .map_or(1, |line| line.id + 1);
         let line = GroupTranscriptLine {
             id,
             pane,
+            elapsed_ms,
             text: text.into(),
             shortened,
         };
         if let Some(recording) = &self.recording {
             let _ = recording.incoming.send(line.clone());
         }
-        snapshot.lines.push_back(line);
+        if self
+            .output_watch
+            .as_ref()
+            .is_some_and(|send| send.send(line.clone()).is_err())
+        {
+            self.output_watch = None;
+        }
+        self.history.push(line);
     }
 }
 
@@ -699,6 +880,93 @@ mod tests {
         assert_eq!(&*current.lines.back().unwrap().text, "West last");
         assert_eq!(paused.lines.len(), 1);
         assert_eq!(&*paused.lines[0].text, "West first");
+    }
+
+    #[test]
+    fn output_watch_connects_scoped_history_to_the_final_live_line() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let transcript = GroupTranscript::default();
+        let east = transcript.host(1);
+        let west = transcript.host(2);
+        let append = |host: &GroupTranscriptHost, text: &str| {
+            host.append(LiveOutputBatch {
+                lines: vec![LiveOutputLine {
+                    text: text.into(),
+                    shortened: false,
+                }],
+                gap: false,
+            })
+        };
+        append(&east, "unselected");
+        append(&west, "retained");
+        transcript.finish_dispatch();
+        let snapshot = transcript.read_output(Some(2), false);
+        assert!(!snapshot.settled);
+        assert!(snapshot.incoming.is_none());
+        let watch = transcript.read_output(Some(2), true);
+        assert_eq!(watch.history.lines.len(), 1);
+        assert_eq!(watch.latest_line, 2);
+        assert_eq!(watch.evicted_through, 0);
+        assert_eq!(&*watch.history.lines[0].text, "retained");
+        let mut incoming = watch.incoming.unwrap();
+        append(&west, "final");
+        drop(west);
+        drop(east);
+        let line = incoming.try_recv().unwrap();
+        assert_eq!((line.id, line.pane, &*line.text), (3, 2, "final"));
+        assert!(matches!(incoming.try_recv(), Err(TryRecvError::Closed)));
+        let settled = transcript.read_output(None, true);
+        assert_eq!(settled.history.lines.len(), 3);
+        assert_eq!(settled.latest_line, 3);
+        assert!(settled.settled);
+        assert!(settled.incoming.is_none());
+    }
+
+    #[test]
+    fn host_history_recovers_early_lines_after_a_burst_and_stays_bounded() {
+        let mut transcript = Transcript::default();
+        transcript.push(1, 10, "Quiet result", false);
+        let paused = transcript.history.clone();
+        for pane in 2..=6 {
+            for _ in 0..TRANSCRIPT_LINES {
+                transcript.push(pane, pane * 10, "Loud output", false);
+            }
+        }
+        let history = &transcript.history;
+        assert_eq!(history.scoped(None).lines.len(), TRANSCRIPT_LINES);
+        assert!(history.scoped(None).lines.iter().all(|line| line.pane == 6));
+        assert_eq!(&*history.scoped(Some(1)).lines[0].text, "Quiet result");
+        assert_eq!(history.scoped(Some(1)).lines[0].elapsed_ms, 10);
+        assert_eq!(history.scoped(Some(1)).omitted, 0);
+        let earlier = history.scoped(Some(2));
+        let quota = HOST_TRANSCRIPT_BUDGET / 6;
+        assert_eq!(earlier.lines.len(), quota);
+        assert_eq!(earlier.omitted, (TRANSCRIPT_LINES - quota) as u64);
+        let newest = history.scoped(Some(6));
+        assert_eq!(newest.lines.len(), TRANSCRIPT_LINES);
+        assert_eq!(newest.omitted, 0);
+        assert_eq!(
+            history.scoped_with_boundary(None).1,
+            (TRANSCRIPT_LINES * 4 + 1) as u64
+        );
+        assert_eq!(history.scoped_with_boundary(Some(1)).1, 0);
+        assert_eq!(
+            history.scoped_with_boundary(Some(2)).1,
+            (TRANSCRIPT_LINES - quota + 1) as u64
+        );
+        assert_eq!(history.scoped_with_boundary(Some(6)).1, 0);
+        assert!(
+            history
+                .hosts
+                .values()
+                .map(|host| host.reserved.snapshot.lines.len())
+                .sum::<usize>()
+                <= HOST_TRANSCRIPT_BUDGET
+        );
+        assert_eq!(paused.scoped(Some(1)).lines[0].id, 1);
+        assert_eq!(paused.scoped(Some(1)).lines[0].elapsed_ms, 10);
+        assert!(paused.scoped(Some(6)).lines.is_empty());
     }
 
     #[test]
