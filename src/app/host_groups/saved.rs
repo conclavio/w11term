@@ -5,6 +5,8 @@ mod roster_update;
 pub use roster_update::Action as RosterUpdateAction;
 pub(super) use roster_update::update_button;
 
+const MEMBER_PAGE_SIZE: usize = 24;
+
 #[derive(Default)]
 pub(super) struct SavedUi {
     selected: Option<String>,
@@ -21,8 +23,90 @@ struct Editor {
     original: Option<(String, Vec<String>)>,
     name: String,
     members: Vec<String>,
+    query: String,
+    page: usize,
     confirm_delete: bool,
     without_profile: usize,
+}
+
+struct Candidate<'a> {
+    name: &'a str,
+    address: Option<String>,
+    position: Option<usize>,
+}
+
+impl Editor {
+    fn matching<'a>(&'a self, catalog: &'a Profiles) -> Vec<Candidate<'a>> {
+        let query = self.query.to_lowercase();
+        let words: Vec<_> = query.split_whitespace().collect();
+        let selected = self
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name, Some(index)));
+        let available = catalog
+            .profile_order
+            .iter()
+            .filter(|name| catalog.ssh_host_group_member(name).is_some())
+            .map(|name| (name, None));
+        let mut seen = BTreeSet::new();
+        selected
+            .chain(available)
+            .filter_map(|(name, position)| {
+                if !seen.insert(name) {
+                    return None;
+                }
+                let address = catalog
+                    .ssh_host_group_member(name)
+                    .map(|ssh| address::display(&ssh.user, &ssh.host, ssh.port));
+                let fields = format!("{name} {}", address.as_deref().unwrap_or("")).to_lowercase();
+                words
+                    .iter()
+                    .all(|word| fields.contains(word))
+                    .then_some(Candidate {
+                        name,
+                        address,
+                        position,
+                    })
+            })
+            .collect()
+    }
+
+    fn check_matches(&mut self, offered: &[String], checked: bool, catalog: &Profiles) {
+        if !self
+            .matching(catalog)
+            .iter()
+            .map(|candidate| candidate.name)
+            .eq(offered.iter().map(String::as_str))
+        {
+            return;
+        }
+        if checked {
+            let selected: BTreeSet<_> = self.members.iter().map(String::as_str).collect();
+            let added: Vec<_> = offered
+                .iter()
+                .filter(|name| {
+                    !selected.contains(name.as_str())
+                        && catalog.ssh_host_group_member(name).is_some()
+                })
+                .cloned()
+                .collect();
+            self.members.extend(added);
+        } else {
+            let names: BTreeSet<_> = offered.iter().collect();
+            self.members.retain(|name| !names.contains(name));
+        }
+    }
+
+    fn move_adjacent(&mut self, earlier: &str, later: &str) {
+        if let Some(index) = self
+            .members
+            .windows(2)
+            .position(|pair| pair[0] == earlier && pair[1] == later)
+        {
+            self.members.swap(index, index + 1);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -95,6 +179,8 @@ impl SavedUi {
             original,
             name,
             members,
+            query: String::new(),
+            page: 0,
             confirm_delete: false,
             without_profile: selection.without_profile,
         });
@@ -118,7 +204,11 @@ pub enum Action {
 
 pub enum DraftAction {
     Name(String),
+    Filter(String),
+    Page(usize),
     Member(String, bool),
+    CheckMatches(Vec<String>, bool),
+    Move(String, String),
     Save,
     Delete,
     ConfirmDelete,
@@ -216,11 +306,10 @@ impl TerminalApp {
     }
 
     fn edit_saved_host_group(&mut self, id: TabId, editor: u64, action: DraftAction) {
-        let member_allowed = match &action {
-            DraftAction::Member(name, true) => self.catalog.ssh_host_group_member(name).is_some(),
-            _ => true,
-        };
-        let Some(page) = self.host_group_mut(id) else {
+        if self.tabs.active_id() != Some(id) {
+            return;
+        }
+        let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
             return;
         };
         let Some(draft) = page
@@ -237,14 +326,45 @@ impl TerminalApp {
                 draft.confirm_delete = false;
                 return;
             }
+            DraftAction::Filter(query) => {
+                if draft.query != query {
+                    draft.query = query;
+                    draft.page = 0;
+                    draft.confirm_delete = false;
+                }
+                return;
+            }
+            DraftAction::Page(page) => {
+                if page
+                    < draft
+                        .matching(&self.catalog)
+                        .len()
+                        .div_ceil(MEMBER_PAGE_SIZE)
+                {
+                    draft.page = page;
+                }
+                return;
+            }
             DraftAction::Member(name, checked) => {
                 if checked {
-                    if member_allowed && !draft.members.contains(&name) {
+                    if self.catalog.ssh_host_group_member(&name).is_some()
+                        && !draft.members.contains(&name)
+                    {
                         draft.members.push(name);
                     }
                 } else {
                     draft.members.retain(|member| member != &name);
                 }
+                draft.confirm_delete = false;
+                return;
+            }
+            DraftAction::CheckMatches(names, checked) => {
+                draft.check_matches(&names, checked, &self.catalog);
+                draft.confirm_delete = false;
+                return;
+            }
+            DraftAction::Move(earlier, later) => {
+                draft.move_adjacent(&earlier, &later);
                 draft.confirm_delete = false;
                 return;
             }
@@ -572,41 +692,93 @@ impl TerminalApp {
         let editor = draft.id;
         let action =
             move |change| Message::HostGroup(HostAction::Saved(id, Action::Draft(editor, change)));
-        let mut choices: Vec<_> = self
-            .catalog
-            .profile_order
-            .iter()
-            .filter(|name| self.catalog.ssh_host_group_member(name).is_some())
-            .collect();
-        choices.extend(
-            draft
-                .members
+        let matching = draft.matching(&self.catalog);
+        let pages = matching.len().div_ceil(MEMBER_PAGE_SIZE).max(1);
+        let page = draft.page.min(pages - 1);
+        let offered: Rc<Vec<_>> = Rc::new(
+            matching
                 .iter()
-                .filter(|name| self.catalog.ssh_host_group_member(name).is_none()),
+                .map(|candidate| candidate.name.to_owned())
+                .collect(),
         );
-        let mut unique = BTreeSet::new();
-        let rows: Vec<_> = choices
-            .into_iter()
-            .filter(|name| unique.insert(name.as_str()))
-            .map(|name| {
-                let label = if self.catalog.ssh_host_group_member(name).is_some() {
-                    name.clone()
+        let can_add = matching
+            .iter()
+            .any(|candidate| candidate.position.is_none() && candidate.address.is_some());
+        let can_remove = matching
+            .iter()
+            .any(|candidate| candidate.position.is_some());
+        let rows = matching
+            .iter()
+            .skip(page * MEMBER_PAGE_SIZE)
+            .take(MEMBER_PAGE_SIZE)
+            .map(|candidate| {
+                let name = candidate.name;
+                let item = name.to_owned();
+                let position = candidate.position;
+                let order = if let Some(position) = position {
+                    let before = position
+                        .checked_sub(1)
+                        .and_then(|index| draft.members.get(index))
+                        .cloned();
+                    let after = draft.members.get(position + 1).cloned();
+                    let up = name.to_owned();
+                    let down = name.to_owned();
+                    StackPanel::new()
+                        .grid_column(1)
+                        .spacing(6.0)
+                        .orientation(Orientation::Horizontal)
+                        .children((
+                            TextBlock::new()
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text(format!("Position {}", position + 1)),
+                            Button::new()
+                                .automation_name(format!("Move {name} up"))
+                                .is_enabled(before.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    before.as_ref().map_or(Message::ControlIdle, |before| {
+                                        action(DraftAction::Move(before.clone(), up.clone()))
+                                    })
+                                }))
+                                .content("Move up"),
+                            Button::new()
+                                .automation_name(format!("Move {name} down"))
+                                .is_enabled(after.is_some())
+                                .on_click(ctx.callback(move |_| {
+                                    after.as_ref().map_or(Message::ControlIdle, |after| {
+                                        action(DraftAction::Move(down.clone(), after.clone()))
+                                    })
+                                }))
+                                .content("Move down"),
+                        ))
                 } else {
-                    format!("{name} · unavailable")
+                    View::empty()
                 };
-                let item = name.clone();
                 KeyedView::new(
-                    name.as_str(),
-                    CheckBox::new()
-                        .automation_name(format!("Group member {name}"))
-                        .is_checked(draft.members.contains(name))
-                        .on_is_checked_changed(ctx.callback(move |checked| {
-                            action(DraftAction::Member(item.clone(), checked))
-                        }))
-                        .content(label),
+                    name,
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .children((
+                            StackPanel::new().spacing(2.0).children((
+                                CheckBox::new()
+                                    .automation_name(format!("Group member {name}"))
+                                    .is_checked(position.is_some())
+                                    .on_is_checked_changed(ctx.callback(move |checked| {
+                                        action(DraftAction::Member(item.clone(), checked))
+                                    }))
+                                    .content(name),
+                                TextBlock::new()
+                                    .text(
+                                        candidate
+                                            .address
+                                            .as_deref()
+                                            .unwrap_or("SSH profile unavailable"),
+                                    )
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )),
+                            order,
+                        )),
                 )
-            })
-            .collect();
+            });
         let mut buttons = vec![
             KeyedView::new(
                 "save",
@@ -642,13 +814,18 @@ impl TerminalApp {
                     }),
             ));
         }
-        let choices = if rows.is_empty() {
+        let choices = if matching.is_empty() {
             TextBlock::new()
-                .text("Save a direct SSH profile to use it in a group.")
+                .text(if draft.query.trim().is_empty() {
+                    "Save a direct SSH profile to use it in a group."
+                } else {
+                    "No SSH profiles match this search."
+                })
                 .into()
         } else {
-            StackPanel::new().spacing(4.0).keyed_children(rows)
+            StackPanel::new().spacing(8.0).keyed_children(rows)
         };
+        let add_matches = Rc::clone(&offered);
         let selection_notice = match draft.without_profile {
             0 => View::empty(),
             count => {
@@ -664,6 +841,7 @@ impl TerminalApp {
         Some(
             Grid::new()
                 .margin(Thickness::uniform(16.0))
+                .row_spacing(8.0)
                 .rows([
                     GridLength::Auto,
                     GridLength::Auto,
@@ -678,12 +856,60 @@ impl TerminalApp {
                         } else {
                             "New SSH group"
                         }),
-                    TextBox::new()
-                        .grid_row(1)
-                        .automation_name("SSH group name")
-                        .placeholder_text("Group name")
-                        .text(&draft.name)
-                        .on_text_changed(ctx.callback(move |name| action(DraftAction::Name(name)))),
+                    StackPanel::new().grid_row(1).spacing(6.0).children((
+                        TextBox::new()
+                            .automation_name("SSH group name")
+                            .placeholder_text("Group name")
+                            .text(&draft.name)
+                            .on_text_changed(
+                                ctx.callback(move |name| action(DraftAction::Name(name))),
+                            ),
+                        TextBox::new()
+                            .automation_name("Find group profiles")
+                            .placeholder_text("Filter by profile name or SSH address")
+                            .text(&draft.query)
+                            .on_text_changed(
+                                ctx.callback(move |query| action(DraftAction::Filter(query))),
+                            ),
+                        StackPanel::new()
+                            .spacing(6.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                Button::new()
+                                    .is_enabled(can_add)
+                                    .on_click(ctx.callback(move |_| {
+                                        action(DraftAction::CheckMatches(
+                                            (*add_matches).clone(),
+                                            true,
+                                        ))
+                                    }))
+                                    .content("Check matches"),
+                                Button::new()
+                                    .is_enabled(can_remove)
+                                    .on_click(ctx.callback(move |_| {
+                                        action(DraftAction::CheckMatches((*offered).clone(), false))
+                                    }))
+                                    .content("Uncheck matches"),
+                                Button::new()
+                                    .is_enabled(page > 0)
+                                    .on_click(ctx.callback(move |_| {
+                                        action(DraftAction::Page(page.saturating_sub(1)))
+                                    }))
+                                    .content("Previous profiles"),
+                                Button::new()
+                                    .is_enabled(page + 1 < pages)
+                                    .on_click(
+                                        ctx.callback(move |_| action(DraftAction::Page(page + 1))),
+                                    )
+                                    .content("Next profiles"),
+                            )),
+                        TextBlock::new().text(format!(
+                            "{} selected · {} matches · Page {} of {pages}",
+                            draft.members.len(),
+                            matching.len(),
+                            page + 1
+                        )),
+                    )),
                     ScrollViewer::new().grid_row(2).content(choices),
                     StackPanel::new().grid_row(3).spacing(5.0).children((
                         selection_notice,

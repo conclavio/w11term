@@ -1276,6 +1276,12 @@ async fn native_saved_ssh_host_group_reopens_profiles_after_restart() {
         profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
         peers.push((root, opens, server));
     }
+    for index in 1..=30 {
+        let mut profile = profiles["East"].clone();
+        profile["host"] = json!("catalog-only.test");
+        profile["port"] = json!(2200 + index);
+        profiles.insert(format!("Candidate {index:02}"), profile);
+    }
     profiles.insert(
         "Local witness".into(),
         json!({"backend":"local", "executable":"powershell.exe", "args":["-NoProfile"]}),

@@ -44,6 +44,10 @@ function Filter-Roster([string]$Query) {
     }
     $value.SetValue($Query)
 }
+function Filter-GroupProfiles([string]$Query) {
+    $field = Wait-Until 'saved group profile search' { Find-Element 'Find group profiles' $edit }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+}
 function Launch-Window {
     $launchArgs = @('--profiles',('"' + $profiles + '"'),'--demo','--cols','95','--rows','32')
     $script:app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -84,14 +88,47 @@ try {
     Open-GroupPage
     Click 'New group'
     Name-Group 'Fleet'
+    $null = Wait-Until 'the first catalog page is bounded' { Find-Element "0 selected${dot}32 matches${dot}Page 1 of 2" }
+    if (Find-Element 'Group member West') { throw 'The full catalog was mounted on the first page' }
+    Click 'Check matches'
+    $null = Wait-Until 'checking matches reaches the second page' { Find-Element "32 selected${dot}32 matches${dot}Page 1 of 2" }
+    Click 'Uncheck matches'
+    $null = Wait-Until 'clearing matches reaches the second page' { Find-Element "0 selected${dot}32 matches${dot}Page 1 of 2" }
+    Click 'Next profiles'
     if (Find-Element 'Group member Local witness') { throw 'Local shell was offered as a group member' }
-    (Wait-CheckBox 'Group member East' Off).Toggle()
+    $null = Wait-CheckBox 'Group member West' Off
+    Filter-GroupProfiles 'missing fixture host'
+    $null = Wait-Until 'an empty search shows its own status' { Find-Element 'No SSH profiles match this search.' }
+    Filter-GroupProfiles 'EAST'
+    $null = Wait-Until 'search returns East from the earlier page' {
+        (Find-Element 'Group member East') -and !(Find-Element 'Group member West')
+    }
+    Click 'Check matches'
     $null = Wait-CheckBox 'Group member East' On
-    (Wait-CheckBox 'Group member West' Off).Toggle()
+    $westernPort = (Catalog).profiles.West.port
+    Filter-GroupProfiles "TEST 127.0.0.1:$westernPort"
+    $null = Wait-Until 'address search finds West alone' {
+        (Find-Element 'Group member West') -and !(Find-Element 'Group member East')
+    }
+    Click 'Check matches'
     $null = Wait-CheckBox 'Group member West' On
+    Click 'Uncheck matches'
+    $null = Wait-CheckBox 'Group member West' Off
+    $null = Wait-Until 'the hidden member remains checked' { Find-Element "1 selected${dot}1 matches${dot}Page 1 of 1" }
+    Click 'Check matches'
+    $null = Wait-CheckBox 'Group member West' On
+    Click 'Move West up'
+    $null = Wait-Until 'West moves to the first position above hidden East' {
+        $move = Find-Element 'Move West up' $button
+        $move -and !$move.Current.IsEnabled -and (Find-Element 'Position 1')
+    }
+    Click 'Move West down'
+    $null = Wait-Until 'West can move back down' { Find-Element 'Position 2' }
+    Click 'Move West up'
+    $null = Wait-Until 'West returns to the first position' { Find-Element 'Position 1' }
     Click 'Save group'
-    $null = Wait-Until 'both saved members on the group page' { Find-Element 'East, West' }
-    if (((Catalog).ssh_host_groups.Fleet -join ',') -cne 'East,West') { throw 'Both members were not saved' }
+    $null = Wait-Until 'both members appear in the saved order' { Find-Element 'West, East' }
+    if (((Catalog).ssh_host_groups.Fleet -join ',') -cne 'West,East') { throw 'Both members were not saved in the reviewed order' }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Saving opened terminal sessions' }
     $original = [IO.File]::ReadAllBytes($profiles)
     $changed = Catalog
@@ -127,6 +164,12 @@ try {
         $current = @((Control @('list')).sessions)
         if ($current.Count -eq 3 -and @($current.tab_id | Sort-Object -Unique).Count -eq 3) { ,$current }
     }
+    $tabItem = [System.Windows.Automation.ControlType]::TabItem
+    $null = Wait-Until 'reopened sessions follow the saved tab order' {
+        $left = Find-Element 'West' $tabItem
+        $right = Find-Element 'East' $tabItem
+        $left -and $right -and $left.Current.BoundingRectangle.X -lt $right.Current.BoundingRectangle.X
+    }
     foreach ($name in 'East','West') {
         $pane = ($sessions | Where-Object label -ceq $name).id
         if (!$pane) { throw "Missing group pane $name" }
@@ -137,6 +180,7 @@ try {
 
     Click 'Edit group'
     $null = Wait-CheckBox 'Group member East' On
+    Filter-GroupProfiles 'west'
     (Wait-CheckBox 'Group member West' On).Toggle()
     $null = Wait-CheckBox 'Group member West' Off
     Name-Group 'East only'
@@ -182,6 +226,7 @@ try {
     }
     Click $saveSelection
     $null = Wait-CheckBox 'Group member West' On
+    Filter-GroupProfiles 'east'
     $null = Wait-CheckBox 'Group member East' Off
     Name-Group 'Selected West'
     Click 'Save group'
