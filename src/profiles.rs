@@ -349,6 +349,32 @@ impl ProfileStore {
         expected: Option<&[String]>,
         replacement: Option<&[String]>,
     ) -> Result<Profiles> {
+        self.edit_ssh_recipient_set(group, expected_group, name, expected, replacement, |_| {
+            Ok(())
+        })
+    }
+
+    /// Create a new set and recheck the launch review under the catalog write lock.
+    pub fn create_reviewed_ssh_recipient_set(
+        &self,
+        group: &str,
+        expected_group: &[String],
+        name: &str,
+        members: &[String],
+        verify: impl FnOnce(&Profiles) -> Result<()>,
+    ) -> Result<Profiles> {
+        self.edit_ssh_recipient_set(group, expected_group, name, None, Some(members), verify)
+    }
+
+    fn edit_ssh_recipient_set(
+        &self,
+        group: &str,
+        expected_group: &[String],
+        name: &str,
+        expected: Option<&[String]>,
+        replacement: Option<&[String]>,
+        verify: impl FnOnce(&Profiles) -> Result<()>,
+    ) -> Result<Profiles> {
         ensure!(
             !name.is_empty()
                 && name.len() <= 128
@@ -361,6 +387,7 @@ impl ProfileStore {
                 catalog.ssh_host_groups.get(group).map(Vec::as_slice) == Some(expected_group),
                 "The SSH group changed on disk. Reopen the group before editing recipient sets."
             );
+            verify(catalog)?;
             let mut groups = catalog.ssh_recipient_sets.clone();
             let sets = groups.entry(group.to_owned()).or_default();
             ensure!(

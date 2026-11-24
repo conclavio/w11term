@@ -217,10 +217,43 @@ try {
     }
     Click 'Back to launch review'
     Expect-Field 'Find launch profiles' 'no matching fixture address'
+    Click ('Save as recipient set' + [char]0x2026)
+    $null = Wait-Until 'recipient profile preview' { Find-Element 'Recipient set profiles' }
+    (Field 'Launch recipient set name').SetValue('Before connect')
+    $beforeSaving = [IO.File]::ReadAllBytes($profiles)
+    $changed = [Text.Encoding]::UTF8.GetString($beforeSaving) | ConvertFrom-Json
+    $changed.profiles.East.port = 1
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Save recipient set'
+    $null = Wait-Until 'an edited profile blocks saving the reviewed set' {
+        Find-Element 'SSH profiles changed. Refresh the review before continuing.'
+    }
+    if ((Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets) {
+        throw 'Saving a stale launch set changed the catalog'
+    }
+    [IO.File]::WriteAllBytes($profiles, $beforeSaving)
+    Click 'Save recipient set'
+    $null = Wait-Until 'the launch recipient set is saved' { Find-Element 'Saved recipient set Before connect' }
+    Expect-Field 'Find launch profiles' 'no matching fixture address'
+    Expect-Choice 'Launch recipient set' 'Before connect'
+    $sets = (Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_recipient_sets
+    if (($sets.'Fleet Lab'.'Before connect' -join ',') -cne 'East') {
+        throw 'The saved set did not include exactly the hidden East profile'
+    }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Opening the group review started an SSH session' }
     Click 'Cancel'
     Wait-Focus $origin
     if (Find-Element "SSH group${dot}Fleet Lab" $tabItem) { throw 'Cancelling left a draft group tab' }
+    $savedLaunch = "Review SSH recipient set${dot}Fleet Lab${dot}Before connect"
+    Open-GroupCommandSearch 'review fleet lab before connect'
+    Accept-GroupCommandWithEnter $savedLaunch
+    $null = Wait-Until 'the new preset reopens with just East selected' {
+        Find-Element "0 to reuse${dot}1 to open${dot}29 skipped"
+    }
+    Expect-Choice 'Launch recipient set' 'Before connect'
+    if (@((Control @('list')).sessions).Count -ne 1) { throw 'Reopening the new recipient set started an SSH session' }
+    Click 'Cancel'
+    Wait-Focus $origin
 
     $eastTab = "SSH group${dot}Fleet East"
     $westTab = "SSH group${dot}Fleet West"
