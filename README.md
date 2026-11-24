@@ -167,6 +167,8 @@ Scripts can use `w11term-cli wait-ssh-group-output` to wait for a matching line 
 
 While a run is active, enter a search and choose **Notify on next match**. The alert uses the search options and host filter selected when you arm it. It watches new output even when the view is paused or another tab is active. The first match adds the host and a short excerpt to the Attention inbox. Open the notice to return to that run's results, or choose **Cancel output alert** before it fires.
 
+Choose **View matching output** in the Attention inbox for the matched line and up to two nearby lines on each side from the same host. If that history has expired, the view shows the saved alert excerpt. From there, return to the inbox or open the original run results while they are retained.
+
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.

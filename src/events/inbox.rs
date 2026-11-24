@@ -24,6 +24,7 @@ pub enum NoticeTarget {
     GroupOutput {
         tab: u64,
         submission: u64,
+        pane: u64,
         line_id: u64,
     },
     GroupLogins {
@@ -238,6 +239,7 @@ impl Inbox {
             NoticeTarget::GroupOutput {
                 tab,
                 submission,
+                pane: line.pane,
                 line_id: line.id,
             },
             display_field(source).into(),
@@ -387,6 +389,16 @@ impl Inbox {
 
     pub fn mark_read(&self, pane: u64, sequence: u64) -> bool {
         self.mark_target_read(NoticeTarget::Pane { pane, sequence })
+    }
+
+    pub fn read_group_output_notice(&self, target: NoticeTarget) -> Option<String> {
+        let NoticeTarget::GroupOutput { .. } = target else {
+            return None;
+        };
+        let mut state = self.state.lock().unwrap();
+        let row = state.rows.iter_mut().find(|row| row.target == target)?;
+        row.unread = false;
+        Some(row.message.clone())
     }
 
     pub fn mark_target_read(&self, target: NoticeTarget) -> bool {

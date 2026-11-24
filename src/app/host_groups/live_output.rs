@@ -276,7 +276,7 @@ impl State {
     }
 }
 
-fn displayed_line(line: &GroupTranscriptLine) -> Cow<'_, str> {
+pub(in crate::app) fn displayed_line(line: &GroupTranscriptLine) -> Cow<'_, str> {
     if line.shortened {
         Cow::Owned(format!("{}…", line.text))
     } else {
@@ -394,6 +394,32 @@ impl HostGroup {
 }
 
 impl TerminalApp {
+    pub(in crate::app) fn group_output_context(
+        &self,
+        tab: TabId,
+        run: u64,
+        pane: u64,
+        line_id: u64,
+    ) -> Option<(String, Vec<GroupTranscriptLine>)> {
+        let Page::HostGroup(page) = &self.tabs.get(tab)?.page else {
+            return None;
+        };
+        let submission = page
+            .submissions
+            .iter()
+            .find(|submission| submission.id == run)?;
+        let host = &submission
+            .results
+            .iter()
+            .find(|row| row.target.pane == pane)?
+            .target
+            .name;
+        let lines = submission
+            .transcript
+            .context_around(pane, line_id, CONTEXT_LINES)?;
+        Some((host.clone(), lines))
+    }
+
     pub(super) fn set_group_output_alert(&self, id: TabId, run: u64, armed: bool) {
         if self.tabs.active_id() != Some(id) {
             return;

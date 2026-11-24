@@ -515,6 +515,21 @@ impl GroupTranscript {
             .into_owned()
     }
 
+    /// Read nearby lines from the source pane's retained history.
+    pub fn context_around(
+        &self,
+        pane: u64,
+        line_id: u64,
+        radius: usize,
+    ) -> Option<Vec<GroupTranscriptLine>> {
+        let transcript = self.0.lock().unwrap();
+        let snapshot = transcript.history.scoped(Some(pane));
+        let index = snapshot.lines.iter().position(|line| line.id == line_id)?;
+        let start = index.saturating_sub(radius);
+        let end = index.saturating_add(radius).min(snapshot.lines.len() - 1);
+        Some(snapshot.lines.range(start..=end).cloned().collect())
+    }
+
     pub fn history(&self) -> GroupTranscriptHistory {
         self.0.lock().unwrap().history.clone()
     }
@@ -762,6 +777,28 @@ mod tests {
     use wezterm_term::LiveOutputLine;
 
     #[test]
+    fn output_context_uses_the_source_hosts_retained_lines_in_order() {
+        let group = GroupTranscript::default();
+        {
+            let mut transcript = group.0.lock().unwrap();
+            for index in 0..5 {
+                transcript.push(1, 0, format!("East {index}"), false);
+                transcript.push(2, 0, format!("West {index}"), false);
+            }
+            for _ in 0..TRANSCRIPT_LINES {
+                transcript.push(2, 0, "West burst", false);
+            }
+        }
+        assert!(group.snapshot().lines.iter().all(|line| line.pane == 2));
+        let context = group.context_around(1, 5, 2).unwrap();
+        assert!(context.iter().map(|line| line.id).eq([1, 3, 5, 7, 9]));
+        let start = group.context_around(1, 1, 2).unwrap();
+        assert!(start.iter().map(|line| line.id).eq([1, 3, 5]));
+        assert!(group.context_around(2, 5, 2).is_none());
+        assert!(group.context_around(2, 2, 2).is_none());
+    }
+
+    #[test]
     fn output_alert_consumes_the_first_new_line_from_its_host_scope() {
         let inbox = Inbox::new(|| {});
         let group = GroupTranscript::default();
@@ -805,6 +842,7 @@ mod tests {
             NoticeTarget::GroupOutput {
                 tab: 8,
                 submission: 5,
+                pane: 2,
                 line_id: 5
             }
         );

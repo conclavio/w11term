@@ -2,6 +2,8 @@ use super::{host_groups::FailedLogin, *};
 use std::{fmt::Write as _, io::Write as _};
 use w11term::events::{NoticeTarget, SshAttemptOutcome, SshLoginResult};
 
+mod group_output;
+
 pub(super) const LONG_COMMANDS: &str = "Notify for long commands";
 
 pub(super) fn long_command_toggle(label: &str) -> Option<bool> {
@@ -27,6 +29,7 @@ pub enum Action {
         sequence: u64,
     },
     VisitGroup(NoticeTarget),
+    ViewGroupOutput(NoticeTarget),
     ViewCommand {
         pane: u64,
         sequence: u64,
@@ -55,6 +58,7 @@ pub enum LoginReportAction {
 
 pub(super) enum AttentionPage {
     Inbox,
+    GroupOutput(group_output::MatchView),
     Logins {
         target: NoticeTarget,
         changed: bool,
@@ -131,7 +135,9 @@ impl TerminalApp {
                 | NoticeTarget::GroupOutput {
                     tab, submission, ..
                 } if self.group_run_retained(tab, submission)
-                    && self.inbox.mark_target_read(target) =>
+                    && (matches!(self.active_attention(), Some(AttentionPage::GroupOutput(output))
+                        if output.target == target)
+                        || self.inbox.mark_target_read(target)) =>
                 {
                     self.show_group_run(tab, submission);
                 }
@@ -145,6 +151,7 @@ impl TerminalApp {
                 }
                 _ => return,
             },
+            Action::ViewGroupOutput(target) => self.open_group_output_match(target),
             Action::ViewCommand { pane, sequence } => {
                 if let Some(link) = self.inbox.command_link(pane, sequence)
                     && self.open_command_history(pane, Some(link), ctx)
@@ -246,6 +253,7 @@ impl TerminalApp {
     pub(super) fn attention_view(&self, page: &AttentionPage, ctx: &ViewContext<Self>) -> View {
         match page {
             AttentionPage::Inbox => {}
+            AttentionPage::GroupOutput(output) => return self.group_output_match_view(output, ctx),
             AttentionPage::Logins { target, changed } => {
                 return self.login_results_view(*target, *changed, ctx);
             }
@@ -319,7 +327,20 @@ impl TerminalApp {
                                             .text(label)
                                             .text_wrapping(TextWrapping::Wrap),
                                     );
-                            let content = if let NoticeTarget::GroupLogins { sequence, .. } = target {
+                            let details = match target {
+                                NoticeTarget::GroupLogins { sequence, .. } => Some((
+                                    format!("View SSH login results for {source}, notice {sequence}"),
+                                    "View login results",
+                                    Action::ViewLoginResults as fn(NoticeTarget) -> Action,
+                                )),
+                                NoticeTarget::GroupOutput { submission, line_id, .. } => Some((
+                                    format!("View matching output for {source}, run {submission}, line {line_id}"),
+                                    "View matching output",
+                                    Action::ViewGroupOutput as fn(NoticeTarget) -> Action,
+                                )),
+                                _ => None,
+                            };
+                            let content = if let Some((name, label, action)) = details {
                                 Grid::new()
                                     .columns([GridLength::STAR, GridLength::Auto])
                                     .column_spacing(8.0)
@@ -328,9 +349,9 @@ impl TerminalApp {
                                         Button::new()
                                             .grid_column(1)
                                             .style(ButtonStyle::Subtle)
-                                            .automation_name(format!("View SSH login results for {source}, notice {sequence}"))
-                                            .on_click(ctx.callback(move |_| Message::Attention(Action::ViewLoginResults(target))))
-                                            .content("View login results"),
+                                            .automation_name(name)
+                                            .on_click(ctx.callback(move |_| Message::Attention(action(target))))
+                                            .content(label),
                                     ))
                             } else {
                                 visit

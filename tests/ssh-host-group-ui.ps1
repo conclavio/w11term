@@ -1630,8 +1630,28 @@ try {
     $logReader = $null
     Click 'Attention inbox, 1 unread'
     $outputNotice = "Unread${dot}SSH host group${dot}Run $burstRunId${dot}Matched output${dot}$westName${dot}west record row 00"
-    Click $outputNotice
-    $null = Wait-Until 'the one-shot alert opens its original run and marks the inbox read' {
+    $null = Wait-Until 'the unread alert identifies the matching host and line' { Find-Element $outputNotice $button }
+    $matchedLine = $streamedLines | Where-Object text -CEQ 'west record row 00'
+    $viewMatch = "View matching output for SSH host group, run $burstRunId, line $($matchedLine.line_id)"
+    Click $viewMatch
+    $null = Wait-Until 'the alert opens the match and two nearby lines from its source host' {
+        $match = Find-Element 'west record row 00'
+        $next = Find-Element 'west record row 01'
+        $last = Find-Element 'west record row 02'
+        (Find-Element 'SSH group output match') -and (Find-Element 'Matched line') -and
+            (Find-Element "Run $burstRunId${dot}$westName") -and
+            $match -and $next -and $last -and
+            $match.Current.BoundingRectangle.Top -lt $next.Current.BoundingRectangle.Top -and
+            $next.Current.BoundingRectangle.Top -lt $last.Current.BoundingRectangle.Top -and
+            !(Find-Element 'east record row 79') -and !(Find-Element 'west record row 03') -and
+            (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Click 'Back to inbox'
+    $readOutputNotice = $outputNotice -creplace '^Unread', 'Read'
+    $null = Wait-Until 'returning from the excerpt keeps the notice read' { Find-Element $readOutputNotice $button }
+    Click $viewMatch
+    Click 'Open run results'
+    $null = Wait-Until 'the match view opens its original run' {
         (Find-Element "Submitted${dot}record-fast") -and (Find-Element 'Attention inbox, 0 unread' $button)
     }
     Outcome $westName 'Exit 17'
@@ -1789,6 +1809,22 @@ try {
     }
     if ($trace.hresult -ge 0) {
         $null = Wait-Until 'recording selection was acknowledged' { Find-Element 'Selected in File Explorer' }
+    }
+    $palette = Open-Palette 'Close tab'
+    $palette.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Close tab')
+    Click 'Close tab    Ctrl+Shift+W'
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'the saved alert remains available after closing the group tab' {
+        $expiredNotice = $readOutputNotice.Replace("Run $burstRunId${dot}", "Run $burstRunId (results unavailable)${dot}")
+        $entry = Find-Element $expiredNotice $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    Click $viewMatch
+    $null = Wait-Until 'the expired run shows its saved alert excerpt and disables results navigation' {
+        $results = Find-Element 'Open run results' $button
+        (Find-Element "Run $burstRunId${dot}Saved alert excerpt") -and
+            (Find-Element "Matched output${dot}$westName${dot}west record row 00") -and
+            $results -and !$results.Current.IsEnabled
     }
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
