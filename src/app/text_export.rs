@@ -1,14 +1,16 @@
 use super::*;
-use std::path::PathBuf;
+use std::{fs::File, io, io::Write, path::PathBuf};
 use tokio::sync::oneshot;
 
 pub(super) const SCROLLBACK_LABEL: &str = "Save scrollback as text…";
 pub(super) const COMMAND_OUTPUT_LABEL: &str = "Save output as text…";
+pub(super) const GROUP_REPORT_LABEL: &str = "Save results…";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {
     Scrollback(u64),
     CommandOutput { pane: u64, command: u64 },
+    HostGroupResults(u64),
 }
 
 impl Subject {
@@ -16,6 +18,7 @@ impl Subject {
         match self {
             Self::Scrollback(pane) => format!("scrollback for pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
+            Self::HostGroupResults(_) => "SSH group results".into(),
         }
     }
 
@@ -24,6 +27,9 @@ impl Subject {
             Self::Scrollback(_) => file_picker::Purpose::Scrollback,
             Self::CommandOutput { pane, command } => {
                 file_picker::Purpose::CommandOutput(format!("pane-{pane}-command-{command}.txt"))
+            }
+            Self::HostGroupResults(submission) => {
+                file_picker::Purpose::GroupReport(format!("ssh-group-submission-{submission}.txt"))
             }
         }
     }
@@ -85,7 +91,11 @@ impl TerminalApp {
             {
                 let subject = Subject::Scrollback(pane);
                 match result {
-                    Ok(text) => self.save_export(subject, text, context),
+                    Ok(text) => self.save_export(
+                        subject,
+                        move |file| file.write_all(text.as_bytes()),
+                        context,
+                    ),
                     Err(error) => self.export.finish(subject, Err(error)),
                 }
             }
@@ -108,12 +118,34 @@ impl TerminalApp {
             return;
         }
         let subject = Subject::CommandOutput { pane, command };
-        self.export.pending = Some(subject);
-        self.export.status = None;
-        self.save_export(subject, text.to_owned(), context);
+        let text = text.to_owned();
+        self.begin_text_export(
+            subject,
+            move |file| file.write_all(text.as_bytes()),
+            context,
+        );
     }
 
-    fn save_export(&mut self, subject: Subject, text: String, context: &ComponentContext<Self>) {
+    pub(super) fn begin_text_export(
+        &mut self,
+        subject: Subject,
+        write: impl FnOnce(&mut File) -> io::Result<()> + Send + 'static,
+        context: &ComponentContext<Self>,
+    ) {
+        if self.export.pending.is_some() {
+            return;
+        }
+        self.export.pending = Some(subject);
+        self.export.status = None;
+        self.save_export(subject, write, context);
+    }
+
+    fn save_export(
+        &mut self,
+        subject: Subject,
+        write: impl FnOnce(&mut File) -> io::Result<()> + Send + 'static,
+        context: &ComponentContext<Self>,
+    ) {
         let Some(owner) = self.keyboard.hwnd() else {
             return self
                 .export
@@ -129,7 +161,10 @@ impl TerminalApp {
                     let Some(file) = file_picker::pick(owner, subject.picker())? else {
                         return Ok(None);
                     };
-                    w11term::transcript::save(&file.path, &text, file.overwrite)?;
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
+                    w11term::transcript::save_with(&file.path, file.overwrite, write)?;
                     Ok(Some(file.path))
                 };
                 Message::Export(Action::Finished(

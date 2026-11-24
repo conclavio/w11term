@@ -3,9 +3,12 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'group-result-clipboard.txt'
+$env:W11TERM_EXPORT_SMOKE_DIR = Join-Path $State 'exports'
+$null = [IO.Directory]::CreateDirectory($env:W11TERM_EXPORT_SMOKE_DIR)
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_DATA_DIR)
 $library = Join-Path $env:W11TERM_DATA_DIR 'saved-commands.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -252,6 +255,34 @@ try {
             $report.Contains("$westName${dot}Not sent${dot}Waiting for a fresh prompt")
     }
     $null = Wait-Until 'copy confirmation' { Find-Element 'Copied results' }
+    $saveResults = 'Save results' + [char]0x2026
+    $destination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3.txt'
+    Click $saveResults
+    $dialog = Wait-Until 'owned group results save dialog' { Find-OwnedDialog 'Save SSH group results as text' }
+    $null = Wait-Until 'cancel the group results export' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'group results dialog closes after cancel' { !(Find-OwnedDialog 'Save SSH group results as text') }
+    if ([IO.File]::Exists($destination)) { throw 'Cancelling the save published a report' }
+    Click $saveResults
+    $dialog = Wait-Until 'owned group results save dialog reopens' { Find-OwnedDialog 'Save SSH group results as text' }
+    $null = Wait-Until 'save the group results report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $savedStatus = Wait-Until 'report was saved with its submission name' {
+        if ([IO.File]::Exists($destination)) {
+            $prefix = 'Saved SSH group results to '
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            $buttons = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
+            foreach ($element in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttons)) {
+                $name = $element.Current.Name
+                if ($name.StartsWith($prefix, [StringComparison]::Ordinal) -and
+                    [FixtureDialog]::SameFile($destination, $name.Substring($prefix.Length))) {
+                    return $name
+                }
+            }
+        }
+    }
+    $exported = [IO.File]::ReadAllText($destination, [Text.UTF8Encoding]::new($false, $true))
+    if ($exported -cne (Read-ClipboardFixture)) { throw 'The saved report omitted retained output or host status' }
+    Click $savedStatus
     $null = Wait-Until 'the hidden West result is outside the retry scope' {
         $entry = Find-Element 'Prepare retry' $button
         $entry -and !$entry.Current.IsEnabled
