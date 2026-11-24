@@ -244,6 +244,7 @@ mod tests {
             "5",
             "--canary",
             "5",
+            "--dry-run",
             "--expect-output",
             "^READY [0-9]+$",
             "--regex",
@@ -255,6 +256,7 @@ mod tests {
         ])
         .unwrap();
         let checked = serde_json::to_value(checked).unwrap();
+        assert_eq!(checked["dry_run"], true);
         assert_eq!(checked["canary_pane_id"], 5);
         assert_eq!(
             checked["expect_output"],

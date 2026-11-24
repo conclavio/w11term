@@ -30,6 +30,7 @@ pub struct SshGroupExpectedOutput {
 
 #[derive(Debug)]
 pub struct SshGroupCommandOptions {
+    pub dry_run: bool,
     pub canary_pane_id: Option<u64>,
     pub expect_output: Option<(SshGroupExpectedOutput, Regex)>,
     pub record_output: Option<PathBuf>,
@@ -37,6 +38,7 @@ pub struct SshGroupCommandOptions {
 
 impl SshGroupCommandOptions {
     pub(super) fn prepare(
+        dry_run: bool,
         canary_pane_id: Option<u64>,
         expect_output: Option<SshGroupExpectedOutput>,
         record_output: Option<PathBuf>,
@@ -53,6 +55,7 @@ impl SshGroupCommandOptions {
             .transpose()
             .context("invalid expected output")?;
         Ok(Self {
+            dry_run,
             canary_pane_id,
             expect_output,
             record_output,
@@ -276,6 +279,7 @@ impl Registry {
     ) -> Result<Value> {
         let ui = self.window_ui(window)?;
         let (reply, response) = oneshot::channel();
+        let dry_run = options.dry_run;
         ui(UiRequest::SubmitSshGroupCommand {
             tab_id: tab,
             pane_ids,
@@ -283,11 +287,18 @@ impl Registry {
             options,
             reply,
         });
-        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+        let Ok(Ok(result)) = tokio::time::timeout(TIMEOUT, response).await else {
+            if dry_run {
+                bail!("SSH group preview was not acknowledged");
+            }
             bail!("SSH group submission was not acknowledged. Check retained runs before retrying");
         };
-        let run = run.map_err(anyhow::Error::msg)?;
-        Ok(json!({ "window_id": window, "tab_id": tab, "run_id": run }))
+        let result = result.map_err(anyhow::Error::msg)?;
+        Ok(if dry_run {
+            json!({ "window_id": window, "tab_id": tab, "plan": result })
+        } else {
+            json!({ "window_id": window, "tab_id": tab, "run_id": result })
+        })
     }
 
     pub(super) async fn query_ssh_group_roster(
@@ -859,7 +870,12 @@ mod tests {
                 assert_eq!(rule.query, "^READY [0-9]+$");
                 assert!(pattern.is_match("READY 2"));
                 assert!(!pattern.is_match("ready 2"));
-                reply.send(Ok(json!(3))).unwrap();
+                let result = if options.dry_run {
+                    json!({"command": command, "recipients": [{"pane_id": 7}, {"pane_id": 8}]})
+                } else {
+                    json!(3)
+                };
+                reply.send(Ok(result)).unwrap();
             }
             UiRequest::GetSshGroupRoster {
                 tab_id,
@@ -920,18 +936,25 @@ mod tests {
                 Arc::new(|_, _, _| unreachable!()),
             )
         };
-        let submission = submit(json!({
+        let submission = json!({
             "window_id": 3,
             "pane_ids": [8, 7],
             "command": "show  status",
             "canary_pane_id": 7,
             "expect_output": { "query": "^READY [0-9]+$", "regex": true, "match_case": true },
             "record_output": r"C:\fixture\capture.txt",
-        }))
-        .await
-        .unwrap();
+        });
+        let mut preview = submission.clone();
+        preview["dry_run"] = json!(true);
         assert_eq!(
-            submission,
+            submit(preview).await.unwrap(),
+            json!({
+                "window_id": 3, "tab_id": 9,
+                "plan": {"command":"show  status","recipients":[{"pane_id":7},{"pane_id":8}]}
+            })
+        );
+        assert_eq!(
+            submit(submission).await.unwrap(),
             json!({ "window_id": 3, "tab_id": 9, "run_id": 3 })
         );
         for (mut wire, message) in [

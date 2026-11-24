@@ -168,6 +168,29 @@ impl TerminalApp {
                 return;
             }
         };
+        if options.dry_run {
+            let canary = |target: &&Target| Some(target.pane) == offer.canary;
+            let recipients: Vec<_> = offer
+                .targets
+                .iter()
+                .filter(canary)
+                .chain(offer.targets.iter().filter(|target| !canary(target)))
+                .map(|target| {
+                    json!({
+                        "pane_id": target.pane,
+                        "label": target.name,
+                        "address": target.names.address(),
+                        "profile": target.profile,
+                    })
+                })
+                .collect();
+            let _ = reply.send(Ok(json!({
+                "command": &*offer.text,
+                "dispatch_policy": offer.dispatch_policy(),
+                "recipients": recipients,
+            })));
+            return;
+        }
         let alert = options
             .expect_output
             .map(|(rule, pattern)| alerted_send::Alert::expected_output(rule, pattern));

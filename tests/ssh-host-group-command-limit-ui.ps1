@@ -563,12 +563,23 @@ try {
     $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
         '--pane',"$($panes.East)",'--pane',"$($panes.West)",'--timeout','10')
     $overrideLog = Join-Path $State 'cli-canary-override.txt'
-    $submitted = Control @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",
+    $submissionArgs = @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",
         '--pane',"$($panes.East)",'--pane',"$($panes.West)",'--canary',"$($panes.West)",
-        '--record-output',$overrideLog,'--','verify-override')
+        '--record-output',$overrideLog)
+    $beforePreview = (Control @('list-ssh-groups')).windows.groups.runs.run_id -join ','
+    $preview = Control ($submissionArgs + @('--dry-run','--','verify-override'))
+    $afterPreview = (Control @('list-ssh-groups')).windows.groups.runs.run_id -join ','
+    if ($preview.window_id -ne $groupWindow -or $preview.tab_id -ne $groupTab -or $null -ne $preview.run_id -or
+        $preview.plan.command -cne 'verify-override' -or $preview.plan.dispatch_policy.canary.pane_id -ne $panes.West -or
+        ($preview.plan.recipients.pane_id -join ',') -cne "$($panes.West),$($panes.East)" -or
+        $beforePreview -cne $afterPreview -or (Test-Path -LiteralPath $overrideLog)) {
+        throw 'The dry run planned the wrong recipients or allocated a run or recording'
+    }
+    $submitted = Control ($submissionArgs + @('--','verify-override'))
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started verify-override')
     $override = (Run-Snapshot $submitted.run_id).run
-    if ($override.dispatch_policy.canary.pane_id -ne $panes.West -or
+    if (($override.dispatch_policy | ConvertTo-Json -Compress) -cne
+        ($preview.plan.dispatch_policy | ConvertTo-Json -Compress) -or
         $override.queue.state -cne 'canary_running' -or $override.queue.canary_pane_id -ne $panes.West -or
         $override.queue.unsent -ne 1) {
         throw 'The recorded CLI submission did not run its requested canary first'

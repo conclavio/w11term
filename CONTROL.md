@@ -243,7 +243,7 @@ Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
 background tab or window without changing selection or keyboard focus.
 
-`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--canary PANE] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND`
+`submit-ssh-group-command --window ID --tab ID --pane ID [--pane ID ...] [--dry-run] [--canary PANE] [--expect-output TEXT [--regex] [--match-case]] [--record-output PATH] [--] COMMAND`
 sends one shell line of up to 4,096 UTF-8 bytes to explicitly named panes.
 Pass the command as one quoted argument to preserve spaces. Use `--` before
 a command beginning with two hyphens. The panes must be distinct, belong
@@ -264,6 +264,14 @@ run is accepted. Use the run ID below to confirm delivery, check shell exit
 status, or follow output. A background submission preserves the window focus,
 group draft, and roster selection. If the submission is unacknowledged, check
 the retained runs before retrying.
+
+Use `--dry-run` to validate the same request and return `window_id`,
+`tab_id`, and a `plan` containing the command, effective dispatch policy,
+and recipients in planned dispatch order. When a canary is configured
+for the run, it is first, followed by the other panes in argument order.
+A preview creates no run, recording, or output alert and sends no bytes.
+The real submission revalidates the live roster and prompt state and
+opens any requested recording file.
 
 Use `--expect-output TEXT` to check captured lines from each named pane.
 The check is armed before dispatch and defaults to case-insensitive literal
@@ -428,6 +436,7 @@ w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --pane 17 --pane 19 --timeout 60
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 -- "uname -a"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --canary 19 -- "check-service"
+w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --canary 19 --dry-run -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --expect-output '^READY$' --regex --match-case -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
@@ -453,6 +462,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"pane_ids":[17,19],"timeout_seconds":60}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"uname -a"}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"canary_pane_id":19,"command":"check-service"}
+{"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"canary_pane_id":19,"command":"check-service","dry_run":true}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","expect_output":{"query":"^READY$","regex":true,"match_case":true}}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}

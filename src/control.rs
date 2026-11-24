@@ -113,6 +113,8 @@ pub enum Request {
         tab_id: u64,
         pane_ids: Vec<u64>,
         command: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         canary_pane_id: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -651,13 +653,18 @@ impl Registry {
                 tab_id,
                 pane_ids,
                 command,
+                dry_run,
                 canary_pane_id,
                 expect_output,
                 record_output,
             } => {
                 validate_group_submission(&pane_ids, &command, canary_pane_id)?;
-                let options =
-                    SshGroupCommandOptions::prepare(canary_pane_id, expect_output, record_output)?;
+                let options = SshGroupCommandOptions::prepare(
+                    dry_run,
+                    canary_pane_id,
+                    expect_output,
+                    record_output,
+                )?;
                 self.submit_ssh_group_command(window_id, tab_id, pane_ids, command, options)
                     .await
             }
