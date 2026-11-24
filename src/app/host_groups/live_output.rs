@@ -6,7 +6,7 @@ use w11term::{
         GroupCompletionState, GroupOutputAlert, GroupOutputAlertRule, GroupTranscriptHistory,
         GroupTranscriptLine, GroupTranscriptSnapshot,
     },
-    search::{MAX_QUERY_BYTES, compile_regex},
+    saved_output_rules::compile_query,
 };
 
 const CONTEXT_LINES: usize = 2;
@@ -26,6 +26,7 @@ pub enum Action {
     ShowElapsed(bool),
     FilterHost(Option<u64>),
     ClearFilters,
+    Presets(alert_rule_presets::Action),
     ArmOutputAlert,
     CopyShown,
     SaveShown,
@@ -69,6 +70,7 @@ pub(super) struct OutputSearch {
     pub(super) matcher: Option<Result<Regex, String>>,
     pub(super) regex: bool,
     pub(super) sensitive: bool,
+    pub(super) presets: Option<Box<alert_rule_presets::Panel>>,
 }
 
 struct HostFilter {
@@ -98,20 +100,7 @@ impl OutputSearch {
         if (self.query.as_str(), self.regex, self.sensitive) == (query.as_str(), regex, sensitive) {
             return;
         }
-        self.matcher = if query.is_empty() {
-            None
-        } else if query.len() > MAX_QUERY_BYTES {
-            Some(Err(format!(
-                "Search text exceeds {MAX_QUERY_BYTES} UTF-8 bytes"
-            )))
-        } else {
-            let pattern = if regex {
-                Cow::Borrowed(query.as_str())
-            } else {
-                Cow::Owned(regex::escape(&query))
-            };
-            Some(compile_regex(&pattern, sensitive))
-        };
+        self.matcher = (!query.is_empty()).then(|| compile_query(&query, regex, sensitive));
         self.query = query;
         self.regex = regex;
         self.sensitive = sensitive;
@@ -444,6 +433,7 @@ impl HostGroup {
             Action::ShowElapsed(enabled) => output.timeline.show_elapsed = enabled,
             Action::FilterHost(_) => output.filter.host = host_filter,
             Action::ClearFilters => output.filter = Filter::default(),
+            Action::Presets(action) => output.filter.search.update_presets(action),
             _ => {}
         }
     }
@@ -834,6 +824,10 @@ impl TerminalApp {
                         )),
                     search,
                     search_options,
+                    output
+                        .filter
+                        .search
+                        .preset_view(move |action| send(Action::Presets(action)), ctx),
                     alert_rule.as_deref().map_or_else(View::empty, |rule| {
                         armed_alert_view(id, submission_id, rule, ctx)
                     }),
@@ -886,6 +880,7 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use w11term::search::MAX_QUERY_BYTES;
 
     #[test]
     fn live_output_filters_match_literal_unicode_text_and_source_together() {

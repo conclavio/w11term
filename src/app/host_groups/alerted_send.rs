@@ -26,6 +26,7 @@ pub enum Action {
     Regex(bool),
     MatchCase(bool),
     Record(bool),
+    Presets(alert_rule_presets::Action),
     Confirm,
     Cancel,
 }
@@ -104,6 +105,7 @@ impl State {
                                 .text_wrapping(TextWrapping::Wrap)
                                 .into()
                         }),
+                        search.preset_view(move |action| send(Action::Presets(action)), ctx),
                         CheckBox::new()
                             .is_checked(review.record)
                             .on_is_checked_changed(ctx.callback(move |on| send(Action::Record(on))))
@@ -196,6 +198,7 @@ impl TerminalApp {
                         search.configure(search.query.clone(), search.regex, on)
                     }
                     Action::Record(on) => review.record = on,
+                    Action::Presets(action) => search.update_presets(action),
                     _ => {}
                 }
             }

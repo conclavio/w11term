@@ -11,6 +11,7 @@ use w11term::options::{
 };
 use w11term::prompts::Question;
 mod address;
+mod alert_rule_presets;
 mod alerted_send;
 mod close_ended;
 mod command_order;

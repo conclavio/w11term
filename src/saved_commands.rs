@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -104,24 +103,11 @@ impl Commands {
 
     /// Read and update under the same lock so edits from different windows compose.
     pub fn update(path: &Path, original: Option<&Entry>, new: Option<Entry>) -> Result<Self> {
-        let directory = path.parent().context("Saved commands path has no parent")?;
-        fs::create_dir_all(directory)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.with_extension("lock"))?;
-        lock.try_lock()
-            .context("Another window is saving commands. Try again.")?;
-        let mut commands = Self::load(path)?;
-        commands.change(original, new)?;
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        serde_json::to_writer_pretty(&mut file, &commands)?;
-        file.write_all(b"\n")?;
-        file.as_file().sync_all()?;
-        file.persist(path).context("Saving commands")?;
-        Ok(commands)
+        crate::stored_json::update(path, "commands", || {
+            let mut commands = Self::load(path)?;
+            commands.change(original, new)?;
+            Ok(commands)
+        })
     }
 }
 

@@ -284,7 +284,23 @@ try {
         (Find-Element 'Send to 1 host' $button) -and !(Find-Element "Submitted${dot}one")
     }
     Click $alertedSend
-    (Command-Editor $alertSearch).SetValue('east-accepted one')
+    $savedAlertRules = 'Saved alert rules' + [char]0x2026
+    $ruleName = 'Fast success'
+    $ruleQuery = '^east-accepted one$'
+    (Wait-CheckBox 'Regular expression' Off).Toggle()
+    $null = Wait-CheckBox 'Regular expression' On
+    (Wait-CheckBox 'Match case' Off).Toggle()
+    $null = Wait-CheckBox 'Match case' On
+    (Command-Editor $alertSearch).SetValue($ruleQuery)
+    Click $savedAlertRules
+    (Command-Editor 'Output alert rule name').SetValue($ruleName)
+    Click 'Save current rule'
+    $null = Wait-Until 'the named rule appears after saving' { Find-Element "Use alert rule $ruleName" $button }
+    $storedRule = Get-Content -LiteralPath (Join-Path $env:W11TERM_DATA_DIR 'output-alert-rules.json') -Raw | ConvertFrom-Json
+    if ($storedRule.name -cne $ruleName -or $storedRule.query -cne $ruleQuery -or !$storedRule.regex -or !$storedRule.match_case) {
+        throw 'The named rule lost its query or matching options'
+    }
+    Click 'Close saved rules'
     $chooseRecording = 'Choose recording file' + [char]0x2026
     (Wait-CheckBox 'Record full output' Off).Toggle()
     Click $chooseRecording
@@ -296,7 +312,13 @@ try {
             (Find-Element $alertedSend $button) -and !(Find-Element "Submitted${dot}one")
     }
     Click $alertedSend
-    (Command-Editor $alertSearch).SetValue('east-accepted one')
+    Click $savedAlertRules
+    Click "Use alert rule $ruleName"
+    $null = Wait-Until 'loading the saved rule restores the exact review query' {
+        (Command-Editor $alertSearch).Current.Value -ceq $ruleQuery
+    }
+    $null = Wait-CheckBox 'Regular expression' On
+    $null = Wait-CheckBox 'Match case' On
     (Wait-CheckBox 'Record full output' Off).Toggle()
     Click $chooseRecording
     $dialog = Wait-Until 'reopen the recording destination for the alert' { Find-OwnedDialog 'Record SSH group output' }
@@ -1641,6 +1663,16 @@ try {
     $null = Wait-Until 'retained burst output is shown before arming an alert' {
         Find-Element 'east record row 79'
     }
+    Click $savedAlertRules
+    Click "Use alert rule $ruleName"
+    $null = Wait-Until 'the live output view can load the same named rule' {
+        (Command-Editor $outputSearch).Current.Value -ceq $ruleQuery
+    }
+    $null = Wait-CheckBox $outputRegex On
+    $null = Wait-CheckBox $outputCase On
+    Click 'Clear output filters'
+    $null = Wait-CheckBox $outputRegex Off
+    $null = Wait-CheckBox $outputCase Off
     Click 'Pause output'
     (Command-Editor $outputSearch).SetValue('record row')
     $null = Wait-Until 'the paused view has a valid search for a live alert' {
