@@ -165,6 +165,13 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_seconds: u64,
     },
+    WaitSshGroupApproval {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     WaitSshGroupOutput {
         window_id: WindowId,
         tab_id: u64,
@@ -284,7 +291,7 @@ pub enum UiRequest {
     GetSshGroupRun {
         tab_id: u64,
         run_id: u64,
-        wait_for_settlement: bool,
+        wait_for: Option<SshGroupRunWait>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     SshGroupQueue {
@@ -355,6 +362,7 @@ impl UiRequest {
 pub use ssh_groups::{
     SshGroupCommandOptions, SshGroupDispatchOverrides, SshGroupExpectedOutput, SshGroupOutput,
     SshGroupQueueAction, SshGroupReadiness, SshGroupReportFormat, SshGroupReportWriter,
+    SshGroupRunWait,
 };
 pub use ssh_groups::{validate_group_panes, validate_group_submission};
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
@@ -716,15 +724,25 @@ impl Registry {
                 run_id,
                 timeout_seconds,
             } => {
-                ensure!(
-                    (1..=3600).contains(&timeout_seconds),
-                    "SSH group wait timeout must be 1..=3600 seconds"
-                );
                 self.query_ssh_group_run(
                     window_id,
                     tab_id,
                     run_id,
-                    Some(Duration::from_secs(timeout_seconds)),
+                    Some((SshGroupRunWait::Settlement, timeout_seconds)),
+                )
+                .await
+            }
+            Request::WaitSshGroupApproval {
+                window_id,
+                tab_id,
+                run_id,
+                timeout_seconds,
+            } => {
+                self.query_ssh_group_run(
+                    window_id,
+                    tab_id,
+                    run_id,
+                    Some((SshGroupRunWait::CanaryApproval, timeout_seconds)),
                 )
                 .await
             }
@@ -1116,6 +1134,7 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitSshGroupRun { .. }
+                        | Request::WaitSshGroupApproval { .. }
                         | Request::WaitSshGroupOutput { .. }
                         | Request::FollowSshGroupOutput { .. }
                         | Request::WaitSshGroupReady { .. }
@@ -1462,6 +1481,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupRun {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshGroupApproval {
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupOutput {

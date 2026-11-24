@@ -2,11 +2,16 @@ use super::*;
 use serde_json::{Value, json};
 use w11term::control::{
     SshGroupCommandOptions, SshGroupDispatchOverrides, SshGroupOutput, SshGroupReadiness,
-    SshGroupReportFormat, SshGroupReportWriter,
+    SshGroupReportFormat, SshGroupReportWriter, SshGroupRunWait,
 };
 use w11term::events::GroupCompletionState;
 
 pub(in crate::app) type ControlReply = oneshot::Sender<Result<Value, String>>;
+
+pub(super) struct ControlRunWait {
+    until: SshGroupRunWait,
+    reply: ControlReply,
+}
 
 pub struct PreparedControlRecording {
     tab: TabId,
@@ -103,22 +108,51 @@ impl Submission {
         }
     }
 
-    fn poll_control_waiters(&mut self) {
-        self.control_waiters.retain(|reply| !reply.is_closed());
-        if self.control_waiters.is_empty()
-            || self.transcript.completion_state() != GroupCompletionState::Settled
+    fn settled_run_snapshot(&mut self) -> Option<Value> {
+        if self.transcript.completion_state() != GroupCompletionState::Settled
             || self
                 .control_recording
                 .as_ref()
                 .is_some_and(|recording| !recording.finished())
         {
-            return;
+            return None;
         }
         self.refresh_deliveries();
-        if let Some(snapshot) = report::describe_run(self, true) {
-            for reply in std::mem::take(&mut self.control_waiters) {
-                let _ = reply.send(Ok(snapshot.clone()));
+        report::describe_run(self, true)
+    }
+
+    fn poll_control_waiters(&mut self) {
+        self.control_waiters.retain(|wait| !wait.reply.is_closed());
+        let has_waiter = |until| self.control_waiters.iter().any(|wait| wait.until == until);
+        let wait_for_settlement = has_waiter(SshGroupRunWait::Settlement);
+        let wait_for_approval = has_waiter(SshGroupRunWait::CanaryApproval);
+        let settled = wait_for_settlement
+            .then(|| self.settled_run_snapshot())
+            .flatten()
+            .map(Ok);
+        let approval = if wait_for_approval {
+            match self.canary_approval_available() {
+                Ok(false) => None,
+                Ok(true) => {
+                    self.refresh_deliveries();
+                    report::describe_run(self, false).map(Ok)
+                }
+                Err(error) => Some(Err(error.into())),
             }
+        } else {
+            None
+        };
+        let result = |until| match until {
+            SshGroupRunWait::Settlement => settled.as_ref(),
+            SshGroupRunWait::CanaryApproval => approval.as_ref(),
+        };
+        for wait in self
+            .control_waiters
+            .extract_if(.., |wait| result(wait.until).is_some())
+        {
+            let _ = wait
+                .reply
+                .send(result(wait.until).expect("a resolved wait").clone());
         }
     }
 }
@@ -443,7 +477,7 @@ impl TerminalApp {
         &mut self,
         tab: TabId,
         run: u64,
-        wait_for_settlement: bool,
+        wait_for: Option<SshGroupRunWait>,
         reply: ControlReply,
     ) {
         let submission = match self.control_group_run(tab, run) {
@@ -453,8 +487,10 @@ impl TerminalApp {
                 return;
             }
         };
-        if wait_for_settlement {
-            submission.control_waiters.push(reply);
+        if let Some(until) = wait_for {
+            submission
+                .control_waiters
+                .push(ControlRunWait { until, reply });
             submission.poll_control_waiters();
         } else {
             submission.refresh_deliveries();
@@ -666,7 +702,10 @@ mod tests {
             GroupCompletionState::Settled
         );
         let (reply, mut received) = oneshot::channel();
-        run.control_waiters.push(reply);
+        run.control_waiters.push(ControlRunWait {
+            until: SshGroupRunWait::Settlement,
+            reply,
+        });
         run.poll_control_waiters();
         assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
 
@@ -707,8 +746,21 @@ mod tests {
         let (second, mut second_reply) = oneshot::channel();
         let (cancelled, cancelled_reply) = oneshot::channel();
         drop(cancelled_reply);
-        run.control_waiters.extend([first, second, cancelled]);
+        run.control_waiters
+            .extend([first, second, cancelled].map(|reply| ControlRunWait {
+                until: SshGroupRunWait::Settlement,
+                reply,
+            }));
+        let (approval, mut approval_reply) = oneshot::channel();
+        run.control_waiters.push(ControlRunWait {
+            until: SshGroupRunWait::CanaryApproval,
+            reply: approval,
+        });
         run.poll_control_waiters();
+        assert_eq!(
+            approval_reply.try_recv().unwrap().unwrap_err(),
+            "This SSH group run has no canary gate"
+        );
         assert_eq!(run.control_waiters.len(), 2);
         assert!(matches!(first_reply.try_recv(), Err(TryRecvError::Empty)));
         drop(host);

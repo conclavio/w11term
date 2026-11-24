@@ -67,6 +67,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "save-ssh-group-report"
             | "submit-ssh-group-command"
             | "wait-ssh-group-run"
+            | "wait-ssh-group-approval"
             | "wait-ssh-group-output"
             | "get-ssh-group-output"
             | "follow-ssh-group-output"
@@ -700,6 +701,18 @@ mod tests {
             ) if pattern == "--ready"
         ));
         assert!(matches!(
+            parse_line("wait-ssh-group-approval --window 11 --tab 12 --run 4 --timeout 8").unwrap(),
+            (
+                None,
+                Request::WaitSshGroupApproval {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4,
+                    timeout_seconds: 8
+                }
+            )
+        ));
+        assert!(matches!(
             parse_line("--pid 7 get-ssh-group-run --tab 12 --run 4 --window 11").unwrap(),
             (
                 Some(7),
@@ -745,6 +758,8 @@ mod tests {
             "interrupt-ssh-group-command --window 2 --tab 3 --run 4 --pane 7 --pane 8",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 0",
             "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 3601",
+            "wait-ssh-group-approval --window 2 --tab 3 --run 4 --timeout 3601",
+            "wait-ssh-group-approval --window 2 --tab 3 --run 4 --require-success",
             "wait-ssh-group-output --window 2 --tab 3 --run 4",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --pane 0 ready",
             "wait-ssh-group-output --window 2 --tab 3 --run 4 --timeout 3601 ready",

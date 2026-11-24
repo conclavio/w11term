@@ -275,6 +275,22 @@ impl Drop for Waiting {
 }
 
 impl Submission {
+    pub(super) fn canary_approval_available(&self) -> Result<bool, &'static str> {
+        let Some(queue) = &self.command_queue else {
+            return Err("This SSH group run has no canary gate");
+        };
+        let Some(gate) = queue.canary else {
+            return Err("This SSH group run has no canary awaiting approval");
+        };
+        if deadline_reached(queue.deadline, Instant::now()) {
+            return Err("The SSH group command queue expired before approval");
+        }
+        if !self.has_queue() {
+            return Err("The canary gate closed before approval");
+        }
+        Ok(matches!(gate, CanaryGate::AwaitingApproval(_)))
+    }
+
     pub(super) fn queue_snapshot(&self) -> Option<Value> {
         let queue = self.command_queue.as_ref()?;
         let unsent = self

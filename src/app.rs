@@ -5409,12 +5409,12 @@ impl Component for TerminalApp {
             Message::Control(w11term::control::UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,
-                wait_for_settlement,
+                wait_for,
                 reply,
             }) => {
                 if !reply.is_closed() {
-                    self.control_ssh_group_run(tab_id, run_id, wait_for_settlement, reply);
-                    if wait_for_settlement {
+                    self.control_ssh_group_run(tab_id, run_id, wait_for, reply);
+                    if wait_for.is_some() {
                         self.update_host_group_timer(context);
                     }
                 }

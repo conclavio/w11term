@@ -409,6 +409,15 @@ a skipped host or missing exit status. In either case the JSON reply still
 has `ok: true` and the full run. Request errors and timeouts exit **1**.
 Without the flag, any successfully retrieved run exits **0**.
 
+`wait-ssh-group-approval --window ID --tab ID --run ID [--timeout SECONDS]`
+returns the run snapshot when the canary reports a verified zero exit and
+unsent hosts are waiting for approval. Use `run.queue.canary_pane_id` with
+`ssh-group-queue ... approve-canary --pane ID` after reviewing the result.
+The wait leaves the gate in place and works from the background. A failed
+canary, drained or expired queue, previously approved run, or retired
+run returns an error. The timeout defaults to 30 seconds and accepts 1
+through 3600.
+
 `wait-ssh-group-output --window ID --tab ID --run ID [--pane ID] [--after-line ID] [--regex] [--match-case] [--timeout SECONDS] [--] TEXT`
 returns the first matching line from the selected run. It searches the retained
 combined feed in arrival order, then listens for new output. With `--pane ID`,
@@ -492,6 +501,7 @@ w11term-cli --pid 12345 interrupt-ssh-group-command --window 1 --tab 9 --run 3 -
 w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --require-success
+w11term-cli --pid 12345 wait-ssh-group-approval --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --regex '^ready for traffic$'
 w11term-cli --pid 12345 get-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --after-line 42 --limit 20
@@ -523,6 +533,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"interrupt-ssh-group-command","window_id":1,"tab_id":9,"run_id":3,"pane_id":17}
 {"verb":"save-ssh-group-report","window_id":1,"tab_id":9,"run_id":3,"path":"C:\\Reports\\group report.json","format":"json","overwrite":false}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
+{"verb":"wait-ssh-group-approval","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"pattern":"^ready for traffic$","regex":true}
 {"verb":"get-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"after_line":42,"limit":20}

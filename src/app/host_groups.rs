@@ -154,7 +154,7 @@ struct Submission {
     command_queue: Option<command_queue::Queue>,
     dispatch_policy: Option<dispatch_policy::Policy>,
     show_queue_activity: bool,
-    control_waiters: Vec<control_api::ControlReply>,
+    control_waiters: Vec<control_api::ControlRunWait>,
     output_lifetime: Option<watch::Sender<()>>,
 }
 

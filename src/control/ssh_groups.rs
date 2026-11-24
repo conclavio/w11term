@@ -78,6 +78,12 @@ pub enum SshGroupReadiness {
     Panes(Vec<u64>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshGroupRunWait {
+    Settlement,
+    CanaryApproval,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SshGroupQueueAction {
@@ -400,20 +406,35 @@ impl Registry {
         window: WindowId,
         tab: u64,
         run: u64,
-        wait_for: Option<Duration>,
+        wait_for: Option<(SshGroupRunWait, u64)>,
     ) -> Result<Value> {
-        let deadline = Instant::now() + wait_for.unwrap_or(TIMEOUT);
+        let (condition, timeout) = if let Some((condition, seconds)) = wait_for {
+            ensure!(
+                (1..=3600).contains(&seconds),
+                "SSH group wait timeout must be 1..=3600 seconds"
+            );
+            (Some(condition), Duration::from_secs(seconds))
+        } else {
+            (None, TIMEOUT)
+        };
+        let deadline = Instant::now() + timeout;
         let (reply, response) = oneshot::channel();
         self.window_ui(window)?(UiRequest::GetSshGroupRun {
             tab_id: tab,
             run_id: run,
-            wait_for_settlement: wait_for.is_some(),
+            wait_for: condition,
             reply,
         });
-        let run = if wait_for.is_some() {
+        let run = if let Some(condition) = condition {
+            let timeout_error = match condition {
+                SshGroupRunWait::Settlement => "wait-ssh-group-run timed out before settlement",
+                SshGroupRunWait::CanaryApproval => {
+                    "wait-ssh-group-approval timed out before the canary was ready"
+                }
+            };
             tokio::time::timeout_at(deadline, response)
                 .await
-                .context("wait-ssh-group-run timed out before settlement")?
+                .context(timeout_error)?
                 .with_context(|| {
                     format!(
                         "SSH group run {run} is no longer retained in tab {tab} of window {window}"
@@ -806,24 +827,31 @@ mod tests {
         let registry = Registry::window(3, None);
         let (send, receive) = std::sync::mpsc::channel();
         registry.set_ui(move |request| send.send(request).unwrap());
-        let error = registry
-            .query_ssh_group_run(3, 9, 2, Some(Duration::from_secs(1)))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("timed out before settlement"));
-        let UiRequest::GetSshGroupRun {
-            wait_for_settlement,
-            reply,
-            ..
-        } = receive.try_recv().unwrap()
-        else {
-            panic!("wrong request");
-        };
-        assert!(wait_for_settlement && reply.is_closed());
+        for (condition, timeout_error) in [
+            (SshGroupRunWait::Settlement, "timed out before settlement"),
+            (
+                SshGroupRunWait::CanaryApproval,
+                "timed out before the canary was ready",
+            ),
+        ] {
+            let error = registry
+                .query_ssh_group_run(3, 9, 2, Some((condition, 1)))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(timeout_error));
+            let UiRequest::GetSshGroupRun {
+                wait_for, reply, ..
+            } = receive.try_recv().unwrap()
+            else {
+                panic!("wrong request");
+            };
+            assert_eq!(wait_for, Some(condition));
+            assert!(reply.is_closed());
+        }
 
         registry.set_ui(drop);
         let error = registry
-            .query_ssh_group_run(3, 9, 2, Some(Duration::from_secs(1)))
+            .query_ssh_group_run(3, 9, 2, Some((SshGroupRunWait::Settlement, 1)))
             .await
             .unwrap_err();
         assert!(
@@ -861,11 +889,11 @@ mod tests {
             UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,
-                wait_for_settlement,
+                wait_for,
                 reply,
             } => {
                 assert_eq!((tab_id, run_id), (9, 2));
-                assert!(!wait_for_settlement);
+                assert!(wait_for.is_none());
                 reply
                     .send(Ok(json!({ "summary": { "run_id": run_id } })))
                     .unwrap();

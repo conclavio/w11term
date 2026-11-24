@@ -75,6 +75,7 @@ function Select-GroupOption([string]$Name, [string]$Label) {
 $launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '--rows', '36')
 $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $waitJob = $null
+$approvalJob = $null
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
@@ -346,7 +347,25 @@ try {
     $null = Wait-Until 'the preview is open before leaving the group' { Find-Element 'Back to roster and results' $button }
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the canary group is in the background' { Find-Element 'No bells or notifications' }
+    $approvalArgs = @('wait-ssh-group-approval','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $approvalTimeout = & $Cli --pid $app.Id @approvalArgs 5 --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $approvalTimeout.ok -or $approvalTimeout.error -notlike '*timed out before the canary was ready*') {
+        throw 'Waiting for approval did not time out while East was held'
+    }
+    $approvalOutput = Join-Path $State 'wait-canary-approval.json'
+    $approvalJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $approvalArgs + @('5','--timeout','15')) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $approvalOutput
+    $waitFocus = [FixtureMessages]::GetForegroundWindow()
     New-Item -ItemType File -Path (Join-Path $State 'release-east-canary-ok') | Out-Null
+    if (!$approvalJob.WaitForExit(10000)) {
+        throw 'The background wait did not return when the canary became ready'
+    }
+    $approval = [IO.File]::ReadAllText($approvalOutput) | ConvertFrom-Json
+    if (!$approval.ok -or $approval.result.window_id -ne $groupWindow -or $approval.result.tab_id -ne $groupTab -or
+        $approval.result.run.queue.state -cne 'canary_approval' -or $approval.result.run.queue.canary_pane_id -ne $panes.East -or
+        $approval.result.run.queue.unsent -ne 1 -or [FixtureMessages]::GetForegroundWindow() -ne $waitFocus) {
+        throw 'The approval wait lost the pending gate, targeted the wrong host, or changed focus'
+    }
     $canaryNotice = "$group${dot}Run 5${dot}Canary ready for approval${dot}$($labels.East)"
     Click "Unread${dot}$canaryNotice"
     $null = Wait-Until 'the canary notice opens the run requiring approval' {
@@ -376,6 +395,10 @@ try {
         throw 'Approving the correct canary left the gate in place or changed focus'
     }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished canary-ok')
+    $completedGate = & $Cli --pid $app.Id @approvalArgs 5 --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $completedGate.ok -or $completedGate.error -notlike '*no canary awaiting approval*') {
+        throw 'A second approval wait accepted a gate that was already approved'
+    }
     $null = Wait-Until 'the canary notice stays read while the run completion is unread' {
         Find-Element "Read${dot}$canaryNotice" $button
     }
@@ -402,6 +425,10 @@ try {
     Click 'Run canary first'
     Click 'Attention inbox, 1 unread'
     Click "Unread${dot}$group${dot}Run 6${dot}Canary did not report a successful exit${dot}$($labels.East)"
+    $failedGate = & $Cli --pid $app.Id @approvalArgs 6 --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 1 -or $failedGate.ok -or $failedGate.error -notlike '*canary gate closed before approval*') {
+        throw 'A failed canary did not resolve the approval wait as an error'
+    }
     $null = Wait-Until 'a failed canary notice opens the exact run that withheld West' {
         (Find-Element "$($labels.East)${dot}Exit 17") -and
             (Find-Element "$($labels.West)${dot}Not sent${dot}Canary did not report a successful exit.") -and
@@ -722,6 +749,10 @@ try {
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {
+    if ($approvalJob) {
+        if (!$approvalJob.HasExited) { $approvalJob.Kill(); $approvalJob.WaitForExit() }
+        $approvalJob.Dispose()
+    }
     if ($waitJob) {
         if (!$waitJob.HasExited) { $waitJob.Kill(); $waitJob.WaitForExit() }
         $waitJob.Dispose()
