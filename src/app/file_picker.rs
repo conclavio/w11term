@@ -28,6 +28,7 @@ pub(super) enum Purpose {
     Scrollback,
     CommandOutput(String),
     GroupReport(String),
+    SshHostList,
     StartRecording,
     OpenRecording,
 }
@@ -274,7 +275,10 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
                 None
             }
-            Purpose::Scrollback | Purpose::CommandOutput(_) | Purpose::GroupReport(_) => {
+            Purpose::Scrollback
+            | Purpose::CommandOutput(_)
+            | Purpose::GroupReport(_)
+            | Purpose::SshHostList => {
                 #[cfg(feature = "ui-smoke")]
                 if fixture_picker_folder(&dialog, "W11TERM_EXPORT_SMOKE_DIR")? {
                     options |= FOS_DONTADDTORECENT;
@@ -286,6 +290,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                     Purpose::GroupReport(suggestion) => {
                         (w!("Save SSH group results as text"), suggestion.as_str())
                     }
+                    Purpose::SshHostList => (w!("Save SSH host list"), "ssh-hosts.txt"),
                     _ => (w!("Save scrollback as text"), "terminal.txt"),
                 };
                 dialog.SetTitle(title)?;

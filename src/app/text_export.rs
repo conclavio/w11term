@@ -11,6 +11,7 @@ pub enum Subject {
     Scrollback(u64),
     CommandOutput { pane: u64, command: u64 },
     HostGroupResults(u64),
+    SshHostList,
 }
 
 impl Subject {
@@ -19,6 +20,7 @@ impl Subject {
             Self::Scrollback(pane) => format!("scrollback for pane {pane}"),
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
             Self::HostGroupResults(_) => "SSH group results".into(),
+            Self::SshHostList => "SSH host list".into(),
         }
     }
 
@@ -31,6 +33,7 @@ impl Subject {
             Self::HostGroupResults(submission) => {
                 file_picker::Purpose::GroupReport(format!("ssh-group-submission-{submission}.txt"))
             }
+            Self::SshHostList => file_picker::Purpose::SshHostList,
         }
     }
 }

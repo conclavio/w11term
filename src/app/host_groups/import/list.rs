@@ -1,5 +1,6 @@
+use super::super::address::{Endpoint, display};
 use anyhow::{Context, Result, ensure};
-use std::{collections::BTreeMap, net::Ipv6Addr, path::Path};
+use std::{collections::BTreeMap, path::Path};
 use w11term::options::{Authentication, Profiles, SshOptions};
 
 const MAX_BYTES: usize = 32 * 1024;
@@ -28,40 +29,7 @@ impl Target {
 }
 
 pub(super) fn address(ssh: &SshOptions) -> String {
-    let host = &ssh.host;
-    if host.contains(':') && !host.starts_with('[') {
-        format!("{}@[{host}]:{}", ssh.user, ssh.port)
-    } else {
-        format!("{}@{host}:{}", ssh.user, ssh.port)
-    }
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-struct Endpoint {
-    user: String,
-    host: String,
-    port: u16,
-}
-
-impl From<&SshOptions> for Endpoint {
-    fn from(ssh: &SshOptions) -> Self {
-        let host = ssh
-            .host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(&ssh.host);
-        let (ip, scope) = host.split_once('%').unwrap_or((host, ""));
-        let host = match ip.parse::<Ipv6Addr>() {
-            Ok(ip) if !scope.is_empty() => format!("{ip}%{scope}"),
-            Ok(ip) => ip.to_string(),
-            Err(_) => host.to_ascii_lowercase(),
-        };
-        Self {
-            user: ssh.user.clone(),
-            host,
-            port: ssh.port,
-        }
-    }
+    display(&ssh.user, &ssh.host, ssh.port)
 }
 
 pub(super) fn build(

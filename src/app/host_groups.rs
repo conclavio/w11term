@@ -5,8 +5,10 @@ use w11term::events::{
     CommandLink, GroupExecution, GroupInterruptTarget, GroupOutput, GroupTranscript, PromptToken,
     ShellPrompt,
 };
+mod address;
 mod compare;
 mod filter;
+mod host_list_export;
 mod import;
 mod live_output;
 mod membership;
@@ -46,6 +48,7 @@ pub(super) struct HostGroup {
     live_output: Option<live_output::State>,
     comparison: compare::State,
     import: import::State,
+    host_list_export: Box<host_list_export::State>,
     reconnect_feedback: String,
     retry_feedback: String,
     prompt_setup: prompt_setup::State,
@@ -351,6 +354,7 @@ pub enum Action {
     LiveOutput(TabId, u64, live_output::Action),
     Compare(TabId, u64, compare::Action),
     Import(TabId, import::Action),
+    HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
     FilterResults(TabId, u64, progress::Filter),
     LoadCommand(TabId, u64),
@@ -417,6 +421,7 @@ impl TerminalApp {
                     && page.live_output.is_none()
                     && !page.comparison.is_open()
                     && !page.import.is_open()
+                    && !page.host_list_export.is_open()
                     && !page.edit_membership_open()
                     && !page.saved.reuse.is_open()
                     && !page.prompt_setup.is_open()
@@ -690,6 +695,7 @@ impl TerminalApp {
             Action::Reuse(id, action) => self.handle_host_group_reuse(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
+            Action::HostListExport(id, action) => self.handle_host_list_export(id, action, ctx),
             Action::RecipientSets(id, action) => self.handle_recipient_sets(id, action),
             Action::Transfer(id, action) => self.handle_host_group_transfer(id, action, ctx),
             Action::Tick => {
@@ -957,6 +963,12 @@ impl TerminalApp {
         if let Some(view) = page.import.view(id, ctx) {
             return view;
         }
+        if let Some(view) = page
+            .host_list_export
+            .view(id, self.export.pending.is_some(), ctx)
+        {
+            return view;
+        }
         if let Some(view) = page.saved.reuse.view(id, ctx) {
             return view;
         }
@@ -1163,6 +1175,7 @@ impl TerminalApp {
                     } else {
                         View::empty()
                     },
+                    host_list_export::button(id, &selected, ctx),
                 )),
         ));
         let instructions = if !page.draft.is_empty() && !valid_text {
