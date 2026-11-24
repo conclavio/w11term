@@ -535,12 +535,14 @@ mod tests {
             connected: true,
             state: TargetState::Unverified,
         };
-        let mut group = HostGroup::default();
-        group.roster = Some(Box::new(MemberRoster {
-            panes: BTreeSet::from([7]),
+        let mut group = HostGroup {
+            roster: Some(Box::new(MemberRoster {
+                panes: BTreeSet::from([7]),
+                ..Default::default()
+            })),
+            selected: BTreeSet::from([7]),
             ..Default::default()
-        }));
-        group.selected.insert(7);
+        };
         let (reply, mut result) = oneshot::channel();
         group.wait_for_readiness(
             "Fleet",
