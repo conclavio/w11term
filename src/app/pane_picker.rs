@@ -621,9 +621,13 @@ impl TerminalApp {
         );
     }
 
-    pub(super) fn open_window_group_run_picker(&mut self, ctx: &ComponentContext<Self>) {
+    pub(super) fn open_window_group_run_picker(
+        &mut self,
+        scope: host_groups::WindowRunScope,
+        ctx: &ComponentContext<Self>,
+    ) {
         self.start_picker(
-            Mode::Commands(command_palette::Search::WindowGroupRuns),
+            Mode::Commands(command_palette::Search::WindowGroupRuns(scope)),
             ctx,
         );
         self.update_host_group_timer(ctx);
@@ -631,7 +635,10 @@ impl TerminalApp {
 
     pub(super) fn window_group_run_picker_open(&self) -> bool {
         self.picker.as_ref().is_some_and(|picker| {
-            picker.mode == Mode::Commands(command_palette::Search::WindowGroupRuns)
+            matches!(
+                picker.mode,
+                Mode::Commands(command_palette::Search::WindowGroupRuns(_))
+            )
         })
     }
 
@@ -647,8 +654,8 @@ impl TerminalApp {
             Mode::Commands(command_palette::Search::GroupRuns(group)) => {
                 self.group_run_rows(group, query)
             }
-            Mode::Commands(command_palette::Search::WindowGroupRuns) => {
-                self.window_group_run_rows(query)
+            Mode::Commands(command_palette::Search::WindowGroupRuns(scope)) => {
+                self.window_group_run_rows(scope, query)
             }
             _ => self.command_rows(query),
         }

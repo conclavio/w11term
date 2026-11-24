@@ -1,4 +1,5 @@
 use super::*;
+use host_groups::WindowRunScope;
 use w11term::shortcuts::BINDINGS;
 
 pub(super) const FIND_TAB_LABEL: &str = "Find tab…";
@@ -10,7 +11,7 @@ pub(super) enum Search {
     GroupLibrary(TabId),
     GroupRecent(TabId),
     GroupRuns(TabId),
-    WindowGroupRuns,
+    WindowGroupRuns(WindowRunScope),
 }
 
 impl Search {
@@ -21,7 +22,10 @@ impl Search {
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
             Self::GroupRuns(_) => "Search group runs",
-            Self::WindowGroupRuns => "Search group runs across tabs",
+            Self::WindowGroupRuns(WindowRunScope::All) => "Search group runs across tabs",
+            Self::WindowGroupRuns(WindowRunScope::ArmedOutputAlerts) => {
+                "Search armed SSH output alerts"
+            }
         }
     }
 
@@ -32,7 +36,13 @@ impl Search {
                 "Commands submitted in this tab will appear here."
             }
             Self::GroupRecent(_) => "No matching recent commands",
-            Self::GroupRuns(_) | Self::WindowGroupRuns => "No matching group runs",
+            Self::WindowGroupRuns(WindowRunScope::ArmedOutputAlerts) if query.is_empty() => {
+                "No armed SSH output alerts"
+            }
+            Self::WindowGroupRuns(WindowRunScope::ArmedOutputAlerts) => {
+                "No matching armed SSH output alerts"
+            }
+            Self::GroupRuns(_) | Self::WindowGroupRuns(_) => "No matching group runs",
             Self::Tabs => "No matching tabs",
             _ => "No matching commands",
         }
@@ -69,8 +79,8 @@ pub enum CommandId {
     GroupRecentCommand(TabId, u64),
     SearchGroupRuns(TabId),
     GroupRun(TabId, u64),
-    SearchWindowGroupRuns,
-    WindowGroupRun(TabId, u64),
+    SearchWindowGroupRuns(WindowRunScope),
+    WindowGroupRun(WindowRunScope, TabId, u64),
     FocusTab(TabId),
     OpenSavedHostGroup(String, Vec<String>),
     ReviewSavedHostGroup(host_groups::LaunchReviewOffer),
@@ -565,12 +575,22 @@ impl TerminalApp {
             });
         }
         if self.has_window_group_runs() {
-            rows.push(Row {
-                id: CommandId::SearchWindowGroupRuns,
-                label: host_groups::WINDOW_RUN_SEARCH_LABEL.into(),
-                chord: String::new(),
-                enabled: true,
-            });
+            rows.extend(
+                [
+                    (WindowRunScope::All, host_groups::WINDOW_RUN_SEARCH_LABEL),
+                    (
+                        WindowRunScope::ArmedOutputAlerts,
+                        host_groups::WINDOW_OUTPUT_ALERT_SEARCH_LABEL,
+                    ),
+                ]
+                .into_iter()
+                .map(|(scope, label)| Row {
+                    id: CommandId::SearchWindowGroupRuns(scope),
+                    label: label.into(),
+                    chord: String::new(),
+                    enabled: true,
+                }),
+            );
         }
         if let Some(group) = self.host_group_command_target() {
             rows.extend(self.group_saved_rows(group));
@@ -703,12 +723,12 @@ impl TerminalApp {
             CommandId::GroupRun(group, run) => {
                 Message::HostGroup(host_groups::Action::ViewSubmission(group, run))
             }
-            CommandId::SearchWindowGroupRuns => {
-                self.open_window_group_run_picker(ctx);
+            CommandId::SearchWindowGroupRuns(scope) => {
+                self.open_window_group_run_picker(scope, ctx);
                 return;
             }
-            CommandId::WindowGroupRun(group, run) => {
-                self.open_window_group_run(group, run, ctx);
+            CommandId::WindowGroupRun(scope, group, run) => {
+                self.open_window_group_run(scope, group, run, ctx);
                 return;
             }
             CommandId::FocusTab(group) => return self.select_switched_group(group, ctx),
@@ -798,7 +818,7 @@ pub(super) fn view(
     let search_label = mode.placeholder();
     let trimming = if matches!(
         mode,
-        Search::Tabs | Search::GroupRecent(_) | Search::GroupRuns(_) | Search::WindowGroupRuns
+        Search::Tabs | Search::GroupRecent(_) | Search::GroupRuns(_) | Search::WindowGroupRuns(_)
     ) {
         TextTrimming::CharacterEllipsis
     } else {

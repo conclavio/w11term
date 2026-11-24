@@ -55,7 +55,9 @@ pub(super) const LABEL: &str = "SSH host group";
 pub(super) const NEW_TAB_LABEL: &str = "New SSH group tab";
 pub(super) const RECENT_COMMANDS_LABEL: &str = "Recent group commands…";
 pub(super) const FIND_RUN_LABEL: &str = "Find group run…";
-pub(super) use run_search::WINDOW_RUN_SEARCH_LABEL;
+pub(super) use run_search::{
+    WINDOW_OUTPUT_ALERT_SEARCH_LABEL, WINDOW_RUN_SEARCH_LABEL, WindowRunScope,
+};
 const REQUIRE_READY: &str = "Require all recipients ready";
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBMISSION_LIMIT: usize = 8;

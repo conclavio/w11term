@@ -387,6 +387,32 @@ try {
     }
     Expect-Field 'Group command' 'east-only draft'
     Expect-Field 'Host filter' 'east'
+
+    $alertPicker = 'Find armed SSH output alerts' + [char]0x2026
+    $alertField = 'Search armed SSH output alerts'
+    $query = 'release witness'
+    Click ('Live output' + [char]0x2026)
+    Click 'Pause output'
+    Choose-Option 'Filter live output by host' $eastName
+    (Field 'Find in live output').SetValue($query)
+    Click 'Notify on next match'
+    $null = Wait-Until 'East has an armed output alert' { Find-Element "Armed output search${dot}$query" }
+    Select-Tab $westTab
+    Choose-GroupCommand $alertPicker
+    $alertRow = "$eastTab${dot}Run 1${dot}$eastName${dot}$query${dot}east-probe    Running${dot}0 of 1 settled"
+    $null = Wait-Until 'a background alert appears with its host and saved query' { Find-Element $alertRow $button }
+    (Field $alertField).SetValue('WEST #1')
+    $null = Wait-Until 'a retained run without an alert is omitted' { Find-Element 'No matching armed SSH output alerts' }
+    (Field $alertField).SetValue('WITNESS EAST #1')
+    $null = Wait-Until 'the alert can be found by its saved query and run' { Find-Element $alertRow $button }
+    Press-Key 13
+    Wait-Tab $eastTab
+    $null = Wait-Until 'opening the alert preserves the paused view of the same run' {
+        (Find-Element 'SSH group live output') -and (Find-Element 'Resume output' $button) -and
+            (Find-Element "Armed output search${dot}$query")
+    }
+    Expect-Field 'Find in live output' $query
+    Click 'Back to results'
     Select-Tab $westTab
 
     Click ('Recent commands' + [char]0x2026)
@@ -432,6 +458,11 @@ try {
         $results.Count -eq 1 -and $results[0].Contains($address)
     }
     Press-Key 13
+    Wait-Focus $west
+    Choose-GroupCommand $alertPicker
+    $null = Wait-Until 'settlement retires the background alert from the picker' { Find-Element 'No armed SSH output alerts' }
+    Press-Key 27
+    $null = Wait-Until 'the empty alert picker closes' { !(Find-Element $alertField $edit) }
     Wait-Focus $west
     Choose-GroupCommand 'SSH host group'
     Wait-Tab $westTab
