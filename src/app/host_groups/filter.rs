@@ -3,6 +3,7 @@ use regex::{RegexSet, RegexSetBuilder};
 use std::{fmt::Write, sync::Arc};
 
 const MAX_PATTERN_BYTES: usize = 4096;
+pub(super) const PROFILE_PAGE_SIZE: usize = 24;
 
 #[derive(Clone, Default)]
 pub(super) struct Filter {
@@ -110,13 +111,11 @@ impl Filter {
         match &self.matcher {
             Matcher::All => true,
             Matcher::Invalid(_) => false,
-            Matcher::Text(terms) => {
-                let name = target.name.to_lowercase();
-                let profile = target.profile.as_deref().unwrap_or_default().to_lowercase();
-                terms
-                    .iter()
-                    .all(|term| name.contains(term) || profile.contains(term))
-            }
+            Matcher::Text(terms) => matches_text(
+                terms,
+                &target.name,
+                target.profile.as_deref().unwrap_or_default(),
+            ),
             Matcher::Wildcards(wildcards) => {
                 let mut values = target
                     .names
@@ -130,6 +129,22 @@ impl Filter {
             }
         }
     }
+
+    pub(super) fn matches_profile(&self, name: &str, address: Option<&str>) -> bool {
+        match &self.matcher {
+            Matcher::All => true,
+            Matcher::Text(terms) => matches_text(terms, name, address.unwrap_or_default()),
+            _ => false,
+        }
+    }
+}
+
+fn matches_text(terms: &[String], name: &str, address: &str) -> bool {
+    let name = name.to_lowercase();
+    let address = address.to_lowercase();
+    terms
+        .iter()
+        .all(|term| name.contains(term) || address.contains(term))
 }
 
 fn parse_patterns(query: &str) -> Result<Matcher, &'static str> {

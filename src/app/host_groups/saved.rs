@@ -1,11 +1,9 @@
-use super::{Action as HostAction, *};
+use super::{Action as HostAction, filter::PROFILE_PAGE_SIZE, *};
 use anyhow::{Result, ensure};
 
 mod roster_update;
 pub use roster_update::Action as RosterUpdateAction;
 pub(super) use roster_update::update_button;
-
-const MEMBER_PAGE_SIZE: usize = 24;
 
 #[derive(Default)]
 pub(super) struct SavedUi {
@@ -23,7 +21,7 @@ struct Editor {
     original: Option<(String, Vec<String>)>,
     name: String,
     members: Vec<String>,
-    query: String,
+    filter: filter::Filter,
     page: usize,
     confirm_delete: bool,
     without_profile: usize,
@@ -37,8 +35,6 @@ struct Candidate<'a> {
 
 impl Editor {
     fn matching<'a>(&'a self, catalog: &'a Profiles) -> Vec<Candidate<'a>> {
-        let query = self.query.to_lowercase();
-        let words: Vec<_> = query.split_whitespace().collect();
         let selected = self
             .members
             .iter()
@@ -59,10 +55,8 @@ impl Editor {
                 let address = catalog
                     .ssh_host_group_member(name)
                     .map(|ssh| address::display(&ssh.user, &ssh.host, ssh.port));
-                let fields = format!("{name} {}", address.as_deref().unwrap_or("")).to_lowercase();
-                words
-                    .iter()
-                    .all(|word| fields.contains(word))
+                self.filter
+                    .matches_profile(name, address.as_deref())
                     .then_some(Candidate {
                         name,
                         address,
@@ -179,7 +173,7 @@ impl SavedUi {
             original,
             name,
             members,
-            query: String::new(),
+            filter: filter::Filter::default(),
             page: 0,
             confirm_delete: false,
             without_profile: selection.without_profile,
@@ -327,8 +321,8 @@ impl TerminalApp {
                 return;
             }
             DraftAction::Filter(query) => {
-                if draft.query != query {
-                    draft.query = query;
+                if draft.filter.query() != query {
+                    draft.filter.set_query(query);
                     draft.page = 0;
                     draft.confirm_delete = false;
                 }
@@ -339,7 +333,7 @@ impl TerminalApp {
                     < draft
                         .matching(&self.catalog)
                         .len()
-                        .div_ceil(MEMBER_PAGE_SIZE)
+                        .div_ceil(PROFILE_PAGE_SIZE)
                 {
                     draft.page = page;
                 }
@@ -693,7 +687,7 @@ impl TerminalApp {
         let action =
             move |change| Message::HostGroup(HostAction::Saved(id, Action::Draft(editor, change)));
         let matching = draft.matching(&self.catalog);
-        let pages = matching.len().div_ceil(MEMBER_PAGE_SIZE).max(1);
+        let pages = matching.len().div_ceil(PROFILE_PAGE_SIZE).max(1);
         let page = draft.page.min(pages - 1);
         let offered: Rc<Vec<_>> = Rc::new(
             matching
@@ -709,8 +703,8 @@ impl TerminalApp {
             .any(|candidate| candidate.position.is_some());
         let rows = matching
             .iter()
-            .skip(page * MEMBER_PAGE_SIZE)
-            .take(MEMBER_PAGE_SIZE)
+            .skip(page * PROFILE_PAGE_SIZE)
+            .take(PROFILE_PAGE_SIZE)
             .map(|candidate| {
                 let name = candidate.name;
                 let item = name.to_owned();
@@ -816,7 +810,7 @@ impl TerminalApp {
         }
         let choices = if matching.is_empty() {
             TextBlock::new()
-                .text(if draft.query.trim().is_empty() {
+                .text(if draft.filter.query().trim().is_empty() {
                     "Save a direct SSH profile to use it in a group."
                 } else {
                     "No SSH profiles match this search."
@@ -867,7 +861,7 @@ impl TerminalApp {
                         TextBox::new()
                             .automation_name("Find group profiles")
                             .placeholder_text("Filter by profile name or SSH address")
-                            .text(&draft.query)
+                            .text(draft.filter.query())
                             .on_text_changed(
                                 ctx.callback(move |query| action(DraftAction::Filter(query))),
                             ),

@@ -158,18 +158,54 @@ try {
     $origin = (Wait-Until 'the active Demo pane' {
         (Control @('list')).sessions | Where-Object active | Select-Object -First 1
     }).id
-    $groupReview = "Review SSH group${dot}Fleet Mixed"
-    Open-GroupCommandSearch 'review fleet mixed group'
+    $groupReview = "Review SSH group${dot}Fleet Lab"
+    Open-GroupCommandSearch 'review fleet lab group'
     Accept-GroupCommandWithEnter $groupReview
-    $null = Wait-Until 'the keyboard opens the group review' {
-        (Find-Element $groupReview) -and (Find-Element "0 to reuse${dot}2 to open")
+    $null = Wait-Until 'the keyboard opens the first page of a large review' {
+        (Find-Element $groupReview) -and (Find-Element "0 to reuse${dot}30 to open") -and
+            (Find-Element "30 matches${dot}Page 1 of 2")
     }
-    $null = Wait-CheckBox 'Include profile East' On
+    if (Find-Element 'Include profile North') { throw 'A second-page profile was shown on the first page' }
+    Click 'Next profiles'
+    $null = Wait-Until 'the last review page is available' { Find-Element "30 matches${dot}Page 2 of 2" }
     $null = Wait-CheckBox 'Include profile North' On
+    (Field 'Find launch profiles').SetValue('CATALOG-ONLY.TEST')
+    $null = Wait-Until 'a filter resets the page and preserves launch choices' {
+        (Find-Element "28 matches${dot}Page 1 of 2") -and (Find-Element "0 to reuse${dot}30 to open")
+    }
+    Click 'Include only matches'
+    $null = Wait-Until 'the scope includes matching hosts on both pages' {
+        Find-Element "0 to reuse${dot}28 to open${dot}2 skipped"
+    }
+    $eastQuery = "EAST 127.0.0.1:$($config.East.port)"
+    (Field 'Find launch profiles').SetValue($eastQuery)
+    $null = Wait-CheckBox 'Include profile East' Off
+    Click 'Include only matches'
+    $null = Wait-Until 'only the matching SSH address is offered' {
+        Find-Element "0 to reuse${dot}1 to open${dot}29 skipped"
+    }
+    Click 'Refresh review'
+    Expect-Field 'Find launch profiles' $eastQuery
+    $null = Wait-CheckBox 'Include profile East' On
+    (Field 'Find launch profiles').SetValue('NORTH')
+    $null = Wait-CheckBox 'Include profile North' Off
+    Click 'Include matches'
+    $null = Wait-Until 'adding matches preserves the hidden East choice' {
+        Find-Element "0 to reuse${dot}2 to open${dot}28 skipped"
+    }
+    Click 'Skip matches'
+    $null = Wait-CheckBox 'Include profile North' Off
+    (Field 'Find launch profiles').SetValue('no matching fixture address')
+    $null = Wait-Until 'an empty search keeps the earlier choice' {
+        $only = Find-Element 'Include only matches' $button
+        ($only -and !$only.Current.IsEnabled) -and
+            (Find-Element 'No SSH profiles match this search.') -and
+            (Find-Element "0 to reuse${dot}1 to open${dot}29 skipped")
+    }
     if (@((Control @('list')).sessions).Count -ne 1) { throw 'Opening the group review started an SSH session' }
     Click 'Cancel'
     Wait-Focus $origin
-    if (Find-Element "SSH group${dot}Fleet Mixed" $tabItem) { throw 'Cancelling left a draft group tab' }
+    if (Find-Element "SSH group${dot}Fleet Lab" $tabItem) { throw 'Cancelling left a draft group tab' }
 
     $eastTab = "SSH group${dot}Fleet East"
     $westTab = "SSH group${dot}Fleet West"
