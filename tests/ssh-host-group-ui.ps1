@@ -2188,7 +2188,19 @@ try {
     if ($trace.hresult -ge 0) {
         $null = Wait-Until 'recording selection was acknowledged' { Find-Element 'Selected in File Explorer' }
     }
-    Run-Palette 'Close tab    Ctrl+Shift+W' -Enter
+    # Explorer can activate asynchronously after Shell32 acknowledges the selection.
+    # Invoke the group tab's close button directly, then wait for the app to retire it.
+    $closeId = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'CloseButton')
+    $closeGroup = Wait-Until 'the SSH group tab close button' {
+        $tab = Find-Element 'SSH host group' ([System.Windows.Automation.ControlType]::TabItem)
+        if ($tab) { $tab.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $closeId) }
+    }
+    Invoke-Button $closeGroup
+    $null = Wait-Until "SSH group tab $groupTab to close" {
+        $owner = (Control @('list-ssh-groups')).windows | Where-Object window_id -eq $groupWindow
+        $owner -and ($groupTab -notin $owner.groups.tab_id)
+    }
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the saved alert remains available after closing the group tab' {
         $expiredNotice = $readOutputNotice.Replace("Run $burstRunId${dot}", "Run $burstRunId (results unavailable)${dot}")
