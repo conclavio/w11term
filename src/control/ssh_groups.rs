@@ -401,6 +401,23 @@ impl Registry {
         Ok(json!({ "pid": std::process::id(), "windows": windows }))
     }
 
+    pub(super) async fn ssh_group_retry_plan(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + TIMEOUT;
+        let (reply, response) = oneshot::channel();
+        self.window_ui(window)?(UiRequest::GetSshGroupRetryPlan {
+            tab_id: tab,
+            run_id: run,
+            reply,
+        });
+        let plan = receive(window, response, deadline).await?;
+        Ok(json!({ "window_id": window, "tab_id": tab, "run_id": run, "plan": plan }))
+    }
+
     pub(super) async fn query_ssh_group_run(
         &self,
         window: WindowId,
@@ -898,6 +915,14 @@ mod tests {
                     .send(Ok(json!({ "summary": { "run_id": run_id } })))
                     .unwrap();
             }
+            UiRequest::GetSshGroupRetryPlan {
+                tab_id,
+                run_id,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id), (9, 2));
+                reply.send(Ok(json!({"ready_pane_ids":[7]}))).unwrap();
+            }
             UiRequest::SshGroupQueue {
                 tab_id,
                 run_id,
@@ -983,6 +1008,10 @@ mod tests {
             ])
         );
         let lookup = second.query_ssh_group_run(3, 9, 2, None).await.unwrap();
+        assert_eq!(
+            second.ssh_group_retry_plan(3, 9, 2).await.unwrap(),
+            json!({ "window_id": 3, "tab_id": 9, "run_id": 2, "plan": {"ready_pane_ids":[7]} })
+        );
         let paused = second
             .change_ssh_group_queue(3, 9, 2, SshGroupQueueAction::Pause)
             .await

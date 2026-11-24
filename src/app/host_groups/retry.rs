@@ -1,4 +1,69 @@
 use super::*;
+use serde_json::{Value, json};
+
+impl TerminalApp {
+    pub(in crate::app) fn control_ssh_group_retry_plan(
+        &mut self,
+        tab: TabId,
+        run: u64,
+    ) -> Result<Value, String> {
+        let targets = self.host_group_targets();
+        let page = self
+            .host_group_by_id_mut(tab)
+            .ok_or_else(|| format!("unknown SSH group tab {tab} in this window"))?;
+        let roster = page
+            .scoped_targets(&targets)
+            .map(|target| (target.pane, target))
+            .collect();
+        let submission = self.control_group_run(tab, run)?;
+        submission.refresh_deliveries();
+        unsent_retry_plan(submission, &roster)
+    }
+}
+
+fn unsent_retry_plan(
+    submission: &Submission,
+    roster: &BTreeMap<u64, &Target>,
+) -> Result<Value, String> {
+    let command = submission
+        .content
+        .command()
+        .ok_or("This SSH group run did not submit a shell command")?;
+    let mut ready_pane_ids = Vec::new();
+    let mut recipients = Vec::new();
+    for delivery in &submission.results {
+        let DeliveryStatus::Rejected(reason) = &delivery.status else {
+            continue;
+        };
+        let original = &delivery.target;
+        let address = original.names.address();
+        let block_reason = match roster.get(&original.pane) {
+            None => Some("The pane is outside this group's current roster".into()),
+            Some(target) if target.names.address() != address => {
+                Some("The pane's SSH destination changed".into())
+            }
+            Some(target) if !target.state.is_ready() => Some(target.state.label()),
+            Some(_) => None,
+        };
+        let ready = block_reason.is_none();
+        if ready {
+            ready_pane_ids.push(original.pane);
+        }
+        recipients.push(json!({
+            "pane_id": original.pane,
+            "label": original.names.label,
+            "address": address,
+            "delivery_reason": reason,
+            "ready": ready,
+            "block_reason": block_reason,
+        }));
+    }
+    Ok(json!({
+        "command": command,
+        "recipients": recipients,
+        "ready_pane_ids": ready_pane_ids,
+    }))
+}
 
 fn retryable(delivery: &Delivery) -> bool {
     match delivery.status {
@@ -144,6 +209,51 @@ mod tests {
             duration: Duration::ZERO,
             output: GroupOutput::Unavailable("fixture"),
         }))
+    }
+
+    #[test]
+    fn unsent_retry_plan_excludes_uncertain_or_sent_commands_and_checks_live_destinations() {
+        let mut group = HostGroup::default();
+        let run = group.submit(
+            SubmissionContent::Command("show  status".into()),
+            vec![
+                delivery(
+                    target(1, "withheld"),
+                    DeliveryStatus::Rejected("stopped".into()),
+                    None,
+                ),
+                delivery(target(2, "unconfirmed"), DeliveryStatus::Unconfirmed, None),
+                delivery(
+                    target(3, "sent"),
+                    DeliveryStatus::Sent,
+                    Some(finished(Some(17))),
+                ),
+                delivery(target(4, "skipped"), DeliveryStatus::Skipped, None),
+                delivery(
+                    target(5, "closed"),
+                    DeliveryStatus::Rejected("closed".into()),
+                    None,
+                ),
+            ],
+            GroupTranscript::default(),
+        );
+        let mut changed = target(1, "withheld");
+        changed.names = filter::Names::new("withheld", "other.test", "ops", 22);
+        let plan = unsent_retry_plan(run, &BTreeMap::from([(1, &changed)])).unwrap();
+        assert_eq!(plan["command"], "show  status");
+        assert_eq!(plan["ready_pane_ids"], json!([]));
+        assert_eq!(plan["recipients"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["recipients"][0]["pane_id"], 1);
+        assert_eq!(plan["recipients"][0]["delivery_reason"], "stopped");
+        assert_eq!(
+            plan["recipients"][0]["block_reason"],
+            "The pane's SSH destination changed"
+        );
+        assert_eq!(plan["recipients"][1]["pane_id"], 5);
+        assert_eq!(
+            plan["recipients"][1]["block_reason"],
+            "The pane is outside this group's current roster"
+        );
     }
 
     #[test]

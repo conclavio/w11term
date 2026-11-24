@@ -189,6 +189,14 @@ try {
     if ($LASTEXITCODE -ne 2 -or !$strict.ok -or $strict.result.run.recipients[1].delivery.state -cne 'rejected') {
         throw 'A settled failure did not preserve the JSON report with exit code 2'
     }
+    $retryArgs = @('get-ssh-group-retry-plan','--window',"$groupWindow",'--tab',"$groupTab",'--run')
+    $blockedRetry = Control ($retryArgs + @('1'))
+    if ($blockedRetry.plan.recipients.Count -ne 1 -or
+        $blockedRetry.plan.recipients[0].pane_id -ne $panes.North -or $blockedRetry.plan.recipients[0].ready -or
+        !$blockedRetry.plan.recipients[0].block_reason -or $blockedRetry.plan.ready_pane_ids.Count -ne 0 -or
+        !(Find-Element 'No bells or notifications') -or [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
+        throw 'The retry plan included delivered hosts, lost the reason for blocking North, or changed focus'
+    }
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
     $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'North was tried before East despite the new roster sort' {
@@ -725,6 +733,14 @@ try {
     $readyForPolicy = @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
         '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
     $null = Control $readyForPolicy
+    $retry = Control ($retryArgs + @("$($stop.run_id)"))
+    if ($retry.run_id -ne $stop.run_id -or $retry.plan.command -cne 'policy-stop' -or
+        $retry.plan.recipients.Count -ne 1 -or ($retry.plan.ready_pane_ids -join ',') -cne "$($panes.East)" -or
+        !$retry.plan.recipients[0].ready -or $retry.plan.recipients[0].pane_id -ne $panes.East -or
+        $null -ne $retry.plan.recipients[0].block_reason -or
+        $retry.plan.recipients[0].delivery_reason -cne 'Queue stopped after an unsuccessful host.') {
+        throw 'The retry plan did not isolate the ready, unsent host from the sent failure'
+    }
     $keepGoing = Control ($serialArgs + @('--parallel','1','--on-failure','continue','--','policy-continue'))
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-continue')
     New-Item -ItemType File -Path (Join-Path $State 'release-policy-continue') | Out-Null

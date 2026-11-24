@@ -5419,6 +5419,15 @@ impl Component for TerminalApp {
                     }
                 }
             }
+            Message::Control(w11term::control::UiRequest::GetSshGroupRetryPlan {
+                tab_id,
+                run_id,
+                reply,
+            }) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(self.control_ssh_group_retry_plan(tab_id, run_id));
+                }
+            }
             Message::Control(w11term::control::UiRequest::SshGroupQueue {
                 tab_id,
                 run_id,

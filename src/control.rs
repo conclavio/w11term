@@ -136,6 +136,11 @@ pub enum Request {
         tab_id: u64,
         run_id: u64,
     },
+    GetSshGroupRetryPlan {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+    },
     SshGroupQueue {
         window_id: WindowId,
         tab_id: u64,
@@ -294,6 +299,11 @@ pub enum UiRequest {
         wait_for: Option<SshGroupRunWait>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    GetSshGroupRetryPlan {
+        tab_id: u64,
+        run_id: u64,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     SshGroupQueue {
         tab_id: u64,
         run_id: u64,
@@ -344,6 +354,7 @@ impl UiRequest {
             | Self::GetSshGroupRoster { reply, .. }
             | Self::SubmitSshGroupCommand { reply, .. }
             | Self::GetSshGroupRun { reply, .. }
+            | Self::GetSshGroupRetryPlan { reply, .. }
             | Self::SshGroupQueue { reply, .. }
             | Self::InterruptSshGroupCommand { reply, .. } => reply,
             Self::ReadSshGroupOutput { reply, .. } => {
@@ -658,6 +669,11 @@ impl Registry {
                 self.query_ssh_group_run(window_id, tab_id, run_id, None)
                     .await
             }
+            Request::GetSshGroupRetryPlan {
+                window_id,
+                tab_id,
+                run_id,
+            } => self.ssh_group_retry_plan(window_id, tab_id, run_id).await,
             Request::SshGroupQueue {
                 window_id,
                 tab_id,
