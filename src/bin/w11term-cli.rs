@@ -44,6 +44,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "open-ssh-group"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
+            | "ssh-group-queue"
             | "save-ssh-group-report"
             | "submit-ssh-group-command"
             | "wait-ssh-group-run"
@@ -292,6 +293,55 @@ mod tests {
         ] {
             assert!(submit(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn parses_explicit_ssh_group_queue_actions() {
+        let parse_queue = |action: &str| {
+            parse(
+                [
+                    "ssh-group-queue",
+                    "--window",
+                    "2",
+                    "--tab",
+                    "3",
+                    "--run",
+                    "4",
+                    action,
+                ]
+                .map(str::to_owned),
+            )
+        };
+        for action in ["pause", "resume", "stop"] {
+            let (_, request) = parse_queue(action).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                serde_json::json!({"verb":"ssh-group-queue","window_id":2,"tab_id":3,"run_id":4,"action":action})
+            );
+        }
+        assert!(parse_queue("cancel").is_err());
+        assert!(
+            parse(["ssh-group-queue", "--window", "2", "--tab", "3", "pause"].map(str::to_owned))
+                .is_err()
+        );
+        assert!(
+            parse(
+                [
+                    "ssh-group-queue",
+                    "--window",
+                    "2",
+                    "--tab",
+                    "3",
+                    "--run",
+                    "4",
+                    "--pane",
+                    "5",
+                    "pause"
+                ]
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
 
     #[test]

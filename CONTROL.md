@@ -305,6 +305,22 @@ output, use `get-command` with its `pane_id` and the
 `execution.command_id` and `execution.connection_generation` in the reply.
 The usual pane history retention rules apply.
 
+`ssh-group-queue --window ID --tab ID --run ID pause|resume|stop`
+controls unsent commands in a retained run. Pause holds further dispatch.
+Resume allows dispatch under the run's existing limits and prompt checks.
+Stop marks the remaining queued commands cancelled before sending.
+Commands already dispatched to an SSH pane continue through delivery
+and execution. Pause and resume require an
+ungated queue. Stop is available while a canary is pending. Actions on
+an expired queue or a run with no unsent commands return an error.
+
+The action returns the same detail reply as `get-ssh-group-run`. When a
+run uses a queue, the reply has a `queue` object with `unsent` and `state`.
+The state is `dispatching`, `paused`, `canary_running`, `canary_approval`, or
+`drained`. Drained means there are no unsent recipients. Check
+`queue_activity` and the recipient states for dispatch and cancellation
+outcomes. Queue actions work in a background tab or window.
+
 `save-ssh-group-report --window ID --tab ID --run ID [--format json|text] [--overwrite] [--] PATH`
 saves the same full-run report available from the group results view. JSON
 is the default. Both formats include all recipients, their current status,
@@ -398,6 +414,7 @@ w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --expect-output '^READY$' --regex --match-case -- "check-service"
 w11term-cli --pid 12345 submit-ssh-group-command --window 1 --tab 9 --pane 17 --pane 19 --record-output "service check.txt" -- "check-service"
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
+w11term-cli --pid 12345 ssh-group-queue --window 1 --tab 9 --run 3 pause
 w11term-cli --pid 12345 save-ssh-group-report --window 1 --tab 9 --run 3 "group report.json"
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 w11term-cli --pid 12345 wait-ssh-group-output --window 1 --tab 9 --run 3 --pane 17 --regex '^ready for traffic$'
@@ -419,6 +436,7 @@ Direct pipe clients use these JSON requests.
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","expect_output":{"query":"^READY$","regex":true,"match_case":true}}
 {"verb":"submit-ssh-group-command","window_id":1,"tab_id":9,"pane_ids":[17,19],"command":"check-service","record_output":"C:\\Reports\\service check.txt"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
+{"verb":"ssh-group-queue","window_id":1,"tab_id":9,"run_id":3,"action":"pause"}
 {"verb":"save-ssh-group-report","window_id":1,"tab_id":9,"run_id":3,"path":"C:\\Reports\\group report.json","format":"json","overwrite":false}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 {"verb":"wait-ssh-group-output","window_id":1,"tab_id":9,"run_id":3,"pane":17,"pattern":"^ready for traffic$","regex":true}

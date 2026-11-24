@@ -1,4 +1,6 @@
 use super::*;
+use serde_json::{Value, json};
+use w11term::control::SshGroupQueueAction;
 use w11term::events::{GroupQueueEventKind, GroupTranscriptHost};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,6 +275,23 @@ impl Drop for Waiting {
 }
 
 impl Submission {
+    pub(super) fn queue_snapshot(&self) -> Option<Value> {
+        let queue = self.command_queue.as_ref()?;
+        let unsent = self
+            .results
+            .iter()
+            .filter(|result| matches!(result.status, DeliveryStatus::Queued(_)))
+            .count();
+        let state = match (unsent, queue.canary, queue.paused) {
+            (0, _, _) => "drained",
+            (_, Some(CanaryGate::Pending(_)), _) => "canary_running",
+            (_, Some(CanaryGate::AwaitingApproval(_)), _) => "canary_approval",
+            (_, None, true) => "paused",
+            (_, None, false) => "dispatching",
+        };
+        Some(json!({ "state": state, "unsent": unsent }))
+    }
+
     pub(super) fn has_queue(&self) -> bool {
         self.results
             .iter()
@@ -298,6 +317,65 @@ impl Submission {
                 delivery.status = DeliveryStatus::Rejected(reason.into());
             }
         }
+    }
+
+    fn change_queue(&mut self, action: Action, now: Instant) -> Result<bool, &'static str> {
+        if !self.has_queue() {
+            return Err("This SSH group run has no unsent commands");
+        }
+        let Some(queue) = &mut self.command_queue else {
+            return Err("This SSH group run has no command queue");
+        };
+        if deadline_reached(queue.deadline, now) {
+            queue.notify_canary = false;
+            self.stop_queue(StopReason::Expired);
+            return Err("The SSH group command queue expired");
+        }
+        match action {
+            Action::Cancel => {
+                queue.notify_canary = false;
+                self.transcript
+                    .note_queue_activity(GroupQueueEventKind::Cancelled);
+                self.reject_queued_commands("Cancelled before sending.");
+            }
+            Action::CancelCanaryNotice => queue.notify_canary = false,
+            Action::SkipHost(pane) if !queue.is_canary(pane) => {
+                if let Some(delivery) = self
+                    .results
+                    .iter_mut()
+                    .find(|delivery| delivery.target.pane == pane)
+                    && let DeliveryStatus::Queued(waiting) = &mut delivery.status
+                    && let Some(host) = waiting.0.take()
+                {
+                    host.skip_queued();
+                    delivery.status = DeliveryStatus::Skipped;
+                    return Ok(true);
+                }
+            }
+            Action::SetPaused(_) if queue.canary.is_some() => {
+                return Err("Pause and resume are unavailable while the canary is pending");
+            }
+            Action::SetPaused(paused) if queue.paused != paused => {
+                queue.paused = paused;
+                let event = if paused {
+                    GroupQueueEventKind::Paused
+                } else {
+                    GroupQueueEventKind::Resumed
+                };
+                self.transcript.note_queue_activity(event);
+                return Ok(!paused);
+            }
+            Action::ApproveCanary
+                if matches!(queue.canary, Some(CanaryGate::AwaitingApproval(_))) =>
+            {
+                queue.canary = None;
+                self.transcript
+                    .note_queue_activity(GroupQueueEventKind::CanaryApproved);
+                return Ok(true);
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 }
 
@@ -471,64 +549,45 @@ impl TerminalApp {
             .and_then(|page| {
                 page.submissions
                     .iter_mut()
-                    .find(|submission| submission.id == run && submission.has_queue())
+                    .find(|submission| submission.id == run)
             })
         else {
             return;
         };
-        let Some(queue) = &mut submission.command_queue else {
-            return;
+        if submission.change_queue(action, Instant::now()) == Ok(true) {
+            self.poll_command_queues();
+        }
+    }
+
+    pub(in crate::app) fn control_ssh_group_queue(
+        &mut self,
+        id: TabId,
+        run: u64,
+        action: SshGroupQueueAction,
+    ) -> Result<Value, String> {
+        let action = match action {
+            SshGroupQueueAction::Pause => Action::SetPaused(true),
+            SshGroupQueueAction::Resume => Action::SetPaused(false),
+            SshGroupQueueAction::Stop => Action::Cancel,
         };
-        if deadline_reached(queue.deadline, Instant::now()) {
-            queue.notify_canary = false;
-            submission.stop_queue(StopReason::Expired);
-            return;
+        if self
+            .command_queue_run(id, run)?
+            .change_queue(action, Instant::now())?
+        {
+            self.poll_command_queues();
         }
-        match action {
-            Action::Cancel => {
-                queue.notify_canary = false;
-                submission
-                    .transcript
-                    .note_queue_activity(GroupQueueEventKind::Cancelled);
-                submission.reject_queued_commands("Cancelled before sending.");
-            }
-            Action::CancelCanaryNotice => queue.notify_canary = false,
-            Action::SkipHost(pane) if !queue.is_canary(pane) => {
-                if let Some(delivery) = submission
-                    .results
-                    .iter_mut()
-                    .find(|delivery| delivery.target.pane == pane)
-                    && let DeliveryStatus::Queued(waiting) = &mut delivery.status
-                    && let Some(host) = waiting.0.take()
-                {
-                    host.skip_queued();
-                    delivery.status = DeliveryStatus::Skipped;
-                    self.poll_command_queues();
-                }
-            }
-            Action::SetPaused(paused) if queue.canary.is_none() && queue.paused != paused => {
-                queue.paused = paused;
-                let event = if paused {
-                    GroupQueueEventKind::Paused
-                } else {
-                    GroupQueueEventKind::Resumed
-                };
-                submission.transcript.note_queue_activity(event);
-                if !paused {
-                    self.poll_command_queues();
-                }
-            }
-            Action::ApproveCanary
-                if matches!(queue.canary, Some(CanaryGate::AwaitingApproval(_))) =>
-            {
-                queue.canary = None;
-                submission
-                    .transcript
-                    .note_queue_activity(GroupQueueEventKind::CanaryApproved);
-                self.poll_command_queues();
-            }
-            _ => {}
-        }
+        let submission = self.command_queue_run(id, run)?;
+        submission.refresh_deliveries();
+        Ok(report::describe_run(submission, false).expect("an unfiltered run snapshot"))
+    }
+
+    fn command_queue_run(&mut self, id: TabId, run: u64) -> Result<&mut Submission, String> {
+        self.host_group_by_id_mut(id)
+            .ok_or_else(|| format!("unknown SSH group tab {id} in this window"))?
+            .submissions
+            .iter_mut()
+            .find(|submission| submission.id == run)
+            .ok_or_else(|| format!("SSH group run {run} is not retained in tab {id}"))
     }
 }
 

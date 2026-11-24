@@ -277,6 +277,9 @@ pub(in crate::app::host_groups) fn describe_run(
     if let Some(recording) = &submission.control_recording {
         run["recording"] = recording.snapshot();
     }
+    if let Some(queue) = submission.queue_snapshot() {
+        run["queue"] = queue;
+    }
     Some(run)
 }
 

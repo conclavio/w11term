@@ -123,6 +123,12 @@ pub enum Request {
         tab_id: u64,
         run_id: u64,
     },
+    SshGroupQueue {
+        window_id: WindowId,
+        tab_id: u64,
+        run_id: u64,
+        action: SshGroupQueueAction,
+    },
     SaveSshGroupReport {
         window_id: WindowId,
         tab_id: u64,
@@ -262,6 +268,12 @@ pub enum UiRequest {
         wait_for_settlement: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    SshGroupQueue {
+        tab_id: u64,
+        run_id: u64,
+        action: SshGroupQueueAction,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     CaptureSshGroupReport {
         tab_id: u64,
         run_id: u64,
@@ -299,7 +311,8 @@ impl UiRequest {
             | Self::OpenSshGroup { reply, .. }
             | Self::GetSshGroupRoster { reply, .. }
             | Self::SubmitSshGroupCommand { reply, .. }
-            | Self::GetSshGroupRun { reply, .. } => reply,
+            | Self::GetSshGroupRun { reply, .. }
+            | Self::SshGroupQueue { reply, .. } => reply,
             Self::ReadSshGroupOutput { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
                 return;
@@ -314,8 +327,8 @@ impl UiRequest {
 }
 
 pub use ssh_groups::{
-    SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput, SshGroupReadiness,
-    SshGroupReportFormat, SshGroupReportWriter,
+    SshGroupCommandOptions, SshGroupExpectedOutput, SshGroupOutput, SshGroupQueueAction,
+    SshGroupReadiness, SshGroupReportFormat, SshGroupReportWriter,
 };
 pub use ssh_groups::{validate_group_panes, validate_group_submission};
 type UiHandler = Arc<dyn Fn(UiRequest) + Send + Sync>;
@@ -609,6 +622,15 @@ impl Registry {
                 run_id,
             } => {
                 self.query_ssh_group_run(window_id, tab_id, run_id, None)
+                    .await
+            }
+            Request::SshGroupQueue {
+                window_id,
+                tab_id,
+                run_id,
+                action,
+            } => {
+                self.change_ssh_group_queue(window_id, tab_id, run_id, action)
                     .await
             }
             Request::SaveSshGroupReport {

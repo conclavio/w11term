@@ -40,6 +40,14 @@ pub enum SshGroupReadiness {
     Panes(Vec<u64>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshGroupQueueAction {
+    Pause,
+    Resume,
+    Stop,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SshGroupReportFormat {
@@ -145,6 +153,27 @@ pub fn validate_group_panes(pane_ids: &[u64]) -> Result<()> {
 }
 
 impl Registry {
+    pub(super) async fn change_ssh_group_queue(
+        &self,
+        window: WindowId,
+        tab: u64,
+        run: u64,
+        action: SshGroupQueueAction,
+    ) -> Result<Value> {
+        let ui = self.window_ui(window)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::SshGroupQueue {
+            tab_id: tab,
+            run_id: run,
+            action,
+            reply,
+        });
+        let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
+            bail!("SSH group queue action was not acknowledged. Check the run before retrying");
+        };
+        Ok(json!({ "window_id": window, "tab_id": tab, "run": run.map_err(anyhow::Error::msg)? }))
+    }
+
     pub(super) async fn save_ssh_group_report(
         &self,
         window: WindowId,
@@ -773,6 +802,17 @@ mod tests {
                     .send(Ok(json!({ "summary": { "run_id": run_id } })))
                     .unwrap();
             }
+            UiRequest::SshGroupQueue {
+                tab_id,
+                run_id,
+                action,
+                reply,
+            } => {
+                assert_eq!((tab_id, run_id, action), (9, 2, SshGroupQueueAction::Pause));
+                reply
+                    .send(Ok(json!({ "queue": {"state":"paused", "unsent":1} })))
+                    .unwrap();
+            }
             UiRequest::SubmitSshGroupCommand {
                 tab_id,
                 pane_ids,
@@ -821,6 +861,14 @@ mod tests {
             ])
         );
         let lookup = second.query_ssh_group_run(3, 9, 2, None).await.unwrap();
+        let paused = second
+            .change_ssh_group_queue(3, 9, 2, SshGroupQueueAction::Pause)
+            .await
+            .unwrap();
+        assert_eq!(
+            paused,
+            json!({"window_id":3, "tab_id":9, "run":{"queue":{"state":"paused","unsent":1}}})
+        );
         let opened = second.open_ssh_group(3, "East Fleet".into()).await.unwrap();
         assert_eq!(opened, json!({ "window_id": 3, "tab_id": 10 }));
         let saved = second.list_saved_ssh_groups(3).await.unwrap();

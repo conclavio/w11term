@@ -37,6 +37,9 @@ function Set-Command([string]$Command) {
 function Run-Snapshot([uint64]$Run) {
     Control @('get-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$Run")
 }
+function Queue-Action([uint64]$Run, [string]$Action) {
+    Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$Run",$Action)
+}
 function Select-GroupOption([string]$Name, [string]$Label) {
     $combo = [System.Windows.Automation.ControlType]::ComboBox
     $listItem = [System.Windows.Automation.ControlType]::ListItem
@@ -210,7 +213,14 @@ try {
     $dialog = Wait-Until 'output recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the bounded recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started keep-first')
-    Click 'Cancel queued commands'
+    $stopped = (Queue-Action 2 'stop').run
+    $kept = $stopped.recipients | Where-Object pane_id -eq $panes.West
+    $withheld = $stopped.recipients | Where-Object pane_id -eq $panes.East
+    if ($stopped.queue.state -cne 'drained' -or $stopped.queue.unsent -ne 0 -or
+        $kept.execution.state -cne 'running' -or $withheld.delivery.state -cne 'rejected' -or
+        $withheld.delivery.reason -cne 'Cancelled before sending.') {
+        throw 'Stopping the CLI queue did not withhold the unsent host and leave the running host alone'
+    }
     $null = Wait-Until 'East was canceled before sending' {
         Find-Element "$($labels.East)${dot}Not sent${dot}Cancelled before sending."
     }
@@ -249,25 +259,35 @@ try {
     Set-Command 'inspect'
     Click 'Send to 2 hosts'
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started inspect')
-    Click 'Pause queue'
-    $null = Wait-Until 'the next run is paused' { Find-Element 'Command queue paused' }
     Click 'Attention inbox, 0 unread'
-    $null = Wait-Until 'the paused group is in the background' { Find-Element 'No bells or notifications' }
+    $null = Wait-Until 'the queue is controlled from the background' { Find-Element 'No bells or notifications' }
+    $queueFocus = [FixtureMessages]::GetForegroundWindow()
+    $paused = (Queue-Action 4 'pause').run
+    $pausedAgain = (Queue-Action 4 'pause').run
+    if ($paused.queue.state -cne 'paused' -or $paused.queue.unsent -ne 1 -or
+        $pausedAgain.queue_activity.events.Count -ne $paused.queue_activity.events.Count) {
+        throw 'The background queue did not pause or logged a duplicate pause'
+    }
     New-Item -ItemType File -Path (Join-Path $State 'release-inspect') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West finished inspect')
-    $tab = Wait-Until 'the group tab after pausing' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
-    $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'the queue remains paused with a free slot' {
-        (Find-Element 'Command queue paused') -and (Find-Element "$($labels.West)${dot}Exit 0") -and
-            (Find-Element "$($labels.East)${dot}Queued")
+        $run = (Run-Snapshot 4).run
+        $first = $run.recipients | Where-Object pane_id -eq $panes.West
+        $next = $run.recipients | Where-Object pane_id -eq $panes.East
+        $run.queue.state -ceq 'paused' -and $first.execution.exit_code -eq 0 -and $next.delivery.state -ceq 'queued'
     }
     New-Item -ItemType File -Path (Join-Path $State 'resume-inspect') | Out-Null
-    Click 'Resume queue'
-    $null = Wait-Until 'the queue resumed' { !(Find-Element 'Command queue paused') }
+    $resumed = (Queue-Action 4 'resume').run
+    if ($resumed.queue.state -ceq 'paused' -or
+        [FixtureMessages]::GetForegroundWindow() -ne $queueFocus -or !(Find-Element 'No bells or notifications')) {
+        throw 'Resuming the queue changed focus or left it paused'
+    }
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
+    $tab = Wait-Until 'the group tab after resuming' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
+    $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'East was sent the resumed command' {
         Find-Element "$($labels.East)${dot}Sent to SSH channel"
     }
-    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished inspect')
     Click 'Show queue activity'
     $null = Wait-Until 'the completed run retains pause and resume events' {
         (Find-Element 'Paused queue') -and (Find-Element 'Resumed queue')
@@ -295,6 +315,10 @@ try {
     $dialog = Wait-Until 'canary recording dialog' { Find-OwnedDialog 'Record SSH group output' }
     $null = Wait-Until 'start the canary recording' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started canary-ok')
+    $blocked = & $Cli --pid $app.Id ssh-group-queue --window $groupWindow --tab $groupTab --run 5 resume | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $blocked.ok -or $blocked.error -notlike '*while the canary is pending*') {
+        throw 'Resuming a command queue bypassed its canary gate'
+    }
     $null = Wait-Until 'only East runs before a canary result' {
         (Find-Element "$($labels.West)${dot}Queued") -and
             (Find-Element "$($labels.East)${dot}Waiting for the canary result") -and
