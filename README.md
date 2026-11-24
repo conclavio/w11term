@@ -139,6 +139,8 @@ Text and JSON reports include the known per-host times when you open the Save di
 
 Choose **Compare results…** to group the viewed submission by exact captured output and verified exit code. Smaller groups appear first. Each distinct result shows its hosts, an output preview, and where its output first differs from the largest group. If sizes tie, the earliest group in the submission is the reference. Running commands, unverified exits, and results with only a truncated preview are listed separately. Use **Refresh comparison** to include results that arrived after opening the view.
 
+Choose **View differences** on a result to see added and removed lines against the reference group with original line numbers and both exit codes. Large differences show a bounded excerpt. Use **View full output** from the comparison to inspect a longer result in its command history.
+
 Choose **Prepare follow-up** on a result group to return to the roster with the original command in the editor and that group’s visible, matching panes checked. The button shows how many hosts are in scope when the roster excludes some members. Edit the draft if needed, then use **Send to _n_ hosts** when the intended shells are ready. **Restore draft** brings back the previous draft, roster filter, and checked hosts.
 
 While viewing a submission, choose **Interrupt selected** to send Ctrl+C to its selected hosts that still report the matching command as running. The result shows Ctrl+C delivery and the command’s eventual exit status separately. w11term uses each pane’s current keyboard mode.

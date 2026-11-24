@@ -40,6 +40,7 @@ impl Section {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Output {
     result: Arc<GroupCommandResult>,
     retained: Option<Arc<CompletedCommand>>,
