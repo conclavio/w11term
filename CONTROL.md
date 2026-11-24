@@ -201,6 +201,14 @@ checked hosts meet the group's `require_all_ready` prompt rule. The Send
 button also depends on the current draft and review.
 The query leaves the group's selection and window focus in place.
 
+`wait-ssh-group-ready --window ID --tab ID [--timeout SECONDS]` returns the
+same roster snapshot when every initially checked, shown host has a verified
+prompt. It always requires all of those hosts, including when partial sends
+are enabled for the group. Use a roster filter that keeps the intended hosts
+shown as their state changes. A changed checked-and-shown set, empty scope,
+closed tab, or timeout returns an error. The wait defaults to 30 seconds and
+accepts 1 through 3600. It can complete with the roster in the background.
+
 Each run summary has `run_id`, `label`, `kind` (`command` or `environment`),
 `recipient_count`, `settled_count`, and `outcomes` counts for `waiting`,
 `running`, `succeeded`, `attention`, and `skipped`. Both commands can read a
@@ -231,6 +239,7 @@ leaves the original run in progress.
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
 w11term-cli --pid 12345 get-ssh-group-roster --window 1 --tab 9
+w11term-cli --pid 12345 wait-ssh-group-ready --window 1 --tab 9 --timeout 60
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
 w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 ```
@@ -240,6 +249,7 @@ Direct pipe clients use these JSON requests.
 ```json
 {"verb":"list-ssh-groups"}
 {"verb":"get-ssh-group-roster","window_id":1,"tab_id":9}
+{"verb":"wait-ssh-group-ready","window_id":1,"tab_id":9,"timeout_seconds":60}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
 {"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 ```

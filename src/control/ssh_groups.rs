@@ -2,11 +2,34 @@ use super::*;
 use tokio::time::Instant;
 
 impl Registry {
-    pub(super) async fn get_ssh_group_roster(&self, window: WindowId, tab: u64) -> Result<Value> {
-        let deadline = Instant::now() + TIMEOUT;
+    pub(super) async fn query_ssh_group_roster(
+        &self,
+        window: WindowId,
+        tab: u64,
+        wait_for: Option<Duration>,
+    ) -> Result<Value> {
+        let deadline = Instant::now() + wait_for.unwrap_or(TIMEOUT);
         let (reply, response) = oneshot::channel();
-        self.window_ui(window)?(UiRequest::GetSshGroupRoster { tab_id: tab, reply });
-        let roster = receive(window, response, deadline).await?;
+        self.window_ui(window)?(UiRequest::GetSshGroupRoster {
+            tab_id: tab,
+            wait_for_readiness: wait_for.is_some(),
+            reply,
+        });
+        let roster = if wait_for.is_some() {
+            tokio::time::timeout_at(deadline, response)
+                .await
+                .context(
+                    "wait-ssh-group-ready timed out before all checked, shown hosts were ready",
+                )?
+                .with_context(|| {
+                    format!(
+                        "SSH group tab {tab} in window {window} closed during the readiness wait"
+                    )
+                })?
+                .map_err(anyhow::Error::msg)?
+        } else {
+            receive(window, response, deadline).await?
+        };
         Ok(json!({ "window_id": window, "tab_id": tab, "roster": roster }))
     }
 
@@ -132,8 +155,13 @@ mod tests {
                     .send(Ok(json!({ "summary": { "run_id": run_id } })))
                     .unwrap();
             }
-            UiRequest::GetSshGroupRoster { tab_id, reply } => {
+            UiRequest::GetSshGroupRoster {
+                tab_id,
+                wait_for_readiness,
+                reply,
+            } => {
                 assert_eq!(tab_id, 9);
+                assert!(!wait_for_readiness);
                 reply
                     .send(Ok(json!({ "hosts": [{ "pane_id": 7 }] })))
                     .unwrap();
@@ -158,7 +186,7 @@ mod tests {
             json!({ "window_id": 3, "tab_id": 9, "run": { "summary": { "run_id": 2 } } })
         );
         assert_eq!(
-            second.get_ssh_group_roster(3, 9).await.unwrap(),
+            second.query_ssh_group_roster(3, 9, None).await.unwrap(),
             json!({ "window_id": 3, "tab_id": 9, "roster": { "hosts": [{ "pane_id": 7 }] } })
         );
         first.unregister().unwrap();

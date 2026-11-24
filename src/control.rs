@@ -92,6 +92,12 @@ pub enum Request {
         window_id: WindowId,
         tab_id: u64,
     },
+    WaitSshGroupReady {
+        window_id: WindowId,
+        tab_id: u64,
+        #[serde(default = "default_wait_timeout")]
+        timeout_seconds: u64,
+    },
     GetSshGroupRun {
         window_id: WindowId,
         tab_id: u64,
@@ -165,6 +171,7 @@ pub enum UiRequest {
     },
     GetSshGroupRoster {
         tab_id: u64,
+        wait_for_readiness: bool,
         reply: oneshot::Sender<Result<Value, String>>,
     },
     GetSshGroupRun {
@@ -454,7 +461,23 @@ impl Registry {
             Request::WorkspaceWindows { key } => Ok(json!(self.workspace_windows(&key))),
             Request::ListSshGroups => self.list_ssh_groups().await,
             Request::GetSshGroupRoster { window_id, tab_id } => {
-                self.get_ssh_group_roster(window_id, tab_id).await
+                self.query_ssh_group_roster(window_id, tab_id, None).await
+            }
+            Request::WaitSshGroupReady {
+                window_id,
+                tab_id,
+                timeout_seconds,
+            } => {
+                ensure!(
+                    (1..=3600).contains(&timeout_seconds),
+                    "SSH group wait timeout must be 1..=3600 seconds"
+                );
+                self.query_ssh_group_roster(
+                    window_id,
+                    tab_id,
+                    Some(Duration::from_secs(timeout_seconds)),
+                )
+                .await
             }
             Request::GetSshGroupRun {
                 window_id,
@@ -823,6 +846,7 @@ async fn serve(
                     r,
                     Request::WaitForText { .. }
                         | Request::WaitSshGroupRun { .. }
+                        | Request::WaitSshGroupReady { .. }
                         | Request::Events {
                             timeout_seconds: 1..,
                             ..
@@ -1081,6 +1105,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
                 timeout_seconds, ..
             }
             | Request::WaitSshGroupRun {
+                timeout_seconds, ..
+            }
+            | Request::WaitSshGroupReady {
                 timeout_seconds, ..
             }
             | Request::Events {

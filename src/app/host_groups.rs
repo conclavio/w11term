@@ -61,6 +61,7 @@ pub(super) struct HostGroup {
     saved: Box<saved::SavedUi>,
     roster: Option<Box<MemberRoster>>,
     selected: BTreeSet<u64>,
+    ready_waiters: Vec<control_api::ReadinessWait>,
     filter: filter::Filter,
     roster_preferences: SshRosterDefaults,
     login_queue: Option<(usize, Arc<Semaphore>)>,
@@ -136,7 +137,7 @@ struct Submission {
     command_queue: Option<command_queue::Queue>,
     dispatch_policy: Option<dispatch_policy::Policy>,
     show_queue_activity: bool,
-    control_waiters: Vec<control_api::RunReply>,
+    control_waiters: Vec<control_api::ControlReply>,
 }
 
 #[derive(Clone)]
@@ -883,9 +884,10 @@ impl TerminalApp {
             Some(Page::HostGroup(_))
         ) || self.tabs.entries().iter().any(|entry| {
             matches!(&entry.value.page, Page::HostGroup(page)
-            if page.connection_notice.is_armed() || page.submissions.iter().any(|run| {
-                run.has_queue() || !run.control_waiters.is_empty()
-            }))
+            if page.connection_notice.is_armed() || !page.ready_waiters.is_empty()
+                || page.submissions.iter().any(|run| {
+                    run.has_queue() || !run.control_waiters.is_empty()
+                }))
         }) {
             if self.host_group_timer.is_none() {
                 let sender = ctx.sender();
@@ -1283,6 +1285,7 @@ impl TerminalApp {
                 self.poll_connection_notices();
                 self.poll_command_queues();
                 self.poll_ssh_group_waiters();
+                self.poll_ssh_group_ready_waiters();
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
                     Some(Page::HostGroup(_))

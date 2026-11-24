@@ -40,6 +40,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
             | "wait-ssh-group-run"
+            | "wait-ssh-group-ready"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -192,6 +193,27 @@ mod tests {
             )
         ));
         assert!(matches!(
+            parse_line("wait-ssh-group-ready --window 11 --tab 12 --timeout 4").unwrap(),
+            (
+                None,
+                Request::WaitSshGroupReady {
+                    window_id: 11,
+                    tab_id: 12,
+                    timeout_seconds: 4
+                }
+            )
+        ));
+        assert!(matches!(
+            parse_line("wait-ssh-group-ready --window 11 --tab 12").unwrap(),
+            (
+                None,
+                Request::WaitSshGroupReady {
+                    timeout_seconds: 30,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
             parse_line("wait-ssh-group-run --window 11 --tab 12 --run 4 --timeout 7").unwrap(),
             (
                 None,
@@ -230,6 +252,9 @@ mod tests {
             "get-ssh-group-roster --tab 2",
             "get-ssh-group-roster --window 2 --tab 3 --run 1",
             "get-ssh-group-roster --window 2 --tab 3 --pane 1",
+            "wait-ssh-group-ready --window 2 --tab 3 --run 1",
+            "wait-ssh-group-ready --window 2 --tab 3 --timeout 0",
+            "wait-ssh-group-ready --window 2 --tab 3 --timeout 3601",
             "get-ssh-group-run --window 2 --tab 3",
             "get-ssh-group-run --window 2 --tab 0 --run 4",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --run 5",

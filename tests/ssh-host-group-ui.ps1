@@ -174,6 +174,7 @@ function Wait-RecordingStatus([string]$Prefix, [string]$Path, [switch]$PassThru)
 $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+$readyJob = $null
 $logReader = $null
 $explorer = $null
 $priorExplorerWindows = @()
@@ -198,6 +199,7 @@ try {
     $groupWindow = $owner.window_id
     $groupTab = ($owner.groups | Where-Object label -ceq 'SSH host group').tab_id
     if (!$groupWindow -or !$groupTab) { throw 'The CLI did not list the active SSH group' }
+    $readyArgs = @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab")
     $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Connecting'
     $null = Wait-Until 'the connecting filter isolates West during its shell request' {
@@ -227,6 +229,10 @@ try {
     $null = Wait-Until 'an empty filter result cannot send' {
         $entry = Find-Element 'Send to 0 hosts' $button
         $entry -and !$entry.Current.IsEnabled
+    }
+    $emptyWait = & $Cli --pid $app.Id @readyArgs --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $emptyWait.ok -or $emptyWait.error -notlike 'No checked, shown*') {
+        throw 'The readiness wait accepted an empty host scope'
     }
     $eastAddress = "EaST 127.0.0.1:$($profileData.East.port)"
     Set-HostFilter $eastAddress
@@ -877,8 +883,37 @@ try {
         $send = Find-Element 'Send to 1 host' $button
         $send -and !$send.Current.IsEnabled -and !(Find-Element "Focus pane $east" $button)
     }
-    Select-ComboValue $hostStateFilter 'Ready'
+    Select-ComboValue $hostStateFilter 'All host states'
+    $roster = Roster-Snapshot
+    if ($roster.require_all_ready -or !$roster.selection_ready -or $roster.counts.ready_checked_shown -ne 1 -or
+        $roster.counts.checked_shown -ne 2) {
+        throw 'Expected the normal send policy to allow East while West was still unavailable'
+    }
+    $readyTimeout = & $Cli --pid $app.Id @readyArgs --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $readyTimeout.ok -or $readyTimeout.error -notlike '*timed out before all*') {
+        throw 'The readiness wait did not require both shown checked hosts'
+    }
+    $readyOutput = Join-Path $State 'wait-group-ready.json'
+    $readyJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $readyArgs + @('--timeout','15')) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $readyOutput
+    Click 'Attention inbox, 0 unread'
+    $null = Wait-Until 'Attention view before releasing the West prompt' {
+        Find-Element 'Attention inbox' ([System.Windows.Automation.ControlType]::Text)
+    }
+    $readyFocus = [FixtureMessages]::GetForegroundWindow()
+    if ($readyJob.HasExited) { throw 'The readiness wait ended while West was in the alternate screen' }
     Send-Raw $west 'prompt'
+    if (!$readyJob.WaitForExit(10000)) { throw 'The readiness wait did not finish while the group was in the background' }
+    $readyReply = [IO.File]::ReadAllText($readyOutput) | ConvertFrom-Json
+    $readyRoster = $readyReply.result.roster
+    if (!$readyReply.ok -or $readyRoster.counts.checked_shown -ne 2 -or
+        $readyRoster.counts.ready_checked_shown -ne 2 -or
+        [FixtureMessages]::GetForegroundWindow() -ne $readyFocus -or
+        !(Find-Element 'Attention inbox' ([System.Windows.Automation.ControlType]::Text))) {
+        throw "The readiness wait lost its original host scope or changed focus: $($readyReply.error)"
+    }
+    Run-Palette 'SSH host group'
+    Select-ComboValue $hostStateFilter 'Ready'
     Pane-Status $west "Connected${dot}Ready"
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
@@ -1356,6 +1391,10 @@ try {
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
+    if ($readyJob) {
+        if (!$readyJob.HasExited) { $readyJob.Kill(); $readyJob.WaitForExit() }
+        $readyJob.Dispose()
+    }
     if ($logReader) { $logReader.Dispose() }
     if ($explorer) {
         foreach ($item in @($explorer.Windows())) {
