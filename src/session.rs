@@ -679,7 +679,7 @@ async fn run(
         launch::Launcher::new(source.clone(), sharing, prompts.clone(), events.clone());
     let mut launch_id = 1u64;
     let mut phase = Phase::Running;
-    let mut ssh_failure = None;
+    let mut ssh_exit = None;
     let mut queued_before_connection = 0usize;
     let mut show_progress = interactive;
     let endpoint = match &source {
@@ -840,10 +840,11 @@ async fn run(
         if phase == Phase::PublishingExit {
             phase = Phase::Exited;
             if is_ssh {
-                events.set_ssh_connection_phase(ssh_failure.take().map_or(
-                    crate::events::SshConnectionPhase::Disconnected,
-                    crate::events::SshConnectionPhase::Failed,
-                ));
+                events.set_ssh_connection_phase(
+                    ssh_exit
+                        .take()
+                        .unwrap_or(crate::events::SshConnectionPhase::Disconnected),
+                );
             }
             if restartable {
                 events.pane_exited(launch_id);
@@ -1448,7 +1449,9 @@ async fn run(
                     if let Some(Err(error)) = joined {
                         status = format!("Terminal transport failed: {error}");
                         if is_ssh {
-                            ssh_failure = Some(crate::events::display_field(&status).into());
+                            ssh_exit = Some(crate::events::SshConnectionPhase::Failed(
+                                crate::events::display_field(&status).into(),
+                            ));
                         }
                     }
                     // A peer that exits halfway through a synchronized update
@@ -1494,9 +1497,15 @@ async fn run(
                             });
                         }
                         ssh::Event::ConnectionFailed(reason) => {
-                            ssh_failure = Some(crate::events::display_field(&reason).into());
+                            ssh_exit = Some(crate::events::SshConnectionPhase::Failed(
+                                crate::events::display_field(&reason).into(),
+                            ));
                             status = format!("SSH: {reason}");
                             log::info!("{status}");
+                        }
+                        ssh::Event::ConnectionStopped => {
+                            ssh_exit = Some(crate::events::SshConnectionPhase::Stopped);
+                            status = "SSH connection attempt stopped".into();
                         }
                         ssh::Event::Data(bytes) => {
                             if observed.receiver_count() > 0 {

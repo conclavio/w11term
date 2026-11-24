@@ -6,6 +6,7 @@ pub enum RosterCommand {
     Copy(BTreeSet<u64>),
     OpenPrompt { pane: u64, prompt: u64 },
     Reconnect(Vec<ExitedPane>),
+    StopPending(Vec<reconnect::Attempt>),
     ReviewDisconnect(Vec<disconnect::Recipient>),
 }
 
@@ -16,6 +17,7 @@ impl RosterCommand {
             Self::Copy(_) => "Copy shown SSH roster",
             Self::OpenPrompt { .. } => "Open next SSH sign-in or host-key prompt",
             Self::Reconnect(_) => "Reconnect selected SSH hosts",
+            Self::StopPending(_) => "Stop pending SSH connections",
             Self::ReviewDisconnect(_) => "Review disconnect for selected SSH hosts",
         }
     }
@@ -28,6 +30,7 @@ impl RosterCommand {
             Self::Reconnect(exits) => {
                 Action::Reconnect(group, reconnect::Request::Selection(exits))
             }
+            Self::StopPending(attempts) => Action::StopPending(group, attempts),
             Self::ReviewDisconnect(recipients) => {
                 Action::Disconnect(group, disconnect::Action::Review(recipients))
             }
@@ -52,6 +55,10 @@ impl TerminalApp {
         let exits = reconnect::selected_exits(page, &shown);
         if !exits.is_empty() {
             commands.push(RosterCommand::Reconnect(exits));
+        }
+        let pending = self.pending_attempts(page, &shown);
+        if !pending.is_empty() {
+            commands.push(RosterCommand::StopPending(pending));
         }
         if page.disconnect.can_review() {
             let recipients = self.disconnect_recipients(

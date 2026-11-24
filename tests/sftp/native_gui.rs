@@ -1089,6 +1089,58 @@ async fn native_ssh_host_group_opens_filtered_authentication_prompts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "stops selected pending SSH attempts from the Windows roster"]
+async fn native_ssh_host_group_stops_selected_pending_attempts() {
+    let state = tempfile::tempdir().unwrap();
+    let mut profiles = serde_json::Map::new();
+    let mut peers = Vec::new();
+    for (name, attempts, pending) in [
+        ("Pending East", 2, true),
+        ("Pending West", 1, true),
+        ("Live shell", 1, false),
+    ] {
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (Source::Ssh(mut ssh), root, opens, server) =
+            fixture_counting_accepts(false, attempts + 1, accepted.clone()).await
+        else {
+            unreachable!()
+        };
+        if name == "Pending East" {
+            ssh.authentication = Authentication::Password;
+        } else if name == "Pending West" {
+            ssh.host_key = None;
+            ssh.host_key_alias = Some(format!(
+                "w11term-stop-{}.invalid",
+                state.path().file_name().unwrap().to_string_lossy()
+            ));
+        }
+        ssh.player.reconnect = true;
+        profiles.insert(name.into(), serde_json::to_value(ssh).unwrap());
+        peers.push((name, attempts, pending, accepted, root, opens, server));
+    }
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": profiles,
+            "ssh_host_groups": {"Stop attempts": ["Pending East", "Pending West", "Live shell"]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("ssh-host-group-stop-ui.ps1", state.path());
+    for (name, attempts, pending, accepted, _root, opens, server) in peers {
+        assert_eq!(accepted.load(Ordering::Relaxed), attempts, "{name}");
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            usize::from(!pending),
+            "{name}"
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reviews and disconnects selected SSH shells in a Windows roster"]
 async fn native_ssh_host_group_disconnects_reviewed_shells_and_keeps_panes() {
     let state = tempfile::tempdir().unwrap();

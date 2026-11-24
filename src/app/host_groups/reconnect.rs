@@ -1,4 +1,11 @@
 use super::*;
+use w11term::events::PendingSshAttempt;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attempt {
+    pane: u64,
+    token: PendingSshAttempt,
+}
 
 pub enum Request {
     Host(ExitedPane),
@@ -25,13 +32,66 @@ impl TargetState {
     fn exit(self) -> Option<ExitedPane> {
         match self {
             Self::Restartable(exit) => Some(exit),
-            Self::Failed(exit) => exit,
+            Self::Failed(exit) | Self::Stopped(exit) => exit,
             _ => None,
         }
     }
 }
 
 impl TerminalApp {
+    pub(super) fn pending_attempts(&self, page: &HostGroup, shown: &[&Target]) -> Vec<Attempt> {
+        shown
+            .iter()
+            .filter(|target| !target.connected && page.selected.contains(&target.pane))
+            .filter_map(|target| {
+                let session = self.direct_ssh_session(target.pane)?;
+                Some(Attempt {
+                    pane: target.pane,
+                    token: session.events.pending_ssh_attempt()?,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn stop_pending_host_group(&mut self, id: TabId, offered: &[Attempt]) {
+        if offered.is_empty() || self.host_group_command_target() != Some(id) {
+            return;
+        }
+        let Some(Page::HostGroup(page)) = self.tabs.get(id).map(|entry| &entry.page) else {
+            return;
+        };
+        let roster = self.host_group_targets();
+        let pending = self
+            .pending_attempts(page, &page.shown(&roster).collect::<Vec<_>>())
+            .into_iter()
+            .map(|attempt| (attempt.pane, attempt.token))
+            .collect::<BTreeMap<_, _>>();
+        let stopped = offered
+            .iter()
+            .filter(|attempt| {
+                pending.get(&attempt.pane) == Some(&attempt.token)
+                    && self
+                        .direct_ssh_session(attempt.pane)
+                        .is_some_and(|session| session.events.cancel_ssh_attempt(attempt.token))
+            })
+            .count();
+        let skipped = offered.len() - stopped;
+        let mut feedback = Vec::new();
+        if stopped > 0 {
+            feedback.push(format!("Stop requested for {}.", host_count(stopped)));
+        }
+        if skipped > 0 {
+            feedback.push(format!(
+                "{} changed before the stop request.",
+                host_count(skipped)
+            ));
+        }
+        if let Some(page) = self.host_group_mut(id) {
+            page.reconnect_feedback = feedback.join(" ");
+        }
+        self.refresh_open_commands();
+    }
+
     pub(super) fn reconnect_host_group(&mut self, id: TabId, request: Request) {
         if self.host_group_command_target() != Some(id) || request.exits().is_empty() {
             return;
@@ -103,10 +163,11 @@ pub(super) fn selection_controls(
     id: TabId,
     page: &HostGroup,
     shown: &[&Target],
+    pending: Vec<Attempt>,
     ctx: &ViewContext<TerminalApp>,
 ) -> View {
     let visible_exit = shown.iter().any(|target| target.state.exit().is_some());
-    if !visible_exit && page.reconnect_feedback.is_empty() {
+    if !visible_exit && pending.is_empty() && page.reconnect_feedback.is_empty() {
         return View::empty();
     }
     let exits = selected_exits(page, shown);
@@ -134,7 +195,24 @@ pub(super) fn selection_controls(
             .text_wrapping(TextWrapping::Wrap)
             .into()
     };
-    StackPanel::new().spacing(4.0).children((button, feedback))
+    let stop = if pending.is_empty() {
+        View::empty()
+    } else {
+        let count = pending.len();
+        Button::new()
+            .automation_name("Stop selected SSH attempts")
+            .on_click(
+                ctx.callback(move |_| Message::HostGroup(Action::StopPending(id, pending.clone()))),
+            )
+            .content(format!("Stop selected SSH attempts ({count})"))
+    };
+    StackPanel::new().spacing(4.0).children((
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((button, stop)),
+        feedback,
+    ))
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use super::durability::{LifecycleError, Program};
 use super::game_resume;
 use super::sharing::{ConnectionShare, ShareSlot, Sharing, ShellChannel};
 use crate::{
-    events::Events,
+    events::{AttemptGuard, Events},
     options::{Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
@@ -13,7 +13,7 @@ use russh::{
     keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
 use std::{sync::Arc, time::Duration};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use wezterm_term::TerminalSize;
 use zeroize::Zeroizing;
 
@@ -29,6 +29,7 @@ pub enum Event {
     Reconnecting(u32),
     /// Final SSH failure from the transport launcher.
     ConnectionFailed(String),
+    ConnectionStopped,
     /// Ordered after the last bytes from this generation and before any retry.
     Disconnected,
 }
@@ -42,6 +43,52 @@ impl std::fmt::Display for Permanent {
 impl std::error::Error for Permanent {}
 fn stop(message: impl Into<String>) -> anyhow::Error {
     Permanent(message.into()).into()
+}
+
+#[derive(Debug)]
+pub(crate) struct AttemptStopped;
+
+impl std::fmt::Display for AttemptStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SSH connection attempt stopped")
+    }
+}
+
+impl std::error::Error for AttemptStopped {}
+
+#[derive(Default)]
+struct PendingAttempt {
+    guard: Option<AttemptGuard>,
+    cancelled: Option<oneshot::Receiver<()>>,
+}
+
+impl PendingAttempt {
+    fn begin(&mut self, events: &Events) {
+        let (guard, cancelled) = events.begin_ssh_attempt();
+        self.guard = Some(guard);
+        self.cancelled = Some(cancelled);
+    }
+
+    fn finish(guard: &mut Option<AttemptGuard>) -> Result<()> {
+        if let Some(guard) = guard.take()
+            && !guard.finish()
+        {
+            return Err(AttemptStopped.into());
+        }
+        Ok(())
+    }
+
+    async fn wait_for_stop(cancelled: &mut Option<oneshot::Receiver<()>>) {
+        if let Some(receiver) = cancelled {
+            let result = receiver.await;
+            *cancelled = None;
+            if result.is_ok() {
+                return;
+            }
+        }
+        // The sender also closes when the attempt becomes an established shell.
+        std::future::pending().await
+    }
 }
 pub(crate) struct Handler {
     options: SshOptions,
@@ -659,6 +706,29 @@ impl Driver {
 
     pub(super) async fn run(&mut self, program: &Program) -> Result<()> {
         program.validate_target(&self.options)?;
+        let can_stop = matches!(program, Program::Shell(None))
+            && !self.options.durable
+            && !self.options.player.rustmush
+            && self
+                .sharing
+                .startup
+                .as_ref()
+                .is_none_or(|launch| launch.command.is_empty());
+        let mut attempt = PendingAttempt::default();
+        if can_stop {
+            attempt.begin(&self.events);
+        }
+        let result = self.run_pending(program, can_stop, &mut attempt).await;
+        PendingAttempt::finish(&mut attempt.guard)?;
+        result
+    }
+
+    async fn run_pending(
+        &mut self,
+        program: &Program,
+        can_stop: bool,
+        attempt: &mut PendingAttempt,
+    ) -> Result<()> {
         let mut failures = 0u32;
         let mut dropped_at: Option<tokio::time::Instant> = None;
         loop {
@@ -675,6 +745,8 @@ impl Driver {
                 tokio::pin!(future);
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
                         _ = tokio::time::sleep_until(deadline.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600))), if deadline.is_some() => anyhow::bail!("automatic reconnection stopped after 300 seconds"),
                         result = &mut future => break result,
                         message = self.input.recv() => match message {
@@ -688,7 +760,13 @@ impl Driver {
                 Ok(session) => {
                     self.generation = self.sharing.next_generation();
                     let started = tokio::time::Instant::now();
-                    let result = run_channel(session, self, program).await;
+                    let result = tokio::select! {
+                        biased;
+                        _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => {
+                            return Err(AttemptStopped.into());
+                        }
+                        result = run_channel(session, self, program, &mut attempt.guard) => result,
+                    };
                     self.output.send(Event::Disconnected).await?;
                     if let Some(game) = &mut self.game {
                         game.disconnected();
@@ -705,6 +783,9 @@ impl Driver {
                 Ok(()) => return Ok(()),
                 Err(e) => e,
             };
+            if error.is::<AttemptStopped>() {
+                return Err(error);
+            }
             if self.command_dispatched && error.downcast_ref::<Permanent>().is_none() {
                 return Err(error.context(
                     "Workspace command interrupted; reopen the workspace to run it again",
@@ -723,6 +804,9 @@ impl Driver {
                 return Err(error.context("automatic reconnection stopped after 300 seconds"));
             }
             failures += 1;
+            if can_stop && attempt.guard.is_none() {
+                attempt.begin(&self.events);
+            }
             program.reconnecting(&format!("Link lost: {error:#}"));
             let delay = Duration::from_secs((1u64 << failures.saturating_sub(1).min(4)).min(10));
             self.events.push(
@@ -742,6 +826,8 @@ impl Driver {
             tokio::pin!(wait);
             loop {
                 tokio::select! {
+                    biased;
+                    _ = PendingAttempt::wait_for_stop(&mut attempt.cancelled) => return Err(AttemptStopped.into()),
                     _ = &mut wait => break,
                     message = self.input.recv() => match message {
                         Some(message) => self.discard_input(message),
@@ -752,7 +838,12 @@ impl Driver {
         }
     }
 }
-async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Program) -> Result<()> {
+async fn run_channel(
+    mut shell: OpenShell,
+    driver: &mut Driver,
+    program: &Program,
+    attempt: &mut Option<AttemptGuard>,
+) -> Result<()> {
     let _published = shell.published.shell_lifetime(&shell.link);
     if let Some(reference) = program.herdr_reference() {
         return run_herdr_channel(shell, driver, program, &reference).await;
@@ -977,7 +1068,17 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             }
             message=channel.wait()=>match message {
                 Some(russh::ChannelMsg::Data{data}|russh::ChannelMsg::ExtendedData{data,..})=>for chunk in data.chunks(32*1024){output.send(Event::Data(chunk.to_vec())).await?;},
-                Some(russh::ChannelMsg::Success) if pending>0=>{pending=pending.saturating_sub(1);if pending==0{shell.published.publish(&shell.link,generation);program.ready();events.push("connected",serde_json::json!({"generation":generation}));output.send(Event::Connected(generation)).await?;output.send(Event::Status(format!("{}@{}:{}",options.user,options.host,options.port))).await?;}},
+                Some(russh::ChannelMsg::Success) if pending > 0 => {
+                    pending -= 1;
+                    if pending == 0 {
+                        PendingAttempt::finish(attempt)?;
+                        shell.published.publish(&shell.link, generation);
+                        program.ready();
+                        events.push("connected", serde_json::json!({"generation":generation}));
+                        output.send(Event::Connected(generation)).await?;
+                        output.send(Event::Status(format!("{}@{}:{}", options.user, options.host, options.port))).await?;
+                    }
+                },
                 Some(russh::ChannelMsg::Failure)=>return Err(stop(format!("remote server rejected a PTY or {} request ({pending} outstanding)", if sharing.startup.is_some() {"workspace exec"} else {"shell"}))),
                 // Exit status is advisory until EOF/close; the peer can still
                 // deliver final terminal bytes after reporting it.

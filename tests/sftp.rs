@@ -1384,6 +1384,96 @@ async fn disconnecting_one_shell_keeps_its_shared_ssh_transport_available() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_an_ssh_retry_keeps_the_pane_available_for_manual_reconnect() {
+    use in_band_resize::Wire;
+    use w11term::events::SshConnectionPhase;
+
+    async fn wait_for<T>(description: &str, mut poll: impl FnMut() -> Option<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = poll() {
+                    return result;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(description)
+    }
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (wire, mut messages) = tokio::sync::mpsc::unbounded_channel();
+    let (Source::Ssh(mut ssh), _root, _, server) =
+        fixture_with_wire(false, 2, accepted.clone(), Some(wire)).await
+    else {
+        unreachable!()
+    };
+    ssh.player.reconnect = true;
+    let pane = Session::start(Source::Ssh(ssh));
+    let Wire::Shell(_, server_handle) =
+        tokio::time::timeout(Duration::from_secs(5), messages.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    else {
+        panic!("waiting for the first shell");
+    };
+    let generation = wait_for("first established shell", || {
+        pane.ssh_connection_generation()
+    })
+    .await;
+    assert_eq!(pane.events.pending_ssh_attempt(), None);
+    server_handle
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            "fixture drops the SSH session".into(),
+            "en".into(),
+        )
+        .await
+        .unwrap();
+
+    let attempt = wait_for("the automatic retry to be scheduled", || {
+        if matches!(
+            pane.events.ssh_connection_phase(),
+            Some(SshConnectionPhase::Reconnecting { attempt: Some(_) })
+        ) {
+            pane.events.pending_ssh_attempt()
+        } else {
+            None
+        }
+    })
+    .await;
+    assert!(pane.events.cancel_ssh_attempt(attempt));
+    let restart = wait_for("the stopped pane to be restartable", || {
+        pane.events.restart_token()
+    })
+    .await;
+    assert_eq!(
+        pane.events.ssh_connection_phase(),
+        Some(SshConnectionPhase::Stopped)
+    );
+    assert_eq!(pane.events.pending_ssh_attempt(), None);
+    assert_eq!(pane.ssh_connection_generation(), None);
+
+    // The first automatic retry had a one-second delay.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    pane.restart_exited(restart).unwrap();
+    assert!(!pane.events.cancel_ssh_attempt(attempt));
+    wait_for(
+        "the manual reconnect to open a new shell in the same pane",
+        || {
+            pane.ssh_connection_generation()
+                .filter(|next| *next > generation)
+        },
+    )
+    .await;
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
+    drop(pane);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drawer_reports_confirmed_transfer_bytes_and_keeps_remote_errors() {
     use tokio::sync::{oneshot, watch};
     use w11term::sftp::{CHUNK, Job, Operation, TransferProgress};

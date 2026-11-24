@@ -172,6 +172,7 @@ impl Target {
 enum TargetState {
     Offline,
     Failed(Option<ExitedPane>),
+    Stopped(Option<ExitedPane>),
     Connecting,
     Reconnecting(Option<u32>),
     Restartable(ExitedPane),
@@ -196,6 +197,7 @@ pub enum RosterStatus {
     Reconnecting,
     Disconnected,
     Failed,
+    Stopped,
     HostKey,
     Authentication,
     ReadOnly,
@@ -203,7 +205,7 @@ pub enum RosterStatus {
 }
 
 impl RosterStatus {
-    const OPTIONS: [Self; 12] = [
+    const OPTIONS: [Self; 13] = [
         Self::All,
         Self::Ready,
         Self::Waiting,
@@ -212,6 +214,7 @@ impl RosterStatus {
         Self::Reconnecting,
         Self::Disconnected,
         Self::Failed,
+        Self::Stopped,
         Self::HostKey,
         Self::Authentication,
         Self::ReadOnly,
@@ -228,6 +231,7 @@ impl RosterStatus {
             Self::Reconnecting => "Reconnecting",
             Self::Disconnected => "Disconnected",
             Self::Failed => "Connection failed",
+            Self::Stopped => "Connection stopped",
             Self::HostKey => "Host key verification required",
             Self::Authentication => "Authentication required",
             Self::ReadOnly => "Read-only",
@@ -285,6 +289,7 @@ impl TargetState {
         match self {
             Self::Offline | Self::Restartable(_) => RosterStatus::Disconnected,
             Self::Failed(_) => RosterStatus::Failed,
+            Self::Stopped(_) => RosterStatus::Stopped,
             Self::Connecting => RosterStatus::Connecting,
             Self::Reconnecting(_) => RosterStatus::Reconnecting,
             Self::HostKey(_) => RosterStatus::HostKey,
@@ -301,6 +306,7 @@ impl TargetState {
         match self {
             Self::Restartable(_) => "Disconnected · reconnect available".into(),
             Self::Failed(Some(_)) => "Connection failed · reconnect available".into(),
+            Self::Stopped(Some(_)) => "Connection stopped · reconnect available".into(),
             Self::Authentication(None) => "Authentication in progress".into(),
             Self::Matched(_) => "Ready · prompt match".into(),
             Self::Reconnecting(Some(attempt)) => format!("Reconnecting · attempt {attempt}").into(),
@@ -638,6 +644,7 @@ pub enum Action {
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
+    StopPending(TabId, Vec<reconnect::Attempt>),
     Disconnect(TabId, disconnect::Action),
     FilterResults(TabId, u64, progress::Filter),
     OrderResults(TabId, u64, progress::ResultOrder),
@@ -825,6 +832,9 @@ impl TerminalApp {
                         }
                         Some(SshConnectionPhase::Failed(_)) => {
                             TargetState::Failed(entry.value.exited_pane())
+                        }
+                        Some(SshConnectionPhase::Stopped) => {
+                            TargetState::Stopped(entry.value.exited_pane())
                         }
                         _ => entry
                             .value
@@ -1091,6 +1101,7 @@ impl TerminalApp {
             Action::Membership(id, action) => self.handle_group_membership(id, action),
             Action::Reuse(id, action) => self.handle_host_group_reuse(id, action, ctx),
             Action::Reconnect(id, request) => self.reconnect_host_group(id, request),
+            Action::StopPending(id, attempts) => self.stop_pending_host_group(id, &attempts),
             Action::Disconnect(id, action) => self.handle_group_disconnect(id, action),
             Action::PromptSetup(id, action) => self.handle_group_prompt_setup(id, action),
             Action::HostListExport(id, action) => self.handle_host_list_export(id, action, ctx),
@@ -1805,7 +1816,13 @@ impl TerminalApp {
                         }))
                         .content("Save selection as group…"),
                 )),
-            reconnect::selection_controls(id, page, &shown, ctx),
+            reconnect::selection_controls(
+                id,
+                page,
+                &shown,
+                self.pending_attempts(page, &shown),
+                ctx,
+            ),
             page.disconnect
                 .controls(id, self.disconnect_recipients(selected.iter()), ctx),
             next_prompt,

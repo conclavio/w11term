@@ -161,7 +161,7 @@ impl State {
 }
 
 impl TerminalApp {
-    fn disconnect_session(&self, pane: u64) -> Option<&Session> {
+    pub(super) fn direct_ssh_session(&self, pane: u64) -> Option<&Session> {
         match self.tab_for_pane(pane).and_then(|id| self.tabs.get(id)) {
             Some(AppTab {
                 page: Page::Terminal(live),
@@ -181,7 +181,7 @@ impl TerminalApp {
                 Some(Recipient {
                     pane: target.pane,
                     connection: self
-                        .disconnect_session(target.pane)?
+                        .direct_ssh_session(target.pane)?
                         .ssh_connection_generation()?,
                     name: target.name.clone(),
                 })
@@ -260,7 +260,7 @@ impl TerminalApp {
                     .map(|target| {
                         let (reply, received) = oneshot::channel();
                         let status =
-                            if self.disconnect_session(target.pane).is_some_and(|session| {
+                            if self.direct_ssh_session(target.pane).is_some_and(|session| {
                                 session
                                     .input
                                     .send(Command::DisconnectSshShell {

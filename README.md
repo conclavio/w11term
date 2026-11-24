@@ -101,6 +101,8 @@ The roster shows **Connecting** while the first shell opens and **Reconnecting**
 
 Filter by **Connection failed** to find panes whose SSH attempt ended with an error. Each failed row shows a short diagnostic and offers **Reconnect** when the pane can restart.
 
+Choose **Stop selected SSH attempts** to stop connecting, signing in, or retrying for the checked hosts shown by the roster. The command palette also offers **Stop pending SSH connections**. A stopped pane keeps its scrollback and can be reconnected explicitly.
+
 Choose **Open next SSH prompt** to open the first pending host-key or sign-in prompt in the displayed roster. The button shows how many visible hosts are waiting and follows the roster filters and sort order. Select the group tab to return to the roster.
 
 Turn on **Show last command output** in a group tab to see the exit status and a short excerpt from each visible host’s latest completed shell capture. **Open history** opens that capture in the host’s command history. The preview uses the current SSH connection and hides during authentication and alternate-screen applications.

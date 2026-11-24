@@ -97,6 +97,9 @@ impl Launcher {
                         .await;
                         let event = match result {
                             Ok(()) => ssh::Event::Status("Disconnected".into()),
+                            Err(error) if error.is::<ssh::AttemptStopped>() => {
+                                ssh::Event::ConnectionStopped
+                            }
                             Err(error) => ssh::Event::ConnectionFailed(format!("{error:#}")),
                         };
                         let _ = output.send(event).await;

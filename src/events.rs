@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 mod group_command;
 mod group_transcript;
 mod inbox;
+mod ssh_attempt;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
@@ -21,6 +22,8 @@ pub use group_transcript::{
 };
 pub(crate) use inbox::display_field;
 pub use inbox::{Inbox, NoticeTarget};
+pub(crate) use ssh_attempt::AttemptGuard;
+pub use ssh_attempt::PendingSshAttempt;
 
 const CAPACITY: usize = 4096;
 const LONG_COMMAND_THRESHOLD: Duration = Duration::from_secs(10);
@@ -46,6 +49,7 @@ pub enum SshConnectionPhase {
     Reconnecting { attempt: Option<u32> },
     Connected,
     Disconnected,
+    Stopped,
     Failed(Arc<str>),
 }
 #[derive(Clone, Debug, Serialize)]
@@ -71,6 +75,7 @@ struct State {
     next_prompt: u64,
     notify_long_commands: bool,
     ssh_connection_phase: Option<SshConnectionPhase>,
+    ssh_attempts: ssh_attempt::Attempts,
     restart_token: Option<u64>,
     restart_closed: bool,
 }
