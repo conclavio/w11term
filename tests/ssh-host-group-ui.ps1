@@ -696,7 +696,7 @@ try {
     $burstPath = $newLogs[0].FullName
     Click $liveButton
     Click 'Stop recording'
-    $null = Wait-Until 'the recording of the immediate burst is saved' { Find-Element "Saved live output to $burstPath" }
+    Wait-RecordingStatus 'Saved live output to ' $burstPath
     $burst = [IO.File]::ReadAllLines($burstPath)
     if ($burst[0] -cne "Submitted$($dot)record-fast" -or $burst[-1] -cne '[Recording stopped]') {
         throw 'The recorded submission is missing its header or footer'
