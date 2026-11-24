@@ -122,6 +122,13 @@ impl Review {
             .collect()
     }
 
+    fn included_profiles(&self) -> impl Iterator<Item = &str> {
+        self.members
+            .iter()
+            .filter(|member| member.included)
+            .map(|member| member.profile.as_str())
+    }
+
     fn choices(&self) -> Vec<Launch> {
         self.members.iter().map(Member::launch).collect()
     }
@@ -218,6 +225,7 @@ pub(super) struct State {
     return_to: Option<TabId>,
     filter: filter::Filter,
     page: usize,
+    set_name: Option<String>,
 }
 
 pub enum Action {
@@ -235,6 +243,10 @@ pub enum Change {
     RecipientSet(String),
     Approve(Vec<Launch>, Option<String>),
     Export(Vec<Launch>, Option<String>),
+    BeginSaveSet,
+    SetName(String),
+    SaveSet,
+    BackFromSet,
     Refresh,
     Back,
 }
@@ -266,6 +278,7 @@ impl State {
     fn open(&mut self, review: Review) {
         self.filter.clear();
         self.page = 0;
+        self.set_name = None;
         self.replace(review);
     }
 
@@ -319,6 +332,9 @@ impl State {
         let action = move |change| {
             Message::HostGroup(super::Action::Reuse(id, Action::Form(revision, change)))
         };
+        if let Some(name) = self.set_name.as_deref() {
+            return Some(save_set_view(review, name, action, ctx));
+        }
         let offered = review.choices();
         let reuse = offered
             .iter()
@@ -437,26 +453,38 @@ impl State {
                                         page + 1
                                     )),
                             )),
-                        if set_names.is_empty() {
-                            View::empty()
-                        } else {
-                            let selected = set_names
-                                .iter()
-                                .position(|name| Some(name) == review.selected_set.as_ref());
-                            ComboBox::new()
-                                .automation_name("Launch recipient set")
-                                .placeholder_text("Choose a recipient set")
-                                .items_source(set_names.clone())
-                                .selected_index(selected)
-                                .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                                    index
-                                        .and_then(|index| set_names.get(index))
-                                        .map_or(Message::ControlIdle, |name| {
-                                            action(Change::RecipientSet(name.clone()))
-                                        })
-                                }))
-                                .into()
-                        },
+                        StackPanel::new()
+                            .spacing(8.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                if set_names.is_empty() {
+                                    View::empty()
+                                } else {
+                                    let selected = set_names.iter().position(|name| {
+                                        Some(name) == review.selected_set.as_ref()
+                                    });
+                                    ComboBox::new()
+                                        .automation_name("Launch recipient set")
+                                        .placeholder_text("Choose a recipient set")
+                                        .items_source(set_names.clone())
+                                        .selected_index(selected)
+                                        .on_selection_changed(ctx.callback(
+                                            move |index: Option<usize>| {
+                                                index.and_then(|index| set_names.get(index)).map_or(
+                                                    Message::ControlIdle,
+                                                    |name| {
+                                                        action(Change::RecipientSet(name.clone()))
+                                                    },
+                                                )
+                                            },
+                                        ))
+                                        .into()
+                                },
+                                Button::new()
+                                    .is_enabled(reuse + new > 0)
+                                    .on_click(ctx.callback(move |_| action(Change::BeginSaveSet)))
+                                    .content("Save as recipient set…"),
+                            )),
                         StackPanel::new()
                             .spacing(8.0)
                             .orientation(Orientation::Horizontal)
@@ -544,6 +572,60 @@ impl State {
                 )),
         )
     }
+}
+
+fn save_set_view(
+    review: &Review,
+    name: &str,
+    action: impl Fn(Change) -> Message + Copy + 'static,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    let exists = review.sets.contains_key(name.trim());
+    let feedback = if exists {
+        "A recipient set with this name already exists."
+    } else {
+        &review.feedback
+    };
+    let profiles = review.included_profiles().collect::<Vec<_>>().join("\n");
+    Grid::new()
+        .margin(16.0)
+        .row_spacing(8.0)
+        .rows([GridLength::Auto, GridLength::STAR])
+        .children((
+            StackPanel::new().spacing(8.0).children((
+                TextBlock::new()
+                    .font_size(24.0)
+                    .text(format!("Save recipient set · {}", review.name)),
+                TextBox::new()
+                    .automation_name("Launch recipient set name")
+                    .placeholder_text("Recipient set name")
+                    .text(name)
+                    .on_text_changed(ctx.callback(move |name| action(Change::SetName(name)))),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .style(ButtonStyle::Accent)
+                            .is_enabled(!name.trim().is_empty() && !exists)
+                            .on_click(ctx.callback(move |_| action(Change::SaveSet)))
+                            .content("Save recipient set"),
+                        Button::new()
+                            .on_click(ctx.callback(move |_| action(Change::BackFromSet)))
+                            .content("Back to launch review"),
+                    )),
+                TextBlock::new()
+                    .text(feedback)
+                    .text_wrapping(TextWrapping::Wrap),
+            )),
+            ScrollViewer::new().grid_row(1).content(
+                TextBlock::new()
+                    .automation_name("Recipient set profiles")
+                    .text(profiles)
+                    .is_text_selection_enabled(true)
+                    .text_wrapping(TextWrapping::Wrap),
+            ),
+        ))
 }
 
 pub(super) fn button(
@@ -646,6 +728,10 @@ impl TerminalApp {
         else {
             return;
         };
+        if state.set_name.is_some() {
+            self.edit_launch_set(id, change);
+            return;
+        }
         match change {
             Change::Back => {
                 if let Some(previous) = state.return_to {
@@ -750,6 +836,63 @@ impl TerminalApp {
                             }
                         }
                     }
+                }
+            }
+            Change::BeginSaveSet if review.included_profiles().next().is_some() => {
+                if let Some(page) = self.host_group_mut(id) {
+                    let state = &mut page.saved.reuse;
+                    if let Some(review) = &mut state.review {
+                        review.feedback.clear();
+                        state.set_name = Some(String::new());
+                        state.revision += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn edit_launch_set(&mut self, id: TabId, change: Change) {
+        let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
+            return;
+        };
+        let state = &mut page.saved.reuse;
+        let (Some(review), Some(name)) = (&mut state.review, &mut state.set_name) else {
+            return;
+        };
+        match change {
+            Change::SetName(text) => {
+                *name = text;
+                review.feedback.clear();
+            }
+            Change::BackFromSet => {
+                state.set_name = None;
+                state.revision += 1;
+                review.feedback.clear();
+            }
+            Change::SaveSet => {
+                let name = name.trim().to_owned();
+                let members: Vec<_> = review.included_profiles().map(str::to_owned).collect();
+                match self.store.create_reviewed_ssh_recipient_set(
+                    &review.name,
+                    &review.profiles(),
+                    &name,
+                    &members,
+                    |catalog| review.validate_profiles(catalog),
+                ) {
+                    Ok(catalog) => {
+                        review.sets = catalog
+                            .ssh_recipient_sets
+                            .get(&review.name)
+                            .cloned()
+                            .unwrap_or_default();
+                        review.feedback = format!("Saved recipient set {name}");
+                        review.selected_set = Some(name);
+                        state.set_name = None;
+                        state.revision += 1;
+                        self.use_group_catalog(catalog);
+                    }
+                    Err(error) => review.feedback = format!("{error:#}"),
                 }
             }
             _ => {}
