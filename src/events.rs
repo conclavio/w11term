@@ -15,9 +15,9 @@ mod inbox;
 use group_command::GroupRun;
 pub use group_command::{GroupCommandResult, GroupExecution, GroupInterruptTarget, GroupOutput};
 pub use group_transcript::{
-    GroupRecordingEnd, GroupRecordingMode, GroupTranscript, GroupTranscriptHost,
-    GroupTranscriptLine, GroupTranscriptRecording, GroupTranscriptSnapshot, GroupTranscriptStream,
-    GroupWriteReceipt,
+    GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
+    GroupTranscript, GroupTranscriptHost, GroupTranscriptLine, GroupTranscriptRecording,
+    GroupTranscriptSnapshot, GroupTranscriptStream, GroupWriteReceipt,
 };
 pub use inbox::Inbox;
 pub(crate) use inbox::display_field;

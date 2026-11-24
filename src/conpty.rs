@@ -68,7 +68,7 @@ fn write_input(
                 kind,
                 ..
             } if connection != generation => {
-                let _ = reply.send(Err(kind.stale_error().into()));
+                kind.reject(reply, kind.stale_error());
             }
             TransportInput::Scoped {
                 kind: ScopedInput::GroupInterrupt(_),

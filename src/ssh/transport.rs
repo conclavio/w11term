@@ -434,10 +434,8 @@ fn offline(input: TransportInput, size: &mut TerminalSize, options: &mut SshOpti
         TransportInput::Resize(new) => *size = new,
         TransportInput::Authenticate(auth) => options.authentication = auth,
         TransportInput::Data(_) | TransportInput::Automatic(_) => {}
-        TransportInput::Raw(_, reply) | TransportInput::Scoped { reply, .. } => {
-            let _ = reply.send(Err(
-                "SSH is reconnecting; input was not queued or sent".into()
-            ));
+        message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. }) => {
+            message.reject_input("SSH is reconnecting; input was not queued or sent");
         }
         TransportInput::Sftp(job) => {
             let _ = job.reply.send(Err(
@@ -640,10 +638,8 @@ impl Driver {
 
     pub(super) fn discard_input(&mut self, message: TransportInput) {
         match message {
-            TransportInput::Raw(_, reply) | TransportInput::Scoped { reply, .. } => {
-                let _ = reply.send(Err(
-                    "No SSH shell is attached; input was not queued or sent".into(),
-                ));
+            message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. }) => {
+                message.reject_input("No SSH shell is attached; input was not queued or sent");
             }
             TransportInput::Sftp(job) => {
                 let _ = job.reply.send(Err(
@@ -905,7 +901,9 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
             message = input.recv() => {
                 if process_exited {
                     match message {
-                        Some(TransportInput::Raw(_, reply) | TransportInput::Scoped { reply, .. }) => { let _ = reply.send(Err("Remote process exited; input was not sent".into())); }
+                        Some(message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. })) => {
+                            message.reject_input("Remote process exited; input was not sent");
+                        }
                         Some(TransportInput::Sftp(job)) => { let _ = job.reply.send(Err("Remote process exited; SFTP operation was not started".into())); }
                         Some(_) => {}
                         None => return Ok(()),
@@ -922,12 +920,12 @@ async fn run_channel(mut shell: OpenShell, driver: &mut Driver, program: &Progra
                         forward_sftp(&sftp_tx,&cleanup_tx,job);
                     }
                     Some(TransportInput::Data(_) | TransportInput::Automatic(_)) if discard_input => {}
-                    Some(TransportInput::Raw(_, reply) | TransportInput::Scoped { reply, .. }) if discard_input => {
-                        let _ = reply.send(Err("RustMUSH resume is pending; input was not queued or sent".into()));
+                    Some(message @ (TransportInput::Raw(..) | TransportInput::Scoped { .. })) if discard_input => {
+                        message.reject_input("RustMUSH resume is pending; input was not queued or sent");
                     }
                     Some(TransportInput::Data(bytes) | TransportInput::Automatic(bytes)) => channel.data(bytes.as_slice()).await?,
                     Some(TransportInput::Scoped { connection, reply, kind, .. }) if connection != generation || pending != 0 => {
-                        let _ = reply.send(Err(kind.stale_error().into()));
+                        kind.reject(reply, kind.stale_error());
                     }
                     Some(TransportInput::Scoped { kind: ScopedInput::GroupInterrupt(link), reply, .. })
                         if !events.group_command_running(link) => {
@@ -1028,7 +1026,7 @@ async fn run_herdr_channel(
                 Some(TransportInput::Data(data))=>viewer.input(&data).await?,
                 Some(TransportInput::Automatic(data))=>viewer.automatic_input(&data).await?,
                 Some(TransportInput::Scoped {connection,reply,kind,..}) if connection != generation => {
-                    let _=reply.send(Err(kind.stale_error().into()));
+                    kind.reject(reply, kind.stale_error());
                 }
                 Some(TransportInput::Scoped {kind:ScopedInput::GroupInterrupt(_),reply,..}) => {
                     let _=reply.send(Err("Group interrupts require a direct SSH shell.".into()));

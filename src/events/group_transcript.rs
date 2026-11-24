@@ -1,9 +1,7 @@
+use super::GroupExecution;
 use std::{
     collections::VecDeque,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 use tokio::sync::{broadcast, oneshot};
 use wezterm_term::LiveOutputBatch;
@@ -19,7 +17,8 @@ struct Transcript {
     snapshot: GroupTranscriptSnapshot,
     recording: Option<Recording>,
     next_recording: u64,
-    hosts: usize,
+    hosts: Vec<HostRecord>,
+    active_hosts: usize,
     dispatch_finished: bool,
 }
 
@@ -28,7 +27,7 @@ struct Recording {
     id: u64,
     mode: GroupRecordingMode,
     incoming: broadcast::Sender<GroupTranscriptLine>,
-    ended: oneshot::Sender<GroupRecordingEnd>,
+    ended: oneshot::Sender<GroupRecordingSummary>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +40,50 @@ pub enum GroupRecordingMode {
 pub enum GroupRecordingEnd {
     Stopped,
     Settled,
+}
+
+#[derive(Debug)]
+pub struct GroupRecordingSummary {
+    pub end: GroupRecordingEnd,
+    pub hosts: Vec<(u64, GroupRecordingOutcome)>,
+}
+
+#[derive(Debug)]
+pub enum GroupRecordingOutcome {
+    AwaitingDelivery,
+    DeliveryUnconfirmed,
+    Rejected(Arc<str>),
+    Sent(Option<GroupExecution>),
+}
+
+#[derive(Debug)]
+struct HostRecord {
+    pane: u64,
+    active: bool,
+    receipt: GroupWriteReceipt,
+    execution: Option<GroupExecution>,
+}
+
+impl HostRecord {
+    fn outcome(&self) -> GroupRecordingOutcome {
+        match self.receipt.0.get() {
+            Some(Ok(())) => {
+                let execution = self.execution.clone().filter(|state| {
+                    self.active
+                        || matches!(
+                            state,
+                            GroupExecution::Finished(_)
+                                | GroupExecution::PromptReturned
+                                | GroupExecution::Unavailable(_)
+                        )
+                });
+                GroupRecordingOutcome::Sent(execution)
+            }
+            Some(Err(reason)) => GroupRecordingOutcome::Rejected(reason.clone()),
+            None if self.active => GroupRecordingOutcome::AwaitingDelivery,
+            None => GroupRecordingOutcome::DeliveryUnconfirmed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,19 +104,26 @@ pub struct GroupTranscriptLine {
 pub struct GroupTranscriptHost {
     transcript: GroupTranscript,
     pane: u64,
-    receipt: Option<GroupWriteReceipt>,
+    index: usize,
+    verify_delivery: bool,
+    receipt: GroupWriteReceipt,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct GroupWriteReceipt(Arc<AtomicBool>);
+pub struct GroupWriteReceipt(Arc<OnceLock<Result<(), Arc<str>>>>);
 
 impl GroupWriteReceipt {
     pub(crate) fn acknowledge(&self) {
-        self.0.store(true, Ordering::Release);
+        let _ = self.0.set(Ok(()));
+    }
+
+    /// Record a refusal before any bytes could be sent.
+    pub fn reject(&self, reason: &str) {
+        let _ = self.0.set(Err(reason.into()));
     }
 
     fn acknowledged(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.get().is_some_and(Result::is_ok)
     }
 }
 
@@ -98,18 +148,28 @@ impl Drop for GroupTranscriptRecording {
 pub struct GroupTranscriptStream {
     pub history: GroupTranscriptSnapshot,
     pub incoming: broadcast::Receiver<GroupTranscriptLine>,
-    pub ended: oneshot::Receiver<GroupRecordingEnd>,
+    pub ended: oneshot::Receiver<GroupRecordingSummary>,
 }
 
 impl GroupTranscript {
     pub fn host(&self, pane: u64) -> GroupTranscriptHost {
         let mut transcript = self.0.lock().unwrap();
         debug_assert!(!transcript.dispatch_finished);
-        transcript.hosts += 1;
+        let receipt = GroupWriteReceipt::default();
+        let index = transcript.hosts.len();
+        transcript.hosts.push(HostRecord {
+            pane,
+            active: true,
+            receipt: receipt.clone(),
+            execution: None,
+        });
+        transcript.active_hosts += 1;
         GroupTranscriptHost {
             transcript: self.clone(),
             pane,
-            receipt: None,
+            index,
+            verify_delivery: false,
+            receipt,
         }
     }
 
@@ -162,22 +222,32 @@ impl GroupTranscript {
 impl Drop for GroupTranscriptHost {
     fn drop(&mut self) {
         let mut transcript = self.transcript.0.lock().unwrap();
-        transcript.hosts -= 1;
+        transcript.hosts[self.index].active = false;
+        transcript.active_hosts -= 1;
         transcript.finish_if_settled();
     }
 }
 
 impl GroupTranscriptHost {
+    pub fn delivery_receipt(&self) -> GroupWriteReceipt {
+        self.receipt.clone()
+    }
+
     pub(crate) fn require_delivery(&mut self) -> GroupWriteReceipt {
-        let receipt = GroupWriteReceipt::default();
-        self.receipt = Some(receipt.clone());
-        receipt
+        self.verify_delivery = true;
+        self.delivery_receipt()
+    }
+
+    pub(crate) fn reject_delivery(&self, reason: &str) {
+        self.receipt.reject(reason);
+    }
+
+    pub(super) fn set_execution(&self, execution: &GroupExecution) {
+        self.transcript.0.lock().unwrap().hosts[self.index].execution = Some(execution.clone());
     }
 
     pub(super) fn cleared_for_output(&self) -> bool {
-        self.receipt
-            .as_ref()
-            .is_none_or(GroupWriteReceipt::acknowledged)
+        !self.verify_delivery || self.receipt.acknowledged()
     }
 
     pub(super) fn append(&self, batch: LiveOutputBatch) {
@@ -201,7 +271,7 @@ impl GroupTranscriptHost {
 impl Transcript {
     fn finish_if_settled(&mut self) {
         if self.dispatch_finished
-            && self.hosts == 0
+            && self.active_hosts == 0
             && self
                 .recording
                 .as_ref()
@@ -215,7 +285,14 @@ impl Transcript {
         if let Some(recording) = self.recording.take() {
             // Publish the reason before closing the only line sender. The
             // writer reads it only after draining the remaining lines.
-            let _ = recording.ended.send(reason);
+            let hosts = self
+                .hosts
+                .iter()
+                .map(|host| (host.pane, host.outcome()))
+                .collect();
+            let _ = recording
+                .ended
+                .send(GroupRecordingSummary { end: reason, hosts });
         }
     }
 
@@ -308,7 +385,10 @@ mod tests {
             Err(TryRecvError::Closed)
         ));
         assert_eq!(transcript.snapshot().lines.len(), 3);
-        assert_eq!(stream.ended.try_recv().unwrap(), GroupRecordingEnd::Stopped);
+        assert_eq!(
+            stream.ended.try_recv().unwrap().end,
+            GroupRecordingEnd::Stopped
+        );
         assert!(
             transcript
                 .start_recording(GroupRecordingMode::Manual)
@@ -334,6 +414,8 @@ mod tests {
             .start_recording(GroupRecordingMode::UntilSettled)
             .unwrap();
         let east = transcript.host(1);
+        east.delivery_receipt().acknowledge();
+        east.set_execution(&GroupExecution::PromptReturned);
         append(&east, "first");
         drop(east);
         assert_eq!(&*stream.incoming.try_recv().unwrap().text, "first");
@@ -343,21 +425,38 @@ mod tests {
         ));
 
         let west = transcript.host(2);
+        west.delivery_receipt().acknowledge();
         let rejected = transcript.host(3);
+        rejected
+            .delivery_receipt()
+            .reject("The host requires authentication.");
+        let unconfirmed = transcript.host(4);
         transcript.finish_dispatch();
         drop(rejected);
+        drop(unconfirmed);
         assert!(matches!(
             stream.incoming.try_recv(),
             Err(TryRecvError::Empty)
         ));
         append(&west, "last");
+        west.set_execution(&GroupExecution::Unavailable("The connection closed."));
         drop(west);
         assert_eq!(&*stream.incoming.try_recv().unwrap().text, "last");
         assert!(matches!(
             stream.incoming.try_recv(),
             Err(TryRecvError::Closed)
         ));
-        assert_eq!(stream.ended.try_recv().unwrap(), GroupRecordingEnd::Settled);
+        let summary = stream.ended.try_recv().unwrap();
+        assert_eq!(summary.end, GroupRecordingEnd::Settled);
+        assert!(matches!(
+            summary.hosts.as_slice(),
+            [
+                (1, GroupRecordingOutcome::Sent(Some(GroupExecution::PromptReturned))),
+                (2, GroupRecordingOutcome::Sent(Some(GroupExecution::Unavailable("The connection closed.")))),
+                (3, GroupRecordingOutcome::Rejected(reason)),
+                (4, GroupRecordingOutcome::DeliveryUnconfirmed),
+            ] if &**reason == "The host requires authentication."
+        ));
 
         let (new_recording, mut manual) = transcript
             .start_recording(GroupRecordingMode::Manual)
@@ -368,6 +467,9 @@ mod tests {
             Err(TryRecvError::Empty)
         ));
         drop(new_recording);
-        assert_eq!(manual.ended.try_recv().unwrap(), GroupRecordingEnd::Stopped);
+        assert_eq!(
+            manual.ended.try_recv().unwrap().end,
+            GroupRecordingEnd::Stopped
+        );
     }
 }

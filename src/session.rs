@@ -911,7 +911,13 @@ async fn run(
                 let command = if phase != Phase::Running || queued_offline {
                     match command {
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("No active terminal connection; clipboard text was not sent".into())); continue; }
-                        Some(Command::SendGroupCommand { reply, .. } | Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
+                        Some(Command::SendGroupCommand { transcript, reply, .. }) => {
+                            let reason = "The host is disconnected.";
+                            transcript.reject_delivery(reason);
+                            let _ = reply.send(Err(reason.into()));
+                            continue;
+                        }
+                        Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("The host is disconnected.".into())); continue; }
                         Some(Command::Raw(_, reply)) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
@@ -927,7 +933,13 @@ async fn run(
                             continue;
                         }
                         Some(Command::ClipboardPaste(_, reply)) => { let _ = reply.send(Err("Pane input is read-only".into())); continue; }
-                        Some(Command::SendGroupCommand { reply, .. } | Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
+                        Some(Command::SendGroupCommand { transcript, reply, .. }) => {
+                            let reason = "Pane input is read-only.";
+                            transcript.reject_delivery(reason);
+                            let _ = reply.send(Err(reason.into()));
+                            continue;
+                        }
+                        Some(Command::InterruptGroupCommand { reply, .. }) => { let _ = reply.send(Err("Pane input is read-only.".into())); continue; }
                         Some(Command::Raw(_, reply)) => {
                             let _ = reply.send(Err("Pane input is read-only".into()));
                             continue;
@@ -994,7 +1006,7 @@ async fn run(
                             None
                         };
                         if let Some(reason) = rejected {
-                            let _ = reply.send(Err(reason.into()));
+                            kind.reject(reply, reason);
                             continue;
                         }
                         match terminal::group_command_bytes(&terminal, &text) {
@@ -1003,7 +1015,7 @@ async fn run(
                                     events.observe_group_command(prompt.connection, text, execution, transcript);
                                 }
                             }
-                            Err(error) => { let _ = reply.send(Err(error.to_string())); }
+                            Err(error) => kind.reject(reply, &error.to_string()),
                         }
                         Ok(())
                     }
@@ -1527,9 +1539,7 @@ fn write_group_input(
     }) {
         Ok(()) => true,
         Err(error) => {
-            if let TransportInput::Scoped { reply, .. } = error.0 {
-                let _ = reply.send(Err("The host connection closed.".into()));
-            }
+            error.0.reject_input("The host connection closed.");
             false
         }
     }

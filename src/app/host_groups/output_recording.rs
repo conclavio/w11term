@@ -7,8 +7,8 @@ use std::{
 };
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use w11term::events::{
-    GroupRecordingEnd, GroupRecordingMode, GroupTranscriptLine, GroupTranscriptRecording,
-    GroupTranscriptStream,
+    GroupRecordingEnd, GroupRecordingMode, GroupRecordingOutcome, GroupRecordingSummary,
+    GroupTranscriptLine, GroupTranscriptRecording, GroupTranscriptStream,
 };
 
 #[derive(Default)]
@@ -199,6 +199,36 @@ fn write_line(
     Ok(())
 }
 
+fn write_outcomes(
+    file: &mut impl Write,
+    names: &BTreeMap<u64, String>,
+    summary: GroupRecordingSummary,
+) -> io::Result<()> {
+    if !summary.hosts.is_empty() {
+        writeln!(file, "[Host outcomes]\r")?;
+    }
+    for (pane, outcome) in summary.hosts {
+        let Some(host) = names.get(&pane) else {
+            continue;
+        };
+        let status = match outcome {
+            GroupRecordingOutcome::AwaitingDelivery => "Awaiting delivery".into(),
+            GroupRecordingOutcome::DeliveryUnconfirmed => "Delivery unconfirmed".into(),
+            GroupRecordingOutcome::Rejected(reason) => format!("Not sent · {reason}"),
+            GroupRecordingOutcome::Sent(None) => "Sent to SSH channel · result unavailable".into(),
+            GroupRecordingOutcome::Sent(Some(execution)) => {
+                format!("Sent to SSH channel · {}", execution_caption(&execution))
+            }
+        };
+        writeln!(file, "{host} · {status}\r")?;
+    }
+    let ending = match summary.end {
+        GroupRecordingEnd::Settled => "[Group run settled]",
+        GroupRecordingEnd::Stopped => "[Recording stopped]",
+    };
+    writeln!(file, "{ending}\r")
+}
+
 fn write_output(
     file: &mut impl Write,
     label: &str,
@@ -237,11 +267,11 @@ fn write_output(
             Err(RecvError::Closed) => break,
         }
     }
-    let ending = match stream.ended.try_recv() {
-        Ok(GroupRecordingEnd::Settled) => "[Group run settled]",
-        _ => "[Recording stopped]",
-    };
-    writeln!(file, "{ending}\r")?;
+    let summary = stream.ended.try_recv().unwrap_or(GroupRecordingSummary {
+        end: GroupRecordingEnd::Stopped,
+        hosts: Vec::new(),
+    });
+    write_outcomes(file, names, summary)?;
     file.flush()
 }
 
@@ -363,11 +393,7 @@ impl TerminalApp {
         let Some(submission) = self.output_recording_submission(id, run) else {
             return;
         };
-        let targets = submission
-            .results
-            .iter()
-            .filter(|delivery| matches!(delivery.status, DeliveryStatus::Sent))
-            .map(|delivery| &delivery.target);
+        let targets = submission.results.iter().map(|delivery| &delivery.target);
         submission.recording = State::start(
             path,
             &submission.transcript,
@@ -404,7 +430,18 @@ mod tests {
         }
         drop(sender);
         let (finish, ended) = oneshot::channel();
-        finish.send(GroupRecordingEnd::Stopped).unwrap();
+        finish
+            .send(GroupRecordingSummary {
+                end: GroupRecordingEnd::Stopped,
+                hosts: vec![
+                    (1, GroupRecordingOutcome::DeliveryUnconfirmed),
+                    (
+                        2,
+                        GroupRecordingOutcome::Sent(Some(GroupExecution::PromptReturned)),
+                    ),
+                ],
+            })
+            .unwrap();
         let stream = GroupTranscriptStream {
             history: GroupTranscriptSnapshot {
                 omitted: 2,
@@ -435,7 +472,8 @@ mod tests {
             concat!(
                 "Submitted · show\r\n[2 earlier output lines were no longer in the live view]\r\n",
                 "West · west first\r\nEast · east next\r\n[Recording writer skipped 1 output lines]\r\n",
-                "West · 尾 [line shortened]\r\n[Recording stopped]\r\n",
+                "West · 尾 [line shortened]\r\n[Host outcomes]\r\nEast · Delivery unconfirmed\r\n",
+                "West · Sent to SSH channel · Prompt returned · exit status unavailable\r\n[Recording stopped]\r\n",
             ),
         );
         assert!(PreparedFile::open(path.clone()).is_err());
