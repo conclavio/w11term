@@ -306,7 +306,9 @@ try {
 
     Click ('Import group definition' + [char]0x2026)
     $dialog = Wait-Until 'group definition open dialog' { Find-OwnedDialog 'Open SSH group definition' }
-    Select-DialogItem $dialog 'ssh-group.json'
+    $null = Wait-Until 'the group definition path is entered' {
+        [FixtureDialog]::SetFilename($dialog, $definitionFile, '')
+    }
     $null = Wait-Until 'open the definition for review' { [FixtureDialog]::ClickButton($dialog, 1) }
     $westAddr = "West${dot}test@127.0.0.1:$($definitionCatalog.profiles.West.port)"
     $null = Wait-Until 'the import resolves the current local West profile' { Find-Element $westAddr }
