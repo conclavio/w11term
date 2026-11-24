@@ -136,6 +136,7 @@ struct Submission {
     command_queue: Option<command_queue::Queue>,
     dispatch_policy: Option<dispatch_policy::Policy>,
     show_queue_activity: bool,
+    control_waiters: Vec<control_api::RunReply>,
 }
 
 #[derive(Clone)]
@@ -612,6 +613,7 @@ impl HostGroup {
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
+            control_waiters: Vec::new(),
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -880,7 +882,9 @@ impl TerminalApp {
             Some(Page::HostGroup(_))
         ) || self.tabs.entries().iter().any(|entry| {
             matches!(&entry.value.page, Page::HostGroup(page)
-                if page.connection_notice.is_armed() || page.submissions.iter().any(Submission::has_queue))
+            if page.connection_notice.is_armed() || page.submissions.iter().any(|run| {
+                run.has_queue() || !run.control_waiters.is_empty()
+            }))
         }) {
             if self.host_group_timer.is_none() {
                 let sender = ctx.sender();
@@ -1277,6 +1281,7 @@ impl TerminalApp {
             Action::Tick => {
                 self.poll_connection_notices();
                 self.poll_command_queues();
+                self.poll_ssh_group_waiters();
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
                     Some(Page::HostGroup(_))
@@ -1307,9 +1312,7 @@ impl TerminalApp {
                             if let Some(path) = submission.recording.poll() {
                                 submission.saved_recordings.add(path);
                             }
-                            for delivery in &mut submission.results {
-                                delivery.poll();
-                            }
+                            submission.refresh_deliveries();
                         }
                     }
                 }

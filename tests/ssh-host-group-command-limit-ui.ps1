@@ -58,6 +58,7 @@ function Select-GroupOption([string]$Name, [string]$Label) {
 
 $launch = @('--profiles', ('"' + $profiles + '"'), '--demo', '--cols', '100', '--rows', '36')
 $app = Start-Process -FilePath $Gui -ArgumentList $launch -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+$waitJob = $null
 try {
     $window = Wait-InputWindow
     $null = Wait-Until 'control pipe' { Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "w11term\instances\$($app.Id).json") }
@@ -127,26 +128,50 @@ try {
         !(Find-Element 'No bells or notifications') -or [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
         throw 'CLI discovery changed the visible page or did not summarize the background run'
     }
+    $waitArgs = @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--run','1')
+    $timedOut = & $Cli --pid $app.Id @waitArgs --timeout 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $timedOut.ok -or $timedOut.error -notlike '*timed out before settlement*') {
+        throw 'A held run did not return a wait timeout'
+    }
+    $waitOutput = Join-Path $State 'wait-run-1.json'
+    $waitJob = Start-Process -FilePath $Cli -ArgumentList (@('--pid',"$($app.Id)") + $waitArgs + @('--timeout','15')) `
+        -NoNewWindow -PassThru -RedirectStandardOutput $waitOutput
     New-Item -ItemType File -Path (Join-Path $State 'release-roll') | Out-Null
     $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East started roll')
+    $null = Wait-Until 'the CLI reads the running East host while the wait is pending' {
+        $run = (Run-Snapshot 1).run
+        $run.recipients[1].delivery.state -ceq 'rejected' -and
+            $run.recipients[2].execution.state -ceq 'running'
+    }
+    if ($waitJob.HasExited) { throw 'The group wait ended before East finished' }
+    New-Item -ItemType File -Path (Join-Path $State 'release-east-roll') | Out-Null
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished roll')
+    if (!$waitJob.WaitForExit(10000)) {
+        throw 'Wait did not finish after the background run settled'
+    }
+    $waitReply = [IO.File]::ReadAllText($waitOutput) | ConvertFrom-Json
+    if (!$waitReply.ok) { throw "Wait did not return the completed background run: $($waitReply.error)" }
+    $settled = $waitReply.result
+    $run = $settled.run
+    $westResult, $northResult, $eastResult = $run.recipients
+    if ($settled.window_id -ne $groupWindow -or $settled.tab_id -ne $groupTab -or
+        $run.summary.settled_count -ne 3 -or $run.summary.outcomes.succeeded -ne 2 -or
+        $run.summary.outcomes.attention -ne 1 -or $westResult.execution.exit_code -ne 0 -or
+        $northResult.delivery.state -cne 'rejected' -or $northResult.delivery.reason -notlike 'The verified prompt changed*' -or
+        $eastResult.execution.exit_code -ne 0 -or $eastResult.execution.command_id -le 0 -or
+        $null -eq $eastResult.execution.connection_generation -or
+        ($eastResult.PSObject.Properties.Name -contains 'output')) {
+        throw 'Wait did not return the final recipient outcomes'
+    }
+    $again = Control ($waitArgs + @('--timeout','1'))
+    if ($again.run.summary.settled_count -ne 3 -or !(Find-Element 'No bells or notifications') -or
+        [FixtureMessages]::GetForegroundWindow() -ne $activeWindow) {
+        throw 'Waiting again did not return the settled run or changed focus'
+    }
     $tab = Wait-Until 'the group tab' { Find-Element $group ([System.Windows.Automation.ControlType]::TabItem) }
     $tab.GetCurrentPattern($item).Select()
     $null = Wait-Until 'North was tried before East despite the new roster sort' {
         Find-Element "$($labels.North)${dot}Not sent${dot}The verified prompt changed before the command was sent."
-    }
-    New-Item -ItemType File -Path (Join-Path $State 'release-east-roll') | Out-Null
-    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished roll')
-    $null = Wait-Until 'CLI reports completed exit codes, a withheld host, and output lookup IDs' {
-        $run = (Run-Snapshot 1).run
-        $westResult = $run.recipients[0]
-        $northResult = $run.recipients[1]
-        $eastResult = $run.recipients[2]
-        $run.summary.settled_count -eq 3 -and $run.summary.outcomes.succeeded -eq 2 -and
-            $run.summary.outcomes.attention -eq 1 -and $westResult.execution.exit_code -eq 0 -and
-            $northResult.delivery.state -ceq 'rejected' -and $northResult.delivery.reason -like 'The verified prompt changed*' -and
-            $eastResult.execution.exit_code -eq 0 -and $eastResult.execution.command_id -gt 0 -and
-            $null -ne $eastResult.execution.connection_generation -and
-            !($eastResult.PSObject.Properties.Name -contains 'output')
     }
     $eastExecution = (Run-Snapshot 1).run.recipients[2].execution
     $output = Control @('get-command','--pane',"$($panes.East)",'--id',"$($eastExecution.command_id)",
@@ -453,6 +478,10 @@ try {
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {
+    if ($waitJob) {
+        if (!$waitJob.HasExited) { $waitJob.Kill(); $waitJob.WaitForExit() }
+        $waitJob.Dispose()
+    }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

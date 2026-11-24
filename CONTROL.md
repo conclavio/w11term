@@ -198,9 +198,18 @@ output, use `get-command` with its `pane_id` and the
 `execution.command_id` and `execution.connection_generation` in the reply.
 The usual pane history retention rules apply.
 
+`wait-ssh-group-run --window ID --tab ID --run ID [--timeout SECONDS]`
+returns the same detail reply once all recipients settle. It handles running,
+paused, and canary-gated queues in the background. The timeout defaults to
+30 seconds and accepts 1 through 3600. A settled run returns immediately.
+Check the recipient statuses and exit codes to decide whether the run succeeded.
+Timeout, a closed window or tab, or an evicted run returns an error. A timeout
+leaves the original run in progress.
+
 ```powershell
 w11term-cli --pid 12345 list-ssh-groups
 w11term-cli --pid 12345 get-ssh-group-run --window 1 --tab 9 --run 3
+w11term-cli --pid 12345 wait-ssh-group-run --window 1 --tab 9 --run 3 --timeout 60
 ```
 
 Direct pipe clients use these JSON requests.
@@ -208,6 +217,7 @@ Direct pipe clients use these JSON requests.
 ```json
 {"verb":"list-ssh-groups"}
 {"verb":"get-ssh-group-run","window_id":1,"tab_id":9,"run_id":3}
+{"verb":"wait-ssh-group-run","window_id":1,"tab_id":9,"run_id":3,"timeout_seconds":60}
 ```
 
 ## Waiting, geometry, tabs, and events

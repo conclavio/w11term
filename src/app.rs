@@ -5384,10 +5384,14 @@ impl Component for TerminalApp {
             Message::Control(w11term::control::UiRequest::GetSshGroupRun {
                 tab_id,
                 run_id,
+                wait_for_settlement,
                 reply,
             }) => {
                 if !reply.is_closed() {
-                    let _ = reply.send(self.control_ssh_group_run(tab_id, run_id));
+                    self.control_ssh_group_run(tab_id, run_id, wait_for_settlement, reply);
+                    if wait_for_settlement {
+                        self.update_host_group_timer(context);
+                    }
                 }
             }
             Message::Control(w11term::control::UiRequest::Open {

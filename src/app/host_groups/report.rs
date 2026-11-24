@@ -305,6 +305,7 @@ mod tests {
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
+            control_waiters: Vec::new(),
             transcript: Default::default(),
             results: vec![
                 captured(7, "preview".into(), true),
@@ -430,6 +431,7 @@ mod tests {
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
+            control_waiters: Vec::new(),
             transcript: Default::default(),
             results: vec![
                 captured(7, "雪".repeat(400), false),
@@ -507,6 +509,7 @@ mod tests {
             command_queue: None,
             dispatch_policy: None,
             show_queue_activity: false,
+            control_waiters: Vec::new(),
             transcript: Default::default(),
             results: vec![captured(7, String::new(), false), running, pending],
         };

@@ -219,6 +219,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 103. **Find recipients in command results.** Search historical recipient names and SSH addresses alongside the outcome filter. Scope interrupts and retries to the matching rows, and keep full-run counts and exports.
 104. **Share filtered command results.** Copy the displayed recipient rows or save them as text or JSON. Preserve their order and identify how many original recipients the report covers.
 105. **Read retained group runs from the CLI.** Discover group tabs across the process and read a scoped run's dispatch policy and recipient outcomes without changing focus. Use the original pane and command IDs to retrieve retained shell output.
+106. **Wait for a group run from the CLI.** Return a final result snapshot when every recipient settles, including while the group is in the background. Report timeouts and runs that leave retained history.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

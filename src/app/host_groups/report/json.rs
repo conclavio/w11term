@@ -208,7 +208,10 @@ pub(in crate::app::host_groups) fn summarize_run(submission: &Submission) -> Run
     RunSummary::new(submission, outcomes)
 }
 
-pub(in crate::app::host_groups) fn describe_run(submission: &Submission) -> Value {
+pub(in crate::app::host_groups) fn describe_run(
+    submission: &Submission,
+    require_settlement: bool,
+) -> Option<Value> {
     let now = Instant::now();
     let mut outcomes = Summary::default();
     let recipients: Vec<_> = submission
@@ -223,14 +226,17 @@ pub(in crate::app::host_groups) fn describe_run(submission: &Submission) -> Valu
             Recipient::capture(delivery, &submission.content, execution.as_ref(), now)
         })
         .collect();
-    json!({
+    if require_settlement && outcomes.settled() != outcomes.total() {
+        return None;
+    }
+    Some(json!({
         "schema_version": 1,
         "summary": RunSummary::new(submission, outcomes),
         "command": submission.content.command(),
         "dispatch_policy": submission.dispatch_policy,
         "queue_activity": submission.transcript.queue_activity(),
         "recipients": recipients,
-    })
+    }))
 }
 
 impl Report {

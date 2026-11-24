@@ -26,7 +26,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<(Option<u32>, Request
         match arg.as_str() {
             "find-text" | "wait-for-text" | "events" | "open" | "resize" | "record"
             | "save-text" | "restart" | "list-commands" | "get-command" | "inspect"
-            | "playback" | "list-ssh-groups" | "get-ssh-group-run"
+            | "playback" | "list-ssh-groups" | "get-ssh-group-run" | "wait-ssh-group-run"
                 if verb.is_none() =>
             {
                 ensure!(
@@ -169,6 +169,28 @@ mod tests {
             (Some(7), Request::ListSshGroups)
         ));
         assert!(matches!(
+            parse_line("wait-ssh-group-run --window 11 --tab 12 --run 4 --timeout 7").unwrap(),
+            (
+                None,
+                Request::WaitSshGroupRun {
+                    window_id: 11,
+                    tab_id: 12,
+                    run_id: 4,
+                    timeout_seconds: 7
+                }
+            )
+        ));
+        assert!(matches!(
+            parse_line("wait-ssh-group-run --window 11 --tab 12 --run 4").unwrap(),
+            (
+                None,
+                Request::WaitSshGroupRun {
+                    timeout_seconds: 30,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
             parse_line("--pid 7 get-ssh-group-run --tab 12 --run 4 --window 11").unwrap(),
             (
                 Some(7),
@@ -186,6 +208,9 @@ mod tests {
             "get-ssh-group-run --window 2 --tab 0 --run 4",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --run 5",
             "get-ssh-group-run --window 2 --tab 3 --run 4 --pane 7",
+            "get-ssh-group-run --window 2 --tab 3 --run 4 --timeout 1",
+            "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 0",
+            "wait-ssh-group-run --window 2 --tab 3 --run 4 --timeout 3601",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

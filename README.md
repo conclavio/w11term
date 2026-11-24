@@ -189,7 +189,7 @@ Choose **Save results…** to write a UTF-8 report of the viewed submission. It 
 
 When the result filters show a nonempty subset, use **Copy shown results**, **Save shown results…**, or **Save shown results as JSON…**. These reports keep the displayed recipient order, the original recipient count, and the run's dispatch settings and queue activity. Text reports identify the subset in their heading. JSON reports include `total_recipient_count`, with the shown hosts in `recipients`.
 
-Scripts can discover open groups and read their retained run metadata using `w11term-cli list-ssh-groups` and `get-ssh-group-run`. [SSH group control commands](CONTROL.md#retained-ssh-group-runs)
+Scripts can discover open groups with `w11term-cli list-ssh-groups`, inspect them with `get-ssh-group-run`, and wait for their final outcomes with `wait-ssh-group-run`. [SSH group control commands](CONTROL.md#retained-ssh-group-runs)
 
 Command results, reports, and output recordings show the dispatch settings captured for that run. These settings stay with the run when you change the next draft. **Show queue activity** lists pauses, resumes, canary decisions, and stops with elapsed time since submission. Reports and completed recordings include the most recent 32 queue events and count any earlier events omitted.
 
