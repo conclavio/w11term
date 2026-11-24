@@ -683,6 +683,42 @@ try {
     if ($default.plan.dispatch_policy.queue_expiry_ms -ne 5000 -or $null -ne $noExpiry.plan.dispatch_policy.queue_expiry_ms) {
         throw 'The expiry override changed the configured deadline or failed to disable expiry'
     }
+    Select-GroupOption 'Expire unsent commands' 'Never'
+    Select-GroupOption 'Time between sends' 'No delay'
+    $groupWait = @('wait-ssh-group-run','--window',"$groupWindow",'--tab',"$groupTab",'--timeout','10','--run')
+    $stop = Control ($serialArgs + @('--on-failure','stop','--','policy-stop'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-stop')
+    New-Item -ItemType File -Path (Join-Path $State 'release-policy-stop') | Out-Null
+    $stopped = (Control ($groupWait + @("$($stop.run_id)"))).run
+    if (!$stopped.dispatch_policy.stop_on_failure -or $stopped.dispatch_policy.parallel_limit -ne 1 -or
+        $stopped.recipients[0].execution.exit_code -ne 17 -or
+        $stopped.recipients[1].delivery.reason -cne 'Queue stopped after an unsuccessful host.') {
+        throw 'Stop-on-failure did not keep East unsent after West failed'
+    }
+    $readyForPolicy = @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.West)",'--pane',"$($panes.East)",'--timeout','10')
+    $null = Control $readyForPolicy
+    $keepGoing = Control ($serialArgs + @('--parallel','1','--on-failure','continue','--','policy-continue'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-continue')
+    New-Item -ItemType File -Path (Join-Path $State 'release-policy-continue') | Out-Null
+    $continued = (Control ($groupWait + @("$($keepGoing.run_id)"))).run
+    if ($continued.dispatch_policy.stop_on_failure -or $continued.recipients[0].execution.exit_code -ne 17 -or
+        $continued.recipients[1].execution.exit_code -ne 0) {
+        throw 'Continue-on-failure did not send East after West failed'
+    }
+    $null = Control $readyForPolicy
+    $default = Control ($serialArgs + @('--parallel','1','--dry-run','--','policy-continue'))
+    if (!$default.plan.dispatch_policy.stop_on_failure) {
+        throw 'The per-run failure policy changed the group default'
+    }
+    $failedCanary = Control ($serialArgs + @('--canary',"$($panes.West)",'--on-failure','continue','--','policy-canary'))
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started policy-canary')
+    New-Item -ItemType File -Path (Join-Path $State 'release-policy-canary') | Out-Null
+    $canaryResult = (Control ($groupWait + @("$($failedCanary.run_id)"))).run
+    if ($canaryResult.recipients[0].execution.exit_code -ne 17 -or
+        $canaryResult.recipients[1].delivery.reason -cne 'Canary did not report a successful exit.') {
+        throw 'Continue-on-failure bypassed the failed canary'
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

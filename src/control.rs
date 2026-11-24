@@ -125,6 +125,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queue_expiry_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_on_failure: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         expect_output: Option<SshGroupExpectedOutput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         record_output: Option<PathBuf>,
@@ -688,6 +690,7 @@ impl Registry {
                 parallel_limit,
                 interval_ms,
                 queue_expiry_ms,
+                stop_on_failure,
                 expect_output,
                 record_output,
             } => {
@@ -699,6 +702,7 @@ impl Registry {
                         parallel_limit,
                         interval_ms,
                         queue_expiry_ms,
+                        stop_on_failure,
                     },
                     expect_output,
                     record_output,

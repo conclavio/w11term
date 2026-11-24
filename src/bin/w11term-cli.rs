@@ -372,6 +372,8 @@ mod tests {
             "0",
             "--queue-expiry-ms",
             "1750",
+            "--on-failure",
+            "continue",
             "--dry-run",
             "--expect-output",
             "^READY [0-9]+$",
@@ -389,6 +391,9 @@ mod tests {
         assert_eq!(checked["parallel_limit"], 3);
         assert_eq!(checked["interval_ms"], 0);
         assert_eq!(checked["queue_expiry_ms"], 1750);
+        assert_eq!(checked["stop_on_failure"], false);
+        let (_, stop) = submit(&["--pane", "5", "--on-failure", "stop", "show"]).unwrap();
+        assert_eq!(serde_json::to_value(stop).unwrap()["stop_on_failure"], true);
         assert_eq!(
             checked["expect_output"],
             serde_json::json!({ "query":"^READY [0-9]+$", "regex":true, "match_case":true }),
@@ -413,6 +418,16 @@ mod tests {
             &["--pane", "5", "--parallel", "1", "--parallel", "4", "show"],
             &["--pane", "5", "--interval-ms", "-1", "show"],
             &["--pane", "5", "--queue-expiry-ms", "-1", "show"],
+            &["--pane", "5", "--on-failure", "ignore", "show"],
+            &[
+                "--pane",
+                "5",
+                "--on-failure",
+                "stop",
+                "--on-failure",
+                "continue",
+                "show",
+            ],
             &[
                 "--pane",
                 "5",

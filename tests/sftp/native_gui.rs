@@ -1685,9 +1685,12 @@ async fn native_ssh_group_bounds_parallel_commands() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }
-                        let status = match line {
-                            "halt-on-failure" | "canary-fails" => ";17",
-                            "canary-unknown" => "",
+                        let status = match (name, line) {
+                            (_, "halt-on-failure" | "canary-fails")
+                            | ("West", "policy-stop" | "policy-continue" | "policy-canary") => {
+                                ";17"
+                            }
+                            (_, "canary-unknown") => "",
                             _ => ";0",
                         };
                         let end = format!("{name} finished {line}\r\n\x1b]133;D{status}\x07");
@@ -1728,11 +1731,11 @@ async fn native_ssh_group_bounds_parallel_commands() {
     for (name, _root, server, responder, inputs) in peers {
         let expected = match name {
             "West" => {
-                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\rverify-pacing\rverify-expiry\r"
+                b"roll\rkeep-first\rhalt-on-failure\rinspect\rcanary-ok\rxrestore-promptpace\rskip-middle\rdeadline\rverify-override\rverify-parallel\rverify-pacing\rverify-expiry\rpolicy-stop\rpolicy-continue\rpolicy-canary\r"
                     .as_slice()
             }
             "East" => {
-                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\rverify-pacing\r"
+                b"roll\rinspect\rcanary-ok\rcanary-fails\rcanary-unknown\rcanary-stale\rpace\rdeadline-approval\rverify-override\rverify-parallel\rverify-pacing\rpolicy-continue\r"
             }
             _ => b"xrestore-promptskip-middle\r",
         };

@@ -347,6 +347,13 @@ impl TerminalApp {
         if let Some(expiry_ms) = dispatch.queue_expiry_ms {
             offer.queue_expiry = (expiry_ms != 0).then_some(Duration::from_millis(expiry_ms));
         }
+        if let Some(stop_on_failure) = dispatch.stop_on_failure {
+            offer.stop_queue_on_failure = stop_on_failure;
+            // A failure can withhold unsent work only when there is a dispatch limit or delay.
+            if stop_on_failure && offer.parallel_limit.is_none() && offer.interval.is_zero() {
+                offer.parallel_limit = Some(1);
+            }
+        }
         offer.queue_deadline(Instant::now())?;
         Ok(offer)
     }
