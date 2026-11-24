@@ -24,7 +24,7 @@ pub use group_transcript::{
     GroupTranscriptStream, GroupWriteReceipt,
 };
 pub(crate) use inbox::display_field;
-pub use inbox::{Inbox, NoticeTarget, SshLoginResult};
+pub use inbox::{Inbox, InboxWake, NoticeTarget, SshLoginResult};
 pub(crate) use ssh_attempt::AttemptGuard;
 pub use ssh_attempt::{PendingSshAttempt, SshAttemptCompletion, SshAttemptOutcome};
 
@@ -1006,7 +1006,7 @@ mod tests {
         assert_eq!(inbox.unread_count(), 0);
         let notice = moved_to.rows().pop().unwrap();
         assert_eq!(notice.message, "Recording failed · disk full on D:");
-        assert!(!moved_to.acknowledge_wake());
+        assert!(!moved_to.acknowledge_wake().flash_taskbar);
         let last = pane.since(0).events.pop().unwrap();
         assert_eq!(last.kind, "recording-error");
         assert_eq!(last.data["error"], reason);

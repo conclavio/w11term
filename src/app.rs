@@ -98,6 +98,7 @@ mod tab_title;
 mod tab_windows;
 mod taskbar;
 mod text_export;
+mod visual_bell;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
 use pane_view::PaneSurface;
@@ -359,6 +360,7 @@ struct TabSwitcher {
 }
 #[derive(Clone, Copy)]
 pub enum InteractionField {
+    VisualBell,
     ApplicationTabTitles,
     FailedCommandMarks,
     StickyCommandContext,
@@ -968,6 +970,7 @@ impl PaneArrangement {
 
 pub struct TerminalApp {
     caret_interval: Option<u32>,
+    visual_bell_timer: Option<crate::ui_timer::RetryTimer>,
     folder_wake: Arc<dyn Fn() + Send + Sync>,
     folder_panel_timer: Option<(TabId, crate::ui_timer::RetryTimer)>,
     forward_watch: Option<crate::ui_timer::RetryTimer>,
@@ -1063,6 +1066,7 @@ pub enum Message {
     TabTitle(tab_title::Action),
     Attention(attention::Action),
     AttentionChanged,
+    VisualBellTick,
     ToggleInspector,
     PaletteChoose(command_palette::CommandId),
     PickerQuery(String),
@@ -2367,6 +2371,11 @@ impl TerminalApp {
                 InteractionField::StickyCommandContext,
                 "Show command context in scrollback",
                 appearance.interaction.sticky_command_context,
+            ),
+            (
+                InteractionField::VisualBell,
+                "Show a visual bell",
+                appearance.interaction.visual_bell,
             ),
             (
                 InteractionField::ScrollZoom,
@@ -4762,6 +4771,7 @@ impl Component for TerminalApp {
         });
         let mut app = Self {
             caret_interval: crate::cursor_blink::system_interval(),
+            visual_bell_timer: None,
             folder_wake,
             inbox,
             taskbar: RefCell::default(),
@@ -4936,6 +4946,7 @@ impl Component for TerminalApp {
                 | Message::Pointer(..)
                 | Message::CaptureLost(..)
                 | Message::FinalizeCapture(..)
+                | Message::VisualBellTick
         ) {
             self.header.borrow_mut().take();
         }
@@ -4943,11 +4954,13 @@ impl Component for TerminalApp {
             &message,
             Message::Control(_) | Message::AttentionChanged | Message::FolderAuthority
         ) {
-            if self.inbox.acknowledge_wake()
+            let wake = self.inbox.acknowledge_wake();
+            if wake.flash_taskbar
                 && let Some(hwnd) = self.keyboard.hwnd()
             {
                 attention::flash_background_window(hwnd);
             }
+            self.ring_visual_bells(wake.bells, context);
             self.refresh_open_commands();
             self.watch_control(context);
         }
@@ -5069,6 +5082,7 @@ impl Component for TerminalApp {
             Message::TabTitle(action) => self.edit_tab_title(action, context),
             Message::Attention(action) => self.handle_attention(action, context),
             Message::AttentionChanged | Message::FolderAuthority => {}
+            Message::VisualBellTick => self.expire_visual_bells(),
             Message::ToggleInspector => {
                 self.show_inspector = !self.show_inspector;
                 self.sync_inspector();
@@ -6452,6 +6466,7 @@ impl Component for TerminalApp {
                     InteractionField::StickyCommandContext => {
                         &mut appearance.interaction.sticky_command_context
                     }
+                    InteractionField::VisualBell => &mut appearance.interaction.visual_bell,
                     InteractionField::DetectUrls => &mut appearance.interaction.detect_urls,
                     InteractionField::Osc52 => &mut appearance.interaction.osc52,
                     InteractionField::Osc52ForegroundOnly => {

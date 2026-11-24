@@ -598,6 +598,19 @@ async fn native_ssh_cursor_blinks_while_the_terminal_is_idle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "samples the visual bell outline on a muted SSH split beside another focused pane"]
+async fn native_visual_bell_outlines_only_the_originating_pane() {
+    let (Source::Ssh(mut ssh), _remote, shells, server) = fixture_server(false).await else {
+        unreachable!()
+    };
+    ssh.player.mute = true;
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("visual-bell-ui.ps1", &ssh, state.path());
+    assert_eq!(shells.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "watches OSC 133 commands in a background SSH tab while a real PowerShell stays active"]
 async fn native_command_finish_is_one_shot_and_returns_to_the_same_ssh_pane() {
     let (Source::Ssh(ssh), remote, opens, server) = fixture_connections(false, 1).await else {

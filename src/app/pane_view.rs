@@ -194,6 +194,7 @@ pub(super) struct PaneSurface {
     pub(super) invalidator: Invalidator,
     pub(super) scrollbar: Rc<scrollback_bar::ScrollBar>,
     cursor_blink: Rc<RefCell<crate::cursor_blink::CursorBlink>>,
+    bell: Rc<Cell<visual_bell::Pulse>>,
     pub(super) area: Rc<Cell<Option<(f32, f32, f32)>>>,
     window_grid: Rc<Cell<WindowGrid>>,
     window_size: Rc<Cell<(f64, f64)>>,
@@ -208,6 +209,7 @@ impl PaneSurface {
 
     pub(super) fn release(&self) {
         self.pause_cursor();
+        self.update_bell(Instant::now(), false);
         self.scrollbar.configure(false, false, false);
         self.canvas.borrow_mut().take();
     }
@@ -216,6 +218,26 @@ impl PaneSurface {
         self.cursor_blink
             .borrow_mut()
             .set_focus(false, None, &self.invalidator);
+    }
+
+    pub(super) fn ring_bell(&self, received: Instant, now: Instant) -> bool {
+        let mut pulse = self.bell.get();
+        if !pulse.ring(received, now) {
+            return false;
+        }
+        self.bell.set(pulse);
+        self.invalidator.invalidate();
+        true
+    }
+
+    pub(super) fn update_bell(&self, now: Instant, enabled: bool) -> bool {
+        let mut pulse = self.bell.get();
+        if pulse.visible && (!enabled || pulse.elapsed(now)) {
+            pulse.visible = false;
+            self.bell.set(pulse);
+            self.invalidator.invalidate();
+        }
+        pulse.visible
     }
 
     pub(super) fn remeasure(&self, renderer: &mut Renderer) -> Option<TerminalSize> {
@@ -425,6 +447,8 @@ impl TerminalApp {
         let read_only = tab.read_only.clone();
         let scrollbar = surface.scrollbar.clone();
         let scrollbar_brush = RefCell::new(None);
+        let bell = surface.bell.clone();
+        let bell_brush = RefCell::new(None);
         let hover = tab.hover.clone();
         let hints = self.hints.clone();
         let copy_mode = self.copy_mode.clone();
@@ -474,6 +498,7 @@ impl TerminalApp {
                 let offset = renderer.draw_preedit(ctx, &frame, &preedit.text, preedit.cursor)?;
                 crate::input::ime::position_after_draw(offset, measured.scale);
             }
+            visual_bell::draw(ctx, bell.get().visible, &mut bell_brush.borrow_mut());
             let window_mode = window_grid.get();
             if matches!(window_mode, WindowGrid::Terminal) {
                 if initial_grid

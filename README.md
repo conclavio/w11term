@@ -614,6 +614,8 @@ For a Rustmush profile, select the Rustmush checkbox, generate a device key, and
 
 BEL and names-only OSC 440 sounds support per-profile mute, `system`/`off`/named bells, and verified asset packs fetched over the existing SFTP connection. The complete server contract—including OSC bytes, manifest limits, and Hello fields—is in [Game client protocol v1](docs/game-client-protocol.md). Sprite/font/help assets are cached without installing or executing them. Set `W11TERM_DATA_DIR` to redirect keys, assets, and window placements for portable configuration or isolated tests; appearance settings retain their own override.
 
+Turn on **Settings → Interaction → Show a visual bell** to briefly outline the pane that rings in the foreground window. The outline works with audio muted, leaves focus where it is, and appears at most once per second per pane. Bells from hidden panes still appear in the Attention Inbox. The setting is off by default and is stored as `"visualBell": true` under `interaction`.
+
 Example optional profile settings (all fields may be omitted):
 
 ```json

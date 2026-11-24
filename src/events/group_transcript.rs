@@ -1424,10 +1424,10 @@ mod tests {
             rows[0].message,
             "Group run finished · 1 succeeded · 1 needs attention"
         );
-        assert!(inbox.acknowledge_wake());
+        assert!(inbox.acknowledge_wake().flash_taskbar);
         assert!(inbox.mark_target_read(rows[0].target));
         assert_eq!(inbox.unread_count(), 0);
-        assert!(!inbox.acknowledge_wake());
+        assert!(!inbox.acknowledge_wake().flash_taskbar);
     }
 
     #[test]

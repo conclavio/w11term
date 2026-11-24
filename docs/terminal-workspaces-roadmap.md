@@ -88,6 +88,8 @@ Add Windows IME composition and candidate positioning for the focused pane. Expo
 
 **Acceptance.** Compose and commit text with a Windows IME while switching between panes, read a terminal selection with Narrator, and compare representative text and image fixtures against reference renders. Check that idle panes stay idle and a continuously updating pane leaves its neighbor responsive.
 
+**Visual bell.** Offer a brief outline on the originating visible pane, independent of bell audio, with a per-pane rate limit and the same inbox history for hidden panes.
+
 ## Release 5 · Local PowerShell via ConPTY
 
 Add **Local PowerShell** to the same **+** and split menus as SSH profiles. A local profile identifies a Windows executable, its arguments and an optional starting directory. Offer PowerShell 7 (`pwsh.exe`) when installed and Windows PowerShell (`powershell.exe`) under its own label. A saved workspace records which executable to launch. Reopening it starts a fresh local process.
