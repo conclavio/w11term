@@ -80,6 +80,7 @@ pub(super) struct HostGroup {
     next_submission: u64,
     copy_feedback: String,
     result_filter: progress::Filter,
+    recipient_search: filter::Filter,
     result_order: progress::ResultOrder,
     live_output: Option<Box<live_output::State>>,
     comparison: compare::State,
@@ -593,6 +594,7 @@ impl HostGroup {
         self.next_submission += 1;
         self.viewing = self.next_submission;
         self.result_filter = progress::Filter::All;
+        self.recipient_search.clear();
         if let SubmissionContent::Command(command) = &content {
             self.recent_commands.record(self.viewing, command.clone());
             self.previous_draft = None;
@@ -715,6 +717,7 @@ pub enum Action {
     CloseEnded(TabId, close_ended::Action),
     Disconnect(TabId, disconnect::Action),
     FilterResults(TabId, u64, progress::Filter),
+    SearchRecipients(TabId, u64, String),
     OrderResults(TabId, u64, progress::ResultOrder),
     LoadCommand(TabId, u64),
     PrepareRetry(TabId, u64, BTreeSet<u64>),
@@ -1160,7 +1163,7 @@ impl TerminalApp {
                 eligible.contains(&pane)
                     && run.results.iter().any(|delivery| {
                         delivery.target.pane == pane
-                            && page.result_filter.includes(progress::Outcome::of(delivery))
+                            && page.matches_result(delivery, progress::Outcome::of(delivery))
                             && delivery.interrupt_target() == Some(link)
                     })
             })
@@ -1446,6 +1449,13 @@ impl TerminalApp {
                     && page.viewed_submission(submission).is_some()
                 {
                     page.result_filter = filter;
+                }
+            }
+            Action::SearchRecipients(id, submission, query) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && page.viewed_submission(submission).is_some()
+                {
+                    page.recipient_search.set_query(query);
                 }
             }
             Action::OrderResults(id, submission, order) => {
@@ -2353,8 +2363,7 @@ impl TerminalApp {
                 let outcome =
                     progress::Outcome::with_execution(&delivery.status, execution.as_ref());
                 summary.add(outcome);
-                page.result_filter
-                    .includes(outcome)
+                page.matches_result(delivery, outcome)
                     .then_some((delivery, execution))
             })
             .collect();
@@ -2421,6 +2430,40 @@ impl TerminalApp {
                         Message::HostGroup(Action::OrderResults(id, submission_id, order))
                     })
             }));
+        let recipient_search = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(8.0)
+            .children((
+                TextBox::new()
+                    .automation_name("Search result recipients")
+                    .placeholder_text("Search by profile, pane, or SSH address")
+                    .text(page.recipient_search.query())
+                    .on_text_changed(ctx.callback(move |query| {
+                        Message::HostGroup(Action::SearchRecipients(id, submission_id, query))
+                    })),
+                Button::new()
+                    .grid_column(1)
+                    .is_enabled(!page.recipient_search.query().is_empty())
+                    .on_click(ctx.callback(move |_| {
+                        Message::HostGroup(Action::SearchRecipients(
+                            id,
+                            submission_id,
+                            String::new(),
+                        ))
+                    }))
+                    .content("Clear recipient search"),
+            ));
+        let result_count = if shown.len() != summary.total() {
+            TextBlock::new()
+                .text(format!(
+                    "Showing {} of {} recipients",
+                    shown.len(),
+                    summary.total()
+                ))
+                .into()
+        } else {
+            View::empty()
+        };
         details.push(KeyedView::new(
             "results",
             StackPanel::new().spacing(4.0).children((
@@ -2503,6 +2546,8 @@ impl TerminalApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
                     .children((result_filter, result_order)),
+                recipient_search,
+                result_count,
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)

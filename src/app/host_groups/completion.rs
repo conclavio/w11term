@@ -26,6 +26,7 @@ impl TerminalApp {
             page.viewing = run;
             page.preview_command_order = false;
             page.result_filter = progress::Filter::All;
+            page.recipient_search.clear();
             page.copy_feedback.clear();
             page.live_output = None;
             page.comparison.close();

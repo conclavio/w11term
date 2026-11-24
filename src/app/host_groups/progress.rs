@@ -1,4 +1,4 @@
-use super::{Delivery, DeliveryStatus, GroupExecution};
+use super::{Delivery, DeliveryStatus, GroupExecution, HostGroup};
 use std::{cmp::Reverse, time::Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +88,13 @@ pub(super) const FILTERS: [(Filter, &str); 6] = [
 impl Filter {
     pub(super) fn includes(self, outcome: Outcome) -> bool {
         self == Self::All || self == Self::Only(outcome)
+    }
+}
+
+impl HostGroup {
+    pub(super) fn matches_result(&self, delivery: &Delivery, outcome: Outcome) -> bool {
+        self.result_filter.includes(outcome)
+            && self.recipient_search.matches_query(&delivery.target)
     }
 }
 

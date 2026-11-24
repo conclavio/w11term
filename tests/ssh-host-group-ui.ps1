@@ -111,6 +111,10 @@ function Select-ComboValue([string]$ControlName, [string]$Name) {
 function Set-ResultFilter([string]$Name) {
     Select-ComboValue 'Filter submission results' $Name
 }
+function Set-RecipientSearch([string]$Query) {
+    $field = Wait-Until 'result recipient search' { Find-Element 'Search result recipients' $edit }
+    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+}
 function Expect-PaneButtonOrder([string]$Prefix, [uint64[]]$Panes) {
     $expected = ($Panes | ForEach-Object { "$Prefix$_" }) -join '|'
     $null = Wait-Until "pane order '$expected'" {
@@ -279,7 +283,17 @@ try {
     Select-ComboValue 'Sort submission results' 'Longest shell time'
     Expect-ResultOrder @($west, $east)
     $null = Wait-Until 'East output in the group' { Find-Element 'east-accepted both' }
+    Set-RecipientSearch "WEST TEST@127.0.0.1:$($profileData.West.port)"
+    Expect-ResultOrder @($west)
+    Result-Progress 'Showing 1 of 2 recipients'
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
+    Set-ResultFilter 'Succeeded'
+    Expect-ResultOrder @()
+    Result-Progress 'Showing 0 of 2 recipients'
+    Click 'Clear recipient search'
+    Expect-ResultOrder @($east)
+    Set-ResultFilter 'All results'
+    Expect-ResultOrder @($west, $east)
     $liveButton = 'Live output' + [char]0x2026
     Click $liveButton
     $null = Wait-Until 'completed East output in the live feed' {
@@ -453,6 +467,8 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-Until 'West remains hidden after host list export' { !(Find-Element "Focus pane $west" $button) }
     $null = Wait-Until 'the full East output is retained' { Find-Element "View output for pane $east" $button }
+    Set-RecipientSearch 'east'
+    Expect-ResultOrder @($east)
     Click 'Copy results'
     $null = Wait-Until 'the current report contains full output and both host outcomes' {
         $report = Read-ClipboardFixture
@@ -463,6 +479,7 @@ try {
             $report.Contains("$westName${dot}Not sent${dot}Waiting for a fresh prompt")
     }
     $null = Wait-Until 'copy confirmation' { Find-Element 'Copied results' }
+    Click 'Clear recipient search'
     $saveResults = 'Save results' + [char]0x2026
     $destination = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'ssh-group-submission-3.txt'
     Click $saveResults
@@ -880,9 +897,18 @@ try {
     $null = Wait-Until 'East is selected and hidden' {
         Find-Element '1 selected host is hidden by the filter.'
     }
+    Set-RecipientSearch 'east'
+    Expect-ResultOrder @($east)
+    $null = Wait-Until 'disjoint roster and result filters disable interrupt' {
+        $entry = Find-Element 'Interrupt selected' $button
+        $entry -and !$entry.Current.IsEnabled
+    }
+    Set-RecipientSearch 'west'
+    Expect-ResultOrder @($west)
     Click 'Interrupt selected'
     Outcome $westName 'Ctrl+C sent'
     Outcome $westName 'Exit 130'
+    Click 'Clear recipient search'
     Outcome $eastName 'Running'
     $null = Wait-Until 'only hidden East remains running' {
         $entry = Find-Element 'Interrupt selected' $button
@@ -906,10 +932,15 @@ try {
     Click 'Interrupt selected'
     Outcome $eastName 'Exit 130'
     Outcome $westName 'Exit 130'
+    Set-RecipientSearch 'west'
+    Expect-ResultOrder @($west)
     Click 'Previous submission'
     $null = Wait-Until 'show the previous interrupt' { Find-Element "Submitted${dot}interrupt-pair" }
+    Expect-ResultOrder @($west)
     Click 'Previous submission'
     $null = Wait-Until 'show the command to load' { Find-Element "Submitted${dot}after-reconnect" }
+    Expect-ResultOrder @($west)
+    Click 'Clear recipient search'
     Set-HostFilter 'west'
     $null = Wait-Until 'East is selected but hidden during reuse' {
         Find-Element '1 selected host is hidden by the filter.'
