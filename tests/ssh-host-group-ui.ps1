@@ -686,7 +686,7 @@ try {
     $null = Wait-Until 'accept recording before dispatch' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'submission is attached to its recording' { Find-Element "Submitted$($dot)record-fast" }
     Outcome $eastName 'Exit 0'
-    Outcome $westName 'Exit 0'
+    Outcome $westName 'Sent to SSH channel'
     $newLogs = @(Get-ChildItem -LiteralPath $env:W11TERM_EXPORT_SMOKE_DIR -Filter 'ssh-group-output-*.txt' |
         Where-Object Name -NotIn $previousLogs.Name)
     if ($newLogs.Count -ne 1 -or $newLogs[0].Name -notmatch '^ssh-group-output-(\d+)\.txt$') {
@@ -694,12 +694,26 @@ try {
     }
     $nextName = "ssh-group-output-$([int]$Matches[1] + 1).txt"
     $burstPath = $newLogs[0].FullName
-    Click $liveButton
-    Click 'Stop recording'
+    $logReader = Open-PeerTraceReader $burstPath
+    $null = Wait-Until 'the recorder is still open with West awaiting its result' {
+        $captured = [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader))
+        $captured.Contains("$eastName$($dot)east record row 79") -and !$captured.Contains('[Group run settled]')
+    }
+    Click "Focus pane $west"
+    Wait-Focus $west
+    [IO.File]::WriteAllText((Join-Path $State 'release-record-fast'), '')
+    $null = Wait-Until 'the recording ends automatically with the terminal tab focused' {
+        [Text.Encoding]::UTF8.GetString((Read-PeerTrace $logReader)).Contains('[Group run settled]')
+    }
+    $logReader.Dispose()
+    $logReader = $null
+    Run-Palette 'SSH host group'
+    Outcome $westName 'Exit 0'
     Wait-RecordingStatus 'Saved live output to ' $burstPath
     $burst = [IO.File]::ReadAllLines($burstPath)
-    if ($burst[0] -cne "Submitted$($dot)record-fast" -or $burst[-1] -cne '[Recording stopped]') {
-        throw 'The recorded submission is missing its header or footer'
+    if ($burst[0] -cne "Submitted$($dot)record-fast" -or $burst[-2] -cne "$westName$($dot)west record tail" -or
+        $burst[-1] -cne '[Group run settled]') {
+        throw 'The automatic recording is missing the header, final output line, or completion marker'
     }
     foreach ($side in @('east', 'west')) {
         $prefix = if ($side -eq 'east') { $eastName + $dot } else { $westName + $dot }
@@ -709,7 +723,6 @@ try {
             throw "Unexpected burst from $side ($($actual.Count) of 80 rows): $($actual -join ', ')"
         }
     }
-    Click 'Back to results'
     $beforeCollision = [IO.File]::ReadAllText($burstPath)
     (Command-Editor).SetValue('never-send-on-collision')
     Click $sendRecorded

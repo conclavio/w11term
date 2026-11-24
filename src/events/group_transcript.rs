@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use wezterm_term::LiveOutputBatch;
 
 const TRANSCRIPT_LINES: usize = 128;
@@ -17,7 +17,30 @@ pub struct GroupTranscript(Arc<Mutex<Transcript>>);
 #[derive(Debug, Default)]
 struct Transcript {
     snapshot: GroupTranscriptSnapshot,
-    recording: Option<broadcast::Sender<GroupTranscriptLine>>,
+    recording: Option<Recording>,
+    next_recording: u64,
+    hosts: usize,
+    dispatch_finished: bool,
+}
+
+#[derive(Debug)]
+struct Recording {
+    id: u64,
+    mode: GroupRecordingMode,
+    incoming: broadcast::Sender<GroupTranscriptLine>,
+    ended: oneshot::Sender<GroupRecordingEnd>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupRecordingMode {
+    Manual,
+    UntilSettled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupRecordingEnd {
+    Stopped,
+    Settled,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -56,23 +79,33 @@ impl GroupWriteReceipt {
 
 pub struct GroupTranscriptRecording {
     transcript: GroupTranscript,
+    id: u64,
 }
 
 impl Drop for GroupTranscriptRecording {
     fn drop(&mut self) {
-        // Close the only sender. The file writer can drain its last queued
-        // lines before it reports that the recording has stopped.
-        self.transcript.0.lock().unwrap().recording = None;
+        let mut transcript = self.transcript.0.lock().unwrap();
+        if transcript
+            .recording
+            .as_ref()
+            .is_some_and(|recording| recording.id == self.id)
+        {
+            transcript.finish_recording(GroupRecordingEnd::Stopped);
+        }
     }
 }
 
 pub struct GroupTranscriptStream {
     pub history: GroupTranscriptSnapshot,
     pub incoming: broadcast::Receiver<GroupTranscriptLine>,
+    pub ended: oneshot::Receiver<GroupRecordingEnd>,
 }
 
 impl GroupTranscript {
     pub fn host(&self, pane: u64) -> GroupTranscriptHost {
+        let mut transcript = self.0.lock().unwrap();
+        debug_assert!(!transcript.dispatch_finished);
+        transcript.hosts += 1;
         GroupTranscriptHost {
             transcript: self.clone(),
             pane,
@@ -80,11 +113,22 @@ impl GroupTranscript {
         }
     }
 
+    /// All hosts have been offered the submission. A host remains tracked
+    /// while its command is queued or being observed by its session.
+    pub fn finish_dispatch(&self) {
+        let mut transcript = self.0.lock().unwrap();
+        transcript.dispatch_finished = true;
+        transcript.finish_if_settled();
+    }
+
     pub fn snapshot(&self) -> GroupTranscriptSnapshot {
         self.0.lock().unwrap().snapshot.clone()
     }
 
-    pub fn start_recording(&self) -> Option<(GroupTranscriptRecording, GroupTranscriptStream)> {
+    pub fn start_recording(
+        &self,
+        mode: GroupRecordingMode,
+    ) -> Option<(GroupTranscriptRecording, GroupTranscriptStream)> {
         let mut transcript = self.0.lock().unwrap();
         if transcript.recording.is_some() {
             return None;
@@ -92,15 +136,34 @@ impl GroupTranscript {
         // Take the history and subscribe under the same lock so the first live
         // line comes immediately after the last retained line.
         let (send, incoming) = broadcast::channel(RECORDING_QUEUE);
-        transcript.recording = Some(send);
+        let (finish, ended) = oneshot::channel();
+        transcript.next_recording += 1;
+        let id = transcript.next_recording;
+        transcript.recording = Some(Recording {
+            id,
+            mode,
+            incoming: send,
+            ended: finish,
+        });
         let stream = GroupTranscriptStream {
             history: transcript.snapshot.clone(),
             incoming,
+            ended,
         };
         let recording = GroupTranscriptRecording {
             transcript: self.clone(),
+            id,
         };
+        transcript.finish_if_settled();
         Some((recording, stream))
+    }
+}
+
+impl Drop for GroupTranscriptHost {
+    fn drop(&mut self) {
+        let mut transcript = self.transcript.0.lock().unwrap();
+        transcript.hosts -= 1;
+        transcript.finish_if_settled();
     }
 }
 
@@ -136,6 +199,26 @@ impl GroupTranscriptHost {
 }
 
 impl Transcript {
+    fn finish_if_settled(&mut self) {
+        if self.dispatch_finished
+            && self.hosts == 0
+            && self
+                .recording
+                .as_ref()
+                .is_some_and(|recording| recording.mode == GroupRecordingMode::UntilSettled)
+        {
+            self.finish_recording(GroupRecordingEnd::Settled);
+        }
+    }
+
+    fn finish_recording(&mut self, reason: GroupRecordingEnd) {
+        if let Some(recording) = self.recording.take() {
+            // Publish the reason before closing the only line sender. The
+            // writer reads it only after draining the remaining lines.
+            let _ = recording.ended.send(reason);
+        }
+    }
+
     fn push(&mut self, pane: u64, text: impl Into<Arc<str>>, shortened: bool) {
         let snapshot = &mut self.snapshot;
         let id = snapshot.lines.back().map_or(1, |line| line.id + 1);
@@ -150,7 +233,7 @@ impl Transcript {
             shortened,
         };
         if let Some(recording) = &self.recording {
-            let _ = recording.send(line.clone());
+            let _ = recording.incoming.send(line.clone());
         }
         snapshot.lines.push_back(line);
     }
@@ -205,8 +288,14 @@ mod tests {
             });
         };
         append(1, "earlier");
-        let (recording, mut stream) = transcript.start_recording().unwrap();
-        assert!(transcript.start_recording().is_none());
+        let (recording, mut stream) = transcript
+            .start_recording(GroupRecordingMode::Manual)
+            .unwrap();
+        assert!(
+            transcript
+                .start_recording(GroupRecordingMode::Manual)
+                .is_none()
+        );
         append(2, "after launch");
         drop(recording);
         append(1, "after stop");
@@ -219,6 +308,66 @@ mod tests {
             Err(TryRecvError::Closed)
         ));
         assert_eq!(transcript.snapshot().lines.len(), 3);
-        assert!(transcript.start_recording().is_some());
+        assert_eq!(stream.ended.try_recv().unwrap(), GroupRecordingEnd::Stopped);
+        assert!(
+            transcript
+                .start_recording(GroupRecordingMode::Manual)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn automatic_recording_waits_for_dispatch_and_every_host_and_keeps_the_final_line() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let append = |host: &GroupTranscriptHost, text: &str| {
+            host.append(LiveOutputBatch {
+                lines: vec![LiveOutputLine {
+                    text: text.to_owned(),
+                    shortened: false,
+                }],
+                gap: false,
+            });
+        };
+        let transcript = GroupTranscript::default();
+        let (recording, mut stream) = transcript
+            .start_recording(GroupRecordingMode::UntilSettled)
+            .unwrap();
+        let east = transcript.host(1);
+        append(&east, "first");
+        drop(east);
+        assert_eq!(&*stream.incoming.try_recv().unwrap().text, "first");
+        assert!(matches!(
+            stream.incoming.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+
+        let west = transcript.host(2);
+        let rejected = transcript.host(3);
+        transcript.finish_dispatch();
+        drop(rejected);
+        assert!(matches!(
+            stream.incoming.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        append(&west, "last");
+        drop(west);
+        assert_eq!(&*stream.incoming.try_recv().unwrap().text, "last");
+        assert!(matches!(
+            stream.incoming.try_recv(),
+            Err(TryRecvError::Closed)
+        ));
+        assert_eq!(stream.ended.try_recv().unwrap(), GroupRecordingEnd::Settled);
+
+        let (new_recording, mut manual) = transcript
+            .start_recording(GroupRecordingMode::Manual)
+            .unwrap();
+        drop(recording);
+        assert!(matches!(
+            manual.incoming.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        drop(new_recording);
+        assert_eq!(manual.ended.try_recv().unwrap(), GroupRecordingEnd::Stopped);
     }
 }
