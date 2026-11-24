@@ -149,7 +149,7 @@ Use **Sort submission results** to show the longest or shortest shell times firs
 
 Choose **Load command** on a previous submission to put its exact text back in the group editor. Edit it if needed, check the current host selection, then choose **Send** to run it. **Restore draft** recovers the text you were editing before loading from history.
 
-Choose **Recent commands…** or find **Recent group commands…** in the command palette to search the last 50 distinct commands submitted from this tab, newest first. Search matches the full command without regard to case. Press Enter to load the selected command as a draft or Esc to return to your current draft. The host filter and checked hosts stay as they are. Recent commands are kept in memory for the life of the group tab.
+Press **Ctrl+R** in an SSH host group, choose **Recent commands…**, or find **Recent group commands…** in the command palette to search the last 50 distinct commands submitted from this tab, newest first. Search matches the full command without regard to case. Press Enter to load the selected command as a draft or Esc to return to your current draft. The host filter and checked hosts stay as they are. Recent commands are kept in memory for the life of the group tab.
 
 Choose **Prepare retry** to load the exact command and select original recipients with a confirmed nonzero exit or withheld delivery. The roster and result filters scope the selection to the hosts you can see. Review the command and checked hosts, then choose **Send** when the targets have fresh prompts. **Restore draft** also restores the previous host selection and roster filter. Unconfirmed delivery and exit outcomes remain available in **Needs attention** for inspection.
 

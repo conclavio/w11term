@@ -1907,9 +1907,18 @@ impl TerminalApp {
         let saved_commands = Button::new()
             .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenSavedCommands(id))))
             .content("Saved commands…");
+        let recall = ctx.sender();
         let recent_commands = Button::new()
+            .automation_name("Recent commands…")
+            .key_accelerators(KeyAccelerators::new([KeyAccelerator::new(
+                AcceleratorKey::R,
+                AcceleratorModifiers::Control,
+                move || {
+                    recall.send(Message::HostGroup(Action::OpenRecentCommands(id)));
+                },
+            )]))
             .on_click(ctx.callback(move |_| Message::HostGroup(Action::OpenRecentCommands(id))))
-            .content("Recent commands…");
+            .content("Recent commands…  Ctrl+R");
         let save_command = page.command_save.button(id, &page.draft, ctx);
         let restore = if page.previous_draft.is_some() {
             Button::new()

@@ -4,6 +4,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
+Add-Type -AssemblyName System.Windows.Forms
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'group-result-clipboard.txt'
@@ -1100,10 +1101,17 @@ try {
     $null = Wait-Until 'Escape closes recent search' { !(Find-Element $recent $edit) }
     if ((Command-Editor).Current.Value -cne 'unsent recent witness') { throw 'Escape changed the draft' }
     Run-Palette ('Recent group commands' + [char]0x2026)
-    $null = Wait-Until 'recent search receives keyboard focus' {
-        $field = Find-Element $recent $edit
-        $field -and $field.Current.HasKeyboardFocus
+    $null = Wait-PickerEditor $recent 'Recent group commands from the palette'
+    Press-Key 27
+    $null = Wait-Until 'the palette search closes' { !(Find-Element $recent $edit) }
+    $entry = Wait-Until 'the SSH group command editor' { Find-Element 'Group command' $edit }
+    $entry.SetFocus()
+    $null = Wait-Until 'fixture owns input in its command editor' {
+        $entry.Current.HasKeyboardFocus -and [FixtureMessages]::GetForegroundWindow() -eq $window
     }
+    if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'Fixture lost keyboard input' }
+    [Windows.Forms.SendKeys]::SendWait('^r')
+    $null = Wait-PickerEditor $recent 'Ctrl+R'
     (Command-Editor $recent).SetValue('WHILE-SLO')
     $null = Wait-Until 'recent search finds an older full command without regard to case' {
         (Find-Element 'while-slow' $button) -and !(Find-Element 'shared-status' $button)
