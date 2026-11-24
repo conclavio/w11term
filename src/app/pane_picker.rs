@@ -224,7 +224,7 @@ impl Choice {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Mode {
-    Commands(Option<TabId>),
+    Commands(command_palette::Search),
     Focus,
     Text,
     Destination { source: TabId },
@@ -288,13 +288,13 @@ impl Picker {
         if self.mode == Mode::Text {
             return self.text_view(app, ctx);
         }
-        if let Mode::Commands(group_library) = self.mode {
+        if let Mode::Commands(search) = self.mode {
             return command_palette::view(
                 &self.commands,
                 self.selected,
                 &self.query,
                 &self.input,
-                group_library.is_some(),
+                search,
                 app,
                 ctx,
             );
@@ -554,7 +554,7 @@ impl TerminalApp {
             }
             return;
         }
-        self.start_picker(Mode::Commands(None), ctx);
+        self.start_picker(Mode::Commands(command_palette::Search::Window), ctx);
     }
 
     pub(super) fn open_group_command_library(
@@ -562,12 +562,31 @@ impl TerminalApp {
         group: TabId,
         ctx: &ComponentContext<Self>,
     ) {
-        self.start_picker(Mode::Commands(Some(group)), ctx);
+        self.start_picker(
+            Mode::Commands(command_palette::Search::GroupLibrary(group)),
+            ctx,
+        );
+    }
+
+    pub(super) fn open_group_recent_commands(
+        &mut self,
+        group: TabId,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.start_picker(
+            Mode::Commands(command_palette::Search::GroupRecent(group)),
+            ctx,
+        );
     }
 
     fn picker_command_rows(&self, mode: Mode, query: &str) -> Vec<command_palette::Row> {
         match mode {
-            Mode::Commands(Some(group)) => self.group_saved_command_rows(group, query),
+            Mode::Commands(command_palette::Search::GroupLibrary(group)) => {
+                self.group_saved_command_rows(group, query)
+            }
+            Mode::Commands(command_palette::Search::GroupRecent(group)) => {
+                self.group_recent_command_rows(group, query)
+            }
             _ => self.command_rows(query),
         }
     }
@@ -648,10 +667,15 @@ impl TerminalApp {
             self.finish_switcher(false, ctx);
         }
         let (matches, commands) = if mode.has_commands() {
-            if mode == Mode::Commands(None) {
+            if mode == Mode::Commands(command_palette::Search::Window) {
                 self.refresh_profiles();
             }
-            self.reload_saved_commands();
+            if !matches!(
+                mode,
+                Mode::Commands(command_palette::Search::GroupRecent(_))
+            ) {
+                self.reload_saved_commands();
+            }
             (vec![], self.picker_command_rows(mode, ""))
         } else if mode == Mode::Text {
             (vec![], vec![])

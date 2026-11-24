@@ -774,6 +774,34 @@ try {
     $null = Wait-CheckBox $westName On
     Pane-Status $east "Connected$($dot)Ready"
     Pane-Status $west "Connected$($dot)Ready"
+    $recent = 'Search recent group commands'
+    (Command-Editor).SetValue('unsent recent witness')
+    Set-HostFilter 'west'
+    Click ('Recent commands' + [char]0x2026)
+    (Command-Editor $recent).SetValue('never-submitted-witness')
+    $null = Wait-Until 'recent search reports no matches' { Find-Element 'No matching recent commands' }
+    Press-Key 27
+    $null = Wait-Until 'Escape closes recent search' { !(Find-Element $recent $edit) }
+    if ((Command-Editor).Current.Value -cne 'unsent recent witness') { throw 'Escape changed the draft' }
+    Run-Palette ('Recent group commands' + [char]0x2026)
+    $null = Wait-Until 'recent search receives keyboard focus' {
+        $field = Find-Element $recent $edit
+        $field -and $field.Current.HasKeyboardFocus
+    }
+    (Command-Editor $recent).SetValue('WHILE-SLO')
+    $null = Wait-Until 'recent search finds an older full command without regard to case' {
+        (Find-Element 'while-slow' $button) -and !(Find-Element 'shared-status' $button)
+    }
+    Press-Key 13
+    Wait-CommandDraft 'while-slow'
+    $null = Wait-Until 'recall leaves the current submission and hidden East selection in place' {
+        (Find-Element "Submitted${dot}shared-status") -and
+        (Find-Element '1 selected host is hidden by the filter.')
+    }
+    $null = Wait-CheckBox $westName On
+    Click 'Restore draft'
+    Wait-CommandDraft 'unsent recent witness'
+    Set-HostFilter ''
     $sendRecorded = 'Send and record' + [char]0x2026
     (Command-Editor).SetValue('record-fast')
     Click $sendRecorded
