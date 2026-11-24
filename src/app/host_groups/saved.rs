@@ -580,6 +580,7 @@ mod tests {
         let target = |pane, profile: Option<&str>| Target {
             pane,
             name: format!("Pane {pane}"),
+            names: Default::default(),
             profile: profile.map(str::to_owned),
             connected: true,
             state: TargetState::InUse,
