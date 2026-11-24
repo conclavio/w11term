@@ -213,10 +213,11 @@ function Run-Palette([string]$Command) {
                 return $true
             }
         } catch {
-            if ($_.Exception.GetBaseException() -isnot [System.Windows.Automation.ElementNotAvailableException]) {
-                throw
-            }
-            # The provider can also disappear between lookup and Invoke.
+            # Invoke on a retired WinUI provider can return either error.
+            $cause = $_.Exception.GetBaseException()
+            $retired = $cause -is [System.Windows.Automation.ElementNotAvailableException] -or
+                       ($cause -is [Runtime.InteropServices.COMException] -and $cause.HResult -eq -2147467259) # E_FAIL
+            if (!$retired) { throw }
         }
     }
     $null = Wait-Until 'picker to close' { !(Find-Element 'Search commands') }
