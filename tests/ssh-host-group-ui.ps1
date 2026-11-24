@@ -7,6 +7,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'group-result-clipboard.txt'
+$env:W11TERM_TEST_EXPLORER_TRACE = Join-Path $State 'recording-explorer.json'
 $env:W11TERM_EXPORT_SMOKE_DIR = Join-Path $State 'exports'
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_EXPORT_SMOKE_DIR)
 $null = [IO.Directory]::CreateDirectory($env:W11TERM_DATA_DIR)
@@ -70,9 +71,9 @@ function Submit([string]$Text, [string]$ButtonName) {
 function Outcome([string]$Target, [string]$Status) {
     $null = Wait-Until "$Target $Status" { Find-Element "$Target$dot$Status" }
 }
-function Result-FilterPopup([string]$Expected) {
-    Wait-Until "submission result filter '$Expected'" {
-        $entry = Find-Element 'Filter submission results' ([System.Windows.Automation.ControlType]::ComboBox)
+function Combo-Popup([string]$ControlName, [string]$Expected) {
+    Wait-Until "combo '$ControlName' with selection '$Expected'" {
+        $entry = Find-Element $ControlName ([System.Windows.Automation.ControlType]::ComboBox)
         $provider = $null
         $selection = $null
         if ($entry -and $entry.TryGetCurrentPattern(
@@ -85,9 +86,9 @@ function Result-FilterPopup([string]$Expected) {
         }
     }
 }
-function Set-ResultFilter([string]$Name) {
-    (Result-FilterPopup '').Expand()
-    $choice = Wait-Until "result filter '$Name'" {
+function Select-ComboValue([string]$ControlName, [string]$Name) {
+    (Combo-Popup $ControlName '').Expand()
+    $choice = Wait-Until "combo item '$Name'" {
         $entry = Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
         $provider = $null
         if ($entry -and $entry.Current.IsEnabled -and !$entry.Current.IsOffscreen -and
@@ -96,8 +97,11 @@ function Set-ResultFilter([string]$Name) {
         }
     }
     $choice.Select()
-    $popup = Result-FilterPopup $Name
+    $popup = Combo-Popup $ControlName $Name
     if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+}
+function Set-ResultFilter([string]$Name) {
+    Select-ComboValue 'Filter submission results' $Name
 }
 function Result-Progress([string]$Caption) {
     $null = Wait-Until 'submission progress counts' { Find-Element $Caption }
@@ -112,24 +116,25 @@ function Click([string]$Name) {
     $invoke.Invoke()
 }
 
-function Wait-RecordingStatus([string]$Prefix, [string]$Path) {
+function Wait-RecordingStatus([string]$Prefix, [string]$Path, [switch]$PassThru) {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $text = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Text)
     $last = @{ Status = @() }
     try {
-        $null = Wait-Until "$Prefix$Path" {
+        $reported = Wait-Until "$Prefix$Path" {
             $last.Status = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $text) |
                 ForEach-Object { $_.Current.Name } |
                 Where-Object { $_ -match 'recording|record live output|live output to|output file' })
             foreach ($name in $last.Status) {
                 if ($name.StartsWith($Prefix, [StringComparison]::Ordinal) -and
                     [FixtureDialog]::SameFile($Path, $name.Substring($Prefix.Length))) {
-                    return $true
+                    return $name.Substring($Prefix.Length)
                 }
             }
         }
+        if ($PassThru) { return $reported }
     } catch {
         throw "$($_.Exception.Message). Recording statuses: $($last.Status -join ' | '). Expected file exists: $([IO.File]::Exists($Path))."
     }
@@ -139,6 +144,8 @@ $launchArgs = @('--profiles',('"' + $profiles + '"'),'--profile','East',
     '--tab','West','--tab','"Local witness"','--cols','95','--rows','32')
 $app = Start-Process -FilePath $Gui -ArgumentList $launchArgs -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 $logReader = $null
+$explorer = $null
+$priorExplorerWindows = @()
 try {
     $window = Wait-InputWindow
     $sessions = (Control @('list')).sessions
@@ -259,7 +266,7 @@ try {
         (Find-Element 'SSH group live output') -and (Find-Element 'west while paused')
     }
     Click 'Stop recording'
-    Wait-RecordingStatus 'Saved live output to ' $logFile
+    $firstRecordedPath = Wait-RecordingStatus 'Saved live output to ' $logFile -PassThru
     $logReader.Dispose()
     $logReader = $null
     $recorded = [IO.File]::ReadAllText($logFile)
@@ -423,7 +430,47 @@ try {
     $null = Wait-Until 'completed West output in the earlier live feed' {
         (Find-Element 'west-accepted both') -and (Find-Element 'west while paused')
     }
+    Click $recordOutput
+    $dialog = Wait-Until 'picker for a second recording of the same submission' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'cancel the second recording' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'dismiss the cancelled picker' { !(Find-OwnedDialog 'Record SSH group output') }
+    Wait-RecordingStatus 'Saved live output to ' $logFile
+    Click $recordOutput
+    $dialog = Wait-Until 'picker for the second saved recording' { Find-OwnedDialog 'Record SSH group output' }
+    $secondRecording = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'live both second.txt'
+    $null = Wait-Until 'enter the distinct recording path' {
+        [FixtureDialog]::SetFilename($dialog, $secondRecording, 'ssh-group-output-2.txt')
+    }
+    $null = Wait-Until 'save the second recording' { [FixtureDialog]::ClickButton($dialog, 1) }
+    Wait-RecordingStatus 'Recording live output to ' $secondRecording
+    Click 'Stop recording'
+    Wait-RecordingStatus 'Saved live output to ' $secondRecording
+    Select-ComboValue 'Saved recordings' $firstRecordedPath
+    Wait-RecordingStatus 'Saved live output to ' $logFile
+    Click 'Copy recording path'
+    $null = Wait-Until 'copy the chosen older recording path' {
+        $path = Read-ClipboardFixture
+        $path -and [FixtureDialog]::SameFile($logFile, $path)
+    }
     Click 'Back to results'
+    Wait-RecordingStatus 'Saved live output to ' $logFile
+    $moved = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'moved-recording.txt'
+    [IO.File]::Move($logFile, $moved)
+    try {
+        Click 'Show in File Explorer'
+        $null = Wait-Until 'missing recording status in the result view' {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                    [System.Windows.Automation.Condition]::TrueCondition)) {
+                if ($item.Current.Name.StartsWith('Could not show the recording in File Explorer')) { return $true }
+            }
+        }
+        if ([IO.File]::Exists($env:W11TERM_TEST_EXPLORER_TRACE)) {
+            throw 'The missing recording reached the Windows Shell selector'
+        }
+    } finally {
+        [IO.File]::Move($moved, $logFile)
+    }
     Result-Progress "2 of 2 settled${dot}0 waiting${dot}0 running${dot}1 succeeded${dot}1 needs attention"
     Set-ResultFilter 'Needs attention'
     $null = Wait-Until 'show only the failed result' {
@@ -773,10 +820,37 @@ try {
         $outcomes[-1] -cne '[Group run settled]') {
         throw "The recording footer omitted the rejected host: $($outcomes -join ' | ')"
     }
+    try {
+        $explorer = New-Object -ComObject Shell.Application
+        $priorExplorerWindows = @($explorer.Windows() | ForEach-Object { $_.HWND })
+    } catch { $explorer = $null }
+    Click 'Show in File Explorer'
+    $trace = Wait-Until 'Shell32 receives the saved output file' {
+        if ([IO.File]::Exists($env:W11TERM_TEST_EXPLORER_TRACE)) {
+            [IO.File]::ReadAllText($env:W11TERM_TEST_EXPLORER_TRACE) | ConvertFrom-Json
+        }
+    }
+    if ($trace.action -cne 'select' -or ![FixtureDialog]::SameFile($withheldPath, $trace.path)) {
+        throw "File Explorer received the wrong recording: $($trace | ConvertTo-Json -Compress)"
+    }
+    if ($trace.hresult -ge 0) {
+        $null = Wait-Until 'recording selection was acknowledged' { Find-Element 'Selected in File Explorer' }
+    }
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
     if ($logReader) { $logReader.Dispose() }
+    if ($explorer) {
+        foreach ($item in @($explorer.Windows())) {
+            try {
+                $path = $item.Document.Folder.Self.Path
+                if ($item.HWND -notin $priorExplorerWindows -and [IO.Directory]::Exists($path) -and
+                    [FixtureDialog]::DirectoryPath($path) -eq [FixtureDialog]::DirectoryPath($env:W11TERM_EXPORT_SMOKE_DIR)) {
+                    $item.Quit()
+                }
+            } catch { }
+        }
+    }
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
         if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }

@@ -78,6 +78,7 @@ struct Submission {
     results: Vec<Delivery>,
     transcript: GroupTranscript,
     recording: output_recording::State,
+    saved_recordings: output_recording::saved::State,
 }
 
 enum SubmissionContent {
@@ -337,6 +338,7 @@ impl HostGroup {
             results,
             transcript,
             recording: Default::default(),
+            saved_recordings: Default::default(),
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -843,7 +845,9 @@ impl TerminalApp {
                         page.selected.retain(|pane| panes.contains(pane));
                         page.prompt_setup.poll();
                         for submission in &mut page.submissions {
-                            submission.recording.poll();
+                            if let Some(path) = submission.recording.poll() {
+                                submission.saved_recordings.add(path);
+                            }
                             for delivery in &mut submission.results {
                                 delivery.poll();
                             }
@@ -1458,7 +1462,7 @@ impl TerminalApp {
                 TextBlock::new()
                     .text(summary.caption())
                     .text_wrapping(TextWrapping::Wrap),
-                submission.recording.status_view(),
+                output_recording::status_view(id, submission, ctx),
                 ProgressBar::new()
                     .automation_name("SSH group submission progress")
                     .maximum(summary.total().max(1) as f64)

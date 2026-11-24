@@ -11,6 +11,8 @@ use w11term::events::{
     GroupTranscriptLine, GroupTranscriptRecording, GroupTranscriptStream,
 };
 
+pub(super) mod saved;
+
 #[derive(Default)]
 pub(super) enum State {
     #[default]
@@ -21,7 +23,7 @@ pub(super) enum State {
         worker: watch::Receiver<WriterStatus>,
         recording: Option<GroupTranscriptRecording>,
     },
-    Written(Result<PathBuf, String>),
+    Failed(String),
 }
 
 pub(super) enum WriterStatus {
@@ -65,21 +67,29 @@ impl State {
         })
     }
 
-    pub(super) fn poll(&mut self) {
-        if let Self::Writing { path, worker, .. } = self {
-            let closed = worker.has_changed().is_err();
-            let result = match &*worker.borrow() {
-                WriterStatus::Finished(result) => Some(result.clone().map(|()| path.clone())),
-                _ if closed => Some(Err("The file writer stopped unexpectedly".into())),
-                _ => None,
-            };
-            if let Some(result) = result {
-                *self = Self::Written(result);
+    pub(super) fn poll(&mut self) -> Option<PathBuf> {
+        let Self::Writing { path, worker, .. } = self else {
+            return None;
+        };
+        let closed = worker.has_changed().is_err();
+        let result = match &*worker.borrow() {
+            WriterStatus::Finished(result) => Some(result.clone().map(|()| path.clone())),
+            _ if closed => Some(Err("The file writer stopped unexpectedly".into())),
+            _ => None,
+        };
+        match result? {
+            Ok(path) => {
+                *self = Self::Idle;
+                Some(path)
+            }
+            Err(error) => {
+                *self = Self::Failed(error);
+                None
             }
         }
     }
 
-    pub(super) fn status_view(&self) -> View {
+    fn status_view(&self) -> View {
         let text = match self {
             Self::Idle => return View::empty(),
             Self::Picking => "Choosing an output file…".into(),
@@ -92,8 +102,7 @@ impl State {
                 format!("Recording live output to {}", path.display())
             }
             Self::Writing { .. } => "Opening the output file…".into(),
-            Self::Written(Ok(path)) => format!("Saved live output to {}", path.display()),
-            Self::Written(Err(error)) => format!("Could not record live output · {error}"),
+            Self::Failed(error) => format!("Could not record live output · {error}"),
         };
         TextBlock::new()
             .text(text)
@@ -146,6 +155,18 @@ pub enum Action {
     Pick,
     Picked(Result<Option<PathBuf>, String>),
     Stop,
+    Saved(saved::Action),
+}
+
+pub(super) fn status_view(
+    id: TabId,
+    submission: &Submission,
+    ctx: &ViewContext<TerminalApp>,
+) -> View {
+    StackPanel::new().children((
+        submission.recording.status_view(),
+        submission.saved_recordings.view(id, submission.id, ctx),
+    ))
 }
 
 fn ready(submission: &Submission) -> bool {
@@ -329,7 +350,7 @@ impl TerminalApp {
                 match result {
                     Ok(Some(path)) => self.start_group_output_writer(id, run, path),
                     Ok(None) => submission.recording = State::Idle,
-                    Err(error) => submission.recording = State::Written(Err(error)),
+                    Err(error) => submission.recording = State::Failed(error),
                 }
             }
             Action::Stop if self.tabs.active_id() == Some(id) => {
@@ -340,6 +361,7 @@ impl TerminalApp {
                 }
             }
             Action::Stop => {}
+            Action::Saved(action) => self.handle_saved_recording(id, run, action, ctx),
         }
     }
 
@@ -357,13 +379,13 @@ impl TerminalApp {
         let Some(submission) = self
             .output_recording_submission(id, run)
             .filter(|submission| {
-                matches!(submission.recording, State::Idle | State::Written(_)) && ready(submission)
+                matches!(submission.recording, State::Idle | State::Failed(_)) && ready(submission)
             })
         else {
             return;
         };
         let Some(owner) = owner else {
-            submission.recording = State::Written(Err("The window is unavailable".into()));
+            submission.recording = State::Failed("The window is unavailable".into());
             return;
         };
         submission.recording = State::Picking;
@@ -402,7 +424,7 @@ impl TerminalApp {
             GroupRecordingMode::Manual,
             create_file,
         )
-        .unwrap_or_else(|error| State::Written(Err(error)));
+        .unwrap_or_else(State::Failed);
     }
 }
 

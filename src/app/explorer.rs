@@ -103,6 +103,29 @@ impl Location {
     }
 }
 
+pub(super) fn reveal_saved_file(path: &Path) -> Result<()> {
+    // This path comes from the user's save picker. Unlike a path taken
+    // from terminal output, it can name a network filesystem.
+    ensure!(
+        path.is_absolute()
+            && matches!(
+                path.components().next(),
+                Some(Component::Prefix(prefix)) if matches!(
+                    prefix.kind(),
+                    Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(..) | Prefix::VerbatimUNC(..)
+                )
+            ),
+        "Expected an absolute filesystem path"
+    );
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Cannot find {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "The saved path no longer identifies a file"
+    );
+    shell_item(path, ShellAction::Select)
+}
+
 fn wsl_root(distribution: &str) -> Option<PathBuf> {
     w11term::sftp::validate_download_name(distribution).ok()?;
     Some(PathBuf::from(format!(r"\\wsl.localhost\{distribution}\")))
