@@ -165,6 +165,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 49. **Search a saved group launch.** Find reviewed hosts by profile name or SSH address, update the matching scope across pages, and preserve the search and approved choices on refresh.
 50. **Export saved group addresses before connecting.** Preview the full saved group or the included launch profiles in saved order. Copy or save the same portable addresses offered by live-roster export.
 51. **Save included launch profiles as a recipient set.** Name the full checked selection, recheck its saved profiles during the catalog update, and return to the same launch review with the new set selected.
+52. **Choose connections for launch matches together.** Use fresh panes or select unique live matches for included profiles across pages. Preserve explicit choices when reuse is ambiguous.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

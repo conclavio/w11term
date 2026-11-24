@@ -70,7 +70,7 @@ struct Member {
 
 impl Member {
     fn new(profile: String, options: Option<SshOptions>, candidates: Vec<Candidate>) -> Self {
-        let choice = (candidates.len() == 1).then(|| candidates[0].connection);
+        let choice = unique_connection(&candidates);
         let included = options.is_some();
         let address = options
             .as_ref()
@@ -103,6 +103,13 @@ impl Member {
         } else {
             Launch::Skip
         }
+    }
+}
+
+fn unique_connection(candidates: &[Candidate]) -> Option<Connection> {
+    match candidates {
+        [candidate] => Some(candidate.connection),
+        _ => None,
     }
 }
 
@@ -240,6 +247,7 @@ pub enum Change {
     Filter(String),
     Page(usize),
     IncludeMatches(Vec<usize>, MatchSelection),
+    ChooseMatches(Vec<usize>, ConnectionSelection),
     RecipientSet(String),
     Approve(Vec<Launch>, Option<String>),
     Export(Vec<Launch>, Option<String>),
@@ -256,6 +264,21 @@ pub enum MatchSelection {
     Include,
     Only,
     Skip,
+}
+
+#[derive(Clone, Copy)]
+pub enum ConnectionSelection {
+    Fresh,
+    ReuseUnique,
+}
+
+impl ConnectionSelection {
+    fn choice(self, member: &Member) -> Option<Connection> {
+        match self {
+            Self::Fresh => None,
+            Self::ReuseUnique => unique_connection(&member.candidates).or(member.choice),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -326,6 +349,29 @@ impl State {
         }
     }
 
+    fn choose_matches(&mut self, offered: Vec<usize>, selection: ConnectionSelection) {
+        let Some(review) = self.review.as_deref() else {
+            return;
+        };
+        if !self
+            .matching(review)
+            .into_iter()
+            .filter(|&index| review.members[index].included)
+            .eq(offered.iter().copied())
+        {
+            return;
+        }
+        let review = self.review.as_mut().unwrap();
+        for index in offered {
+            let member = &mut review.members[index];
+            let choice = selection.choice(member);
+            if member.choice != choice {
+                member.choice = choice;
+                review.feedback.clear();
+            }
+        }
+    }
+
     pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> Option<View> {
         let review = self.review.as_deref()?;
         let revision = self.revision;
@@ -375,6 +421,27 @@ impl State {
         };
         let can_include = matches.iter().any(|&i| review.members[i].options.is_some());
         let can_skip = matches.iter().any(|&i| review.members[i].included);
+        let connection_scope: Rc<Vec<_>> = Rc::new(
+            matches
+                .iter()
+                .copied()
+                .filter(|&index| review.members[index].included)
+                .collect(),
+        );
+        let connection_button =
+            |label, selection: ConnectionSelection| {
+                let scope = Rc::clone(&connection_scope);
+                let enabled = scope.iter().any(|&index| {
+                    let member = &review.members[index];
+                    selection.choice(member) != member.choice
+                });
+                Button::new()
+                    .is_enabled(enabled)
+                    .on_click(ctx.callback(move |_| {
+                        action(Change::ChooseMatches((*scope).clone(), selection))
+                    }))
+                    .content(label)
+            };
         let rows =
             matches
                 .iter()
@@ -551,6 +618,19 @@ impl State {
                                         .content("Clear included hosts"),
                                 ))
                         },
+                        StackPanel::new()
+                            .spacing(8.0)
+                            .orientation(Orientation::Horizontal)
+                            .children((
+                                connection_button(
+                                    "Use new panes for matches",
+                                    ConnectionSelection::Fresh,
+                                ),
+                                connection_button(
+                                    "Reuse unique matches",
+                                    ConnectionSelection::ReuseUnique,
+                                ),
+                            )),
                         if review.feedback.is_empty() {
                             View::empty()
                         } else {
@@ -786,6 +866,11 @@ impl TerminalApp {
             Change::IncludeMatches(offered, selection) => {
                 if let Some(page) = self.host_group_mut(id) {
                     page.saved.reuse.include_matches(offered, selection);
+                }
+            }
+            Change::ChooseMatches(offered, selection) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.saved.reuse.choose_matches(offered, selection);
                 }
             }
             Change::RecipientSet(name) => {
@@ -1132,6 +1217,51 @@ mod tests {
         assert!(multiple.choice == Some(id));
         multiple.select(None);
         assert!(multiple.choice.is_none());
+    }
+
+    #[test]
+    fn bulk_connection_choices_respect_the_included_filter_and_keep_ambiguous_reuse() {
+        let mut ambiguous = Member::new(
+            "East backup".into(),
+            Some(options("east-backup")),
+            vec![candidate(4, 1), candidate(5, 1)],
+        );
+        let manual = ambiguous.candidates[1].connection;
+        ambiguous.select(Some(manual));
+        let mut skipped = Member::new(
+            "East skipped".into(),
+            Some(options("east-skipped")),
+            vec![candidate(6, 1)],
+        );
+        skipped.included = false;
+        let mut state = State::default();
+        state.open(Review {
+            name: "Fleet".into(),
+            members: vec![
+                Member::new("East".into(), Some(options("east")), vec![candidate(2, 1)]),
+                Member::new("West".into(), Some(options("west")), vec![candidate(3, 1)]),
+                ambiguous,
+                skipped,
+            ],
+            sets: SshRecipientSets::new(),
+            selected_set: Some("Fleet".into()),
+            feedback: String::new(),
+        });
+        state.filter.set_query("east".into());
+        state.choose_matches(vec![0, 1, 2], ConnectionSelection::Fresh);
+        assert!(state.review.as_ref().unwrap().members[0].choice.is_some());
+        state.choose_matches(vec![0, 2], ConnectionSelection::Fresh);
+        let review = state.review.as_mut().unwrap();
+        assert!(review.members[0].choice.is_none());
+        assert!(review.members[1].choice.is_some());
+        assert!(review.members[2].choice.is_none());
+        assert!(review.members[3].choice.is_some() && !review.members[3].included);
+        review.members[2].select(Some(manual));
+        state.choose_matches(vec![0, 2], ConnectionSelection::ReuseUnique);
+        let review = state.review.as_ref().unwrap();
+        assert!(review.members[0].choice.is_some());
+        assert!(review.members[2].choice == Some(manual));
+        assert_eq!(review.selected_set.as_deref(), Some("Fleet"));
     }
 
     #[test]
