@@ -229,6 +229,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 113. **Find group runs across tabs.** Show live progress for retained runs in the window. Search by tab title, command and run number, and open the original run without changing its draft or checked hosts.
 114. **Find hosts in a run comparison.** Search by label or SSH address and narrow the view by classification. Keep the filters when returning from a host diff and preserve full comparison exports.
 115. **Search group output with a pattern.** Offer regular-expression and case-sensitive matching alongside the host filter. Report invalid patterns and export the same retained lines shown in the view.
+116. **Switch runs within live output.** Carry the query and host scope across retained submissions. Show when the selected host is absent, and keep each recording attached to its original run.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

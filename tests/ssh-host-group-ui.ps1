@@ -422,6 +422,26 @@ try {
         [IO.File]::Exists($excerptPath) -and
             [IO.File]::ReadAllText($excerptPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $excerpt
     }
+    $outputRun = 'Live output run'
+    $outputPattern = '^WEST WHILE (PAUSED|AWAY)$'
+    Click 'Pause output'
+    $null = Wait-Until 'the current run is paused before switching' { Find-Element 'Resume output' $button }
+    Select-ComboValue $outputRun "Run 1${dot}one"
+    $null = Wait-Until 'the earlier run keeps the absent host scoped and starts live' {
+        $copy = Find-Element 'Copy shown output' $button
+        $copy -and !$copy.Current.IsEnabled -and (Find-Element 'Pause output' $button) -and
+            (Find-Element 'The selected host did not receive this run.') -and
+            (Command-Editor $outputSearch).Current.Value -ceq $outputPattern -and
+            !(Find-Element 'west while paused')
+    }
+    Select-ComboValue $outputRun "Run 2${dot}both"
+    $null = Wait-CheckBox $outputRegex On
+    $null = Wait-Until 'returning restores the same scoped lines without the prior pause' {
+        (Find-Element 'Pause output' $button) -and (Find-Element 'west while paused') -and
+            (Find-Element 'west while away') -and !(Find-Element 'west live first') -and
+            (Command-Editor $outputSearch).Current.Value -ceq $outputPattern
+    }
+    Wait-RecordingStatus 'Recording live output to ' $logFile
     Click 'Clear output filters'
     $null = Wait-Until 'clearing the filters restores all retained output' {
         (Find-Element 'east-accepted both') -and (Find-Element 'west live first') -and
@@ -448,7 +468,13 @@ try {
     if ($withNoGaps -cne (($expectedLines -join "`r`n") + "`r`n")) {
         throw "The output log lost, repeated, or reordered a line: $recorded"
     }
+    Select-ComboValue $outputRun "Run 1${dot}one"
     Click 'Back to results'
+    $null = Wait-Until 'Back opens the selected run results' {
+        (Find-Element "Submitted${dot}one") -and !(Find-Element 'SSH group live output') -and
+            !(Find-Element "Focus result pane $west" $button)
+    }
+    Click 'Next submission'
     Outcome $westName 'Running'
     Set-ResultFilter 'Running'
     $null = Wait-Until 'show the running result only' {

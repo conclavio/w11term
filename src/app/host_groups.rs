@@ -1894,7 +1894,7 @@ impl TerminalApp {
         if let Some(output) = &page.live_output
             && let Some(submission) = page.viewed_submission(output.submission)
         {
-            return self.host_group_live_output(id, output, submission, ctx);
+            return self.host_group_live_output(id, page, output, submission, ctx);
         }
         if page.focus_loaded_command {
             let sender = ctx.sender();
