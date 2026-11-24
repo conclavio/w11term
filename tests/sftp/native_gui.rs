@@ -1050,6 +1050,45 @@ fn recording_burst(host: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews two real SSH prompts from a named native host group"]
+async fn native_ssh_host_group_opens_filtered_authentication_prompts() {
+    let state = tempfile::tempdir().unwrap();
+    let (Source::Ssh(mut trust), _trust_root, trust_opens, trust_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    trust.host_key = None;
+    trust.player.reconnect = false;
+    trust.host_key_alias = Some(format!(
+        "w11term-native-{}.invalid",
+        state.path().file_name().unwrap().to_string_lossy()
+    ));
+    let (Source::Ssh(mut login), _login_root, login_opens, login_server) =
+        fixture_server(false).await
+    else {
+        unreachable!()
+    };
+    login.authentication = Authentication::Password;
+    login.player.reconnect = false;
+    fs::write(
+        state.path().join("profiles.json"),
+        serde_json::to_vec(&json!({
+            "profiles": {"Trust host": trust, "Password host": login},
+            "ssh_host_groups": {"Prompt review": ["Trust host", "Password host"]},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    drive_gui("ssh-host-group-prompts-ui.ps1", state.path());
+    assert_eq!(trust_opens.load(Ordering::Relaxed), 0);
+    assert_eq!(login_opens.load(Ordering::Relaxed), 0);
+    trust_server.abort();
+    login_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "checks reviewed rank, shell syntax and prompt scope on the native SSH group tab"]
 async fn native_ssh_host_group_exports_ranked_variables() {
     use in_band_resize::Wire;

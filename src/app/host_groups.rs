@@ -6,6 +6,7 @@ use w11term::events::{
     ShellPrompt, SshConnectionPhase,
 };
 use w11term::options::{SshRosterDefaults, SshRosterOrder as RosterOrder};
+use w11term::prompts::Question;
 mod address;
 mod compare;
 mod completion;
@@ -166,7 +167,8 @@ enum TargetState {
     Connecting,
     Reconnecting(Option<u32>),
     Restartable(ExitedPane),
-    Authentication,
+    HostKey(u64),
+    Authentication(Option<u64>),
     ReadOnly,
     Alternate,
     Unverified,
@@ -186,13 +188,14 @@ pub enum RosterStatus {
     Reconnecting,
     Disconnected,
     Failed,
+    HostKey,
     Authentication,
     ReadOnly,
     Alternate,
 }
 
 impl RosterStatus {
-    const OPTIONS: [Self; 11] = [
+    const OPTIONS: [Self; 12] = [
         Self::All,
         Self::Ready,
         Self::Waiting,
@@ -201,6 +204,7 @@ impl RosterStatus {
         Self::Reconnecting,
         Self::Disconnected,
         Self::Failed,
+        Self::HostKey,
         Self::Authentication,
         Self::ReadOnly,
         Self::Alternate,
@@ -216,6 +220,7 @@ impl RosterStatus {
             Self::Reconnecting => "Reconnecting",
             Self::Disconnected => "Disconnected",
             Self::Failed => "Connection failed",
+            Self::HostKey => "Host key verification required",
             Self::Authentication => "Authentication required",
             Self::ReadOnly => "Read-only",
             Self::Alternate => "Alternate screen",
@@ -246,6 +251,17 @@ fn sort_roster(order: RosterOrder, targets: &mut [&Target], selected: &BTreeSet<
 }
 
 impl TargetState {
+    fn is_authenticating(self) -> bool {
+        matches!(self, Self::HostKey(_) | Self::Authentication(_))
+    }
+
+    fn authentication_prompt(self) -> Option<u64> {
+        match self {
+            Self::HostKey(id) | Self::Authentication(Some(id)) => Some(id),
+            _ => None,
+        }
+    }
+
     fn is_ready(self) -> bool {
         self.prompt().is_some()
     }
@@ -263,7 +279,8 @@ impl TargetState {
             Self::Failed(_) => RosterStatus::Failed,
             Self::Connecting => RosterStatus::Connecting,
             Self::Reconnecting(_) => RosterStatus::Reconnecting,
-            Self::Authentication => RosterStatus::Authentication,
+            Self::HostKey(_) => RosterStatus::HostKey,
+            Self::Authentication(_) => RosterStatus::Authentication,
             Self::ReadOnly => RosterStatus::ReadOnly,
             Self::Alternate => RosterStatus::Alternate,
             Self::Unverified => RosterStatus::Unverified,
@@ -276,6 +293,7 @@ impl TargetState {
         match self {
             Self::Restartable(_) => "Disconnected · reconnect available".into(),
             Self::Failed(Some(_)) => "Connection failed · reconnect available".into(),
+            Self::Authentication(None) => "Authentication in progress".into(),
             Self::Matched(_) => "Ready · prompt match".into(),
             Self::Reconnecting(Some(attempt)) => format!("Reconnecting · attempt {attempt}").into(),
             _ => self.status().label().into(),
@@ -560,6 +578,7 @@ pub enum Action {
     Select(TabId, u64, bool),
     SelectShown(TabId, BTreeSet<u64>, ShownSelection),
     Visit(TabId, u64),
+    VisitPrompt(TabId, u64, u64),
     ViewSubmission(TabId, u64),
     NotifyCompletion(TabId, u64, bool),
     LiveOutput(TabId, u64, live_output::Action),
@@ -737,8 +756,15 @@ impl TerminalApp {
                 }
                 let pane = live.session.pane_id;
                 let connected = live.session.ssh_connection().is_some();
-                let state = if live.device_busy || live.session.prompts.current().is_some() {
-                    TargetState::Authentication
+                let state = if let Some(prompt) = live.session.prompts.current() {
+                    match prompt.question {
+                        Question::HostKey { .. } => TargetState::HostKey(prompt.id),
+                        Question::Authentication { .. } => {
+                            TargetState::Authentication(Some(prompt.id))
+                        }
+                    }
+                } else if live.device_busy {
+                    TargetState::Authentication(None)
                 } else if !connected {
                     match live.session.events.ssh_connection_phase() {
                         Some(SshConnectionPhase::Connecting) => TargetState::Connecting,
@@ -966,6 +992,16 @@ impl TerminalApp {
         }
     }
 
+    fn focus_host_group_pane(&mut self, id: TabId, pane: u64, ctx: &ComponentContext<Self>) {
+        if self.host_group_mut(id).is_some()
+            && let Some(tab) = self.tab_for_pane(pane)
+            && self.tabs.select(tab)
+        {
+            self.sync_selection(ctx);
+            self.activate(ctx);
+        }
+    }
+
     pub(super) fn handle_host_group(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
             Action::Open | Action::NewTab => {
@@ -1106,13 +1142,18 @@ impl TerminalApp {
                     }
                 }
             }
-            Action::Visit(id, pane) => {
-                if self.host_group_mut(id).is_some()
-                    && let Some(tab) = self.tab_for_pane(pane)
-                    && self.tabs.select(tab)
-                {
-                    self.sync_selection(ctx);
-                    self.activate(ctx);
+            Action::Visit(id, pane) => self.focus_host_group_pane(id, pane, ctx),
+            Action::VisitPrompt(id, pane, prompt) => {
+                if self.host_group_command_target() == Some(id) {
+                    let targets = self.host_group_targets();
+                    if self.host_group_mut(id).is_some_and(|page| {
+                        page.shown(&targets).any(|target| {
+                            target.pane == pane
+                                && target.state.authentication_prompt() == Some(prompt)
+                        })
+                    }) {
+                        self.focus_host_group_pane(id, pane, ctx);
+                    }
                 }
             }
             Action::ViewSubmission(id, submission) => {
@@ -1330,10 +1371,8 @@ impl TerminalApp {
         ctx: &ViewContext<Self>,
     ) -> Option<View> {
         if !target.connected
-            || matches!(
-                target.state,
-                TargetState::Authentication | TargetState::Alternate
-            )
+            || target.state.is_authenticating()
+            || matches!(target.state, TargetState::Alternate)
         {
             return None;
         }
@@ -1464,6 +1503,19 @@ impl TerminalApp {
             &mut roster_rows,
             &page.selected,
         );
+        let mut prompts = roster_rows
+            .iter()
+            .filter_map(|target| Some((target.pane, target.state.authentication_prompt()?)));
+        let next_prompt =
+            prompts.next().map_or_else(View::empty, |(pane, prompt)| {
+                let count = 1 + prompts.count();
+                Button::new()
+                    .automation_name("Open next SSH prompt")
+                    .on_click(ctx.callback(move |_| {
+                        Message::HostGroup(Action::VisitPrompt(id, pane, prompt))
+                    }))
+                    .content(format!("Open next SSH prompt ({count})"))
+            });
         let mut details: Vec<KeyedView> = roster_rows
             .into_iter()
             .map(|target| {
@@ -1671,6 +1723,7 @@ impl TerminalApp {
                         .content("Save selection as group…"),
                 )),
             reconnect::selection_controls(id, page, &shown, ctx),
+            next_prompt,
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(8.0)

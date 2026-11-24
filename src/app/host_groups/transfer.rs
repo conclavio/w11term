@@ -22,7 +22,7 @@ impl Direction {
     }
 
     fn allows(self, state: TargetState) -> bool {
-        !matches!(state, TargetState::Authentication)
+        !state.is_authenticating()
             && (self == Self::Download || !matches!(state, TargetState::ReadOnly))
     }
 }
