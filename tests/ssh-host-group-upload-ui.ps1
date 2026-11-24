@@ -68,7 +68,7 @@ try {
     foreach ($name in $targets.Values) { $null = Wait-CheckBox $name On }
     Set-Field 'Host filter' 'Fleet'
     $null = Wait-Until 'Witness is hidden by the roster filter' { Find-Element '1 selected host is hidden by the filter.' }
-    Click "Upload file$ellipsis"
+    Click "Upload files$ellipsis"
     $null = Wait-Until 'upload review includes only shown hosts' {
         (Find-Element 'Upload to selected SSH hosts') -and
         (Find-Element $targets['Fleet East']) -and
@@ -76,11 +76,11 @@ try {
         (Find-Element $targets['Fleet Stale']) -and
         !(Find-Element $targets['Witness'])
     }
-    Click "Choose local file$ellipsis"
-    $picker = Wait-Until 'owned single-file picker' { Find-OwnedDialog 'Choose a file to upload' }
+    Click "Choose local files$ellipsis"
+    $picker = Wait-Until 'owned file picker' { Find-OwnedDialog 'Choose files to upload' }
     Select-DialogItem $picker 'fleet-source'
     $null = Wait-Until 'confirm the selected file' { [FixtureDialog]::ClickButton($picker, 1) }
-    $null = Wait-Until 'close the single-file picker' { !(Find-OwnedDialog 'Choose a file to upload') }
+    $null = Wait-Until 'close the file picker' { !(Find-OwnedDialog 'Choose files to upload') }
     $size = "${dot}97000 bytes"
     $null = Wait-Until 'selected file and size are shown' {
         foreach ($name in (View-Text)) {
@@ -117,6 +117,30 @@ try {
     }
     Click 'Back to host group'
     $null = Wait-CheckBox $targets['Fleet East'] On
+    (Wait-CheckBox $targets['Fleet Stale'] On).Toggle()
+    $null = Wait-CheckBox $targets['Fleet Stale'] Off
+    Click "Upload files$ellipsis"
+    Click "Choose local files$ellipsis"
+    $picker = Wait-Until 'owned multi-file picker' { Find-OwnedDialog 'Choose files to upload' }
+    Select-DialogItem $picker 'fleet-source'
+    Select-DialogItem $picker 'second-source' -Add
+    $null = Wait-Until 'confirm both selected files' { [FixtureDialog]::ClickButton($picker, 1) }
+    $null = Wait-Until 'review shows both selected files' { Find-Element '2 local files' }
+    Set-Field 'Remote directory' '../incoming'
+    $null = Wait-Until 'relative directory is ineligible' {
+        $submit = Find-Element 'Upload to 2 hosts' $button
+        $submit -and !$submit.Current.IsEnabled
+    }
+    Set-Field 'Remote directory' '/incoming/'
+    Click 'Upload to 2 hosts'
+    $null = Wait-Until 'each host and file has its own upload outcome' {
+        (Find-Element "3 files uploaded${dot}0 pending${dot}1 skipped, failed or cancelled") -and
+        (Find-Element "$($targets['Fleet East'])${dot}fleet-source${dot}Uploaded${dot}97000 bytes") -and
+        (Find-Element "$($targets['Fleet East'])${dot}second-source${dot}Uploaded${dot}11 bytes") -and
+        (View-ContainsPrefix "$($targets['Fleet West'])${dot}fleet-source${dot}Upload failed${dot}") -and
+        (Find-Element "$($targets['Fleet West'])${dot}second-source${dot}Uploaded${dot}11 bytes")
+    }
+    Click 'Back to host group'
     Set-Field 'Host filter' ''
     $null = Wait-CheckBox $targets['Witness'] On
 } catch {

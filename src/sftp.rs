@@ -28,7 +28,7 @@ mod directory;
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name};
 mod group_upload;
-pub use group_upload::{GroupUploadFile, validate_group_upload_path};
+pub use group_upload::{GroupUploadFile, GroupUploadSet, validate_group_upload_path};
 mod drop_source;
 mod editor;
 mod text_preview;

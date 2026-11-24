@@ -17,7 +17,6 @@ use windows::{
 };
 
 pub(super) enum Purpose {
-    UploadFile,
     UploadFiles,
     UploadFolder,
     SshConfig(PathBuf),
@@ -163,8 +162,7 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
         let _apartment = Apartment;
         let clsid = if matches!(
             purpose,
-            Purpose::UploadFile
-                | Purpose::UploadFiles
+            Purpose::UploadFiles
                 | Purpose::UploadFolder
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
@@ -212,16 +210,9 @@ fn show(owner: usize, purpose: Purpose) -> Result<Vec<Selection>> {
                 }
                 None
             }
-            Purpose::UploadFile | Purpose::UploadFiles => {
-                dialog.SetTitle(if multiple {
-                    w!("Choose files to upload")
-                } else {
-                    w!("Choose a file to upload")
-                })?;
-                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST;
-                if multiple {
-                    options |= FOS_ALLOWMULTISELECT;
-                }
+            Purpose::UploadFiles => {
+                dialog.SetTitle(w!("Choose files to upload"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_ALLOWMULTISELECT;
                 #[cfg(feature = "ui-smoke")]
                 if fixture_picker_folder(&dialog, "W11TERM_SFTP_PICKER_SMOKE_DIR")? {
                     options |= FOS_DONTADDTORECENT;
