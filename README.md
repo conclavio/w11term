@@ -209,6 +209,8 @@ Choose **Compare results…** to group the viewed submission by exact captured o
 
 Choose **View differences** on a result to see added and removed lines against the reference group with original line numbers and both exit codes. Large differences show a bounded excerpt. Use **View full output** from the comparison to inspect a longer result in its command history.
 
+Use **Compare with earlier run…** on a completed host result to compare the same pane and SSH address across two retained runs. Pick the earlier run and choose **Compare output**. Both sides need complete output and a reported exit code. The view shows the two run IDs, command labels, and exit codes. Choose **Save full run differences…** to export the complete line changes.
+
 Choose **Use as reference** on a result group when a particular host is the expected baseline. Refresh keeps that choice while the host still belongs to a comparable group. **Use largest group** restores automatic selection.
 
 In the diff view, choose **Save full differences…** to write a UTF-8 report of the current comparison. It includes the command, both hosts and exit codes, and changed lines at full length. If the changed sections are too large to align, the report includes both full unmatched sections in source order.

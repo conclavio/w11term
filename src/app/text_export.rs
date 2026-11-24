@@ -33,6 +33,11 @@ pub enum Subject {
         reference: u64,
         selected: u64,
     },
+    HostGroupRunDiff {
+        baseline: u64,
+        run: u64,
+        pane: u64,
+    },
     SshHostList,
     SshGroupDefinition,
     SshLoginReport(u64),
@@ -54,6 +59,7 @@ impl Subject {
             }
             Self::HostGroupShownOutput(_) => "shown SSH group output".into(),
             Self::HostGroupDiff { .. } => "SSH group differences".into(),
+            Self::HostGroupRunDiff { .. } => "SSH group run differences".into(),
             Self::SshHostList => "SSH host list".into(),
             Self::SshGroupDefinition => "SSH group definition".into(),
             Self::SshLoginReport(_) => "SSH login report".into(),
@@ -91,6 +97,13 @@ impl Subject {
                 selected,
             } => file_picker::Purpose::GroupOutputDiff(format!(
                 "ssh-group-diff-{submission}-{reference}-to-{selected}.txt"
+            )),
+            Self::HostGroupRunDiff {
+                baseline,
+                run,
+                pane,
+            } => file_picker::Purpose::GroupOutputDiff(format!(
+                "ssh-group-run-diff-{baseline}-to-{run}-pane-{pane}.txt"
             )),
             Self::SshHostList => file_picker::Purpose::SshHostList,
             Self::SshGroupDefinition => file_picker::Purpose::SshGroupDefinition,

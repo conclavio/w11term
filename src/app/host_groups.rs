@@ -2804,6 +2804,9 @@ impl TerminalApp {
                             .content("View full output"),
                     ));
                 }
+                if let Some(button) = self.compare_run_button(id, submission, pane, ctx) {
+                    rows.push(KeyedView::new("compare-run", button));
+                }
             }
         }
         if let Some(caption) = delivery.interrupt_caption() {

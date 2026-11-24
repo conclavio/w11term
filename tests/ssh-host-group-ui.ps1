@@ -530,6 +530,30 @@ try {
     $exported = [IO.File]::ReadAllText($destination, [Text.UTF8Encoding]::new($false, $true))
     if ($exported -cne (Read-ClipboardFixture)) { throw 'The saved report omitted retained output or host status' }
     Click $savedStatus
+    Click "Compare earlier run for pane $east"
+    $null = Wait-Until 'the cross-run comparison opens for East' { Find-Element 'SSH output across runs' }
+    Select-ComboValue 'Earlier group run' "Run 2${dot}both"
+    Click 'Compare output'
+    $null = Wait-Until 'the diff compares complete captures from the same pane' {
+        (Find-Element "Run 2${dot}both${dot}Exit 0") -and
+            (Find-Element "Run 3${dot}while-slow${dot}Exit 0") -and
+            (Find-Element "Removed line 1${dot}east-accepted both") -and
+            (Find-Element "Added line 1${dot}east-accepted while-slow")
+    }
+    Click ('Save full run differences' + [char]0x2026)
+    $dialog = Wait-Until 'owned run differences save dialog' { Find-OwnedDialog 'Save SSH group differences' }
+    $null = Wait-Until 'save the cross-run differences' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $runDiffPath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR "ssh-group-run-diff-2-to-3-pane-$east.txt"
+    $null = Wait-Until 'the export includes the entire later output and both run headers' {
+        if (![IO.File]::Exists($runDiffPath)) { return }
+        $diff = [IO.File]::ReadAllText($runDiffPath)
+        $diff.Contains("Run 2${dot}both${dot}Exit 0") -and $diff.Contains("Run 3${dot}while-slow${dot}Exit 0") -and
+            $diff.Contains('east-report-tail') -and ([regex]::Matches($diff, 'east-report-line')).Count -eq 35
+    }
+    Click 'Back to results'
+    $null = Wait-Until 'the cross-run comparison returns to the current submission' {
+        (Find-Element "Submitted${dot}while-slow") -and !(Find-Element 'SSH output across runs')
+    }
     Set-ResultFilter 'Succeeded'
     $null = Wait-Until 'the rejected result is hidden in the filtered view' {
         (Find-Element "Focus result pane $east" $button) -and !(Find-Element "Focus result pane $west" $button)
