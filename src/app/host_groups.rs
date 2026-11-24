@@ -53,6 +53,7 @@ pub(super) struct HostGroup {
     next_submission: u64,
     copy_feedback: String,
     result_filter: progress::Filter,
+    result_order: progress::ResultOrder,
     live_output: Option<live_output::State>,
     comparison: compare::State,
     import: import::State,
@@ -451,6 +452,7 @@ pub enum Action {
     HostListExport(TabId, host_list_export::Action),
     Reconnect(TabId, reconnect::Request),
     FilterResults(TabId, u64, progress::Filter),
+    OrderResults(TabId, u64, progress::ResultOrder),
     LoadCommand(TabId, u64),
     PrepareRetry(TabId, u64, BTreeSet<u64>),
     PromptSetup(TabId, prompt_setup::Action),
@@ -987,6 +989,13 @@ impl TerminalApp {
                     page.result_filter = filter;
                 }
             }
+            Action::OrderResults(id, submission, order) => {
+                if let Some(page) = self.host_group_mut(id)
+                    && page.viewed_submission(submission).is_some()
+                {
+                    page.result_order = order;
+                }
+            }
             Action::LoadCommand(id, submission) => {
                 if let Some(page) = self.host_group_mut(id)
                     && page.load_command(submission)
@@ -1490,19 +1499,23 @@ impl TerminalApp {
         let submission = &page.submissions[index];
         let submission_id = submission.id;
         let mut summary = progress::Summary::default();
-        let shown: Vec<_> = submission
+        let mut shown: Vec<_> = submission
             .results
             .iter()
-            .filter(|delivery| {
-                let outcome = progress::Outcome::of(delivery);
+            .filter_map(|delivery| {
+                let execution = delivery.execution();
+                let outcome =
+                    progress::Outcome::with_execution(&delivery.status, execution.as_ref());
                 summary.add(outcome);
-                page.result_filter.includes(outcome)
+                page.result_filter
+                    .includes(outcome)
+                    .then_some((delivery, execution))
             })
             .collect();
         let interrupt_targets: Vec<_> = shown
             .iter()
-            .filter(|delivery| selected_shown.contains(&delivery.target.pane))
-            .filter_map(|delivery| {
+            .filter(|(delivery, _)| selected_shown.contains(&delivery.target.pane))
+            .filter_map(|(delivery, _)| {
                 delivery
                     .interrupt_target()
                     .map(|link| (delivery.target.pane, link))
@@ -1531,6 +1544,37 @@ impl TerminalApp {
                 }))
                 .content(label)
         };
+        let result_filter = ComboBox::new()
+            .automation_name("Filter submission results")
+            .items_source(progress::FILTERS.map(|(_, label)| label))
+            .selected_index(
+                progress::FILTERS
+                    .iter()
+                    .position(|&(filter, _)| filter == page.result_filter),
+            )
+            .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                index.and_then(|index| progress::FILTERS.get(index)).map_or(
+                    Message::ControlIdle,
+                    |&(filter, _)| {
+                        Message::HostGroup(Action::FilterResults(id, submission_id, filter))
+                    },
+                )
+            }));
+        let result_order = ComboBox::new()
+            .automation_name("Sort submission results")
+            .items_source(progress::RESULT_ORDERS.map(|(_, label)| label))
+            .selected_index(
+                progress::RESULT_ORDERS
+                    .iter()
+                    .position(|&(order, _)| order == page.result_order),
+            )
+            .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                index
+                    .and_then(|index| progress::RESULT_ORDERS.get(index))
+                    .map_or(Message::ControlIdle, |&(order, _)| {
+                        Message::HostGroup(Action::OrderResults(id, submission_id, order))
+                    })
+            }));
         details.push(KeyedView::new(
             "results",
             StackPanel::new().spacing(4.0).children((
@@ -1600,22 +1644,10 @@ impl TerminalApp {
                             .content("Live output…"),
                         interrupt,
                     )),
-                ComboBox::new()
-                    .automation_name("Filter submission results")
-                    .items_source(progress::FILTERS.map(|(_, label)| label))
-                    .selected_index(
-                        progress::FILTERS
-                            .iter()
-                            .position(|&(filter, _)| filter == page.result_filter),
-                    )
-                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
-                        index.and_then(|index| progress::FILTERS.get(index)).map_or(
-                            Message::ControlIdle,
-                            |&(filter, _)| {
-                                Message::HostGroup(Action::FilterResults(id, submission_id, filter))
-                            },
-                        )
-                    })),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((result_filter, result_order)),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(8.0)
@@ -1663,10 +1695,19 @@ impl TerminalApp {
                 TextBlock::new().text("No recipients match this result filter."),
             ));
         }
-        details.extend(shown.into_iter().map(|delivery| {
+        let now = Instant::now();
+        page.result_order.apply(&mut shown, now);
+        details.extend(shown.into_iter().map(|(delivery, execution)| {
             KeyedView::new(
                 format!("delivery-{}-{}", submission.id, delivery.target.pane),
-                self.host_group_result_row(id, delivery, &submission.content, ctx),
+                self.host_group_result_row(
+                    id,
+                    delivery,
+                    &submission.content,
+                    execution.as_ref(),
+                    now,
+                    ctx,
+                ),
             )
         }));
     }
@@ -1676,6 +1717,8 @@ impl TerminalApp {
         id: TabId,
         delivery: &Delivery,
         content: &SubmissionContent,
+        execution: Option<&GroupExecution>,
+        now: Instant,
         ctx: &ViewContext<Self>,
     ) -> View {
         let pane = delivery.target.pane;
@@ -1693,9 +1736,9 @@ impl TerminalApp {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        if let Some(result) = delivery.execution() {
+        if let Some(result) = execution {
             let name = &delivery.target.name;
-            let caption = execution_caption(&result);
+            let caption = execution_caption(result);
             rows.push(KeyedView::new(
                 "execution",
                 TextBlock::new()
@@ -1703,7 +1746,7 @@ impl TerminalApp {
                     .text(caption.as_ref())
                     .text_wrapping(TextWrapping::Wrap),
             ));
-            if let Some(timing) = execution_time_caption(&result, Instant::now()) {
+            if let Some(timing) = execution_time_caption(result, now) {
                 rows.push(KeyedView::new(
                     "shell-time",
                     TextBlock::new()

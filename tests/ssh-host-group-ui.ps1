@@ -110,6 +110,19 @@ function Select-ComboValue([string]$ControlName, [string]$Name) {
 function Set-ResultFilter([string]$Name) {
     Select-ComboValue 'Filter submission results' $Name
 }
+function Expect-ResultOrder([uint64[]]$Panes) {
+    $expected = ($Panes | ForEach-Object { "Focus result pane $_" }) -join '|'
+    $null = Wait-Until "result order '$expected'" {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $byButton = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
+        $actual = foreach ($entry in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $byButton)) {
+            $name = $entry.Current.Name
+            if ($name.StartsWith('Focus result pane ', [StringComparison]::Ordinal)) { $name }
+        }
+        ($actual -join '|') -ceq $expected
+    }
+}
 function Result-Progress([string]$Caption) {
     $null = Wait-Until 'submission progress counts' { Find-Element $Caption }
 }
@@ -222,6 +235,13 @@ try {
     $null = Wait-Until 'the held West result reports live elapsed time' {
         (Result-Timing $west) -match ($runningPrefix + '[1-9][0-9]* s$')
     }
+    Expect-ResultOrder @($east, $west)
+    Select-ComboValue 'Sort submission results' 'Longest shell time'
+    Expect-ResultOrder @($west, $east)
+    Select-ComboValue 'Sort submission results' 'Shortest shell time'
+    Expect-ResultOrder @($east, $west)
+    Select-ComboValue 'Sort submission results' 'Longest shell time'
+    Expect-ResultOrder @($west, $east)
     $null = Wait-Until 'East output in the group' { Find-Element 'east-accepted both' }
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
     $liveButton = 'Live output' + [char]0x2026
@@ -325,6 +345,8 @@ try {
     Submit 'while-slow' 'Send to 2 hosts'
     Outcome $eastName 'Exit 0'
     Outcome $westName "Not sent${dot}Waiting for a fresh prompt"
+    $null = Combo-Popup 'Sort submission results' 'Longest shell time'
+    Expect-ResultOrder @($east, $west)
     Result-Progress "2 of 2 settled${dot}0 waiting${dot}0 running${dot}1 succeeded${dot}1 needs attention"
     Set-HostFilter 'east'
     $null = Wait-Until 'West has left the roster' { !(Find-Element "Focus pane $west" $button) }
@@ -482,6 +504,7 @@ try {
     $null = Wait-Until 'the West result keeps its measured completion time' {
         (Result-Timing $west) -match ($finishedPrefix + '[1-9][0-9]*\.[0-9]{2} s$')
     }
+    Expect-ResultOrder @($west, $east)
     Click $liveButton
     $null = Wait-Until 'completed West output in the earlier live feed' {
         (Find-Element 'west-accepted both') -and (Find-Element 'west while paused')
@@ -536,11 +559,14 @@ try {
     $null = Wait-Until 'the earlier report contains its own outputs and exit statuses' {
         $report = Read-ClipboardFixture
         $report -and $report.StartsWith("Submitted${dot}both") -and
+            $report.IndexOf("$eastName${dot}Sent to SSH channel") -lt
+                $report.IndexOf("$westName${dot}Sent to SSH channel") -and
             $report.Contains("  Exit 0") -and $report.Contains('east-accepted both') -and
             $report.Contains("  Exit 17") -and $report.Contains('west-accepted both') -and
             $report.Contains('west while paused') -and
             !$report.Contains('east-report-tail')
     }
+    Select-ComboValue 'Sort submission results' 'Submission order'
     Click "View output for pane $west"
     $null = Wait-Until 'full West output opens the matching command history entry' {
         Find-Element "Selected, both${dot}exit 17" $button
