@@ -1810,9 +1810,7 @@ try {
     if ($trace.hresult -ge 0) {
         $null = Wait-Until 'recording selection was acknowledged' { Find-Element 'Selected in File Explorer' }
     }
-    $palette = Open-Palette 'Close tab'
-    $palette.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue('Close tab')
-    Click 'Close tab    Ctrl+Shift+W'
+    Run-Palette 'Close tab    Ctrl+Shift+W' -Enter
     Click 'Attention inbox, 0 unread'
     $null = Wait-Until 'the saved alert remains available after closing the group tab' {
         $expiredNotice = $readOutputNotice.Replace("Run $burstRunId${dot}", "Run $burstRunId (results unavailable)${dot}")
