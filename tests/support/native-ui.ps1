@@ -129,13 +129,18 @@ function Copy-ModeOpen {
     }
     return $false
 }
-function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Type) {
+function Find-Element([string]$Name, [System.Windows.Automation.ControlType]$Type, [switch]$Visible) {
     $condition = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
     if ($Type) {
         $byType = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $Type)
         $condition = [System.Windows.Automation.AndCondition]::new($condition, $byType)
+    }
+    if ($Visible) {
+        $onScreen = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::IsOffscreenProperty, $false)
+        $condition = [System.Windows.Automation.AndCondition]::new($condition, $onScreen)
     }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $found = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)

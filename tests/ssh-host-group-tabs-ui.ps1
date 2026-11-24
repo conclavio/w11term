@@ -65,8 +65,7 @@ function Choose-SavedGroup([string]$Name) {
     $popup = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
     $popup.Expand()
     $item = Wait-Until "'$Name' in the group chooser" {
-        $entry = Find-Element $Name $listItem
-        if ($entry -and !$entry.Current.IsOffscreen) { $entry }
+        Find-Element $Name $listItem -Visible
     }
     $item.GetCurrentPattern($selectionItem).Select()
     $null = Wait-Until "'$Name' is selected in the group chooser" {
@@ -88,15 +87,23 @@ function Expect-Choice([string]$FieldName, [string]$Choice) {
 }
 function Choose-Option([string]$FieldName, [string]$Choice) {
     $combo = Wait-Until $FieldName { Find-Element $FieldName $comboBox }
-    $popup = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    $popup.Expand()
+    $selected = $combo.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+    if ($selected.Count -eq 1 -and $selected[0].Current.Name -ceq $Choice) { return }
     $item = Wait-Until "visible option '$Choice'" {
-        $entry = Find-Element $Choice $listItem
-        if ($entry -and !$entry.Current.IsOffscreen) { $entry }
+        $field = Find-Element $FieldName $comboBox
+        if ($field) {
+            $expand = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+            if ($expand.Current.ExpandCollapseState -eq 'Collapsed') { $expand.Expand() }
+            Find-Element $Choice $listItem -Visible
+        }
     }
     $item.GetCurrentPattern($selectionItem).Select()
     Expect-Choice $FieldName $Choice
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    $field = Find-Element $FieldName $comboBox
+    if ($field) {
+        $expand = $field.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        if ($expand.Current.ExpandCollapseState -eq 'Expanded') { $expand.Collapse() }
+    }
 }
 function Session([string]$Name) {
     Wait-Until "SSH pane '$Name'" { (Control @('list')).sessions | Where-Object label -ceq $Name }
