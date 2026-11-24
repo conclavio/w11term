@@ -30,8 +30,34 @@ pub struct SshGroupExpectedOutput {
 
 #[derive(Debug)]
 pub struct SshGroupCommandOptions {
+    pub canary_pane_id: Option<u64>,
     pub expect_output: Option<(SshGroupExpectedOutput, Regex)>,
     pub record_output: Option<PathBuf>,
+}
+
+impl SshGroupCommandOptions {
+    pub(super) fn prepare(
+        canary_pane_id: Option<u64>,
+        expect_output: Option<SshGroupExpectedOutput>,
+        record_output: Option<PathBuf>,
+    ) -> Result<Self> {
+        ensure!(
+            record_output.as_ref().is_none_or(|path| path.is_absolute()),
+            "group output recording path must be absolute"
+        );
+        let expect_output = expect_output
+            .map(|rule| {
+                let pattern = output_pattern(&rule.query, rule.regex, rule.match_case)?;
+                Ok::<_, anyhow::Error>((rule, pattern))
+            })
+            .transpose()
+            .context("invalid expected output")?;
+        Ok(Self {
+            canary_pane_id,
+            expect_output,
+            record_output,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -129,12 +155,27 @@ fn describe_output_line(line: &GroupTranscriptLine, label: &str, address: &str) 
     })
 }
 
-pub fn validate_group_submission(pane_ids: &[u64], command: &str) -> Result<()> {
+pub fn validate_group_submission(
+    pane_ids: &[u64],
+    command: &str,
+    canary_pane_id: Option<u64>,
+) -> Result<()> {
     ensure!(
         crate::saved_commands::valid_command_text(command),
         "provide one nonempty shell command line of up to 4096 UTF-8 bytes"
     );
-    validate_group_panes(pane_ids)
+    validate_group_panes(pane_ids)?;
+    if let Some(canary) = canary_pane_id {
+        ensure!(
+            pane_ids.contains(&canary),
+            "canary pane {canary} must be one of the explicit recipient panes"
+        );
+        ensure!(
+            pane_ids.len() > 1,
+            "provide at least one other recipient pane with a canary"
+        );
+    }
+    Ok(())
 }
 
 pub fn validate_group_panes(pane_ids: &[u64]) -> Result<()> {
@@ -230,31 +271,15 @@ impl Registry {
         tab: u64,
         pane_ids: Vec<u64>,
         command: String,
-        expect_output: Option<SshGroupExpectedOutput>,
-        record_output: Option<PathBuf>,
+        options: SshGroupCommandOptions,
     ) -> Result<Value> {
-        validate_group_submission(&pane_ids, &command)?;
-        ensure!(
-            record_output.as_ref().is_none_or(|path| path.is_absolute()),
-            "group output recording path must be absolute"
-        );
-        let expect_output = expect_output
-            .map(|rule| {
-                let pattern = output_pattern(&rule.query, rule.regex, rule.match_case)?;
-                Ok::<_, anyhow::Error>((rule, pattern))
-            })
-            .transpose()
-            .context("invalid expected output")?;
         let ui = self.window_ui(window)?;
         let (reply, response) = oneshot::channel();
         ui(UiRequest::SubmitSshGroupCommand {
             tab_id: tab,
             pane_ids,
             command,
-            options: SshGroupCommandOptions {
-                expect_output,
-                record_output,
-            },
+            options,
             reply,
         });
         let Ok(Ok(run)) = tokio::time::timeout(TIMEOUT, response).await else {
@@ -824,6 +849,7 @@ mod tests {
                 assert_eq!(tab_id, 9);
                 assert_eq!(pane_ids, [8, 7]);
                 assert_eq!(command, "show  status");
+                assert_eq!(options.canary_pane_id, Some(7));
                 assert_eq!(
                     options.record_output,
                     Some(PathBuf::from(r"C:\fixture\capture.txt"))
@@ -885,67 +911,52 @@ mod tests {
                 .to_string()
                 .contains("unknown window 99")
         );
-        let submission = second
-            .submit_ssh_group_command(
-                3,
-                9,
-                vec![8, 7],
-                "show  status".into(),
-                Some(SshGroupExpectedOutput {
-                    query: "^READY [0-9]+$".into(),
-                    regex: true,
-                    match_case: true,
-                }),
-                Some(PathBuf::from(r"C:\fixture\capture.txt")),
+        let submit = |mut wire: Value| {
+            wire["verb"] = json!("submit-ssh-group-command");
+            wire["tab_id"] = json!(9);
+            second.execute(
+                serde_json::from_value(wire).unwrap(),
+                Arc::new(|_, _, _| unreachable!()),
             )
-            .await
-            .unwrap();
+        };
+        let submission = submit(json!({
+            "window_id": 3,
+            "pane_ids": [8, 7],
+            "command": "show  status",
+            "canary_pane_id": 7,
+            "expect_output": { "query": "^READY [0-9]+$", "regex": true, "match_case": true },
+            "record_output": r"C:\fixture\capture.txt",
+        }))
+        .await
+        .unwrap();
         assert_eq!(
             submission,
             json!({ "window_id": 3, "tab_id": 9, "run_id": 3 })
         );
-        assert!(
-            second
-                .submit_ssh_group_command(3, 9, vec![7, 7], "show".into(), None, None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("specified more than once")
-        );
-        assert!(
-            second
-                .submit_ssh_group_command(
-                    5,
-                    9,
-                    vec![7],
-                    "show".into(),
-                    Some(SshGroupExpectedOutput {
-                        query: "[".into(),
-                        regex: true,
-                        match_case: false
-                    }),
-                    None,
-                )
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("invalid expected output")
-        );
-        assert!(
-            second
-                .submit_ssh_group_command(
-                    5,
-                    9,
-                    vec![7],
-                    "show".into(),
-                    None,
-                    Some(PathBuf::from("relative.txt")),
-                )
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("recording path must be absolute")
-        );
+        for (mut wire, message) in [
+            (json!({"pane_ids": [7, 7]}), "specified more than once"),
+            (
+                json!({"pane_ids": [7], "expect_output": {"query": "[", "regex": true}}),
+                "invalid expected output",
+            ),
+            (
+                json!({"pane_ids": [7], "record_output": "relative.txt"}),
+                "recording path must be absolute",
+            ),
+            (
+                json!({"pane_ids": [7, 8], "canary_pane_id": 6}),
+                "must be one of the explicit recipient panes",
+            ),
+            (
+                json!({"pane_ids": [7], "canary_pane_id": 7}),
+                "at least one other recipient pane",
+            ),
+        ] {
+            wire["window_id"] = json!(5);
+            wire["command"] = json!("show");
+            let error = submit(wire).await.unwrap_err().to_string();
+            assert!(error.contains(message), "{error}");
+        }
         assert_eq!(
             lookup,
             json!({ "window_id": 3, "tab_id": 9, "run": { "summary": { "run_id": 2 } } })

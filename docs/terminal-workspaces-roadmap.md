@@ -256,6 +256,7 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 140. **Wait for explicitly named SSH panes.** Use the same pane IDs for readiness and command submission so UI filters and checks can change independently.
 141. **Control SSH dispatch queues from the CLI.** Pause, resume, or stop unsent commands on a retained run and return its queue state and remaining count.
 142. **Approve SSH canary runs from the CLI.** Report the canary pane while the gate is active. Require explicit approval of that pane after a verified successful exit before releasing the remaining hosts.
+143. **Choose an SSH canary per CLI submission.** Select a named recipient as the canary for a single run. Apply the same approval gate to recorded and unrecorded commands.
 
 **Acceptance.** Open two loopback SSH shells on different tabs, with the same SSH user and hostname but different ports, plus a local PowerShell. Select one SSH shell and verify that it alone receives the submitted line. Enable the other and verify both accept an identical command and report their own output and exit status. Switch one shell to an alternate screen or reconnect it during submission and verify its result explains why the line was withheld. After reconnect, verify that no previous submission appears on the new shell.
 

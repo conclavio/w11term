@@ -537,6 +537,40 @@ try {
             (Find-Element "$($labels.North)${dot}Not sent${dot}Queue expired before sending.") -and
             !(Find-Element 'Approve remaining hosts' $button)
     }
+    Select-GroupOption 'Expire unsent commands' 'Never'
+    $null = Control @('wait-ssh-group-ready','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.East)",'--pane',"$($panes.West)",'--timeout','10')
+    $overrideLog = Join-Path $State 'cli-canary-override.txt'
+    $submitted = Control @('submit-ssh-group-command','--window',"$groupWindow",'--tab',"$groupTab",
+        '--pane',"$($panes.East)",'--pane',"$($panes.West)",'--canary',"$($panes.West)",
+        '--record-output',$overrideLog,'--','verify-override')
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started verify-override')
+    $override = (Run-Snapshot $submitted.run_id).run
+    if ($override.dispatch_policy.canary.pane_id -ne $panes.West -or
+        $override.queue.state -cne 'canary_running' -or $override.queue.canary_pane_id -ne $panes.West -or
+        $override.queue.unsent -ne 1) {
+        throw 'The recorded CLI submission did not run its requested canary first'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-verify-override') | Out-Null
+    $null = Wait-Until 'the selected West canary finished and needs approval' {
+        (Run-Snapshot $submitted.run_id).run.queue.state -ceq 'canary_approval'
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'approve-verify-override') | Out-Null
+    $null = Control @('ssh-group-queue','--window',"$groupWindow",'--tab',"$groupTab",'--run',"$($submitted.run_id)",
+        'approve-canary','--pane',"$($panes.West)")
+    $null = Control @('wait-for-text','--pane',"$($panes.East)",'--timeout','10','East finished verify-override')
+    $null = Wait-Until 'the recording contains the override and both verified outcomes' {
+        $recorded = Read-GroupRecording $overrideLog
+        $recorded -and $recorded.Contains("canary $($labels.West)") -and
+            $recorded.Contains('West finished verify-override') -and
+            $recorded.Contains('East finished verify-override') -and
+            $recorded.Contains('[Group run settled]')
+    }
+    Set-Command 'existing draft'
+    Click 'Preview send order'
+    $null = Wait-Until 'the draft still uses the configured East canary' {
+        Find-Element "Canary first${dot}$($labels.East)"
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

@@ -11,6 +11,7 @@ pub(in crate::app) type ControlReply = oneshot::Sender<Result<Value, String>>;
 pub struct PreparedControlRecording {
     tab: TabId,
     offer: CommandOffer,
+    canary_pane_id: Option<u64>,
     alert: Option<alerted_send::Alert>,
     file: Result<output_recording::PreparedFile, String>,
     reply: ControlReply,
@@ -158,7 +159,9 @@ impl TerminalApp {
         reply: ControlReply,
         ctx: &ComponentContext<Self>,
     ) {
-        let offer = match self.control_command_offer(tab, pane_ids, command.into()) {
+        let canary_pane_id = options.canary_pane_id;
+        let offer = match self.control_command_offer(tab, pane_ids, command.into(), canary_pane_id)
+        {
             Ok(offer) => offer,
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -184,6 +187,7 @@ impl TerminalApp {
                 PreparedControlRecording {
                     tab,
                     offer,
+                    canary_pane_id,
                     alert,
                     file,
                     reply,
@@ -200,6 +204,7 @@ impl TerminalApp {
         let PreparedControlRecording {
             tab,
             offer,
+            canary_pane_id,
             alert,
             file,
             reply,
@@ -209,7 +214,11 @@ impl TerminalApp {
         }
         let result = file.and_then(|file| {
             let panes: Vec<_> = offer.targets.iter().map(|target| target.pane).collect();
-            let latest = self.control_command_offer(tab, &panes, offer.text.clone())?;
+            let latest =
+                self.control_command_offer(tab, &panes, offer.text.clone(), canary_pane_id)?;
+            if latest.canary != offer.canary {
+                return Err("The SSH canary changed while preparing the recording".into());
+            }
             if offer
                 .targets
                 .iter()
@@ -233,6 +242,7 @@ impl TerminalApp {
         tab: TabId,
         pane_ids: &[u64],
         command: Arc<str>,
+        canary_pane_id: Option<u64>,
     ) -> Result<CommandOffer, String> {
         let targets = self.host_group_targets();
         let Some(Page::HostGroup(page)) = self.tabs.get_mut(tab).map(|tab| &mut tab.page) else {
@@ -263,11 +273,12 @@ impl TerminalApp {
             }
             recipients.push(target.clone());
         }
-        command_queue::canary_readiness(&recipients, page.canary).map_err(|_| {
-            "Include the configured canary at a fresh shell marker and at least one other ready SSH pane"
+        let canary = canary_pane_id.or(page.canary);
+        command_queue::canary_readiness(&recipients, canary).map_err(|_| {
+            "Include the canary at a fresh shell marker and at least one other ready SSH pane"
                 .to_owned()
         })?;
-        Ok(page.command_offer(command, recipients))
+        Ok(page.command_offer(command, recipients, canary))
     }
 
     fn dispatch_control_offer(

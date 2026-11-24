@@ -617,7 +617,12 @@ impl HostGroup {
         })
     }
 
-    fn command_offer(&self, text: Arc<str>, targets: Vec<Target>) -> CommandOffer {
+    fn command_offer(
+        &self,
+        text: Arc<str>,
+        targets: Vec<Target>,
+        canary: Option<u64>,
+    ) -> CommandOffer {
         CommandOffer {
             text,
             targets,
@@ -625,8 +630,8 @@ impl HostGroup {
             interval: self.roster_preferences.command_interval,
             queue_expiry: self.roster_preferences.command_queue_expiry,
             stop_queue_on_failure: self.roster_preferences.stop_command_queue_on_failure,
-            canary: self.canary,
-            notify_canary: self.canary.is_some() && self.notify_canary,
+            canary,
+            notify_canary: canary.is_some() && self.notify_canary,
         }
     }
 
@@ -2402,6 +2407,7 @@ impl TerminalApp {
                 .into_iter()
                 .cloned()
                 .collect(),
+            page.canary,
         );
         let (body_key, body) = if page.preview_command_order {
             (
