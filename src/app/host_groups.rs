@@ -45,6 +45,7 @@ pub(super) struct HostGroup {
     roster: Option<Box<MemberRoster>>,
     selected: BTreeSet<u64>,
     filter: filter::Filter,
+    roster_order: RosterOrder,
     show_last_output: bool,
     require_all_ready: bool,
     roster_copy_feedback: String,
@@ -202,6 +203,46 @@ impl RosterStatus {
             Self::Authentication => "Authentication required",
             Self::ReadOnly => "Read-only",
             Self::Alternate => "Alternate screen",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum RosterOrder {
+    #[default]
+    Tabs,
+    Label,
+    CheckedFirst,
+    AttentionFirst,
+}
+
+impl RosterOrder {
+    const OPTIONS: [Self; 4] = [
+        Self::Tabs,
+        Self::Label,
+        Self::CheckedFirst,
+        Self::AttentionFirst,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tabs => "Tab order",
+            Self::Label => "Host label",
+            Self::CheckedFirst => "Checked first",
+            Self::AttentionFirst => "Needs attention first",
+        }
+    }
+
+    fn apply(self, targets: &mut [&Target], selected: &BTreeSet<u64>) {
+        match self {
+            Self::Tabs => {}
+            Self::Label => targets.sort_by_cached_key(|target| target.names.label.to_lowercase()),
+            Self::CheckedFirst => targets.sort_by_key(|target| !selected.contains(&target.pane)),
+            Self::AttentionFirst => targets.sort_by_key(|target| match target.state {
+                TargetState::Ready(_) | TargetState::Matched(_) => 2,
+                TargetState::InUse => 1,
+                _ => 0,
+            }),
         }
     }
 }
@@ -505,6 +546,7 @@ pub enum Action {
     Filter(TabId, String),
     FilterWildcards(TabId, bool),
     FilterStatus(TabId, RosterStatus),
+    OrderRoster(TabId, RosterOrder),
     ShowLastOutput(TabId, bool),
     RequireAllReady(TabId, bool),
     CopyRoster(TabId, BTreeSet<u64>),
@@ -993,6 +1035,11 @@ impl TerminalApp {
                     page.filter.set_status(status);
                 }
             }
+            Action::OrderRoster(id, order) => {
+                if let Some(page) = self.host_group_mut(id) {
+                    page.roster_order = order;
+                }
+            }
             Action::ShowLastOutput(id, show) => {
                 if let Some(page) = self.host_group_mut(id) {
                     page.show_last_output = show;
@@ -1386,8 +1433,10 @@ impl TerminalApp {
             selected.len(),
             if selected.len() == 1 { "host" } else { "hosts" }
         );
-        let mut details: Vec<KeyedView> = shown
-            .iter()
+        let mut roster_rows = shown.clone();
+        page.roster_order.apply(&mut roster_rows, &page.selected);
+        let mut details: Vec<KeyedView> = roster_rows
+            .into_iter()
             .map(|target| {
                 let pane = target.pane;
                 let state = target.status_caption();
@@ -1466,7 +1515,12 @@ impl TerminalApp {
         };
         let filter_input = Grid::new()
             .column_spacing(8.0)
-            .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+            .columns([
+                GridLength::STAR,
+                GridLength::Auto,
+                GridLength::Auto,
+                GridLength::Auto,
+            ])
             .children((
                 TextBox::new()
                     .automation_name("Host filter")
@@ -1505,6 +1559,26 @@ impl TerminalApp {
                             .and_then(|index| RosterStatus::OPTIONS.get(index))
                             .map_or(Message::ControlIdle, |&status| {
                                 Message::HostGroup(Action::FilterStatus(id, status))
+                            })
+                    })),
+                ComboBox::new()
+                    .grid_column(3)
+                    .automation_name("Sort SSH roster")
+                    .items_source(
+                        RosterOrder::OPTIONS
+                            .map(|order| order.label().to_owned())
+                            .to_vec(),
+                    )
+                    .selected_index(
+                        RosterOrder::OPTIONS
+                            .iter()
+                            .position(|&order| order == page.roster_order),
+                    )
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index
+                            .and_then(|index| RosterOrder::OPTIONS.get(index))
+                            .map_or(Message::ControlIdle, |&order| {
+                                Message::HostGroup(Action::OrderRoster(id, order))
                             })
                     })),
             ));
@@ -2052,6 +2126,48 @@ impl TerminalApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_sort_uses_stable_ties_and_keeps_recipient_order() {
+        let targets = [
+            ("Zulu", TargetState::InUse),
+            ("ALPHA", TargetState::Offline),
+            ("alpha", TargetState::ReadOnly),
+            ("Beta", TargetState::Unverified),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (label, state))| Target {
+            pane: index as u64 + 1,
+            name: label.into(),
+            names: filter::Names::new(label, "lab.example", "ops", 22),
+            profile: None,
+            connected: !matches!(state, TargetState::Offline),
+            state,
+        })
+        .collect::<Vec<_>>();
+        let group = HostGroup {
+            selected: BTreeSet::from([1, 4]),
+            ..Default::default()
+        };
+        for (order, expected) in [
+            (RosterOrder::Tabs, [1, 2, 3, 4]),
+            (RosterOrder::Label, [2, 3, 4, 1]),
+            (RosterOrder::CheckedFirst, [1, 4, 2, 3]),
+            (RosterOrder::AttentionFirst, [2, 3, 4, 1]),
+        ] {
+            let mut shown: Vec<_> = group.shown(&targets).collect();
+            order.apply(&mut shown, &group.selected);
+            assert!(shown.iter().map(|target| target.pane).eq(expected));
+            assert!(
+                group
+                    .shown(&targets)
+                    .filter(|target| group.selected.contains(&target.pane))
+                    .map(|target| target.pane)
+                    .eq([1, 4])
+            );
+        }
+    }
 
     #[test]
     fn group_send_readiness_requires_a_recipient_and_respects_the_tab_option() {

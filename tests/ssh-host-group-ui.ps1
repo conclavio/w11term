@@ -110,18 +110,21 @@ function Select-ComboValue([string]$ControlName, [string]$Name) {
 function Set-ResultFilter([string]$Name) {
     Select-ComboValue 'Filter submission results' $Name
 }
-function Expect-ResultOrder([uint64[]]$Panes) {
-    $expected = ($Panes | ForEach-Object { "Focus result pane $_" }) -join '|'
-    $null = Wait-Until "result order '$expected'" {
+function Expect-PaneButtonOrder([string]$Prefix, [uint64[]]$Panes) {
+    $expected = ($Panes | ForEach-Object { "$Prefix$_" }) -join '|'
+    $null = Wait-Until "pane order '$expected'" {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $byButton = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $button)
         $actual = foreach ($entry in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $byButton)) {
             $name = $entry.Current.Name
-            if ($name.StartsWith('Focus result pane ', [StringComparison]::Ordinal)) { $name }
+            if ($name.StartsWith($Prefix, [StringComparison]::Ordinal)) { $name }
         }
         ($actual -join '|') -ceq $expected
     }
+}
+function Expect-ResultOrder([uint64[]]$Panes) {
+    Expect-PaneButtonOrder 'Focus result pane ' $Panes
 }
 function Result-Progress([string]$Caption) {
     $null = Wait-Until 'submission progress counts' { Find-Element $Caption }
@@ -707,9 +710,15 @@ try {
     Outcome $westName "Not sent${dot}Waiting for a fresh prompt"
     Send-Raw $west 'alt'
     Pane-Status $west "Connected${dot}Alternate screen"
+    $rosterSort = 'Sort SSH roster'
+    $null = Combo-Popup $rosterSort 'Tab order'
+    Expect-PaneButtonOrder 'Focus pane ' @($east, $west)
+    Select-ComboValue $rosterSort 'Needs attention first'
+    Expect-PaneButtonOrder 'Focus pane ' @($west, $east)
     Submit 'while-alt' 'Send to 2 hosts'
     Outcome $eastName 'Sent to SSH channel'
     Outcome $westName "Not sent${dot}Alternate screen"
+    Expect-ResultOrder @($east, $west)
     (Wait-CheckBox $showLastOutput Off).Toggle()
     $null = Wait-Until 'the alternate-screen host has no roster preview' {
         (Find-Element $openEastOutput $button) -and !(Find-Element $openWestOutput $button)
@@ -725,10 +734,14 @@ try {
             $report.Contains("2 shown${dot}1 checked") -and
             $report.Contains("Checked${dot}$eastName${dot}Connected${dot}Ready") -and
             $report.Contains("Unchecked${dot}$westName${dot}Connected${dot}Alternate screen") -and
+            $report.IndexOf($westName) -lt $report.IndexOf($eastName) -and
             !$report.Contains('east-accepted while-alt')
     }
+    Select-ComboValue $rosterSort 'Checked first'
+    Expect-PaneButtonOrder 'Focus pane ' @($east, $west)
     (Wait-CheckBox $westName Off).Toggle()
     $null = Wait-CheckBox $westName On
+    Select-ComboValue $rosterSort 'Needs attention first'
     $hostStateFilter = 'Filter host state'
     Select-ComboValue $hostStateFilter 'Ready'
     $null = Wait-Until 'the ready filter scopes the roster and send count to East' {
@@ -763,6 +776,8 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     Select-ComboValue $hostStateFilter 'All host states'
+    Expect-PaneButtonOrder 'Focus pane ' @($east, $west)
+    Select-ComboValue $rosterSort 'Tab order'
     $null = Wait-Until 'the retained preview returns when West leaves the alternate screen' {
         Find-Element $openWestOutput $button
     }

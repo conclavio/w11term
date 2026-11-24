@@ -59,11 +59,12 @@ impl TerminalApp {
             return;
         };
         let targets = self.host_group_targets();
-        let shown: Vec<_> = page.shown(&targets).collect();
+        let mut shown: Vec<_> = page.shown(&targets).collect();
         let current: BTreeSet<_> = shown.iter().map(|target| target.pane).collect();
         let feedback = if current != *offered {
             "The shown roster changed. Copy it again.".into()
         } else {
+            page.roster_order.apply(&mut shown, &page.selected);
             match roster_text(label, &shown, &page.selected, w11term::clipboard::MAX_TEXT)
                 .and_then(|text| w11term::clipboard::write(&text))
             {
