@@ -1113,6 +1113,11 @@ impl TerminalApp {
                                 Message::HostGroup(Action::Membership(id, membership::Action::Open))
                             }))
                             .content(membership::LABEL),
+                        if page.saved.can_update_roster() {
+                            saved::update_button(id, ctx)
+                        } else {
+                            View::empty()
+                        },
                     ))
             }),
             filter_error.map_or_else(View::empty, |error| {
