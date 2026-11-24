@@ -179,6 +179,8 @@ Open **Saved alert rules…** in Live output or the send-with-alert review to sa
 
 In **Send with alert…**, turn on **Alert if expected output is missing** to look for a confirmation line across the selected hosts. A verified match clears the alert quietly. If the run settles without a match, the Attention inbox reports either **Expected output missing** when capture completed for all recipients or **Could not verify expected output** when delivery or capture was incomplete.
 
+Select **Require a match from every host** when each recipient needs to produce its own confirmation. The inbox summarizes missing and unverified hosts at settlement. Open the notice to see which hosts fall into each group.
+
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.

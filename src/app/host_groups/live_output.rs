@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, fmt::Write as _, io::Write as _};
 use w11term::{
     events::{
         GroupCompletionState, GroupOutputAlert, GroupOutputAlertRule, GroupOutputAlertTrigger,
-        GroupTranscriptHistory, GroupTranscriptLine, GroupTranscriptSnapshot,
+        GroupOutputExpectation, GroupTranscriptHistory, GroupTranscriptLine,
+        GroupTranscriptSnapshot,
     },
     saved_output_rules::compile_query,
 };
@@ -306,6 +307,7 @@ pub(super) fn armed_alert_view(
     let trigger = match rule.trigger {
         GroupOutputAlertTrigger::Match => "",
         GroupOutputAlertTrigger::Missing => " · Missing match at settlement",
+        GroupOutputAlertTrigger::MissingByHost => " · Match required from every host",
     };
     StackPanel::new().spacing(4.0).children((
         TextBlock::new()
@@ -331,6 +333,28 @@ pub(super) fn armed_alert_view(
                     }))
                     .content("Cancel output alert"),
             )),
+    ))
+}
+
+pub(super) fn output_expectation_view(expectation: &GroupOutputExpectation) -> View {
+    let hosts = expectation.hosts.iter().map(|host| {
+        let status = if host.confirmed {
+            "Expected output missing"
+        } else {
+            "Could not verify expected output"
+        };
+        KeyedView::new(
+            host.pane.to_string(),
+            TextBlock::new()
+                .text(format!("{status} · {}", host.name))
+                .text_wrapping(TextWrapping::Wrap),
+        )
+    });
+    StackPanel::new().spacing(4.0).children((
+        TextBlock::new()
+            .text(format!("Expected output · {}", expectation.rule.query))
+            .text_wrapping(TextWrapping::Wrap),
+        StackPanel::new().spacing(2.0).keyed_children(hosts),
     ))
 }
 

@@ -14,6 +14,7 @@ struct Review {
     search: OutputSearch,
     record: bool,
     missing: bool,
+    require_every_host: bool,
 }
 
 pub(super) struct Alert {
@@ -28,6 +29,7 @@ pub enum Action {
     MatchCase(bool),
     Record(bool),
     Missing(bool),
+    RequireEveryHost(bool),
     Presets(alert_rule_presets::Action),
     Confirm,
     Cancel,
@@ -115,6 +117,13 @@ impl State {
                             )
                             .content("Alert if expected output is missing"),
                         CheckBox::new()
+                            .is_enabled(review.missing)
+                            .is_checked(review.require_every_host)
+                            .on_is_checked_changed(
+                                ctx.callback(move |on| send(Action::RequireEveryHost(on))),
+                            )
+                            .content("Require a match from every host"),
+                        CheckBox::new()
                             .is_checked(review.record)
                             .on_is_checked_changed(ctx.callback(move |on| send(Action::Record(on))))
                             .content("Record full output"),
@@ -181,6 +190,7 @@ impl TerminalApp {
                         search: OutputSearch::default(),
                         record: false,
                         missing: false,
+                        require_every_host: false,
                     }));
                 }
             }
@@ -208,6 +218,7 @@ impl TerminalApp {
                     }
                     Action::Record(on) => review.record = on,
                     Action::Missing(on) => review.missing = on,
+                    Action::RequireEveryHost(on) => review.require_every_host = on,
                     Action::Presets(action) => search.update_presets(action),
                     _ => {}
                 }
@@ -226,10 +237,10 @@ impl TerminalApp {
         else {
             return;
         };
-        let trigger = if review.missing {
-            GroupOutputAlertTrigger::Missing
-        } else {
-            GroupOutputAlertTrigger::Match
+        let trigger = match (review.missing, review.require_every_host) {
+            (true, true) => GroupOutputAlertTrigger::MissingByHost,
+            (true, false) => GroupOutputAlertTrigger::Missing,
+            (false, _) => GroupOutputAlertTrigger::Match,
         };
         let alert = Alert {
             rule: review.search.alert_rule(None, trigger),

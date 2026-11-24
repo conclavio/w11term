@@ -2759,6 +2759,12 @@ impl TerminalApp {
                 },
             )),
         ));
+        if let Some(expectation) = submission.transcript.output_expectation() {
+            details.push(KeyedView::new(
+                "output-expectation",
+                live_output::output_expectation_view(&expectation),
+            ));
+        }
         if shown.is_empty() {
             details.push(KeyedView::new(
                 "results-empty",

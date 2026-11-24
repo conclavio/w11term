@@ -267,6 +267,43 @@ impl Inbox {
         } else {
             "Could not verify expected output"
         };
+        self.push_output_expectation(tab, submission, source, query, status);
+    }
+
+    pub(super) fn group_output_missing_by_host(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        query: &str,
+        missing: usize,
+        unverified: usize,
+    ) {
+        let count_hosts = |count| format!("{count} {}", if count == 1 { "host" } else { "hosts" });
+        let mut parts = Vec::new();
+        if missing > 0 {
+            parts.push(format!(
+                "Expected output missing on {}",
+                count_hosts(missing)
+            ));
+        }
+        if unverified > 0 {
+            parts.push(format!(
+                "Could not verify expected output on {}",
+                count_hosts(unverified)
+            ));
+        }
+        self.push_output_expectation(tab, submission, source, query, &parts.join(" · "));
+    }
+
+    fn push_output_expectation(
+        &self,
+        tab: u64,
+        submission: u64,
+        source: &str,
+        query: &str,
+        status: &str,
+    ) {
         let query = display_field(query);
         let message = if query.is_empty() {
             status.into()

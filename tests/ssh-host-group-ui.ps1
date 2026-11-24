@@ -1932,6 +1932,34 @@ try {
     $null = Wait-Until 'the missing-output notice opens the settled run and marks it read' {
         (Find-Element "Submitted${dot}check-expected") -and (Find-Element 'Attention inbox, 0 unread' $button)
     }
+    Send-Raw $west 'prompt'
+    Set-HostFilter ''
+    Pane-Status $west "Connected${dot}Ready"
+    $null = Wait-CheckBox $eastName On
+    $null = Wait-CheckBox $westName On
+    (Command-Editor).SetValue('check-each-host')
+    Click $alertedSend
+    $expectedLine = 'east-accepted check-each-host'
+    (Command-Editor $alertSearch).SetValue($expectedLine)
+    (Wait-CheckBox 'Alert if expected output is missing' Off).Toggle()
+    $null = Wait-CheckBox 'Alert if expected output is missing' On
+    (Wait-CheckBox 'Require a match from every host' Off).Toggle()
+    $null = Wait-CheckBox 'Require a match from every host' On
+    Click 'Send with alert'
+    $null = Wait-Until 'a match on East leaves West under its own check' {
+        (Find-Element "Submitted${dot}check-each-host") -and (Find-Element 'Attention inbox, 1 unread' $button)
+    }
+    Click 'Attention inbox, 1 unread'
+    $everyHostRun = $missingRun + 1
+    Click "Unread${dot}SSH host group${dot}Run $everyHostRun${dot}Expected output missing on 1 host${dot}$expectedLine"
+    $null = Wait-Until 'run results identify West as the host missing expected output' {
+        (Find-Element "Submitted${dot}check-each-host") -and
+            (Find-Element "Expected output missing${dot}$westName") -and
+            !(Find-Element "Expected output missing${dot}$eastName") -and
+            (Find-Element 'Attention inbox, 0 unread' $button)
+    }
+    Click 'Previous submission'
+    $null = Wait-Until 'move back to the earlier missing-output check' { Find-Element "Submitted${dot}check-expected" }
     Click 'Previous submission'
     $null = Wait-Until 'return to the partially delivered recording' { Find-Element "Submitted${dot}record-one" }
     Wait-RecordingStatus 'Saved live output to ' $withheldPath

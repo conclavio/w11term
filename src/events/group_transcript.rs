@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::Serialize;
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Instant,
 };
@@ -31,18 +31,33 @@ struct Transcript {
     dispatch_finished: bool,
     completion_notice: Option<CompletionNotice>,
     output_alert: Option<ArmedOutputAlert>,
+    output_expectation: Option<Arc<GroupOutputExpectation>>,
 }
 
 #[derive(Debug)]
 struct ArmedOutputAlert {
     alert: GroupOutputAlert,
-    incomplete: bool,
+    incomplete: BTreeSet<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupOutputAlertTrigger {
     Match,
     Missing,
+    MissingByHost,
+}
+
+#[derive(Debug)]
+pub struct GroupOutputExpectation {
+    pub rule: Arc<GroupOutputAlertRule>,
+    pub hosts: Vec<UnmatchedOutputHost>,
+}
+
+#[derive(Debug)]
+pub struct UnmatchedOutputHost {
+    pub pane: u64,
+    pub name: String,
+    pub confirmed: bool,
 }
 
 #[derive(Debug)]
@@ -508,12 +523,16 @@ impl GroupTranscript {
         Some(transcript.output_alert.as_ref()?.alert.rule.clone())
     }
 
+    pub fn output_expectation(&self) -> Option<Arc<GroupOutputExpectation>> {
+        self.0.lock().unwrap().output_expectation.clone()
+    }
+
     pub fn arm_output_alert(&self, alert: GroupOutputAlert) {
         let mut transcript = self.0.lock().unwrap();
         if !transcript.settled() && transcript.output_alert.is_none() && !alert.hosts.is_empty() {
             transcript.output_alert = Some(ArmedOutputAlert {
                 alert,
-                incomplete: false,
+                incomplete: BTreeSet::new(),
             });
         }
     }
@@ -631,20 +650,7 @@ impl GroupTranscript {
             return;
         }
         transcript.output_watch = None;
-        let unresolved_alert = transcript.output_alert.take().and_then(|armed| {
-            let alert = armed.alert;
-            if alert.rule.trigger != GroupOutputAlertTrigger::Missing {
-                return None;
-            }
-            let confirmed = !armed.incomplete
-                && transcript
-                    .hosts
-                    .iter()
-                    .filter(|host| alert.hosts.contains_key(&host.pane) && host.confirmed_output())
-                    .count()
-                    == alert.hosts.len();
-            Some((alert, confirmed))
-        });
+        let unresolved_alert = transcript.finish_output_alert();
         if transcript
             .recording
             .as_ref()
@@ -667,14 +673,31 @@ impl GroupTranscript {
             (notice, succeeded, attention, skipped)
         });
         drop(transcript);
-        if let Some((alert, confirmed)) = unresolved_alert {
-            alert.inbox.group_output_unmatched(
-                alert.tab,
-                alert.submission,
-                &alert.source,
-                &alert.rule.query,
-                confirmed,
-            );
+        if let Some((alert, expectation)) = unresolved_alert {
+            let missing = expectation
+                .hosts
+                .iter()
+                .filter(|host| host.confirmed)
+                .count();
+            let unverified = expectation.hosts.len() - missing;
+            if alert.rule.trigger == GroupOutputAlertTrigger::MissingByHost {
+                alert.inbox.group_output_missing_by_host(
+                    alert.tab,
+                    alert.submission,
+                    &alert.source,
+                    &alert.rule.query,
+                    missing,
+                    unverified,
+                );
+            } else {
+                alert.inbox.group_output_unmatched(
+                    alert.tab,
+                    alert.submission,
+                    &alert.source,
+                    &alert.rule.query,
+                    unverified == 0,
+                );
+            }
         }
         if let Some((notice, succeeded, attention, skipped)) = completion {
             notice.inbox.group_finished(
@@ -742,7 +765,7 @@ impl GroupTranscriptHost {
             if let Some(armed) = transcript.output_alert.as_mut()
                 && armed.alert.hosts.contains_key(&self.pane)
             {
-                armed.incomplete = true;
+                armed.incomplete.insert(self.pane);
             }
             transcript.push(
                 self.pane,
@@ -772,22 +795,57 @@ impl GroupTranscriptHost {
 }
 
 impl Transcript {
+    fn finish_output_alert(&mut self) -> Option<(GroupOutputAlert, Arc<GroupOutputExpectation>)> {
+        let ArmedOutputAlert { alert, incomplete } = self.output_alert.take()?;
+        if alert.rule.trigger == GroupOutputAlertTrigger::Match {
+            return None;
+        }
+        let confirmed: BTreeSet<_> = self
+            .hosts
+            .iter()
+            .filter(|host| host.confirmed_output() && !incomplete.contains(&host.pane))
+            .map(|host| host.pane)
+            .collect();
+        let expectation = Arc::new(GroupOutputExpectation {
+            rule: alert.rule.clone(),
+            hosts: alert
+                .hosts
+                .iter()
+                .map(|(&pane, name)| UnmatchedOutputHost {
+                    pane,
+                    name: name.clone(),
+                    confirmed: confirmed.contains(&pane),
+                })
+                .collect(),
+        });
+        if alert.rule.trigger == GroupOutputAlertTrigger::MissingByHost {
+            self.output_expectation = Some(expectation.clone());
+        }
+        Some((alert, expectation))
+    }
+
     fn observe_alert_line(&mut self) -> Option<(GroupOutputAlert, GroupTranscriptLine)> {
         let armed = self.output_alert.as_mut()?;
         let line = self.history.combined.snapshot.lines.back()?;
         if !armed.alert.hosts.contains_key(&line.pane) {
             return None;
         }
-        let missing = armed.alert.rule.trigger == GroupOutputAlertTrigger::Missing;
-        if missing && line.shortened {
-            armed.incomplete = true;
+        let trigger = armed.alert.rule.trigger;
+        if trigger != GroupOutputAlertTrigger::Match && line.shortened {
+            armed.incomplete.insert(line.pane);
             return None;
         }
         if !armed.alert.pattern.is_match(&line.text) {
             return None;
         }
+        if trigger == GroupOutputAlertTrigger::MissingByHost {
+            armed.alert.hosts.remove(&line.pane);
+            if !armed.alert.hosts.is_empty() {
+                return None;
+            }
+        }
         let alert = self.output_alert.take().unwrap().alert;
-        (!missing).then(|| (alert, line.clone()))
+        (trigger == GroupOutputAlertTrigger::Match).then(|| (alert, line.clone()))
     }
 
     fn settled(&self) -> bool {
@@ -1031,6 +1089,99 @@ mod tests {
                 );
             }
             assert!(group.output_alert_rule().is_none());
+        }
+    }
+
+    #[test]
+    fn every_host_alert_waits_for_all_matches_and_keeps_missing_hosts_separate() {
+        let pattern = Regex::new("^ready$").unwrap();
+        let rule = Arc::new(GroupOutputAlertRule {
+            query: "^ready$".into(),
+            regex: true,
+            match_case: true,
+            host: None,
+            trigger: GroupOutputAlertTrigger::MissingByHost,
+        });
+        let finished = GroupExecution::Finished(Arc::new(GroupCommandResult {
+            link: CommandLink {
+                generation: 1,
+                id: 1,
+            },
+            exit_code: Some(0),
+            duration: std::time::Duration::ZERO,
+            output: GroupOutput::Captured {
+                text: String::new(),
+                truncated: false,
+            },
+        }));
+        for all_matched in [false, true] {
+            let group = GroupTranscript::default();
+            let inbox = Inbox::new(|| {});
+            group.arm_output_alert(GroupOutputAlert {
+                inbox: inbox.clone(),
+                tab: 2,
+                submission: 9,
+                source: "Fleet".into(),
+                hosts: BTreeMap::from([
+                    (1, "East".into()),
+                    (2, "West".into()),
+                    (3, "North".into()),
+                ]),
+                pattern: pattern.clone(),
+                rule: rule.clone(),
+            });
+            let east = group.host(1);
+            let west = group.host(2);
+            let north = group.host(3);
+            group.finish_dispatch();
+            for host in [&east, &west, &north] {
+                host.delivery_receipt().acknowledge();
+                host.set_execution(&finished);
+            }
+            let append = |host: &GroupTranscriptHost, text: &str, gap| {
+                host.append(LiveOutputBatch {
+                    lines: vec![LiveOutputLine {
+                        text: text.into(),
+                        shortened: false,
+                    }],
+                    gap,
+                });
+            };
+            append(&east, "ready", false);
+            append(&east, "ready", false);
+            assert!(group.output_alert_rule().is_some());
+            drop(east);
+            if all_matched {
+                append(&west, "ready", false);
+                append(&north, "ready", true);
+                assert!(group.output_alert_rule().is_none());
+            } else {
+                append(&west, "starting", false);
+                append(&north, "starting", true);
+            }
+            drop(west);
+            assert!(inbox.rows().is_empty());
+            drop(north);
+            if all_matched {
+                assert!(inbox.rows().is_empty());
+                assert!(group.output_expectation().is_none());
+            } else {
+                let report = group.output_expectation().unwrap();
+                assert_eq!(
+                    report
+                        .hosts
+                        .iter()
+                        .map(|host| (host.pane, host.name.as_str(), host.confirmed))
+                        .collect::<Vec<_>>(),
+                    [(2, "West", true), (3, "North", false)]
+                );
+                let rows = inbox.rows();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].message,
+                    "Expected output missing on 1 host · Could not verify expected output on 1 host · ^ready$"
+                );
+            }
         }
     }
 
