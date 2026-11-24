@@ -231,6 +231,8 @@ try {
     Roster-Choice 'Host label' -Choose
     Roster-Choice 'Unlimited' -ControlName 'Parallel SSH commands'
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands' -Choose
+    (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
+    $null = Wait-CheckBox 'Stop queue on failure' On
     (Wait-CheckBox $allReady Off).Toggle()
     (Wait-CheckBox $showOutput Off).Toggle()
     $null = Wait-CheckBox $allReady On
@@ -240,7 +242,8 @@ try {
         if (!(Find-Element 'Saved roster defaults')) { return }
         $savedDefaults = (Catalog).ssh_host_group_defaults.Fleet
         $savedDefaults.order -ceq 'label' -and $savedDefaults.command_limit -ceq 'two' -and
-            $savedDefaults.show_last_output -and $savedDefaults.require_all_ready
+            $savedDefaults.show_last_output -and $savedDefaults.require_all_ready -and
+            $savedDefaults.stop_command_queue_on_failure
     }
     (Wait-CheckBox $showOutput On).Toggle()
     $null = Wait-CheckBox $showOutput Off
@@ -251,6 +254,7 @@ try {
     $null = Wait-Until 'reopened Fleet with its own roster defaults' { Find-Element 'Opened 2 SSH panes for Fleet' }
     Roster-Choice 'Host label'
     Roster-Choice '2 at a time' -ControlName 'Parallel SSH commands'
+    $null = Wait-CheckBox 'Stop queue on failure' On
     $null = Wait-CheckBox $allReady On
     $null = Wait-CheckBox $showOutput On
     $null = Wait-Until 'the loaded preferences match the saved defaults' {

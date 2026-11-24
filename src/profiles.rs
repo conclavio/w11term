@@ -1525,6 +1525,7 @@ mod tests {
             require_all_ready: true,
             login_limit: SshGroupParallelLimit::Four,
             command_limit: SshGroupParallelLimit::Two,
+            stop_command_queue_on_failure: true,
         };
         assert!(
             store

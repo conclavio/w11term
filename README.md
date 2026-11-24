@@ -95,6 +95,8 @@ Turn on **Require all recipients ready** to wait for every visible, checked host
 
 Set **Parallel SSH commands** to run a submission in batches. The default is **Unlimited**. With a limit, the results show queued hosts and the next host gets a slot when an earlier command settles. A queued command still needs the original verified prompt. **Cancel queued commands** withholds the remaining sends while active commands continue.
 
+With a finite limit, turn on **Stop queue on failure** to withhold the remaining commands as soon as a host settles without a confirmed zero exit status. Active commands continue. **Save roster defaults** remembers this choice for a named group.
+
 Use the host-state dropdown to show ready shells, disconnected panes, or another current state. The state filter combines with the name or wildcard filter and keeps checks on hidden hosts. Sending and other actions on checked hosts use the visible selection.
 
 The live state count summarizes every host matching the name or wildcard filter. When a state filter hides hosts, the summary shows how many are visible out of the matching total.

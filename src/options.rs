@@ -464,6 +464,7 @@ pub struct SshRosterDefaults {
     pub require_all_ready: bool,
     pub login_limit: SshGroupParallelLimit,
     pub command_limit: SshGroupParallelLimit,
+    pub stop_command_queue_on_failure: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

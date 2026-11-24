@@ -1,6 +1,8 @@
 use super::*;
 use w11term::events::GroupTranscriptHost;
 
+const FAILED_RESULT: &str = "Queue stopped after an unsuccessful host.";
+
 pub(super) struct Waiting(Option<GroupTranscriptHost>);
 
 impl Waiting {
@@ -26,6 +28,15 @@ impl Submission {
         self.results
             .iter()
             .any(|result| matches!(result.status, DeliveryStatus::Queued(_)))
+    }
+
+    fn reject_queued_commands(&mut self, reason: &str) {
+        for delivery in &mut self.results {
+            if let DeliveryStatus::Queued(waiting) = &mut delivery.status {
+                waiting.reject(reason);
+                delivery.status = DeliveryStatus::Rejected(reason.into());
+            }
+        }
     }
 }
 
@@ -53,6 +64,11 @@ impl TerminalApp {
                 else {
                     continue;
                 };
+                if run.stop_queue_on_failure && run.transcript.has_unsuccessful_result() {
+                    run.reject_queued_commands(FAILED_RESULT);
+                    continue;
+                }
+                let stop_after_failure = run.stop_queue_on_failure.then(|| run.transcript.clone());
                 for (index, delivery) in run.results.iter_mut().enumerate() {
                     let DeliveryStatus::Queued(waiting) = &mut delivery.status else {
                         continue;
@@ -65,11 +81,30 @@ impl TerminalApp {
                         .take()
                         .expect("queued command owns its delivery receipt");
                     host.hold_execution_slot(permit);
-                    jobs.push((run.id, index, delivery.target.clone(), text.clone(), host));
+                    jobs.push((
+                        run.id,
+                        index,
+                        delivery.target.clone(),
+                        text.clone(),
+                        host,
+                        stop_after_failure.clone(),
+                    ));
                 }
             }
-            for (run, index, target, text, host) in jobs {
-                let delivery = self.dispatch_to_host(target, text, host);
+            for (run, index, target, text, host, stop_after_failure) in jobs {
+                let delivery = if stop_after_failure
+                    .is_some_and(|transcript| transcript.has_unsuccessful_result())
+                {
+                    host.delivery_receipt().reject(FAILED_RESULT);
+                    Delivery {
+                        target,
+                        status: DeliveryStatus::Rejected(FAILED_RESULT.into()),
+                        execution: None,
+                        interrupt: None,
+                    }
+                } else {
+                    self.dispatch_to_host(target, text, host)
+                };
                 if let Some(Page::HostGroup(page)) = self.tabs.get_mut(id).map(|tab| &mut tab.page)
                     && let Some(submission) = page
                         .submissions
@@ -97,13 +132,7 @@ impl TerminalApp {
         else {
             return;
         };
-        let reason = "Cancelled before sending.";
-        for delivery in &mut submission.results {
-            if let DeliveryStatus::Queued(waiting) = &mut delivery.status {
-                waiting.reject(reason);
-                delivery.status = DeliveryStatus::Rejected(reason.into());
-            }
-        }
+        submission.reject_queued_commands("Cancelled before sending.");
     }
 }
 

@@ -122,6 +122,7 @@ struct Submission {
     recording: output_recording::State,
     saved_recordings: output_recording::saved::State,
     command_slots: Option<Arc<Semaphore>>,
+    stop_queue_on_failure: bool,
 }
 
 #[derive(Clone)]
@@ -129,6 +130,7 @@ pub struct CommandOffer {
     text: Arc<str>,
     targets: Vec<Target>,
     limit: SshGroupParallelLimit,
+    stop_queue_on_failure: bool,
 }
 
 enum SubmissionContent {
@@ -578,6 +580,7 @@ impl HostGroup {
             recording: Default::default(),
             saved_recordings: Default::default(),
             command_slots: None,
+            stop_queue_on_failure: false,
         });
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
@@ -703,6 +706,7 @@ pub enum Action {
     Interrupt(TabId, u64, Vec<(u64, GroupInterruptTarget)>),
     Send(TabId, CommandOffer),
     CommandLimit(TabId, SshGroupParallelLimit),
+    StopCommandQueueOnFailure(TabId, bool),
     CancelQueuedCommands(TabId, u64),
 }
 
@@ -1004,6 +1008,7 @@ impl TerminalApp {
             text,
             targets,
             limit,
+            stop_queue_on_failure,
         } = offer;
         let roster = self.host_group_targets();
         let selection = targets.iter().map(|target| target.pane).collect();
@@ -1015,6 +1020,7 @@ impl TerminalApp {
             && page.readiness_allows_send(ready, targets.len())
             && page.selected_shown(&roster) == selection
             && page.roster_preferences.command_limit == *limit
+            && page.roster_preferences.stop_command_queue_on_failure == *stop_queue_on_failure
             && page.draft == text.as_ref()
             && w11term::saved_commands::valid_command_text(text)
             && ((!verify_prompts && !page.roster_preferences.require_all_ready)
@@ -1038,6 +1044,7 @@ impl TerminalApp {
             text,
             targets,
             limit,
+            stop_queue_on_failure,
         } = offer;
         let limit = limit.concurrency();
         let results = targets
@@ -1060,6 +1067,7 @@ impl TerminalApp {
             let submission = page.submit(SubmissionContent::Command(text), results, transcript);
             submission.recording = recording;
             submission.command_slots = limit.map(|limit| Arc::new(Semaphore::new(limit)));
+            submission.stop_queue_on_failure = stop_queue_on_failure;
         }
         self.poll_command_queues();
     }
@@ -1484,6 +1492,18 @@ impl TerminalApp {
                 }
             }
             Action::CancelQueuedCommands(id, run) => self.cancel_queued_commands(id, run),
+            Action::StopCommandQueueOnFailure(id, stop) => {
+                if let Some(page) = self.host_group_mut(id).filter(|page| {
+                    !page.recorded_send.pending()
+                        && page
+                            .roster_preferences
+                            .command_limit
+                            .concurrency()
+                            .is_some()
+                }) {
+                    page.roster_preferences.stop_command_queue_on_failure = stop;
+                }
+            }
             Action::Send(id, offer) => {
                 if !self.group_send_matches(id, &offer, false)
                     || self
@@ -2033,6 +2053,7 @@ impl TerminalApp {
             text,
             targets: selected.clone(),
             limit: page.roster_preferences.command_limit,
+            stop_queue_on_failure: page.roster_preferences.stop_command_queue_on_failure,
         };
         let send_recorded = recorded_send::button(id, offer.clone(), enabled, ctx);
         let send = Button::new()
@@ -2093,13 +2114,33 @@ impl TerminalApp {
                 filter,
                 StackPanel::new().grid_row(3).spacing(7.0).children((
                     entry,
-                    parallel_limit::picker(
-                        "Parallel SSH commands",
-                        page.roster_preferences.command_limit,
-                        !page.recorded_send.pending(),
-                        move |limit| Message::HostGroup(Action::CommandLimit(id, limit)),
-                        ctx,
-                    ),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(12.0)
+                        .children((
+                            parallel_limit::picker(
+                                "Parallel SSH commands",
+                                page.roster_preferences.command_limit,
+                                !page.recorded_send.pending(),
+                                move |limit| Message::HostGroup(Action::CommandLimit(id, limit)),
+                                ctx,
+                            ),
+                            CheckBox::new()
+                                .automation_name("Stop queue on failure")
+                                .is_checked(page.roster_preferences.stop_command_queue_on_failure)
+                                .is_enabled(
+                                    !page.recorded_send.pending()
+                                        && page
+                                            .roster_preferences
+                                            .command_limit
+                                            .concurrency()
+                                            .is_some(),
+                                )
+                                .on_is_checked_changed(ctx.callback(move |stop| {
+                                    Message::HostGroup(Action::StopCommandQueueOnFailure(id, stop))
+                                }))
+                                .content("Stop queue on failure"),
+                        )),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)

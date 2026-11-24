@@ -92,6 +92,18 @@ try {
     $null = Wait-Until 'the recording includes the cancelled delivery' {
         [IO.File]::Exists($log) -and [IO.File]::ReadAllText($log).Contains('Cancelled before sending.')
     }
+    (Wait-CheckBox 'Stop queue on failure' Off).Toggle()
+    $null = Wait-CheckBox 'Stop queue on failure' On
+    Set-Command 'halt-on-failure'
+    Click 'Send to 2 hosts'
+    $null = Control @('wait-for-text','--pane',"$($panes.West)",'--timeout','10','West started halt-on-failure')
+    $null = Wait-Until 'East is queued until West settles' {
+        Find-Element "$($labels.East)${dot}Queued"
+    }
+    New-Item -ItemType File -Path (Join-Path $State 'release-halt-on-failure') | Out-Null
+    $null = Wait-Until 'the failure withholds the remaining command' {
+        Find-Element "$($labels.East)${dot}Not sent${dot}Queue stopped after an unsuccessful host."
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {

@@ -81,6 +81,11 @@ struct HostRecord {
 }
 
 impl HostRecord {
+    fn succeeded(&self) -> bool {
+        matches!(self.outcome(), GroupRecordingOutcome::Sent(Some(GroupExecution::Finished(result)))
+            if result.exit_code == Some(0))
+    }
+
     fn outcome(&self) -> GroupRecordingOutcome {
         match self.receipt.0.get() {
             Some(Ok(())) => {
@@ -210,6 +215,15 @@ impl GroupTranscript {
         }
     }
 
+    pub fn has_unsuccessful_result(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .hosts
+            .iter()
+            .any(|host| !host.active && !host.succeeded())
+    }
+
     pub fn set_completion_notice(
         &self,
         armed: bool,
@@ -281,13 +295,7 @@ impl GroupTranscript {
             let succeeded = transcript
                 .hosts
                 .iter()
-                .filter(|host| {
-                    matches!(
-                        host.outcome(),
-                        GroupRecordingOutcome::Sent(Some(GroupExecution::Finished(result)))
-                            if result.exit_code == Some(0)
-                    )
-                })
+                .filter(|host| host.succeeded())
                 .count();
             let attention = transcript.hosts.len() - succeeded;
             drop(transcript);
@@ -402,6 +410,17 @@ mod tests {
     use wezterm_term::LiveOutputLine;
 
     #[test]
+    fn a_settled_prompt_without_an_exit_status_is_unsuccessful() {
+        let group = GroupTranscript::default();
+        let appliance = group.host(7);
+        appliance.delivery_receipt().acknowledge();
+        appliance.set_execution(&GroupExecution::PromptReturned);
+        assert!(!group.has_unsuccessful_result());
+        drop(appliance);
+        assert!(group.has_unsuccessful_result());
+    }
+
+    #[test]
     fn armed_completion_reports_the_final_recipient_outcomes_once() {
         let inbox = Inbox::new(|| {});
         let group = GroupTranscript::default();
@@ -427,7 +446,9 @@ mod tests {
         })));
         drop(east);
         assert!(inbox.rows().is_empty());
+        assert!(!group.has_unsuccessful_result());
         drop(west);
+        assert!(group.has_unsuccessful_result());
         assert_eq!(group.completion_state(), GroupCompletionState::Settled);
         group.set_completion_notice(true, &inbox, 8, 4, "Fleet");
         let rows = inbox.rows();
