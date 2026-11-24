@@ -422,6 +422,36 @@ try {
         [IO.File]::Exists($excerptPath) -and
             [IO.File]::ReadAllText($excerptPath, [Text.UTF8Encoding]::new($false, $true)) -ceq $excerpt
     }
+    $outputOldest = 'Oldest first in live output'
+    $outputElapsed = 'Show elapsed time in live output'
+    (Wait-CheckBox $outputOldest Off).Toggle()
+    (Wait-CheckBox $outputElapsed Off).Toggle()
+    $null = Wait-Until 'oldest-first view places the earlier row above the later row' {
+        $earlier = Find-Element 'west while paused'
+        $later = Find-Element 'west while away'
+        $earlier -and $later -and
+            $earlier.Current.BoundingRectangle.Top -lt $later.Current.BoundingRectangle.Top
+    }
+    $null = Wait-CheckBox $outputElapsed On
+    Click 'Copy shown output'
+    $stamp = '\+\d+\.\d{3} s'
+    $timedPattern = '^' + [regex]::Escape("Submitted${dot}both`r`n") +
+        $stamp + [regex]::Escape("${dot}$westName${dot}west while paused`r`n") +
+        $stamp + [regex]::Escape("${dot}$westName${dot}west while away`r`n") + '$'
+    $timedExcerpt = Wait-Until 'copy includes the elapsed times in oldest-first order' {
+        $text = Read-ClipboardFixture
+        if ($text -cmatch $timedPattern) { $text }
+    }
+    $timelinePath = Join-Path $env:W11TERM_EXPORT_SMOKE_DIR 'timeline.txt'
+    Click ('Save shown output' + [char]0x2026)
+    $dialog = Wait-Until 'owned timeline save dialog' { Find-OwnedDialog 'Save shown SSH group output' }
+    $null = Wait-Until 'enter the timeline file name' {
+        [FixtureDialog]::SetFilename($dialog, $timelinePath, 'ssh-group-output-excerpt-2.txt')
+    }
+    $null = Wait-Until 'save the timeline' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved timeline matches the clipboard' {
+        [IO.File]::Exists($timelinePath) -and [IO.File]::ReadAllText($timelinePath) -ceq $timedExcerpt
+    }
     $outputContext = 'Show surrounding lines'
     Select-ComboValue $outputHosts 'All output hosts'
     (Wait-CheckBox $outputContext Off).Toggle()
@@ -451,6 +481,8 @@ try {
     Select-ComboValue $outputRun "Run 2${dot}both"
     $null = Wait-CheckBox $outputRegex On
     $null = Wait-CheckBox $outputContext On
+    $null = Wait-CheckBox $outputOldest On
+    $null = Wait-CheckBox $outputElapsed On
     $null = Wait-Until 'returning restores the same scoped lines without the prior pause' {
         (Find-Element 'Pause output' $button) -and (Find-Element 'west while paused') -and
             (Find-Element 'west while away') -and (Find-Element 'west live first') -and
@@ -460,11 +492,15 @@ try {
     Click 'Clear output filters'
     $null = Wait-Until 'clearing the filters restores all retained output' {
         (Find-Element 'east-accepted both') -and (Find-Element 'west live first') -and
-            (Find-Element 'Newest first')
+            (Find-Element 'Oldest first')
     }
     $null = Wait-CheckBox $outputRegex Off
     $null = Wait-CheckBox $outputCase Off
     $null = Wait-CheckBox $outputContext Off
+    (Wait-CheckBox $outputOldest On).Toggle()
+    (Wait-CheckBox $outputElapsed On).Toggle()
+    $null = Wait-CheckBox $outputOldest Off
+    $null = Wait-CheckBox $outputElapsed Off
     Click 'Stop recording'
     $firstRecordedPath = Wait-RecordingStatus 'Saved live output to ' $logFile -PassThru
     $logReader.Dispose()

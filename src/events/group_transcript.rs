@@ -120,13 +120,17 @@ impl Default for QueueActivity {
 }
 
 impl QueueActivity {
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.started_at).as_millis())
+            .unwrap_or(u64::MAX)
+    }
+
     fn push(&mut self, kind: GroupQueueEventKind, now: Instant) {
         if self.snapshot.events.len() == QUEUE_EVENT_LIMIT {
             self.snapshot.events.pop_front();
             self.snapshot.omitted = self.snapshot.omitted.saturating_add(1);
         }
-        let elapsed_ms = u64::try_from(now.saturating_duration_since(self.started_at).as_millis())
-            .unwrap_or(u64::MAX);
+        let elapsed_ms = self.elapsed_ms(now);
         self.snapshot
             .events
             .push_back(GroupQueueEvent { elapsed_ms, kind });
@@ -260,6 +264,7 @@ impl GroupTranscriptHistory {
 pub struct GroupTranscriptLine {
     pub id: u64,
     pub pane: u64,
+    pub elapsed_ms: u64,
     pub text: Arc<str>,
     pub shortened: bool,
 }
@@ -550,15 +555,17 @@ impl GroupTranscriptHost {
             return;
         }
         let mut transcript = self.transcript.0.lock().unwrap();
+        let elapsed_ms = transcript.queue_activity.elapsed_ms(Instant::now());
         if batch.gap {
             transcript.push(
                 self.pane,
+                elapsed_ms,
                 "A portion of this host’s output was skipped.",
                 false,
             );
         }
         for line in batch.lines {
-            transcript.push(self.pane, line.text, line.shortened);
+            transcript.push(self.pane, elapsed_ms, line.text, line.shortened);
         }
     }
 }
@@ -585,7 +592,7 @@ impl Transcript {
         }
     }
 
-    fn push(&mut self, pane: u64, text: impl Into<Arc<str>>, shortened: bool) {
+    fn push(&mut self, pane: u64, elapsed_ms: u64, text: impl Into<Arc<str>>, shortened: bool) {
         let id = self
             .history
             .combined
@@ -595,6 +602,7 @@ impl Transcript {
         let line = GroupTranscriptLine {
             id,
             pane,
+            elapsed_ms,
             text: text.into(),
             shortened,
         };
@@ -787,17 +795,18 @@ mod tests {
     #[test]
     fn host_history_recovers_early_lines_after_a_burst_and_stays_bounded() {
         let mut transcript = Transcript::default();
-        transcript.push(1, "Quiet result", false);
+        transcript.push(1, 10, "Quiet result", false);
         let paused = transcript.history.clone();
         for pane in 2..=6 {
             for _ in 0..TRANSCRIPT_LINES {
-                transcript.push(pane, "Loud output", false);
+                transcript.push(pane, pane * 10, "Loud output", false);
             }
         }
         let history = &transcript.history;
         assert_eq!(history.scoped(None).lines.len(), TRANSCRIPT_LINES);
         assert!(history.scoped(None).lines.iter().all(|line| line.pane == 6));
         assert_eq!(&*history.scoped(Some(1)).lines[0].text, "Quiet result");
+        assert_eq!(history.scoped(Some(1)).lines[0].elapsed_ms, 10);
         assert_eq!(history.scoped(Some(1)).omitted, 0);
         let earlier = history.scoped(Some(2));
         let quota = HOST_TRANSCRIPT_BUDGET / 6;
@@ -815,6 +824,7 @@ mod tests {
                 <= HOST_TRANSCRIPT_BUDGET
         );
         assert_eq!(paused.scoped(Some(1)).lines[0].id, 1);
+        assert_eq!(paused.scoped(Some(1)).lines[0].elapsed_ms, 10);
         assert!(paused.scoped(Some(6)).lines.is_empty());
     }
 

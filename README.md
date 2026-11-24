@@ -161,6 +161,8 @@ Choose **Live output…** on a submission to follow recent output from all its h
 
 Turn on **Show surrounding lines** to include up to two retained lines before and after each match from the same host. The view labels those lines as context and shows the match count separately. Copy and save include the context in the order shown.
 
+Choose **Oldest first** to read the output in the order w11term received it. **Show elapsed time** annotates each line with the local capture time since w11term started tracking the run. Lines from the same batch can share a time. Both options carry over when you switch runs, and copy and save use the displayed order and timestamps.
+
 The run selector switches among retained submissions and keeps the text search, its options, and the selected host. If the selected host is absent from a run, the view stays scoped to that host until you select another. The destination opens in live mode. **Back to results** opens the selected run, and any original recording continues on its own run.
 
 Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.

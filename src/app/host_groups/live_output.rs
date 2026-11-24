@@ -19,6 +19,8 @@ pub enum Action {
     UseRegex(bool),
     MatchCase(bool),
     ShowContext(bool),
+    OldestFirst(bool),
+    ShowElapsed(bool),
     FilterHost(Option<u64>),
     ClearFilters,
     CopyShown,
@@ -29,7 +31,25 @@ pub(super) struct State {
     pub(super) submission: u64,
     paused: Option<GroupTranscriptHistory>,
     filter: Filter,
+    timeline: Timeline,
     copy_feedback: Option<String>,
+}
+
+#[derive(Default)]
+struct Timeline {
+    oldest_first: bool,
+    show_elapsed: bool,
+}
+
+impl Timeline {
+    fn status(&self, paused: bool) -> &'static str {
+        match (paused, self.oldest_first) {
+            (false, false) => "Newest first",
+            (false, true) => "Oldest first",
+            (true, false) => "Paused · newest first",
+            (true, true) => "Paused · oldest first",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -229,11 +249,15 @@ impl State {
                 matched: self.filter.matches_text(line),
             })
         });
-        if self.filter.includes_context() {
+        let mut shown = if self.filter.includes_context() {
             retain_with_context(rows.collect())
         } else {
             rows.filter(|row| row.matched).collect()
+        };
+        if self.timeline.oldest_first {
+            shown.reverse();
         }
+        shown
     }
 
     fn excerpt(&self, submission: &Submission) -> Option<String> {
@@ -243,6 +267,7 @@ impl State {
             submission.content.label(),
             snapshot.omitted,
             self.shown(&snapshot, &hosts),
+            self.timeline.show_elapsed,
         )
     }
 }
@@ -255,12 +280,24 @@ fn displayed_line(line: &GroupTranscriptLine) -> Cow<'_, str> {
     }
 }
 
-fn format_excerpt<'a>(label: &str, omitted: u64, lines: Vec<ShownLine<'a>>) -> Option<String> {
+fn elapsed_label(elapsed_ms: u64) -> String {
+    format!("+{}.{:03} s", elapsed_ms / 1000, elapsed_ms % 1000)
+}
+
+fn format_excerpt(
+    label: &str,
+    omitted: u64,
+    lines: Vec<ShownLine<'_>>,
+    show_elapsed: bool,
+) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
     let mut text = format!("Submitted · {label}\r\n");
     for ShownLine { line, name, .. } in lines {
+        if show_elapsed {
+            let _ = write!(text, "{} · ", elapsed_label(line.elapsed_ms));
+        }
         let _ = writeln!(text, "{name} · {}\r", displayed_line(line));
     }
     if omitted > 0 {
@@ -280,6 +317,7 @@ impl HostGroup {
                 submission: id,
                 paused: None,
                 filter: Filter::default(),
+                timeline: Timeline::default(),
                 copy_feedback: None,
             }));
             return;
@@ -342,6 +380,8 @@ impl HostGroup {
                     .configure(output.filter.query.clone(), output.filter.regex, sensitive)
             }
             Action::ShowContext(show) => output.filter.show_context = show,
+            Action::OldestFirst(enabled) => output.timeline.oldest_first = enabled,
+            Action::ShowElapsed(enabled) => output.timeline.show_elapsed = enabled,
             Action::FilterHost(_) => output.filter.host = host_filter,
             Action::ClearFilters => output.filter = Filter::default(),
             _ => {}
@@ -417,17 +457,30 @@ impl TerminalApp {
                                 Message::HostGroup(super::Action::Visit(id, pane))
                             }))
                             .content(name);
-                    let source = if matched {
+                    let source = if matched && !output.timeline.show_elapsed {
                         host
                     } else {
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
                             .spacing(8.0)
                             .children((
+                                if output.timeline.show_elapsed {
+                                    TextBlock::new()
+                                        .text(elapsed_label(line.elapsed_ms))
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .into()
+                                } else {
+                                    View::empty()
+                                },
                                 host,
-                                TextBlock::new()
-                                    .text("Context")
-                                    .vertical_alignment(VerticalAlignment::Center),
+                                if matched {
+                                    View::empty()
+                                } else {
+                                    TextBlock::new()
+                                        .text("Context")
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .into()
+                                },
                             ))
                     };
                     KeyedView::new(
@@ -450,11 +503,7 @@ impl TerminalApp {
         } else {
             ("Pause output", Action::Pause)
         };
-        let status = if output.paused.is_some() {
-            "Paused · newest first"
-        } else {
-            "Newest first"
-        };
+        let status = output.timeline.status(output.paused.is_some());
         let mut panes = vec![None];
         let mut host_labels = vec![Cow::Borrowed("All output hosts")];
         let mut selected_host = 0;
@@ -551,6 +600,25 @@ impl TerminalApp {
                     )
                     .content("Show surrounding lines"),
             ));
+        let timeline_options = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((
+                CheckBox::new()
+                    .automation_name("Oldest first in live output")
+                    .is_checked(output.timeline.oldest_first)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::OldestFirst(enabled))),
+                    )
+                    .content("Oldest first"),
+                CheckBox::new()
+                    .automation_name("Show elapsed time in live output")
+                    .is_checked(output.timeline.show_elapsed)
+                    .on_is_checked_changed(
+                        ctx.callback(move |enabled| send(Action::ShowElapsed(enabled))),
+                    )
+                    .content("Show elapsed time"),
+            ));
         let status = if output.filter.includes_context() {
             Cow::Owned(format!(
                 "{status} · {matches} {} · {} of {} retained lines shown",
@@ -611,6 +679,7 @@ impl TerminalApp {
                         )),
                     search,
                     search_options,
+                    timeline_options,
                     output.filter.error().map_or_else(View::empty, |error| {
                         TextBlock::new()
                             .text(format!("Live output search · {error}"))
@@ -661,6 +730,7 @@ mod tests {
         let line = |pane, text: &str| GroupTranscriptLine {
             id: pane,
             pane,
+            elapsed_ms: 0,
             text: text.into(),
             shortened: false,
         };
@@ -692,6 +762,7 @@ mod tests {
         let line = GroupTranscriptLine {
             id: 1,
             pane: 2,
+            elapsed_ms: 0,
             text: "Error 503".into(),
             shortened: false,
         };
@@ -737,6 +808,7 @@ mod tests {
                 .map(|(id, (pane, text))| GroupTranscriptLine {
                     id: id as u64,
                     pane,
+                    elapsed_ms: 0,
                     text: text.into(),
                     shortened: false,
                 })
@@ -749,6 +821,7 @@ mod tests {
                 show_context: true,
                 ..Default::default()
             },
+            timeline: Timeline::default(),
             copy_feedback: None,
         };
         let hosts = BTreeMap::from([(1, ("East", "east")), (2, ("West", "west"))]);
@@ -769,7 +842,7 @@ mod tests {
                 (1, false)
             ]
         );
-        let excerpt = format_excerpt("run", 0, shown).unwrap();
+        let excerpt = format_excerpt("run", 0, shown, false).unwrap();
         assert_eq!(excerpt.matches("between errors").count(), 1);
         assert!(!excerpt.contains("unrelated"));
         output.filter.configure("(".into(), true, false);
@@ -781,6 +854,7 @@ mod tests {
         let line = |id, pane, text: &str, shortened| GroupTranscriptLine {
             id,
             pane,
+            elapsed_ms: id * 50,
             text: text.into(),
             shortened,
         };
@@ -804,19 +878,46 @@ mod tests {
                 }),
                 ..Filter::default()
             },
+            timeline: Timeline::default(),
             copy_feedback: None,
         };
         let names = BTreeMap::from([(7, ("East", "east")), (9, ("West", "west"))]);
         output.filter.set_query("witness".into());
         assert_eq!(
-            format_excerpt("show", snapshot.omitted, output.shown(&snapshot, &names)).as_deref(),
+            format_excerpt(
+                "show",
+                snapshot.omitted,
+                output.shown(&snapshot, &names),
+                false
+            )
+            .as_deref(),
             Some(
                 "Submitted · show\r\nEast · 雪 WITNESS…\r\nEast · first witness\r\n[Older lines are outside the retained output.]\r\n"
             ),
         );
+        output.timeline.oldest_first = true;
+        output.timeline.show_elapsed = true;
+        assert_eq!(
+            format_excerpt(
+                "show",
+                snapshot.omitted,
+                output.shown(&snapshot, &names),
+                output.timeline.show_elapsed
+            )
+            .as_deref(),
+            Some(
+                "Submitted · show\r\n+0.050 s · East · first witness\r\n+0.200 s · East · 雪 WITNESS…\r\n[Older lines are outside the retained output.]\r\n"
+            ),
+        );
         output.filter.set_query("missing".into());
         assert!(
-            format_excerpt("show", snapshot.omitted, output.shown(&snapshot, &names)).is_none()
+            format_excerpt(
+                "show",
+                snapshot.omitted,
+                output.shown(&snapshot, &names),
+                true
+            )
+            .is_none()
         );
     }
 }
