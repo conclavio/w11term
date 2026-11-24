@@ -104,6 +104,7 @@ impl GroupRun {
             .is_some_and(|started| started.id == id)
             && label == Some(self.expected.as_ref())
             && self.is_running(self.target)
+            && self.transcript.cleared_for_output()
         {
             self.transcript.append(output.read(&mut self.output_cursor));
         }

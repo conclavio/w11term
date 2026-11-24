@@ -2,7 +2,7 @@ use super::*;
 use anyhow::Context;
 use std::{
     fs::File,
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Seek, Write},
     path::{Path, PathBuf},
 };
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -28,6 +28,39 @@ pub(super) enum WriterStatus {
 }
 
 impl State {
+    pub(super) fn start(
+        path: PathBuf,
+        transcript: &GroupTranscript,
+        label: Arc<str>,
+        names: BTreeMap<u64, String>,
+        open: impl FnOnce(&Path) -> anyhow::Result<File> + Send + 'static,
+    ) -> Result<Self, String> {
+        let (recording, stream) = transcript
+            .start_recording()
+            .ok_or("This output already has a recorder")?;
+        let (status, worker) = watch::channel(WriterStatus::Opening);
+        let destination = path.clone();
+        // Keep long-running writes off the bounded Reactor worker pool.
+        std::thread::Builder::new()
+            .name("w11term group output recorder".into())
+            .spawn(move || {
+                let result = open(&destination).and_then(|file| {
+                    write_file(file, &destination, &label, &names, stream, || {
+                        status.send_replace(WriterStatus::Recording);
+                    })
+                });
+                status.send_replace(WriterStatus::Finished(
+                    result.map_err(|error| format!("{error:#}")),
+                ));
+            })
+            .map_err(|error| format!("Could not start the file writer · {error}"))?;
+        Ok(Self::Writing {
+            path,
+            worker,
+            recording: Some(recording),
+        })
+    }
+
     pub(super) fn poll(&mut self) {
         if let Self::Writing { path, worker, .. } = self {
             let closed = worker.has_changed().is_err();
@@ -65,6 +98,39 @@ impl State {
     }
 }
 
+pub struct PreparedFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl PreparedFile {
+    pub(super) fn open(path: PathBuf) -> anyhow::Result<Self> {
+        let mut file = create_file(&path)?;
+        // If the approved scope changes before dispatch, leave a clear status
+        // at the chosen destination. Only a dispatched run replaces it.
+        file.write_all(b"[No command was sent]\r\n")
+            .context("Preparing the output recording")?;
+        Ok(Self { path, file })
+    }
+
+    pub(super) fn start(
+        mut self,
+        transcript: &GroupTranscript,
+        label: Arc<str>,
+        names: BTreeMap<u64, String>,
+    ) -> Result<State, String> {
+        State::start(self.path, transcript, label, names, move |_| {
+            self.file
+                .rewind()
+                .context("Starting the output recording")?;
+            self.file
+                .set_len(0)
+                .context("Starting the output recording")?;
+            Ok(self.file)
+        })
+    }
+}
+
 pub enum Action {
     Pick,
     Picked(Result<Option<PathBuf>, String>),
@@ -80,6 +146,12 @@ fn ready(submission: &Submission) -> bool {
             .results
             .iter()
             .all(|delivery| !matches!(delivery.status, DeliveryStatus::Pending(..)))
+}
+
+pub(super) fn names<'a>(targets: impl Iterator<Item = &'a Target>) -> BTreeMap<u64, String> {
+    targets
+        .map(|target| (target.pane, target.name.replace(['\r', '\n'], " ")))
+        .collect()
 }
 
 pub(super) fn button(id: TabId, submission: &Submission, ctx: &ViewContext<TerminalApp>) -> View {
@@ -158,18 +230,22 @@ fn write_output(
     file.flush()
 }
 
+fn create_file(path: &Path) -> anyhow::Result<File> {
+    File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("Creating a new file at {}", path.display()))
+}
+
 fn write_file(
+    file: File,
     path: &Path,
     label: &str,
     names: &BTreeMap<u64, String>,
     stream: GroupTranscriptStream,
     opened: impl FnOnce(),
 ) -> anyhow::Result<()> {
-    let file = File::options()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("Creating a new file at {}", path.display()))?;
     let mut file = BufWriter::new(file);
     write_output(&mut file, label, names, stream, opened)
         .with_context(|| format!("Writing {}. The file may be incomplete", path.display()))?;
@@ -272,44 +348,19 @@ impl TerminalApp {
         let Some(submission) = self.output_recording_submission(id, run) else {
             return;
         };
-        let Some((recording, stream)) = submission.transcript.start_recording() else {
-            submission.recording = State::Written(Err("This output already has a recorder".into()));
-            return;
-        };
-        let names = submission
+        let targets = submission
             .results
             .iter()
             .filter(|delivery| matches!(delivery.status, DeliveryStatus::Sent))
-            .map(|delivery| {
-                (
-                    delivery.target.pane,
-                    delivery.target.name.replace(['\r', '\n'], " "),
-                )
-            })
-            .collect();
-        let label = submission.content.label().to_owned();
-        let (status, worker) = watch::channel(WriterStatus::Opening);
-        submission.recording = State::Writing {
-            path: path.clone(),
-            worker,
-            recording: Some(recording),
-        };
-        // A command can run for hours. Keep the writer off the bounded GUI
-        // worker pool and surface its status through the group tab's timer.
-        let spawned = std::thread::Builder::new()
-            .name("w11term group output recorder".into())
-            .spawn(move || {
-                let result = write_file(&path, &label, &names, stream, || {
-                    status.send_replace(WriterStatus::Recording);
-                });
-                status.send_replace(WriterStatus::Finished(
-                    result.map_err(|error| format!("{error:#}")),
-                ));
-            });
-        if let Err(error) = spawned {
-            submission.recording =
-                State::Written(Err(format!("Could not start the file writer · {error}")));
-        }
+            .map(|delivery| &delivery.target);
+        submission.recording = State::start(
+            path,
+            &submission.transcript,
+            submission.content.label().into(),
+            names(targets),
+            create_file,
+        )
+        .unwrap_or_else(|error| State::Written(Err(error)));
     }
 }
 
@@ -350,7 +401,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("output.txt");
         let names = [(1, "East".into()), (2, "West".into())].into();
-        write_file(&path, "show", &names, stream, || {}).unwrap();
+        write_file(
+            create_file(&path).unwrap(),
+            &path,
+            "show",
+            &names,
+            stream,
+            || {},
+        )
+        .unwrap();
         let recorded = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             recorded,
@@ -360,8 +419,7 @@ mod tests {
                 "West · 尾 [line shortened]\r\n[Recording stopped]\r\n",
             ),
         );
-        let (_, stream) = GroupTranscript::default().start_recording().unwrap();
-        assert!(write_file(&path, "other", &names, stream, || {}).is_err());
+        assert!(PreparedFile::open(path.clone()).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), recorded);
     }
 }

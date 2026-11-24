@@ -132,20 +132,20 @@ pub enum TransportInput {
     Resize(TerminalSize),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum ScopedInput {
     Clipboard,
-    GroupCommand,
+    GroupCommand(crate::events::GroupWriteReceipt),
     GroupInterrupt(crate::events::GroupInterruptTarget),
 }
 
 impl ScopedInput {
-    pub(crate) fn stale_error(self) -> &'static str {
+    pub(crate) fn stale_error(&self) -> &'static str {
         match self {
             Self::Clipboard => {
                 "The pane connection changed. Paste again to use the new connection."
             }
-            Self::GroupCommand => "The host reconnected before the command was sent.",
+            Self::GroupCommand(_) => "The host reconnected before the command was sent.",
             Self::GroupInterrupt(_) => "The host reconnected before Ctrl+C was sent.",
         }
     }
@@ -1296,11 +1296,16 @@ mod tests {
         events.command_stream(Some(1));
         term.advance_bytes(b"\x1b]633;A\x07$ \x1b]633;B\x07");
         let (notice, result) = tokio::sync::watch::channel(GroupExecution::AwaitingMarkers);
-        events.observe_group_command(1, "show".into(), notice, transcript.host(42));
+        let mut host = transcript.host(42);
+        let receipt = host.require_delivery();
+        events.observe_group_command(1, "show".into(), notice, host);
         term.advance_bytes(b"\r\n\x1b]633;C\x07\x1b[31mfirst\x1b[0m\r\nunfinished");
         term.notify_running_shell_output();
         assert!(lines().is_empty());
         term.advance_bytes(b"\x1b]633;E;show\x07");
+        term.notify_running_shell_output();
+        assert!(lines().is_empty());
+        receipt.acknowledge();
         term.notify_running_shell_output();
         term.notify_running_shell_output();
         assert_eq!(lines(), ["first"]);

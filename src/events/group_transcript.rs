@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::broadcast;
 use wezterm_term::LiveOutputBatch;
@@ -35,6 +38,20 @@ pub struct GroupTranscriptLine {
 pub struct GroupTranscriptHost {
     transcript: GroupTranscript,
     pane: u64,
+    receipt: Option<GroupWriteReceipt>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GroupWriteReceipt(Arc<AtomicBool>);
+
+impl GroupWriteReceipt {
+    pub(crate) fn acknowledge(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn acknowledged(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 pub struct GroupTranscriptRecording {
@@ -59,6 +76,7 @@ impl GroupTranscript {
         GroupTranscriptHost {
             transcript: self.clone(),
             pane,
+            receipt: None,
         }
     }
 
@@ -87,6 +105,18 @@ impl GroupTranscript {
 }
 
 impl GroupTranscriptHost {
+    pub(crate) fn require_delivery(&mut self) -> GroupWriteReceipt {
+        let receipt = GroupWriteReceipt::default();
+        self.receipt = Some(receipt.clone());
+        receipt
+    }
+
+    pub(super) fn cleared_for_output(&self) -> bool {
+        self.receipt
+            .as_ref()
+            .is_none_or(GroupWriteReceipt::acknowledged)
+    }
+
     pub(super) fn append(&self, batch: LiveOutputBatch) {
         if batch.lines.is_empty() && !batch.gap {
             return;

@@ -18,6 +18,7 @@ mod progress;
 mod prompt_setup;
 mod recipient_sets;
 mod reconnect;
+mod recorded_send;
 mod report;
 mod retry;
 mod reuse;
@@ -42,6 +43,7 @@ pub(super) struct HostGroup {
     previous_draft: Option<DraftBackup>,
     command_editor: ElementRef<TextBox>,
     command_save: save_command::State,
+    recorded_send: recorded_send::State,
     submissions: VecDeque<Submission>,
     viewing: u64,
     next_submission: u64,
@@ -319,7 +321,7 @@ impl HostGroup {
         content: SubmissionContent,
         results: Vec<Delivery>,
         transcript: GroupTranscript,
-    ) {
+    ) -> &mut Submission {
         self.next_submission += 1;
         self.viewing = self.next_submission;
         self.result_filter = progress::Filter::All;
@@ -338,6 +340,9 @@ impl HostGroup {
         if self.submissions.len() > SUBMISSION_LIMIT {
             self.submissions.pop_front();
         }
+        self.submissions
+            .back_mut()
+            .expect("the new submission is retained")
     }
 
     fn viewed_submission(&self, id: u64) -> Option<&Submission> {
@@ -403,6 +408,7 @@ pub enum Action {
     ViewSubmission(TabId, u64),
     LiveOutput(TabId, u64, live_output::Action),
     RecordOutput(TabId, u64, output_recording::Action),
+    RecordedSend(TabId, recorded_send::Action),
     Compare(TabId, u64, compare::Action),
     Import(TabId, import::Action),
     HostListExport(TabId, host_list_export::Action),
@@ -659,6 +665,58 @@ impl TerminalApp {
         }
     }
 
+    fn group_send_matches(
+        &self,
+        id: TabId,
+        text: &str,
+        targets: &[Target],
+        verify_prompts: bool,
+    ) -> bool {
+        if self.host_group_command_target() != Some(id) {
+            return false;
+        }
+        let Some(AppTab {
+            page: Page::HostGroup(page),
+            ..
+        }) = self.tabs.get(id)
+        else {
+            return false;
+        };
+        let roster = self.host_group_targets();
+        let selection = targets.iter().map(|target| target.pane).collect();
+        !page.sending()
+            && !targets.is_empty()
+            && page.selected_shown(&roster) == selection
+            && page.draft == text
+            && w11term::saved_commands::valid_command_text(text)
+            && (!verify_prompts
+                || targets.iter().all(|reviewed| {
+                    roster.iter().any(|current| {
+                        current.pane == reviewed.pane
+                            && current.state.prompt() == reviewed.state.prompt()
+                            && current.name == reviewed.name
+                    })
+                }))
+    }
+
+    fn submit_group_command(
+        &mut self,
+        id: TabId,
+        text: Arc<str>,
+        targets: Vec<Target>,
+        transcript: GroupTranscript,
+        recording: output_recording::State,
+    ) {
+        let results = targets
+            .into_iter()
+            .map(|target| self.dispatch_to_host(target, text.clone(), &transcript))
+            .collect();
+        if let Some(page) = self.host_group_mut(id) {
+            page.submit(SubmissionContent::Command(text), results, transcript)
+                .recording = recording;
+        }
+    }
+
     fn interrupt_hosts(
         &mut self,
         id: TabId,
@@ -752,6 +810,7 @@ impl TerminalApp {
             Action::RecipientSets(id, action) => self.handle_recipient_sets(id, action),
             Action::Transfer(id, action) => self.handle_host_group_transfer(id, action, ctx),
             Action::Environment(id, action) => self.handle_host_group_environment(id, action),
+            Action::RecordedSend(id, action) => self.handle_recorded_send(id, action, ctx),
             Action::Tick => {
                 if !matches!(
                     self.tabs.active().map(|tab| &tab.page),
@@ -950,30 +1009,23 @@ impl TerminalApp {
                 self.interrupt_hosts(id, submission, targets)
             }
             Action::Send(id, text, targets) => {
-                if self.host_group_command_target() != Some(id) {
-                    return;
-                }
-                let roster = self.host_group_targets();
-                let Some(page) = self.host_group_mut(id) else {
-                    return;
-                };
-                let selection: BTreeSet<_> = targets.iter().map(|target| target.pane).collect();
-                if page.sending()
-                    || selection.is_empty()
-                    || page.selected_shown(&roster) != selection
-                    || page.draft != text.as_ref()
-                    || !w11term::saved_commands::valid_command_text(&text)
+                if !self.group_send_matches(id, &text, &targets, false)
+                    || self
+                        .host_group_mut(id)
+                        .is_none_or(|page| page.recorded_send.pending())
                 {
                     return;
                 }
-                let transcript = GroupTranscript::default();
-                let results = targets
-                    .into_iter()
-                    .map(|target| self.dispatch_to_host(target, text.clone(), &transcript))
-                    .collect();
                 if let Some(page) = self.host_group_mut(id) {
-                    page.submit(SubmissionContent::Command(text), results, transcript);
+                    page.recorded_send.clear_feedback();
                 }
+                self.submit_group_command(
+                    id,
+                    text,
+                    targets,
+                    GroupTranscript::default(),
+                    Default::default(),
+                );
             }
         }
     }
@@ -1070,8 +1122,10 @@ impl TerminalApp {
             .collect::<Vec<_>>();
         let text: Arc<str> = page.draft.as_str().into();
         let valid_text = w11term::saved_commands::valid_command_text(&text);
-        let enabled =
-            valid_text && !page.sending() && selected.iter().any(|target| target.state.is_ready());
+        let enabled = valid_text
+            && !page.sending()
+            && !page.recorded_send.pending()
+            && selected.iter().any(|target| target.state.is_ready());
         let send_label = format!(
             "Send to {} {}",
             selected.len(),
@@ -1261,6 +1315,7 @@ impl TerminalApp {
             .placeholder_text("Enter one shell command")
             .text(&page.draft)
             .on_text_changed(ctx.callback(move |text| Message::HostGroup(Action::Edit(id, text))));
+        let send_recorded = recorded_send::button(id, text.clone(), selected.clone(), enabled, ctx);
         let send = Button::new()
             .style(ButtonStyle::Accent)
             .is_enabled(enabled)
@@ -1312,8 +1367,9 @@ impl TerminalApp {
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
-                        .children((send, saved_commands, save_command, restore)),
+                        .children((send, send_recorded, saved_commands, save_command, restore)),
                     page.command_save.view(id, ctx),
+                    page.recorded_send.feedback(),
                     retry::feedback(page),
                     hidden_selection,
                     TextBlock::new()

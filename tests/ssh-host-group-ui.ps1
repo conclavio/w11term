@@ -670,6 +670,72 @@ try {
         (Find-Element 'fleet-status-ok') -and (Find-Element "Focus compared pane $east" $button) -and
         (Find-Element "Focus compared pane $west" $button)
     }
+    Click 'Back to results'
+    Pane-Status $east "Connected$($dot)Ready"
+    Pane-Status $west "Connected$($dot)Ready"
+    $sendRecorded = 'Send and record' + [char]0x2026
+    (Command-Editor).SetValue('record-fast')
+    Click $sendRecorded
+    $dialog = Wait-Until 'record-before-send file picker' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'cancel recording before dispatch' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Until 'file picker closes without a recorded submission' { !(Find-OwnedDialog 'Record SSH group output') }
+    if (Find-Element "Submitted$($dot)record-fast") { throw 'Cancelling the picker sent the command' }
+    $previousLogs = @(Get-ChildItem -LiteralPath $env:W11TERM_EXPORT_SMOKE_DIR -Filter 'ssh-group-output-*.txt')
+    Click $sendRecorded
+    $dialog = Wait-Until 'second record-before-send file picker' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'accept recording before dispatch' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'submission is attached to its recording' { Find-Element "Submitted$($dot)record-fast" }
+    Outcome $eastName 'Exit 0'
+    Outcome $westName 'Exit 0'
+    $newLogs = @(Get-ChildItem -LiteralPath $env:W11TERM_EXPORT_SMOKE_DIR -Filter 'ssh-group-output-*.txt' |
+        Where-Object Name -NotIn $previousLogs.Name)
+    if ($newLogs.Count -ne 1 -or $newLogs[0].Name -notmatch '^ssh-group-output-(\d+)\.txt$') {
+        throw 'Expected one new file for the recorded run'
+    }
+    $nextName = "ssh-group-output-$([int]$Matches[1] + 1).txt"
+    $burstPath = $newLogs[0].FullName
+    Click $liveButton
+    Click 'Stop recording'
+    Wait-RecordingStatus 'Saved live output to ' $burstPath
+    $burst = [IO.File]::ReadAllLines($burstPath)
+    if ($burst[0] -cne "Submitted$($dot)record-fast" -or $burst[-1] -cne '[Recording stopped]') {
+        throw 'The recorded submission is missing its header or footer'
+    }
+    foreach ($side in @('east', 'west')) {
+        $prefix = if ($side -eq 'east') { $eastName + $dot } else { $westName + $dot }
+        $actual = @($burst | Where-Object { $_.StartsWith("$prefix$side record row ") })
+        $expected = @(0..79 | ForEach-Object { "$prefix$side record row " + $_.ToString('00') })
+        if (($actual -join '|') -cne ($expected -join '|')) {
+            throw "Unexpected burst from $side ($($actual.Count) of 80 rows): $($actual -join ', ')"
+        }
+    }
+    Click 'Back to results'
+    $beforeCollision = [IO.File]::ReadAllText($burstPath)
+    (Command-Editor).SetValue('never-send-on-collision')
+    Click $sendRecorded
+    $dialog = Wait-Until 'recording file picker for collision' { Find-OwnedDialog 'Record SSH group output' }
+    $null = Wait-Until 'choose the existing capture' { [FixtureDialog]::SetFilename($dialog, $burstPath, $nextName) }
+    $null = Wait-Until 'confirm the existing name in the picker' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'exclusive creation reports a collision' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        foreach ($element in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                [System.Windows.Automation.Condition]::TrueCondition)) {
+            if ($element.Current.Name.StartsWith('Could not prepare the recording')) { return $true }
+        }
+    }
+    if ([IO.File]::ReadAllText($burstPath) -cne $beforeCollision) { throw 'The existing recording was modified' }
+    (Command-Editor).SetValue('never-send-with-stale-prompt')
+    Click $sendRecorded
+    $dialog = Wait-Until 'file picker before a host changes prompt state' { Find-OwnedDialog 'Record SSH group output' }
+    Send-Raw $west 'alt'
+    $null = Control @('wait-for-text','--pane',"$west",'--timeout','15','alternate-proof')
+    $null = Wait-Until 'approve a path after the target left its prompt' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'changed prompts require another review' {
+        Find-Element 'The command, hosts or prompts changed. Review them before sending again.'
+    }
+    if ([IO.File]::ReadAllText((Join-Path $env:W11TERM_EXPORT_SMOKE_DIR $nextName)).Trim() -cne '[No command was sent]') {
+        throw 'A stale review was presented as a recorded submission'
+    }
 } catch {
     throw "$($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {

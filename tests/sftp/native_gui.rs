@@ -948,10 +948,10 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                     continue;
                                 }
                                 let complete = if use_633 {
-                                    let (output, code) = if line == "shared-status" {
-                                        ("fleet-status-ok".to_owned(), 0)
-                                    } else {
-                                        (format!("west-accepted {line}"), 17)
+                                    let (output, code) = match line {
+                                        "shared-status" => ("fleet-status-ok".to_owned(), 0),
+                                        "record-fast" => (recording_burst("west"), 0),
+                                        _ => (format!("west-accepted {line}"), 17),
                                     };
                                     format!(
                                         "\r\n\x1b]633;C\x07{output}\r\n\x1b]633;E;{line}\x07\x1b]633;D;{code}\x07"
@@ -965,10 +965,10 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
                                     } else {
                                         String::new()
                                     };
-                                    let output = if line == "shared-status" {
-                                        "fleet-status-ok".into()
-                                    } else {
-                                        format!("east-accepted {line}")
+                                    let output = match line {
+                                        "shared-status" => "fleet-status-ok".into(),
+                                        "record-fast" => recording_burst("east"),
+                                        _ => format!("east-accepted {line}"),
                                     };
                                     format!(
                                         "{line}\r\n\x1b]133;C\x07{output}\r\n{details}\x1b]133;D;0\x07"
@@ -999,8 +999,8 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
     .unwrap();
     drive_gui("ssh-host-group-ui.ps1", state.path());
     let expected: [&[u8]; 2] = [
-        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\r",
-        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r",
+        b"one\rboth\rwhile-slow\rwhile-edit\rwhile-alt\rwhile-reconnecting\rafter-reconnect\rinterrupt-pair\r\x03interrupt-both\r\x03\x04shared-status\rrecord-fast\r",
+        b"\x1b[200~both\x1b[201~\rpartaltpromptdropprompt\x1b[200~after-reconnect\x1b[201~\r\x1b[200~interrupt-pair\x1b[201~\r\x03\x1b[200~interrupt-both\x1b[201~\r\x03\x1b[200~after-reconnect-review\x1b[201~\r\x1b[200~show  fleet-health\x1b[201~\r\x1b[200~snapshot  status\x1b[201~\r\x04\x1b[200~snapshot  status\x1b[201~\r\x1b[200~shared-status\x1b[201~\r\x1b[200~record-fast\x1b[201~\ralt",
     ];
     for (index, (_, opens, server, responder, trace)) in runtimes.into_iter().enumerate() {
         assert_eq!(opens.load(Ordering::Relaxed), index + 2);
@@ -1012,6 +1012,13 @@ async fn native_ssh_host_group_delivers_to_selected_fresh_prompts() {
         responder.abort();
         server.abort();
     }
+}
+
+fn recording_burst(host: &str) -> String {
+    (0..80)
+        .map(|index| format!("{host} record row {index:02}"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

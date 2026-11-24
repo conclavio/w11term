@@ -924,7 +924,7 @@ async fn password_reconnect_uses_memory_credential_latest_grid_and_never_replays
             connection: 1,
             bytes: b"STALE_GROUP_COMMAND\r".to_vec(),
             reply,
-            kind: ScopedInput::GroupCommand,
+            kind: ScopedInput::GroupCommand(w11term::events::GroupWriteReceipt::default()),
         })
         .unwrap();
     assert!(response.await.unwrap().unwrap_err().contains("reconnected"));
