@@ -4,9 +4,11 @@ use std::{cell::OnceCell, path::Path};
 
 mod file;
 mod list;
+mod profiles;
 mod ranges;
 mod review;
 mod save_group;
+pub(super) use profiles::button as saved_profiles_button;
 use review::{Approval, Review};
 
 const LABEL: &str = "Import host list…";
@@ -27,12 +29,14 @@ struct Draft {
     default_user: String,
     authentication: usize,
     identity: String,
+    profiles: Option<Box<profiles::Picker>>,
     review: Option<Review>,
     error: Option<String>,
 }
 
 pub enum Action {
     Begin,
+    PickSaved,
     Form(u64, Change),
     FileLoaded(u64, Result<Option<String>, String>),
 }
@@ -45,6 +49,8 @@ pub enum Change {
     Authentication(usize),
     Identity(String),
     Preview,
+    Picker(profiles::Change),
+    RefreshProfiles,
     Check(usize, bool),
     Connection(usize, Option<reuse::Connection>),
     ReuseUnique,
@@ -57,6 +63,9 @@ pub enum Change {
 
 impl Draft {
     fn rows(&self, catalog: &Profiles, path: &Path) -> Result<Vec<list::Row>> {
+        if let Some(profiles) = &self.profiles {
+            return profiles.rows(catalog);
+        }
         let auth =
             ssh_authentication(self.authentication, &self.identity).map_err(|e| e.to_string());
         list::build(&self.text, &self.default_user, catalog, path, auth)
@@ -122,9 +131,22 @@ impl State {
         };
         let cancel = Button::new()
             .on_click(ctx.callback(move |_| action(Change::Cancel)))
-            .content("Cancel import");
+            .content(if draft.profiles.is_some() {
+                "Cancel"
+            } else {
+                "Cancel import"
+            });
         if let Some(review) = &draft.review {
-            return Some(review.view(action, cancel, error_text(draft), ctx));
+            return Some(review.view(
+                action,
+                cancel,
+                error_text(draft),
+                draft.profiles.is_some(),
+                ctx,
+            ));
+        }
+        if let Some(profiles) = &draft.profiles {
+            return Some(profiles.view(action, cancel, error_text(draft), ctx));
         }
         let key = if draft.authentication == PRIVATE_KEY_AUTH {
             TextBox::new()
@@ -217,6 +239,31 @@ impl TerminalApp {
                 }
                 return;
             }
+            Action::PickSaved => {
+                if self.host_group_command_target() == Some(id) {
+                    let picker = self
+                        .store
+                        .catalog()
+                        .map(|catalog| profiles::Picker::new(&catalog));
+                    if let Some(page) = self.host_group_mut(id) {
+                        match picker {
+                            Ok(profiles) => {
+                                page.import.revision += 1;
+                                page.import.feedback.clear();
+                                page.import.draft = Some(Draft {
+                                    profiles: Some(Box::new(profiles)),
+                                    ..Draft::default()
+                                });
+                            }
+                            Err(error) => {
+                                page.import.feedback =
+                                    format!("Could not read saved profiles. {error:#}")
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             Action::Form(revision, change) => (revision, change),
             Action::FileLoaded(revision, result) => {
                 if let Some(page) = self.host_group_mut(id) {
@@ -230,6 +277,7 @@ impl TerminalApp {
         }
         match change {
             Change::Preview => return self.preview_host_import(id, revision),
+            Change::RefreshProfiles => return self.refresh_import_profiles(id, revision),
             Change::Open(approval) => return self.open_host_import(id, revision, approval, ctx),
             Change::BeginSaveGroup(checked) => {
                 return self.begin_import_group_save(id, revision, checked);
@@ -257,6 +305,14 @@ impl TerminalApp {
             Change::Mounted if draft.review.is_none() && !draft.editor_ready => {
                 draft.editor_ready = true;
                 draft.editor.take();
+            }
+            Change::Picker(change) if draft.review.is_none() => {
+                if let Some(profiles) = &mut draft.profiles {
+                    draft.error = profiles
+                        .edit(change)
+                        .err()
+                        .map(|error| format!("{error:#}"));
+                }
             }
             Change::Text(text)
                 if draft.review.is_none()
@@ -361,6 +417,31 @@ impl TerminalApp {
                 state.revision += 1;
             }
             _ => {}
+        }
+    }
+
+    fn refresh_import_profiles(&mut self, id: TabId, revision: u64) {
+        if !self
+            .import_draft(id, revision)
+            .is_some_and(|draft| draft.review.is_none() && draft.profiles.is_some())
+        {
+            return;
+        }
+        let catalog = self.store.catalog();
+        if let Some(page) = self.host_group_mut(id)
+            && let Some(draft) = &mut page.import.draft
+            && let Some(profiles) = &mut draft.profiles
+        {
+            match catalog {
+                Ok(catalog) => {
+                    profiles.refresh(&catalog);
+                    draft.error = None;
+                    page.import.revision += 1;
+                }
+                Err(error) => {
+                    draft.error = Some(format!("Could not read saved profiles. {error:#}"))
+                }
+            }
         }
     }
 }

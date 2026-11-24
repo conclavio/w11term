@@ -79,6 +79,11 @@ struct MemberRoster {
     membership: membership::State,
 }
 
+enum PaneLaunch {
+    Select,
+    Add,
+}
+
 struct DraftBackup {
     text: String,
     scope: Option<DraftScope>,
@@ -633,8 +638,9 @@ impl TerminalApp {
     fn start_host_group_panes(
         &mut self,
         id: TabId,
-        mut selected: BTreeSet<u64>,
+        mut opened: BTreeSet<u64>,
         targets: impl IntoIterator<Item = (Option<String>, SshOptions)>,
+        mode: PaneLaunch,
         ctx: &ComponentContext<Self>,
     ) {
         for (profile, ssh) in targets {
@@ -642,20 +648,22 @@ impl TerminalApp {
             let label = profile.clone().unwrap_or_else(|| source_label(&source));
             let tab = self.make_live_tab(label, source, profile);
             if let Some(pane) = tab.pane_id() {
-                selected.insert(pane);
+                opened.insert(pane);
             }
             self.tabs.insert(tab);
         }
         self.tabs.select(id);
         if let Some(page) = self.host_group_mut(id) {
             if let Some(roster) = &mut page.roster {
-                roster.panes.extend(selected.iter().copied());
+                roster.panes.extend(opened.iter().copied());
             }
-            page.selected = selected;
-            page.filter.clear();
-            page.saved.feedback.clear();
-            page.import.feedback.clear();
-            page.reconnect_feedback.clear();
+            if matches!(mode, PaneLaunch::Select) {
+                page.selected = opened;
+                page.filter.clear();
+                page.saved.feedback.clear();
+                page.import.feedback.clear();
+                page.reconnect_feedback.clear();
+            }
         }
         self.sync_selection(ctx);
         self.activate(ctx);

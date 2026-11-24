@@ -1501,7 +1501,7 @@ impl TerminalApp {
         } else {
             self.new_host_group_tab(Some(&name))
         };
-        self.start_host_group_panes(id, reused, fresh, ctx);
+        self.start_host_group_panes(id, reused, fresh, PaneLaunch::Select, ctx);
         self.remember_group_launch(id, &name, &profiles, skipped == 0, feedback);
         Ok(())
     }

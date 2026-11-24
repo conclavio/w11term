@@ -612,6 +612,7 @@ impl TerminalApp {
             id,
             BTreeSet::new(),
             expected.iter().cloned().map(Some).zip(members),
+            PaneLaunch::Select,
             ctx,
         );
         self.remember_group_launch(
@@ -647,29 +648,31 @@ impl TerminalApp {
         let selected = saved.name(&self.catalog);
         let selection = selected.and_then(|name| names.iter().position(|item| item == name));
         let members = selected.and_then(|name| self.catalog.ssh_host_groups.get(name));
-        let review_actions = selected.zip(members).map(|(name, members)| {
-            let launch = reuse::button(id, name, members, ctx);
-            let name = name.to_owned();
-            let members = members.clone();
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    launch,
-                    Button::new()
-                        .is_enabled(!members.is_empty())
-                        .on_click(ctx.callback(move |_| {
-                            Message::HostGroup(HostAction::HostListExport(
-                                id,
-                                host_list_export::Action::OpenSaved {
-                                    name: name.clone(),
-                                    members: members.clone(),
-                                },
-                            ))
-                        }))
-                        .content("Export saved group hosts…"),
-                ))
-        });
+        let review_actions = selected
+            .zip(members)
+            .map_or_else(View::empty, |(name, members)| {
+                let launch = reuse::button(id, name, members, ctx);
+                let name = name.to_owned();
+                let members = members.clone();
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        launch,
+                        Button::new()
+                            .is_enabled(!members.is_empty())
+                            .on_click(ctx.callback(move |_| {
+                                Message::HostGroup(HostAction::HostListExport(
+                                    id,
+                                    host_list_export::Action::OpenSaved {
+                                        name: name.clone(),
+                                        members: members.clone(),
+                                    },
+                                ))
+                            }))
+                            .content("Export saved group hosts…"),
+                    ))
+            });
         let action = move |action| Message::HostGroup(HostAction::Saved(id, action));
         let mut items = Vec::new();
         if let Some((name, members)) = selected.zip(members) {
@@ -748,9 +751,13 @@ impl TerminalApp {
                     .text_trimming(TextTrimming::CharacterEllipsis),
             ));
         }
-        if let Some(review_actions) = review_actions {
-            details.push(KeyedView::new("review-group-actions", review_actions));
-        }
+        details.push(KeyedView::new(
+            "review-group-actions",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((review_actions, import::saved_profiles_button(id, ctx))),
+        ));
         if !saved.feedback.is_empty() {
             details.push(KeyedView::new(
                 "feedback",

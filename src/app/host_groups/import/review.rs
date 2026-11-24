@@ -23,11 +23,16 @@ struct Launch {
 }
 
 impl Launch {
-    fn feedback(&self) -> String {
+    fn feedback(&self, saved: bool) -> String {
+        let source = if saved {
+            "saved profiles"
+        } else {
+            "the host list"
+        };
         match (self.reused.len(), self.fresh.len()) {
-            (0, 1) => "Opened 1 SSH pane from the host list".into(),
-            (0, fresh) => format!("Opened {fresh} SSH panes from the host list"),
-            (reused, fresh) => format!("Reused {reused} · Opened {fresh} from the host list"),
+            (0, 1) => format!("Opened 1 SSH pane from {source}"),
+            (0, fresh) => format!("Opened {fresh} SSH panes from {source}"),
+            (reused, fresh) => format!("Reused {reused} · Opened {fresh} from {source}"),
         }
     }
 }
@@ -105,6 +110,7 @@ impl Review {
         action: impl Fn(Change) -> Message + Copy + 'static,
         cancel: View,
         error: View,
+        saved: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         if let Some(editor) = &self.save {
@@ -174,7 +180,11 @@ impl Review {
             .rows([GridLength::Auto, GridLength::STAR])
             .children((
                 StackPanel::new().spacing(6.0).children((
-                    TextBlock::new().font_size(24.0).text("Review SSH hosts"),
+                    TextBlock::new().font_size(24.0).text(if saved {
+                        "Review saved SSH profiles"
+                    } else {
+                        "Review SSH hosts"
+                    }),
                     TextBlock::new().text(format!("{reused} to reuse · {fresh} to open")),
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
@@ -201,7 +211,11 @@ impl Review {
                                 .content("Save checked hosts as group…"),
                             Button::new()
                                 .on_click(ctx.callback(move |_| action(Change::Edit)))
-                                .content("Edit host list"),
+                                .content(if saved {
+                                    "Edit profile selection"
+                                } else {
+                                    "Edit host list"
+                                }),
                             cancel,
                         )),
                     error,
@@ -216,6 +230,7 @@ impl Review {
 fn launch_plan(
     rows: Vec<list::Row>,
     approval: Approval,
+    review_again: &str,
     matches: impl Fn(reuse::Connection, &list::Target) -> bool,
 ) -> Result<Launch> {
     let mut launch = Launch::default();
@@ -226,7 +241,7 @@ fn launch_plan(
         if let Some(connection) = connection {
             ensure!(
                 matches(connection, &target),
-                "The reviewed SSH connection for {} changed. Choose a new pane or preview the host list again.",
+                "The reviewed SSH connection for {} changed. Choose a new pane or {review_again}.",
                 target.label()
             );
             launch.reused.insert(connection.pane);
@@ -320,7 +335,13 @@ impl TerminalApp {
                 return;
             }
         };
-        let launch = match launch_plan(rows, approval, |connection, target| {
+        let saved = draft.profiles.is_some();
+        let review_again = if saved {
+            "review the profiles again"
+        } else {
+            "preview the host list again"
+        };
+        let launch = match launch_plan(rows, approval, review_again, |connection, target| {
             self.group_reuse_connection(connection.pane, target.profile.as_deref(), &target.ssh)
                 == Some(connection)
         }) {
@@ -330,13 +351,23 @@ impl TerminalApp {
                 return;
             }
         };
-        let feedback = launch.feedback();
+        let feedback = launch.feedback(saved);
         if let Some(page) = self.host_group_mut(id) {
             page.import.draft = None;
             page.import.revision += 1;
         }
         self.use_group_catalog(catalog);
-        self.start_host_group_panes(id, launch.reused, launch.fresh, ctx);
+        self.start_host_group_panes(
+            id,
+            launch.reused,
+            launch.fresh,
+            if saved {
+                PaneLaunch::Add
+            } else {
+                PaneLaunch::Select
+            },
+            ctx,
+        );
         if let Some(page) = self.host_group_mut(id) {
             page.import.feedback = feedback;
         }

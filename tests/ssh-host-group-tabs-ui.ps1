@@ -792,6 +792,56 @@ try {
     if ($sets.Fleet -or ($sets.Canaries -join ',') -cne 'East') { throw 'Deleting a set edited another set' }
     Click 'Back to SSH group'
     if (@((Control @('list')).sessions).Count -ne 4) { throw 'Roster and recipient edits changed the SSH sessions' }
+
+    $beforeAdd = @((Control @('list')).sessions)
+    (Field 'Host filter').SetValue('east')
+    Expect-Field 'Host filter' 'east'
+    $addProfiles = 'Add saved profiles' + [char]0x2026
+    Click $addProfiles
+    (Field 'Find saved SSH profiles').SetValue('WEST')
+    $null = Wait-CheckBox 'Add SSH profile West' Off
+    Click 'Check matches'
+    $null = Wait-CheckBox 'Add SSH profile West' On
+    (Field 'Find saved SSH profiles').SetValue('NORTH')
+    (Wait-CheckBox 'Add SSH profile North' Off).Toggle()
+    $null = Wait-CheckBox 'Add SSH profile North' On
+    Click 'Review selected profiles'
+    $westLabel = "West${dot}test@127.0.0.1:$($config.West.port)"
+    Choose-Option "Connection for $westLabel" "Reuse${dot}$westName"
+    $beforeStale = [IO.File]::ReadAllBytes($profiles)
+    $changed = [Text.Encoding]::UTF8.GetString($beforeStale) | ConvertFrom-Json
+    $changed.profiles.North.port = 1
+    [IO.File]::WriteAllText($profiles, ($changed | ConvertTo-Json -Depth 30))
+    Click 'Use 2 checked hosts'
+    $null = Wait-Until 'a changed saved profile returns to the picker' {
+        Find-Element 'SSH profile North changed. Refresh saved profiles and review again.'
+    }
+    if (@((Control @('list')).sessions).Count -ne $beforeAdd.Count) { throw 'A stale profile review opened a pane' }
+    [IO.File]::WriteAllBytes($profiles, $beforeStale)
+    Click 'Refresh saved profiles'
+    Expect-Field 'Find saved SSH profiles' 'NORTH'
+    $null = Wait-CheckBox 'Add SSH profile North' On
+    Click 'Review selected profiles'
+    Choose-Option "Connection for $westLabel" "Reuse${dot}$westName"
+    Click 'Use 2 checked hosts'
+    $null = Wait-Until 'the selected profiles are added to the named roster' {
+        Find-Element "Reused 1${dot}Opened 1 from saved profiles"
+    }
+    Expect-Field 'Group command' 'retained roster draft'
+    Expect-Field 'Host filter' 'east'
+    $null = Wait-CheckBox $eastName On
+    $newNorth = Wait-Until 'exactly one fresh North pane is opened' {
+        $current = @((Control @('list')).sessions)
+        if ($current.Count -eq ($beforeAdd.Count + 1)) {
+            $current | Where-Object { $_.label -ceq 'North' -and $_.id -notin $beforeAdd.id }
+        }
+    }
+    (Field 'Host filter').SetValue('')
+    $null = Wait-CheckBox $westName Off
+    $null = Wait-CheckBox (Target-Label 'North' $newNorth.id) Off
+    if (((Get-Content -LiteralPath $profiles -Raw | ConvertFrom-Json).ssh_host_groups.'Fleet East' -join ',') -cne 'East') {
+        throw 'Adding profiles changed the saved group membership'
+    }
 } catch {
     throw ($_.Exception.Message + [Environment]::NewLine + $_.ScriptStackTrace)
 } finally {
