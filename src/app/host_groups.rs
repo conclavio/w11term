@@ -241,7 +241,7 @@ impl Delivery {
             return None;
         }
         match *self.execution.as_ref()?.borrow() {
-            GroupExecution::Running(link) => Some(link),
+            GroupExecution::Running { target, .. } => Some(target),
             _ => None,
         }
     }
@@ -277,7 +277,7 @@ fn execution_caption(result: &GroupExecution) -> Cow<'_, str> {
     match result {
         GroupExecution::AwaitingMarkers => "Waiting for shell markers".into(),
         GroupExecution::AwaitingPrompt => "Waiting for a matching prompt".into(),
-        GroupExecution::Running(_) => "Running".into(),
+        GroupExecution::Running { .. } => "Running".into(),
         GroupExecution::PromptReturned => "Prompt returned · exit status unavailable".into(),
         GroupExecution::Unavailable(reason) => format!("Result unavailable · {reason}").into(),
         GroupExecution::Finished(result) => result.exit_code.map_or_else(
@@ -285,6 +285,15 @@ fn execution_caption(result: &GroupExecution) -> Cow<'_, str> {
             |code| format!("Exit {code}").into(),
         ),
     }
+}
+
+fn execution_time_caption(result: &GroupExecution, now: Instant) -> Option<String> {
+    let time = result.shell_time(now)?;
+    Some(match result {
+        GroupExecution::Running { .. } => format!("Running for {} s", time.as_secs()),
+        _ if time < Duration::from_secs(1) => format!("Shell time · {} ms", time.as_millis()),
+        _ => format!("Shell time · {:.2} s", time.as_secs_f64()),
+    })
 }
 
 impl HostGroup {
@@ -1694,6 +1703,15 @@ impl TerminalApp {
                     .text(caption.as_ref())
                     .text_wrapping(TextWrapping::Wrap),
             ));
+            if let Some(timing) = execution_time_caption(&result, Instant::now()) {
+                rows.push(KeyedView::new(
+                    "shell-time",
+                    TextBlock::new()
+                        .automation_id(format!("ssh-group-result-time-{pane}"))
+                        .automation_name(format!("{name} · {timing}"))
+                        .text(timing),
+                ));
+            }
             if let GroupExecution::Finished(result) = result {
                 let link = result.link;
                 let (preview, truncated) = match &result.output {

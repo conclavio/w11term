@@ -71,6 +71,13 @@ function Submit([string]$Text, [string]$ButtonName) {
 function Outcome([string]$Target, [string]$Status) {
     $null = Wait-Until "$Target $Status" { Find-Element "$Target$dot$Status" }
 }
+function Result-Timing([uint64]$Pane) {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $byId = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, "ssh-group-result-time-$Pane")
+    $entry = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $byId)
+    if ($entry) { $entry.Current.Name }
+}
 function Combo-Popup([string]$ControlName, [string]$Expected) {
     Wait-Until "combo '$ControlName' with selection '$Expected'" {
         $entry = Find-Element $ControlName ([System.Windows.Automation.ControlType]::ComboBox)
@@ -211,6 +218,10 @@ try {
     Outcome $westName 'Sent to SSH channel'
     Outcome $eastName 'Exit 0'
     Outcome $westName 'Running'
+    $runningPrefix = [regex]::Escape("$westName${dot}Running for ")
+    $null = Wait-Until 'the held West result reports live elapsed time' {
+        (Result-Timing $west) -match ($runningPrefix + '[1-9][0-9]* s$')
+    }
     $null = Wait-Until 'East output in the group' { Find-Element 'east-accepted both' }
     Result-Progress "1 of 2 settled${dot}0 waiting${dot}1 running${dot}1 succeeded${dot}0 need attention"
     $liveButton = 'Live output' + [char]0x2026
@@ -401,7 +412,8 @@ try {
     if ($eastJson.pane_id -ne $east -or $eastJson.profile -cne 'East' -or
         $eastJson.address -cne "test@127.0.0.1:$($profileData.East.port)" -or
         $eastJson.delivery.state -cne 'sent' -or $eastJson.execution.state -cne 'completed' -or
-        $eastJson.execution.exit_code -ne 0 -or $eastJson.output.state -cne 'complete' -or
+        $eastJson.execution.exit_code -ne 0 -or $null -eq $eastJson.execution.duration_ms -or
+        $eastJson.execution.duration_ms -lt 0 -or $eastJson.output.state -cne 'complete' -or
         !$eastJson.output.text.Contains('east-report-tail') -or
         ([regex]::Matches($eastJson.output.text, 'east-report-line')).Count -ne 35) {
         throw 'The JSON report lost the completed host identity, exit status, or full retained output'
@@ -466,6 +478,10 @@ try {
     $null = Wait-CheckBox $eastName On
     $null = Wait-CheckBox $westName On
     Outcome $westName 'Exit 17'
+    $finishedPrefix = [regex]::Escape("$westName${dot}Shell time$dot")
+    $null = Wait-Until 'the West result keeps its measured completion time' {
+        (Result-Timing $west) -match ($finishedPrefix + '[1-9][0-9]*\.[0-9]{2} s$')
+    }
     Click $liveButton
     $null = Wait-Until 'completed West output in the earlier live feed' {
         (Find-Element 'west-accepted both') -and (Find-Element 'west while paused')

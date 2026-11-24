@@ -1,5 +1,8 @@
 use super::{CommandLink, GroupTranscriptHost, application_id};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::watch;
 use wezterm_term::{
     CompletedCommand, FinalTermPromptKind, FinalTermSemanticPrompt, LiveCommandOutput,
@@ -13,10 +16,23 @@ const PREVIEW_LINES: usize = 32;
 pub enum GroupExecution {
     AwaitingMarkers,
     AwaitingPrompt,
-    Running(GroupInterruptTarget),
+    Running {
+        target: GroupInterruptTarget,
+        started_at: Instant,
+    },
     PromptReturned,
     Finished(Arc<GroupCommandResult>),
     Unavailable(&'static str),
+}
+
+impl GroupExecution {
+    pub fn shell_time(&self, now: Instant) -> Option<Duration> {
+        match self {
+            Self::Running { started_at, .. } => Some(now.saturating_duration_since(*started_at)),
+            Self::Finished(result) => Some(result.duration),
+            _ => None,
+        }
+    }
 }
 
 /// One verified group submission on a single shell stream. Capture IDs can
@@ -31,6 +47,7 @@ pub struct GroupInterruptTarget {
 pub struct GroupCommandResult {
     pub link: CommandLink,
     pub exit_code: Option<i32>,
+    pub duration: Duration,
     pub output: GroupOutput,
 }
 
@@ -73,6 +90,7 @@ pub(super) struct GroupRun {
 struct Started {
     id: u64,
     aid: Option<[u8; 32]>,
+    at: Instant,
 }
 
 impl GroupRun {
@@ -124,13 +142,12 @@ impl GroupRun {
     }
 
     pub(super) fn identify(&self, id: u64, label: Option<&str>) {
-        if self
-            .started
-            .as_ref()
-            .is_some_and(|started| started.id == id)
-        {
+        if let Some(started) = self.started.as_ref().filter(|started| started.id == id) {
             self.publish(if label == Some(self.expected.as_ref()) {
-                GroupExecution::Running(self.target)
+                GroupExecution::Running {
+                    target: self.target,
+                    started_at: started.at,
+                }
             } else {
                 GroupExecution::AwaitingMarkers
             });
@@ -144,7 +161,7 @@ impl GroupRun {
 
     pub(super) fn is_running(&self, target: GroupInterruptTarget) -> bool {
         !self.status.is_closed()
-            && matches!(*self.status.borrow(), GroupExecution::Running(current) if current == target)
+            && matches!(*self.status.borrow(), GroupExecution::Running { target: current, .. } if current == target)
     }
 
     /// Keep observing only while this capture can still be attributed to the submitted line.
@@ -153,6 +170,7 @@ impl GroupRun {
         marker: &FinalTermSemanticPrompt,
         started: Option<(u64, Option<&str>)>,
         completed: Option<&CompletedCommand>,
+        now: Instant,
     ) -> bool {
         use FinalTermSemanticPrompt::*;
         if self.status.is_closed() {
@@ -170,6 +188,7 @@ impl GroupRun {
             self.started = Some(Started {
                 id,
                 aid: application_id(aid.as_deref()),
+                at: now,
             });
             self.identify(id, label);
             return true;
@@ -183,7 +202,7 @@ impl GroupRun {
                 | MarkEndOfPromptAndStartOfInputUntilEndOfLine
         );
         if let Some(command) = completed {
-            let matched = self.started.as_ref().is_some_and(|started| {
+            let matched = self.started.as_ref().filter(|started| {
                 started.id == command.id
                     && command.command.as_deref() == Some(self.expected.as_ref())
                     && match marker {
@@ -191,13 +210,14 @@ impl GroupRun {
                         _ => fresh_prompt,
                     }
             });
-            if matched {
+            if let Some(started) = matched {
                 self.publish(GroupExecution::Finished(Arc::new(GroupCommandResult {
                     link: CommandLink {
                         generation: self.target.generation,
                         id: command.id,
                     },
                     exit_code: command.exit_code,
+                    duration: now.saturating_duration_since(started.at),
                     output: command.into(),
                 })));
             } else {
@@ -220,6 +240,64 @@ impl GroupRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measures_from_the_start_marker_even_when_the_command_is_identified_later() {
+        use FinalTermSemanticPrompt::{CommandStatus, MarkEndOfInputAndStartOfOutput};
+        let start = Instant::now();
+        let finished = start + Duration::from_millis(1350);
+        let (status, observation) = watch::channel(GroupExecution::AwaitingMarkers);
+        let mut run = GroupRun::new(
+            GroupInterruptTarget {
+                generation: 1,
+                serial: 3,
+            },
+            "report".into(),
+            status,
+            crate::events::GroupTranscript::default().host(1),
+        );
+        assert!(run.marker(
+            &MarkEndOfInputAndStartOfOutput {
+                aid: Some("shell".into()),
+                command: None,
+            },
+            Some((7, None)),
+            None,
+            start,
+        ));
+        assert_eq!(observation.borrow().shell_time(start), None);
+        run.identify(7, Some("report"));
+        assert_eq!(
+            observation
+                .borrow()
+                .shell_time(start + Duration::from_millis(600)),
+            Some(Duration::from_millis(600)),
+        );
+        assert!(!run.marker(
+            &CommandStatus {
+                status: Some(17),
+                aid: Some("shell".into()),
+            },
+            None,
+            Some(&CompletedCommand {
+                id: 7,
+                command: Some("report".into()),
+                exit_code: Some(17),
+                output: Ok(String::new()),
+            }),
+            finished,
+        ));
+        assert!(matches!(
+            &*observation.borrow(),
+            GroupExecution::Finished(result) if result.exit_code == Some(17)
+        ));
+        assert_eq!(
+            observation
+                .borrow()
+                .shell_time(finished + Duration::from_secs(60)),
+            Some(Duration::from_millis(1350)),
+        );
+    }
 
     #[test]
     fn group_preview_bounds_lines_and_preserves_utf8() {

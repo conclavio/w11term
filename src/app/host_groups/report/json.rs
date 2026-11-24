@@ -1,7 +1,10 @@
 use super::{CapturedOutput, Report};
 use crate::app::host_groups::{Delivery, DeliveryStatus, GroupExecution, SubmissionContent};
 use serde::Serialize;
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,10 +40,13 @@ impl From<&DeliveryStatus> for DeliveryState {
 enum Execution {
     AwaitingMarkers,
     AwaitingPrompt,
-    Running,
+    Running {
+        elapsed_ms: u64,
+    },
     PromptReturned,
     Completed {
         exit_code: Option<i32>,
+        duration_ms: u64,
         connection_generation: u64,
         command_id: u64,
     },
@@ -49,15 +55,22 @@ enum Execution {
     },
 }
 
-impl From<&GroupExecution> for Execution {
-    fn from(execution: &GroupExecution) -> Self {
+fn milliseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+impl Execution {
+    fn capture(execution: &GroupExecution, now: Instant) -> Self {
         match execution {
             GroupExecution::AwaitingMarkers => Self::AwaitingMarkers,
             GroupExecution::AwaitingPrompt => Self::AwaitingPrompt,
-            GroupExecution::Running(_) => Self::Running,
+            GroupExecution::Running { started_at, .. } => Self::Running {
+                elapsed_ms: milliseconds(now.saturating_duration_since(*started_at)),
+            },
             GroupExecution::PromptReturned => Self::PromptReturned,
             GroupExecution::Finished(result) => Self::Completed {
                 exit_code: result.exit_code,
+                duration_ms: milliseconds(result.duration),
                 connection_generation: result.link.generation,
                 command_id: result.link.id,
             },
@@ -83,6 +96,7 @@ impl Recipient {
         delivery: &Delivery,
         content: &SubmissionContent,
         execution: Option<&GroupExecution>,
+        now: Instant,
     ) -> Self {
         let target = &delivery.target;
         Self {
@@ -92,7 +106,7 @@ impl Recipient {
             address: target.names.address().to_owned(),
             command: content.host_command(target.pane).map(str::to_owned),
             delivery: DeliveryState::from(&delivery.status),
-            execution: execution.map(Execution::from),
+            execution: execution.map(|execution| Execution::capture(execution, now)),
             interrupt: delivery.interrupt.as_ref().map(DeliveryState::from),
         }
     }

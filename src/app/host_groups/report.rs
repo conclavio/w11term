@@ -1,6 +1,8 @@
-use super::{CommandLink, GroupExecution, GroupOutput, Submission, execution_caption};
+use super::{
+    CommandLink, GroupExecution, GroupOutput, Submission, execution_caption, execution_time_caption,
+};
 use anyhow::{Context, Result};
-use std::{fmt::Write as _, io, sync::Arc};
+use std::{fmt::Write as _, io, sync::Arc, time::Instant};
 use w11term::events::GroupCommandResult;
 use wezterm_term::CompletedCommand;
 
@@ -90,6 +92,7 @@ impl Report {
         submission: &Submission,
         mut retained: impl FnMut(u64, CommandLink) -> Option<Arc<CompletedCommand>>,
     ) -> Self {
+        let now = Instant::now();
         let sections = submission
             .results
             .iter()
@@ -101,6 +104,9 @@ impl Report {
                 let execution = delivery.execution();
                 if let Some(execution) = &execution {
                     let _ = writeln!(heading, "  {}\r", execution_caption(execution));
+                    if let Some(timing) = execution_time_caption(execution, now) {
+                        let _ = writeln!(heading, "  {timing}\r");
+                    }
                 }
                 if let Some(interrupt) = delivery.interrupt_caption() {
                     let _ = writeln!(heading, "  {interrupt}\r");
@@ -138,6 +144,7 @@ impl Report {
                         delivery,
                         &submission.content,
                         execution.as_ref(),
+                        now,
                     ),
                     output,
                 }
@@ -223,7 +230,7 @@ mod tests {
         Delivery, DeliveryStatus, GroupInterruptTarget, SubmissionContent, Target, TargetState,
         filter::Names,
     };
-    use std::{collections::BTreeMap, time::Instant};
+    use std::{collections::BTreeMap, time::Duration};
     use tokio::sync::{oneshot, watch};
 
     fn captured(pane: u64, text: String, truncated: bool) -> Delivery {
@@ -233,6 +240,7 @@ mod tests {
                 id: 3,
             },
             exit_code: Some(17),
+            duration: Duration::from_millis(1250),
             output: GroupOutput::Captured { text, truncated },
         };
         let (_, execution) = watch::channel(GroupExecution::Finished(Arc::new(capture)));
@@ -289,9 +297,9 @@ mod tests {
         });
         let report = snapshot.clipboard(1024).unwrap();
         assert!(report.contains(
-            "Host 7 · Sent to SSH channel\r\n  Exit 17\r\n  Output\r\nfull output\r\nsecond line"
+            "Host 7 · Sent to SSH channel\r\n  Exit 17\r\n  Shell time · 1.25 s\r\n  Output\r\nfull output\r\nsecond line"
         ));
-        assert!(report.contains("Host 8 · Sent to SSH channel\r\n  Exit 17\r\n  Output preview · full output unavailable\r\nmissing tail"));
+        assert!(report.contains("Host 8 · Sent to SSH channel\r\n  Exit 17\r\n  Shell time · 1.25 s\r\n  Output preview · full output unavailable\r\nmissing tail"));
         assert!(!report.contains("\r\npreview"));
         let mut file = Vec::new();
         snapshot.write_to(&mut file).unwrap();
@@ -306,6 +314,7 @@ mod tests {
         assert_eq!(hosts[0]["address"], "ops@lab.example:2222");
         assert_eq!(hosts[0]["delivery"]["state"], "sent");
         assert_eq!(hosts[0]["execution"]["exit_code"], 17);
+        assert_eq!(hosts[0]["execution"]["duration_ms"], 1250);
         assert_eq!(hosts[0]["execution"]["command_id"], 3);
         assert_eq!(hosts[0]["output"]["state"], "complete");
         assert_eq!(hosts[0]["output"]["text"], "full output\r\nsecond line");
@@ -355,10 +364,13 @@ mod tests {
     #[test]
     fn json_preserves_host_assignments_and_distinguishes_running_pending_and_empty_output() {
         let mut running = captured(8, String::new(), false);
-        let (_, execution) = watch::channel(GroupExecution::Running(GroupInterruptTarget {
-            generation: 1,
-            serial: 4,
-        }));
+        let (_, execution) = watch::channel(GroupExecution::Running {
+            target: GroupInterruptTarget {
+                generation: 1,
+                serial: 4,
+            },
+            started_at: Instant::now() - Duration::from_secs(2),
+        });
         running.execution = Some(execution);
         running.interrupt = Some(DeliveryStatus::Unconfirmed);
         let mut pending = captured(9, String::new(), false);
@@ -388,10 +400,13 @@ mod tests {
             serde_json::json!({"state": "complete", "text": ""})
         );
         assert_eq!(hosts[1]["execution"]["state"], "running");
+        assert!(hosts[1]["execution"]["elapsed_ms"].as_u64().unwrap() >= 2000);
+        assert!(hosts[1]["execution"]["duration_ms"].is_null());
         assert_eq!(hosts[1]["interrupt"]["state"], "unconfirmed");
         assert!(hosts[1]["output"].is_null());
         assert_eq!(hosts[2]["command"], "export POLYSH_RANK=2");
         assert_eq!(hosts[2]["delivery"]["state"], "pending");
         assert!(hosts[2]["execution"].is_null() && hosts[2]["output"].is_null());
+        assert!(snapshot.clipboard(1024).unwrap().contains("  Running for "));
     }
 }

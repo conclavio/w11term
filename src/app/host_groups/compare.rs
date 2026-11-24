@@ -556,6 +556,7 @@ mod tests {
                 id: 5,
             },
             exit_code,
+            duration: Duration::ZERO,
             output,
         };
         Delivery {

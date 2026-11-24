@@ -138,6 +138,7 @@ mod tests {
                 id: 1,
             },
             exit_code: code,
+            duration: Duration::ZERO,
             output: GroupOutput::Unavailable("fixture"),
         }))
     }
