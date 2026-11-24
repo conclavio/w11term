@@ -18,6 +18,7 @@ pub enum Subject {
     Scrollback(u64),
     CommandOutput { pane: u64, command: u64 },
     HostGroupResults(u64, GroupReportFormat),
+    HostGroupShownOutput(u64),
     SshHostList,
 }
 
@@ -28,6 +29,7 @@ impl Subject {
             Self::CommandOutput { pane, .. } => format!("command output from pane {pane}"),
             Self::HostGroupResults(_, GroupReportFormat::Text) => "SSH group results".into(),
             Self::HostGroupResults(_, GroupReportFormat::Json) => "SSH group JSON results".into(),
+            Self::HostGroupShownOutput(_) => "shown SSH group output".into(),
             Self::SshHostList => "SSH host list".into(),
         }
     }
@@ -46,6 +48,9 @@ impl Subject {
                     "ssh-group-submission-{submission}.json"
                 ))
             }
+            Self::HostGroupShownOutput(submission) => file_picker::Purpose::GroupOutputExcerpt(
+                format!("ssh-group-output-excerpt-{submission}.txt"),
+            ),
             Self::SshHostList => file_picker::Purpose::SshHostList,
         }
     }

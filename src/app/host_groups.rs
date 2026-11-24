@@ -967,6 +967,18 @@ impl TerminalApp {
                 }
             }
             Action::LiveOutput(id, submission, action) => {
+                if matches!(
+                    action,
+                    live_output::Action::CopyShown | live_output::Action::SaveShown
+                ) {
+                    self.share_group_live_output(
+                        id,
+                        submission,
+                        matches!(action, live_output::Action::SaveShown),
+                        ctx,
+                    );
+                    return;
+                }
                 if matches!(action, live_output::Action::Open)
                     && self.host_group_command_target() != Some(id)
                 {

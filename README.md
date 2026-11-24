@@ -99,6 +99,8 @@ Choose **Live output…** on a submission to follow recent output from all its h
 
 Use **Find in live output** for a literal, case-insensitive text search and the host dropdown to narrow the retained lines to one SSH pane. The view shows the number of matching lines and keeps the filters when you pause, resume, or visit an originating pane. **Clear output filters** restores all retained lines.
 
+Choose **Copy shown output** or **Save shown output…** to share a plain-text excerpt of the active view, with source labels and newest lines first. The save dialog takes a snapshot when it opens. Paused views export the frozen lines that match the current filters.
+
 In **Live output…**, choose **Record output…** to write that submission's host-labeled output to a new UTF-8 text file in arrival order. The recording starts with the retained lines and continues while the view is paused or another tab is focused. Missing or shortened lines are marked in the file. Choose **Stop recording** to finish writing and see the saved path.
 
 At the end of a recording, **Host outcomes** lists each checked host's delivery status and the shell result known at the time. A host still running when you stop is shown as running. For confirmed completions the file includes the exit code when the shell reported one.
